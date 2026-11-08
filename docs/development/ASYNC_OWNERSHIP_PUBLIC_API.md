@@ -64,6 +64,8 @@ cancellation evidence: callback registration alone cannot certify observation.
 If that original physical outcome cannot be recovered, the receipt retains
 explicit uncertainty and retirement debt naming the exact original Task. All
 later readers use that one terminal receipt and the creator's error policy.
+Implicit exception context from an observer's active error handler is not
+physical completion evidence and cannot certify that capture succeeded.
 A caller that directly awaits the native Task must recover its completed receipt
 with `owned_task_error` before classifying a cause-free cancellation as Stop.
 Failed request admission joins a positively identified canonical wrapper whose

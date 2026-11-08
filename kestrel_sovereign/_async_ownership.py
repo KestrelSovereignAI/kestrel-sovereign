@@ -1452,8 +1452,11 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
         physical = cancellation
     bare_cancellation = (
         isinstance(physical, asyncio.CancelledError) and not physical.args
-        and physical.__cause__ is None and physical.__context__ is None
+        and physical.__cause__ is None
     )
+    # Python can attach the observer's active exception as implicit context
+    # while task.exception() manufactures a consumed-C surrogate. That ambient
+    # context is neither original completion evidence nor capture proof.
     if (admission is not None and admission._canonical_wrapper_only
             and admission._canonical_error is not None and bare_cancellation):
         # Exact wrapper identity rules out an independent outer epilogue. Its

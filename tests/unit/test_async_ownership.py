@@ -1029,13 +1029,14 @@ async def test_native_cancellation_recovery_preserves_actual_writer_restoration_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("handling_error", [False, True])
 @pytest.mark.parametrize("mode", [
     pytest.param("eager", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
     pytest.param("eager-preconsumed", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
     "prior-callback", "canonical-prior-callback",
 ])
 @pytest.mark.parametrize("kind", [None, "plain", "sdk", "audit"])
-async def test_original_completion_capture_cannot_rely_on_callback_registration(tmp_path, mode, kind):
+async def test_original_completion_capture_cannot_rely_on_callback_registration(tmp_path, mode, kind, handling_error):
     import inspect
     from kestrel_sdk.resources import ResourceOutcomeUnknown
     from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_cancellation_error, owned_task_error
@@ -1057,6 +1058,9 @@ async def test_original_completion_capture_cannot_rely_on_callback_registration(
         return "original outer success"
     payload = operation()
     admission = OwnedTaskAdmission()
+    caller_error = RuntimeError("unrelated caller exception during original admission")
+    def admit():
+        return create_owned_task(payload, admission=admission, retain_originals=True)
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     def consume(task):
         if mode == "canonical-prior-callback":
@@ -1090,7 +1094,13 @@ async def test_original_completion_capture_cannot_rely_on_callback_registration(
         return task
     try:
         loop.set_task_factory(factory)
-        owner = create_owned_task(payload, admission=admission, retain_originals=True)
+        if handling_error:
+            try:
+                raise caller_error
+            except RuntimeError:
+                owner = admit()
+        else:
+            owner = admit()
         loop.set_task_factory(previous)
         try:
             value = await owner
@@ -1113,6 +1123,7 @@ async def test_original_completion_capture_cannot_rely_on_callback_registration(
                 "Unobservable original completion lost its exact native owner debt")
             assert original not in tuple(_explicit_control_chain(recovered)), "Lost original identity was fabricated"
         assert owned_task_error(owner) is recovered
+        assert caller_error not in tuple(_explicit_control_chain(recovered))
         assert (await await_owned_task(owner)).error is recovered
         assert effect.read_text() == "original physical effect completed once"
         assert len(bodies) == int(mode == "canonical-prior-callback")
