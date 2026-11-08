@@ -41,7 +41,7 @@ from kestrel_sovereign.deidentification import (
     EvidenceValidationError,
 )
 from kestrel_sovereign.execution_custody import (
-    execution_terminal_error,
+    execution_observation_error,
     is_execution_control_error,
     ExecutionAuthorityError,
 )
@@ -609,12 +609,13 @@ class ReentrantTransitionLock:
                     try:
                         await self._wait_change()
                     except asyncio.CancelledError as error:
-                        cancellation = execution_terminal_error(cancellation, error, retain_originals=True)
+                        cancellation = execution_observation_error(cancellation, error, prefer_cancellation=True)
                 self._parked.pop()
                 self._writer, self._depth = task, frame.depth
                 self._notify()
                 if cancellation is not None:
-                    raise execution_terminal_error(pending, cancellation, retain_originals=True)
+                    raise execution_observation_error(pending, cancellation,
+                        prefer_cancellation=isinstance(pending, asyncio.CancelledError))
         finally:
             if previous is None:
                 scope.waits.pop(task)
@@ -640,10 +641,11 @@ class ReentrantTransitionLock:
                     await self._acquire_writer(task)
                     break
                 except asyncio.CancelledError as error:
-                    cancellation = execution_terminal_error(cancellation, error, retain_originals=True)
+                    cancellation = execution_observation_error(cancellation, error, prefer_cancellation=True)
             self._depth = depth
             if cancellation is not None:
-                raise execution_terminal_error(pending, cancellation, retain_originals=True)
+                raise execution_observation_error(pending, cancellation,
+                    prefer_cancellation=isinstance(pending, asyncio.CancelledError))
 
     async def _close_span(self, pending):
         await self.close_native_scope(self._token, pending)
@@ -666,13 +668,16 @@ class ReentrantTransitionLock:
             for child in children:
                 outcome = await await_owned_task(child)
                 if outcome.error is not None and is_execution_control_error(outcome.error):
-                    terminal = execution_terminal_error(terminal, outcome.error)
-                terminal = execution_terminal_error(terminal, outcome.cancellation)
+                    terminal = execution_observation_error(terminal, outcome.error,
+                        prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
+                terminal = execution_observation_error(terminal, outcome.cancellation,
+                    prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
             if self._token is scope and self._writer is not None:
                 try:
                     await self._wait_change()
                 except asyncio.CancelledError as error:
-                    terminal = execution_terminal_error(terminal, error, retain_originals=True)
+                    terminal = execution_observation_error(terminal, error,
+                        prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
         if self._token is scope:
             self._token = self._owner = None
             self._lock.release()
@@ -726,13 +731,17 @@ class ReentrantTransitionLock:
                 return await operation()
 
         admission = OwnedTaskAdmission()
+        opening = None
         try:
             task = create_owned_task(run(), name=name, context=context,
                 admission=admission, retain_originals=True)
-        except BaseException:
+        except BaseException as error:
             if admission.task is None:
                 raise
-            return admission.task
+            # Its start gate already failed, but this is still the original
+            # accepted Task. Publish its native ownership before handing it
+            # to a callback cohort; no failed opening can enter the body.
+            task, opening = admission.task, error
         try:
             if captured is not None:
                 self.admit_owned_task(parent, task, admission)
@@ -744,9 +753,9 @@ class ReentrantTransitionLock:
             task.add_done_callback(completed)
         except BaseException as error:
             self._native_work.discard(task)
-            retained.set_result(_retain_owned_admission_error(task, error))
+            retained.set_result(_retain_owned_admission_error(task, execution_observation_error(opening, error)))
             return task
-        retained.set_result(None)
+        retained.set_result(opening)
         return task
     async def join_owned_native_work(self):
         from kestrel_sovereign._async_ownership import owned_task_join_ancestors
@@ -760,8 +769,10 @@ class ReentrantTransitionLock:
                 continue
             outcome = await await_owned_task(task)
             if outcome.error is not None and is_execution_control_error(outcome.error):
-                terminal = execution_terminal_error(terminal, outcome.error)
-            terminal = execution_terminal_error(terminal, outcome.cancellation)
+                terminal = execution_observation_error(terminal, outcome.error,
+                        prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
+            terminal = execution_observation_error(terminal, outcome.cancellation,
+                    prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
         if terminal is not None:
             raise terminal
 
@@ -3323,7 +3334,7 @@ class PrivacyEnforcingStorage:
                 agent_id, since,
             )
 
-        terminal = execution_terminal_error(
+        terminal = execution_observation_error(
             *(result.control_error for result in report.store_results.values()),
             observability_control,
         )

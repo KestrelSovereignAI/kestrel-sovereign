@@ -16,7 +16,7 @@ from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutco
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
-    execution_evidence_carriers, execution_terminal_error, require_execution_work, is_tool_execution_terminal_error,
+    execution_evidence_carriers, execution_observation_error, require_execution_work, is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectAttempt, ToolEffectClaim, ToolEffectStore,
@@ -137,9 +137,9 @@ class ToolEffectTurn:
                         async with owned_native_wait((executor,)):
                             outcome = await await_owned_task(completion)
                         self.pending.pop(completion, None)
-                        terminal = execution_terminal_error(
+                        terminal = execution_observation_error(
                             terminal, outcome.error, outcome.cancellation,
-                            retain_originals=True,
+                            prefer_cancellation=isinstance(terminal, asyncio.CancelledError),
                         )
                 try:
                     async with self.owner._get_durable_persistence_gate().shared_lock():
@@ -149,23 +149,19 @@ class ToolEffectTurn:
                         if privacy.allows_persistent_storage():
                             await self.store.finish(self.attempt)
                 except BaseException as finish_error:
-                    terminal = execution_terminal_error(
-                        terminal, finish_error, retain_originals=True,
-                    )
-                # Preserve an original terminal outcome and cooperative withdrawal.
-                # A swallowed uncertain effect still needs a typed root failure;
-                # adding that synthetic error to an already typed/control failure
-                # would replace or wrap the very evidence the caller must retain.
+                    terminal = execution_observation_error(terminal, finish_error,
+                        prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
+                # Keep original terminals and uncertain effects in one finite
+                # envelope without decorating either source's graph. A synthetic
+                # unknown classification is only for turns without a terminal.
                 protected = _requires_original_terminal_error(terminal)
                 if self.unconfirmed and protected:
-                    terminal = execution_terminal_error(
-                        terminal, *self.unconfirmed, retain_originals=True,
-                        prefer_cancellation=True,
-                    )
+                    terminal = execution_observation_error(terminal, *self.unconfirmed,
+                        prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
                 if self.unconfirmed and not protected:
                     unknown = ToolEffectOutcomeUnconfirmed('tool_effect_outcome_unconfirmed')
-                    unknown.__cause__ = execution_terminal_error(
-                        terminal, *self.unconfirmed, retain_originals=True)
+                    unknown.__cause__ = execution_observation_error(terminal, *self.unconfirmed,
+                        prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
                     terminal = unknown
             finally:
                 self.live = False
@@ -173,7 +169,8 @@ class ToolEffectTurn:
                     try:
                         await self.privacy_lock.close_native_scope(self.privacy_scope, terminal)
                     except BaseException as retirement_error:
-                        terminal = execution_terminal_error(terminal, retirement_error, retain_originals=True)
+                        terminal = execution_observation_error(terminal, retirement_error,
+                            prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
             if terminal is not None:
                 raise terminal
 
@@ -351,9 +348,8 @@ async def execute_tool_effect(
                 await store.settle(claim, state=state)
             except BaseException as settlement_error:
                 turn.unconfirmed.append(settlement_error)
-                error = execution_terminal_error(
-                    error, settlement_error, retain_originals=True,
-                )
+                error = execution_observation_error(error, settlement_error,
+                    prefer_cancellation=isinstance(error, asyncio.CancelledError))
             if error is not None:
                 raise error
             return result

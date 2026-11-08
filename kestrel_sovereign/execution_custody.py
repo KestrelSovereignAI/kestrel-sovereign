@@ -445,13 +445,16 @@ def execution_native_source_error(*errors: BaseException | None) -> BaseExceptio
 
 
 def execution_observation_error(*errors: BaseException | None,
-                                message: str = "original completion observation evidence") -> BaseException | None:
+                                message: str = "original completion observation evidence",
+                                prefer_cancellation: bool = False) -> BaseException | None:
     """Compose a Core-owned join without making observers genuine sources.
 
     A fresh group preserves even ordinary physical errors without decorating
     their graphs. Only the originals' authenticated native-source projections
     cross a later shared boundary. Genuine unmarked source groups remain whole;
     this does not authorize flattening a foreign group containing cancellation.
+    A caller retaining ordinary cancellation can request a fresh cancellation
+    envelope; its original exception graph still remains untouched.
     """
     present = []
     sources = []
@@ -478,6 +481,11 @@ def execution_observation_error(*errors: BaseException | None,
                                         isolate_control_originals=True)
     terminal = BaseExceptionGroup(message, present)
     terminal._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, tuple(sources))
+    if prefer_cancellation:
+        withdrawal = next((error for error in present
+            if issubclass(type(error), asyncio.CancelledError)), None)
+        if withdrawal is not None:
+            return execution_error_with_cause(asyncio.CancelledError(*withdrawal.args), terminal)
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
 
 

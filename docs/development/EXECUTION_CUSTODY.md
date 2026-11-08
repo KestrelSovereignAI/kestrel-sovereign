@@ -47,6 +47,13 @@ Bounded observation includes writer restoration: later withdrawals remain with
 the first cancellation, and the original task is sampled after restoration.
 A still-pending handoff retains its exact task and finite observation errors;
 shared native-source projections exclude the observer's cancellations.
+Writer restoration, privacy lifetime closure, native-work joins and journal
+closure use the same finite observation composer. It keeps original cause and
+group graphs intact; an ordinary cancellation envelope retains its original
+withdrawal while preserving each original in its explicit graph. Codex sends
+failed native callback admission to the original turn even if the callback
+body never entered. The shared Codex connection retains only native source
+facts, while each turn receives its own complete observation evidence.
 Both bounded and ordinary joins retain a successful collected result when
 writer restoration adds an independent observation error.
 

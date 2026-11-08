@@ -174,9 +174,20 @@ async def test_root_close_preserves_an_original_terminal_error_with_uncertain_ef
         asyncio.CancelledError('original caller withdrawal'))
     if terminal_kind == 'mixed-group':
         terminal = BaseExceptionGroup('original control group', [terminal, ValueError('original closer failure')])
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    original_cause = terminal.__cause__
     with pytest.raises(BaseException) as observed:
         await turn.close(terminal)
-    assert observed.value is terminal
+    evidence = execution_evidence_carriers(observed.value)
+    assert any(error is terminal for error in evidence)
+    assert any(error is original_unknown for error in evidence)
+    assert terminal.__cause__ is original_cause and original_unknown.__cause__ is None, (
+        'journal closure rewrote an original source graph to retain another observation')
+    if terminal_kind == 'unknown':
+        assert observed.value is terminal
+    if terminal_kind == 'cancelled':
+        assert isinstance(observed.value, asyncio.CancelledError)
+        assert observed.value.args == terminal.args
     assert witness.read_text() == 'one effect'
     assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
 

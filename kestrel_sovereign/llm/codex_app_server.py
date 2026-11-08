@@ -51,7 +51,7 @@ from kestrel_sovereign._async_ownership import (
 )
 from kestrel_sovereign.execution_custody import (
     current_execution_custody,
-    execution_terminal_error,
+    execution_terminal_error, execution_native_source_error,
     is_execution_control_error,
     is_scope_local_execution_control,
     owned_native_http_client,
@@ -859,14 +859,22 @@ class CodexAppServerClient:
                 # lifecycle, unscoped, commit and native-close failures remain
                 # connection-wide control, never inferred from a thread ID.
                 return
-            self._server_request_failure = execution_terminal_error(
+            self._server_request_failure = execution_native_source_error(
                 getattr(self, "_server_request_failure", None), error,
             )
             self._fail_all(self._server_request_failure)
 
-    def _server_request_done(self, task: asyncio.Task) -> None:
+    def _server_request_done(self, task: asyncio.Task, *, thread_id=None) -> None:
         error = owned_task_error(task)
         if error is not None:
+            # A failed native start gate never enters the RPC handler. Its
+            # original turn must still observe completion failure promptly.
+            # An ordinary scoped opening cannot poison an unrelated turn.
+            sinks = (self._turn_sinks.values() if thread_id is None else
+                     (self._turn_sinks.get(thread_id),))
+            for sink in sinks:
+                if sink is not None:
+                    sink.put_nowait({"__bridge_error__": error})
             self._retain_request_failure(error,
                 caller_scopes=getattr(task, "_kestrel_codex_caller_scopes", ()))
         self._server_request_tasks.discard(task)
@@ -1211,7 +1219,8 @@ class CodexAppServerClient:
             if not hasattr(self, "_server_request_tasks"):
                 self._server_request_tasks = set()
             self._server_request_tasks.add(task)
-            task.add_done_callback(self._server_request_done)
+            task.add_done_callback(lambda finished, tid=tid:
+                self._server_request_done(finished, thread_id=tid))
             active_tasks = getattr(handler, "_codex_active_tasks", None)
             if isinstance(active_tasks, set):
                 # Admission is synchronous with task creation. A cooperative
