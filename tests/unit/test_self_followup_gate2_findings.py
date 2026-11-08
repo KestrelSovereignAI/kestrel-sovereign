@@ -38,9 +38,7 @@ from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_sovereign.signals.sources.self_followup import (
     TASK_NAME as SELF_FOLLOWUP,
 )
-from tests.unit.test_inline_executor_contextvar_invariant import (
-    _CodexReaderHarness,
-)
+from tests.utils.codex_inline import OwnedCallbackReader
 from tests.unit.test_self_followup_schedule import SOURCE, _drain, _schedule
 from tests.utils.scheduler_ticks import tick_and_settle
 
@@ -127,9 +125,9 @@ async def test_native_task_started_inline_from_a_follow_up_keeps_the_single_hop_
         raise AssertionError(f"unexpected inline tool {name}")
 
     make_executor = _bind_inline_executor(agent, execute_named_tool)
-    harness = _CodexReaderHarness()
+    harness = OwnedCallbackReader()
     # Spawned BEFORE either turn: its frozen context carries no chain.
-    await harness.ensure_started()
+    await harness.start()
 
     async def follow_up_turn(prompt, pre_turn_guard=None, **kwargs):
         # A self_followup source declares a pre-turn guard, which the
