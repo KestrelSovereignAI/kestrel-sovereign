@@ -1,6 +1,6 @@
 """Durable operation admission inside the canonical live invocation boundary."""
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 import inspect
@@ -15,6 +15,7 @@ from kestrel_sovereign.tools.effect_journal import (
     current_tool_effect_state,
 )
 from kestrel_sovereign.tool_effect_store import ToolEffectClaim
+from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 
 
 def _operation_namespace():
@@ -31,17 +32,18 @@ def _operation_namespace():
     return ['internal', 'local']
 
 
-@dataclass(frozen=True)
+@dataclass
 class _JournalInvocation:
     turn: ToolEffectTurn | None
     parent_claim: ToolEffectClaim | None
     root: bool
+    delivery: OwnedTaskHandoff | None = None
 
     def bind(self):
         return bind_tool_effect_turn((self.turn, self.parent_claim))
 
     async def close(self, error=None):
-        with self.bind():
+        with self.bind(), (self.delivery.handoff() if self.delivery is not None else nullcontext()):
             if self.root and self.turn is not None:
                 await self.turn.close(error)
             elif error is not None:
@@ -172,7 +174,7 @@ async def _journal_turn(owner, arguments, route):
     state = await _open_journal_turn(owner, arguments, route)
     with state.bind():
         try:
-            yield state.turn
+            yield state
         except BaseException as error:
             await state.close(error)
         else:
@@ -192,8 +194,11 @@ def journal_async_invocation(function):
     async def wrapped(*args, **kwargs):
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        async with _journal_turn(args[0], bound.arguments, function.__name__):
-            return await function(*args, **kwargs)
+        async with _journal_turn(args[0], bound.arguments, function.__name__) as state:
+            result = await function(*args, **kwargs)
+            if isinstance(result, OwnedTaskHandoff):
+                state.delivery = result
+            return result
 
     return wrapped
 

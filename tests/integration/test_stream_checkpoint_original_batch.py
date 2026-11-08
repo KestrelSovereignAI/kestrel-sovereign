@@ -14,9 +14,7 @@ import asyncpg
 import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
-from kestrel_sovereign.agent.streaming import (
-    _DeferredToolBatchCancellation,
-)
+from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     ProcessRuntimeExecutionFence,
@@ -126,7 +124,7 @@ async def test_stream_checkpoint_failure_keeps_original_batch_receipt(
             input_response.tool_calls, {}, set(), [], 0, "declared component",
             tool_results=kwargs["tool_results"], defer_cancellation_to_persistence=True,
         )
-        assert isinstance(result, _DeferredToolBatchCancellation)
+        assert isinstance(result, OwnedTaskHandoff)
         carriers.append(result)
         agent.stopped = door == "stopped"
         yield result

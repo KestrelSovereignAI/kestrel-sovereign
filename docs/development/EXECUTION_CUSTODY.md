@@ -2273,6 +2273,18 @@ Stream-journal exit and source close use immutable finite observation compositio
 An original native closer error cannot acquire GeneratorExit or another finite
 observer's cause in its own original graph.
 
+OwnedTaskHandoff owns a finite native outcome through delivery. Streaming
+producers keep its handoff active until consumer advance; non-streaming journal
+returns keep that same handoff active through journal retirement. If retirement
+raises before the result reaches its consumer, both the native source and the
+original caller withdrawal remain explicit. The handoff grants no work authority.
+
+Claim admission and protected pre-body audit use the same reconciliation
+classification as Root closure. A native COMMIT acknowledgment or retirement
+failure reaches the live journal latch before an enclosing feature can catch it
+and request another effect. Known validation refusals remain recoverable. Claim
+counts reflect the actual SQL outcome; uncertainty never invents a business claim.
+
 Operation uncertainty includes the Root's original SDK unknown-outcome, native
 commit outcome and unresolved native retirement debt, even if no individual
 business claimant populated the live uncertainty list. Known claim-free

@@ -14,7 +14,7 @@ import pytest
 
 from kestrel_sovereign import execution_custody
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.agent.streaming import _DeferredToolBatchCancellation
+from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 from kestrel_sovereign.execution_custody import _explicit_control_chain
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.utils.native_tool_effects import drive_native
@@ -232,7 +232,7 @@ async def test_parallel_join_keeps_actual_outer_withdrawal_and_source(
         result = await drive_native(agent, lambda: operation(
             calls, {}, set(), [], 0, "local native callback", **kwargs
         ))
-        if isinstance(result, _DeferredToolBatchCancellation):
+        if isinstance(result, OwnedTaskHandoff):
             result.raise_outcome()
         return result
 

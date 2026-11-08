@@ -7,12 +7,12 @@ import logging
 from kestrel_sovereign.tools.effect_invocation import journal_async_generator_invocation
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign._async_ownership import (
-    OwnedTaskOutcome,
+    OwnedTaskHandoff,
     await_owned_task,
     raise_owned_outcome,
 )
@@ -57,40 +57,6 @@ from kestrel_sovereign.telemetry import (
     capture_turn_ids,
     start_span,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _DeferredToolBatchCancellation:
-    """Carry Stop across the streaming turn's history checkpoint."""
-
-    outcome: OwnedTaskOutcome[Any]
-
-    @contextmanager
-    def handoff(self):
-        """Keep finite evidence until the consumer resumes this handoff.
-
-        Owned stream forwarding resumes a source only after consumer advance.
-        Aborted delivery or generator close must project the original receipt,
-        not discard it as a yielded value that nobody received.
-        """
-        try:
-            yield self
-        except BaseException as consumer_error:
-            self.raise_outcome(consumer_error)
-
-    def raise_outcome(self, consumer_error: BaseException | None = None):
-        """Project this SAME finite batch evidence on every consumer exit."""
-        if consumer_error is not None:
-            from kestrel_sovereign.execution_custody import execution_terminal_error
-
-            raise execution_terminal_error(
-                self.outcome.error, self.outcome.cancellation, consumer_error,
-                retain_originals=True, isolate_control_originals=True,
-            )
-        return raise_owned_outcome(
-            self.outcome, operation="side-effecting orchestrator tool batch",
-            retain_originals=True,
-        )
 
 
 def resolve_turn_invocation_context(
@@ -1944,7 +1910,7 @@ class StreamingMixin:
             tool_events = []
             tool_results: list = []
             deferred_tool_batch_cancellation: Optional[
-                _DeferredToolBatchCancellation
+                OwnedTaskHandoff
             ] = None
 
             def tool_batch_completed() -> bool:
@@ -2021,7 +1987,7 @@ class StreamingMixin:
                     continuation_user_content=prompt + lazy_hint,
                 )) as _owned_forwarder_1870:
                     async for chunk in _owned_forwarder_1870:
-                        if isinstance(chunk, _DeferredToolBatchCancellation):
+                        if isinstance(chunk, OwnedTaskHandoff):
                             deferred_tool_batch_cancellation = chunk
                             # Resume once so the inner async generator reaches its return
                             # after the marker instead of leaving cleanup to finalization.

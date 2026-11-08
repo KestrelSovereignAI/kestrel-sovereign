@@ -43,6 +43,7 @@ from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, Reso
 from kestrel_sdk.tools import DeferredToolResult
 
 from kestrel_sovereign._async_ownership import (
+    OwnedTaskHandoff,
     OwnedTaskOutcome,
     await_owned_task,
     create_owned_task,
@@ -106,7 +107,6 @@ from kestrel_sovereign.agent.streaming import (
     STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
     _build_revise_sentinel,
     _build_tool_sentinel,
-    _DeferredToolBatchCancellation,
     _stopped_generation,
 )
 from kestrel_sovereign.execution_custody import (
@@ -1005,7 +1005,9 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
     to another protected operation; serialization, policy, required audit
     and final shaping must not reach an adapter outside that protection.
     """
-    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from kestrel_sovereign.tools.effect_journal import (
+        current_tool_effect_turn, requires_tool_effect_reconciliation,
+    )
 
     turn = current_tool_effect_turn(host)
     if turn is not None:
@@ -1016,7 +1018,7 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
             turn.require_confirmed()
         return result
     except BaseException as error:
-        if execution.returned or (turn is not None and observed_outcome_unknown(error)):
+        if execution.returned or (turn is not None and requires_tool_effect_reconciliation(error)):
             # All producers retain completion uncertainty before either an
             # inline recovery or terminal propagation can hide it from Root.
             # Required audit can become uncertain before a tool body starts.
@@ -4059,7 +4061,7 @@ class OrchestratorEngineMixin:
         ):
             mark_current_invocation_effect_completed(kwargs.get("session_id"))
         if defer_cancellation_to_persistence and outcome.cancellation is not None:
-            return _DeferredToolBatchCancellation(outcome)
+            return OwnedTaskHandoff(outcome, operation="side-effecting orchestrator tool batch")
         return raise_owned_outcome(
             outcome,
             operation="side-effecting orchestrator tool batch",
@@ -4321,7 +4323,7 @@ class OrchestratorEngineMixin:
                 effective_model=effective_model,
                 defer_cancellation_to_persistence=True,
             )
-            if isinstance(batch_result, _DeferredToolBatchCancellation):
+            if isinstance(batch_result, OwnedTaskHandoff):
                 batch_result.raise_outcome()
 
             # Continue conversation with tool results
@@ -4808,7 +4810,7 @@ class OrchestratorEngineMixin:
                 effective_model=effective_model,
                 defer_cancellation_to_persistence=True,
             )
-            if isinstance(batch_result, _DeferredToolBatchCancellation):
+            if isinstance(batch_result, OwnedTaskHandoff):
                 # The side effect and its result are complete, but Stop cancelled
                 # the invocation owner while this batch was in flight. Hand the
                 # captured cancellation to StreamingMixin without emitting any

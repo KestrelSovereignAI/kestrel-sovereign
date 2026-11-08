@@ -15,7 +15,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
 )
-from kestrel_sovereign.agent.streaming import _DeferredToolBatchCancellation
+from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCustody,
@@ -165,7 +165,7 @@ async def test_original_batch_receipt_survives_aborted_source_handoff(
         # Same actual source Task and real producer result, no synthetic ACK.
         source_owners.append(asyncio.current_task())
         result = await execute_batch(*args, **kwargs)
-        if isinstance(result, _DeferredToolBatchCancellation):
+        if isinstance(result, OwnedTaskHandoff):
             batch_receipts.append(result)
         return result
 
@@ -201,7 +201,7 @@ async def test_original_batch_receipt_survives_aborted_source_handoff(
                     reader_errors.append(error)
                     raise
                 received.append(item)
-                assert isinstance(item, _DeferredToolBatchCancellation)
+                assert isinstance(item, OwnedTaskHandoff)
                 # Actual continuation handshake confirms delivery before the
                 # caller's checkpoint, matching StreamingMixin's continue.
                 with pytest.raises(StopAsyncIteration):

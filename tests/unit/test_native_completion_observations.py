@@ -16,6 +16,90 @@ from tests.unit.test_tool_effect_execution import owner as owner
 from tests.unit.test_tool_effect_invocation import governed
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase,loss', [
+    ('claim', 'before'), ('claim', 'after'), ('audit', 'before'), ('audit', 'after'),
+    ('claim', 'known-refusal'),
+])
+async def test_original_prebody_commit_failure_fences_live_effects(owner, monkeypatch, tmp_path, phase, loss):
+    import aiosqlite
+    from kestrel_sovereign.agent.orchestrator_engine import _run_tool_execution
+    from kestrel_sovereign.agent.tool_registry import _ToolExecution
+    from kestrel_sovereign.execution_custody import current_execution_custody, execution_commit_outcome
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn, execute_tool_effect
+
+    database = owner.tool_effect_store.database
+    connection = database.backend._connection
+    native_commit = aiosqlite.Connection.commit
+    original = OSError('original prebody SQLite COMMIT acknowledgment lost')
+    lost, seen = [], {}
+    witness = tmp_path / 'live-effect-after-prebody-commit-loss'
+    table = 'tool_effect_claims' if phase == 'claim' else 'a2a_tool_dispatches'
+
+    async def lose_ack(target):
+        if target is connection and not lost:
+            async with target.execute('SELECT COUNT(*) FROM ' + table) as cursor:
+                present = (await cursor.fetchone())[0]
+            if present:
+                lost.append(True)
+                if loss == 'after':
+                    await native_commit(target)
+                raise original
+        await native_commit(target)
+
+    async def first_effect():
+        witness.write_text('first unadmitted effect ran')
+
+    async def later_effect():
+        witness.write_text('later effect admitted after original claim/audit uncertainty')
+        return 'confirmed later effect'
+
+    async def propagate(error, *args):
+        raise error
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        assert not current_execution_custody(agent), 'probe requires the supported standalone SQLite host'
+        if loss != 'known-refusal':
+            monkeypatch.setattr(aiosqlite.Connection, 'commit', lose_ack)
+        try:
+            if phase == 'claim':
+                await execute_tool_effect(agent, registration='original-uncertain-claim',
+                    arguments=({'invalid_json': object()} if loss == 'known-refusal' else {}),
+                    execute=first_effect)
+            else:
+                await _run_tool_execution(agent, lambda: write_required_denial_audit(agent),
+                    execution=_ToolExecution(), dispatch_meta={}, session_id='original-native-audit',
+                    on_failure=propagate, on_terminal=propagate)
+        except BaseException as error:
+            seen['original_error'] = error
+        seen['unconfirmed'] = tuple(current_tool_effect_turn(agent).unconfirmed)
+        try:
+            seen['later_result'] = await execute_tool_effect(agent,
+                registration='later-live-effect', arguments={}, execute=later_effect)
+        except BaseException as error:
+            seen['later_error'] = error
+
+    try:
+        await invoke(owner, 'original prebody commit uncertainty', invocation_id='original-prebody-commit')
+    except BaseException as error:
+        seen['root_error'] = error
+    if loss == 'known-refusal':
+        assert not seen['unconfirmed'] and 'root_error' not in seen and 'later_error' not in seen
+        assert seen['later_result'] == 'confirmed later effect'
+        assert await database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 0)
+        return
+    assert not witness.exists(), 'prebody native COMMIT uncertainty admitted another live effect'
+    assert lost == [True] and execution_commit_outcome(seen['original_error']) == 'unknown'
+    assert any(error is original for error in execution_evidence_carriers(seen['original_error']))
+    assert seen['unconfirmed'] and 'later_error' in seen and 'root_error' in seen
+    assert any(error is original for error in execution_evidence_carriers(seen['root_error']))
+    assert original.__cause__ is None
+    assert await database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 1)
+    assert await database.fetchone('SELECT COUNT(*) FROM ' + table) == (int(loss == 'after'),)
+    assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (int(phase == 'claim' and loss == 'after'),)
+
+
 def native_failure(kind):
     error = (asyncio.CancelledError('original source cancellation') if kind == 'cancel' else
         ResourceOutcomeUnknown('ordinary SDK outcome uncertainty') if kind == 'ordinary' else

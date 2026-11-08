@@ -726,6 +726,33 @@ class OwnedTaskOutcome(Generic[_T]):
     cancellation: asyncio.CancelledError | None
 
 
+@dataclass(frozen=True, slots=True)
+class OwnedTaskHandoff(Generic[_T]):
+    """Retain a finite original outcome until its consumer accepts delivery."""
+
+    outcome: OwnedTaskOutcome[_T]
+    operation: str
+
+    @contextmanager
+    def handoff(self):
+        try:
+            yield self
+        except BaseException as consumer_error:
+            self.raise_outcome(consumer_error)
+
+    def raise_outcome(self, consumer_error: BaseException | None = None):
+        if consumer_error is not None:
+            from kestrel_sovereign.execution_custody import execution_terminal_error
+
+            raise execution_terminal_error(
+                self.outcome.error, self.outcome.cancellation, consumer_error,
+                retain_originals=True, isolate_control_originals=True,
+            )
+        return raise_owned_outcome(
+            self.outcome, operation=self.operation, retain_originals=True,
+        )
+
+
 def owned_task_admission_error(resource, admission, failure):
     """Private debt for one failed admission; never decorate the source.
 

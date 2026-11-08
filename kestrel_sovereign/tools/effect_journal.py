@@ -39,6 +39,12 @@ class ToolEffectOutcomeUnconfirmed(ResourceOutcomeUnknown):
     """A turn observed an uncertain effect and must not narrate success."""
 
 
+def requires_tool_effect_reconciliation(error: BaseException | None) -> bool:
+    """Native ACK/retirement uncertainty also fences pre-body journal work."""
+    return bool(observed_outcome_unknown(error)
+        or execution_commit_outcome(error) is not None or execution_cleanup_debts(error))
+
+
 def _requires_original_terminal_error(error: BaseException | None) -> bool:
     return ((error is not None and not isinstance(error, Exception))
         or is_tool_execution_terminal_error(error)
@@ -175,9 +181,7 @@ class ToolEffectTurn:
                         if privacy is None:
                             raise ToolEffectJournalUnavailable("tool_effect_journal_unavailable")
                         if privacy.allows_persistent_storage():
-                            uncertain = bool(self.unconfirmed or observed_outcome_unknown(terminal)
-                                or execution_commit_outcome(terminal) is not None
-                                or execution_cleanup_debts(terminal))
+                            uncertain = bool(self.unconfirmed or requires_tool_effect_reconciliation(terminal))
                             await self.store.finish(self.attempt, unconfirmed=uncertain)
                 except BaseException as finish_error:
                     terminal = execution_observation_error(terminal, finish_error,
@@ -325,10 +329,15 @@ async def execute_tool_effect(
             if store is not turn.store:
                 raise ToolEffectJournalUnavailable("tool_effect_journal_changed")
             require_execution_work(owner)
-            claim = await store.claim(
-                turn.attempt, registration=[generation, registration], arguments=arguments,
-                parent=_current_claim.get(),
-            )
+            try:
+                claim = await store.claim(
+                    turn.attempt, registration=[generation, registration], arguments=arguments,
+                    parent=_current_claim.get(),
+                )
+            except BaseException as admission_error:
+                if requires_tool_effect_reconciliation(admission_error):
+                    _record_uncertain_effect(turn, admission_error)
+                raise
             started = False
             result = None
             error = None
