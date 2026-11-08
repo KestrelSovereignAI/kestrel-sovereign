@@ -100,3 +100,8 @@ actual blocked-thread body/finalizer retirement through the public imports.
 They also exercise real native Task allocation/publication, bounded observation,
 original-error harvesting, and resource-bound pending debt. These CPU fixtures
 do not prove database COMMIT, remote ownership, or descendant-process drain.
+
+For a native Task or Future admitted elsewhere, its existing retained terminal
+cancellation remains stable across canonical joins. There is no Core admission
+receipt to reconcile; rereading asyncio's consumed cancellation cannot supply a
+new physical failure. This does not grant Core ownership of that foreign task.

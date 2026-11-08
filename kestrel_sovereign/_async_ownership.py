@@ -1361,6 +1361,11 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     if not task.done():
         raise RuntimeError("owned task has not reached terminal state")
     cached = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
+    if admission is None and cached is not _TASK_ERROR_UNSET and task.cancelled():
+        # A Task/Future admitted elsewhere has no original Core receipt to
+        # reconcile. Its retained terminal observation is already the only
+        # original cancellation; retrieving asyncio again manufactures one.
+        return cached
     try:
         physical = task.exception()
     except asyncio.CancelledError as cancellation:

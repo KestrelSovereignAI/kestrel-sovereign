@@ -837,3 +837,30 @@ async def test_blocking_operation_finishes_before_cancellation_propagates():
 
     with pytest.raises(asyncio.CancelledError):
         await owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["plain", "sdk", "audit", "cancelled-future"])
+async def test_unadmitted_native_cancellation_has_one_stable_terminal_observation(kind):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    original = asyncio.CancelledError("unadmitted native original cancellation")
+    if kind in {"sdk", "audit"}:
+        original.__cause__ = (ResourceOutcomeUnknown("unadmitted original effect acknowledgement")
+            if kind == "sdk" else ToolAuditUnconfirmedError("unadmitted original audit acknowledgement"))
+    async def source():
+        raise original
+    if kind == "cancelled-future":
+        task = asyncio.get_running_loop().create_future()
+        task.cancel("unadmitted native Future cancellation")
+    else:
+        task = asyncio.create_task(source())
+    first = await await_owned_task(task)
+    if kind != "cancelled-future":
+        assert first.error is original
+    original_graph = tuple(_explicit_control_chain(first.error))
+    for _ in range(3):
+        again = await await_owned_task(task)
+        assert again.error is first.error, "Repeated native observation manufactured another cancellation"
+        assert owned_task_error(task) is first.error
+        assert tuple(_explicit_control_chain(first.error)) == original_graph
