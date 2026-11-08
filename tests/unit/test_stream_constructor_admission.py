@@ -21,7 +21,7 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
 @pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
 @pytest.mark.parametrize("phase,factory_kind,first_kind", [
     (phase, factory, kind)
-    for phase in ("owner-admission", "owner-completion", "lifecycle", "watcher-allocation", "watcher-admission", "watcher-completion", "privacy-completion", "join-publication")
+    for phase in ("owner-admission", "owner-completion", "lifecycle", "resource-lifecycle", "watcher-allocation", "watcher-admission", "watcher-completion", "privacy-completion", "join-publication")
     for factory, kind in [("default", None), *[(name, item) for name in ("custom", "privacy") for item in (None, "ordinary", "unknown", "committed")]]
     if phase != "owner-admission" or kind is None
     if phase != "privacy-completion" or factory == "privacy"
@@ -84,6 +84,12 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
         if phase == "lifecycle":
             raise second
 
+    def resource_started(iterator, task, resource):
+        assert resource is stream and resource.retirement_task is not task
+        assert resource._iterator is iterator and iterator.producer_task is task
+        if phase == "resource-lifecycle":
+            raise second
+
     async def source():
         bodies.append(asyncio.current_task())
         await db.execute_commit("INSERT INTO effects VALUES (1)")
@@ -92,7 +98,8 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
     lock = ReentrantTransitionLock()
     factory = (None if factory_kind == "default" else lock.capture_native_work_factory()
         if factory_kind == "privacy" else custom_factory)
-    stream = execution_stream(None, source(), lifecycle=ExecutionStreamLifecycle(factory, started, lambda: None))
+    stream = execution_stream(None, source(), lifecycle=ExecutionStreamLifecycle(
+        factory, started, lambda: None, resource_started=resource_started))
     loop.set_task_factory(native_factory)
     async def drive():
         if reserved:
@@ -562,13 +569,14 @@ async def test_reserved_native_descendant_lifecycle_refuses_invalid_result_befor
 @pytest.mark.asyncio
 async def test_every_close_observer_parks_its_original_native_privacy_writer(tmp_path, monkeypatch):
     from contextvars import Context
+    from contextlib import asynccontextmanager
     from kestrel_sovereign._async_ownership import OwnedOperation, owned_native_wait
     from kestrel_sovereign.execution_custody import reserve_execution_stream
 
     lock, entered = ReentrantTransitionLock(), asyncio.Event()
     writer, source_owners = asyncio.current_task(), []
     receipt = tmp_path / 'closed-original-native-source'
-    original_observe = OwnedOperation.observe
+    original_park = lock.park_native_wait
     stream = foreign = None
 
     async def source():
@@ -581,11 +589,14 @@ async def test_every_close_observer_parks_its_original_native_privacy_writer(tmp
         entered.set()
         await stream.aclose()
 
-    async def observe(operation, **options):
-        if stream is not None and operation is stream._close_operation and asyncio.current_task() is writer:
-            assert lock._writer is not writer, (
-                'Original writer observer joined a foreign closer without lending its native producer writer')
-        return await original_observe(operation, **options)
+    @asynccontextmanager
+    async def park(targets):
+        async with original_park(targets):
+            if (stream is not None and stream.retirement_task in targets
+                    and asyncio.current_task() is writer):
+                assert lock._writer is not writer, (
+                    'Original writer observer joined a foreign closer without lending its native producer writer')
+            yield
 
     async with lock.policy_span():
         async with lock:
@@ -595,7 +606,7 @@ async def test_every_close_observer_parks_its_original_native_privacy_writer(tmp
                 lambda iterator, task: source_owners.append((iterator, task)), lambda: None))
             assert await anext(stream) == b'original'
             assert lock._writer is writer
-            monkeypatch.setattr(OwnedOperation, 'observe', observe)
+            monkeypatch.setattr(lock, 'park_native_wait', park)
             foreign = asyncio.create_task(foreign_close(), context=Context())
             try:
                 await entered.wait()
@@ -604,7 +615,7 @@ async def test_every_close_observer_parks_its_original_native_privacy_writer(tmp
                 assert receipt.read_text() == 'original source physically closed'
                 assert lock._writer is writer
             finally:
-                monkeypatch.setattr(OwnedOperation, 'observe', original_observe)
+                monkeypatch.setattr(lock, 'park_native_wait', original_park)
                 # Even a failed observation explicitly joins the SAME admitted
                 # source while lending its original writer, so RED cannot hang.
                 async with owned_native_wait(tuple(task for _, task in source_owners)):
@@ -758,3 +769,242 @@ async def test_native_validation_retains_consumer_scopes_added_during_original_l
         for task in children:
             await await_owned_task(task)
         await await_owned_operation(stream.aclose(), retain_originals=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_reserved_owner_keeps_a_valid_writer_for_remaining_source_cleanup(tmp_path):
+    from kestrel_sovereign._async_ownership import await_owned_operation
+    from kestrel_sovereign.execution_custody import reserve_execution_stream
+
+    lock, owners = ReentrantTransitionLock(), []
+    opening = OSError('original producer gate refused before native source entry')
+    path = tmp_path / 'native-close-under-original-writer'
+    handle = path.open('w')
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise AssertionError('Refused native source dispatched payload')
+        async def aclose(self):
+            # Observe the actual wait eligibility before a real lock acquire;
+            # the RED exits at this boundary instead of hanging its owner.
+            assert lock._writer_eligible(asyncio.current_task()), (
+                'Remaining physical source cleanup had no eligible original privacy writer')
+            async with lock:
+                handle.write('original native close')
+                handle.close()
+    class PublicationTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'close_unstarted':
+                raise opening
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = False
+    def task_factory(loop, coroutine, **options):
+        nonlocal refused
+        operation = coroutine.cr_frame.f_locals.get('operation') if coroutine.cr_frame else None
+        native_body = (operation.cr_frame.f_locals.get('operation')
+            if getattr(operation, 'cr_frame', None) is not None else None)
+        if (not refused and 'ReentrantTransitionLock.start_owned_native_work' in getattr(operation, '__qualname__', '')
+                and getattr(native_body, '__name__', '') == 'run_owned'):
+            refused = True
+            return PublicationTask(coroutine, loop=loop, **options)
+        return asyncio.Task(coroutine, loop=loop, **options)
+    try:
+        async with lock.policy_span():
+            async with lock:
+                native = lock.capture_native_work_factory()
+                loop.set_task_factory(task_factory)
+                try:
+                    stream = await reserve_execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
+                        lambda body, context: native(body, context=context),
+                        lambda iterator, task: owners.append((iterator, task)), lambda: None))
+                finally:
+                    loop.set_task_factory(previous)
+                assert refused, 'Original native producer gate was not refused'
+                settled = await await_owned_task(owners[0][1])
+                assert opening in tuple(_explicit_control_chain(settled.error))
+                terminal = None
+                try:
+                    await stream.aclose()
+                except BaseException as error:
+                    terminal = error
+                assert opening in tuple(_explicit_control_chain(terminal))
+                assert handle.closed, 'Remaining physical source cleanup could not reacquire its original writer'
+                assert path.read_text() == 'original native close'
+    finally:
+        loop.set_task_factory(previous)
+        if not handle.closed:
+            handle.close()
+    assert all(task.done() and iterator.owner_task.done() for iterator, task in owners)
+
+
+@pytest.mark.asyncio
+async def test_private_close_interrupt_of_unentered_native_source_is_not_caller_withdrawal(tmp_path):
+    from kestrel_sovereign._async_ownership import await_owned_operation
+    from kestrel_sovereign.execution_custody import reserve_execution_stream
+
+    lock, owners = ReentrantTransitionLock(), []
+    path = tmp_path / 'private-native-interrupt'
+    handle = path.open('w')
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise AssertionError('Unpulled native source dispatched payload')
+        async def aclose(self):
+            handle.write('original close completed')
+            handle.close()
+    try:
+        async with lock.policy_span():
+            async with lock:
+                native = lock.capture_native_work_factory()
+                stream = await reserve_execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
+                    lambda body, context: native(body, context=context),
+                    lambda iterator, task: owners.append((iterator, task)), lambda: None))
+                await asyncio.sleep(0)
+                assert not stream._producer_started and not owners[0][1].done()
+                first = await await_owned_operation(stream.aclose(), retain_originals=True)
+                second = await await_owned_operation(stream.aclose(), retain_originals=True)
+                assert first.error is first.cancellation is second.error is second.cancellation is None, (
+                    'Private source close interruption was replayed as caller withdrawal')
+                assert path.read_text() == 'original close completed'
+    finally:
+        if not handle.closed:
+            handle.close()
+    assert all(task.done() and iterator.owner_task.done() for iterator, task in owners)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel_observer', [False, True], ids=['live-observer', 'withdrawn-observer'])
+async def test_close_observer_retains_native_outcome_through_original_writer_restoration(tmp_path, monkeypatch, cancel_observer):
+    from contextvars import Context
+    from kestrel_sovereign._async_ownership import await_owned_operation
+    from kestrel_sovereign.execution_custody import reserve_execution_stream
+
+    lock = ReentrantTransitionLock()
+    writer = asyncio.current_task()
+    entered, release, restoring = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = ExecutionCommitOutcomeError('unknown')
+    owners, children, withdrawals = [], [], []
+    witness = tmp_path / 'native-closed-before-writer-restoration'
+    original_wait = lock._wait_change
+    async def wait_change():
+        if lock._parked and lock._parked[-1].task is writer and lock._parked[-1].restoring:
+            restoring.set()
+        try:
+            return await original_wait()
+        except asyncio.CancelledError as withdrawal:
+            if asyncio.current_task() is writer:
+                withdrawals.append(withdrawal)
+            raise
+    monkeypatch.setattr(lock, '_wait_change', wait_change)
+    async def descendant():
+        entered.set()
+        await release.wait()
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            return b'original'
+        async def aclose(self):
+            child = lock.capture_native_work_factory()(descendant)
+            children.append(child)
+            await entered.wait()
+            witness.write_text('native physical close completed')
+            raise original
+    async def restore_observer():
+        await restoring.wait()
+        if cancel_observer:
+            writer.cancel('original close observer withdrew during writer restoration')
+        release.set()
+    observer = None
+    try:
+        async with lock.policy_span():
+            async with lock:
+                native = lock.capture_native_work_factory(acquire_span=False)
+                stream = await reserve_execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
+                    lambda body, context: native(body, context=context),
+                    lambda iterator, task: owners.append((iterator, task)), lambda: None))
+                assert await anext(stream) == b'original'
+                observer = asyncio.create_task(restore_observer(), context=Context())
+                terminal = None
+                try:
+                    await stream.aclose()
+                except BaseException as error:
+                    terminal = error
+                assert original in tuple(_explicit_control_chain(terminal)), (
+                    'Writer restoration discarded the collected original native close outcome')
+                assert witness.read_text() == 'native physical close completed'
+                if cancel_observer:
+                    assert withdrawals and all(error in tuple(_explicit_control_chain(terminal)) for error in withdrawals)
+                else:
+                    assert not withdrawals
+    finally:
+        release.set()
+        if observer is not None:
+            observer.cancel()
+            await asyncio.gather(observer, return_exceptions=True)
+        for child in children:
+            await await_owned_task(child)
+    assert all(task.done() and iterator.owner_task.done() for iterator, task in owners)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('publication', ['allocate', 'accepted-start'])
+async def test_native_retirement_owner_admission_refusal_retains_original_unclosed_resource(tmp_path, publication):
+    from kestrel_sovereign.execution_custody import reserve_execution_stream, execution_cleanup_debts
+    from kestrel_sovereign._async_ownership import await_owned_operation
+
+    lock, owners, bodies, accepted = ReentrantTransitionLock(), [], [], []
+    refusal = OSError('original native stream retirement admission refused')
+    handle = (tmp_path / 'original-unclosed-native-resource').open('w')
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            bodies.append('payload')
+            return b'payload'
+        async def aclose(self):
+            handle.close()
+    source = Source()
+    class RefusedTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'close_unstarted':
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        operation = coroutine.cr_frame.f_locals.get('operation') if coroutine.cr_frame else None
+        native_body = (operation.cr_frame.f_locals.get('operation')
+            if getattr(operation, 'cr_frame', None) is not None else None)
+        if getattr(native_body, '__name__', '') == '_close_when_requested':
+            if publication == 'allocate':
+                raise refusal
+            task = RefusedTask(coroutine, loop=loop, **options)
+            accepted.append(task)
+            return task
+        return asyncio.Task(coroutine, loop=loop, **options)
+    try:
+        async with lock.policy_span():
+            native = lock.capture_native_work_factory()
+            def cleanup(body, context, admission, resource):
+                return native(body, context=context, admission=admission,
+                    retirement_resource=resource, acquire_span=False)
+            lifecycle = ExecutionStreamLifecycle(lambda body, context: native(body, context=context),
+                lambda iterator, task: owners.append(task), lambda: None, cleanup_factory=cleanup)
+            loop.set_task_factory(factory)
+            try:
+                outcome = await await_owned_operation(reserve_execution_stream(None, source, lifecycle=lifecycle), retain_originals=True)
+            finally:
+                loop.set_task_factory(previous)
+            assert refusal in tuple(_explicit_control_chain(outcome.error))
+            debts = execution_cleanup_debts(outcome.error)
+            assert any(getattr(resource, '_source', None) is source for resource, task in debts), (
+                'Failed retirement admission discarded its original acquired source')
+            assert not handle.closed and not owners and not bodies
+            assert len(accepted) == (publication == 'accepted-start')
+            assert all(task.done() for task in accepted)
+    finally:
+        loop.set_task_factory(previous)
+        handle.close()

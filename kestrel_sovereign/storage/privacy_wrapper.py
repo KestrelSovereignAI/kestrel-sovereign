@@ -741,15 +741,18 @@ class ReentrantTransitionLock:
         parent = asyncio.current_task()
         captured = self.current_native_scope()
 
-        def start(operation, context=None, *, name="privacy-owned-native-work", on_completion=None):
+        def start(operation, context=None, *, name="privacy-owned-native-work", on_completion=None,
+                  acquire_span=acquire_span, admission=None, retirement_resource=None):
             return self.start_owned_native_work(operation, context=context, name=name,
                 on_completion=on_completion, acquire_span=acquire_span,
+                admission=admission, retirement_resource=retirement_resource,
                 _parent=parent if captured is not None else None, _span=captured)
         return start
 
     def start_owned_native_work(self, operation, *, context=None,
                                 name="privacy-owned-native-work", acquire_span=True,
-                                on_completion=None, _parent=None, _span=None):
+                                on_completion=None, admission=None, retirement_resource=None,
+                                _parent=None, _span=None):
         parent = asyncio.current_task() if _parent is None else _parent
         captured = self.current_native_scope() if _span is None else _span
         if captured is not None and (
@@ -774,11 +777,13 @@ class ReentrantTransitionLock:
                         return await operation()
                 return await operation()
 
-        admission = OwnedTaskAdmission()
+        if admission is None:
+            admission = OwnedTaskAdmission()
         opening = None
         try:
             task = create_owned_task(run(), name=name, context=context,
-                admission=admission, retain_originals=True, on_completion=on_completion)
+                admission=admission, retain_originals=True, on_completion=on_completion,
+                retirement_resource=retirement_resource)
         except BaseException as error:
             if admission.task is None:
                 raise

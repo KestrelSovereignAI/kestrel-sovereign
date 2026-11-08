@@ -246,6 +246,7 @@ def _retain_owned_admission_error(task, error):
     cached = getattr(task, "_kestrel_owned_terminal_error", None)
     terminal = retained_execution_error(execution_observation_error(cached, error))
     task._kestrel_owned_terminal_error = terminal
+    task._kestrel_owned_admission_error = terminal
     return terminal
 
 
@@ -781,18 +782,35 @@ class OwnedOperation:
     """
 
     def __init__(self, operation, *, retirement_resource=None,
-                 retain_originals=False, name=None, context=None):
+                 retain_originals=False, name=None, context=None, owner_factory=None):
         admission = OwnedTaskAdmission()
         self._opening = None
         try:
-            self._task = create_owned_task(
-                operation, retirement_resource=retirement_resource,
-                retain_originals=retain_originals, name=name, context=context,
-                admission=admission,
-            )
+            if owner_factory is None:
+                self._task = create_owned_task(
+                    operation, retirement_resource=retirement_resource,
+                    retain_originals=retain_originals, name=name, context=context,
+                    admission=admission,
+                )
+            else:
+                self._task = owner_factory(operation, context, admission, retirement_resource)
+                if self._task is not admission.task:
+                    raise TypeError("original operation factory did not retain its native admission")
+                opening = getattr(self._task, '_kestrel_owned_admission_error', None)
+                if opening is not None:
+                    self._opening = owned_task_admission_error(retirement_resource, admission, opening)
         except BaseException as failure:
             self._opening = owned_task_admission_error(retirement_resource, admission, failure)
             self._task = admission.task
+
+    @property
+    def task(self):
+        """The exact admitted owner, or None after a true allocation refusal."""
+        return self._task
+
+    @property
+    def admission_error(self):
+        return self._opening
 
     async def observe(self, **observation):
         from kestrel_sovereign.execution_custody import execution_terminal_error
@@ -901,6 +919,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._waiting_for_continue = False
         self._interrupt_after_continue = False
         self._closed = False
+        self._owner_cancelled_by_close = False
         self._interrupted_by_cleanup = False
         self._cleanup_error: BaseException | None = None
         # asyncio discards a cancelled task's original exception after its
@@ -1091,7 +1110,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 self._owner.cancel()
             raise
 
-    async def join_source_owners(self):
+    async def join_source_owners(self, *, closing=False):
         """Retain the source AND its original cancellation observer outcomes."""
         from kestrel_sovereign.execution_custody import execution_terminal_error, execution_observation_error, is_execution_control_error
         def compose(*errors):
@@ -1103,11 +1122,16 @@ class OwnedAsyncIterator(Generic[_T]):
         watcher_error = watcher.error if watcher is not None else None
         if issubclass(type(watcher_error), asyncio.CancelledError) and not is_execution_control_error(watcher_error):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
-        return OwnedTaskOutcome(
+        result = OwnedTaskOutcome(
             outcome.result,
             compose(self._terminal_error, outcome.error, watcher_error),
             compose(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
+        if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
+                and issubclass(type(result.error), asyncio.CancelledError)
+                and self._cleanup_error is None and not is_execution_control_error(result.error)):
+            return OwnedTaskOutcome(None, None, result.cancellation)
+        return result
 
     def _interrupt_if_watch_never_started(
         self,
@@ -1223,22 +1247,9 @@ class OwnedAsyncIterator(Generic[_T]):
         self._consumer_close.closed = True
         self._stop.set()
         self._continue.set()
-        owner_cancelled_by_close = False
         if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
-            owner_cancelled_by_close = self._owner.cancel()
-        outcome = await self.join_source_owners()
-        from kestrel_sovereign.execution_custody import is_execution_control_error
-        if (
-            (owner_cancelled_by_close or self._construction_error is not None)
-            and issubclass(type(outcome.error), asyncio.CancelledError)
-            and self._cleanup_error is None
-            and not is_execution_control_error(outcome.error)
-        ):
-            # Cancellation is the private interrupt used to wake a producer
-            # blocked in ``anext``. Once the owner's finally block has closed
-            # the iterator, it is a successful close, while cancellation of
-            # the caller itself still takes precedence below.
-            outcome = OwnedTaskOutcome(None, None, outcome.cancellation)
+            self._owner_cancelled_by_close = self._owner.cancel()
+        outcome = await self.join_source_owners(closing=True)
         if self._construction_error is not None and outcome.error is None:
             # Reconcile ONLY the original constructor task reservation, after
             # its actual frame/lock cleanup AND watcher have physically joined.

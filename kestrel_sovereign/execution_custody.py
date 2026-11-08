@@ -906,6 +906,20 @@ def require_execution_work(owner: Any = None) -> None:
         raise terminal
 
 
+def capture_execution_work_check(owner: Any = None) -> Callable[[], None]:
+    """Retain only a work check through the original native worker handoff.
+
+    Its copied context retains the SAME mutable stream restriction records.
+    Calling it performs no SQL and cannot admit work or replace an owner.
+    A fresh context copy permits concurrent read-only checks of that evidence.
+    """
+    from contextvars import copy_context
+    captured = copy_context()
+    def check():
+        captured.copy().run(require_execution_work, owner)
+    return check
+
+
 def refuse_unfenced_executor(owner: Any = None) -> None:
     """SQLAlchemy cannot validate authority on its actual mutation session."""
     if _execution_cleanup_requested() or current_execution_custody(owner):
@@ -1781,12 +1795,17 @@ class ExecutionStreamLifecycle:
     The factory receives the lazy body and its original context. Registration
     finishes before any body step, including under an eager task factory.
     Nested forwarders inherit this same lifetime only inside source work.
+    ``owner_started`` registers the physical producer. ``resource_started``
+    additionally receives its forwarder and retained retirement task when a
+    feature must retain the entire resource through cleanup settlement.
     """
 
     owner_factory: Callable
-    owner_started: Callable
+    owner_started: Callable[[Any, asyncio.Task], None] | None
     require_work: Callable
     descendant_lifecycle: Callable[[], "ExecutionStreamLifecycle"] | None = None
+    cleanup_factory: Callable | None = None
+    resource_started: Callable[[Any, asyncio.Task, Any], None] | None = None
 
 
 _STREAM_LIFECYCLE: ContextVar[tuple[asyncio.Task, ExecutionStreamLifecycle] | None] = ContextVar("execution_stream_lifecycle", default=None)
@@ -1826,6 +1845,7 @@ class _ExecutionForwarder:
         self._producer_started = False
         self._source_closed = False
         self._close_operation = None
+        self._close_requested = asyncio.Event()
         inherited = _STREAM_LIFECYCLE.get()
         self._lifecycle = lifecycle if lifecycle is not None else (
             inherited[1] if inherited is not None and inherited[0] is asyncio.current_task() else None
@@ -1845,13 +1865,55 @@ class _ExecutionForwarder:
             from kestrel_sovereign.llm.call_progress import inherit_call_progress
 
             inherit_call_progress(self._owner_context)
+            self._reserve_close_owner()
+            if self._close_operation.admission_error is not None:
+                raise self._close_operation.admission_error
+            def started(iterator, task):
+                self._iterator = iterator
+                task.add_done_callback(lambda _: self._close_requested.set())
+                if self._lifecycle is not None and self._lifecycle.owner_started is not None:
+                    self._lifecycle.owner_started(iterator, task)
+                if self._lifecycle is not None and self._lifecycle.resource_started is not None:
+                    self._lifecycle.resource_started(iterator, task, self)
             with self._turn_scope.bind():
                 self._iterator = await create_owned_iterator(
                     self._produce, operation="execution-stream-forward",
                     owner_context=self._owner_context,
                     owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
-                    owner_started=None if self._lifecycle is None else self._lifecycle.owner_started,
+                    owner_started=started,
                 )
+
+    def _reserve_close_owner(self):
+        if self._close_operation is None:
+            from kestrel_sovereign._async_ownership import OwnedOperation
+            factory = None if self._lifecycle is None else self._lifecycle.cleanup_factory
+            self._close_operation = OwnedOperation(
+                self._close_when_requested() if factory is None else self._close_when_requested,
+                retirement_resource=self, retain_originals=True,
+                context=self._owner_context.copy(), owner_factory=factory)
+
+    async def _close_when_requested(self):
+        await self._close_requested.wait()
+        with bind_execution_cleanup(self._runtime_owner, self._scopes):
+            await self._close()
+
+    @property
+    def retirement_task(self):
+        return None if self._close_operation is None else self._close_operation.task
+
+    @property
+    def terminal_error(self):
+        from kestrel_sovereign._async_ownership import owned_task_error
+        task = self.retirement_task
+        return execution_terminal_error(
+            None if self._iterator is None else self._iterator.terminal_error,
+            owned_task_error(task) if task is not None and task.done() else None,
+            retain_originals=True, isolate_control_originals=True)
+
+    @property
+    def cleanup_error(self):
+        original = None if self._iterator is None else self._iterator.cleanup_error
+        return original or (None if self._source_closed else self.terminal_error)
 
     async def _retire_failed_step(self, error):
         try:
@@ -1957,16 +2019,10 @@ class _ExecutionForwarder:
         # synchronously before the source owner is cancelled.
         if not self._source_exhausted:
             self._cleanup_state.requested = True
-        from kestrel_sovereign._async_ownership import OwnedOperation, owned_native_wait
-
         with bind_execution_cleanup(self._runtime_owner, self._scopes):
-            if self._close_operation is None:
-                self._close_operation = OwnedOperation(self._close(),
-                    retirement_resource=self, retain_originals=True)
-            # Each observer lends its own writer to the SAME admitted source.
-            # A closer first created in a foreign context has no such admission.
-            async with owned_native_wait(() if self._iterator is None else (self._iterator.producer_task,)):
-                outcome = await self._close_operation.observe()
+            self._reserve_close_owner()
+            self._close_requested.set()
+            outcome = await self._close_operation.observe()
             error = execution_terminal_error(outcome.error, outcome.cancellation,
                 retain_originals=True, isolate_control_originals=True)
             if error is not None:
@@ -1987,7 +2043,7 @@ class _ExecutionForwarder:
             # source failure. Observe that original producer AND watcher even
             # when the physical aclose path has already become a no-op.
             try:
-                outcome = await self._iterator.join_source_owners()
+                outcome = await self._iterator.join_source_owners(closing=True)
             except BaseException as observation_error:
                 error = execution_terminal_error(error, observation_error,
                     retain_originals=True, isolate_control_originals=True)

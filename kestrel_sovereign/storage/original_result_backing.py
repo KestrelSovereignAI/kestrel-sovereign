@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     current_execution_custody,
+    capture_execution_work_check,
     require_execution_work,
 )
 
@@ -50,6 +51,7 @@ class _OriginalResultBacking:
     key: object
     scope: object
     work_scopes: tuple
+    work_check: object
     owner_task: object
     backing: object
     generation: object
@@ -113,6 +115,7 @@ class _OriginalResultCustody:
             key,
             getattr(backend, "_execution_custody", None),
             current_execution_custody(backend),
+            capture_execution_work_check(backend),
             asyncio.current_task(),
             backing,
             backend.connection_generation if type(backend) is SQLiteBackend else None,

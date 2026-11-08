@@ -88,9 +88,28 @@ and context.
 Children already queued before a later consumer retain the shared stream scope
 membership too. Work checks and explicit backend snapshots read that membership
 at dispatch; authority validation also locks scopes added during an original
-validator's wait. Every close observer lends its own privacy writer to the
-original admitted producer, independently of who created the retained close
-operation. A terminal pull before close cannot discard an unentered producer's
+validator's wait. Current visual-row admissions capture a read-only work check
+over those same live scope references; a queued native COMMIT checks them again
+inside its actual SQLite worker, where event-loop ContextVars are unavailable.
+This check grants no authority and does not change original-result privileges.
+
+The forwarder reserves its single retirement owner before producer admission.
+A lifecycle cleanup factory admits that owner into the original native lifetime
+without holding a privacy writer while it waits for a close request. Each close
+observer lends its writer to that same admitted retirement owner; its actual
+source join can delegate the loan to the original producer. A failed producer
+does not have to remain writer-eligible for an acquired source to be closed.
+Producer completion opens the retirement gate even without another consumer
+pull. Failed cleanup admission retains the acquired resource and exact accepted
+task, when any, and refuses payload dispatch. The producer registration callback
+keeps its two-argument physical-owner contract. Optional resource registration
+also receives the forwarder, allowing a feature to keep that original producer
+in its inventory until the retained retirement task settles.
+
+Close suppresses only its own private interruption of an unentered producer;
+native admission/COMMIT failures and real observer withdrawals remain visible.
+Writer restoration preserves a collected physical-close result alongside a
+later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
 original admission failure; the closer observes the canonical source-owner
 outcome without starting or closing another source.
 
