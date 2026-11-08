@@ -900,3 +900,24 @@ def test_native_cancellation_helpers_reject_invalid_input():
         cancel_owned_task(object())
     with pytest.raises(TypeError, match="requires CancelledError"):
         owned_task_cancellation_error(object(), RuntimeError("not cancellation"))
+
+
+@pytest.mark.asyncio
+async def test_native_cancellation_recovery_never_uses_exception_truthiness():
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import owned_task_cancellation_error
+    class FalsyCancellation(asyncio.CancelledError):
+        def __bool__(self):
+            return False
+    original = FalsyCancellation("original native cancellation with false truth value")
+    original.__cause__ = ResourceOutcomeUnknown("original acknowledgement remains uncertain")
+    async def source():
+        raise original
+    owner = create_owned_task(source(), retain_originals=True)
+    try:
+        await owner
+    except asyncio.CancelledError as received:
+        assert owned_task_cancellation_error(owner, received) is original, (
+            "Native cancellation recovery replaced an original because its truth value was false")
+    else:
+        pytest.fail("Original native cancellation disappeared")

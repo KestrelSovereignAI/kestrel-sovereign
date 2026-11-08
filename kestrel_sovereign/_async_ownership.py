@@ -263,7 +263,8 @@ def owned_task_cancellation_error(task, cancellation):
     """Recover a native await's original receipt before finite Stop handling."""
     if not isinstance(cancellation, asyncio.CancelledError):
         raise TypeError("native cancellation recovery requires CancelledError")
-    return (owned_task_error(task) if task.done() else None) or cancellation
+    original = owned_task_error(task) if task.done() else None
+    return cancellation if original is None else original
 
 
 def _has_owned_task_metadata(task) -> bool:
