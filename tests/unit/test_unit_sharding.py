@@ -11,7 +11,7 @@ from tests.utils.ci_budget import CI_WORKFLOW
 from tests.utils.unit_sharding import shard_for_node, verify_manifests
 
 
-def _run_actual_shards(tmp_path: Path, *, selectors=(), distributed=False):
+def _run_actual_shards(tmp_path: Path, *, selectors=(), distributed=False, reorder=False):
     reports = tmp_path / 'reports'
     witness = tmp_path / 'executed'
     results = []
@@ -19,7 +19,8 @@ def _run_actual_shards(tmp_path: Path, *, selectors=(), distributed=False):
         root = tmp_path / f'run-{index}'
         root.mkdir()
         workers = ['-p', 'xdist.plugin', '-n', '2'] if distributed else []
-        result = run_child_pytest(root, conftest='', test_file='test_owned_shards.py',
+        conftest = 'def pytest_collection_modifyitems(items):\n    items.reverse()\n' if reorder else ''
+        result = run_child_pytest(root, conftest=conftest, test_file='test_owned_shards.py',
             source=f'''import pytest
 from pathlib import Path
 
@@ -55,7 +56,8 @@ def test_actual_pytest_shards_execute_every_collected_test_once(tmp_path, distri
 
 @pytest.mark.parametrize('corrupt', ['missing-shard', 'omitted-test', 'wrong-shard',
     'changed-suite', 'duplicate-node', 'duplicate-worker', 'wrong-count',
-    'invalid-schema', 'boolean-version', 'invalid-worker', 'invalid-nodes', 'empty-suite'])
+    'invalid-schema', 'boolean-version', 'invalid-worker', 'invalid-nodes', 'empty-suite',
+    'different-worker-order'])
 def test_manifest_verification_refuses_incomplete_or_ambiguous_coverage(actual_shard_reports, corrupt):
     reports, _ = actual_shard_reports
     paths = sorted(reports.glob('*.json'))
@@ -73,6 +75,9 @@ def test_manifest_verification_refuses_incomplete_or_ambiguous_coverage(actual_s
         data['selected_nodeids'].append(data['selected_nodeids'][0])
     elif corrupt == 'duplicate-worker':
         (reports / 'duplicate.json').write_text(first.read_text())
+    elif corrupt == 'different-worker-order':
+        other = dict(data, worker='another-worker', selected_nodeids=list(reversed(data['selected_nodeids'])))
+        (reports / 'other-worker.json').write_text(json.dumps(other))
     elif corrupt == 'invalid-schema':
         data['unexpected'] = True
     elif corrupt == 'boolean-version':
@@ -142,3 +147,13 @@ def test_later_pytest_selection_cannot_certify_unexecuted_tests(tmp_path, select
         verify_manifests(reports, 2)
     assert sorted(witness.read_text().splitlines()) == sorted(
         ['beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta'])
+
+
+@pytest.mark.parametrize('distributed', [False, True], ids=['one-process', 'native-xdist-workers'])
+def test_later_hooks_may_reorder_the_complete_shard(tmp_path, distributed):
+    reports, witness, results = _run_actual_shards(tmp_path, distributed=distributed, reorder=True)
+    for child in results:
+        assert child.returncode == 0, child.stdout
+    assert verify_manifests(reports, 2)['assigned_tests'] == 8
+    assert sorted(witness.read_text().splitlines()) == sorted(
+        ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta'])

@@ -15,6 +15,10 @@ def shard_for_node(nodeid: str, count: int) -> int:
     return int.from_bytes(digest, 'big') % count + 1
 
 
+def _same_node_membership(first, second):
+    return len(first) == len(second) and set(first) == set(second)
+
+
 def _valid_worker(worker) -> bool:
     return isinstance(worker, str) and bool(worker) and all(c.isalnum() or c in '_-' for c in worker)
 
@@ -50,7 +54,7 @@ def pytest_collection_modifyitems(config, items):
     config.hook.pytest_deselected(items=deselected)
     items[:] = selected
     yield
-    if [item.nodeid for item in items] != [item.nodeid for item in selected]:
+    if not _same_node_membership([item.nodeid for item in items], [item.nodeid for item in selected]):
         raise pytest.UsageError('Unit shard final collection changed after assignment')
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
@@ -94,8 +98,10 @@ def verify_manifests(directory: Path, count: int) -> dict:
             raise ValueError('Duplicate unit shard worker manifest')
         workers.add(worker_key)
         expected = [node for node in original if shard_for_node(node, count) == index]
-        if selected != expected:
+        if not _same_node_membership(selected, expected):
             raise ValueError('Unit shard selection omitted or misassigned collected tests')
+        if index in groups and groups[index] != selected:
+            raise ValueError("Unit shard workers collected different final execution orders")
         groups[index] = selected
     if set(groups) != set(range(1, count + 1)):
         raise ValueError('Missing unit shard collection manifests')
