@@ -374,12 +374,13 @@ async def test_private_close_cannot_acknowledge_an_independent_original_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', [None, 'sdk', 'audit'])
-async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tmp_path, kind):
+@pytest.mark.parametrize('kind', [None, 'sdk', 'audit', 'plain'])
+@pytest.mark.parametrize('before_first_step', [False, True])
+async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tmp_path, kind, before_first_step):
     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
     handle = (tmp_path / 'original-watcher-owned-source').open('w')
     independent = asyncio.CancelledError('independent original watcher completion')
-    if kind is not None:
+    if kind in {'sdk', 'audit'}:
         independent.__cause__ = (ResourceOutcomeUnknown('watcher retains original effect uncertainty')
             if kind == 'sdk' else ToolAuditUnconfirmedError('watcher retains original audit uncertainty'))
     attempts, watchers = [], []
@@ -396,6 +397,9 @@ async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tm
         operation = coroutine.cr_frame.f_locals.get('operation')
         if getattr(operation, 'cr_code', None) is OwnedAsyncIterator._watch_owner_cancellation.__code__:
             async def observe():
+                if before_first_step and kind is not None:
+                    coroutine.close()
+                    raise independent
                 await coroutine
                 if kind is not None:
                     raise independent
@@ -403,10 +407,17 @@ async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tm
             watchers.append(task)
             return task
         return asyncio.Task(coroutine, loop=loop, **options)
-    stream = execution_stream(None, Source())
+    stream = None
     try:
         loop.set_task_factory(factory)
-        terminal = await await_owned_operation(anext(stream), retain_originals=True)
+        if before_first_step and kind is not None:
+            stream = await reserve_execution_stream(None, Source())
+            terminal = await await_owned_task(stream._iterator.owner_task)
+            assert not stream._iterator.producer_task.cancelling() and not handle.closed, (
+                'Independent unstarted watcher failure interrupted the original source')
+        else:
+            stream = execution_stream(None, Source())
+            terminal = await await_owned_operation(anext(stream), retain_originals=True)
         loop.set_task_factory(previous)
         if kind is None:
             assert isinstance(terminal.error, StopAsyncIteration)
@@ -422,17 +433,21 @@ async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tm
         assert handle.closed and len(attempts) == len(watchers) == 1 and watchers[0].done()
     finally:
         loop.set_task_factory(previous)
-        await await_owned_operation(stream.aclose(), retain_originals=True)
+        if stream is not None:
+            await await_owned_operation(stream.aclose(), retain_originals=True)
         handle.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', ['sdk', 'audit'])
-async def test_original_watcher_uncertainty_does_not_issue_a_private_source_interrupt(tmp_path, kind):
+@pytest.mark.parametrize('kind,cancel_watcher', [
+    ('sdk', False), ('audit', False), ('plain', False), ('sdk', True), ('audit', True),
+])
+async def test_original_watcher_uncertainty_does_not_issue_a_private_source_interrupt(tmp_path, kind, cancel_watcher):
     refused = asyncio.Event()
     independent = asyncio.CancelledError('original watcher observation publication failed')
-    independent.__cause__ = (ResourceOutcomeUnknown('original observer effect uncertain')
-        if kind == 'sdk' else ToolAuditUnconfirmedError('original observer audit uncertain'))
+    if kind in {'sdk', 'audit'}:
+        independent.__cause__ = (ResourceOutcomeUnknown('original observer effect uncertain')
+            if kind == 'sdk' else ToolAuditUnconfirmedError('original observer audit uncertain'))
     handle = (tmp_path / 'original-unconsumed-observer-source').open('w')
     attempts = []
     class Source:
@@ -450,6 +465,8 @@ async def test_original_watcher_uncertainty_does_not_issue_a_private_source_inte
                     and caller.get_name().startswith('owned_async_iterator_cancel:')
                     and 'await_owned_task.<locals>.mark_complete' in getattr(callback, '__qualname__', '')):
                 refused.set()
+                if cancel_watcher:
+                    caller.cancel('original watcher Stop raced observation publication')
                 raise independent
             return super().add_done_callback(callback, context=context)
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()

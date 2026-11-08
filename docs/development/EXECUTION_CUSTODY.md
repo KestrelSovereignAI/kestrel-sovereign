@@ -135,6 +135,12 @@ the same terminal classifier. Once the source has handled its private close
 interruption, a later completion-publication failure is independent evidence,
 including a plain cancellation. A prior cancellation request cannot acknowledge
 that later failure away. Terminal inspection reads the original task receipt.
+Watcher Stop suppression additionally requires the exact original cancellation
+recorded from an actual watcher cancellation request. Independent watcher
+publication and completion failures stay visible even when they are plain
+cancellation. Before its first step, a failed watcher cannot cancel the source
+unless the watcher itself received a real cancellation request; uncertain
+completion evidence remains a failure rather than that private handoff.
 Writer restoration preserves a collected physical-close result alongside a
 later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
 original admission failure; the closer observes the canonical source-owner

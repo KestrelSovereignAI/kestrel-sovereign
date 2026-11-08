@@ -958,6 +958,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._terminal_published = False
         self._terminal_consumed = False
         self._cancellation_watch_started = False
+        self._watcher_private_cancellation: asyncio.CancelledError | None = None
         self._construction_error = None
         self._cancellation_owner = None
         self._consumer_close = _ConsumerCloseRecord()
@@ -1109,8 +1110,9 @@ class OwnedAsyncIterator(Generic[_T]):
                 raise outcome.error
         except asyncio.CancelledError as error:
             from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
-            if is_tool_execution_terminal_error(error):
+            if is_tool_execution_terminal_error(error) or not asyncio.current_task().cancelling():
                 raise
+            self._watcher_private_cancellation = error
             if self._owner.done():
                 return
             if self._item_outstanding:
@@ -1148,7 +1150,9 @@ class OwnedAsyncIterator(Generic[_T]):
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
-        if issubclass(type(watcher_error), asyncio.CancelledError) and not is_tool_execution_terminal_error(watcher_error):
+        if (issubclass(type(watcher_error), asyncio.CancelledError)
+                and watcher_error is self._watcher_private_cancellation
+                and not is_tool_execution_terminal_error(watcher_error)):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
         terminal, owner_error = self._terminal_error, outcome.error
         body_only = (terminal is not None
@@ -1197,9 +1201,14 @@ class OwnedAsyncIterator(Generic[_T]):
         if (
             watcher.cancelled()
             and not self._cancellation_watch_started
-            and not self._owner.done()
         ):
-            self._cancel_owner_if_running()
+            from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+            error = owned_task_error(watcher)
+            if watcher.cancelling() and not is_tool_execution_terminal_error(error):
+                if isinstance(error, asyncio.CancelledError):
+                    self._watcher_private_cancellation = error
+                if not self._owner.done():
+                    self._cancel_owner_if_running()
 
     def _cancel_owner_if_running(self) -> None:
         if not self._owner.done() and not self._owner.cancelling():

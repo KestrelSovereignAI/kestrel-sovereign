@@ -58,6 +58,9 @@ snapshot also reconciles the physical task exception, so an earlier diagnostic
 body-error cache cannot hide a later completion-publication failure.
 Iterator terminal inspection uses that same canonical task reader, including
 completion failures raised after the source has already physically closed.
+Cancellation observers retain the exact private Stop they actually received.
+A callback publication or completion failure does not become private Stop by
+sharing its exception class, including before the observer's first task step.
 
 A custom task factory can make allocation ambiguous. If construction raises
 and the original native task registry cannot identify exactly one accepted
