@@ -2,6 +2,7 @@
 import asyncio
 
 import pytest
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign._async_ownership import (
     OwnedCallbackScope, await_owned_operation, await_owned_task, create_owned_task, owned_task_error,
@@ -15,12 +16,25 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failed_epilogue', [False, True])
-@pytest.mark.parametrize('body_kind', ['ordinary', 'refusal', 'committed', 'unknown'])
+@pytest.mark.parametrize('body_kind', ['ordinary', 'refusal', 'committed', 'unknown', 'cancel', 'wrapped-cancel', 'group-cancel', 'sdk-unknown', 'refusal-unknown'])
 async def test_delivered_body_failure_does_not_hide_an_original_native_epilogue(tmp_path, failed_epilogue, body_kind):
     body_error = (ExecutionCommitOutcomeError(body_kind) if body_kind in {'committed', 'unknown'}
                   else ExecutionAuthorityError('original source refused') if body_kind == 'refusal'
                   else OSError('original source body'))
+    if 'cancel' in body_kind:
+        cancellation = asyncio.CancelledError('original source withdrawal')
+        if body_kind == 'cancel':
+            body_error = cancellation
+        elif body_kind == 'wrapped-cancel':
+            body_error.__cause__ = cancellation
+        else:
+            body_error = BaseExceptionGroup('original source failure', [body_error, cancellation])
     epilogue_error = OSError('original native epilogue')
+    if body_kind in {'sdk-unknown', 'refusal-unknown'}:
+        unknown = ResourceOutcomeUnknown('original external effect uncertain')
+        body_error = unknown if body_kind == 'sdk-unknown' else ExecutionAuthorityError('original refusal carries uncertainty')
+        if body_kind == 'refusal-unknown':
+            body_error.__cause__ = unknown
     handle = (tmp_path / 'native-epilogue').open('w')
     attempts = []
     class Source:
@@ -48,7 +62,7 @@ async def test_delivered_body_failure_does_not_hide_an_original_native_epilogue(
         outcome = await await_owned_operation(stream.aclose(), retain_originals=True)
         if failed_epilogue:
             assert epilogue_error in tuple(_explicit_control_chain(outcome.error))
-        elif body_kind in {'committed', 'unknown'}:
+        elif body_kind in {'committed', 'unknown', 'cancel', 'wrapped-cancel', 'group-cancel', 'sdk-unknown', 'refusal-unknown'}:
             assert body_error in tuple(_explicit_control_chain(outcome.error))
         else:
             assert outcome.error is outcome.cancellation is None
@@ -194,3 +208,88 @@ async def test_admission_metadata_refusal_cannot_strand_an_original_start_gate(
             if not task.done():
                 task.cancel()
             await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+async def test_original_admission_retains_both_native_and_cohort_publication_failures(tmp_path):
+    lock = ReentrantTransitionLock()
+    first, second = ExecutionCommitOutcomeError('unknown'), OSError('original cohort publication failed')
+    metadata = AttributeError('diagnostic task cache refused')
+    effect = tmp_path / 'unadmitted-native-effect'
+    class PublicationTask(asyncio.Task):
+        def __setattr__(self, name, value):
+            if name == '_kestrel_owned_terminal_error':
+                raise metadata
+            super().__setattr__(name, value)
+        def add_done_callback(self, callback, *, context=None):
+            if 'ReentrantTransitionLock.start_owned_native_work.<locals>.completed' in getattr(callback, '__qualname__', ''):
+                raise first
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    async def operation():
+        effect.write_text('unadmitted native effect')
+    def refuse(task):
+        raise second
+    task = None
+    async with lock.policy_span():
+        scope = OwnedCallbackScope()
+        scope._join_observers.add(refuse)
+        try:
+            loop.set_task_factory(lambda loop, coroutine, **options: PublicationTask(coroutine, loop=loop, **options))
+            task = scope.start(operation)
+            task.cancel('withdraw before first original step')
+            loop.set_task_factory(previous)
+            outcome = await await_owned_task(task)
+            graph = tuple(_explicit_control_chain(outcome.error))
+            assert first in graph, 'Second admission publication erased the original native failure'
+            assert second in graph and metadata in graph
+            assert not effect.exists()
+        finally:
+            loop.set_task_factory(previous)
+            scope.close()
+            if task is not None:
+                await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('completion_kind', ['ordinary', 'unknown', 'committed', 'cancel-unknown'])
+async def test_original_terminal_receipt_reconciles_stale_diagnostic_cache(tmp_path, completion_kind):
+    body = OSError('original body failure')
+    completion = (ExecutionCommitOutcomeError(completion_kind) if completion_kind in {'unknown', 'committed'}
+                  else asyncio.CancelledError('original completion cancelled') if completion_kind == 'cancel-unknown'
+                  else OSError('original completion publication failed'))
+    if completion_kind == 'cancel-unknown':
+        completion.__cause__ = ExecutionCommitOutcomeError('unknown')
+    metadata = AttributeError('terminal diagnostic update refused')
+    completed = []
+    handle = (tmp_path / 'original-completion-resource').open('w')
+    class PublicationTask(asyncio.Task):
+        def __setattr__(self, name, value):
+            if name == '_kestrel_owned_terminal_error' and getattr(self, '_first_terminal_cached', False):
+                raise metadata
+            super().__setattr__(name, value)
+            if name == '_kestrel_owned_terminal_error':
+                self._first_terminal_cached = True
+    async def operation():
+        handle.close()
+        raise body
+    def publish(task, error):
+        completed.append((task, error))
+        raise completion
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    task = None
+    try:
+        loop.set_task_factory(lambda loop, coroutine, **options: PublicationTask(coroutine, loop=loop, **options))
+        task = create_owned_task(operation(), on_completion=publish, retain_originals=True)
+        loop.set_task_factory(previous)
+        outcome = await await_owned_task(task)
+        graph = tuple(_explicit_control_chain(outcome.error))
+        assert completion in graph, 'Stale diagnostic cache hid the original physical terminal failure'
+        assert body in graph and metadata in graph
+        assert handle.closed and completed == [(task, body)]
+        assert owned_task_error(task) is outcome.error
+    finally:
+        loop.set_task_factory(previous)
+        if task is not None:
+            await await_owned_task(task)
+        handle.close()

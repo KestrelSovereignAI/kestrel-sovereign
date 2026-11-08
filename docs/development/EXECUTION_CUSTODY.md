@@ -126,6 +126,10 @@ withdrawal and the original source close acknowledged. A separate native
 epilogue or watcher failure, COMMIT/UNKNOWN evidence, and retirement debt remain
 visible. Source-only control projection is not a filter for ordinary physical
 errors.
+Genuine source cancellation remains visible even after terminal delivery; only
+the iterator's own requested close interruption can be suppressed. The shared
+terminal classifier also preserves SDK effect uncertainty. A bare work refusal
+is not a physical close failure, but its cause cannot hide an uncertain effect.
 Writer restoration preserves a collected physical-close result alongside a
 later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
 original admission failure; the closer observes the canonical source-owner

@@ -249,20 +249,23 @@ def _retain_owned_admission_error(task, error, *, admission=None, gate=None):
     accepted owner or replace its original publication failure.
     """
     from kestrel_sovereign.execution_custody import execution_observation_error, retained_execution_error
-    try:
-        cached = getattr(task, "_kestrel_owned_terminal_error", None)
-    except BaseException as publication:
-        cached = publication
-    terminal = retained_execution_error(execution_observation_error(cached, error))
-    try:
-        task._kestrel_owned_terminal_error = terminal
-    except BaseException as publication:
-        terminal = retained_execution_error(execution_observation_error(terminal, publication))
+    receipt_error = None
     if admission is None:
         try:
             admission = getattr(task, '_kestrel_owned_admission', None)
         except BaseException as publication:
-            terminal = retained_execution_error(execution_observation_error(terminal, publication))
+            receipt_error = publication
+    if type(admission) is OwnedTaskAdmission and admission.task is task:
+        receipt_error = execution_observation_error(receipt_error, admission.error)
+    try:
+        cached = getattr(task, "_kestrel_owned_terminal_error", None)
+    except BaseException as publication:
+        cached = publication
+    terminal = retained_execution_error(execution_observation_error(receipt_error, cached, error))
+    try:
+        task._kestrel_owned_terminal_error = terminal
+    except BaseException as publication:
+        terminal = retained_execution_error(execution_observation_error(terminal, publication))
     if type(admission) is OwnedTaskAdmission and admission.task is task:
         admission.error = terminal
     if gate is not None and not gate.done():
@@ -1143,7 +1146,8 @@ class OwnedAsyncIterator(Generic[_T]):
         """Retain the source AND its original cancellation observer outcomes."""
         from kestrel_sovereign.execution_custody import (
             ExecutionAuthorityError, execution_commit_outcome, execution_cleanup_debts,
-            execution_observation_error, is_execution_control_error,
+            _explicit_control_chain, execution_observation_error, is_execution_control_error,
+            is_tool_execution_terminal_error,
         )
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
@@ -1151,9 +1155,11 @@ class OwnedAsyncIterator(Generic[_T]):
         if issubclass(type(watcher_error), asyncio.CancelledError) and not is_execution_control_error(watcher_error):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
         terminal, owner_error = self._terminal_error, outcome.error
-        body_only = (terminal is not None and (
-            not is_execution_control_error(terminal)
+        body_only = (terminal is not None
+            and not any(isinstance(error, asyncio.CancelledError) for error in _explicit_control_chain(terminal)) and (
+            not is_tool_execution_terminal_error(terminal)
             or (type(terminal) is ExecutionAuthorityError
+                and terminal.__cause__ is None
                 and not execution_cleanup_debts(terminal)
                 and execution_commit_outcome(terminal) is None)))
         if closing and body_close_acknowledged and self._terminal_consumed and body_only:
@@ -1347,9 +1353,9 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
         if task.done() and not task.cancelled():
             # Capturing inside the child preserves original evidence, but does
             # not acknowledge asyncio's native exception notification. Harvest
-            # that completed result as well so a joined task cannot later emit
-            # an orphaned "exception was never retrieved" diagnostic.
-            task.exception()
+            # the physical result before latching the receipt: completion can
+            # fail after the earlier body cache was successfully published.
+            retained = execution_observation_error(retained, task.exception())
         if admission is not None and admission._terminal_error is _TASK_ERROR_UNSET:
             retained = execution_observation_error(admission.error, retained)
             if task.done():

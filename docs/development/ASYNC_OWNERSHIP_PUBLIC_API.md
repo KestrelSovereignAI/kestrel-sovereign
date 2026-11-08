@@ -53,6 +53,9 @@ terminal observation. Task error attributes are diagnostic caches: refusal to
 publish them is reported with the original error, but cannot strand an accepted
 task behind a start gate. Cancellation before the first task step cannot erase
 the original admission failure, even if that diagnostic cache is unavailable.
+Multiple failed publications compose into that same receipt. Its terminal
+snapshot also reconciles the physical task exception, so an earlier diagnostic
+body-error cache cannot hide a later completion-publication failure.
 
 A custom task factory can make allocation ambiguous. If construction raises
 and the original native task registry cannot identify exactly one accepted
