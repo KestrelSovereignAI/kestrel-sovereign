@@ -347,9 +347,10 @@ a different hash encoding cannot silently replace existing replay history.
 Each governed tool leaf acknowledges a STARTED claim before dispatch. A claim
 that might have executed fences replay after a lost reply or process restart,
 including a known returned error. An uncertain settlement also fences further
-effects in the live turn even if its database transaction failed. Only a proven
-NOT_EXECUTED claim permits a subsequent attempt to supersede the old one. Reusing
-an intent with changed input conflicts; an explicitly new intent gets a new ID.
+effects in the live turn even if its database transaction failed. Each admitted
+operation ID is consumed once, including claim-free or NOT_EXECUTED operations.
+Reusing an ID with unchanged input requires reconciliation; changed input
+conflicts. An explicitly new intent gets a fresh ID.
 This is a local replay fence, not a cross-vendor exactly-once guarantee.
 
 Result classification finishes before claim settlement. A failed classifier

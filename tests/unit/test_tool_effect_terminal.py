@@ -10,7 +10,9 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, execution_evidence_carriers, is_execution_control_error,
 )
 from kestrel_sdk.resources import ResourceConflict
-from kestrel_sovereign.tool_effect_store import ToolEffectAttemptSuperseded
+from kestrel_sovereign.tool_effect_store import (
+    ToolEffectAttemptSuperseded, ToolEffectReconciliationRequired,
+)
 from tests.unit.test_tool_effect_execution import admit, owner as owner
 
 
@@ -31,12 +33,20 @@ async def test_cleanup_closes_only_original_attempt_and_cannot_admit_fresh_work(
     assert await owner.tool_effect_store.database.fetchone("SELECT COUNT(*) FROM sqlite_master WHERE name='must_not_exist'") == (0,)
 
 
-async def test_original_terminal_cannot_close_a_superseding_attempt(owner):
+async def test_original_terminal_cannot_close_a_fresh_operation(owner):
     original = await admit(owner)
     await original.close()
-    successor = await admit(owner)
+    db = owner.tool_effect_store.database
+    first = await db.fetchone('SELECT attempt_id,revision,state FROM tool_effect_operations')
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(owner)
+    assert await db.fetchall('SELECT attempt_id,revision,state FROM tool_effect_operations') == [first]
+    successor = await admit(owner, key='explicit-fresh-terminal-operation')
     await owner.tool_effect_store.finish(original.attempt)
-    assert await owner.tool_effect_store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations') == (successor.attempt.attempt_id, 'OPEN')
+    assert await db.fetchone('SELECT attempt_id,revision,state FROM tool_effect_operations WHERE attempt_id = ?',
+        (original.attempt.attempt_id,)) == first
+    assert await db.fetchone('SELECT state FROM tool_effect_operations WHERE attempt_id = ?',
+        (successor.attempt.attempt_id,)) == ('OPEN',)
     await successor.close()
 
 

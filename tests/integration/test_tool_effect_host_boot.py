@@ -104,15 +104,24 @@ async def test_actual_http_retry_preserves_client_input_before_session_resolutio
             response = await client.post(endpoint, json={
                 'input': body['input'], 'invocation_id': body['request_id'], 'user_passphrase': None,
             })
-            assert response.status_code == 200, 'Unchanged client input was mistaken for another operation: ' + response.text
+            assert response.status_code == 409, response.text
+            assert response.json()['error']['code'] == 'tool_effect_reconciliation_required', (
+                'Unchanged client input was mistaken for another operation: ' + response.text)
             with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
-                second, = db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall()
-                assert second[0] != first[0] and second[1] > first[1] and second[2] == 'CLOSED'
+                assert db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall() == [first]
             response = await client.post(endpoint, json=dict(body, input='!status'))
             assert response.status_code == 409, response.text
             assert response.json()['error']['code'] == 'tool_effect_operation_conflict'
             with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
-                assert db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall() == [second]
+                assert db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall() == [first]
+                assert db.execute('SELECT COUNT(*) FROM tool_effect_claims').fetchone() == (0,)
+            response = await client.post(endpoint, json=dict(body, request_id='owned-http-fresh-intent'))
+            assert response.status_code == 200, response.text
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+                rows = db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall()
+                assert len(rows) == 2 and first in rows
+                fresh, = [row for row in rows if row != first]
+                assert fresh[0] != first[0] and fresh[2] == 'CLOSED'
                 assert db.execute('SELECT COUNT(*) FROM tool_effect_claims').fetchone() == (0,)
     assert await c.peer.witness(None, None) == []
 

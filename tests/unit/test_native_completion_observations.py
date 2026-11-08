@@ -399,6 +399,9 @@ async def test_no_claim_uncertainty_fences_reopened_operation(owner, interrupted
         turn.live = False
         await turn.privacy_lock.close_native_scope(turn.privacy_scope, None)
     assert await db.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    expected = ('OPEN', 0) if interrupted else ('CLOSED', 1)
+    assert await db.fetchone('SELECT state,latched FROM tool_effect_operations') == expected, (
+        'Original completion uncertainty was not durably recorded')
     await store.close()
     await db.backend.close()
     await db.backend.connect()
