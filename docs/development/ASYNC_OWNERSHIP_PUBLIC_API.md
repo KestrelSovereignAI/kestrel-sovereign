@@ -129,6 +129,9 @@ Formatting and consuming that response cannot complete an uncertain request:
 the same terminal evidence remains available through physical stream cleanup,
 request disposition and the speech-drain handoff. Direct decorated invocations
 and generators use the same terminal classifier for their own registrations.
+Retirement classifies all actual outcomes after cleanup, including uncertainty
+first raised during producer unwind, physical close or speech-tap completion.
+An earlier cancellation snapshot cannot certify those later stages.
 
 If publication of the original completion callback is refused, a foreign native
 await may consume an independent cancelled completion before Core can capture it.

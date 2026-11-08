@@ -1158,9 +1158,9 @@ async def stream_agent_response(request: Request):
                 # A formatted frame can be consumed normally; its original
                 # terminal uncertainty still governs retirement and speech.
                 active_error = execution_observation_error(sys.exception(), handled_terminal_error)
-                control_failed = active_error is not None and is_tool_execution_terminal_error(active_error)
                 agent_stream_cleanup_failed = False
                 source_cleanup_error = None
+                tap_finish_error = None
                 try:
                     # One producer task owns construction, iteration, and close
                     # of the nested generator. Its join is cancellation-safe
@@ -1188,11 +1188,15 @@ async def stream_agent_response(request: Request):
                             and not agent_stream_cleanup_failed and not stop_notice_emitted
                         ))
                     except BaseException as tap_error:
+                        tap_finish_error = tap_error
                         raise execution_terminal_error(active_error, source_cleanup_error, tap_error)
                     finally:
                         # A failed nested close is an abandoned lifecycle,
                         # never proof that Stop succeeded.
-                        if agent_stream_cleanup_failed or control_failed:
+                        retirement_error = execution_observation_error(
+                            active_error, source_cleanup_error, tap_finish_error,
+                        )
+                        if agent_stream_cleanup_failed or is_tool_execution_terminal_error(retirement_error):
                             agent._cleanup_cancelled_request(
                                 request_id,
                                 disposition=(

@@ -513,3 +513,99 @@ async def test_direct_stream_close_uncertainty_preserves_actual_generation(tmp_p
         await await_owned_operation(iterator.aclose(), retain_originals=True)
         await agent.llm_service.close()
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport,phase", [("http", "source"), ("bridge", "source"), ("http", "tap")])
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+async def test_actual_stream_retirement_classifies_late_terminal_outcomes(tmp_path, monkeypatch, transport, phase, kind):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.endpoints.agent import stream_agent_response
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    from kestrel_sovereign.features.bridge.feature import BridgeFeature
+    from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+    from kestrel_sovereign.features.bridge.router import get_router
+    from kestrel_sovereign.streams.tap import AgentStreamTap
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    await db.execute("CREATE TABLE late_stream_retirement_effects (phase TEXT)")
+    request_id = "original-late-stream-terminal"
+    original = (ResourceOutcomeUnknown("original late stream effect uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original late stream audit uncertain"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    handle = (tmp_path / "actual-late-stream-resource").open("w")
+    closes, generations = [], []
+    async def source(self, user_input, *, request_id=None, **kwargs):
+        generations.append(agent._active_request_generations[request_id])
+        try:
+            await db.execute("INSERT INTO late_stream_retirement_effects VALUES ('body')")
+            yield "original body"
+            if phase == "source":
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    if kind is not None:
+                        raise original
+                    raise
+        finally:
+            await db.execute("INSERT INTO late_stream_retirement_effects VALUES ('close')")
+            closes.append(asyncio.current_task())
+            handle.close()
+    monkeypatch.setattr(agent, "process_input_streaming", source.__get__(agent, type(agent)))
+    AgentStreamTap.reset()
+    tap = AgentStreamTap.get_instance()
+    actual_finish = tap.finish
+    if phase == "tap":
+        async def finish(delivery_id, *, completed=False):
+            await actual_finish(delivery_id, completed=completed)
+            await db.execute("INSERT INTO late_stream_retirement_effects VALUES ('tap')")
+            if kind is not None:
+                raise original
+        monkeypatch.setattr(tap, "finish", finish)
+    response, reader = None, None
+    try:
+        request = _invocation_request(agent, {"input": "work", "request_id": request_id})
+        if transport == "bridge":
+            bridge = BridgeFeature(agent)
+            await bridge.initialize()
+            agent.features["BridgeFeature"] = bridge
+            endpoint = next(route.endpoint for route in get_router().routes if getattr(route, "path", None) == "/api/bridge/stream")
+            endpoint = getattr(endpoint, "__wrapped__", endpoint)
+            response = await endpoint(request, BridgeRequest(message="work", request_id=request_id))
+        else:
+            endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+            response = await endpoint(request)
+        assert "original body" in await anext(response.body_iterator)
+        reader = create_owned_task(anext(response.body_iterator), retain_originals=True)
+        if phase == "source":
+            await asyncio.wait_for(entered.wait(), 1)
+            reader.cancel("actual response reader disconnected")
+        outcome = await await_owned_task(reader)
+        if kind is not None:
+            assert original in tuple(_explicit_control_chain(outcome.error))
+        elif phase == "source":
+            assert isinstance(outcome.error, asyncio.CancelledError)
+        else:
+            assert isinstance(outcome.error, StopAsyncIteration)
+        assert handle.closed and len(closes) == 1
+        if transport == "http":
+            delivery = response.headers["X-Stream-Delivery-ID"]
+            if kind is not None and phase == "tap":
+                assert not tap._requests[delivery].is_live(), (
+                    "Late terminal tap uncertainty retained successful drain authority")
+            tap.unregister(delivery)
+        assert await agent.wait_for_request_completion(request_id, generation=generations[0]) is (
+            RequestCompletionDisposition.COMPLETED if kind is None else RequestCompletionDisposition.ABANDONED), (
+                "Late stream retirement uncertainty was classified from stale completion state")
+        assert await db.fetchval("SELECT COUNT(*) FROM late_stream_retirement_effects") == (3 if phase == "tap" else 2)
+    finally:
+        release.set()
+        if reader is not None:
+            await await_owned_task(reader)
+        if response is not None:
+            await await_owned_operation(response.body_iterator.aclose(), retain_originals=True)
+        AgentStreamTap.reset()
+        handle.close()
+        await agent.llm_service.close()
+        await db.close()

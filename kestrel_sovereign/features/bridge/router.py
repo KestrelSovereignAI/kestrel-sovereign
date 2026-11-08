@@ -547,12 +547,13 @@ def get_router() -> APIRouter:
                 yield bridge_sse_error_event(e)
             finally:
                 active_error = execution_observation_error(sys.exception(), handled_terminal_error)
-                control_failed = active_error is not None and is_tool_execution_terminal_error(active_error)
                 agent_stream_cleanup_failed = False
+                source_cleanup_error = None
                 try:
                     if agent_stream is not None:
                         await agent_stream.aclose()
                 except BaseException as cleanup_error:
+                    source_cleanup_error = cleanup_error
                     agent_stream_cleanup_failed = (
                         agent_stream is not None
                         and agent_stream.cleanup_error is not None
@@ -571,7 +572,8 @@ def get_router() -> APIRouter:
                     # a cancellation key; each generator releases only its own
                     # registration after nested stream cleanup is terminal.
                     if request_lifecycle_registered:
-                        if agent_stream_cleanup_failed or control_failed:
+                        retirement_error = execution_observation_error(active_error, source_cleanup_error)
+                        if agent_stream_cleanup_failed or is_tool_execution_terminal_error(retirement_error):
                             agent._cleanup_cancelled_request(
                                 request_id,
                                 disposition=(
