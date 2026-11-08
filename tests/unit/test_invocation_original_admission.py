@@ -16,6 +16,21 @@ from tests.unit.test_cleanup_task_admission import _partial_native_agent
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
+def _kite_invocation_request(agent, request_id):
+    from fastapi import FastAPI
+    from starlette.requests import Request
+    app = FastAPI()
+    app.state.agent = agent
+    body = json.dumps({"request_id": request_id, "kite_evidence": {"operation": "diagnostics", "nonce": "a" * 64}}).encode()
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+    request = Request({"type": "http", "http_version": "1.1", "method": "POST",
+                           "scheme": "http", "path": "/api/agent/invoke", "raw_path": b"/api/agent/invoke",
+                           "query_string": b"", "headers": [(b"content-type", b"application/json")],
+                           "client": ("test", 1), "server": ("test", 80), "app": app}, receive)
+    return request
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["allocation", "binding", "callback-before", "callback-after",
                                   "canonical-before", "canonical-after"])
@@ -24,8 +39,7 @@ from tests.unit.test_host_context_native_cleanup import _actual_operation
 async def test_kite_endpoint_retires_original_observation_before_registration(
     tmp_path, monkeypatch, mode, prior, retirement_fails,
 ):
-    from fastapi import FastAPI, Response
-    from starlette.requests import Request
+    from fastapi import Response
     from kestrel_sovereign.endpoints.agent import invoke_agent
     # This exercises the actual endpoint and Agent lifecycle with an explicit
     # SQL observation component, not full Kite diagnostics or Agent READY.
@@ -73,15 +87,7 @@ async def test_kite_endpoint_retires_original_observation_before_registration(
             accepted.append(task)
             return task
         return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
-    app = FastAPI()
-    app.state.agent = agent
-    body = json.dumps({"request_id": request_id, "kite_evidence": {"operation": "diagnostics", "nonce": "a" * 64}}).encode()
-    async def receive():
-        return {"type": "http.request", "body": body, "more_body": False}
-    request = Request({"type": "http", "http_version": "1.1", "method": "POST",
-                       "scheme": "http", "path": "/api/agent/invoke", "raw_path": b"/api/agent/invoke",
-                       "query_string": b"", "headers": [(b"content-type", b"application/json")],
-                       "client": ("test", 1), "server": ("test", 80), "app": app}, receive)
+    request = _kite_invocation_request(agent, request_id)
     owner = None
     try:
         monkeypatch.setattr("kestrel_sovereign.endpoints.agent._kite_runtime_observation", native_evidence)
@@ -270,6 +276,54 @@ async def test_isolated_invocation_recovers_original_terminal_cancellation_recei
                 "Isolated invocation replaced its original terminal cancellation with typed Stop")
         assert await db.fetchval("SELECT COUNT(*) FROM original_invocation_receipt_effects") == 1
         assert not any(vars(agent).get("_request_operation_tasks", {}).values())
+    finally:
+        await agent.llm_service.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "unknown", "committed", "sdk", "audit"])
+@pytest.mark.parametrize("stop", [False, True])
+async def test_kite_endpoint_recovers_original_terminal_cancellation_before_stop(
+    tmp_path, monkeypatch, kind, stop,
+):
+    from fastapi import Response
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.endpoints.agent import invoke_agent
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, ToolAuditUnconfirmedError, _explicit_control_chain,
+    )
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    from tests.unit.test_kite_release_evidence import _kite_evidence_env
+    evidence_home = tmp_path / "kite-evidence-home"
+    evidence_home.mkdir(mode=0o700)
+    _kite_evidence_env(monkeypatch, evidence_home)
+    await db.execute("CREATE TABLE kite_original_receipt_effects (id INTEGER)")
+    request_id = "original-kite-terminal-receipt"
+    original = asyncio.CancelledError("original Kite observation acknowledgement")
+    if kind is not None:
+        original.__cause__ = (ResourceOutcomeUnknown("original Kite effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original Kite audit uncertain") if kind == "audit"
+            else ExecutionCommitOutcomeError(kind))
+    async def native_evidence(*args, **kwargs):
+        await db.execute("INSERT INTO kite_original_receipt_effects VALUES (1)")
+        if stop:
+            assert agent.cancel_current_request(request_id)
+        if kind is not None:
+            raise original
+        return "diagnostics", {"completed": True}
+    monkeypatch.setattr("kestrel_sovereign.endpoints.agent._kite_runtime_observation", native_evidence)
+    request = _kite_invocation_request(agent, request_id)
+    endpoint = getattr(invoke_agent, "__wrapped__", invoke_agent)
+    try:
+        outcome = await await_owned_task(create_owned_task(endpoint(request, Response()), retain_originals=True))
+        if kind is None:
+            assert outcome.error is outcome.cancellation is None
+        else:
+            assert original in tuple(_explicit_control_chain(outcome.error)), (
+                "Kite endpoint replaced its original terminal cancellation with Stop or synthetic cancellation")
+        assert await db.fetchval("SELECT COUNT(*) FROM kite_original_receipt_effects") == 1
     finally:
         await agent.llm_service.close()
         await db.close()

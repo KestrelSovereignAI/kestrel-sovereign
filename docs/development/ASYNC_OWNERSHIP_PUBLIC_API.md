@@ -105,3 +105,25 @@ For a native Task or Future admitted elsewhere, its existing retained terminal
 cancellation remains stable across canonical joins. There is no Core admission
 receipt to reconcile; rereading asyncio's consumed cancellation cannot supply a
 new physical failure. This does not grant Core ownership of that foreign task.
+
+Private Stop is authenticated by the cancellation token on the exact original
+admission receipt. Core lifecycle cancellation uses `cancel_owned_task`; neither a
+positive cancellation count nor a close flag authenticates a distinct source or
+watcher error. The same check applies before source entry, during unwinding, and
+at terminal close. Genuine teardown cancellation still propagates, with every
+original carrier retained. Multiple pure cancellations use the canonical finite
+cancellation envelope; their original graph remains intact. Invocation and Kite
+recover native-await evidence through `owned_task_cancellation_error` before Stop
+classification.
+
+If publication of the original completion callback is refused, a foreign native
+await may consume an independent cancelled completion before Core can capture it.
+The exact lost exception cannot be reconstructed. Its admission retains explicit
+unobservable-completion uncertainty and debt naming that same Task, rather than
+certifying ordinary failure or successful retirement. No callback retry, new
+physical operation, replacement receipt or source-only graph guess is used.
+
+A native Task whose actual coroutine is exactly the canonical wrapper, which
+never entered that wrapper, cannot have run an outer completion epilogue. This
+positive identity/entry proof retains its known gate failure without inventing
+completion uncertainty. An outer custom-factory coroutine does not satisfy it.

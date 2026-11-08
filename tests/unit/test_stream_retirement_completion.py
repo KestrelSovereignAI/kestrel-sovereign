@@ -300,7 +300,7 @@ async def test_original_terminal_receipt_reconciles_stale_diagnostic_cache(tmp_p
 @pytest.mark.parametrize('phase,kind', [
     ('unwind', None), ('completion', None),
     ('admission', None), ('admission', 'sdk'), ('admission', 'audit'),
-    ('unwind', 'sdk'), ('unwind', 'audit'),
+    ('unwind', 'sdk'), ('unwind', 'audit'), ('unwind', 'plain'), ('admission', 'plain'),
     ('completion', 'sdk'), ('completion', 'audit'), ('completion', 'plain'),
 ])
 async def test_private_close_cannot_acknowledge_an_independent_original_failure(tmp_path, phase, kind):
@@ -375,8 +375,8 @@ async def test_private_close_cannot_acknowledge_an_independent_original_failure(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', [None, 'sdk', 'audit', 'plain'])
-@pytest.mark.parametrize('before_first_step', [False, True])
-async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tmp_path, kind, before_first_step):
+@pytest.mark.parametrize('before_first_step,request_before_raise', [(False, False), (True, False), (True, True)])
+async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tmp_path, kind, before_first_step, request_before_raise):
     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
     handle = (tmp_path / 'original-watcher-owned-source').open('w')
     independent = asyncio.CancelledError('independent original watcher completion')
@@ -398,6 +398,8 @@ async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tm
         if getattr(operation, 'cr_code', None) is OwnedAsyncIterator._watch_owner_cancellation.__code__:
             async def observe():
                 if before_first_step and kind is not None:
+                    if request_before_raise:
+                        asyncio.current_task().cancel('undelivered request before independent failure')
                     coroutine.close()
                     raise independent
                 await coroutine
@@ -530,7 +532,8 @@ async def test_physical_watcher_completion_reconciles_its_cached_private_cancell
         stream = OwnedAsyncIterator(lambda: Source(), operation='physical-watcher-completion', cleanup_requested=lambda: True)
         await asyncio.wait_for(entered.wait(), 1)
         await asyncio.wait_for(observing.wait(), 1)
-        stream.owner_task.cancel('original watcher Stop')
+        from kestrel_sovereign._async_ownership import cancel_owned_task
+        cancel_owned_task(stream.owner_task)
         # A native caller can consume asyncio's one-shot cancellation before
         # the canonical lifecycle join. The original completion receipt must
         # already retain the actual outer Task result for every later reader.
@@ -559,4 +562,74 @@ async def test_physical_watcher_completion_reconciles_its_cached_private_cancell
         release.set()
         if stream is not None:
             await await_owned_operation(stream.aclose(), retain_originals=True)
+        handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+@pytest.mark.parametrize("foreign_first", [False, True])
+@pytest.mark.parametrize("outer_before_first", [False, True])
+async def test_rejected_completion_capture_cannot_turn_lost_native_uncertainty_into_ordinary_failure(
+    tmp_path, kind, foreign_first, outer_before_first,
+):
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+    from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error, execution_cleanup_debts
+    handle = (tmp_path / "rejected-original-completion").open("w")
+    opening = OSError("original completion callback publication refused")
+    independent = asyncio.CancelledError("original physical completion after callback refusal")
+    if kind is not None:
+        independent.__cause__ = (ResourceOutcomeUnknown("original physical effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original physical audit uncertain"))
+    effects = []
+    async def operation():
+        effects.append(asyncio.current_task())
+        handle.write("unadmitted effect")
+    class RejectedCompletionTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "close_unstarted":
+                raise opening
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        async def outer():
+            if outer_before_first and kind is not None:
+                coroutine.close()
+                raise independent
+            try:
+                await coroutine
+            finally:
+                if kind is not None:
+                    raise independent
+        return RejectedCompletionTask(outer(), loop=loop, **options)
+    admission = OwnedTaskAdmission()
+    try:
+        loop.set_task_factory(factory)
+        try:
+            create_owned_task(operation(), admission=admission, retain_originals=True)
+        except BaseException as error:
+            assert opening in tuple(_explicit_control_chain(error))
+        finally:
+            loop.set_task_factory(previous)
+        assert admission.task is not None
+        if foreign_first:
+            try:
+                await admission.task
+            except BaseException:
+                pass  # A native caller can consume the one-shot physical C.
+        outcome = await await_owned_task(admission.task)
+        assert opening in tuple(_explicit_control_chain(outcome.error))
+        if kind is not None:
+            assert is_tool_execution_terminal_error(outcome.error), (
+                "Rejected completion capture downgraded lost native uncertainty to ordinary failure")
+            if foreign_first:
+                assert any(owner is admission.task for _, owner in execution_cleanup_debts(outcome.error)), (
+                    "Unobservable physical completion lost its original owner debt")
+            else:
+                assert independent in tuple(_explicit_control_chain(outcome.error))
+        assert not effects and not handle.closed
+        assert owned_task_error(admission.task) is outcome.error
+    finally:
+        loop.set_task_factory(previous)
+        if admission.task is not None:
+            await await_owned_task(admission.task)
         handle.close()

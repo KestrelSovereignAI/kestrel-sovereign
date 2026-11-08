@@ -389,7 +389,8 @@ class RequestLifecycleMixin:
                 try:
                     operation.add_done_callback(release)
                     if self.is_request_cancelled(request_id):
-                        cancellation.cancel()
+                        from kestrel_sovereign._async_ownership import cancel_owned_task
+                        cancel_owned_task(cancellation)
                 except BaseException:
                     operation.remove_done_callback(release)
                     release(operation)
@@ -665,7 +666,8 @@ class RequestLifecycleMixin:
                 for operation in tuple(
                     operations.get((target_request_id, generation), {}).values()
                 ):
-                    operation.cancel()
+                    from kestrel_sovereign._async_ownership import cancel_owned_task
+                    cancel_owned_task(operation)
         logging.info(
             "Cancelled request lifecycle: %s",
             invocation_log_correlation(target_request_id),

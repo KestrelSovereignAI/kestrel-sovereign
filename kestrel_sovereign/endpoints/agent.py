@@ -589,19 +589,24 @@ async def invoke_agent(request: Request, http_response: Response):
             try:
                 operation, observation = await evidence_task
             except asyncio.CancelledError as error:
-                if is_execution_control_error(error):
-                    raise
+                from kestrel_sovereign._async_ownership import owned_task_cancellation_error, is_owned_task_cancellation
+                from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+                error = owned_task_cancellation_error(evidence_task, error)
+                if not isinstance(error, asyncio.CancelledError) or is_tool_execution_terminal_error(error):
+                    raise error
                 if (
                     owner_task is not None
                     and owner_task.cancelling()
                     > owner_cancellation_baseline
                 ):
-                    raise
+                    raise error
                 if not (
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 ):
-                    raise
+                    raise error
+                if not is_owned_task_cancellation(evidence_task, error):
+                    raise error
                 if invocation_was_self_fenced(agent, request_id):
                     raise self_fenced_invocation_http_error(request_id)
                 http_response.headers["X-Request-ID"] = (

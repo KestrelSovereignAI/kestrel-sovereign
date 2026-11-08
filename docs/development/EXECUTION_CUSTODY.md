@@ -2418,3 +2418,10 @@ still controls ordinary cancellation normalization. Observation-publication fail
 is explicitly caused by its original error; pending Stop requests do not convert
 a synchronously raised publication cancellation into a private interrupt. Repeated
 owner joins preserve independent failures without repeating physical source close.
+
+An original admission token authenticates private cancellation at source entry,
+unwind and watcher handoff. A request count or prior close alone cannot erase a
+distinct physical cancellation. If the original terminal-capture callback was
+refused and cancelled completion cannot be reconstructed after native consumption,
+the same receipt/Task retain unobservable-completion uncertainty and retirement
+debt. A later source close cannot prove that lost completion ordinary or settled.

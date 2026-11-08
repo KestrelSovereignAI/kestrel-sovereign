@@ -227,6 +227,43 @@ class OwnedTaskAdmission:
     error: BaseException | None = field(default=None, repr=False)
     _terminal_error: object = field(default=_TASK_ERROR_UNSET, repr=False)
     _retain_originals: bool = field(default=False, repr=False)
+    _cancel_token: object = field(default_factory=object, repr=False)
+    _completion_capture_registered: bool = field(default=False, repr=False)
+    _canonical_wrapper_only: bool = field(default=False, repr=False)
+    _wrapper_started: bool = field(default=False, repr=False)
+
+
+def cancel_owned_task(task: asyncio.Task) -> bool:
+    """Request cancellation through this exact native admission's private token.
+
+    A pending request count is not proof that a received error was its Stop.
+    Tasks created elsewhere keep native cancellation semantics; this request
+    neither adopts their operation nor creates an admission receipt.
+    """
+    if not isinstance(task, _NATIVE_TASK):
+        raise TypeError("owned cancellation requires an original native Task")
+    admission = getattr(task, "_kestrel_owned_admission", None)
+    token = (admission._cancel_token
+        if type(admission) is OwnedTaskAdmission and admission.task is task else None)
+    return task.cancel(token)
+
+
+def is_owned_task_cancellation(task, error) -> bool:
+    """Authenticate this original Task's requested private cancellation."""
+    if not isinstance(task, _NATIVE_TASK) or not isinstance(error, asyncio.CancelledError):
+        return False
+    from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+    admission = getattr(task, "_kestrel_owned_admission", None)
+    return (type(admission) is OwnedTaskAdmission and admission.task is task
+        and len(error.args) == 1 and error.args[0] is admission._cancel_token
+        and not is_tool_execution_terminal_error(error))
+
+
+def owned_task_cancellation_error(task, cancellation):
+    """Recover a native await's original receipt before finite Stop handling."""
+    if not isinstance(cancellation, asyncio.CancelledError):
+        raise TypeError("native cancellation recovery requires CancelledError")
+    return (owned_task_error(task) if task.done() else None) or cancellation
 
 
 def _has_owned_task_metadata(task) -> bool:
@@ -301,6 +338,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     unstarted_closed = False
     async def run():
         nonlocal started
+        admission._wrapper_started = True
         observed = None
         try:
             if gate is not None:
@@ -365,6 +403,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                     close()
         finally:
             if _task is not None and _task.done():
+                admission._completion_capture_registered = True
                 # This is the first callback installed by the original creator.
                 # Snapshot the physical outcome before a foreign await consumes
                 # asyncio's original CancelledError, including outer epilogues.
@@ -429,9 +468,11 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 query_error = failure
             if query_error is None and len(matches) == 1:
                 task = admission.task = matches[0]
+                admission._canonical_wrapper_only = True
                 try:
                     task._kestrel_owned_admission = admission
                     task.add_done_callback(close_unstarted)
+                    admission._completion_capture_registered = True
                 except BaseException as publication:
                     from kestrel_sovereign.execution_custody import execution_observation_error
                     error = execution_observation_error(error, publication)
@@ -492,9 +533,11 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             )
         raise
     admission.task = task
+    admission._canonical_wrapper_only = isinstance(task, _NATIVE_TASK) and _NATIVE_TASK.get_coro(task) is wrapper
     try:
         task._kestrel_owned_admission = admission
         task.add_done_callback(close_unstarted)
+        admission._completion_capture_registered = True
         # An explicit context narrows the original ownership handoff. Resident
         # contexts deliberately carry no invocation coordinator. Routing still
         # cannot enroll anything unless the actual creator is an original member.
@@ -1028,9 +1071,9 @@ class OwnedAsyncIterator(Generic[_T]):
                 (self, self._owner),
             )
             self._stop.set()
-            self._owner.cancel()
+            cancel_owned_task(self._owner)
             if self._cancellation_owner is not None:
-                self._cancellation_owner.cancel()
+                cancel_owned_task(self._cancellation_owner)
             raise error
         dispatch.set()
 
@@ -1121,7 +1164,8 @@ class OwnedAsyncIterator(Generic[_T]):
             from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
             if is_tool_execution_terminal_error(error) or not asyncio.current_task().cancelling():
                 raise
-            self._watcher_private_cancellation = error
+            if self._is_private_watcher_cancellation(error):
+                self._watcher_private_cancellation = error
             if self._owner.done():
                 return
             if self._item_outstanding:
@@ -1176,17 +1220,22 @@ class OwnedAsyncIterator(Generic[_T]):
             if owner_error is terminal:
                 owner_error = None
             terminal = None
+        originals = (terminal, owner_error, watcher_error)
         result = OwnedTaskOutcome(
             outcome.result,
-            execution_observation_error(terminal, owner_error, watcher_error),
+            execution_observation_error(*originals, prefer_cancellation=all(
+                error is None or isinstance(error, asyncio.CancelledError) for error in originals)),
             execution_observation_error(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
         if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
                 and not self._interrupted_by_cleanup
-                and issubclass(type(result.error), asyncio.CancelledError)
-                and self._cleanup_error is None and not is_tool_execution_terminal_error(result.error)):
+                and is_owned_task_cancellation(self._owner, result.error)
+                and self._cleanup_error is None):
             return OwnedTaskOutcome(None, None, result.cancellation)
         return result
+
+    def _is_private_watcher_cancellation(self, error):
+        return is_owned_task_cancellation(self._cancellation_owner, error)
 
     def _interrupt_if_watch_never_started(
         self,
@@ -1206,9 +1255,8 @@ class OwnedAsyncIterator(Generic[_T]):
             watcher.cancelled()
             and not self._cancellation_watch_started
         ):
-            from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
             error = owned_task_error(watcher)
-            if watcher.cancelling() and not is_tool_execution_terminal_error(error):
+            if self._is_private_watcher_cancellation(error):
                 if isinstance(error, asyncio.CancelledError):
                     self._watcher_private_cancellation = error
                 if not self._owner.done():
@@ -1216,7 +1264,7 @@ class OwnedAsyncIterator(Generic[_T]):
 
     def _cancel_owner_if_running(self) -> None:
         if not self._owner.done() and not self._owner.cancelling():
-            self._owner.cancel()
+            cancel_owned_task(self._owner)
 
     async def _run(self) -> None:
         iterator: AsyncIterator[_T] | None = None
@@ -1267,7 +1315,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 # ownership solely to cancellation that interrupted the source.
                 if close_requested and not issubclass(type(error), asyncio.CancelledError):
                     self._cleanup_error = error
-                if cancellation_requested and issubclass(type(error), asyncio.CancelledError):
+                if cancellation_requested and is_owned_task_cancellation(self._owner, error):
                     self._interrupted_by_cleanup = True
                     self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
                     return
@@ -1308,7 +1356,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._stop.set()
         self._continue.set()
         if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
-            self._owner_cancelled_by_close = self._owner.cancel()
+            self._owner_cancelled_by_close = cancel_owned_task(self._owner)
         outcome = await self.join_source_owners(closing=True)
         if self._construction_error is not None and outcome.error is None:
             # Reconcile ONLY the original constructor task reservation, after
@@ -1377,10 +1425,22 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
         admission._terminal_error = physical
         physical = execution_terminal_error(physical, retain_originals=admission._retain_originals)
         admission._terminal_error = physical
+    unobservable = None
+    if (admission is not None and not admission._completion_capture_registered
+            and not (admission._canonical_wrapper_only and not admission._wrapper_started)
+            and task.cancelled() and physical is not cached):
+        from kestrel_sdk.resources import ResourceOutcomeUnknown
+        # A refused capture followed by a foreign native await can consume an
+        # independent physical C. Its exact lost graph is unrecoverable. Keep
+        # this original Task's observation debt; ordinary gate failure cannot
+        # certify that the outer physical completion was ordinary or successful.
+        missing = ResourceOutcomeUnknown("original native completion is unobservable after callback publication refusal")
+        missing.__cause__ = admission.error
+        unobservable = owned_task_admission_error(admission, admission, missing)
     error = execution_observation_error(
         admission.error if admission is not None else None,
         cached if cached is not _TASK_ERROR_UNSET else None,
-        physical,
+        physical, unobservable,
     )
     if cached is _TASK_ERROR_UNSET and _has_owned_task_metadata(task):
         try:

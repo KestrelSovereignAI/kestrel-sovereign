@@ -717,7 +717,8 @@ async def test_cancelling_unstarted_iterator_owner_interrupts_source(watch_start
         await asyncio.sleep(0)
     # Registration can expose the watcher before its first step, or Stop can
     # arrive while its original borrowed observation is already suspended.
-    assert owned.owner_task.cancel() is True
+    from kestrel_sovereign._async_ownership import cancel_owned_task
+    assert cancel_owned_task(owned.owner_task) is True
 
     await asyncio.wait_for(entered.wait(), timeout=0.2)
     for _attempt in range(20):
@@ -864,3 +865,38 @@ async def test_unadmitted_native_cancellation_has_one_stable_terminal_observatio
         assert again.error is first.error, "Repeated native observation manufactured another cancellation"
         assert owned_task_error(task) is first.error
         assert tuple(_explicit_control_chain(first.error)) == original_graph
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+async def test_private_cancellation_is_bound_to_its_original_admission_and_carrier(kind):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import cancel_owned_task, is_owned_task_cancellation
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
+    entered = asyncio.Event()
+    async def source():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as error:
+            if kind is not None:
+                error.__cause__ = (ResourceOutcomeUnknown("original requested cancellation retains effect uncertainty")
+                    if kind == "sdk" else ToolAuditUnconfirmedError("original requested cancellation retains audit uncertainty"))
+            raise
+    owner = create_owned_task(source(), retain_originals=True)
+    await entered.wait()
+    assert cancel_owned_task(owner)
+    outcome = await await_owned_task(owner)
+    assert is_owned_task_cancellation(owner, outcome.error) is (kind is None)
+    assert not is_owned_task_cancellation(asyncio.current_task(), outcome.error)
+    assert not is_owned_task_cancellation(owner, asyncio.CancelledError("independent cancellation")), (
+        "Independent cancellation became an authenticated original private Stop")
+    assert (await await_owned_task(owner)).error is outcome.error
+
+
+def test_native_cancellation_helpers_reject_invalid_input():
+    from kestrel_sovereign._async_ownership import cancel_owned_task, owned_task_cancellation_error
+    with pytest.raises(TypeError, match="original native Task"):
+        cancel_owned_task(object())
+    with pytest.raises(TypeError, match="requires CancelledError"):
+        owned_task_cancellation_error(object(), RuntimeError("not cancellation"))

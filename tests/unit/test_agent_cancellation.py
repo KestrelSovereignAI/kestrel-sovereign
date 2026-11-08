@@ -772,7 +772,8 @@ async def test_outer_stream_stop_does_not_abandon_clean_nested_command(native_to
     # then propagates through the await and cleanly terminalizes that child.
     agent._cancelled_request_generations.add((request_id, endpoint_generation))
     agent._cancelled_requests.add(request_id)
-    assert owned.owner_task.cancel() is True
+    from kestrel_sovereign._async_ownership import cancel_owned_task
+    assert cancel_owned_task(owned.owner_task) is True
 
     with pytest.raises(StopAsyncIteration):
         await advance
