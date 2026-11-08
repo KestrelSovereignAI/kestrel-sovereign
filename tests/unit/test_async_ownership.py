@@ -692,8 +692,9 @@ async def test_closing_owned_iterator_interrupts_blocked_source():
 
 
 @pytest.mark.asyncio
-async def test_cancelling_unstarted_iterator_owner_interrupts_source():
-    """The exposed cancellation owner works before its coroutine first runs."""
+@pytest.mark.parametrize('watch_started', [False, True])
+async def test_cancelling_unstarted_iterator_owner_interrupts_source(watch_started):
+    """The same cancellation owner retires its source before or after startup."""
 
     entered = asyncio.Event()
     finalized = asyncio.Event()
@@ -711,8 +712,11 @@ async def test_cancelling_unstarted_iterator_owner_interrupts_source():
         operation="never-started watcher",
         cleanup_requested=lambda: True,
     )
-    # This is the endpoint race: registration exposes the watcher and Stop
-    # cancels it in the same event-loop turn, before its coroutine body runs.
+    if watch_started:
+        await entered.wait()
+        await asyncio.sleep(0)
+    # Registration can expose the watcher before its first step, or Stop can
+    # arrive while its original borrowed observation is already suspended.
     assert owned.owner_task.cancel() is True
 
     await asyncio.wait_for(entered.wait(), timeout=0.2)

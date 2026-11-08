@@ -2409,3 +2409,12 @@ Chat and bridge capture the same stream-binding callback at original request
 registration. Neither deferred serializer may publish from copied context after
 the producer has started. Both publish the actual producer and its existing
 Stop watcher before opening the payload gate.
+
+The original owned-task completion receipt snapshots the physical Task outcome in
+the creator's first done callback, including cancelled outer completion wrappers.
+A body diagnostic cache cannot replace that result, and a foreign native await
+cannot erase it for a later lifecycle join. The original retain-originals policy
+still controls ordinary cancellation normalization. Observation-publication failure
+is explicitly caused by its original error; pending Stop requests do not convert
+a synchronously raised publication cancellation into a private interrupt. Repeated
+owner joins preserve independent failures without repeating physical source close.

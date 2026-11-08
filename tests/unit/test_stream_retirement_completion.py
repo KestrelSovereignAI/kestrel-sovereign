@@ -440,7 +440,7 @@ async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tm
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind,cancel_watcher', [
-    ('sdk', False), ('audit', False), ('plain', False), ('sdk', True), ('audit', True),
+    ('sdk', False), ('audit', False), ('plain', False), ('sdk', True), ('audit', True), ('plain', True),
 ])
 async def test_original_watcher_uncertainty_does_not_issue_a_private_source_interrupt(tmp_path, kind, cancel_watcher):
     refused = asyncio.Event()
@@ -485,6 +485,78 @@ async def test_original_watcher_uncertainty_does_not_issue_a_private_source_inte
         assert handle.closed and len(attempts) == 1
     finally:
         loop.set_task_factory(previous)
+        if stream is not None:
+            await await_owned_operation(stream.aclose(), retain_originals=True)
+        handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', [None, 'sdk', 'audit', 'plain'])
+async def test_physical_watcher_completion_reconciles_its_cached_private_cancellation(tmp_path, kind):
+    from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+    entered, observing, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    handle = (tmp_path / 'physical-original-watcher-source').open('w')
+    independent = asyncio.CancelledError('physical completion after original watcher Stop')
+    if kind in {'sdk', 'audit'}:
+        independent.__cause__ = (ResourceOutcomeUnknown('physical watcher effect uncertain')
+            if kind == 'sdk' else ToolAuditUnconfirmedError('physical watcher audit uncertain'))
+    attempts = []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            entered.set()
+            await release.wait()
+            raise StopAsyncIteration
+        async def aclose(self):
+            attempts.append(asyncio.current_task())
+            handle.close()
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        operation = coroutine.cr_frame.f_locals.get('operation')
+        if getattr(operation, 'cr_code', None) is OwnedAsyncIterator._watch_owner_cancellation.__code__:
+            async def observe():
+                observing.set()
+                try:
+                    await coroutine
+                finally:
+                    if kind is not None:
+                        raise independent
+            return asyncio.Task(observe(), loop=loop, **options)
+        return asyncio.Task(coroutine, loop=loop, **options)
+    stream = None
+    try:
+        loop.set_task_factory(factory)
+        stream = OwnedAsyncIterator(lambda: Source(), operation='physical-watcher-completion', cleanup_requested=lambda: True)
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(observing.wait(), 1)
+        stream.owner_task.cancel('original watcher Stop')
+        # A native caller can consume asyncio's one-shot cancellation before
+        # the canonical lifecycle join. The original completion receipt must
+        # already retain the actual outer Task result for every later reader.
+        try:
+            await stream.owner_task
+        except asyncio.CancelledError:
+            pass
+        terminal = await await_owned_task(stream.owner_task)
+        loop.set_task_factory(previous)
+        if kind is not None:
+            assert independent in tuple(_explicit_control_chain(terminal.error)), (
+                'Cached private cancellation hid the distinct physical watcher completion')
+        closed = await await_owned_operation(stream.aclose(), retain_originals=True)
+        for _ in range(2):
+            if kind is None:
+                assert closed.error is closed.cancellation is None
+            else:
+                assert independent in tuple(_explicit_control_chain(closed.error))
+            # Raw close is idempotent. Its canonical owner join, also used by
+            # the public execution forwarder, retains every original failure.
+            closed = await stream.join_source_owners(closing=True)
+        assert handle.closed and len(attempts) == 1
+        assert owned_task_error(stream.owner_task) is terminal.error
+    finally:
+        loop.set_task_factory(previous)
+        release.set()
         if stream is not None:
             await await_owned_operation(stream.aclose(), retain_originals=True)
         handle.close()

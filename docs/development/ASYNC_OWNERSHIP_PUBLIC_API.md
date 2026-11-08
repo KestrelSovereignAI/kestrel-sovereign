@@ -55,12 +55,21 @@ task behind a start gate. Cancellation before the first task step cannot erase
 the original admission failure, even if that diagnostic cache is unavailable.
 Multiple failed publications compose into that same receipt. Its terminal
 snapshot also reconciles the physical task exception, so an earlier diagnostic
-body-error cache cannot hide a later completion-publication failure.
+body-error cache cannot hide a later completion-publication failure. The original
+creator's first completion callback captures even a cancelled physical Task,
+before an unrelated native await can consume its original exception. All later
+readers use that one terminal receipt and the creator's original error policy.
 Iterator terminal inspection uses that same canonical task reader, including
 completion failures raised after the source has already physically closed.
 Cancellation observers retain the exact private Stop they actually received.
 A callback publication or completion failure does not become private Stop by
 sharing its exception class, including before the observer's first task step.
+Observation-publication cancellations carry an explicit publication wrapper with
+the exact original cause. A pending cancellation request alone cannot authenticate
+that synchronous failure as a delivered Stop. A borrowed observer's publication
+failure cannot interrupt the producer it does not own. Joins reconcile pre-first-
+step Stop even before the scheduled done callback runs. Repeated owner joins
+retain the same failures without repeating physical source close.
 
 A custom task factory can make allocation ambiguous. If construction raises
 and the original native task registry cannot identify exactly one accepted
