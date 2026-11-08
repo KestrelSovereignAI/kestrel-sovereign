@@ -1025,6 +1025,7 @@ class TestAgentCancellation:
         agent._prune_pending_request_cancellations = KestrelAgent._prune_pending_request_cancellations.__get__(agent)
         agent._consume_pending_request_cancellation = KestrelAgent._consume_pending_request_cancellation.__get__(agent)
         agent.bind_request_operation = KestrelAgent.bind_request_operation.__get__(agent)
+        agent.capture_request_operation_binding = KestrelAgent.capture_request_operation_binding.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)
         agent.wait_for_request_completion = KestrelAgent.wait_for_request_completion.__get__(agent)
         agent._resolve_request_completion = KestrelAgent._resolve_request_completion.__get__(agent)
@@ -1211,7 +1212,16 @@ class TestAgentCancellation:
         )
         assert "Request stopped" in await anext(stream)
 
-        eof = asyncio.create_task(anext(stream))
+        eof_started = asyncio.Event()
+
+        async def advance_to_eof():
+            eof_started.set()
+            return await anext(stream)
+
+        eof = asyncio.create_task(advance_to_eof())
+        # The producer can enter cleanup before the stop notice is consumed.
+        # Its event alone does not prove this new EOF Task took its first step.
+        await asyncio.wait_for(eof_started.wait(), timeout=1)
         await asyncio.wait_for(inner_cleanup_started.wait(), timeout=1)
         assert completion.done() is False
 

@@ -924,8 +924,6 @@ class OwnedAsyncIterator(Generic[_T]):
             # this one construction transaction, including the first callback.
             self._consumer_close.owner = self._owner
             self._owner.add_done_callback(self._publish_owner_completion)
-            if owner_started is not None:
-                owner_started(self, self._owner)
             self._cancellation_owner = create_owned_task(
                 self._watch_owner_cancellation(),
                 name=f"owned_async_iterator_cancel:{operation}",
@@ -934,6 +932,8 @@ class OwnedAsyncIterator(Generic[_T]):
             self._cancellation_owner.add_done_callback(
                 self._interrupt_if_watch_never_started
             )
+            if owner_started is not None:
+                owner_started(self, self._owner)
         except BaseException as error:
             self._owner = self._owner if self._owner is not None else owner_admission.task
             self._cancellation_owner = (self._cancellation_owner if self._cancellation_owner is not None

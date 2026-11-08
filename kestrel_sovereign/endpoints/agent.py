@@ -37,7 +37,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
-    bind_request_operation_if_supported,
+    capture_request_operation_binding_if_supported,
 )
 from kestrel_sovereign.api_errors import (
     ApiHTTPException,
@@ -965,9 +965,11 @@ async def stream_agent_response(request: Request):
             body=data,
         )
         await prime_durable_stop_fence(request, agent, request_id)
+        operation_binding = None
         if hasattr(agent, "register_active_request"):
             register_request_delivery(agent, request_id, nested=False)
             request_lifecycle_registered = True
+            operation_binding = capture_request_operation_binding_if_supported(agent, request_id)
             await_admission = getattr(
                 type(agent), "await_durable_request_admission", None
             )
@@ -1051,11 +1053,9 @@ async def stream_agent_response(request: Request):
                     cleanup_requested=lambda: agent.is_request_cancelled(
                         request_id
                     ),
-                )
-                bind_request_operation_if_supported(
-                    agent,
-                    request_id,
-                    agent_stream.owner_task,
+                    owner_started=(None if operation_binding is None else
+                        lambda iterator, task: operation_binding(
+                            task, cancel_via=iterator.owner_task)),
                 )
                 async for chunk in agent_stream:
                     # Check if request was cancelled

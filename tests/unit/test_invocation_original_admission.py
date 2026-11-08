@@ -57,7 +57,7 @@ async def test_kite_endpoint_retires_original_observation_before_registration(
     class RefusedCallback(asyncio.Task):
         def add_done_callback(self, callback, *, context=None):
             target = (getattr(callback, "__name__", "") == "close_unstarted" if mode.startswith("canonical")
-                      else getattr(callback, "__qualname__", "").endswith("bind_request_operation.<locals>.release"))
+                      else getattr(callback, "__qualname__", "").endswith("capture_request_operation_binding.<locals>.publish.<locals>.release"))
             if target and mode != "binding":
                 if mode.endswith("-after"):
                     super().add_done_callback(callback, context=context)
@@ -174,7 +174,7 @@ async def test_invocation_admission_retires_exact_original_child_and_registratio
 
     class RefusedBindingCallback(asyncio.Task):
         def add_done_callback(self, callback, *, context=None):
-            if mode.startswith("callback") and getattr(callback, "__qualname__", "").endswith("bind_request_operation.<locals>.release"):
+            if mode.startswith("callback") and getattr(callback, "__qualname__", "").endswith("capture_request_operation_binding.<locals>.publish.<locals>.release"):
                 if mode == "callback-after":
                     super().add_done_callback(callback, context=context)
                 raise refusal

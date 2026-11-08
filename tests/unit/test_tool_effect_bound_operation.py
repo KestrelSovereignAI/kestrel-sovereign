@@ -1419,3 +1419,70 @@ async def test_nested_terminal_fences_parent_before_native_retirement(bound_oper
         assert witness.read_text() == 'parent effect while original nested work is retiring'
         assert 'later_error' not in seen and 'root_error' not in seen
     assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
+
+
+async def test_copied_request_generation_cannot_detach_original_journal(bound_operation):
+    from contextvars import copy_context
+    from kestrel_sovereign.agent.invocation import invocation_scope
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from kestrel_sovereign.tools.effect_invocation import journal_async_invocation
+    from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+    from tests.unit.test_tool_effect_invocation import governed
+    host, _binding, witness = bound_operation
+    copied_id = 'copied-generation-without-original-input-task'
+
+    async def effect():
+        witness.write_text('copied generation forged a fresh journal')
+        return 'unadmitted'
+
+    @journal_async_invocation
+    async def unregistered(agent, user_input, *, invocation_id=None):
+        return await execute_tool_effect(agent, registration='forged-independent-input', arguments={}, execute=effect)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        copied = copy_context()
+        # The genuine registrar is THIS Task. The raw child inherits a real
+        # active generation but owns neither its registration nor an admitted
+        # operation in that generation's canonical native inventory.
+        generation = copied.run(agent.register_active_request, copied_id, nested=False)
+
+        async def raw_child():
+            with invocation_scope(copied_id):
+                return await unregistered(agent, 'copied input', invocation_id=copied_id)
+
+        child = copied.run(asyncio.create_task, raw_child())
+        try:
+            with pytest.raises(ExecutionAuthorityError, match='original native privacy lifetime'):
+                await child
+        finally:
+            agent._cleanup_cancelled_request(copied_id, generation=generation)
+        assert not witness.exists()
+        assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (1,)
+
+    await invoke(host, 'original parent input', invocation_id='original-before-copied-generation')
+
+
+@pytest.mark.parametrize('changed', [False, True], ids=['same-input', 'changed-input'])
+async def test_independent_copied_input_key_cannot_reuse_live_parent_journal(bound_operation, changed):
+    from tests.unit.test_tool_effect_invocation import governed
+    host, _binding, witness = bound_operation
+    entered, original_owner = [], []
+    same_key = 'original-live-input-key'
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        if original_owner:
+            entered.append(user_input)
+            return 'unadmitted duplicate body'
+        original_owner.append(asyncio.current_task())
+        # A genuine new request operation must readmit this retry key, even
+        # when it inherited the parent's matching id/generation ContextVars.
+        child = asyncio.create_task(invoke(agent, 'changed input' if changed else user_input,
+            invocation_id=same_key))
+        with pytest.raises(ToolEffectOperationConflict if changed else ToolEffectReconciliationRequired):
+            await child
+        assert entered == [] and not witness.exists()
+        assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (1,)
+
+    await invoke(host, 'original input', invocation_id=same_key)

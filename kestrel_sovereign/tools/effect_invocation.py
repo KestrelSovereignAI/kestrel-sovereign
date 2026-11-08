@@ -140,7 +140,9 @@ async def _open_journal_turn(owner, arguments, route):
     if generation is None:
         raise ToolEffectJournalUnavailable('tool_effect_generation_unavailable')
     turn, parent_claim = current_tool_effect_state(owner)
-    root = turn is None or (turn.invocation_id, turn.generation) != (invocation_id, generation)
+    root = (turn is None
+        or (turn.invocation_id, turn.generation) != (invocation_id, generation)
+        or turn.privacy_lock.current_native_scope() is not turn.privacy_scope)
     if root:
         from kestrel_sovereign.agent.runtime_start import (
             require_input_storage_ready, require_runtime_start_allowed,
@@ -158,10 +160,20 @@ async def _open_journal_turn(owner, arguments, route):
         )
         if provenance is not None and provenance.input_digest is not None:
             request = dict(route=provenance.source_locator, input_digest=provenance.input_digest)
-        turn = await admit_tool_effect_turn(owner, namespace=_operation_namespace(),
-            client_key=(provenance.operation_key if provenance is not None
-                        and provenance.operation_key is not None else invocation_id),
-            request=request, invocation_id=invocation_id)
+        # A separately admitted input can inherit stale business context
+        # without belonging to its parent's native lifetime. Detach only at
+        # this input boundary, using the original request Task inventory.
+        # Nested native members and direct copied-context admissions retain
+        # the central parent's live/uncertainty checks.
+        independent = (turn is not None
+            and turn.privacy_lock.current_native_scope() is None
+            and owner._request_generation_for_current_task(
+                invocation_id, original_only=True) == generation)
+        with bind_tool_effect_turn((None, None)) if independent else nullcontext():
+            turn = await admit_tool_effect_turn(owner, namespace=_operation_namespace(),
+                client_key=(provenance.operation_key if provenance is not None
+                            and provenance.operation_key is not None else invocation_id),
+                request=request, invocation_id=invocation_id)
         if turn is not None:
             turn.generation = generation
     elif turn is not None:

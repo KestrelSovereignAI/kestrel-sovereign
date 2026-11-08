@@ -2311,3 +2311,20 @@ same fence. Claim-free SDK unknowns therefore cannot close a nested operation
 and then resume an unfenced parent, even on the same original Task or while
 native retirement remains pending. Repeated publication retains one original
 terminal carrier; known refusals remain recoverable.
+
+An independent input detaches inherited business context only when no original
+native privacy lifetime belongs to its executing Task and the canonical request
+registration/bound-operation inventory proves that exact Task owns its active
+delivery. Registration records its original Task weakly; a copied generation or
+an agent-global active projection grants no such ownership. Actual nested native
+members retain their parent's fence. Matching copied retry ids/generations also
+cannot reuse a live journal from another Task: a fresh input must readmit the
+original durable key and honor OPEN/reconciliation and input-conflict refusal.
+Publishing a request-operation binding also requires an original active owner;
+a copied requester cannot add itself to that authority-bearing inventory.
+An original requester may explicitly capture a revocable binding publisher for
+its response driver. The iterator publishes its actual producer before opening
+the payload gate. The same inventory pairs that producer with its cancellation
+task, so Stop retains the existing final-item/cleanup handshake. Publication
+uses the captured delivery's cancellation generation and expires with that
+registration; it grants no input ownership to the foreign response driver.
