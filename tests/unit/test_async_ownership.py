@@ -283,6 +283,38 @@ async def test_native_original_policy_keeps_caused_cancellation_without_changing
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retain_originals", [False, True])
+async def test_original_policy_applies_to_native_outer_completion(tmp_path, retain_originals):
+    cause = ValueError("original physical epilogue failure")
+    cancellation = asyncio.CancelledError("original physical outer completion")
+    effect = tmp_path / "original-native-outer-effect"
+    owners = []
+    async def operation():
+        effect.write_text("original effect completed once")
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        async def physical():
+            await coroutine
+            raise cancellation from cause
+        task = asyncio.Task(physical(), loop=loop, **options)
+        owners.append(task)
+        return task
+    try:
+        loop.set_task_factory(factory)
+        owner = create_owned_task(operation(), retain_originals=retain_originals)
+        loop.set_task_factory(previous)
+        outcome = await await_owned_task(owner)
+        assert outcome.error is (cancellation if retain_originals else cause), (
+            "Original admission policy was lost at the native outer completion")
+        assert (await await_owned_task(owner)).error is outcome.error
+        assert effect.read_text() == "original effect completed once" and len(owners) == 1 and owner.done()
+    finally:
+        loop.set_task_factory(previous)
+        for owner in owners:
+            await await_owned_task(owner)
+
+
+@pytest.mark.asyncio
 async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage():
     consumer = asyncio.current_task()
     sources = []

@@ -125,6 +125,10 @@ HTTP, Bridge and cognition dispatch use the shared tool terminal classifier
 before acknowledging typed Stop or owner loss. SDK effect uncertainty and
 unconfirmed audit evidence remain terminal even when carried by cancellation.
 The existing structured tool-error response retains its original explicit cause.
+Formatting and consuming that response cannot complete an uncertain request:
+the same terminal evidence remains available through physical stream cleanup,
+request disposition and the speech-drain handoff. Direct decorated invocations
+and generators use the same terminal classifier for their own registrations.
 
 If publication of the original completion callback is refused, a foreign native
 await may consume an independent cancelled completion before Core can capture it.

@@ -31,7 +31,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.execution_custody import (
-    execution_terminal_error, is_execution_control_error, is_tool_execution_terminal_error,
+    execution_observation_error, execution_terminal_error,
+    is_execution_control_error, is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.endpoints.agent_helpers import (
     cancelled_invocation_http_error,
@@ -395,6 +396,7 @@ def get_router() -> APIRouter:
             response_body_started = True
             full_response = []
             agent_stream = None
+            handled_terminal_error = None
 
             def stopped_event() -> str:
                 stopped_data = json.dumps(
@@ -528,6 +530,8 @@ def get_router() -> APIRouter:
             except Exception as e:
                 if is_execution_control_error(e):
                     raise
+                if is_tool_execution_terminal_error(e):
+                    handled_terminal_error = e
                 # The SSE client gets only the stable safe payload built by
                 # the same shared boundary /api/agent/stream uses.  Logging
                 # also remains content-safe for gateway-provided input.
@@ -542,7 +546,7 @@ def get_router() -> APIRouter:
                 )
                 yield bridge_sse_error_event(e)
             finally:
-                active_error = sys.exception()
+                active_error = execution_observation_error(sys.exception(), handled_terminal_error)
                 control_failed = active_error is not None and is_tool_execution_terminal_error(active_error)
                 agent_stream_cleanup_failed = False
                 try:

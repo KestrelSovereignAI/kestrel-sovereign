@@ -26,6 +26,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
     execution_terminal_error, is_execution_control_error, execution_commit_outcome,
+    is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
@@ -509,8 +510,8 @@ def bind_async_invocation(
 
                 async def preserve_failed_effects(error: BaseException) -> None:
                     nonlocal cleanup_abandoned
-                    if is_execution_control_error(error):
-                        # Authority/commit control can arrive during owned
+                    if is_tool_execution_terminal_error(error):
+                        # Terminal uncertainty can arrive during owned
                         # cleanup, before a tool marks completion. Retain the
                         # exact lifecycle identity without acknowledging Stop.
                         cleanup_abandoned = True
@@ -701,7 +702,6 @@ def bind_async_invocation(
                             # Preserve native irreversible/control evidence
                             # before checkpointing or classifying typed Stop.
                             from kestrel_sovereign._async_ownership import owned_task_cancellation_error
-                            from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
                             original = owned_task_cancellation_error(isolated_operation, error)
                             if original is not None:
                                 # The creator's completion receipt may already
@@ -957,7 +957,7 @@ def bind_async_generator_invocation(
                 finally:
                     active_error = sys.exception()
                     source_close_error = None
-                    if active_error is not None and is_execution_control_error(active_error):
+                    if active_error is not None and is_tool_execution_terminal_error(active_error):
                         cleanup_abandoned = True
                     try:
                         with _exact_invocation_scope(
@@ -971,7 +971,7 @@ def bind_async_generator_invocation(
                                     await close_iterator()
                             except BaseException as close_error:
                                 source_close_error = close_error
-                                if is_execution_control_error(close_error):
+                                if is_tool_execution_terminal_error(close_error):
                                     cleanup_abandoned = True
                                 raise execution_terminal_error(active_error, source_close_error)
                             finally:

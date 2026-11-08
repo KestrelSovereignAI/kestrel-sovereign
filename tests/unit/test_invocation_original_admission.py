@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign._async_ownership import await_owned_operation, await_owned_task, create_owned_task
 from kestrel_sovereign.agent.invocation import bind_async_invocation
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from tests.unit.test_cleanup_task_admission import _partial_native_agent
@@ -246,9 +246,11 @@ async def test_invocation_admission_retires_exact_original_child_and_registratio
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", [None, "plain", "unknown", "committed", "sdk", "audit"])
+@pytest.mark.parametrize("kind,stop", [(kind, False)
+    for kind in (None, "plain", "unknown", "committed", "sdk", "audit")]
+    + [("sdk", True), ("audit", True)])
 async def test_isolated_invocation_recovers_original_terminal_cancellation_receipt(
-    tmp_path, monkeypatch, kind,
+    tmp_path, monkeypatch, kind, stop,
 ):
     from kestrel_sdk.resources import ResourceOutcomeUnknown
     from kestrel_sovereign.execution_custody import (
@@ -263,9 +265,13 @@ async def test_isolated_invocation_recovers_original_terminal_cancellation_recei
             else ToolAuditUnconfirmedError("original audit acknowledgement unknown") if kind == "audit"
             else ExecutionCommitOutcomeError(kind))
 
+    generations = []
     @bind_async_invocation("request_id", track_request_lifecycle=True)
     async def invoke(self, request_id=None):
         await db.execute("INSERT INTO original_invocation_receipt_effects VALUES (1)")
+        generations.append(agent._active_request_generations[request_id])
+        if stop:
+            assert agent.cancel_current_request(request_id)
         if kind is not None:
             raise original
         return "original invocation completed"
@@ -281,6 +287,10 @@ async def test_isolated_invocation_recovers_original_terminal_cancellation_recei
                 "Isolated invocation replaced its original terminal cancellation with typed Stop")
         assert await db.fetchval("SELECT COUNT(*) FROM original_invocation_receipt_effects") == 1
         assert not any(vars(agent).get("_request_operation_tasks", {}).values())
+        disposition = await agent.wait_for_request_completion("original-terminal-receipt", generation=generations[0])
+        assert disposition is (RequestCompletionDisposition.ABANDONED
+            if kind in {"unknown", "committed", "sdk", "audit"} else RequestCompletionDisposition.COMPLETED), (
+                "Original invocation uncertainty was retired as successful completion")
     finally:
         await agent.llm_service.close()
         await db.close()
@@ -376,5 +386,130 @@ async def test_ordinary_endpoint_preserves_original_tool_uncertainty_after_stop(
                 "Ordinary endpoint acknowledged Stop while original tool uncertainty remained")
         assert await db.fetchval("SELECT COUNT(*) FROM ordinary_original_receipt_effects") == 1
     finally:
+        await agent.llm_service.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "bridge", "direct"])
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+async def test_formatted_stream_terminal_retains_actual_abandoned_generation(tmp_path, monkeypatch, transport, kind):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.agent.invocation import bind_async_generator_invocation
+    from kestrel_sovereign.endpoints.agent import stream_agent_response
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    from kestrel_sovereign.features.bridge.feature import BridgeFeature
+    from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+    from kestrel_sovereign.features.bridge.router import get_router
+    from kestrel_sovereign.streams.tap import AgentStreamTap
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    await db.execute("CREATE TABLE formatted_stream_original_effects (id INTEGER)")
+    request_id = "formatted-original-terminal"
+    original = (ResourceOutcomeUnknown("private original tool outcome uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("private original audit outcome uncertain"))
+    generations = []
+    async def process_input_streaming(self, user_input, *, request_id=None, **kwargs):
+        generations.append(agent._active_request_generations[request_id])
+        await db.execute("INSERT INTO formatted_stream_original_effects VALUES (1)")
+        yield "original partial text"
+        if kind is not None:
+            raise original
+    # The direct component owns its decorated registration. Endpoint cases
+    # exercise their own actual registration without a nested decorator that
+    # could independently preserve the same abandoned-generation tombstone.
+    if transport == "direct":
+        process_input_streaming = bind_async_generator_invocation(
+            "request_id", track_request_lifecycle=True)(process_input_streaming)
+    monkeypatch.setattr(agent, "process_input_streaming", process_input_streaming.__get__(agent, type(agent)))
+    AgentStreamTap.reset()
+    tap = AgentStreamTap.get_instance()
+    response = None
+    try:
+        if transport == "direct":
+            async def consume():
+                return [frame async for frame in agent.process_input_streaming("work", request_id=request_id)]
+            outcome = await await_owned_operation(consume(), retain_originals=True)
+            if kind is None:
+                assert outcome.error is outcome.cancellation is None
+                assert outcome.result == ["original partial text"]
+            else:
+                assert original in tuple(_explicit_control_chain(outcome.error))
+            assert await agent.wait_for_request_completion(request_id, generation=generations[0]) is (
+                RequestCompletionDisposition.COMPLETED if kind is None else RequestCompletionDisposition.ABANDONED), (
+                    "Standalone stream uncertainty retired its actual generation as COMPLETED")
+            assert await db.fetchval("SELECT COUNT(*) FROM formatted_stream_original_effects") == 1
+            return
+        request = _invocation_request(agent, {"input": "work", "request_id": request_id})
+        if transport == "bridge":
+            bridge = BridgeFeature(agent)
+            await bridge.initialize()
+            agent.features["BridgeFeature"] = bridge
+            route = next(route for route in get_router().routes if getattr(route, "path", None) == "/api/bridge/stream")
+            endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+            response = await endpoint(request, BridgeRequest(message="work", request_id=request_id))
+        else:
+            endpoint = getattr(stream_agent_response, "__wrapped__", stream_agent_response)
+            response = await endpoint(request)
+        frames = [frame async for frame in response.body_iterator]
+        wire = "".join(frame.decode() if isinstance(frame, bytes) else frame for frame in frames)
+        assert "original partial text" in wire
+        if kind is not None:
+            assert "uncertain" in wire.lower() and "private original" not in wire
+        if transport == "http":
+            delivery = response.headers["X-Stream-Delivery-ID"]
+            assert tap._requests[delivery].drain_retained is (kind is None), (
+                "Formatted terminal uncertainty retained successful speech drain custody")
+            tap.unregister(delivery)
+        disposition = await agent.wait_for_request_completion(request_id, generation=generations[0])
+        assert disposition is (RequestCompletionDisposition.COMPLETED if kind is None
+            else RequestCompletionDisposition.ABANDONED), (
+                "Formatted terminal uncertainty retired its actual request generation as COMPLETED")
+        assert await db.fetchval("SELECT COUNT(*) FROM formatted_stream_original_effects") == 1
+    finally:
+        if response is not None:
+            await await_owned_operation(response.body_iterator.aclose(), retain_originals=True)
+        AgentStreamTap.reset()
+        await agent.llm_service.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+async def test_direct_stream_close_uncertainty_preserves_actual_generation(tmp_path, monkeypatch, kind):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.agent.invocation import bind_async_generator_invocation
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    await db.execute("CREATE TABLE direct_stream_close_effects (phase TEXT)")
+    request_id = "original-direct-stream-close"
+    original = (ResourceOutcomeUnknown("original source close effect uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original source close audit uncertain"))
+    generations = []
+    @bind_async_generator_invocation("request_id", track_request_lifecycle=True)
+    async def source(self, request_id=None):
+        generations.append(agent._active_request_generations[request_id])
+        try:
+            await db.execute("INSERT INTO direct_stream_close_effects VALUES ('body')")
+            yield "original body"
+        finally:
+            await db.execute("INSERT INTO direct_stream_close_effects VALUES ('close')")
+            if kind is not None:
+                raise original
+    iterator = source(agent, request_id=request_id)
+    try:
+        assert await anext(iterator) == "original body"
+        closed = await await_owned_operation(iterator.aclose(), retain_originals=True)
+        if kind is None:
+            assert closed.error is closed.cancellation is None
+        else:
+            assert original in tuple(_explicit_control_chain(closed.error))
+        assert await agent.wait_for_request_completion(request_id, generation=generations[0]) is (
+            RequestCompletionDisposition.COMPLETED if kind is None else RequestCompletionDisposition.ABANDONED), (
+                "Original stream close uncertainty was retired as successful completion")
+        assert await db.fetchval("SELECT COUNT(*) FROM direct_stream_close_effects") == 2
+    finally:
+        await await_owned_operation(iterator.aclose(), retain_originals=True)
         await agent.llm_service.close()
         await db.close()

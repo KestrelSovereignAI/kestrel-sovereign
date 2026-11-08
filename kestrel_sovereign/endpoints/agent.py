@@ -59,6 +59,7 @@ from kestrel_sovereign.endpoints.closing_streaming_response import (
     ClosingStreamingResponse,
 )
 from kestrel_sovereign.execution_custody import (
+    execution_observation_error,
     execution_terminal_error,
     is_execution_control_error,
     is_tool_execution_terminal_error,
@@ -1033,6 +1034,7 @@ async def stream_agent_response(request: Request):
             # append "Request stopped" to an already-delivered answer.
             response_chunk_yielded = False
             agent_stream = None
+            handled_terminal_error = None
             try:
                 if agent.is_request_cancelled(request_id) is True:
                     yield (
@@ -1127,6 +1129,8 @@ async def stream_agent_response(request: Request):
             except Exception as e:
                 if is_execution_control_error(e):
                     raise
+                if is_tool_execution_terminal_error(e):
+                    handled_terminal_error = e
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation
                 # in the operator log; the client receives the shared safe
@@ -1151,7 +1155,9 @@ async def stream_agent_response(request: Request):
                     )
                     yield agent_stream_error_block(e)
             finally:
-                active_error = sys.exception()
+                # A formatted frame can be consumed normally; its original
+                # terminal uncertainty still governs retirement and speech.
+                active_error = execution_observation_error(sys.exception(), handled_terminal_error)
                 control_failed = active_error is not None and is_tool_execution_terminal_error(active_error)
                 agent_stream_cleanup_failed = False
                 source_cleanup_error = None
