@@ -130,6 +130,11 @@ Genuine source cancellation remains visible even after terminal delivery; only
 the iterator's own requested close interruption can be suppressed. The shared
 terminal classifier also preserves SDK effect uncertainty. A bare work refusal
 is not a physical close failure, but its cause cannot hide an uncertain effect.
+Source unwinding, cancellation observation, and requested-close suppression use
+the same terminal classifier. Once the source has handled its private close
+interruption, a later completion-publication failure is independent evidence,
+including a plain cancellation. A prior cancellation request cannot acknowledge
+that later failure away. Terminal inspection reads the original task receipt.
 Writer restoration preserves a collected physical-close result alongside a
 later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
 original admission failure; the closer observes the canonical source-owner

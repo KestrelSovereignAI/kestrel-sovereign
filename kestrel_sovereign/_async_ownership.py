@@ -1041,12 +1041,8 @@ class OwnedAsyncIterator(Generic[_T]):
 
         if not self._owner.done():
             return None
-        if self._terminal_error is not None:
-            return self._terminal_error
-        try:
-            return self._owner.exception()
-        except asyncio.CancelledError as error:
-            return error
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        return execution_observation_error(self._terminal_error, owned_task_error(self._owner))
 
     @property
     def producer_task(self) -> asyncio.Task[None]:
@@ -1112,8 +1108,8 @@ class OwnedAsyncIterator(Generic[_T]):
                 # remains owned by this iterator and is harvested below.
                 raise outcome.error
         except asyncio.CancelledError as error:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-            if is_execution_control_error(error):
+            from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+            if is_tool_execution_terminal_error(error):
                 raise
             if self._owner.done():
                 return
@@ -1146,13 +1142,13 @@ class OwnedAsyncIterator(Generic[_T]):
         """Retain the source AND its original cancellation observer outcomes."""
         from kestrel_sovereign.execution_custody import (
             ExecutionAuthorityError, execution_commit_outcome, execution_cleanup_debts,
-            _explicit_control_chain, execution_observation_error, is_execution_control_error,
+            _explicit_control_chain, execution_observation_error,
             is_tool_execution_terminal_error,
         )
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
-        if issubclass(type(watcher_error), asyncio.CancelledError) and not is_execution_control_error(watcher_error):
+        if issubclass(type(watcher_error), asyncio.CancelledError) and not is_tool_execution_terminal_error(watcher_error):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
         terminal, owner_error = self._terminal_error, outcome.error
         body_only = (terminal is not None
@@ -1178,8 +1174,9 @@ class OwnedAsyncIterator(Generic[_T]):
             execution_observation_error(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
         if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
+                and not self._interrupted_by_cleanup
                 and issubclass(type(result.error), asyncio.CancelledError)
-                and self._cleanup_error is None and not is_execution_control_error(result.error)):
+                and self._cleanup_error is None and not is_tool_execution_terminal_error(result.error)):
             return OwnedTaskOutcome(None, None, result.cancellation)
         return result
 
@@ -1231,9 +1228,9 @@ class OwnedAsyncIterator(Generic[_T]):
                 # A cancellation carrying authority/commit evidence is not
                 # our private producer interrupt, even during requested close.
                 from kestrel_sovereign.execution_custody import (
-                    is_execution_control_error,
+                    is_tool_execution_terminal_error,
                 )
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 # An exception raised while a requested close interrupts
                 # ``anext`` belongs to generator unwinding, not ordinary

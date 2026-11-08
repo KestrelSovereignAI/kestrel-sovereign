@@ -56,6 +56,8 @@ the original admission failure, even if that diagnostic cache is unavailable.
 Multiple failed publications compose into that same receipt. Its terminal
 snapshot also reconciles the physical task exception, so an earlier diagnostic
 body-error cache cannot hide a later completion-publication failure.
+Iterator terminal inspection uses that same canonical task reader, including
+completion failures raised after the source has already physically closed.
 
 A custom task factory can make allocation ambiguous. If construction raises
 and the original native task registry cannot identify exactly one accepted

@@ -9,7 +9,8 @@ from kestrel_sovereign._async_ownership import (
 )
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCommitOutcomeError, ExecutionStreamLifecycle,
-    _explicit_control_chain, execution_observation_error, execution_stream,
+    ToolAuditUnconfirmedError, _explicit_control_chain, execution_observation_error, execution_stream,
+    reserve_execution_stream,
 )
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 
@@ -292,4 +293,81 @@ async def test_original_terminal_receipt_reconciles_stale_diagnostic_cache(tmp_p
         loop.set_task_factory(previous)
         if task is not None:
             await await_owned_task(task)
+        handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase,kind', [
+    ('unwind', None), ('completion', None),
+    ('admission', None), ('admission', 'sdk'), ('admission', 'audit'),
+    ('unwind', 'sdk'), ('unwind', 'audit'),
+    ('completion', 'sdk'), ('completion', 'audit'), ('completion', 'plain'),
+])
+async def test_private_close_cannot_acknowledge_an_independent_original_failure(tmp_path, phase, kind):
+    entered, release = asyncio.Event(), asyncio.Event()
+    handle = (tmp_path / 'original-private-close-source').open('w')
+    independent = asyncio.CancelledError('distinct original completion or unwind failure')
+    if kind in {'sdk', 'audit'}:
+        independent.__cause__ = (ResourceOutcomeUnknown('original external effect uncertain')
+            if kind == 'sdk' else ToolAuditUnconfirmedError('original audit receipt uncertain'))
+    attempts, completions = [], []
+    class Source:
+        pulls = 0
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            self.pulls += 1
+            if self.pulls == 1:
+                return b'original'
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                if phase == 'unwind' and kind is not None:
+                    raise independent
+                raise
+            raise StopAsyncIteration
+        async def aclose(self):
+            attempts.append(asyncio.current_task())
+            handle.close()
+    def factory(body, context):
+        async def original():
+            if phase == 'admission':
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    if kind is not None:
+                        raise independent
+                    raise
+            await body()
+        def publish(task, error):
+            completions.append(task)
+            if phase == 'completion' and kind is not None:
+                raise independent
+        return create_owned_task(original(), context=context, retain_originals=True, on_completion=publish)
+    lifecycle = ExecutionStreamLifecycle(factory, None, lambda: None)
+    stream = (await reserve_execution_stream(None, Source(), lifecycle=lifecycle) if phase == 'admission'
+              else execution_stream(None, Source(), lifecycle=lifecycle))
+    reader = None
+    try:
+        if phase != 'admission':
+            assert await anext(stream) == b'original'
+            reader = create_owned_task(anext(stream), retain_originals=True)
+        await asyncio.wait_for(entered.wait(), 1)
+        for _ in range(2):
+            outcome = await await_owned_operation(stream.aclose(), retain_originals=True)
+            if kind is None:
+                assert outcome.error is outcome.cancellation is None
+            else:
+                assert independent in tuple(_explicit_control_chain(outcome.error)), (
+                    'Requested close erased an independent original failure')
+                assert independent in tuple(_explicit_control_chain(stream._iterator.terminal_error))
+                assert independent in tuple(_explicit_control_chain(stream.terminal_error))
+        assert handle.closed and len(attempts) == len(completions) == 1
+    finally:
+        release.set()
+        await await_owned_operation(stream.aclose(), retain_originals=True)
+        if reader is not None:
+            await await_owned_task(reader)
         handle.close()
