@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
@@ -99,7 +100,7 @@ class OwnedCallbackScope:
         for coordinator in self.coordinators:
             coordinator.register_callback_scope(self)
 
-    def start(self, operation, *, name=None):
+    def start(self, operation, *, name=None, on_completion=None):
         if self.closed:
             raise RuntimeError("native callback admission is closed")
         if len(self.factories) > 1:
@@ -112,8 +113,8 @@ class OwnedCallbackScope:
                 raise opening
             return await operation()
 
-        task = (self.factories[0](run, name=name) if self.factories else
-                create_owned_task(run(), name=name, retain_originals=True))
+        task = (self.factories[0](run, name=name, on_completion=on_completion) if self.factories else
+                create_owned_task(run(), name=name, retain_originals=True, on_completion=on_completion))
         # Physical acceptance precedes cohort publication. Keep that exact
         # owner even when an observer/coordinator refuses its publication.
         self.tasks.add(task)
@@ -249,7 +250,7 @@ def _retain_owned_admission_error(task, error):
 
 
 def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
-                      retirement_resource=None, loop=None, admission=None):
+                      retirement_resource=None, loop=None, admission=None, on_completion=None):
     """Capture the original carrier inside a child before asyncio can erase it.
 
     Creation retains normal copied-context semantics. The caller still owns
@@ -275,6 +276,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     unstarted_closed = False
     async def run():
         nonlocal started
+        observed = None
         try:
             if gate is not None:
                 opening = await gate
@@ -294,18 +296,39 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 execution_observation_error,
                 retained_execution_error,
             )
-            task = asyncio.current_task()
-            cached = getattr(task, "_kestrel_owned_terminal_error", None)
-            terminal = retained_execution_error(
-                execution_observation_error(cached, error)
-                if cached is not None and cached is not error else
-                execution_terminal_error(error, retain_originals=retain_originals)
-            )
+            observed = error
             try:
-                task._kestrel_owned_terminal_error = terminal
+                task = asyncio.current_task()
+                cached = getattr(task, "_kestrel_owned_terminal_error", None)
+                observed = retained_execution_error(
+                    execution_observation_error(cached, error)
+                    if cached is not None and cached is not error else
+                    execution_terminal_error(error, retain_originals=retain_originals)
+                )
+                task._kestrel_owned_terminal_error = observed
             except BaseException as publication:
-                raise execution_observation_error(terminal, publication)
+                observed = execution_observation_error(observed, publication)
+                raise observed
             raise
+        finally:
+            if on_completion is not None:
+                # This belongs to the original physical wrapper, outside its
+                # payload gate. Task callback subscription is not required to
+                # observe a failed gate, including two publication failures.
+                try:
+                    completion = on_completion(asyncio.current_task(), observed)
+                    if completion is not None:
+                        if inspect.iscoroutine(completion):
+                            completion.close()
+                        raise TypeError("native completion publisher must return synchronously with None")
+                except BaseException as publication:
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    combined = execution_observation_error(observed, publication)
+                    try:
+                        asyncio.current_task()._kestrel_owned_terminal_error = combined
+                    except BaseException as cache_error:
+                        combined = execution_observation_error(combined, cache_error)
+                    raise combined
     wrapper = run()
     def close_unstarted(_task):
         nonlocal unstarted_closed
@@ -340,6 +363,9 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         if (type(admission) is not OwnedTaskAdmission or admission.task is not None
                 or admission._acceptance_unknown):
             raise TypeError("owned admission requires a fresh original receipt")
+        if on_completion is not None and (not callable(on_completion)
+                or inspect.iscoroutinefunction(on_completion)):
+            raise TypeError("native completion publisher must be a synchronous callable")
         owner_loop = asyncio.get_running_loop()
         gate = owner_loop.create_future()
         task_factory = owner_loop.get_task_factory()

@@ -147,8 +147,11 @@ async def test_codex_registered_callback_compares_actual_original_scope(
             assert all(any(error is node for node in chain) for error in originals)
             if retirement != "public":
                 assert any(carried[0] is node for node in chain)
-            assert execution_denial_scopes(failure) == ((foreign,) if denied == "foreign"
+            observed_scopes = execution_denial_scopes(failure)
+            expected_scopes = ((foreign,) if denied == "foreign"
                 else (owner, foreign) if denied == "mixed" else (owner,))
+            assert observed_scopes is not None and len(observed_scopes) == len(expected_scopes)
+            assert {id(scope) for scope in observed_scopes} == {id(scope) for scope in expected_scopes}
             with pytest.raises(BaseException) as repeated:
                 await client.ensure_started()
             assert repeated.value is failure

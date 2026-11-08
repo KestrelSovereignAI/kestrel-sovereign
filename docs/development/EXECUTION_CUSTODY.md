@@ -2229,9 +2229,42 @@ all original errors; the originals' causes remain immutable. Native control
 and explicitly preferred caller cancellation retain their existing priority.
 
 Codex request publication stays behind the original accepted Task's gate until
-cohort, metadata, completion subscription and active-inventory publication
-succeed. A refused publication cannot dispatch the tool. Its exact accepted
-owner delivers a scoped error, remains in the original callback cohort and
-settles before that cohort retires. The adapter joins the cohort even if an
-active-inventory publication failed; ordinary scoped failures do not retire
-another thread's shared connection.
+cohort and request/active-inventory publication succeed. A refused publication
+cannot dispatch the tool. The physical wrapper owns scoped completion reporting,
+which cannot hide behind a failed payload gate or Task callback subscription.
+The exact accepted Task remains in its original callback cohort and settles
+before that cohort retires. The adapter joins the cohort even when inventory
+publication failed; ordinary scoped failures do not retire a foreign thread's
+shared connection.
+
+
+Journal seal follows physical native completion, including required audits that
+have not created business claims. The privacy coordinator owns one canonical
+join routine. Journal closure joins its actual admitting Task's accepted native
+descendants without retiring borrowed outer privacy backing or joining its
+ancestors/unrelated cohorts. Only then does the fixed original terminal writer
+capture and persist operation uncertainty. The final privacy retirement reuses
+the same join routine and additionally waits for its physical writer.
+
+An owned Task can supply a synchronous completion publisher. The canonical
+physical wrapper invokes it outside the payload start gate, after settling the
+body, even if Task callback subscriptions failed. A publisher's failure retains
+all original causes in a fresh finite envelope. Async publishers and deferred
+return values fail clearly; they cannot silently leave completion unobserved.
+Codex stores the original publisher/caller snapshot with its exact accepted Task
+in one inventory. It does not depend on fallible duplicate Task metadata or a
+second callback subscription. Connection retirement harvests that same publisher
+if cancellation prevented the Task from taking its first step. A caller snapshot
+used to classify a scoped refusal still confers no business authority.
+
+Stream-journal exit and source close use immutable finite observation composition.
+An original native closer error cannot acquire GeneratorExit or another finite
+observer's cause in its own original graph.
+
+Operation uncertainty includes the Root's original SDK unknown-outcome, native
+commit outcome and unresolved native retirement debt, even if no individual
+business claimant populated the live uncertainty list. Known claim-free
+precondition refusals still allow acknowledged clean readmission; they are not
+relabeled as uncertain business claims. Aggregated denial scopes preserve exact
+original scope identities and membership; finite composition does not promise
+a particular ordering for independent source errors.

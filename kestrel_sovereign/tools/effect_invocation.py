@@ -9,7 +9,7 @@ from kestrel_sovereign.agent.invocation import (
     current_invocation_id, current_invocation_provenance,
 )
 from kestrel_sovereign.auth import CallerContext, CallerRole, current_caller_context
-from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.execution_custody import execution_observation_error
 from kestrel_sovereign.tools.effect_journal import (
     ToolEffectJournalUnavailable, ToolEffectTurn, admit_tool_effect_turn, bind_tool_effect_turn,
     current_tool_effect_state,
@@ -226,7 +226,7 @@ def journal_async_generator_invocation(function):
                 try:
                     await iterator.aclose()
                 except BaseException as error:
-                    terminal = execution_terminal_error(terminal, error, retain_originals=True)
+                    terminal = execution_observation_error(terminal, error)
                 await state.close(terminal)
 
     return wrapped

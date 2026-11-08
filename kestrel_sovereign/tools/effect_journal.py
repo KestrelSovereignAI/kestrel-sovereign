@@ -12,11 +12,12 @@ from typing import Any, Awaitable, Callable, Iterator
 
 from kestrel_sovereign.a2a.media import encode_inline_json
 
-from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown, observed_outcome_unknown
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
-    execution_evidence_carriers, execution_observation_error, require_execution_work, is_tool_execution_terminal_error,
+    execution_cleanup_debts, execution_commit_outcome, execution_evidence_carriers,
+    execution_observation_error, require_execution_work, is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectAttempt, ToolEffectClaim, ToolEffectStore,
@@ -101,8 +102,13 @@ class ToolEffectTurn:
     privacy_lock: Any = field(init=False, repr=False)
     privacy_scope: Any = field(init=False, repr=False)
     owns_privacy_scope: bool = field(init=False, repr=False)
+    native_root: asyncio.Task = field(init=False, repr=False)
 
     def __post_init__(self):
+        native_root = asyncio.current_task()
+        if native_root is None:
+            raise RuntimeError("tool effect journal requires its original admitting Task")
+        self.native_root = native_root
         self.privacy_lock = self.owner._get_privacy_transition_lock()
         self.privacy_scope, self.owns_privacy_scope = self.privacy_lock.begin_native_scope(self)
 
@@ -141,13 +147,22 @@ class ToolEffectTurn:
                             terminal, outcome.error, outcome.cancellation,
                             prefer_cancellation=isinstance(terminal, asyncio.CancelledError),
                         )
+                # Required pre-claim audit/completion work may have no business
+                # claim in pending. Its original native owners must settle
+                # BEFORE the fixed terminal writer captures the uncertainty.
+                # Keep borrowed outer privacy backing live for that writer.
+                terminal = await self.privacy_lock.join_native_scope(
+                    self.privacy_scope, terminal, root=self.native_root)
                 try:
                     async with self.owner._get_durable_persistence_gate().shared_lock():
                         privacy = self.owner.privacy_config
                         if privacy is None:
                             raise ToolEffectJournalUnavailable("tool_effect_journal_unavailable")
                         if privacy.allows_persistent_storage():
-                            await self.store.finish(self.attempt, unconfirmed=bool(self.unconfirmed))
+                            uncertain = bool(self.unconfirmed or observed_outcome_unknown(terminal)
+                                or execution_commit_outcome(terminal) is not None
+                                or execution_cleanup_debts(terminal))
+                            await self.store.finish(self.attempt, unconfirmed=uncertain)
                 except BaseException as finish_error:
                     terminal = execution_observation_error(terminal, finish_error,
                         prefer_cancellation=isinstance(terminal, asyncio.CancelledError))

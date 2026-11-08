@@ -164,9 +164,12 @@ async def test_original_journal_error_does_not_absorb_close_observer_withdrawal(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('privacy', [False, True])
-@pytest.mark.parametrize('failure', ['start-gate', 'accepted-factory', 'completion', 'metadata', 'cohort', 'active'])
+@pytest.mark.parametrize('failure,privacy', [(failure, privacy)
+    for failure in ['start-gate', 'accepted-factory', 'completion', 'metadata', 'cohort', 'active', 'both-subscriptions', 'start-gate-before-step', 'both-subscriptions-before-step']
+    for privacy in [False, True] if failure != 'completion' or privacy])
 async def test_failed_native_codex_callback_notifies_only_its_original_turn(privacy, failure, tmp_path):
+    stop_before_step = failure.endswith('-before-step')
+    failure = failure.removesuffix('-before-step')
     loop, prior = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     original = RuntimeError('original native callback opening failure')
     allocated = []
@@ -175,22 +178,26 @@ async def test_failed_native_codex_callback_notifies_only_its_original_turn(priv
     own = client.open_turn_sink('original-thread')
     foreign = client.open_turn_sink('foreign-thread')
     lock = ReentrantTransitionLock()
+    if failure == 'metadata':
+        class RefusedRequestMetadata(dict):
+            def __setitem__(self, task, completion):
+                super().__setitem__(task, completion)
+                raise original
+        client._server_request_tasks = RefusedRequestMetadata()
 
     class FailedStartTask(asyncio.Task):
         def add_done_callback(self, callback, **kwargs):
-            if (failure == 'start-gate' and getattr(callback, '__name__', '') == 'close_unstarted'
-                    or failure == 'completion' and any(name in (getattr(getattr(callback, '__code__', None), 'co_names', ())
+            if (failure in ('start-gate', 'both-subscriptions') and getattr(callback, '__name__', '') == 'close_unstarted'
+                    or failure in ('completion', 'both-subscriptions') and (
+                        getattr(callback, '__name__', '') == 'completed'
+                        or any(name in (getattr(getattr(callback, '__code__', None), 'co_names', ())
                             + getattr(getattr(callback, '__code__', None), 'co_freevars', ()))
-                        for name in ('_server_request_done', 'report_completion'))):
+                            for name in ('_server_request_done', 'report_completion')))):
                 raise original
             return super().add_done_callback(callback, **kwargs)
-        def __setattr__(self, name, value):
-            if failure == 'metadata' and name == '_kestrel_codex_caller_scopes':
-                raise original
-            return super().__setattr__(name, value)
 
     def refuse_after_acceptance(loop, coroutine, **kwargs):
-        task = (FailedStartTask if failure in ('start-gate', 'completion', 'metadata') else asyncio.Task)(coroutine, loop=loop, **kwargs)
+        task = (FailedStartTask if failure in ('start-gate', 'completion', 'metadata', 'both-subscriptions') else asyncio.Task)(coroutine, loop=loop, **kwargs)
         allocated.append(task)
         if failure == 'accepted-factory':
             raise original
@@ -234,6 +241,9 @@ async def test_failed_native_codex_callback_notifies_only_its_original_turn(priv
                     task.cancel('dispose fixture-owned unadmitted callback')
                     await await_owned_task(task)
             assert escaped is None, 'native callback publication escaped resident dispatch'
+            if stop_before_step:
+                await client._join_server_requests()
+                assert all(task.cancelled() for task in allocated)
             for task in tuple(scope.tasks):
                 await await_owned_task(task)
             await asyncio.sleep(0)
@@ -305,3 +315,297 @@ async def test_no_claim_uncertainty_fences_reopened_operation(owner, interrupted
     assert await db.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
     fresh = await admit(owner, key='independent-new-operation')
     await fresh.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('borrowed', [False, True])
+async def test_original_preclaim_audit_settles_before_operation_seal(owner, monkeypatch, borrowed):
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
+    from kestrel_sovereign.tools.effect_journal import (
+        bind_tool_effect_turn, record_tool_effect_completion_failure,
+    )
+    from tests.unit.test_tool_effect_execution import admit
+
+    loop, prior = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    entered, release, sealing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    joined = loop.create_future()
+    original_worker = []
+    original = ResourceOutcomeUnknown('original required audit delivery unavailable')
+    store, db = owner.tool_effect_store, owner.tool_effect_store.database
+    finish = store.finish
+
+    class OriginalAuditTask(asyncio.Task):
+        def add_done_callback(self, callback, **kwargs):
+            if (original_worker and self is original_worker[0]
+                    and getattr(callback, '__name__', '') == 'mark_complete' and not joined.done()):
+                joined.set_result(None)
+            return super().add_done_callback(callback, **kwargs)
+
+    def allocate(loop, coroutine, **kwargs):
+        return OriginalAuditTask(coroutine, loop=loop, **kwargs)
+
+    async def record_seal(*args, **kwargs):
+        sealing.set()
+        return await finish(*args, **kwargs)
+
+    monkeypatch.setattr(store, 'finish', record_seal)
+    async with AsyncExitStack() as resources:
+        if borrowed:
+            await resources.enter_async_context(owner._get_privacy_transition_lock().policy_span())
+        turn = await admit(owner, key='original-pending-preclaim-audit')
+        assert turn.owns_privacy_scope is not borrowed
+
+        async def audit():
+            entered.set()
+            await release.wait()
+            await write_required_denial_audit(owner)
+            raise record_tool_effect_completion_failure(owner, original)
+
+        with bind_tool_effect_turn((turn, None)):
+            try:
+                loop.set_task_factory(allocate)
+                worker = turn.privacy_lock.start_owned_native_work(audit, acquire_span=False)
+                original_worker.append(worker)
+            finally:
+                loop.set_task_factory(prior)
+            await entered.wait()
+            closing = create_owned_task(turn.close(), retain_originals=True)
+        try:
+            # Observe the real original Task's native join, or an erroneous
+            # early Root return. Neither outcome requires a synthetic collector.
+            done, _ = await asyncio.wait((closing, joined), timeout=1,
+                return_when=asyncio.FIRST_COMPLETED)
+            made_progress = bool(done)
+            sealed_while_pending = sealing.is_set()
+        finally:
+            release.set()
+            outcome = await await_owned_task(closing)
+            worker_outcome = await await_owned_task(worker)
+        assert made_progress, 'original audit closure made no progress'
+    assert not sealed_while_pending, 'journal seal preceded its accepted preclaim audit'
+    assert any(error is original for error in execution_evidence_carriers(worker_outcome.error))
+    assert any(error is original for error in execution_evidence_carriers(outcome.error)), 'Root discarded its late original audit uncertainty'
+    assert await db.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
+    assert await db.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    assert await db.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 1)
+    with pytest.raises(ToolEffectReconciliationRequired) as refused:
+        await admit(owner, key='original-pending-preclaim-audit')
+    assert all(count == 0 for count in refused.value.counts.values())
+    assert worker.done() and closing.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['unknown', 'committed'])
+async def test_stream_journal_close_keeps_original_native_cause_immutable(owner, kind):
+    from tests.unit.test_tool_effect_invocation import governed_stream
+    original, cause = native_failure(kind)
+
+    @governed_stream
+    async def invoke(agent, user_input, *, request_id=None):
+        try:
+            yield 'original stream item'
+        finally:
+            raise original
+
+    stream = invoke(owner, 'original streaming input', request_id='original-stream-native-closer')
+    assert await anext(stream) == 'original stream item'
+    observed = None
+    try:
+        await stream.aclose()
+    except BaseException as error:
+        observed = error
+    assert observed is not None
+    assert original.__cause__ is cause, 'stream journal teardown rewrote its original native source cause'
+    assert any(error is original for error in execution_evidence_carriers(observed))
+    assert any(isinstance(error, GeneratorExit) for error in execution_evidence_carriers(observed))
+    assert await owner.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_operations') == ('CLOSED',)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['success', 'ordinary', 'unknown', 'committed', 'group'])
+async def test_original_task_completion_publisher_failure_preserves_all_sources(tmp_path, kind):
+    original, cause = (None, None) if kind == 'success' else native_failure(kind)
+    publication, publication_cause = OSError('original completion publisher failed'), ValueError('original publication cause')
+    publication.__cause__ = publication_cause
+    receipt = tmp_path / 'physically-settled-original'
+    observed = []
+
+    async def body():
+        receipt.write_text('one original physical operation')
+        if original is not None:
+            raise original
+        return 'acknowledged original result'
+
+    def publish(task, error):
+        observed.append((task, error))
+        raise publication
+
+    task = create_owned_task(body(), retain_originals=True, on_completion=publish)
+    outcome = await await_owned_task(task)
+    assert task.done() and len(observed) == 1 and observed[0][0] is task
+    assert receipt.read_text() == 'one original physical operation'
+    assert any(error is publication for error in execution_evidence_carriers(outcome.error))
+    assert publication.__cause__ is publication_cause
+    if original is not None:
+        assert any(error is original for error in execution_evidence_carriers(outcome.error))
+        assert any(error is original for error in execution_evidence_carriers(observed[0][1]))
+        assert original.__cause__ is cause
+    else:
+        assert observed[0][1] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('declared_async', [False, True])
+async def test_native_completion_publisher_must_finish_synchronously(tmp_path, declared_async):
+    receipt, observer_receipt = tmp_path / 'body', tmp_path / 'async-observer'
+    async def body():
+        receipt.write_text('body settled')
+    async def asynchronous_publication(task, error):
+        observer_receipt.write_text('invalid deferred completion')
+    def concealed_publication(task, error):
+        return asynchronous_publication(task, error)
+    task, refused = None, None
+    try:
+        task = create_owned_task(body(), on_completion=(asynchronous_publication
+            if declared_async else concealed_publication))
+        outcome = await await_owned_task(task)
+        refused = outcome.error
+    except TypeError as error:
+        refused = error
+    assert isinstance(refused, TypeError), 'native completion silently accepted an awaitable publisher'
+    assert not observer_receipt.exists()
+    assert receipt.exists() is not declared_async
+    if task is not None:
+        assert task.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['ordinary', 'unknown', 'committed'])
+async def test_original_uncertain_root_terminal_fences_claim_free_replay(owner, kind):
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
+    from tests.unit.test_tool_effect_execution import admit
+    turn = await admit(owner, key='original-root-finalization-uncertainty')
+    original, cause = native_failure(kind)
+    await write_required_denial_audit(owner)
+    assert not turn.unconfirmed
+    observed = None
+    try:
+        await turn.close(original)
+    except BaseException as error:
+        observed = error
+    assert any(error is original for error in execution_evidence_carriers(observed))
+    assert original.__cause__ is cause
+    assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
+    assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(owner, key='original-root-finalization-uncertainty')
+
+
+async def write_required_denial_audit(owner):
+    from kestrel_sovereign.a2a.stores.unified.observability_store import ToolDispatchEntry
+    await owner.observability_store.log_tool_dispatch(ToolDispatchEntry(
+        agent_did=owner.did, session_id='original-audit-session', turn_id='original-audit-turn',
+        tool_name='refused-native-tool', adapter='native-audit', args_redacted={},
+        result_status='policy_denied', error_class='PolicyDenied', error_message=None,
+        latency_ms=0, result_size_bytes=0), required=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('native', [False, True])
+async def test_known_claim_free_refusal_still_allows_acknowledged_clean_readmission(owner, native):
+    from kestrel_sdk.resources import ResourceConflict
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from tests.unit.test_tool_effect_execution import admit
+    turn = await admit(owner, key='known-safe-claim-free-refusal')
+    original = (ExecutionAuthorityError if native else ResourceConflict)('known admission refusal')
+    await write_required_denial_audit(owner)
+    with pytest.raises(type(original)) as caught:
+        await turn.close(original)
+    assert caught.value is original
+    assert await owner.tool_effect_store.database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 0)
+    assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    successor = await admit(owner, key='known-safe-claim-free-refusal')
+    await successor.close()
+
+
+@pytest.mark.asyncio
+async def test_journal_closure_joins_its_original_subtree_without_waiting_for_foreign_work(owner, tmp_path):
+    from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn
+    from tests.unit.test_tool_effect_execution import admit
+    lock = owner._get_privacy_transition_lock()
+    loop, prior = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    foreign_join = loop.create_future()
+    release_foreign, foreign_entered = asyncio.Event(), asyncio.Event()
+    foreign_owner = []
+    witness = tmp_path / 'unrelated-native-operation'
+
+    class ForeignNativeTask(asyncio.Task):
+        def add_done_callback(self, callback, **kwargs):
+            if (foreign_owner and self is foreign_owner[0]
+                    and getattr(callback, '__name__', '') == 'mark_complete' and not foreign_join.done()):
+                foreign_join.set_result(None)
+            return super().add_done_callback(callback, **kwargs)
+
+    def allocate(loop, coroutine, **kwargs):
+        return ForeignNativeTask(coroutine, loop=loop, **kwargs)
+
+    async def unrelated():
+        foreign_entered.set()
+        await release_foreign.wait()
+        witness.write_text('original unrelated native operation settled')
+
+    async def journal():
+        turn = await admit(owner, key='original-subtree-journal')
+        assert not turn.owns_privacy_scope and turn.native_root is asyncio.current_task()
+        assert turn.privacy_scope.root is not turn.native_root
+        with bind_tool_effect_turn((turn, None)):
+            turn.privacy_lock.start_owned_native_work(
+                lambda: write_required_denial_audit(owner), acquire_span=False)
+        await turn.close()
+
+    async with lock.policy_span():
+        try:
+            loop.set_task_factory(allocate)
+            foreign = create_owned_task(unrelated())
+            foreign_owner.append(foreign)
+        finally:
+            loop.set_task_factory(prior)
+        await foreign_entered.wait()
+        own = create_owned_task(journal(), retain_originals=True)
+        try:
+            await asyncio.wait((own, foreign_join), return_when=asyncio.FIRST_COMPLETED)
+            own_settled = own.done()
+            joined_foreign = foreign_join.done()
+            foreign_still_pending = not foreign.done() and not witness.exists()
+        finally:
+            release_foreign.set()
+            own_outcome = await await_owned_task(own)
+            foreign_outcome = await await_owned_task(foreign)
+    assert own_settled and not joined_foreign, 'journal closure joined an unrelated native cohort or its parent'
+    assert foreign_still_pending
+    assert own_outcome.error is foreign_outcome.error is None
+    assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
+    assert await owner.tool_effect_store.database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 0)
+    assert witness.read_text() == 'original unrelated native operation settled'
+
+
+@pytest.mark.asyncio
+async def test_copied_loop_callback_cannot_construct_an_admitting_journal_root(owner):
+    from kestrel_sovereign.tools.effect_journal import ToolEffectTurn
+    from tests.unit.test_tool_effect_execution import admit
+    turn = await admit(owner, key='original-root-task-required')
+    loop = asyncio.get_running_loop()
+    result = loop.create_future()
+    def callback():
+        try:
+            ToolEffectTurn(owner, owner.tool_effect_store, turn.attempt, 'unadmitted-loop-callback')
+        except RuntimeError as error:
+            result.set_result(error)
+        else:
+            result.set_result(None)
+    loop.call_soon(callback)
+    refused = await result
+    await turn.close()
+    assert isinstance(refused, RuntimeError)
+    assert str(refused) == 'tool effect journal requires its original admitting Task'

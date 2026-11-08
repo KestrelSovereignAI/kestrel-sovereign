@@ -650,19 +650,28 @@ class ReentrantTransitionLock:
     async def _close_span(self, pending):
         await self.close_native_scope(self._token, pending)
 
-    async def close_native_scope(self, scope, pending=None):
-        """Retire originals after their journal and protected writers settle."""
+    async def join_native_scope(self, scope, pending=None, *, root=None):
+        """Join original accepted owners without retiring their privacy backing.
+
+        A journal seals only after its own admitted descendants settle. An
+        enclosing privacy lifetime can outlive that journal; its ancestors and
+        unrelated cohorts are neither business authority nor join obligations.
+        Full privacy retirement additionally waits for its physical writer.
+        """
         if scope not in self._native_scopes:
             raise RuntimeError("native privacy lifetime is already retired")
-        scope.closing = True
+        if root is not None and self._scope_for(root, original=True) is not scope:
+            raise ExecutionAuthorityError("native join requires its original admitted root")
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
         current = asyncio.current_task()
-        if self._token is scope and self._writer is current:
-            raise RuntimeError("cannot retire a native lifetime inside its writer frame")
+        ancestors = owned_task_join_ancestors(current) if root is not None else ()
         terminal = pending
         while True:
             children = [task for task in scope.admissions
-                        if task is not current and not task.done()]
-            active_writer = self._token is scope and self._writer is not None
+                        if task is not current and not task.done()
+                        and (root is None or (task is not root and task not in ancestors
+                            and self._descends_from(task, root, scope=scope)))]
+            active_writer = root is None and self._token is scope and self._writer is not None
             if not children and not active_writer:
                 break
             for child in children:
@@ -672,12 +681,22 @@ class ReentrantTransitionLock:
                         prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
                 terminal = execution_observation_error(terminal, outcome.cancellation,
                     prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
-            if self._token is scope and self._writer is not None:
+            if root is None and self._token is scope and self._writer is not None:
                 try:
                     await self._wait_change()
                 except asyncio.CancelledError as error:
                     terminal = execution_observation_error(terminal, error,
                         prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
+        return terminal
+
+    async def close_native_scope(self, scope, pending=None):
+        """Retire originals after their journal and protected writers settle."""
+        if scope not in self._native_scopes:
+            raise RuntimeError("native privacy lifetime is already retired")
+        scope.closing = True
+        if self._token is scope and self._writer is asyncio.current_task():
+            raise RuntimeError("cannot retire a native lifetime inside its writer frame")
+        terminal = await self.join_native_scope(scope, pending)
         if self._token is scope:
             self._token = self._owner = None
             self._lock.release()
@@ -697,15 +716,15 @@ class ReentrantTransitionLock:
         parent = asyncio.current_task()
         captured = self.current_native_scope()
 
-        def start(operation, context=None, *, name="privacy-owned-native-work"):
+        def start(operation, context=None, *, name="privacy-owned-native-work", on_completion=None):
             return self.start_owned_native_work(operation, context=context, name=name,
-                acquire_span=acquire_span,
+                on_completion=on_completion, acquire_span=acquire_span,
                 _parent=parent if captured is not None else None, _span=captured)
         return start
 
     def start_owned_native_work(self, operation, *, context=None,
                                 name="privacy-owned-native-work", acquire_span=True,
-                                _parent=None, _span=None):
+                                on_completion=None, _parent=None, _span=None):
         parent = asyncio.current_task() if _parent is None else _parent
         captured = self.current_native_scope() if _span is None else _span
         if captured is not None and (
@@ -734,7 +753,7 @@ class ReentrantTransitionLock:
         opening = None
         try:
             task = create_owned_task(run(), name=name, context=context,
-                admission=admission, retain_originals=True)
+                admission=admission, retain_originals=True, on_completion=on_completion)
         except BaseException as error:
             if admission.task is None:
                 raise
