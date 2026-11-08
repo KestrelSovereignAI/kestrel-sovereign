@@ -392,8 +392,9 @@ async def test_public_reservation_defers_payload_and_joins_its_exact_original_ow
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('pull_first', [False, True], ids=['close-first', 'pull-first'])
 @pytest.mark.parametrize('concurrent', [None, False, True], ids=['single', 'repeated', 'concurrent'])
-async def test_unstarted_reserved_source_keeps_one_original_failed_close(tmp_path, concurrent):
+async def test_unstarted_reserved_source_keeps_one_original_failed_close(tmp_path, concurrent, pull_first):
     from kestrel_sovereign.execution_custody import reserve_execution_stream
     from kestrel_sovereign._async_ownership import await_owned_operation
 
@@ -443,6 +444,10 @@ async def test_unstarted_reserved_source_keeps_one_original_failed_close(tmp_pat
             lifecycle=ExecutionStreamLifecycle(original_factory, lambda *_: None, lambda: None))
     finally:
         loop.set_task_factory(previous)
+    if pull_first:
+        release.set()
+        initial = await await_owned_operation(anext(stream), retain_originals=True)
+        assert opening in tuple(_explicit_control_chain(initial.error))
     if concurrent is None:
         release.set()
     first = create_owned_task(await_owned_operation(stream.aclose(), retain_originals=True))
@@ -552,3 +557,204 @@ async def test_reserved_native_descendant_lifecycle_refuses_invalid_result_befor
         for error in _explicit_control_chain(outcome.error)), 'Invalid descendant lifecycle dispatched source payload'
     assert calls == ['close'] and handle.closed
     assert all(task.done() and iterator.owner_task.done() for iterator, task in owners)
+
+
+@pytest.mark.asyncio
+async def test_every_close_observer_parks_its_original_native_privacy_writer(tmp_path, monkeypatch):
+    from contextvars import Context
+    from kestrel_sovereign._async_ownership import OwnedOperation, owned_native_wait
+    from kestrel_sovereign.execution_custody import reserve_execution_stream
+
+    lock, entered = ReentrantTransitionLock(), asyncio.Event()
+    writer, source_owners = asyncio.current_task(), []
+    receipt = tmp_path / 'closed-original-native-source'
+    original_observe = OwnedOperation.observe
+    stream = foreign = None
+
+    async def source():
+        try:
+            yield b'original'
+        finally:
+            receipt.write_text('original source physically closed')
+
+    async def foreign_close():
+        entered.set()
+        await stream.aclose()
+
+    async def observe(operation, **options):
+        if stream is not None and operation is stream._close_operation and asyncio.current_task() is writer:
+            assert lock._writer is not writer, (
+                'Original writer observer joined a foreign closer without lending its native producer writer')
+        return await original_observe(operation, **options)
+
+    async with lock.policy_span():
+        async with lock:
+            factory = lock.capture_native_work_factory()
+            stream = await reserve_execution_stream(None, source(), lifecycle=ExecutionStreamLifecycle(
+                lambda body, context: factory(body, context=context),
+                lambda iterator, task: source_owners.append((iterator, task)), lambda: None))
+            assert await anext(stream) == b'original'
+            assert lock._writer is writer
+            monkeypatch.setattr(OwnedOperation, 'observe', observe)
+            foreign = asyncio.create_task(foreign_close(), context=Context())
+            try:
+                await entered.wait()
+                assert stream._close_operation is not None
+                await stream.aclose()
+                assert receipt.read_text() == 'original source physically closed'
+                assert lock._writer is writer
+            finally:
+                monkeypatch.setattr(OwnedOperation, 'observe', original_observe)
+                # Even a failed observation explicitly joins the SAME admitted
+                # source while lending its original writer, so RED cannot hang.
+                async with owned_native_wait(tuple(task for _, task in source_owners)):
+                    await stream.aclose()
+                await await_owned_task(foreign)
+    assert all(task.done() and iterator.owner_task.done() for iterator, task in source_owners)
+    assert not lock.locked() and not lock._native_scopes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('boundary', ['work', 'captured-backend'])
+@pytest.mark.parametrize('reserved', [False, True], ids=['lazy', 'reserved'])
+@pytest.mark.parametrize('revoke', [False, True], ids=['live', 'revoked'])
+async def test_later_stream_custody_reaches_native_child_queued_before_that_consumer(tmp_path, reserved, revoke, boundary):
+    from concurrent.futures import ThreadPoolExecutor
+    from functools import partial
+    import threading
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, ProcessRuntimeExecutionFence, bind_execution_custody_snapshot,
+        reserve_execution_stream, run_execution_blocking_operation, is_execution_control_error,
+        current_execution_custody, require_execution_backend,
+    )
+
+    loop, queued = asyncio.get_running_loop(), asyncio.Event()
+    entered, release = threading.Event(), threading.Event()
+    witness = tmp_path / 'previously-queued-native-effect'
+    children, native_operations = [], []
+    class NativeQueue(ThreadPoolExecutor):
+        def submit(self, function, /, *args, **kwargs):
+            future = super().submit(function, *args, **kwargs)
+            operation = function.args[0] if isinstance(function, partial) and function.args else None
+            if operation in native_operations or getattr(operation, '__qualname__', '').endswith('run_execution_blocking_operation.<locals>.run_original_work'):
+                loop.call_soon_threadsafe(queued.set)
+            return future
+    def occupy():
+        entered.set()
+        assert release.wait(10), 'Owned native queue was not released'
+    async def source():
+        captured = current_execution_custody()
+        def dispatch():
+            require_execution_backend('postgres', captured)
+            return witness.write_text('original queued native effect')
+        native_operations.append(dispatch)
+        if boundary == 'captured-backend':
+            from kestrel_sovereign._async_ownership import run_blocking_operation
+            operation = run_blocking_operation(dispatch)
+        else:
+            operation = run_execution_blocking_operation(None,
+                witness.write_text, 'original queued native effect')
+        child = create_owned_task(operation, retain_originals=True)
+        children.append(child)
+        try:
+            await queued.wait()
+            yield b'first'
+            yield b'second'
+        finally:
+            await await_owned_task(child)
+
+    prior_executor = loop._default_executor
+    executor, stream = NativeQueue(max_workers=1), None
+    blocker = executor.submit(occupy)
+    fence = ProcessRuntimeExecutionFence('later-consumer-of-previously-queued-child')
+    later = ExecutionCustody(fence)
+    try:
+        assert entered.wait(2), 'Owned executor did not enter its actual worker'
+        loop._default_executor = executor
+        stream = (await reserve_execution_stream(None, source()) if reserved else execution_stream(None, source()))
+        assert await anext(stream) == b'first'
+        with bind_execution_custody_snapshot((later,)):
+            assert await anext(stream) == b'second'
+        if revoke:
+            fence.retire()
+        release.set()
+        outcome = await await_owned_task(children[0])
+        if revoke:
+            assert is_execution_control_error(outcome.error), (
+                'Previously queued native child discarded a later consumer restriction')
+            assert not witness.exists(), 'Previously queued native child made an effect after later consumer retirement'
+        else:
+            assert outcome.error is None and witness.read_text() == 'original queued native effect'
+    finally:
+        release.set()
+        for child in children:
+            await await_owned_task(child)
+        if stream is not None:
+            from kestrel_sovereign._async_ownership import await_owned_operation
+            await await_owned_operation(stream.aclose(), retain_originals=True)
+        blocker.result()
+        loop._default_executor = prior_executor
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('revoke', [False, True], ids=['live', 'revoked'])
+async def test_native_validation_retains_consumer_scopes_added_during_original_lock_wait(tmp_path, monkeypatch, revoke):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, ProcessRuntimeExecutionFence, bind_execution_custody_snapshot,
+        lock_execution_authority, is_execution_control_error,
+    )
+    from kestrel_sovereign._async_ownership import await_owned_operation
+
+    first, later = [ProcessRuntimeExecutionFence(name) for name in ['original-validator', 'later-validator']]
+    first_scope, later_scope = ExecutionCustody(first), ExecutionCustody(later)
+    entered, release = asyncio.Event(), asyncio.Event()
+    observed, children = [], []
+    connection = object()  # A process fence requires no database rows or lease.
+    witness = tmp_path / 'native-validation-completed'
+    original_first, original_later = first.lock_and_validate, later.lock_and_validate
+    async def first_validation(actual):
+        assert actual is connection
+        await original_first(actual)
+        observed.append(first)
+        entered.set()
+        await release.wait()
+    async def later_validation(actual):
+        assert actual is connection
+        await original_later(actual)
+        observed.append(later)
+    monkeypatch.setattr(first, 'lock_and_validate', first_validation)
+    monkeypatch.setattr(later, 'lock_and_validate', later_validation)
+    async def child():
+        await lock_execution_authority(connection, 'postgres', (first_scope,))
+        witness.write_text('all original and later native validators completed')
+    async def source():
+        task = create_owned_task(child(), retain_originals=True)
+        children.append(task)
+        try:
+            await entered.wait()
+            yield b'first'
+            yield b'second'
+        finally:
+            await await_owned_task(task)
+    with bind_execution_custody_snapshot((first_scope,)):
+        stream = execution_stream(None, source())
+    try:
+        assert await anext(stream) == b'first'
+        with bind_execution_custody_snapshot((later_scope,)):
+            assert await anext(stream) == b'second'
+        if revoke:
+            later.retire()
+        release.set()
+        outcome = await await_owned_task(children[0])
+        if revoke:
+            assert is_execution_control_error(outcome.error) and not witness.exists()
+        else:
+            assert outcome.error is None
+            assert observed == [first, later], 'Native lock validation omitted a later consumer scope'
+            assert witness.read_text() == 'all original and later native validators completed'
+    finally:
+        release.set()
+        for task in children:
+            await await_owned_task(task)
+        await await_owned_operation(stream.aclose(), retain_originals=True)

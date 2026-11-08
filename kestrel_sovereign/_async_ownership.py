@@ -1042,7 +1042,7 @@ class OwnedAsyncIterator(Generic[_T]):
             raise StopAsyncIteration
         if marker is _ITERATOR_TERMINAL:
             self._closed = True
-            outcome = await self._join_source_owners()
+            outcome = await self.join_source_owners()
             raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
             raise StopAsyncIteration
 
@@ -1091,7 +1091,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 self._owner.cancel()
             raise
 
-    async def _join_source_owners(self):
+    async def join_source_owners(self):
         """Retain the source AND its original cancellation observer outcomes."""
         from kestrel_sovereign.execution_custody import execution_terminal_error, execution_observation_error, is_execution_control_error
         def compose(*errors):
@@ -1226,7 +1226,7 @@ class OwnedAsyncIterator(Generic[_T]):
         owner_cancelled_by_close = False
         if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
             owner_cancelled_by_close = self._owner.cancel()
-        outcome = await self._join_source_owners()
+        outcome = await self.join_source_owners()
         from kestrel_sovereign.execution_custody import is_execution_control_error
         if (
             (owner_cancelled_by_close or self._construction_error is not None)

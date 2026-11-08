@@ -879,10 +879,14 @@ def _execution_cleanup_requested() -> bool:
     )
 
 
-def current_execution_custody(owner: Any = None) -> tuple[ExecutionCustody, ...]:
-    """Capture immutable scope membership, retaining shared revocation state."""
+def current_execution_custody(
+    owner: Any = None, *, captured: tuple[ExecutionCustody, ...] | None = None,
+) -> tuple[ExecutionCustody, ...]:
+    """Read original scopes and shared, cumulative stream restrictions."""
 
-    ambient = _CURRENT_CUSTODY.get()
+    ambient = _CURRENT_CUSTODY.get() if captured is None else captured
+    for state in _STREAM_CLEANUP.get():
+        ambient += tuple(scope for scope in state.scopes if scope not in ambient)
     retained = getattr(owner, "_execution_custody", None)
     if isinstance(retained, ExecutionCustody) and retained not in ambient:
         return (retained, *ambient)
@@ -922,7 +926,7 @@ def require_execution_backend(
             _identity_anchor_access.require_live()
         except BaseException as denial:
             terminal = execution_terminal_error(terminal, denial)
-    captured = current_execution_custody() if scopes is None else scopes
+    captured = current_execution_custody(captured=scopes)
     for scope in captured:
         try:
             scope.require_work()
@@ -948,16 +952,25 @@ async def lock_execution_authority(
     connection: Any, backend_type: str,
     scopes: tuple[ExecutionCustody, ...] | None = None,
 ) -> None:
-    captured = current_execution_custody() if scopes is None else scopes
-    require_execution_backend(backend_type, captured)
-    for scope in captured:
-        try:
-            await scope.fence.lock_and_validate(connection)
-        except ExecutionAuthorityError as error:
-            scope._retain_denial(error)
-            raise
-        # Cancellation-resistant validators must not republish a lost scope.
+    captured = current_execution_custody(captured=scopes)
+    validated = set()
+    while True:
         require_execution_backend(backend_type, captured)
+        for scope in captured:
+            if scope in validated:
+                continue
+            try:
+                await scope.fence.lock_and_validate(connection)
+            except ExecutionAuthorityError as error:
+                scope._retain_denial(error)
+                raise
+            validated.add(scope)
+            # Cancellation-resistant validators must not republish a lost scope.
+            require_execution_backend(backend_type, captured)
+        latest = current_execution_custody(captured=captured)
+        if latest == captured:
+            return
+        captured = latest
 
 
 @contextmanager
@@ -1944,13 +1957,16 @@ class _ExecutionForwarder:
         # synchronously before the source owner is cancelled.
         if not self._source_exhausted:
             self._cleanup_state.requested = True
-        from kestrel_sovereign._async_ownership import OwnedOperation
+        from kestrel_sovereign._async_ownership import OwnedOperation, owned_native_wait
 
         with bind_execution_cleanup(self._runtime_owner, self._scopes):
             if self._close_operation is None:
                 self._close_operation = OwnedOperation(self._close(),
                     retirement_resource=self, retain_originals=True)
-            outcome = await self._close_operation.observe()
+            # Each observer lends its own writer to the SAME admitted source.
+            # A closer first created in a foreign context has no such admission.
+            async with owned_native_wait(() if self._iterator is None else (self._iterator.producer_task,)):
+                outcome = await self._close_operation.observe()
             error = execution_terminal_error(outcome.error, outcome.cancellation,
                 retain_originals=True, isolate_control_originals=True)
             if error is not None:
@@ -1965,6 +1981,19 @@ class _ExecutionForwarder:
                 await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
         except BaseException as caught:
             error = caught
+        if (self._iterator is not None and not self._producer_started
+                and self._iterator.producer_task.done()):
+            # A terminal pull can mark the iterator closed before raising its
+            # source failure. Observe that original producer AND watcher even
+            # when the physical aclose path has already become a no-op.
+            try:
+                outcome = await self._iterator.join_source_owners()
+            except BaseException as observation_error:
+                error = execution_terminal_error(error, observation_error,
+                    retain_originals=True, isolate_control_originals=True)
+            else:
+                error = execution_terminal_error(error, outcome.error, outcome.cancellation,
+                    retain_originals=True, isolate_control_originals=True)
         # A reserved owner can fail before entering _produce. Its completed
         # Task then cannot run the source-closing finally. Never close a source
         # concurrently with a live producer, or retry its failed physical close.

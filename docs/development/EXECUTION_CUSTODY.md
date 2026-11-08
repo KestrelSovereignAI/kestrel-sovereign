@@ -85,6 +85,14 @@ admission and physical-close failures without closing the source twice. A
 reserved producer that never entered its body is joined before its acquired
 source is closed; an entered generator advances and closes in its original Task
 and context.
+Children already queued before a later consumer retain the shared stream scope
+membership too. Work checks and explicit backend snapshots read that membership
+at dispatch; authority validation also locks scopes added during an original
+validator's wait. Every close observer lends its own privacy writer to the
+original admitted producer, independently of who created the retained close
+operation. A terminal pull before close cannot discard an unentered producer's
+original admission failure; the closer observes the canonical source-owner
+outcome without starting or closing another source.
 
 Closing journal admission uses the original native parent-admission tree of a
 retained worker, not the writer-loan wait graph. Its admitted gather children can
