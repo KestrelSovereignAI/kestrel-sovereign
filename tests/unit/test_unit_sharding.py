@@ -11,14 +11,14 @@ from tests.utils.ci_budget import CI_WORKFLOW
 from tests.utils.unit_sharding import shard_for_node, verify_manifests
 
 
-@pytest.fixture
-def actual_shard_reports(tmp_path: Path, request):
+def _run_actual_shards(tmp_path: Path, *, selectors=(), distributed=False):
     reports = tmp_path / 'reports'
     witness = tmp_path / 'executed'
+    results = []
     for index in (1, 2):
         root = tmp_path / f'run-{index}'
         root.mkdir()
-        distributed = ['-p', 'xdist.plugin', '-n', '2'] if getattr(request, 'param', False) else []
+        workers = ['-p', 'xdist.plugin', '-n', '2'] if distributed else []
         result = run_child_pytest(root, conftest='', test_file='test_owned_shards.py',
             source=f'''import pytest
 from pathlib import Path
@@ -27,16 +27,25 @@ from pathlib import Path
 def test_owned_case(case):
     with Path({str(witness)!r}).open('a') as output:
         output.write(case + '\\n')
-''', args=['-q', *distributed, '-p', 'tests.utils.unit_sharding', '--unit-shard', str(index),
-                '--unit-shard-count', '2', '--unit-shard-manifests', str(reports)], timeout=15)
+''', args=['-q', *workers, '-p', 'tests.utils.unit_sharding', '--unit-shard', str(index),
+                '--unit-shard-count', '2', '--unit-shard-manifests', str(reports), *selectors], timeout=15)
+        results.append(result)
+    return reports, witness, results
+
+
+@pytest.fixture
+def actual_shard_reports(tmp_path: Path, request):
+    reports, witness, results = _run_actual_shards(tmp_path, distributed=getattr(request, 'param', False))
+    for result in results:
         assert result.returncode == 0, result.stdout
     return reports, witness
 
 
-@pytest.mark.parametrize('actual_shard_reports', [False, True], indirect=True,
-    ids=['one-process', 'native-xdist-workers'])
-def test_actual_pytest_shards_execute_every_collected_test_once(actual_shard_reports):
-    reports, witness = actual_shard_reports
+@pytest.mark.parametrize('distributed', [False, True], ids=['one-process', 'native-xdist-workers'])
+def test_actual_pytest_shards_execute_every_collected_test_once(tmp_path, distributed):
+    reports, witness, results = _run_actual_shards(tmp_path, distributed=distributed)
+    for child in results:
+        assert child.returncode == 0, child.stdout
     result = verify_manifests(reports, 2)
     assert result == dict(complete=True, shard_count=2, worker_manifests=len(list(reports.glob('*.json'))),
         collected_tests=8, assigned_tests=8)
@@ -118,3 +127,18 @@ def test_ci_runs_and_verifies_all_unit_shards_without_widening_deadlines():
     assert coverage['needs'] == 'unit-tests'
     assert 'unit_sharding.py --verify unit-shard-manifests --count 2' in str(coverage['steps'])
     assert 'unit-shard-coverage' in jobs['a2a-go-interop']['needs']
+
+
+@pytest.mark.parametrize('selectors', [
+    ('--deselect=test_owned_shards.py::test_owned_case[alpha]',),
+    ('-k', 'not alpha'),
+], ids=['deselect', 'keyword'])
+def test_later_pytest_selection_cannot_certify_unexecuted_tests(tmp_path, selectors):
+    reports, witness, results = _run_actual_shards(tmp_path, selectors=selectors)
+    assert results[0].returncode == 4, results[0].stdout
+    assert 'Unit shard final collection changed after assignment' in results[0].stdout
+    assert results[1].returncode == 0, results[1].stdout
+    with pytest.raises(ValueError, match='Missing unit shard'):
+        verify_manifests(reports, 2)
+    assert sorted(witness.read_text().splitlines()) == sorted(
+        ['beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta'])

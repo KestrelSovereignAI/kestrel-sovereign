@@ -31,6 +31,7 @@ def pytest_collection_modifyitems(config, items):
     count = config.getoption('unit_shard_count')
     directory = config.getoption('unit_shard_manifests')
     if index is None and count is None and directory is None:
+        yield
         return
     import pytest
 
@@ -46,14 +47,17 @@ def pytest_collection_modifyitems(config, items):
     worker = getattr(config, 'workerinput', {}).get('workerid', 'controller')
     if not _valid_worker(worker):
         raise pytest.UsageError('Invalid unit shard worker identity')
+    config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
+    yield
+    if [item.nodeid for item in items] != [item.nodeid for item in selected]:
+        raise pytest.UsageError('Unit shard final collection changed after assignment')
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     target = root / f'shard-{index}-{worker}.json'
     with target.open('x', encoding='utf-8') as output:
         json.dump(dict(format_version=1, shard=index, shard_count=count, worker=worker,
-            all_nodeids=original, selected_nodeids=[item.nodeid for item in selected]), output)
-    config.hook.pytest_deselected(items=deselected)
-    items[:] = selected
+            all_nodeids=original, selected_nodeids=[item.nodeid for item in items]), output)
 
 
 def verify_manifests(directory: Path, count: int) -> dict:
@@ -112,3 +116,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+else:
+    import pytest
+
+    pytest_collection_modifyitems = pytest.hookimpl(wrapper=True, tryfirst=True)(pytest_collection_modifyitems)
