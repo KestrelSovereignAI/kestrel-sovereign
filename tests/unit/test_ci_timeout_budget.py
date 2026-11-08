@@ -260,11 +260,21 @@ def _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog):
 
     observed = ObservedHost(FastAPI(lifespan=lifespan), 'unused', tmp_path,
         shutdown_trace_interval=0.025)
-    with TestClient(observed):
-        assert phases == ['startup']
+    import faulthandler
+    import pytest
+
+    def process_timer_is_not_owned(*args, **kwargs):
+        raise AssertionError('Lifespan observer changed the process-wide crash timer')
+
+    with pytest.MonkeyPatch.context() as boundary:
+        boundary.setattr(faulthandler, 'dump_traceback_later', process_timer_is_not_owned)
+        boundary.setattr(faulthandler, 'cancel_dump_traceback_later', process_timer_is_not_owned)
+        with TestClient(observed):
+            assert phases == ['startup']
     assert phases == ['startup', 'shutdown']
     diagnostic = capfd.readouterr().err
-    assert 'Timeout (' in diagnostic and 'Thread ' in diagnostic
+    assert 'threading.py' in diagnostic and 'File "' in diagnostic
+    assert 'Owned shutdown thread:' in caplog.text
     assert 'Owned shutdown pending task:' in caplog.text
     assert 'Owned shutdown await:' in caplog.text
     assert 'lifespan' in caplog.text
@@ -272,3 +282,57 @@ def _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog):
     import time
     time.sleep(0.06)
     assert capfd.readouterr().err == ''
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fail_shutdown', [False, True])
+async def test_owned_lifespan_observer_retires_pending_callback_on_every_exit(
+    tmp_path, caplog, fail_shutdown,
+):
+    """A completed lifespan cannot inspect another lifetime on the same loop."""
+    import asyncio
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    failure = RuntimeError('original owned lifespan shutdown failure')
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        if fail_shutdown:
+            raise failure
+
+    messages = asyncio.Queue()
+    started = asyncio.Event()
+    sent = []
+
+    async def send(message):
+        sent.append(message['type'])
+        if message['type'] == 'lifespan.startup.complete':
+            started.set()
+
+    observed = ObservedHost(FastAPI(lifespan=lifespan), 'unused', tmp_path,
+        shutdown_trace_interval=0.025)
+    serving = asyncio.create_task(observed(
+        {'type': 'lifespan', 'asgi': {'version': '3.0'}}, messages.get, send))
+    try:
+        messages.put_nowait({'type': 'lifespan.startup'})
+        await asyncio.wait_for(started.wait(), timeout=1)
+        messages.put_nowait({'type': 'lifespan.shutdown'})
+        if fail_shutdown:
+            with pytest.raises(RuntimeError) as raised:
+                await asyncio.wait_for(serving, timeout=1)
+            assert raised.value is failure
+        else:
+            await asyncio.wait_for(serving, timeout=1)
+        assert sent == ['lifespan.startup.complete',
+            'lifespan.shutdown.failed' if fail_shutdown else 'lifespan.shutdown.complete']
+        # Keep the SAME loop alive beyond the diagnostic interval. TestClient
+        # closing its own loop would conceal an unretired callback.
+        await asyncio.sleep(0.06)
+        assert 'Owned shutdown ' not in caplog.text
+    finally:
+        if not serving.done():
+            serving.cancel()
+        await asyncio.gather(serving, return_exceptions=True)

@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import socket
 import sys
+import traceback
 
 import pytest
 import uvicorn
@@ -32,7 +33,6 @@ class ObservedHost:
                 nonlocal pending_snapshot
                 event = await receive()
                 if event['type'] == 'lifespan.shutdown':
-                    faulthandler.dump_traceback_later(self.shutdown_trace_interval, repeat=True)
                     pending_snapshot = asyncio.get_running_loop().call_later(
                         self.shutdown_trace_interval, self.record_shutdown_tasks)
                 return event
@@ -42,7 +42,6 @@ class ObservedHost:
             finally:
                 if pending_snapshot is not None:
                     pending_snapshot.cancel()
-                faulthandler.cancel_dump_traceback_later()
             return
         await self.app(scope, receive, send)
         if scope['type'] != 'http':
@@ -59,6 +58,16 @@ class ObservedHost:
     def record_shutdown_tasks(self):
         """Report original awaits without observing locals or changing owners."""
         logger = logging.getLogger(__name__)
+        # Capture normal Python frame references while holding the interpreter
+        # lock. The process-wide crash timer belongs to pytest/the launcher;
+        # an individual lifespan observer must not replace or cancel it.
+        frames = sys._current_frames()
+        try:
+            for thread_id, frame in frames.items():
+                logger.warning('Owned shutdown thread: %s', thread_id)
+                traceback.print_stack(frame, file=sys.stderr)
+        finally:
+            del frames, frame
         for task in asyncio.all_tasks():
             logger.warning('Owned shutdown pending task: %s', task.get_name())
             task.print_stack(file=sys.stderr)
@@ -169,6 +178,7 @@ async def serve(descriptor, ready):
 
 
 def main():
+    faulthandler.enable()
     parser = argparse.ArgumentParser()
     parser.add_argument('descriptor', type=Path)
     parser.add_argument('ready', type=Path)
