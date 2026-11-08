@@ -802,7 +802,8 @@ class ReentrantTransitionLock:
             task.add_done_callback(completed)
         except BaseException as error:
             self._native_work.discard(task)
-            retained.set_result(_retain_owned_admission_error(task, execution_observation_error(opening, error)))
+            _retain_owned_admission_error(task, execution_observation_error(opening, error),
+                admission=admission, gate=retained)
             return task
         retained.set_result(opening)
         return task

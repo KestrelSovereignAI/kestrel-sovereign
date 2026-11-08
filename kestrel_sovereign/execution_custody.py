@@ -2035,19 +2035,19 @@ class _ExecutionForwarder:
                 await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
         except BaseException as caught:
             error = caught
-        if (self._iterator is not None and self._iterator.producer_task.done()
-                and (not self._producer_started or not self._source_closed)):
-            # A terminal pull can mark the iterator closed before raising its
-            # physical close failure. Observe the original producer AND watcher even
-            # when the physical aclose path has already become a no-op.
+        if (self._iterator is not None and (error is None or self._iterator._closed
+                or self._iterator.producer_task.done())):
+            # Terminal delivery can precede the actual native producer's
+            # epilogue. A successful/no-op iterator close is no substitute for
+            # joining that producer AND its watcher. Failed, unstarted closer
+            # admission instead retains its explicit debt without a new close.
             try:
-                outcome = await self._iterator.join_source_owners(closing=True)
+                outcome = await self._iterator.join_source_owners(
+                    closing=True, body_close_acknowledged=self._source_closed)
             except BaseException as observation_error:
-                error = execution_terminal_error(error, observation_error,
-                    retain_originals=True, isolate_control_originals=True)
+                error = execution_observation_error(error, observation_error)
             else:
-                error = execution_terminal_error(error, outcome.error, outcome.cancellation,
-                    retain_originals=True, isolate_control_originals=True)
+                error = execution_observation_error(error, outcome.error, outcome.cancellation)
         # A reserved owner can fail before entering _produce. Its completed
         # Task then cannot run the source-closing finally. Never close a source
         # concurrently with a live producer, or retry its failed physical close.

@@ -48,6 +48,12 @@ retirement debt rather than inventing a physical-close acknowledgement.
 Creation retains the canonical copied-context and failed-start-gate behavior;
 the public aliases add no admission policy, registry, retry, or new defaults.
 
+The original admission receipt also retains a failed admission and its first
+terminal observation. Task error attributes are diagnostic caches: refusal to
+publish them is reported with the original error, but cannot strand an accepted
+task behind a start gate. Cancellation before the first task step cannot erase
+the original admission failure, even if that diagnostic cache is unavailable.
+
 A custom task factory can make allocation ambiguous. If construction raises
 and the original native task registry cannot identify exactly one accepted
 Task, `admission.task is None` does not prove refusal. The original owner keeps

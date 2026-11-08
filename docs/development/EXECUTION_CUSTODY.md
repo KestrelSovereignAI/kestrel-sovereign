@@ -118,6 +118,14 @@ The native Task must carry this exact original admission binding; a completed
 Task borrowed from another operation cannot certify cleanup. After terminal
 consumption, any unacknowledged physical source close still harvests the same
 producer and watcher outcome, including entered sources, without closing twice.
+Terminal-marker delivery can precede the producer's native epilogue. Retirement
+joins that same producer and watcher even while either remains pending. A
+delivered body error or work-only refusal does not itself mean physical close
+failed; it can be omitted only after the terminal reader joined without
+withdrawal and the original source close acknowledged. A separate native
+epilogue or watcher failure, COMMIT/UNKNOWN evidence, and retirement debt remain
+visible. Source-only control projection is not a filter for ordinary physical
+errors.
 Writer restoration preserves a collected physical-close result alongside a
 later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
 original admission failure; the closer observes the canonical source-owner

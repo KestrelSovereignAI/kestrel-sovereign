@@ -121,7 +121,7 @@ class OwnedCallbackScope:
         try:
             self.accept(task)
         except BaseException as error:
-            published.set_result(_retain_owned_admission_error(task, error))
+            _retain_owned_admission_error(task, error, gate=published)
         else:
             published.set_result(None)
         return task
@@ -224,6 +224,8 @@ class OwnedTaskAdmission:
     _acceptance_unknown: bool = field(default=False, repr=False)
     _reconciled_tasks: tuple[asyncio.Task, ...] = field(default=(), repr=False)
     _unpublished_wrapper: object = field(default=None, repr=False)
+    error: BaseException | None = field(default=None, repr=False)
+    _terminal_error: object = field(default=_TASK_ERROR_UNSET, repr=False)
 
 
 def _has_owned_task_metadata(task) -> bool:
@@ -240,13 +242,31 @@ def _has_owned_task_metadata(task) -> bool:
     return type(admission) is OwnedTaskAdmission and admission.task is task
 
 
-def _retain_owned_admission_error(task, error):
-    """Core-only failed start-gate handoff; the payload must remain unstarted."""
+def _retain_owned_admission_error(task, error, *, admission=None, gate=None):
+    """Retain failed admission on its original receipt and settle its gate.
+
+    Task metadata is a diagnostic cache. Refusing that cache cannot strand an
+    accepted owner or replace its original publication failure.
+    """
     from kestrel_sovereign.execution_custody import execution_observation_error, retained_execution_error
-    cached = getattr(task, "_kestrel_owned_terminal_error", None)
+    try:
+        cached = getattr(task, "_kestrel_owned_terminal_error", None)
+    except BaseException as publication:
+        cached = publication
     terminal = retained_execution_error(execution_observation_error(cached, error))
-    task._kestrel_owned_terminal_error = terminal
-    task._kestrel_owned_admission_error = terminal
+    try:
+        task._kestrel_owned_terminal_error = terminal
+    except BaseException as publication:
+        terminal = retained_execution_error(execution_observation_error(terminal, publication))
+    if admission is None:
+        try:
+            admission = getattr(task, '_kestrel_owned_admission', None)
+        except BaseException as publication:
+            terminal = retained_execution_error(execution_observation_error(terminal, publication))
+    if type(admission) is OwnedTaskAdmission and admission.task is task:
+        admission.error = terminal
+    if gate is not None and not gate.done():
+        gate.set_result(terminal)
     return terminal
 
 
@@ -345,7 +365,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         )
         terminal = execution_terminal_error(opening, retain_originals=retain_originals)
         try:
-            _retain_owned_admission_error(task, terminal)
+            terminal = _retain_owned_admission_error(task, terminal, admission=admission)
         except BaseException as publication:
             terminal = execution_observation_error(terminal, publication)
         finally:
@@ -799,7 +819,7 @@ class OwnedOperation:
                 if (not isinstance(self._task, _NATIVE_TASK) or self._task is not admission.task
                         or getattr(self._task, '_kestrel_owned_admission', None) is not admission):
                     raise TypeError("original operation factory did not retain its native admission")
-                opening = getattr(self._task, '_kestrel_owned_admission_error', None)
+                opening = admission.error
                 if opening is not None:
                     self._opening = owned_task_admission_error(retirement_resource, admission, opening)
         except BaseException as failure:
@@ -933,6 +953,7 @@ class OwnedAsyncIterator(Generic[_T]):
         # first retrieval. Both the reader and closer need the same evidence.
         self._terminal_error: BaseException | None = None
         self._terminal_published = False
+        self._terminal_consumed = False
         self._cancellation_watch_started = False
         self._construction_error = None
         self._cancellation_owner = None
@@ -1069,6 +1090,7 @@ class OwnedAsyncIterator(Generic[_T]):
         if marker is _ITERATOR_TERMINAL:
             self._closed = True
             outcome = await self.join_source_owners()
+            self._terminal_consumed = outcome.cancellation is None
             raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
             raise StopAsyncIteration
 
@@ -1117,17 +1139,36 @@ class OwnedAsyncIterator(Generic[_T]):
                 self._owner.cancel()
             raise
 
-    async def join_source_owners(self, *, closing=False):
+    async def join_source_owners(self, *, closing=False, body_close_acknowledged=False):
         """Retain the source AND its original cancellation observer outcomes."""
-        from kestrel_sovereign.execution_custody import execution_observation_error, is_execution_control_error
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError, execution_commit_outcome, execution_cleanup_debts,
+            execution_observation_error, is_execution_control_error,
+        )
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
         if issubclass(type(watcher_error), asyncio.CancelledError) and not is_execution_control_error(watcher_error):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
+        terminal, owner_error = self._terminal_error, outcome.error
+        body_only = (terminal is not None and (
+            not is_execution_control_error(terminal)
+            or (type(terminal) is ExecutionAuthorityError
+                and not execution_cleanup_debts(terminal)
+                and execution_commit_outcome(terminal) is None)))
+        if closing and body_close_acknowledged and self._terminal_consumed and body_only:
+            # Only this exact, already-delivered ordinary body error may be
+            # omitted from physical retirement. A delivered work-only
+            # refusal likewise says nothing about physical close. COMMIT,
+            # UNKNOWN, cancellation, and retirement debt remain failures.
+            # A distinct native epilogue or
+            # watcher result remains intact, including ordinary failures.
+            if owner_error is terminal:
+                owner_error = None
+            terminal = None
         result = OwnedTaskOutcome(
             outcome.result,
-            execution_observation_error(self._terminal_error, outcome.error, watcher_error),
+            execution_observation_error(terminal, owner_error, watcher_error),
             execution_observation_error(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
         if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
@@ -1295,7 +1336,13 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     observation belongs to OwnedTaskOutcome; producer-supplied retained error
     remains readable, but this join does not invent cross-owner source caching.
     """
-    retained = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
+    from kestrel_sovereign.execution_custody import execution_observation_error
+    admission = getattr(task, "_kestrel_owned_admission", None)
+    if type(admission) is not OwnedTaskAdmission or admission.task is not task:
+        admission = None
+    retained = admission._terminal_error if admission is not None else _TASK_ERROR_UNSET
+    if retained is _TASK_ERROR_UNSET:
+        retained = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
     if retained is not _TASK_ERROR_UNSET:
         if task.done() and not task.cancelled():
             # Capturing inside the child preserves original evidence, but does
@@ -1303,6 +1350,10 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
             # that completed result as well so a joined task cannot later emit
             # an orphaned "exception was never retrieved" diagnostic.
             task.exception()
+        if admission is not None and admission._terminal_error is _TASK_ERROR_UNSET:
+            retained = execution_observation_error(admission.error, retained)
+            if task.done():
+                admission._terminal_error = retained
         return retained
     if not task.done():
         raise RuntimeError("owned task has not reached terminal state")
@@ -1310,6 +1361,8 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
         error = task.exception()
     except asyncio.CancelledError as cancellation:
         error = cancellation
+    if admission is not None:
+        error = execution_observation_error(admission.error, error)
     if _has_owned_task_metadata(task):
         try:
             task._kestrel_owned_terminal_error = error  # type: ignore[attr-defined]
@@ -1317,8 +1370,9 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
             # This producer promised native metadata, then refused its cache.
             # Report that broken contract alongside the physical outcome; a
             # failed publication must never replace UNKNOWN/source C with it.
-            from kestrel_sovereign.execution_custody import execution_observation_error
-            return execution_observation_error(error, publication)
+            error = execution_observation_error(error, publication)
+    if admission is not None:
+        admission._terminal_error = error
     return error
 
 
