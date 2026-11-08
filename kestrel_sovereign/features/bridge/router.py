@@ -30,7 +30,9 @@ import time
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from kestrel_sovereign.rate_limit import limiter
-from kestrel_sovereign.execution_custody import execution_terminal_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error, is_execution_control_error, is_tool_execution_terminal_error,
+)
 from kestrel_sovereign.endpoints.agent_helpers import (
     cancelled_invocation_http_error,
     get_agent,
@@ -190,7 +192,7 @@ def get_router() -> APIRouter:
         try:
             await _register_bridge_request(agent, request_id)
         except InvocationSelfFencedError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             raise self_fenced_invocation_http_error(request_id) from error
         request_cancelled = getattr(agent, "is_request_cancelled", None)
@@ -239,15 +241,15 @@ def get_router() -> APIRouter:
                     invocation_provenance=invocation_provenance,
                 )
             except InvocationSelfFencedError as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 raise self_fenced_invocation_http_error(request_id) from error
             except InvocationCancelledError as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 raise stopped_invocation_http_error(request_id) from error
             except HoldTurnRefusal as exc:
-                if is_execution_control_error(exc):
+                if is_tool_execution_terminal_error(exc):
                     raise
                 raise exc.as_http_exception() from exc
             except Exception as error:
@@ -300,7 +302,7 @@ def get_router() -> APIRouter:
             cleanup = getattr(agent, "_cleanup_cancelled_request", None)
             if callable(cleanup):
                 error = sys.exception()
-                if error is not None and is_execution_control_error(error):
+                if error is not None and is_tool_execution_terminal_error(error):
                     cleanup(request_id, disposition=RequestCompletionDisposition.ABANDONED)
                 else:
                     cleanup(request_id)
@@ -343,7 +345,7 @@ def get_router() -> APIRouter:
         try:
             await _register_bridge_request(agent, request_id)
         except InvocationSelfFencedError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             raise self_fenced_invocation_http_error(request_id) from error
         request_lifecycle_registered = True
@@ -380,7 +382,7 @@ def get_router() -> APIRouter:
             if callable(cleanup):
                 # Control loss is unresolved even when it crosses a setup
                 # write rather than the nested cognition iterator.
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     cleanup(request_id, disposition=RequestCompletionDisposition.ABANDONED)
                 else:
                     cleanup(request_id)
@@ -509,18 +511,18 @@ def get_router() -> APIRouter:
                     duration_ms=elapsed_ms,
                 )
             except InvocationSelfFencedError as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 yield self_fenced_event()
             except InvocationCancelledError as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 # Durable admission refusal is an acknowledged Stop. The
                 # nested lifecycle may consume its marker before the exception
                 # crosses the owned iterator, so preserve the typed outcome.
                 yield stopped_event()
             except HoldTurnRefusal as exc:
-                if is_execution_control_error(exc):
+                if is_tool_execution_terminal_error(exc):
                     raise
                 yield f"event: refusal\ndata: {exc.wire_json()}\n\n"
             except Exception as e:
@@ -541,7 +543,7 @@ def get_router() -> APIRouter:
                 yield bridge_sse_error_event(e)
             finally:
                 active_error = sys.exception()
-                control_failed = active_error is not None and is_execution_control_error(active_error)
+                control_failed = active_error is not None and is_tool_execution_terminal_error(active_error)
                 agent_stream_cleanup_failed = False
                 try:
                     if agent_stream is not None:

@@ -16,12 +16,12 @@ from tests.unit.test_cleanup_task_admission import _partial_native_agent
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 
 
-def _kite_invocation_request(agent, request_id):
+def _invocation_request(agent, payload):
     from fastapi import FastAPI
     from starlette.requests import Request
     app = FastAPI()
     app.state.agent = agent
-    body = json.dumps({"request_id": request_id, "kite_evidence": {"operation": "diagnostics", "nonce": "a" * 64}}).encode()
+    body = json.dumps(payload).encode()
     async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
     request = Request({"type": "http", "http_version": "1.1", "method": "POST",
@@ -29,6 +29,11 @@ def _kite_invocation_request(agent, request_id):
                            "query_string": b"", "headers": [(b"content-type", b"application/json")],
                            "client": ("test", 1), "server": ("test", 80), "app": app}, receive)
     return request
+
+
+def _kite_invocation_request(agent, request_id):
+    return _invocation_request(agent, {"request_id": request_id,
+        "kite_evidence": {"operation": "diagnostics", "nonce": "a" * 64}})
 
 
 @pytest.mark.asyncio
@@ -324,6 +329,52 @@ async def test_kite_endpoint_recovers_original_terminal_cancellation_before_stop
             assert original in tuple(_explicit_control_chain(outcome.error)), (
                 "Kite endpoint replaced its original terminal cancellation with Stop or synthetic cancellation")
         assert await db.fetchval("SELECT COUNT(*) FROM kite_original_receipt_effects") == 1
+    finally:
+        await agent.llm_service.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+@pytest.mark.parametrize("stop", [False, True])
+async def test_ordinary_endpoint_preserves_original_tool_uncertainty_after_stop(
+    tmp_path, monkeypatch, kind, stop,
+):
+    from fastapi import Response
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.endpoints.agent import invoke_agent
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    await db.execute("CREATE TABLE ordinary_original_receipt_effects (id INTEGER)")
+    request_id = "ordinary-original-terminal-receipt"
+    original = asyncio.CancelledError("original ordinary invocation acknowledgement")
+    if kind is not None:
+        original.__cause__ = (ResourceOutcomeUnknown("ordinary invocation effect uncertain")
+            if kind == "sdk" else ToolAuditUnconfirmedError("ordinary invocation audit uncertain"))
+
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    async def process_input(self, user_input, *, invocation_id=None, **kwargs):
+        await db.execute("INSERT INTO ordinary_original_receipt_effects VALUES (1)")
+        if stop:
+            assert agent.cancel_current_request(invocation_id)
+        if kind is not None:
+            raise original
+        return "ordinary invocation completed"
+
+    monkeypatch.setattr(agent, "process_input", process_input.__get__(agent, type(agent)))
+    endpoint = getattr(invoke_agent, "__wrapped__", invoke_agent)
+    request = _invocation_request(agent, {"input": "work", "request_id": request_id})
+    try:
+        outcome = await await_owned_task(create_owned_task(endpoint(request, Response()), retain_originals=True))
+        if kind is None:
+            assert outcome.error is outcome.cancellation is None
+            assert outcome.result["response"] == ("Request stopped during execution."
+                if stop else "ordinary invocation completed")
+        else:
+            assert original in tuple(_explicit_control_chain(outcome.error)), (
+                "Ordinary endpoint acknowledged Stop while original tool uncertainty remained")
+        assert await db.fetchval("SELECT COUNT(*) FROM ordinary_original_receipt_effects") == 1
     finally:
         await agent.llm_service.close()
         await db.close()

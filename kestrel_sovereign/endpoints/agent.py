@@ -61,6 +61,7 @@ from kestrel_sovereign.endpoints.closing_streaming_response import (
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
+    is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.kestrel_config.constants import (
@@ -529,7 +530,7 @@ async def invoke_agent(request: Request, http_response: Response):
             except BaseException as error:
                 retire_request_delivery(
                     agent, request_id, generation=cleanup_generation,
-                    abandoned=is_execution_control_error(error), error=error,
+                    abandoned=is_tool_execution_terminal_error(error), error=error,
                 )
                 raise
         else:
@@ -590,7 +591,6 @@ async def invoke_agent(request: Request, http_response: Response):
                 operation, observation = await evidence_task
             except asyncio.CancelledError as error:
                 from kestrel_sovereign._async_ownership import owned_task_cancellation_error, is_owned_task_cancellation
-                from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
                 error = owned_task_cancellation_error(evidence_task, error)
                 if not isinstance(error, asyncio.CancelledError) or is_tool_execution_terminal_error(error):
                     raise error
@@ -661,7 +661,7 @@ async def invoke_agent(request: Request, http_response: Response):
         try:
             effective_session_id = await agent.storage.resolve_session_id(session_id)
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             effective_session_id = session_id  # fall back; never block the request
 
@@ -688,7 +688,7 @@ async def invoke_agent(request: Request, http_response: Response):
                     "provider": None,
                 }
         except (asyncio.CancelledError, InvocationCancelledError) as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             if callable(request_cancelled) and request_cancelled(request_id) is True:
                 if invocation_was_self_fenced(agent, request_id):
@@ -713,11 +713,11 @@ async def invoke_agent(request: Request, http_response: Response):
             "provider": identity.get("provider"),
         }
     except InvocationSelfFencedError as error:
-        if is_execution_control_error(error):
+        if is_tool_execution_terminal_error(error):
             raise
         raise self_fenced_invocation_http_error(request_id) from error
     except HoldTurnRefusal as exc:
-        if is_execution_control_error(exc):
+        if is_tool_execution_terminal_error(exc):
             raise
         raise exc.as_http_exception() from exc
     except HTTPException:
@@ -775,7 +775,7 @@ async def invoke_agent(request: Request, http_response: Response):
                 )
             retire_request_delivery(
                 cleanup_agent, cleanup_request_id, generation=cleanup_generation,
-                abandoned=cleanup_abandoned or (error is not None and is_execution_control_error(error)),
+                abandoned=cleanup_abandoned or (error is not None and is_tool_execution_terminal_error(error)),
                 error=error,
             )
 
@@ -925,7 +925,7 @@ async def stream_agent_response(request: Request):
         if stream_tap_registered and stream_tap is not None and stream_delivery_id is not None:
             stream_tap.unregister(stream_delivery_id)
         if request_lifecycle_registered and agent is not None and request_id is not None:
-            if error is not None and is_execution_control_error(error):
+            if error is not None and is_tool_execution_terminal_error(error):
                 agent._cleanup_cancelled_request(
                     request_id, disposition=RequestCompletionDisposition.ABANDONED,
                 )
@@ -1003,7 +1003,7 @@ async def stream_agent_response(request: Request):
         try:
             effective_session_id = await agent.storage.resolve_session_id(session_id)
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             effective_session_id = session_id  # fall back; never block the stream
 
@@ -1110,18 +1110,18 @@ async def stream_agent_response(request: Request):
                     )
                     stop_notice_emitted = True
             except InvocationSelfFencedError as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 yield self_fenced_notice
             except InvocationCancelledError as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 # A durable public-turn fence can win before the nested stream
                 # has yielded. Its typed unwind is acknowledged Stop even if
                 # nested cleanup already consumed the cancellation marker.
                 yield stop_notice
             except HoldTurnRefusal as exc:
-                if is_execution_control_error(exc):
+                if is_tool_execution_terminal_error(exc):
                     raise
                 yield exc.wire_json() + "\n"
             except Exception as e:
@@ -1134,7 +1134,8 @@ async def stream_agent_response(request: Request):
                 from kestrel_sovereign.agent.invocation import (
                     invocation_log_correlation,
                 )
-                if invocation_was_self_fenced(agent, request_id):
+                if (invocation_was_self_fenced(agent, request_id)
+                        and not is_tool_execution_terminal_error(e)):
                     yield self_fenced_notice
                 else:
                     logger.error(
@@ -1151,7 +1152,7 @@ async def stream_agent_response(request: Request):
                     yield agent_stream_error_block(e)
             finally:
                 active_error = sys.exception()
-                control_failed = active_error is not None and is_execution_control_error(active_error)
+                control_failed = active_error is not None and is_tool_execution_terminal_error(active_error)
                 agent_stream_cleanup_failed = False
                 source_cleanup_error = None
                 try:
@@ -1211,7 +1212,7 @@ async def stream_agent_response(request: Request):
         )
     except InvocationSelfFencedError as error:
         cleanup_unstarted_stream(error)
-        if is_execution_control_error(error):
+        if is_tool_execution_terminal_error(error):
             raise
         raise self_fenced_invocation_http_error(request_id) from error
     except asyncio.CancelledError as error:
@@ -1222,7 +1223,7 @@ async def stream_agent_response(request: Request):
         raise
     except Exception as error:
         cleanup_unstarted_stream(error)
-        if is_execution_control_error(error):
+        if is_tool_execution_terminal_error(error):
             raise
         logger.error("Error setting up stream")
         raise ApiHTTPException(

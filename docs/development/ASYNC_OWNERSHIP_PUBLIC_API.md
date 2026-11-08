@@ -114,7 +114,17 @@ at terminal close. Genuine teardown cancellation still propagates, with every
 original carrier retained. Multiple pure cancellations use the canonical finite
 cancellation envelope; their original graph remains intact. Invocation and Kite
 recover native-await evidence through `owned_task_cancellation_error` before Stop
-classification.
+classification. Recovery also retains actual caller withdrawal received while
+restoring the privacy writer; the native receipt cannot replace that finite
+observation. A composed cancellation or an explicitly caused cancellation is
+never an individual private Stop acknowledgement. Physical close authenticates
+and omits only the producer's individual acknowledgement before composing the
+remaining source and watcher evidence.
+
+HTTP, Bridge and cognition dispatch use the shared tool terminal classifier
+before acknowledging typed Stop or owner loss. SDK effect uncertainty and
+unconfirmed audit evidence remain terminal even when carried by cancellation.
+The existing structured tool-error response retains its original explicit cause.
 
 If publication of the original completion callback is refused, a foreign native
 await may consume an independent cancelled completion before Core can capture it.

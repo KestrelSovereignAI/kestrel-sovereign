@@ -119,6 +119,7 @@ from kestrel_sovereign.execution_custody import (
     execution_finite_error,
     execution_observation_error,
     is_execution_control_error,
+    is_tool_execution_terminal_error,
     require_execution_work,
 )
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
@@ -6972,7 +6973,7 @@ class SignalDispatcher:
                         span.set_attribute(KESTREL_TURN_ID, result.turn_id)
                 return result
         except InvocationSelfFencedError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             # Losing the distributed owner lease is a fail-closed
             # infrastructure decision, not receipt-backed evidence that an
@@ -6986,7 +6987,7 @@ class SignalDispatcher:
                 audit=audit,
             )
         except InvocationCancelledError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             # Cooperative Stop is neither a provider failure nor retry
             # authority. Preserve the ordinary route audit while carrying a

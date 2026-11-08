@@ -441,6 +441,67 @@ async def test_original_watcher_failure_is_not_a_private_stop_acknowledgement(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('watcher_fails', [False, True])
+async def test_private_unstarted_owner_close_cannot_erase_independent_watcher(tmp_path, watcher_fails):
+    from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+    entered, release = asyncio.Event(), asyncio.Event()
+    independent = asyncio.CancelledError('independent watcher beside private owner Stop')
+    handle = (tmp_path / 'private-owner-and-independent-watcher').open('w')
+    attempts, bodies, watchers = [], [], []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            bodies.append(asyncio.current_task())
+            raise StopAsyncIteration
+        async def aclose(self):
+            attempts.append(asyncio.current_task())
+            handle.close()
+    def producer(body, context):
+        async def original():
+            entered.set()
+            await release.wait()
+            await body()
+        return create_owned_task(original(), context=context, retain_originals=True)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        operation = coroutine.cr_frame.f_locals.get('operation')
+        if watcher_fails and getattr(operation, 'cr_code', None) is OwnedAsyncIterator._watch_owner_cancellation.__code__:
+            async def observe():
+                coroutine.close()
+                raise independent
+            task = asyncio.Task(observe(), loop=loop, **options)
+            watchers.append(task)
+            return task
+        return previous(loop, coroutine, **options) if previous else asyncio.Task(coroutine, loop=loop, **options)
+    stream = None
+    try:
+        loop.set_task_factory(factory)
+        stream = await reserve_execution_stream(None, Source(),
+            lifecycle=ExecutionStreamLifecycle(producer, None, lambda: None))
+        await asyncio.wait_for(entered.wait(), 1)
+        if watcher_fails:
+            assert (await await_owned_task(watchers[0])).error is independent
+        loop.set_task_factory(previous)
+        for _ in range(2):
+            closed = await await_owned_operation(stream.aclose(), retain_originals=True)
+            if watcher_fails:
+                assert independent in tuple(_explicit_control_chain(closed.error)), (
+                    'Private producer Stop erased an independent original watcher cancellation')
+            else:
+                assert closed.error is closed.cancellation is None
+        assert handle.closed and len(attempts) == 1 and not bodies
+        assert stream._iterator.producer_task.done()
+        assert all(task.done() for task in watchers)
+    finally:
+        loop.set_task_factory(previous)
+        release.set()
+        if stream is not None:
+            await await_owned_operation(stream.aclose(), retain_originals=True)
+        handle.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('kind,cancel_watcher', [
     ('sdk', False), ('audit', False), ('plain', False), ('sdk', True), ('audit', True), ('plain', True),
 ])

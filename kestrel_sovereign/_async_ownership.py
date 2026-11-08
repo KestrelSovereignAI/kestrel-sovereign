@@ -256,6 +256,7 @@ def is_owned_task_cancellation(task, error) -> bool:
     admission = getattr(task, "_kestrel_owned_admission", None)
     return (type(admission) is OwnedTaskAdmission and admission.task is task
         and len(error.args) == 1 and error.args[0] is admission._cancel_token
+        and error.__cause__ is None
         and not is_tool_execution_terminal_error(error))
 
 
@@ -264,7 +265,17 @@ def owned_task_cancellation_error(task, cancellation):
     if not isinstance(cancellation, asyncio.CancelledError):
         raise TypeError("native cancellation recovery requires CancelledError")
     original = owned_task_error(task) if task.done() else None
-    return cancellation if original is None else original
+    if original is None:
+        return cancellation
+    from kestrel_sovereign.execution_custody import (
+        execution_observation_error, execution_observer_cancellations,
+    )
+    # A bare native await can consume the Task's exception and manufacture a
+    # cancellation surrogate. Recover its receipt, while retaining any actual
+    # withdrawal already composed during privacy writer restoration.
+    if execution_observer_cancellations(cancellation):
+        return execution_observation_error(original, cancellation, prefer_cancellation=True)
+    return original
 
 
 def _has_owned_task_metadata(task) -> bool:
@@ -1221,6 +1232,13 @@ class OwnedAsyncIterator(Generic[_T]):
             if owner_error is terminal:
                 owner_error = None
             terminal = None
+        if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
+                and not self._interrupted_by_cleanup
+                and is_owned_task_cancellation(self._owner, owner_error)
+                and self._cleanup_error is None):
+            # Authenticate only this producer's individual acknowledgement.
+            # A composed cancellation may also carry an independent watcher.
+            owner_error = None
         originals = (terminal, owner_error, watcher_error)
         result = OwnedTaskOutcome(
             outcome.result,
@@ -1228,11 +1246,6 @@ class OwnedAsyncIterator(Generic[_T]):
                 error is None or isinstance(error, asyncio.CancelledError) for error in originals)),
             execution_observation_error(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
-        if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
-                and not self._interrupted_by_cleanup
-                and is_owned_task_cancellation(self._owner, result.error)
-                and self._cleanup_error is None):
-            return OwnedTaskOutcome(None, None, result.cancellation)
         return result
 
     def _is_private_watcher_cancellation(self, error):
