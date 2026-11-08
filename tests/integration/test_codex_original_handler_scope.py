@@ -141,7 +141,14 @@ async def test_codex_registered_callback_compares_actual_original_scope(
                 "registered callback localized a foreign or mixed original PG denial"
             )
             chain = tuple(_explicit_control_chain(failure))
-            assert carried[0] in chain and all(error in chain for error in originals)
+            # A canonical finite group is a composition, not another native
+            # source. Shared latches retain its exact native leaves; genuine
+            # source withdrawal carriers remain exact and cannot be flattened.
+            assert all(any(error is node for node in chain) for error in originals)
+            if retirement != "public":
+                assert any(carried[0] is node for node in chain)
+            assert execution_denial_scopes(failure) == ((foreign,) if denied == "foreign"
+                else (owner, foreign) if denied == "mixed" else (owner,))
             with pytest.raises(BaseException) as repeated:
                 await client.ensure_started()
             assert repeated.value is failure

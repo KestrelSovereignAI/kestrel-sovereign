@@ -31,6 +31,7 @@ class _FinishRegistration:
     relations: object = None
     writer: object = None
     entry: object = None
+    unconfirmed: bool = False
 
 
 class _OriginalToolEffectFinish(_OriginalResultCustody):
@@ -98,8 +99,10 @@ class _OriginalToolEffectFinish(_OriginalResultCustody):
         table = ('main.tool_effect_operations' if self._backend.backend_type == 'sqlite'
             else self._postgres_relation.qualified_name)
         where = 'scope_digest = ? AND operation_digest = ? AND attempt_id = ?'
-        return (f"UPDATE {table} SET state = 'CLOSED', revision = revision + 1 WHERE {where}",
-            f"SELECT 1 FROM {table} WHERE {where} AND state = 'CLOSED'")
+        latch = ", latched = 1" if self._registration.unconfirmed else ""
+        return (f"UPDATE {table} SET state = 'CLOSED', revision = revision + 1{latch} WHERE {where}",
+            f"SELECT 1 FROM {table} WHERE {where} AND state = 'CLOSED'"
+            + (" AND latched = 1" if self._registration.unconfirmed else ""))
 
     def _require_backing(self):
         if (self._observer_depth or type(self._registration) is not _FinishRegistration
@@ -166,7 +169,11 @@ class _OriginalToolEffectFinish(_OriginalResultCustody):
             return ToolEffectAttemptSuperseded('tool effect attempt was superseded')
         return super().write_refusal(reason, cause)
 
-    async def finish(self):
+    async def finish(self, *, unconfirmed=False):
+        if type(unconfirmed) is not bool:
+            raise ValueError('Tool effect uncertainty must be a boolean')
+        if unconfirmed and self._writer is not None and not self._registration.unconfirmed:
+            raise ExecutionAuthorityError('Original clean terminal writer cannot absorb later uncertainty')
         if self._writer is None:
             if self._phase != 'accepted' or self._attempt is None or self._attempt() is None:
                 raise ExecutionAuthorityError('Original attempt terminal owner is unavailable')
@@ -176,6 +183,7 @@ class _OriginalToolEffectFinish(_OriginalResultCustody):
             # No await separates this admission fence from hold enrollment.
             # Existing writers may retire during close; late writers cannot
             # enter after its original inventory snapshot.
+            self._registration = replace(self._registration, unconfirmed=unconfirmed)
             self._query, self._match_query = self._fixed_queries()
             self._entry = _FinishEntry(self._identity)
             self._phase = 'bound'

@@ -105,11 +105,13 @@ async def test_native_terminal_closes_original_without_admitting_cleanup_work(jo
 
     store, _, _ = journal
     first = await admit(store)
+    await store.finish(first)
     successor = await admit(store)
     scope = ExecutionCustody(ProcessRuntimeExecutionFence('owned-native-terminal'))
     with bind_execution_cleanup(store.database, (scope,)):
-        with pytest.raises(ToolEffectAttemptSuperseded):
-            await store.finish(first)
+        await store.finish(first)
+    assert await store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations') == (successor.attempt_id, 'OPEN')
+    with bind_execution_cleanup(store.database, (scope,)):
         await store.finish(successor)
         with pytest.raises(ExecutionAuthorityError, match='cleanup-only'):
             await store.claim(successor, registration='forbidden', arguments={})
@@ -251,6 +253,9 @@ async def test_zero_effect_supersession_fences_the_old_owner_and_changed_input_c
     request = {"input": {"id": 10**30, "name": name}, "route": "chat"}
     reordered = {"route": "chat", "input": {"name": name, "id": 10**30}}
     old = await admit(store, request=request)
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(store, request=reordered)
+    await store.finish(old)
     current = await admit(store, request=reordered)
     assert old.operation_digest == current.operation_digest
     assert await store.database.fetchval("SELECT COUNT(*) FROM tool_effect_operations") == 1
@@ -282,6 +287,9 @@ async def test_not_executed_allows_new_attempt_but_terminal_claim_cannot_be_reop
     await store.settle(claim, state="NOT_EXECUTED")
     with pytest.raises(ToolEffectClaimConflict):
         await store.settle(claim, state="RETURNED_OK")
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(store)
+    await store.finish(first)
     second = await admit(store)
     with pytest.raises(ToolEffectAttemptSuperseded):
         await store.claim(first, registration="owned-tool", arguments={})
@@ -493,7 +501,11 @@ async def test_sql_refusal_rolls_back_claim_and_does_not_dispatch(journal, tmp_p
         await admit(store)
     await db.execute('DROP TRIGGER refuse_claim' if store.is_sqlite
         else 'DROP TRIGGER refuse_claim ON tool_effect_claims')
-    replacement = await admit(store)
+    # Removing the SQL refusal is not evidence that the interrupted attempt
+    # closed safely; it cannot authorize reuse of the same operation key.
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(store)
+    replacement = await admit(store, key='new-independently-authorized-input')
     assert replacement.attempt_id != attempt.attempt_id
 
 

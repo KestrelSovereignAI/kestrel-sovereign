@@ -2212,3 +2212,26 @@ not completed-worker exception history or writes onto another operation's source
 Advisory cleanup records and joins the accepted original closer even if its
 callback publication fails. Whole-agent shutdown separately retains its current
 caller's finite evidence without publishing that caller history into shared state.
+
+
+Tool-effect operation closure also certifies pre-claim work. A required audit
+can become uncertain before any business claim exists. The original native
+terminal writer persists that uncertainty in the operation latch without
+inventing a claim or changing an acknowledged business result. Readmission
+requires acknowledged clean CLOSED state, no latch and no effect-capable
+claims. An interrupted OPEN operation requires reconciliation even with zero
+claims; removing a SQL refusal or restarting cannot certify clean closure.
+A safely CLOSED claim-free/NOT_EXECUTED operation can admit a fresh attempt.
+
+Finite composition preserves the public SDK ResourceOutcomeUnknown type and
+the first uncertainty diagnostic in a fresh envelope. Its explicit cause keeps
+all original errors; the originals' causes remain immutable. Native control
+and explicitly preferred caller cancellation retain their existing priority.
+
+Codex request publication stays behind the original accepted Task's gate until
+cohort, metadata, completion subscription and active-inventory publication
+succeed. A refused publication cannot dispatch the tool. Its exact accepted
+owner delivers a scoped error, remains in the original callback cohort and
+settles before that cohort retires. The adapter joins the cohort even if an
+active-inventory publication failed; ordinary scoped failures do not retire
+another thread's shared connection.

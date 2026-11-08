@@ -3407,12 +3407,13 @@ class CodexAdapter(LLMAdapter):
                 # Retiring them must not depend on admitting another collector
                 # Task, or an allocator refusal releases the mutex underneath
                 # an accepted effect. Close admission above, then join originals.
-                while active_inline_tool_handlers:
-                    for handler_owner in tuple(active_inline_tool_handlers):
+                while active_inline_tool_handlers or callback_scope.tasks:
+                    for handler_owner in tuple(active_inline_tool_handlers | callback_scope.tasks):
                         outcome = await await_owned_task(handler_owner)
                         # Physical settlement, not deferred callback ordering,
                         # retires this original member of the closed cohort.
                         active_inline_tool_handlers.discard(handler_owner)
+                        callback_scope.tasks.discard(handler_owner)
                         if outcome.error is not None:
                             inline_terminal_errors.append(outcome.error)
                         if outcome.cancellation is not None:

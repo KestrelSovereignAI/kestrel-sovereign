@@ -344,8 +344,8 @@ async def test_root_exit_after_privacy_flip_writes_no_journal_metadata(owner):
         owner.privacy_agent = PrivacyAgent(owner.storage, PrivacyMode.EPHEMERAL)
     await turn.close()
     assert turn.live is False
-    # The obsolete generation is revoked in memory. Its untouched OPEN row
-    # can only be superseded by a new durable admission after leaving privacy.
+    # No durable closure is permitted after the privacy flip. The untouched
+    # OPEN operation therefore requires reconciliation before any redelivery.
     assert await owner.tool_effect_store.database.fetchone("SELECT state FROM tool_effect_operations") == ("OPEN",)
 
 

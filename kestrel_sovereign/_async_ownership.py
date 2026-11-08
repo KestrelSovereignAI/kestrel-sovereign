@@ -104,9 +104,26 @@ class OwnedCallbackScope:
             raise RuntimeError("native callback admission is closed")
         if len(self.factories) > 1:
             raise RuntimeError("a callback must have one original privacy coordinator")
-        task = (self.factories[0](operation, name=name) if self.factories else
-                create_owned_task(operation(), name=name, retain_originals=True))
-        return self.accept(task)
+        published = asyncio.get_running_loop().create_future()
+
+        async def run():
+            opening = await published
+            if opening is not None:
+                raise opening
+            return await operation()
+
+        task = (self.factories[0](run, name=name) if self.factories else
+                create_owned_task(run(), name=name, retain_originals=True))
+        # Physical acceptance precedes cohort publication. Keep that exact
+        # owner even when an observer/coordinator refuses its publication.
+        self.tasks.add(task)
+        try:
+            self.accept(task)
+        except BaseException as error:
+            published.set_result(_retain_owned_admission_error(task, error))
+        else:
+            published.set_result(None)
+        return task
 
     def accept(self, task):
         """Retain a producer's exact accepted Task, including failed publication."""

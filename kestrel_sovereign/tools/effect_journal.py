@@ -147,7 +147,7 @@ class ToolEffectTurn:
                         if privacy is None:
                             raise ToolEffectJournalUnavailable("tool_effect_journal_unavailable")
                         if privacy.allows_persistent_storage():
-                            await self.store.finish(self.attempt)
+                            await self.store.finish(self.attempt, unconfirmed=bool(self.unconfirmed))
                 except BaseException as finish_error:
                     terminal = execution_observation_error(terminal, finish_error,
                         prefer_cancellation=isinstance(terminal, asyncio.CancelledError))

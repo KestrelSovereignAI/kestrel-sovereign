@@ -864,8 +864,9 @@ class CodexAppServerClient:
             )
             self._fail_all(self._server_request_failure)
 
-    def _server_request_done(self, task: asyncio.Task, *, thread_id=None) -> None:
-        error = owned_task_error(task)
+    def _server_request_done(self, task: asyncio.Task, *, thread_id=None,
+                             error=None, caller_scopes=None) -> None:
+        error = owned_task_error(task) if error is None else error
         if error is not None:
             # A failed native start gate never enters the RPC handler. Its
             # original turn must still observe completion failure promptly.
@@ -876,7 +877,8 @@ class CodexAppServerClient:
                 if sink is not None:
                     sink.put_nowait({"__bridge_error__": error})
             self._retain_request_failure(error,
-                caller_scopes=getattr(task, "_kestrel_codex_caller_scopes", ()))
+                caller_scopes=(getattr(task, "_kestrel_codex_caller_scopes", ())
+                    if caller_scopes is None else caller_scopes))
         self._server_request_tasks.discard(task)
 
     async def _join_server_requests(self) -> None:
@@ -1206,28 +1208,61 @@ class CodexAppServerClient:
             if handler is None:
                 handler = self._server_request_handlers.get((method, None))
             callback_scope = getattr(handler, "_codex_native_callback_scope", None)
+            active_tasks = getattr(handler, "_codex_active_tasks", None)
+            caller_scopes = getattr(handler, "_codex_caller_scopes", ())
+            published = asyncio.get_running_loop().create_future()
+            completion_registered = reported = False
+
+            def report_completion(finished, error=None):
+                nonlocal reported
+                if reported:
+                    return
+                reported = True
+                self._server_request_done(finished, thread_id=tid,
+                    error=error, caller_scopes=caller_scopes)
+
+            def completed(finished):
+                try:
+                    report_completion(finished)
+                finally:
+                    if isinstance(active_tasks, set):
+                        active_tasks.discard(finished)
+
+            async def run_request():
+                try:
+                    opening = await published
+                    if opening is not None:
+                        raise opening
+                    await self._handle_server_request(mid, method, params,
+                        selected_handler=handler, handler_selected=True)
+                except BaseException as error:
+                    # If completion subscription itself failed, the accepted
+                    # owner delivers its own scoped failure after its gated
+                    # body settles. No replacement observer Task is required.
+                    if not completion_registered:
+                        report_completion(asyncio.current_task(), error)
+                    raise
+                finally:
+                    self._server_request_tasks.discard(asyncio.current_task())
+                    if isinstance(active_tasks, set):
+                        active_tasks.discard(asyncio.current_task())
+
             if callback_scope is not None:
-                task = callback_scope.start(lambda: self._handle_server_request(
-                    mid, method, params, selected_handler=handler, handler_selected=True,
-                ), name="codex-inline-tool-callback")
+                task = callback_scope.start(run_request, name="codex-inline-tool-callback")
             else:
                 from kestrel_sovereign._async_ownership import create_owned_task
-                task = create_owned_task(self._handle_server_request(
-                    mid, method, params, selected_handler=handler, handler_selected=True,
-                ), name="codex-server-request", retain_originals=True)
-            task._kestrel_codex_caller_scopes = getattr(handler, "_codex_caller_scopes", ())
-            if not hasattr(self, "_server_request_tasks"):
-                self._server_request_tasks = set()
-            self._server_request_tasks.add(task)
-            task.add_done_callback(lambda finished, tid=tid:
-                self._server_request_done(finished, thread_id=tid))
-            active_tasks = getattr(handler, "_codex_active_tasks", None)
-            if isinstance(active_tasks, set):
-                # Admission is synchronous with task creation. A cooperative
-                # Stop may unregister the handler on the very next instruction,
-                # but it will still see and join this already-selected request.
-                active_tasks.add(task)
-                task.add_done_callback(active_tasks.discard)
+                task = create_owned_task(run_request(), name="codex-server-request", retain_originals=True)
+            try:
+                self._server_request_tasks.add(task)
+                task.add_done_callback(completed)
+                completion_registered = True
+                task._kestrel_codex_caller_scopes = caller_scopes
+                if isinstance(active_tasks, set):
+                    active_tasks.add(task)
+            except BaseException as error:
+                published.set_result(error)
+            else:
+                published.set_result(None)
             return
         # Notification — route to the OWNING turn by threadId so
         # concurrent turns never cross-contaminate. Thread-less global

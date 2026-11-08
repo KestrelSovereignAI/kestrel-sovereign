@@ -33,9 +33,9 @@ async def test_cleanup_closes_only_original_attempt_and_cannot_admit_fresh_work(
 
 async def test_original_terminal_cannot_close_a_superseding_attempt(owner):
     original = await admit(owner)
+    await original.close()
     successor = await admit(owner)
-    with pytest.raises(ToolEffectAttemptSuperseded):
-        await owner.tool_effect_store.finish(original.attempt)
+    await owner.tool_effect_store.finish(original.attempt)
     assert await owner.tool_effect_store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations') == (successor.attempt.attempt_id, 'OPEN')
     await successor.close()
 

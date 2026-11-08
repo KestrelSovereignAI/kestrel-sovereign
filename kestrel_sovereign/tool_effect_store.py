@@ -234,14 +234,18 @@ class ToolEffectStore(UnifiedStoreBase):
                 "UPDATE tool_effect_operations SET revision = revision + 1 WHERE scope_digest = ? AND operation_digest = ?",
                 (self.scope_digest, operation),
             )
-            row = await self.database.fetchone("SELECT request_digest FROM tool_effect_operations WHERE scope_digest = ? AND operation_digest = ?", (self.scope_digest, operation))
+            row = await self.database.fetchone("SELECT request_digest, attempt_id, state, latched FROM tool_effect_operations WHERE scope_digest = ? AND operation_digest = ?", (self.scope_digest, operation))
             if row[0] != request_digest:
                 raise ToolEffectOperationConflict("tool effect operation key has different input")
             effect = await self.database.fetchone(
                 "SELECT 1 FROM tool_effect_claims WHERE scope_digest = ? AND operation_digest = ? AND state <> 'NOT_EXECUTED' LIMIT 1",
                 (self.scope_digest, operation),
             )
-            if effect is not None:
+            # Only acknowledged clean closure certifies a claim-free attempt.
+            # An interrupted OPEN operation can include a required audit whose
+            # ACK was lost before any business-effect claim was created.
+            interrupted = row[1] != attempt.attempt_id and row[2] != 'CLOSED'
+            if effect is not None or interrupted or row[3]:
                 raise ToolEffectReconciliationRequired(await self._counts(operation))
             await self.database.execute(
                 "UPDATE tool_effect_operations SET attempt_id = ?, state = 'OPEN', latched = 0 WHERE scope_digest = ? AND operation_digest = ?",
@@ -298,6 +302,6 @@ class ToolEffectStore(UnifiedStoreBase):
                     (self.scope_digest, attempt.operation_digest),
                 )
 
-    async def finish(self, attempt: ToolEffectAttempt) -> None:
+    async def finish(self, attempt: ToolEffectAttempt, *, unconfirmed: bool = False) -> None:
         self._require_scope(attempt)
-        await attempt._terminal.finish()
+        await attempt._terminal.finish(unconfirmed=unconfirmed)

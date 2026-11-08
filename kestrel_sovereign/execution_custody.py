@@ -486,6 +486,12 @@ def execution_observation_error(*errors: BaseException | None,
             if issubclass(type(error), asyncio.CancelledError)), None)
         if withdrawal is not None:
             return execution_error_with_cause(asyncio.CancelledError(*withdrawal.args), terminal)
+    unknown = next((error for error in present
+        if isinstance(error, ResourceOutcomeUnknown)), None)
+    if unknown is not None:
+        # Preserve the public SDK outcome contract and its first diagnostic,
+        # without decorating either original provider/persistence exception.
+        return execution_error_with_cause(ResourceOutcomeUnknown(*unknown.args), terminal)
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
 
 

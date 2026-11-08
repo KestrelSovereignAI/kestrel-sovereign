@@ -759,7 +759,7 @@ async def test_inner_prebody_audit_uncertainty_fences_every_leaf_refusal(
         except Exception as error:
             seen['second_error'] = error
     try:
-        await drive_native(host, operation)
+        await drive_native(host, operation, invocation_id='same-inner-prebody-input')
     except ResourceOutcomeUnknown as error:
         seen['root_error'] = error
     assert not witness.exists(), 'Inner pre-body audit uncertainty admitted a physical leaf effect'
@@ -770,6 +770,14 @@ async def test_inner_prebody_audit_uncertainty_fences_every_leaf_refusal(
         for node in execution_evidence_carriers(error)), 'Inner refusal lost its original live uncertainty'
     assert 'root_error' in seen and sql_errors[0] in execution_evidence_carriers(seen['root_error'])
     assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == []
+
+    assert await host.tool_effect_store.database.fetchone(
+        'SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 1)
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
+    with pytest.raises(ToolEffectReconciliationRequired) as refused:
+        await drive_native(host, operation, invocation_id='same-inner-prebody-input')
+    assert all(count == 0 for count in refused.value.counts.values())
+    assert attempts == [selected] and not witness.exists()
 
 
 @pytest.mark.parametrize('completion', ['serialize', 'post-matcher'])
