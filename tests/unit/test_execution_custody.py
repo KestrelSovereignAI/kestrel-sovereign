@@ -889,7 +889,7 @@ async def test_codex_transport_reader_does_not_inherit_first_occurrence(monkeypa
     from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
     from kestrel_sovereign.execution_custody import current_execution_custody
     monkeypatch.setenv("HOME", str(tmp_path))
-    client = CodexAppServerClient.__new__(CodexAppServerClient)
+    client = CodexAppServerClient(binary="offline-codex-not-invoked")
     client._binary = "/test/no-provider"
     client._closed_error = None
     observed = []

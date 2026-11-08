@@ -276,7 +276,7 @@ async def test_app_server_default_decline_records_event(decline_db):
     db = decline_db
     agent = _agent_with_db(db)
 
-    client = CodexAppServerClient.__new__(CodexAppServerClient)
+    client = CodexAppServerClient(binary="offline-codex-not-invoked")
     client._server_request_handlers = {}
     client._inflight_server_requests = {}
     client._turn_sinks = {}
@@ -307,7 +307,7 @@ async def test_app_server_records_action_shape_decline(decline_db):
     db = decline_db
     agent = _agent_with_db(db)
 
-    client = CodexAppServerClient.__new__(CodexAppServerClient)
+    client = CodexAppServerClient(binary="offline-codex-not-invoked")
     client._server_request_handlers = {}
     client._inflight_server_requests = {}
     client._turn_sinks = {}
@@ -334,7 +334,7 @@ async def test_app_server_no_audit_agent_no_event(decline_db):
     default declines must NOT raise — they just don't get recorded."""
     db = decline_db
 
-    client = CodexAppServerClient.__new__(CodexAppServerClient)
+    client = CodexAppServerClient(binary="offline-codex-not-invoked")
     client._server_request_handlers = {}
     client._inflight_server_requests = {}
     client._turn_sinks = {}

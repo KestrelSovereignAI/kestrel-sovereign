@@ -28,7 +28,7 @@ def _stub_client() -> CodexAppServerClient:
     """Bare ``CodexAppServerClient`` without spawning a subprocess.
     Mirrors the pattern in the main ``TestDispatchLogic`` suite.
     """
-    c = CodexAppServerClient.__new__(CodexAppServerClient)
+    c = CodexAppServerClient(binary="offline-codex-not-invoked")
     c._pending = {}
     c._turn_sinks = {}
     c._server_request_handlers = {}

@@ -65,7 +65,7 @@ async def test_spawn_passes_large_streamreader_limit(monkeypatch, tmp_path):
     """Spawn retains an explicit, frame-ceiling-aligned reader limit."""
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    c = CodexAppServerClient.__new__(CodexAppServerClient)
+    c = CodexAppServerClient(binary="offline-codex-not-invoked")
     c._binary = "/usr/bin/true"
     c._closed_error = None
     c._pending = {}
@@ -113,7 +113,7 @@ async def test_spawn_passes_large_streamreader_limit(monkeypatch, tmp_path):
 async def test_read_loop_accepts_frame_larger_than_legacy_limit():
     """A >16 MiB valid item frame is parsed instead of killing the loop."""
 
-    c = CodexAppServerClient.__new__(CodexAppServerClient)
+    c = CodexAppServerClient(binary="offline-codex-not-invoked")
     c._pending = {}
     sink: asyncio.Queue = asyncio.Queue()
     c._turn_sinks = {"thread-1": sink}
@@ -158,7 +158,7 @@ async def test_oversized_frame_fails_active_work_but_reader_resynchronizes(
     monkeypatch.setattr(
         codex_app_server, "CODEX_APP_SERVER_MAX_FRAME_BYTES", max_frame_bytes,
     )
-    c = CodexAppServerClient.__new__(CodexAppServerClient)
+    c = CodexAppServerClient(binary="offline-codex-not-invoked")
     pending = asyncio.get_running_loop().create_future()
     c._pending = {7: pending}
     sink: asyncio.Queue = asyncio.Queue()
