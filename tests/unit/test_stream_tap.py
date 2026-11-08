@@ -19,9 +19,13 @@ async def test_tap_native_admission_and_completed_drain_use_their_actual_lifetim
     ready, release = asyncio.Event(), asyncio.Event()
     request, delivery = 'native-tap-input', 'native-tap-delivery'
     path = tmp_path / 'native-tap-effects'
-    recorded = []
+    recorded, policy = [], []
+    from kestrel_sovereign.telemetry import bind_current_turn_id, current_turn_id
+    expected_turn = 'live-voice-consumer'
 
     async def effect():
+        policy.append((lock.current_native_scope(), current_bound_reentry_token(), current_turn_id()))
+        assert current_turn_id() == expected_turn, 'tap imported a different consumer turn context'
         with path.open('a') as file:
             file.write('original effect\n')
         return 'acknowledged'
@@ -54,22 +58,31 @@ async def test_tap_native_admission_and_completed_drain_use_their_actual_lifetim
             with pytest.raises(ExecutionAuthorityError, match='original native producer'):
                 tap.capture_request_privacy(agent, request, tap._requests[delivery].generation)
         assert tap._requests[delivery].native_work_factory is original
-        async with tap.producer_privacy(delivery, agent) as factory:
-            assert factory is original
-            assert callable(factory), 'tap did not retain original native work admission'
-            outcome = await await_owned_task(factory(nested_provider))
+        consumer_context = object()
+        with bind_transition_lock_reentry(consumer_context), bind_current_turn_id(expected_turn):
+            async with tap.producer_privacy(delivery, agent) as factory:
+                assert current_bound_reentry_token() is consumer_context, (
+                    'tap replaced consumer turn context instead of admitting original native work')
+                assert factory is original
+                assert callable(factory), 'tap did not retain original native work admission'
+                outcome = await await_owned_task(factory(nested_provider))
         assert outcome.error is None and outcome.result.error is None
         assert outcome.result.result == 'acknowledged' and recorded == [(True, 2)]
         release.set()
         assert (await await_owned_task(producer)).error is None
-        # A stale caller context must not bind a retired text span onto the
-        # original generation's acknowledged final speech drain.
-        with bind_transition_lock_reentry(token):
+        # A final drain admits its own native policy decision, while keeping
+        # the consumer's complete turn context outside that owned worker.
+        expected_turn = 'final-voice-consumer'
+        with bind_transition_lock_reentry(token), bind_current_turn_id(expected_turn):
             async with tap.producer_privacy(delivery, agent) as factory:
-                assert factory is None and current_bound_reentry_token() is None, (
-                    'completed tap drain reused its retired text span')
-                final = await await_owned_task(lock.start_owned_native_work(effect))
+                assert current_bound_reentry_token() is token, 'tap changed its consumer turn context'
+                assert callable(factory), 'completed tap drain has no native work factory'
+                final = await await_owned_task(factory(effect))
         assert final.error is None and final.result == 'acknowledged'
+        assert policy[0] == (token, token, 'live-voice-consumer')
+        assert policy[1][0] is not None and policy[1][0] is not token, (
+            'completed tap drain reused its retired text span')
+        assert policy[1][1:] == (None, 'final-voice-consumer')
         assert path.read_text() == 'original effect\noriginal effect\n'
     finally:
         release.set()
@@ -114,7 +127,8 @@ async def test_tap_drain_waits_for_the_original_native_lifetime_to_close(native_
 
     async def read_final():
         async with tap.producer_privacy(delivery, agent) as factory:
-            child = factory(final_effect) if factory is not None else lock.start_owned_native_work(final_effect)
+            assert callable(factory), 'completed native drain did not receive its own factory'
+            child = factory(final_effect)
             return await await_owned_task(child)
 
     producer, reader = create_owned_task(produce()), None

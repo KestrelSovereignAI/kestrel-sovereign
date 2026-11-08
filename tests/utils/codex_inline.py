@@ -16,7 +16,7 @@ from typing import Any
 from kestrel_sovereign.execution_custody import (
     execution_observation_error, is_tool_execution_terminal_error,
 )
-from kestrel_sovereign._async_ownership import OwnedCallbackScope, await_owned_task
+from kestrel_sovereign._async_ownership import OwnedCallbackScope, await_owned_task, owned_task_error
 
 
 def codex_inline_failure(error: Exception) -> dict[str, Any]:
@@ -47,26 +47,44 @@ class OwnedCallbackReader:
 
         self.baseline = dict(contextvars.copy_context().items())
         while (call := await self._calls.get()) is not None:
-            scope, *request = call
+            scope, executor, name, args, done = call
             if scope.closed:
                 continue
-            handler = scope.start(lambda request=request: self._handle(*request),
-                name='owned-test-codex-callback')
-            self._handlers.add(handler)
-            handler.add_done_callback(self._handlers.discard)
+            try:
+                handler = scope.start(
+                    lambda executor=executor, name=name, args=args: self._execute(executor, name, args),
+                    name='owned-test-codex-callback')
+                self._handlers.add(handler)
+                handler.add_done_callback(lambda task, done=done: self._complete(task, done))
+            except BaseException as error:
+                # An accepted Task remains in its original scope even when a
+                # later admission/publication step fails. Dispatch joins it.
+                self._publish_reply(done, error=error)
 
     async def _execute(self, executor, name, args):
         return await executor(name, args)
 
-    async def _handle(self, executor, name, args, done: asyncio.Future) -> None:
+    @staticmethod
+    def _publish_reply(done, *, result=None, error=None):
+        if done.done():
+            return
+        if error is not None:
+            done.set_exception(error)
+        else:
+            done.set_result(result)
+
+    def _complete(self, task, done):
+        self._handlers.discard(task)
+        result, error = None, None
         try:
-            result = await self._execute(executor, name, args)
-            if not done.done():
-                done.set_result(result)
-        except BaseException as error:
-            if not done.done():
-                done.set_exception(error)
-            raise
+            error = owned_task_error(task)
+            if error is None:
+                result = task.result()
+        except BaseException as observed:
+            error = observed
+        # Completion, rather than callback entry, is the sole reply publisher:
+        # a failed native start gate never enters the callback body.
+        self._publish_reply(done, result=result, error=error)
 
     async def dispatch(self, executor, name: str = 'tool', args: dict | None = None) -> Any:
         scope = OwnedCallbackScope()
@@ -82,8 +100,11 @@ class OwnedCallbackReader:
             scope.close()
             for task in tuple(scope.tasks):
                 outcome = await await_owned_task(task)
+                self._handlers.discard(task)
                 if outcome.error is not None:
                     failures.append(outcome.error)
+                if outcome.cancellation is not None:
+                    failures.append(outcome.cancellation)
         terminal = execution_observation_error(*failures)
         if terminal is not None:
             raise terminal

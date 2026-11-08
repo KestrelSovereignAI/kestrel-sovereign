@@ -716,7 +716,10 @@ class ReentrantTransitionLock:
             if opening is not None:
                 raise opening
             from kestrel_sovereign._async_ownership import bind_owned_coordinator
-            with bind_owned_coordinator(self):
+            # This module owns the privacy carrier. A newly created worker
+            # presents its actual admission, while every other turn value stays
+            # in the consumer context copied when that Task was constructed.
+            with bind_owned_coordinator(self), bind_transition_lock_reentry(captured, replace=True):
                 if acquire_span:
                     async with self:
                         return await operation()

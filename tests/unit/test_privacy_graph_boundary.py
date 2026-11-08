@@ -1962,6 +1962,7 @@ async def test_rename_under_held_turn_lock_does_not_deadlock(tmp_path, mode):
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin  # noqa: E402
 from kestrel_sovereign.features.base import Feature  # noqa: E402
+from tests.utils.codex_inline import OwnedCallbackReader  # noqa: E402
 
 
 class _InlineOrchestratorHost(OrchestratorEngineMixin):
@@ -1996,57 +1997,6 @@ class _InlineOrchestratorHost(OrchestratorEngineMixin):
         return await rename_agent_core(self, args["new_name"])
 
 
-class _AppServerReaderHarness:
-    """Reproduces the codex app-server reader-task topology WITHOUT a live server.
-
-    The reader loop is spawned once; each dispatched tool call runs in its OWN task
-    spawned FROM the reader (mirrors ``codex_app_server`` running each
-    ``item/tool/call`` on a per-call task), so the tool never runs on the turn task
-    — exactly the topology that deadlocks without the captured reentry token.
-    """
-
-    def __init__(self):
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._reader = None
-
-    async def ensure_started(self):
-        if self._reader is None:
-            self._reader = asyncio.create_task(self._read_loop())
-
-    async def _read_loop(self):
-        while True:
-            scope, executor, name, args, done = await self._queue.get()
-            if executor is None:
-                return
-            scope.start(lambda executor=executor, name=name, args=args, done=done:
-                self._handle(executor, name, args, done), name='owned-test-reader-callback')
-
-    async def _handle(self, executor, name, args, done):
-        try:
-            done.set_result(await executor(name, args))
-        except Exception as exc:  # pragma: no cover - defensive
-            done.set_exception(exc)
-
-    async def dispatch(self, executor, name, args):
-        from kestrel_sovereign._async_ownership import OwnedCallbackScope, await_owned_task, raise_owned_outcome
-        scope = OwnedCallbackScope()
-        done = asyncio.get_running_loop().create_future()
-        await self._queue.put((scope, executor, name, args, done))
-        try:
-            async with scope.wait():
-                return await done
-        finally:
-            scope.close()
-            for task in tuple(scope.tasks):
-                outcome = await await_owned_task(task)
-                raise_owned_outcome(outcome, operation='owned-test-reader-callback', retain_originals=True)
-
-    async def stop(self):
-        if self._reader is not None:
-            await self._queue.put((None, None, None, None, None))
-            await self._reader
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
 async def test_inline_rename_from_app_server_task_does_not_deadlock(tmp_path, mode):
@@ -2062,7 +2012,7 @@ async def test_inline_rename_from_app_server_task_does_not_deadlock(tmp_path, mo
         wrapper = PrivacyEnforcingStorage(raw, mode)
         lock = ReentrantTransitionLock()
         host = _InlineOrchestratorHost(wrapper, raw, lock)
-        harness = _AppServerReaderHarness()
+        harness = OwnedCallbackReader()
 
         # Streaming path: hold the transition lock across the whole "turn", build
         # the inline executor INSIDE the held lock (as the orchestrator does, so it
@@ -2072,7 +2022,7 @@ async def test_inline_rename_from_app_server_task_does_not_deadlock(tmp_path, mo
         async with lock.policy_span():
             assert lock.locked()
             executor = host._make_inline_tool_executor("sess-inline")
-            await harness.ensure_started()
+            await harness.start()
             _eff, outcome = await asyncio.wait_for(
                 harness.dispatch(
                     executor, "rename_agent", {"new_name": "RenamedInline"}
@@ -2313,11 +2263,11 @@ async def test_concurrent_inline_renames_serialize_durable_writes(tmp_path):
         wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
         lock = ReentrantTransitionLock()
         host = _InlineOrchestratorHost(wrapper, raw, lock)
-        harness = _AppServerReaderHarness()
+        harness = OwnedCallbackReader()
 
         async with lock.policy_span():
             executor = host._make_inline_tool_executor("sess-inline")
-            await harness.ensure_started()
+            await harness.start()
             results = await asyncio.wait_for(
                 asyncio.gather(
                     harness.dispatch(executor, "rename_agent", {"new_name": "AlphaName"}),
@@ -2419,7 +2369,7 @@ async def test_nested_subagent_rename_from_app_server_task_does_not_deadlock(
     lock = agent._get_privacy_transition_lock()
     feature = _RenameSubagentFeature(agent)
     agent.features[feature.name] = feature
-    harness = _AppServerReaderHarness()
+    harness = OwnedCallbackReader()
     from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory
 
     class DispatchSubagent:
@@ -2441,7 +2391,7 @@ async def test_nested_subagent_rename_from_app_server_task_does_not_deadlock(
     async def invoke(owner, user_input, *, invocation_id=None):
         async with lock.policy_span():
             executor = agent._make_inline_tool_executor("sess-nested")
-            await harness.ensure_started()
+            await harness.start()
             return await asyncio.wait_for(harness.dispatch(
                 executor, binding.name, {"new_name": "NestedRenamed"},
             ), timeout=5.0)
@@ -2869,3 +2819,43 @@ async def test_agent_node_openrouter_key_hash_free_text_rejected(
         with pytest.raises(PrivacyViolationError):
             await wrapper.add_node(node, capability=CAP)
         assert await raw.get_node(AGENT_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_privacy_reader_keeps_withdrawal_through_physical_callback_completion(tmp_path):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    entered, finish = asyncio.Event(), asyncio.Event()
+    receipt = tmp_path / 'privacy-reader-settled'
+    harness = OwnedCallbackReader()
+    await harness.start()
+
+    async def execute(name, arguments):
+        entered.set()
+        await finish.wait()
+        receipt.write_text('original privacy callback settled')
+        return arguments, {'success': True}
+
+    calling = asyncio.create_task(harness.dispatch(execute, 'original', {}))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=0.5)
+        calling.cancel('original privacy reader withdrawal')
+        await asyncio.sleep(0)
+        assert not calling.done(), 'Privacy reader abandoned its accepted callback'
+        finish.set()
+        completed, pending = await asyncio.wait({calling}, timeout=0.5)
+        assert not pending, 'Privacy reader did not collect its original callback'
+        with pytest.raises(BaseException) as caught:
+            await calling
+        evidence = execution_evidence_carriers(caught.value)
+        assert any(isinstance(error, asyncio.CancelledError)
+            and error.args == ('original privacy reader withdrawal',) for error in evidence), (
+                'Privacy reader replaced the original caller withdrawal')
+        assert not any(isinstance(error, asyncio.InvalidStateError) for error in evidence)
+        assert receipt.read_text() == 'original privacy callback settled'
+    finally:
+        finish.set()
+        if not calling.done():
+            calling.cancel()
+        await asyncio.gather(calling, return_exceptions=True)
+        await harness.stop()

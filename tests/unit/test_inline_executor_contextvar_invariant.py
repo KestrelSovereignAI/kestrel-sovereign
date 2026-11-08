@@ -53,6 +53,8 @@ inline tool left without lineage); ``_CURRENT_TURN_ID`` is still NOT covered.
 """
 from __future__ import annotations
 
+from tests.utils.codex_inline import OwnedCallbackReader
+
 import asyncio
 import contextvars
 from types import SimpleNamespace
@@ -126,57 +128,14 @@ class _Agent(OrchestratorEngineMixin):
         return {"ok": True}
 
 
-class _CodexReaderHarness:
-    """Reproduce the codex reader-task topology (see #2081's regression test).
-
-    The reader is spawned ONCE, before the turn publishes its ContextVars, so
-    it freezes a pre-turn snapshot; each tool call runs on a task spawned from
-    that reader - the topology in which an un-re-bound var reads its default.
-    """
-
-    def __init__(self):
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._reader = None
-
-    async def ensure_started(self):
-        if self._reader is None:
-            self._reader = asyncio.create_task(self._read_loop())
-
-    async def _read_loop(self):
-        while True:
-            item = await self._queue.get()
-            if item[0] is None:
-                return
-            executor, name, args, done = item
-            asyncio.create_task(self._handle(executor, name, args, done))
-
-    async def _handle(self, executor, name, args, done):
-        try:
-            done.set_result(await executor(name, args))
-        except Exception as exc:  # noqa: BLE001 - pragma: no cover, re-raised via future
-            done.set_exception(exc)
-
-    async def dispatch(self, executor, name, args):
-        await self.ensure_started()
-        done = asyncio.get_running_loop().create_future()
-        await self._queue.put((executor, name, args, done))
-        return await done
-
-    async def stop(self):
-        if self._reader is not None:
-            await self._queue.put((None, None, None, None))
-            await self._reader
-            self._reader = None
-
-
 @pytest.mark.asyncio
 async def test_inline_executor_rebinds_every_turn_scoped_contextvar():
     """Every ContextVar the turn publishes is visible, with its value, in the tool."""
     agent = _Agent()
-    harness = _CodexReaderHarness()
+    harness = OwnedCallbackReader()
 
     # Reader spawned BEFORE the turn publishes: its tasks inherit pre-turn ctx.
-    await harness.ensure_started()
+    await harness.start()
 
     signal = _FakeSignal("cron.self_followup")
     token = set_current_signal(signal)
@@ -223,8 +182,8 @@ async def test_inline_executor_carries_current_signal_for_the_hop_guard():
     another follow-up unbounded.
     """
     agent = _Agent()
-    harness = _CodexReaderHarness()
-    await harness.ensure_started()
+    harness = OwnedCallbackReader()
+    await harness.start()
 
     signal = _FakeSignal("cron.self_followup")
     token = set_current_signal(signal)
@@ -253,8 +212,8 @@ async def test_off_turn_executor_carries_no_signal():
     guard starts refusing legitimate first-hop schedules.
     """
     agent = _Agent()
-    harness = _CodexReaderHarness()
-    await harness.ensure_started()
+    harness = OwnedCallbackReader()
+    await harness.start()
 
     with part_collector():
         executor = agent._make_inline_tool_executor("session-direct")
@@ -290,9 +249,9 @@ async def test_inline_executor_wiring_carries_scheduler_execution_scope():
     scope = _SchedulerExecutionScope(execution=execution)
 
     agent = _Agent()
-    harness = _CodexReaderHarness()
+    harness = OwnedCallbackReader()
     # Reader spawned BEFORE the scope is published: frozen pre-turn snapshot.
-    await harness.ensure_started()
+    await harness.start()
 
     token = _current_execution.set(scope)
     try:
@@ -367,7 +326,6 @@ async def test_subagent_executor_wiring_carries_scheduler_execution_scope(native
     execution = SimpleNamespace(id="exec-subagent-1", idempotency_key="occ:key:subagent")
     scope = _SchedulerExecutionScope(execution=execution)
 
-    from tests.utils.codex_inline import OwnedCallbackReader
     from tests.utils.native_tool_effects import drive_native
     agent = await native_tool_effect_agent(did="did:test:scheduler-scope")
     feature = _ScopeSubagentFeature(agent)
@@ -440,8 +398,8 @@ async def test_inline_executor_wiring_carries_causation_chain():
     from kestrel_sovereign.agent.turn_lifecycle import _CURRENT_CHAIN
 
     agent = _ChainReadingAgent()
-    harness = _CodexReaderHarness()
-    await harness.ensure_started()
+    harness = OwnedCallbackReader()
+    await harness.start()
 
     frame = _chain_frame("cron.self_followup")
     token = _CURRENT_CHAIN.set([frame])
@@ -470,12 +428,12 @@ async def test_inline_executor_does_not_leak_a_stale_chain_into_a_later_turn():
     from kestrel_sovereign.agent.turn_lifecycle import _CURRENT_CHAIN
 
     agent = _ChainReadingAgent()
-    harness = _CodexReaderHarness()
+    harness = OwnedCallbackReader()
 
     token = _CURRENT_CHAIN.set([_chain_frame("cron.self_followup")])
     try:
         # Reader spawned during the earlier turn: frozen WITH its chain.
-        await harness.ensure_started()
+        await harness.start()
     finally:
         _CURRENT_CHAIN.reset(token)
 
@@ -523,7 +481,6 @@ async def test_subagent_executor_wiring_carries_causation_chain(native_tool_effe
         def get_tools(self):
             return self._tools
 
-    from tests.utils.codex_inline import OwnedCallbackReader
     from tests.utils.native_tool_effects import drive_native
     agent = await native_tool_effect_agent(did="did:test:chain-scope")
     feature = _ChainSubagentFeature(agent)

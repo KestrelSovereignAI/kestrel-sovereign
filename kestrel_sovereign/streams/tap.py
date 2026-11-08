@@ -215,9 +215,9 @@ class AgentStreamTap:
         text is live, its actual producer supplies the original work factory.
         Once that lifetime starts closing, new work waits for the completed
         drain handoff and acquires its own policy span under the retained
-        request generation. No stale writer token crosses that handoff.
+        request generation. Each admitted worker binds its actual privacy
+        identity; the consumer's complete turn context is never rewritten.
         """
-        from kestrel_sovereign.storage.privacy_wrapper import bind_transition_lock_reentry
         producer = self.producer_custody(delivery_id, owner)
         fence = self._requests.get(delivery_id)
         if fence is None:
@@ -233,12 +233,12 @@ class AgentStreamTap:
         if fence.finished.is_set():
             if not fence.drain_retained:
                 raise ExecutionAuthorityError("original stream did not admit a completed native drain")
-            token, factory = None, None
+            factory = owner._get_privacy_transition_lock().capture_native_work_factory()
         else:
             token, factory = fence.privacy_token, fence.native_work_factory
             if token is None or factory is None:
                 raise ExecutionAuthorityError("original stream native admission is unavailable")
-        with bind_execution_custody_snapshot(producer), bind_transition_lock_reentry(token, replace=True):
+        with bind_execution_custody_snapshot(producer):
             yield factory
 
     async def publish(self, delivery_id: str, text_chunk: str) -> None:

@@ -738,20 +738,11 @@ async def test_an_inline_tool_on_a_task_older_than_the_turn_carries_its_identity
     """
     adapter = UsageReportingAdapter(tokens=7, cost=0.0003)
     sinks = _TurnSinks()
-    requests: asyncio.Queue = asyncio.Queue()
-
-    async def reader() -> None:
-        while (request := await requests.get()) is not None:
-            executor, done = request
-            try:
-                done.set_result(await executor("embed_note", {}))
-            except Exception as exc:  # noqa: BLE001 - re-raised via the future
-                done.set_exception(exc)
+    from tests.utils.codex_inline import OwnedCallbackReader
+    reader = OwnedCallbackReader()
 
     async def generate(*, tool_executor, **_kwargs) -> None:
-        done = asyncio.get_running_loop().create_future()
-        await requests.put((tool_executor, done))
-        await done
+        await reader.dispatch(tool_executor, 'embed_note', {})
 
     async with _booted_agent(
         tmp_path, monkeypatch, adapter, sinks, generate=generate
@@ -761,13 +752,11 @@ async def test_an_inline_tool_on_a_task_older_than_the_turn_carries_its_identity
             return await agent.llm_service.get_embedding_service().aembed(TOOL_TEXT)
 
         monkeypatch.setattr(agent, "execute_named_tool", execute_named_tool)
-        reader_task = asyncio.create_task(reader())
-        await asyncio.sleep(0)  # the reader is running before the turn starts
+        await reader.start()  # resident reader precedes the owning turn
         try:
             assert await _run_turn(agent, "process_input", "explicit") == "Noted."
         finally:
-            await requests.put(None)
-            await reader_task
+            await reader.stop()
 
     assert TOOL_TEXT in adapter.texts
     _assert_every_embedding_is_the_turns(adapter, sinks)

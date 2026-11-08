@@ -869,3 +869,63 @@ async def test_partial_gather_admission_keeps_all_original_cleanup_writers(tmp_p
             if not task.done():
                 task.cancel()
         await asyncio.gather(calling, *accepted, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('live_producer', [False, True])
+async def test_native_factory_binds_its_actual_admission_and_preserves_other_context(
+    live_producer, tmp_path,
+):
+    from kestrel_sovereign.storage.privacy_wrapper import current_bound_reentry_token
+    from kestrel_sovereign.telemetry import bind_current_turn_id, current_turn_id
+
+    lock = ReentrantTransitionLock()
+    ready, finish = asyncio.Event(), asyncio.Event()
+    factories, scopes, observed = [], [], []
+    receipt = tmp_path / 'native-factory-policy'
+
+    async def produce():
+        async with lock.policy_span():
+            scopes.append(lock.current_native_scope())
+            if live_producer:
+                factories.append(lock.capture_native_work_factory())
+            ready.set()
+            await finish.wait()
+
+    async def effect():
+        actual = lock.current_native_scope()
+        observed.append((actual, current_bound_reentry_token(), current_turn_id()))
+        assert actual is not None
+        if live_producer:
+            assert actual is scopes[0]
+            assert current_bound_reentry_token() is actual, (
+                'native worker did not bind its actual original admission')
+        else:
+            assert actual is not scopes[0]
+            assert current_bound_reentry_token() is None, (
+                'fresh native worker borrowed a retired caller span')
+        assert current_turn_id() == 'native-work-consumer'
+        receipt.write_text('native policy decision acknowledged')
+
+    producer = create_owned_task(produce())
+    work = None
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        if not live_producer:
+            finish.set()
+            assert (await await_owned_task(producer)).error is None
+            factories.append(lock.capture_native_work_factory())
+        consumer_context = object() if live_producer else scopes[0]
+        with bind_transition_lock_reentry(consumer_context), bind_current_turn_id('native-work-consumer'):
+            work = factories[0](effect)
+            outcome = await await_owned_task(work)
+            assert current_bound_reentry_token() is consumer_context
+        assert outcome.error is None, 'native work rejected its actual admission or fresh policy span'
+        assert receipt.read_text() == 'native policy decision acknowledged'
+        assert len(observed) == 1
+    finally:
+        finish.set()
+        if work is not None:
+            await await_owned_task(work)
+        await await_owned_task(producer)
+    assert not lock.locked() and not lock._native_scopes

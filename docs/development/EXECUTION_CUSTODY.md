@@ -57,7 +57,11 @@ that factory. Provider acquisition and each sentence finish within this native
 admission; waiting for more text does not hold a provider writer. If the text
 lifetime is closing, admission waits for its original physical work and the
 acknowledged drain handoff. A successful final drain retains the same request
-generation and acquires a fresh policy span with the retired text token cleared.
+generation and receives a native factory for its own policy decision. The
+native worker binds the privacy identity established by its actual admission,
+clearing a copied retired text token when it opens a fresh policy span. All
+other turn values come from the consumer context copied at Task construction;
+the tap does not rebind any part of the consumer's turn context by hand.
 Stopped, foreign, or unsuccessfully completed deliveries cannot admit work.
 
 Closing journal admission uses the original native parent-admission tree of a
