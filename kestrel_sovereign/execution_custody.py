@@ -391,10 +391,13 @@ def _native_source_originals(error: BaseException | None, *,
     if sources is not None:
         if include_tool_terminal:
             # Finite delivery envelopes carry Core source provenance, not an
-            # authority grant. Recover their exact unmarked terminal originals
+            # authority grant. Core sources are authoritative in `sources`;
+            # do not recover a finite Core refusal from its explicit leaves.
+            # Recover only additional non-Core terminal delivery originals,
             # without retaining the envelope's unrelated observer withdrawal.
             originals = [*sources, *(member for member in _explicit_control_chain(error)
                 if is_tool_execution_terminal_error(member)
+                and not is_execution_control_error(member)
                 and _canonical_native_source_originals(member) is None)]
             return tuple(_enclosing_original_errors(originals))
         return sources

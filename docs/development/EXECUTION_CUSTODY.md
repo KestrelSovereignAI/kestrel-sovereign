@@ -2472,3 +2472,11 @@ Typed cognition failures and Stop dispositions are constructed by the same
 failure-result factory that schedules their audit. The queued and returned
 result have the same identity until public normalization, so the original
 terminal audit is submitted once without exposing private reconciliation data.
+
+Tool-terminal source projection honors authenticated Core source provenance.
+An explicitly source-free Core admission refusal after a healthy journal COMMIT
+remains a finite observer result; scanning its leaves cannot make it a native
+writer failure. Additional non-Core SDK/audit or reconciliation sources are
+still retained exactly, including when independently composed with that finite
+refusal. The foreground observer keeps the actual committed/refused evidence;
+only genuine native sources enter the shared writer latch.
