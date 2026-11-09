@@ -91,7 +91,7 @@ import time
 import weakref
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import InitVar, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from enum import Enum
@@ -280,9 +280,17 @@ class _StoppedCognitionResult(SignalResult):
     """Typed terminal no-op produced by an acknowledged cooperative Stop."""
 
 
-@dataclass
+@dataclass(kw_only=True)
 class _ReconciliationCognitionResult(SignalResult):
     """Tool effects require reconciliation; no automatic cognition replay."""
+
+    __slots__ = ("_original_error",)
+    original_error: InitVar[BaseException]
+
+    def __post_init__(self, original_error):
+        if not isinstance(original_error, BaseException):
+            raise TypeError("A reconciliation result requires its original failure")
+        self._original_error = original_error
 
 
 @dataclass
@@ -5487,9 +5495,10 @@ class SignalDispatcher:
 
     @staticmethod
     def _completed_cognition_was_stopped(task):
-        from kestrel_sovereign._async_ownership import owned_task_error
-        return (task is not None and task.done() and owned_task_error(task) is None
-                and isinstance(task.result(), _StoppedCognitionResult))
+        if task is None or not task.done():
+            return False
+        outcome = SignalDispatcher._completed_cognition_outcome(task)
+        return outcome.error is None and isinstance(outcome.result, _StoppedCognitionResult)
 
     @asynccontextmanager
     async def _own_cognition_claim(self, delivery, routing_admission, *, journal_completion=()):
@@ -6093,16 +6102,26 @@ class SignalDispatcher:
         )
         return result
 
+    @staticmethod
+    def _cognition_result_is_terminal(result):
+        """One finality rule for immediate and retained route results."""
+        return isinstance(result, (_ReconciliationCognitionResult, _StoppedCognitionResult)) or result.status in {
+            Status.DROPPED_VALIDATION,
+            Status.DROPPED_CYCLE,
+        }
+
     async def _settle_cognition_non_delivery(self, delivery, result, *, consumer_id, retry_delay) -> bool:
         """Persist one source withdrawal or unsuccessful route under its exact lease."""
         # Rate limits, quiet hours, coalescing, and cognition failures are
         # recoverable for cursor-owning ingress. Validation/cycle refusal is a
         # proven terminal no-op and may be acknowledged idempotently.
         reconciliation = isinstance(result, _ReconciliationCognitionResult)
-        terminal = reconciliation or isinstance(result, _StoppedCognitionResult) or result.status in {
-            Status.DROPPED_VALIDATION,
-            Status.DROPPED_CYCLE,
-        }
+        if reconciliation:
+            # Returned reconciliation and raised terminal failure own the
+            # same exact-token terminalizer, including failed-write debt.
+            await self._terminalize_failed_cognition(delivery, result._original_error)
+            return False
+        terminal = self._cognition_result_is_terminal(result)
         try:
             released = await self.nack_durable_delivery(
                 consumer_id=consumer_id,
@@ -6196,10 +6215,12 @@ class SignalDispatcher:
         self._rearm_cleanup_runtime_owner_heartbeat()
 
         def completed(completed_task: asyncio.Task[SignalResult]) -> None:
-            from kestrel_sovereign._async_ownership import owned_task_error
             # First canonical harvest precedes releasing the physical owner;
             # Task.result() can erase a cancellation cause on a second read.
-            error = owned_task_error(completed_task)
+            outcome = self._completed_cognition_outcome(completed_task)
+            result = outcome.result
+            error = execution_observation_error(outcome.error,
+                result._original_error if isinstance(result, _ReconciliationCognitionResult) else None)
             debt = getattr(self, "_retained_cognition_control_debt", {}).get(delivery.delivery_id)
             from kestrel_sovereign.execution_custody import (
                 execution_native_source_error,
@@ -6231,7 +6252,7 @@ class SignalDispatcher:
                 self._rearm_cleanup_runtime_owner_heartbeat()
             self._retained_durable_cognition_tasks.discard(completed_task)
             cleanup = asyncio.create_task(
-                self._release_retained_durable_cognition_task(delivery, retained_error),
+                self._release_retained_durable_cognition_task(delivery, retained_error, result=result),
                 name=(
                     "durable_cognition_retained_cleanup:"
                     f"{delivery.delivery_id}"
@@ -6258,13 +6279,17 @@ class SignalDispatcher:
 
     async def _release_retained_durable_cognition_task(
         self, delivery: DurableDelivery, control_error: BaseException | None = None,
-        *, observe_failure: bool = False,
+        *, observe_failure: bool = False, result: SignalResult | None = None,
     ) -> None:
         """Requeue one exact retained lease only after its task is terminal."""
 
         if control_error is not None:
             await self._terminalize_failed_cognition(delivery, control_error)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            return
+        if result is not None and self._cognition_result_is_terminal(result):
+            await self._settle_cognition_non_delivery(delivery, result,
+                consumer_id=delivery.consumer_id, retry_delay=timedelta())
             return
         try:
             released = await self.release_durable_delivery_after_task(
@@ -6440,7 +6465,11 @@ class SignalDispatcher:
             raise terminal
 
     async def _apply_cognition_control_terminal(self, delivery, error):
-        reason = f"execution_control_unresolved: {type(error).__name__}: {error}"[:500]
+        from kestrel_sovereign.tools.effect_failures import tool_effect_failure
+        failure = tool_effect_failure(error)
+        detail = (f"{failure.code}: {failure.message}" if failure is not None
+            and failure.reconciliation_required else f"{type(error).__name__}: {error}")
+        reason = f"execution_control_unresolved: {detail}"[:500]
         backend = self._durable_store.backend
         if backend.backend_type == "postgres":
             # Ordinary admission is deliberately still denied. Only the fixed
@@ -6480,6 +6509,20 @@ class SignalDispatcher:
         )
 
     @staticmethod
+    def _completed_cognition_outcome(task):
+        """Read the original physical result AND canonical completion receipt."""
+        from kestrel_sovereign._async_ownership import OwnedTaskOutcome, owned_native_completion
+        result = None
+        try:
+            with owned_native_completion(task):
+                result = task.result()
+        except BaseException as error:
+            if isinstance(result, _ReconciliationCognitionResult):
+                error = execution_observation_error(error, result._original_error)
+            return OwnedTaskOutcome(result=result, error=error, cancellation=None)
+        return OwnedTaskOutcome(result=result, error=None, cancellation=None)
+
+    @staticmethod
     def _completed_durable_cognition_result(
         task: asyncio.Task[SignalResult],
         *,
@@ -6488,10 +6531,11 @@ class SignalDispatcher:
     ) -> Optional[SignalResult]:
         """Return a settled route result without leaking task cancellation."""
 
-        from kestrel_sovereign._async_ownership import owned_native_completion
+        outcome = SignalDispatcher._completed_cognition_outcome(task)
+        if outcome.error is None:
+            return outcome.result
         try:
-            with owned_native_completion(task):
-                return task.result()
+            raise outcome.error
         except asyncio.CancelledError as error:
             if is_tool_execution_terminal_error(error):
                 raise
@@ -7052,7 +7096,7 @@ class SignalDispatcher:
                 failed = self._fail(signal, start, Status.FAILED,
                     error=f'{failure.code}: {failure.message}',
                     registration=registration, audit=audit)
-                return _ReconciliationCognitionResult(**vars(failed))
+                return _ReconciliationCognitionResult(**vars(failed), original_error=e)
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
             # `_route_under_locks` calls `_fail` without it. Catch

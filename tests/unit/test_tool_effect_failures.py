@@ -4,7 +4,7 @@ import pytest
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign.api_errors import tool_effect_api_error
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error, is_tool_execution_terminal_error
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectAttemptClosed, ToolEffectAttemptSuperseded,
     ToolEffectOperationConflict, ToolEffectReconciliationRequired,
@@ -30,10 +30,34 @@ def test_transport_classification_does_not_reflect_private_failure_content(error
     assert failure.code == public.code == code
     assert failure.status_code == public.status_code == status
     assert failure.reconciliation_required is reconcile
+    assert is_tool_execution_terminal_error(error) is reconcile
     assert public.message == failure.message
     assert public.details == failure.details
     assert 'private content' not in public.message
     assert public.headers is None, 'Uncertain effects must not advise automatic HTTP retry'
+
+
+@pytest.mark.parametrize('kind', ['reconcile', 'conflict', 'superseded', 'closed'])
+@pytest.mark.parametrize('shape', ['cause', 'group', 'mixed-group', 'mixed-group-reversed'])
+def test_original_reconciliation_classification_survives_finite_delivery_composition(kind, shape):
+    original = (ToolEffectReconciliationRequired({'unsettled': 1}) if kind == 'reconcile' else
+        {'conflict': ToolEffectOperationConflict, 'superseded': ToolEffectAttemptSuperseded,
+         'closed': ToolEffectAttemptClosed}[kind]('private original operation'))
+    expected = tool_effect_failure(original)
+    if shape == 'cause':
+        error = ValueError('private observer diagnostic')
+        error.__cause__ = original
+    else:
+        errors = ([ToolEffectPrivacyRefused('private sibling refusal'), original]
+            if shape.startswith('mixed-group') else [original, ValueError('private observer diagnostic')])
+        if shape == 'mixed-group-reversed':
+            errors.reverse()
+        error = ExceptionGroup('actual independent delivery outcomes', errors)
+    failure = tool_effect_failure(error)
+    assert failure == expected and is_tool_execution_terminal_error(error), (
+        'Independent nonterminal failure downgraded original reconciliation disposition')
+    assert not is_execution_control_error(error)
+    assert 'private' not in tool_effect_api_error(error).message
 
 
 @pytest.mark.parametrize('error', [ValueError('unrelated failure'), ExecutionAuthorityError('original control')])

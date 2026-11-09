@@ -1312,9 +1312,31 @@ async def test_original_durable_route_result_reads_complete_native_receipt(tmp_p
 @pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit"])
 @pytest.mark.parametrize("completion", ["immediate", "retained", "retry-settlement"])
 async def test_original_durable_dispatch_keeps_late_terminal_delivery_nonretryable(tmp_path, monkeypatch, kind, completion):
+    await _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completion)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit", "reconcile", "conflict", "superseded", "closed"])
+@pytest.mark.parametrize("retained", [False, True])
+async def test_original_durable_result_disposition_survives_retained_route(tmp_path, monkeypatch, kind, retained):
+    await _original_durable_dispatch_case(tmp_path, monkeypatch, kind,
+        "retained" if retained else "immediate", route_error=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sdk", "audit", "reconcile", "conflict", "superseded", "closed"])
+@pytest.mark.parametrize("retained", [False, True])
+async def test_original_reconciliation_result_retains_failed_terminal_write_owner(tmp_path, monkeypatch, kind, retained):
+    await _original_durable_dispatch_case(tmp_path, monkeypatch, kind,
+        "retained" if retained else "immediate", route_error=True, fail_terminal=True)
+
+
+async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completion, *, route_error=False, fail_terminal=False):
+    import json
     from datetime import datetime, timedelta, timezone
     from kestrel_sovereign._async_ownership import _retain_owned_admission_error
     from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_tool_execution_terminal_error
+    from kestrel_sovereign.tool_effect_store import (ToolEffectReconciliationRequired, ToolEffectOperationConflict, ToolEffectAttemptSuperseded, ToolEffectAttemptClosed)
     from kestrel_sovereign.signals import DurableConsumerRegistration
     from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
     from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _channel_signal, _close
@@ -1326,6 +1348,23 @@ async def test_original_durable_dispatch_keeps_late_terminal_delivery_nonretryab
     published = (ResourceOutcomeUnknown("original route late effect uncertainty") if kind == "sdk"
         else ToolAuditUnconfirmedError("original route late audit uncertainty") if kind == "audit"
         else OSError("ordinary late route failure"))
+    if kind in {"reconcile", "conflict", "superseded", "closed"}:
+        published = (ToolEffectReconciliationRequired({"unsettled": 1}) if kind == "reconcile"
+            else {"conflict": ToolEffectOperationConflict, "superseded": ToolEffectAttemptSuperseded,
+                  "closed": ToolEffectAttemptClosed}[kind]("original operation requires reconciliation"))
+    if fail_terminal and kind != "reconcile":
+        published.args = ("private original reconciliation diagnostic",)
+    terminal_calls, metadata_error = [], OSError("actual original terminal write failed before SQL")
+    if fail_terminal:
+        terminal = dispatcher._apply_cognition_control_terminal
+        async def fail_first_terminal(delivery, error):
+            debt = dispatcher._retained_cognition_control_debt.get(delivery.delivery_id)
+            assert debt is not None and debt[0] is delivery and published in tuple(execution_evidence_carriers(debt[1]))
+            terminal_calls.append((delivery, delivery.lease_token, error))
+            if len(terminal_calls) == 1:
+                raise metadata_error
+            return await terminal(delivery, error)
+        monkeypatch.setattr(dispatcher, "_apply_cognition_control_terminal", fail_first_terminal)
     retained = completion == "retained"
     settlement = completion == "retry-settlement"
     entered, release = asyncio.Event(), asyncio.Event()
@@ -1336,7 +1375,7 @@ async def test_original_durable_dispatch_keeps_late_terminal_delivery_nonretryab
         task = asyncio.current_task()
         routes.append(task)
         effect.write_text("one original effect")
-        if kind is not None and not settlement:
+        if kind is not None and not settlement and not route_error:
             task.add_done_callback(lambda completed: _retain_owned_admission_error(completed, published))
         entered.set()
         if retained:
@@ -1344,6 +1383,8 @@ async def test_original_durable_dispatch_keeps_late_terminal_delivery_nonretryab
                 await release.wait()
             except asyncio.CancelledError:
                 await release.wait()
+        if route_error and kind is not None:
+            raise published
         if settlement:
             raise OSError("original unsuccessful route requires exact-token retry settlement")
         return "original route completed"
@@ -1376,7 +1417,7 @@ async def test_original_durable_dispatch_keeps_late_terminal_delivery_nonretryab
         else:
             outcome = await await_owned_task(handle.task)
         [delivery] = await dispatcher.list_durable_deliveries()
-        terminal = kind in {"sdk", "audit"}
+        terminal = kind in {"sdk", "audit", "reconcile", "conflict", "superseded", "closed"}
         if terminal:
             assert delivery.status == "failed" and delivery.next_attempt_at is None, (
                 "Late original tool outcome permitted durable cognition replay")
@@ -1386,7 +1427,21 @@ async def test_original_durable_dispatch_keeps_late_terminal_delivery_nonretryab
         else:
             expected = "acknowledged" if kind is None and completion == "immediate" else "retry"
             assert delivery.status == expected
-        if terminal and not retained:
+        if fail_terminal:
+            assert len(terminal_calls) == 2
+            assert terminal_calls[0][0] is terminal_calls[1][0] and terminal_calls[0][1] == terminal_calls[1][1]
+            assert all(published in tuple(execution_evidence_carriers(call[2])) for call in terminal_calls)
+            assert "private" not in delivery.last_error
+        if terminal and not retained and route_error and fail_terminal:
+            assert outcome.error is not None and is_tool_execution_terminal_error(outcome.error)
+            assert published in tuple(execution_evidence_carriers(outcome.error))
+            assert metadata_error in tuple(execution_evidence_carriers(outcome.error))
+        if terminal and not retained and route_error and not fail_terminal:
+            from dataclasses import asdict
+            from kestrel_sdk.signals import Status
+            assert outcome.error is None and outcome.result.status is Status.FAILED
+            json.dumps(asdict(outcome.result))
+        if terminal and not retained and not route_error:
             assert outcome.error is not None and is_tool_execution_terminal_error(outcome.error)
             assert published in tuple(execution_evidence_carriers(outcome.error))
             assert not is_execution_control_error(outcome.error), "Delivery uncertainty broadened Core authority loss"
@@ -1529,3 +1584,42 @@ async def test_actual_supervisor_withdrawal_retains_native_cancellation_contract
         assert effect.read_text() == "one original effect" and task.done()
     finally:
         await await_owned_task(task)
+
+
+@pytest.mark.parametrize("kind", ["reconcile", "conflict", "superseded", "closed"])
+def test_original_tool_reconciliation_projection_excludes_finite_observer_history(kind):
+    from kestrel_sovereign.execution_custody import execution_observation_error
+    from kestrel_sovereign.tool_effect_store import (
+        ToolEffectReconciliationRequired, ToolEffectOperationConflict,
+        ToolEffectAttemptSuperseded, ToolEffectAttemptClosed,
+    )
+    original = (ToolEffectReconciliationRequired({"unsettled": 1}) if kind == "reconcile" else
+        {"conflict": ToolEffectOperationConflict, "superseded": ToolEffectAttemptSuperseded,
+         "closed": ToolEffectAttemptClosed}[kind]("original operation needs reconciliation"))
+    cause = OSError("original provider diagnostic")
+    original.__cause__ = cause
+    shared = None
+    for index in range(6):
+        withdrawal = asyncio.CancelledError("actual finite observer", index)
+        observed = execution_observation_error(original, withdrawal)
+        assert execution_native_source_error(observed) is None
+        shared = execution_native_source_error(shared, observed, include_tool_terminal=True)
+        assert shared is original, "Shared reconciliation source retained finite observer history"
+        assert withdrawal not in tuple(execution_evidence_carriers(shared))
+        assert original.__cause__ is cause
+
+
+def test_reconciliation_result_retains_original_without_adding_public_fields():
+    import json
+    from dataclasses import asdict
+    from kestrel_sdk.signals import SignalMode, SignalResult, Status
+    from kestrel_sovereign.signals.dispatcher import _ReconciliationCognitionResult
+    original = ResourceOutcomeUnknown("private original provider diagnostic")
+    public = SignalResult(signal_id="original-reconciliation", status=Status.FAILED,
+        mode=SignalMode.COGNITION, duration_ms=0, error="tool outcome requires reconciliation")
+    result = _ReconciliationCognitionResult(**vars(public), original_error=original)
+    assert result._original_error is original
+    assert vars(result) == asdict(result) == vars(public)
+    assert "private" not in json.dumps(asdict(result))
+    with pytest.raises(TypeError, match="requires its original failure"):
+        _ReconciliationCognitionResult(**vars(public), original_error=None)

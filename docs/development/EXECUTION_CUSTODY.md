@@ -971,6 +971,17 @@ authority loss. Delivery retention explicitly opts into
 Core source projection and the authority predicate remain unchanged. The opt-in
 recovers exact original SDK/audit sources from canonical finite envelopes and
 excludes unrelated observer withdrawals, rather than retaining observer history.
+Completed cognition reads share one canonical outcome reader, including the
+returned result as well as the Task's exception. A reconciliation result retains
+its actual original exception in a private slot that is absent from public
+dataclass fields and serialization. Immediate and retained reconciliation both
+join the same exact-token terminalizer. A failed terminal write retains that
+source and its original claim for bounded metadata reconciliation, rather than
+releasing work for replay. The terminal row uses the canonical content-free
+failure message. The shared tool-delivery classifier also covers operation
+conflict, superseded/closed attempts and existing-operation reconciliation;
+their meaning cannot be downgraded by an ordinary sibling error. Core authority
+classification remains separate.
 Signal delivery observers read the canonical original completion after a native
 success as well as after exceptions. SDK/audit uncertainty cannot authorize a
 successful checkpoint or ordinary replay restoration. Their supervisor finalizer

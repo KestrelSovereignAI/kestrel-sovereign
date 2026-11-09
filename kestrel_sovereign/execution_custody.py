@@ -272,17 +272,19 @@ def is_execution_control_error(
 
 
 def is_tool_execution_terminal_error(error: BaseException | None) -> bool:
-    """Tool delivery must propagate control, unknown effects and audit uncertainty.
+    """Tool delivery propagates control and every reconciliation-required failure.
 
     An audit error alone is not authority loss or retirement debt. Keep this
     local delivery rule separate from the SDK-registered control predicate.
     """
-    from kestrel_sdk.resources import observed_outcome_unknown
+    if is_execution_control_error(error):
+        return True
+    if error is None:
+        return False
+    from kestrel_sovereign.tools.effect_failures import tool_effect_failure
 
-    return is_execution_control_error(error) or bool(observed_outcome_unknown(error)) or any(
-        issubclass(type(current), ToolAuditUnconfirmedError)
-        for current in _explicit_control_chain(error)
-    )
+    failure = tool_effect_failure(error)
+    return failure is not None and failure.reconciliation_required
 
 
 def retained_execution_error(error: BaseException) -> BaseException:
@@ -388,11 +390,11 @@ def _native_source_originals(error: BaseException | None, *,
     sources = _canonical_native_source_originals(error)
     if sources is not None:
         if include_tool_terminal:
-            # Finite SDK envelopes carry Core source provenance, not an
-            # authority grant. Recover their exact unmarked SDK originals
+            # Finite delivery envelopes carry Core source provenance, not an
+            # authority grant. Recover their exact unmarked terminal originals
             # without retaining the envelope's unrelated observer withdrawal.
             originals = [*sources, *(member for member in _explicit_control_chain(error)
-                if issubclass(type(member), ResourceOutcomeUnknown)
+                if is_tool_execution_terminal_error(member)
                 and _canonical_native_source_originals(member) is None)]
             return tuple(_enclosing_original_errors(originals))
         return sources
