@@ -21,6 +21,16 @@ from tests.unit.test_execution_custody_review30 import (
 
 
 def receipt(kind):
+    if kind in {"sdk", "audit", "cancel_sdk", "cancel_audit"}:
+        from kestrel_sdk.resources import ResourceOutcomeUnknown
+        from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
+        error = (ResourceOutcomeUnknown("original uncertain provider effect")
+            if kind.endswith("sdk") else ToolAuditUnconfirmedError("original uncertain audit"))
+        if kind.startswith("cancel_"):
+            wrapper = asyncio.CancelledError("original tool cancellation")
+            wrapper.__cause__ = error
+            return wrapper
+        return error
     error = ExecutionCommitOutcomeError("unknown")
     if kind == "cancel_unknown":
         wrapper = asyncio.CancelledError("original writer cancellation")

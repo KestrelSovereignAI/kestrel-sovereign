@@ -14,6 +14,7 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.openrouter_adapter import OpenRouterAdapter
 from tests.unit.test_execution_custody_review32 import receipt
+from tests.utils.original_failure import OriginalFailure
 from tests.unit.test_execution_custody_review39_native import Body, openai_chunk
 from tests.unit.test_signals_dispatcher import (
     _action_reg,
@@ -29,7 +30,7 @@ from tests.unit.test_signals_dispatcher import (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
+@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group", "sdk", "audit", "cancel_sdk", "cancel_audit"])
 async def test_native_persist_receipt_reaches_both_dispatch_lanes(
     dispatcher_components, monkeypatch, kind,
 ):
@@ -49,14 +50,17 @@ async def test_native_persist_receipt_reaches_both_dispatch_lanes(
         for wait in (handle.wait, handle.wait_for_durable_admission):
             with pytest.raises(BaseException) as caught:
                 await wait()
-            assert caught.value is original
+            if kind in {"cancel_sdk", "cancel_audit"}:
+                OriginalFailure.capture(original.__cause__).assert_retained(caught.value)
+            else:
+                assert caught.value is original
         assert committed and committed[0].created
     finally:
         await c.dispatcher.shutdown_durable_delivery()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
+@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group", "sdk", "audit", "cancel_sdk", "cancel_audit"])
 @pytest.mark.parametrize("boundary", ["activation", "repair", "legacy"])
 async def test_native_post_commit_paths_retain_strongest_original_control(
     dispatcher_components, monkeypatch, tmp_path, kind, boundary,
@@ -92,7 +96,10 @@ async def test_native_post_commit_paths_retain_strongest_original_control(
             for wait in (handle.wait, handle.wait_for_durable_admission):
                 with pytest.raises(BaseException) as caught:
                     await wait()
-                assert caught.value is original
+                if kind in {"cancel_sdk", "cancel_audit"}:
+                    OriginalFailure.capture(original.__cause__).assert_retained(caught.value)
+                else:
+                    assert caught.value is original
             assert effects
         finally:
             await dispatcher.shutdown_durable_delivery()
@@ -117,10 +124,10 @@ async def test_native_post_commit_paths_retain_strongest_original_control(
             with pytest.raises(BaseException) as caught:
                 await wait()
             chain = tuple(_explicit_control_chain(caught.value))
-            assert original in chain
+            assert (original.__cause__ if kind in {"cancel_sdk", "cancel_audit"} else original) in chain
             if boundary == "repair":
                 assert opening_failure in chain
-            assert execution_commit_outcome(caught.value) == "unknown"
+            assert execution_commit_outcome(caught.value) == (None if kind in {"sdk", "audit", "cancel_sdk", "cancel_audit"} else "unknown")
             assert tuple(_explicit_control_chain(original)) == source_graph
             assert tuple(execution_cleanup_debts(original)) == source_debts
         assert effects == [True]
@@ -129,7 +136,7 @@ async def test_native_post_commit_paths_retain_strongest_original_control(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
+@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group", "sdk", "audit", "cancel_sdk", "cancel_audit"])
 @pytest.mark.parametrize("boundary", ["dispatch", "shutdown"])
 async def test_native_outcome_writer_control_is_not_discarded(
     dispatcher_components, monkeypatch, kind, boundary,
@@ -161,21 +168,27 @@ async def test_native_outcome_writer_control_is_not_discarded(
             await asyncio.sleep(0)
             with pytest.raises(BaseException) as caught:
                 await c.dispatcher.shutdown_durable_delivery()
-        assert caught.value is original
+        if kind in {"sdk", "audit", "cancel_sdk", "cancel_audit"}:
+            OriginalFailure.capture(original.__cause__ if kind.startswith("cancel_") else original).assert_retained(caught.value)
+        else:
+            assert caught.value is original
         assert committed
     finally:
         monkeypatch.setattr(c.dispatcher, "_write_outcome_log", write)
         try:
             await c.dispatcher.shutdown_durable_delivery()
         except BaseException as error:
-            assert error is original
+            if kind in {"cancel_sdk", "cancel_audit"}:
+                OriginalFailure.capture(original.__cause__).assert_retained(error)
+            else:
+                assert error is original
             # Retained uncertain audit outcome refuses owner release. End the
             # disposable fixture's heartbeat only after every writer joined.
             await c.dispatcher._stop_runtime_owner_heartbeat()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group"])
+@pytest.mark.parametrize("kind", ["unknown", "cancel_unknown", "group", "sdk", "audit", "cancel_sdk", "cancel_audit"])
 @pytest.mark.parametrize("cancel_parent", [False, True])
 async def test_monitor_withdrawal_physically_joins_native_worker_receipt(
     dispatcher_components, tmp_path, monkeypatch, kind, cancel_parent,
@@ -191,7 +204,15 @@ async def test_monitor_withdrawal_physically_joins_native_worker_receipt(
     entered, cancellation_seen, release = (asyncio.Event() for _ in range(3))
     original = receipt(kind)
     source = OriginalFailure.capture(original)
-    withdrawals, task = [], None
+    withdrawals, task, reconciliations = [], None, []
+    dispatch_cognition = c.dispatcher._dispatch_cognition
+    async def observe_cognition(*args, **kwargs):
+        result = await dispatch_cognition(*args, **kwargs)
+        from kestrel_sovereign.signals.dispatcher import _ReconciliationCognitionResult
+        if isinstance(result, _ReconciliationCognitionResult):
+            reconciliations.append(result._original_error)
+        return result
+    monkeypatch.setattr(c.dispatcher, "_dispatch_cognition", observe_cognition)
     actual_join = ownership.await_owned_task
     async def observe(owner, *args, **kwargs):
         result = await actual_join(owner, *args, **kwargs)
@@ -228,10 +249,17 @@ async def test_monitor_withdrawal_physically_joins_native_worker_receipt(
         assert not task.done(), "withdrawal released a live native worker"
         release.set()
         outcome = await await_owned_task(task)
-        source.assert_retained(outcome.error)
-        if cancel_parent:
-            assert withdrawals and all(value in tuple(_explicit_control_chain(outcome.error)) for value in withdrawals)
+        if reconciliations:
+            from kestrel_sdk.signals import Status
+            assert outcome.error is None and outcome.result.status is Status.FAILED
+            assert len(reconciliations) == 1
+            terminal = reconciliations[0]
         else:
+            terminal = outcome.error
+        source.assert_retained(terminal)
+        if cancel_parent:
+            assert withdrawals and all(value in tuple(_explicit_control_chain(terminal)) for value in withdrawals)
+        elif not reconciliations:
             assert outcome.error is original
         rows = await c.backend.fetch_all("SELECT COUNT(*) AS n FROM effects")
         assert rows[0][0] == 1

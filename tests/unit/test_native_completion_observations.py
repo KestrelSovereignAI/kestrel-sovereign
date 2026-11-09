@@ -1331,7 +1331,19 @@ async def test_original_reconciliation_result_retains_failed_terminal_write_owne
         "retained" if retained else "immediate", route_error=True, fail_terminal=True)
 
 
-async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completion, *, route_error=False, fail_terminal=False):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit", "control"])
+async def test_original_monitored_withdrawal_cannot_ack_uncertain_effect(tmp_path, monkeypatch, kind):
+    await _original_durable_dispatch_case(tmp_path, monkeypatch, kind, "immediate", withdrawal="monitor")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit", "control"])
+async def test_original_renewal_cancellation_cannot_ack_uncertain_effect(tmp_path, monkeypatch, kind):
+    await _original_durable_dispatch_case(tmp_path, monkeypatch, kind, "immediate", withdrawal="renewal")
+
+
+async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completion, *, route_error=False, fail_terminal=False, withdrawal=None):
     import json
     from datetime import datetime, timedelta, timezone
     from kestrel_sovereign._async_ownership import _retain_owned_admission_error
@@ -1344,9 +1356,10 @@ async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completio
     backend, agent, dispatcher = await _channel_dispatcher(
         tmp_path / "late-original-cognition.db", "did:test:late-original-cognition")
     consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
-        source="channel.message", agent_id=agent.did, max_attempts=0)
+        source="channel.message", agent_id=agent.did, max_attempts=0, lease_seconds=1 if withdrawal == "renewal" else 30)
     published = (ResourceOutcomeUnknown("original route late effect uncertainty") if kind == "sdk"
         else ToolAuditUnconfirmedError("original route late audit uncertainty") if kind == "audit"
+        else ExecutionCommitOutcomeError("unknown") if kind == "control"
         else OSError("ordinary late route failure"))
     if kind in {"reconcile", "conflict", "superseded", "closed"}:
         published = (ToolEffectReconciliationRequired({"unsettled": 1}) if kind == "reconcile"
@@ -1367,7 +1380,7 @@ async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completio
         monkeypatch.setattr(dispatcher, "_apply_cognition_control_terminal", fail_first_terminal)
     retained = completion == "retained"
     settlement = completion == "retry-settlement"
-    entered, release = asyncio.Event(), asyncio.Event()
+    entered, release, renewal_seen = asyncio.Event(), asyncio.Event(), asyncio.Event()
     effect, routes = tmp_path / "original-route-effects", []
     handle = None
 
@@ -1375,9 +1388,18 @@ async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completio
         task = asyncio.current_task()
         routes.append(task)
         effect.write_text("one original effect")
-        if kind is not None and not settlement and not route_error:
+        if kind is not None and not settlement and not route_error and withdrawal is None:
             task.add_done_callback(lambda completed: _retain_owned_admission_error(completed, published))
         entered.set()
+        if withdrawal == "monitor":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if kind is None:
+                    raise
+                raise asyncio.CancelledError("original monitored native cancellation") from published
+        if withdrawal == "renewal":
+            await renewal_seen.wait()
         if retained:
             try:
                 await release.wait()
@@ -1390,6 +1412,20 @@ async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completio
         return "original route completed"
 
     agent.process_input = process_input
+    if withdrawal == "monitor":
+        async def monitor(_signal):
+            await entered.wait()
+            return "durable source withdrew"
+        agent.monitor_cognition_signal_execution = monitor
+    if withdrawal == "renewal":
+        renew = dispatcher.renew_durable_delivery_lease
+        async def renew_then_cancel(**kwargs):
+            result = await renew(**kwargs)
+            renewal_seen.set()
+            if kind is None:
+                raise asyncio.CancelledError("ordinary renewal cancellation")
+            raise asyncio.CancelledError("original renewal native cancellation") from published
+        monkeypatch.setattr(dispatcher, "renew_durable_delivery_lease", renew_then_cancel)
     if settlement:
         nack = dispatcher.nack_durable_delivery
         async def publish_after_retry(*args, **kwargs):
@@ -1417,7 +1453,7 @@ async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completio
         else:
             outcome = await await_owned_task(handle.task)
         [delivery] = await dispatcher.list_durable_deliveries()
-        terminal = kind in {"sdk", "audit", "reconcile", "conflict", "superseded", "closed"}
+        terminal = kind in {"sdk", "audit", "control", "reconcile", "conflict", "superseded", "closed"}
         if terminal:
             assert delivery.status == "failed" and delivery.next_attempt_at is None, (
                 "Late original tool outcome permitted durable cognition replay")
@@ -1425,7 +1461,7 @@ async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completio
                 agent_id=agent.did, consumer_id=consumer.consumer_id, event_id=delivery.event_id,
                 executor_id="dispatcher:replacement", now=datetime.now(timezone.utc) + timedelta(hours=1)) is None
         else:
-            expected = "acknowledged" if kind is None and completion == "immediate" else "retry"
+            expected = ("terminal_ackable" if withdrawal == "monitor" else "acknowledged" if withdrawal == "renewal" or kind is None and completion == "immediate" else "retry")
             assert delivery.status == expected
         if fail_terminal:
             assert len(terminal_calls) == 2
@@ -1444,7 +1480,7 @@ async def _original_durable_dispatch_case(tmp_path, monkeypatch, kind, completio
         if terminal and not retained and not route_error:
             assert outcome.error is not None and is_tool_execution_terminal_error(outcome.error)
             assert published in tuple(execution_evidence_carriers(outcome.error))
-            assert not is_execution_control_error(outcome.error), "Delivery uncertainty broadened Core authority loss"
+            assert is_execution_control_error(outcome.error) == (kind == "control"), "Delivery uncertainty broadened Core authority loss"
         assert effect.read_text() == "one original effect" and len(routes) == 1 and routes[0].done()
     finally:
         release.set()

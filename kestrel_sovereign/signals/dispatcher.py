@@ -3231,7 +3231,7 @@ class SignalDispatcher:
                 journal._ordinary_writer_failure if journal is not None else None)
             if journal is not None and observed_error is not None and not journal.has_acknowledged_commit():
                 self._record_original_outcome_loss(journal, journal._identity[0], observed_error)
-                if (outcome.cancellation is None and isinstance(observed_error, Exception) and not is_execution_control_error(observed_error)
+                if (outcome.cancellation is None and isinstance(observed_error, Exception) and not is_tool_execution_terminal_error(observed_error)
                         and execution_commit_outcome(observed_error) is None):
                     observed_error = None  # ordinary audit loss, not a failed handler
             originals.extend((journal.retain_observation(observed_error),
@@ -3242,7 +3242,7 @@ class SignalDispatcher:
                 complete, publication_error, _ = reconciliation
                 if journal is not None and publication_error is not None and not journal.has_acknowledged_commit():
                     self._record_original_outcome_loss(journal, journal._identity[0], publication_error)
-                    if (outcome.cancellation is None and isinstance(publication_error, Exception) and not is_execution_control_error(publication_error)
+                    if (outcome.cancellation is None and isinstance(publication_error, Exception) and not is_tool_execution_terminal_error(publication_error)
                             and execution_commit_outcome(publication_error) is None):
                         publication_error = None
                 publication_error = (journal.retain_observation(publication_error)
@@ -3353,7 +3353,7 @@ class SignalDispatcher:
                         # until mandatory CAS repair settles. Native UNKNOWN
                         # is different: a later no-match cannot reconcile an
                         # acknowledgement already lost on this original CAS.
-                        if is_execution_control_error(error):
+                        if is_tool_execution_terminal_error(error):
                             raise
                         withdrawal = withdrawal or error
                         continue
@@ -3472,13 +3472,13 @@ class SignalDispatcher:
             raise error
 
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
-        """One existing bounded safety latch for this runtime's native writers."""
-        if error is not None and is_execution_control_error(error):
+        """Retain original terminal delivery evidence from native writers."""
+        if error is not None and is_tool_execution_terminal_error(error):
             from kestrel_sovereign.execution_custody import (
                 execution_native_source_error,
             )
             self._outcome_log_control_error = execution_native_source_error(
-                self._outcome_log_control_error, error,
+                self._outcome_log_control_error, error, include_tool_terminal=True,
             )
 
     def _runtime_owner_cleanup_required(self) -> bool:
@@ -4315,7 +4315,7 @@ class SignalDispatcher:
                             lease_token=delivery.lease_token,
                         )
                     except BaseException as error:
-                        if is_execution_control_error(error):
+                        if is_tool_execution_terminal_error(error):
                             report_loss(error)
                             return
                         if not isinstance(error, Exception):
@@ -4342,7 +4342,7 @@ class SignalDispatcher:
                         return
                     expires_at = renewed.lease_expires_at
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     report_loss(error)
                     return
                 if not isinstance(error, Exception):
@@ -4371,7 +4371,7 @@ class SignalDispatcher:
             # Harvest its original control evidence only after it is terminal.
             outcome = await await_owned_task(task)
             child_error = outcome.error
-            if isinstance(child_error, asyncio.CancelledError) and not is_execution_control_error(child_error):
+            if isinstance(child_error, asyncio.CancelledError) and not is_tool_execution_terminal_error(child_error):
                 child_error = None  # Our requested cancellation of the renewer.
             renewal_error = lost.result() if lost.done() else None
             terminal = execution_observation_error(
@@ -4741,7 +4741,7 @@ class SignalDispatcher:
                                         exc, cleanup_exc, retain_originals=True,
                                         isolate_control_originals=True,
                                     )
-                                if is_execution_control_error(exc):
+                                if is_tool_execution_terminal_error(exc):
                                     raise
                                 if isinstance(exc, Exception):
                                     logger.error(
@@ -4770,7 +4770,7 @@ class SignalDispatcher:
                         **persistence_kwargs,
                     )
         except Exception as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             logger.exception(
                 "Failed to persist durable signal event %s (source=%s)",
@@ -4900,7 +4900,7 @@ class SignalDispatcher:
                             persisted.event_id,
                         )
                 except Exception as error:
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         raise
                     logger.exception(
                         "Could not upgrade legacy durable channel redelivery: event=%s",
@@ -5369,7 +5369,7 @@ class SignalDispatcher:
             from kestrel_sovereign.execution_custody import _explicit_control_chain
             errors = (outcome.error, outcome.cancellation)
             cancellation_only = all(error is None or (
-                type(error) is asyncio.CancelledError and not is_execution_control_error(error)
+                type(error) is asyncio.CancelledError and not is_tool_execution_terminal_error(error)
                 and all(type(member) is asyncio.CancelledError for member in _explicit_control_chain(error)))
                 for error in errors)
             # An ordinary Stop with no independent failure retains native
@@ -6511,7 +6511,13 @@ class SignalDispatcher:
     @staticmethod
     def _completed_cognition_outcome(task):
         """Read the original physical result AND canonical completion receipt."""
-        from kestrel_sovereign._async_ownership import OwnedTaskOutcome, owned_native_completion
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskOutcome, owned_native_completion, owned_task_error,
+        )
+        if task.cancelled():
+            # Snapshot native cancellation before Task.result consumes its
+            # original cause. The canonical harvester retains that same receipt.
+            return OwnedTaskOutcome(result=None, error=owned_task_error(task), cancellation=None)
         result = None
         try:
             with owned_native_completion(task):
@@ -6709,7 +6715,7 @@ class SignalDispatcher:
             if not await self._agent_is_held():
                 return None
         except HoldStateError as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             result = self._failure_result(
                 signal,
@@ -6917,7 +6923,7 @@ class SignalDispatcher:
                 )
 
             except Exception as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 logger.exception(
                     "Handler raised for signal %s (source=%s, mode=%s)",
@@ -7067,7 +7073,7 @@ class SignalDispatcher:
                 audit=audit,
             )
         except HoldStateError as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             # A final turn-start read can fail after the earlier source
             # snapshot. Durable routing recognizes this typed outage and
@@ -7204,8 +7210,8 @@ class SignalDispatcher:
                 outcome = await await_owned_task(task)
                 error = outcome.error
                 # Our withdrawal/cleanup cancellation is expected only when
-                # the worker carries no stronger native control receipt.
-                if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
+                # the worker carries no terminal delivery receipt.
+                if isinstance(error, asyncio.CancelledError) and not is_tool_execution_terminal_error(error):
                     error = None
                 return error, outcome.cancellation
 
@@ -7365,7 +7371,7 @@ class SignalDispatcher:
                     if isinstance(value, str):
                         constitution_text = value
                 except Exception as error:
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         raise
                     logger.exception(
                         "_get_governing_constitution raised for signal %s; "
@@ -7425,7 +7431,7 @@ class SignalDispatcher:
                     if isinstance(refreshed, str) and refreshed:
                         audit.constitution_hash = refreshed
                 except Exception as error:
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         raise
                     logger.exception(
                         "Post-anchor constitution_hash refresh raised for "
@@ -7492,7 +7498,7 @@ class SignalDispatcher:
                             SystemPromptNamespaceError,
                         )
 
-                        if is_execution_control_error(exc) or isinstance(exc, SystemPromptNamespaceError):
+                        if is_tool_execution_terminal_error(exc) or isinstance(exc, SystemPromptNamespaceError):
                             raise
                         logger.exception(
                             "Inline-format doctrine resolution failed for "
@@ -7683,7 +7689,7 @@ class SignalDispatcher:
                         )
 
                         if (not isinstance(exc, Exception)
-                            or is_execution_control_error(exc)
+                            or is_tool_execution_terminal_error(exc)
                             or isinstance(exc, SystemPromptNamespaceError)):
                             # Receipt registration and causation binding happen
                             # before doctrine resolution. This validation error is
@@ -7900,7 +7906,7 @@ class SignalDispatcher:
             if asyncio.iscoroutine(value):
                 await value
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             logger.exception(
                 "agent.ensure_doctrine_bundle_anchored raised; "
@@ -7940,7 +7946,7 @@ class SignalDispatcher:
                     value = await value
                 audit.constitution_hash = value
             except Exception as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 logger.exception(
                     "agent.get_constitution_hash raised for signal %s; "
@@ -7961,7 +7967,7 @@ class SignalDispatcher:
                     value = await value
                 anchored_hash = value
             except Exception as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 logger.exception(
                     "agent.get_anchored_doctrine_bundle_hash raised for "
@@ -7977,7 +7983,7 @@ class SignalDispatcher:
                     value = await value
                 live_hash = value
             except Exception as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 logger.exception(
                     "agent.compute_live_doctrine_bundle_hash raised for "
@@ -8070,7 +8076,7 @@ class SignalDispatcher:
             if asyncio.iscoroutine(value):
                 value = await value
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             logger.exception(
                 "agent.verify_constitution_echo raised for signal %s",
@@ -8259,7 +8265,7 @@ class SignalDispatcher:
                         prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
                         **_audit_to_log_kwargs(audit))
                 except Exception as error:
-                    if is_execution_control_error(error) or execution_commit_outcome(error) is not None:
+                    if is_tool_execution_terminal_error(error) or execution_commit_outcome(error) is not None:
                         raise
                     self._record_original_outcome_loss(journal, signal.id, error)
                     self._release_durable_admission(reservation)
@@ -8284,7 +8290,7 @@ class SignalDispatcher:
                 # for its loss. Accepted writers own their own one outcome.
                 if journal is not None:
                     self._record_original_outcome_loss(journal, signal.id, opening)
-                    if (isinstance(opening, Exception) and not is_execution_control_error(opening)
+                    if (isinstance(opening, Exception) and not is_tool_execution_terminal_error(opening)
                             and execution_commit_outcome(opening) is None):
                         logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
                         return
@@ -8318,7 +8324,7 @@ class SignalDispatcher:
             error = owned_task_error(task)
             if journal is not None and error is not None:
                 self._record_original_outcome_loss(journal, signal.id, error)
-            if error is not None and is_execution_control_error(error):
+            if error is not None and is_tool_execution_terminal_error(error):
                 self._retain_durable_writer_control(error)
             elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # _log_safe reports storage/UI errors itself.  This is a
@@ -8366,7 +8372,7 @@ class SignalDispatcher:
             writer = publication.task
             if writer is None:
                 self._record_original_outcome_loss(journal, signal.id, error)
-                if (isinstance(error, Exception) and not is_execution_control_error(error)
+                if (isinstance(error, Exception) and not is_tool_execution_terminal_error(error)
                         and execution_commit_outcome(error) is None):
                     logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
                     return
@@ -8399,7 +8405,7 @@ class SignalDispatcher:
             logger.error("Signal outcome observation failed after COMMIT for %s" if committed
                          else "Failed to write signal_log entry for %s", signal.id,
                          exc_info=(type(exc), exc, exc.__traceback__))
-            if is_execution_control_error(exc) or execution_commit_outcome(exc) is not None:
+            if is_tool_execution_terminal_error(exc) or execution_commit_outcome(exc) is not None:
                 self._retain_durable_writer_control(exc)
                 raise execution_observation_error(exc, withdrawal)
             if not isinstance(exc, Exception) or withdrawal is not None:
@@ -8410,7 +8416,7 @@ class SignalDispatcher:
     def _record_original_outcome_loss(self, journal, signal_id, error):
         """Exactly one unacknowledged original row, even if its Task never starts."""
         if journal is not None:
-            if (isinstance(error, Exception) and not is_execution_control_error(error)
+            if (isinstance(error, Exception) and not is_tool_execution_terminal_error(error)
                     and execution_commit_outcome(error) is None
                     and not journal.has_acknowledged_commit()):
                 # Best-effort loss is suppressed only for a healthy observer.
@@ -8535,7 +8541,7 @@ class SignalDispatcher:
             receipt = await emit("signal_completed", payload)
         except BaseException as error:
             self._record_surface(signal.id, SURFACE_EMIT_FAILED)
-            if (is_execution_control_error(error) or execution_commit_outcome(error) is not None
+            if (is_tool_execution_terminal_error(error) or execution_commit_outcome(error) is not None
                     or not isinstance(error, Exception)):
                 if journal is not None:
                     raise journal.retain_committed(error)

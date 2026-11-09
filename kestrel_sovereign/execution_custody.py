@@ -523,7 +523,7 @@ def execution_finite_error(*errors: BaseException | None, retain_originals: bool
     independent failures in its original graph. Ordinary no-control callers
     retain their existing selection and caused-cancellation policy.
     """
-    native = any(is_execution_control_error(error) for error in errors)
+    native = any(is_tool_execution_terminal_error(error) for error in errors)
     return execution_terminal_error(
         *errors, retain_originals=retain_originals or native,
         prefer_cancellation=prefer_cancellation,

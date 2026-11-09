@@ -2449,3 +2449,18 @@ distinct physical cancellation. If the original terminal-capture callback was
 refused and cancelled completion cannot be reconstructed after native consumption,
 the same receipt/Task retain unobservable-completion uncertainty and retirement
 debt. A later source close cannot prove that lost completion ordinary or settled.
+
+Dispatcher error suppression uses the shared terminal-delivery classifier,
+including original SDK and audit uncertainty through cancellation causes and
+exception groups. Monitored withdrawal and lease renewal join the original
+worker before applying that rule. An uncertain effect cannot become a proven
+no-op or acknowledged turn. The same rule governs persistence, post-commit
+repair and outcome-log loss; the existing bounded writer latch retains only
+original terminal sources, without finite observer history. Core authority
+classification remains separate: a terminal tool failure grants no authority
+and does not by itself revoke a resident runtime. Cognition's existing typed
+reconciliation result still maps non-Core terminal failures to the public
+content-free failed result before durable settlement.
+A completed cancelled cognition task is harvested before reading its physical
+result, because native `Task.result()` can consume its original cancellation
+cause. Successful results still share the canonical completion observation.
