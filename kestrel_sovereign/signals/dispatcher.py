@@ -6488,14 +6488,16 @@ class SignalDispatcher:
     ) -> Optional[SignalResult]:
         """Return a settled route result without leaking task cancellation."""
 
+        from kestrel_sovereign._async_ownership import owned_native_completion
         try:
-            return task.result()
+            with owned_native_completion(task):
+                return task.result()
         except asyncio.CancelledError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             return None
         except Exception as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             logger.exception(
                 "Durable cognition route task failed outside its result contract: "

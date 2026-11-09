@@ -86,6 +86,8 @@ async def test_aborted_stream_accounting_retains_irreversible_outcome(body_error
     service = _FakeService()
     error = _unknown() if wrapped else ExecutionCommitOutcomeError("unknown")
     service._record_streamed_usage = AsyncMock(side_effect=error)
+    original_cause = error.__cause__
+    aborted = body_error("provider aborted")
 
     class Adapter:
         supports_partial_usage_flush = True
@@ -93,7 +95,7 @@ async def test_aborted_stream_accounting_retains_irreversible_outcome(body_error
         async def get_streaming_response_with_tools(self, *, usage_sink, **kwargs):
             usage_sink["input_tokens"] = 23
             yield "partial"
-            raise body_error("provider aborted")
+            raise aborted
 
     stream = service._stream_adapter_with_usage(
         adapter=Adapter(), client=None, model="model", messages=[],
@@ -102,15 +104,23 @@ async def test_aborted_stream_accounting_retains_irreversible_outcome(body_error
     )
     seen = []
     try:
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(BaseException) as caught:
             async for item in stream:
                 seen.append(item)
-        assert caught.value is error
+        from kestrel_sovereign.execution_custody import execution_evidence_carriers
+        assert error in tuple(execution_evidence_carriers(caught.value))
+        assert aborted in tuple(execution_evidence_carriers(caught.value))
+        assert error.__cause__ is original_cause, "Stream accounting observation mutated the original control graph"
         assert execution_commit_outcome(caught.value) == "unknown"
         assert seen == ["partial"]
         service._record_streamed_usage.assert_awaited_once()
     finally:
-        await stream.aclose()
+        from kestrel_sovereign._async_ownership import await_owned_operation
+        from kestrel_sovereign.execution_custody import execution_evidence_carriers
+        closed = await await_owned_operation(stream.aclose(), retain_originals=True)
+        assert error in tuple(execution_evidence_carriers(closed.error))
+        assert execution_commit_outcome(closed.error) == "unknown"
+        service._record_streamed_usage.assert_awaited_once()
 
 
 @pytest.mark.asyncio

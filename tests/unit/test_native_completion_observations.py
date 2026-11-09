@@ -1251,3 +1251,58 @@ async def test_completed_original_native_control_fences_live_effect_before_root_
         assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
         assert await database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 1)
     assert await database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit", "control-cancel"])
+@pytest.mark.parametrize("publication", [None, "sdk", "audit"])
+async def test_original_durable_route_result_reads_complete_native_receipt(tmp_path, kind, publication):
+    from types import SimpleNamespace
+    from kestrel_sdk.signals import SignalMode, SignalResult, Status
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_tool_execution_terminal_error
+    from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+    physical = (OSError("original route failed") if kind == "ordinary" else
+        ResourceOutcomeUnknown("original route effect uncertain") if kind == "sdk" else
+        ToolAuditUnconfirmedError("original route audit uncertain") if kind == "audit" else
+        asyncio.CancelledError("original route cancelled"))
+    if kind == "control-cancel":
+        physical.__cause__ = ExecutionCommitOutcomeError("unknown")
+    published = (ResourceOutcomeUnknown("original route publication uncertain") if publication == "sdk"
+        else ToolAuditUnconfirmedError("original route publication audit uncertain"))
+    effect = tmp_path / "original-route-effect"
+    value = SignalResult(signal_id="original-route", status=Status.OK, mode=SignalMode.COGNITION, duration_ms=0)
+    async def operation():
+        effect.write_text("one original physical route")
+        if kind is not None:
+            raise physical
+        return value
+    from kestrel_sovereign._async_ownership import _retain_owned_admission_error
+    def publish(task):
+        if publication is not None:
+            _retain_owned_admission_error(task, published)
+    task = create_owned_task(operation(), retain_originals=True)
+    task.add_done_callback(publish)
+    await asyncio.wait({task})
+    observed, result = None, None
+    try:
+        try:
+            result = SignalDispatcher._completed_durable_cognition_result(task,
+                signal=SimpleNamespace(id="original-route", mode=SignalMode.COGNITION), start=asyncio.get_running_loop().time())
+        except BaseException as error:
+            observed = error
+        terminal = publication is not None or kind in {"sdk", "audit", "control-cancel"}
+        if terminal:
+            assert observed is not None and is_tool_execution_terminal_error(observed), (
+                "Durable route completion hid original terminal receipt behind its physical result")
+            graph = tuple(execution_evidence_carriers(observed))
+            if publication is not None:
+                assert published in graph
+            if kind is not None:
+                assert physical in graph
+        elif kind is None:
+            assert observed is None and result is value
+        else:
+            assert observed is None and result.status is Status.FAILED
+        assert effect.read_text() == "one original physical route" and task.done()
+    finally:
+        await await_owned_task(task)

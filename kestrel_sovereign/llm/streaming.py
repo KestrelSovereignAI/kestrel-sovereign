@@ -1467,7 +1467,7 @@ class StreamingMixin:
                 # through the canonical authority/commit/debt classifier.
                 raise execution_terminal_error(
                     failure, accounting_error, retain_originals=True,
-                    prefer_cancellation=True,
+                    prefer_cancellation=True, isolate_control_originals=True,
                 )
 
     async def _run_stream_fallback_attempt(

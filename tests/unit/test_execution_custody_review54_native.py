@@ -246,4 +246,8 @@ async def test_native_peer_subscription_response_close_physically_joins(peer_ses
     finally:
         release.set()
         await join(task)
-        await stream.aclose()
+        from kestrel_sovereign._async_ownership import await_owned_operation
+        closed = await await_owned_operation(stream.aclose(), retain_originals=True)
+        assert carries(closed.error, original), "Repeated close lost original native response retirement failure"
+        assert closes == [True], "Repeated observation replayed the original native response close"
+        assert await p.admission.backend.fetch_val("SELECT COUNT(*) FROM review54_effects") == 1
