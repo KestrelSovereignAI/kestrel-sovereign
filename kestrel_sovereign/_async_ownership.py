@@ -693,7 +693,7 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     """
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
-        is_execution_control_error,
+        is_tool_execution_terminal_error,
     )
     if return_when not in (asyncio.ALL_COMPLETED, asyncio.FIRST_COMPLETED):
         raise ValueError("owned gather requires ALL_COMPLETED or FIRST_COMPLETED")
@@ -774,7 +774,7 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
         for child in children:
             outcome = await await_owned_task(child)
             results.append(outcome.result)
-            if outcome.error is not None and (not issubclass(type(outcome.error), asyncio.CancelledError) or is_execution_control_error(outcome.error)):
+            if outcome.error is not None and (not issubclass(type(outcome.error), asyncio.CancelledError) or is_tool_execution_terminal_error(outcome.error)):
                 errors.append(outcome.error)
             errors.append(outcome.cancellation)
         terminal = execution_terminal_error(

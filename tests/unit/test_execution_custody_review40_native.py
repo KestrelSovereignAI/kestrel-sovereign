@@ -481,3 +481,45 @@ async def test_anthropic_implicit_sdk_close_is_physically_joined(final_message):
         await await_owned_task(task)
         await body.aclose()
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sdk", "audit", "reconcile", "conflict", "superseded", "closed", "ordinary", "stop"])
+async def test_original_typed_cognition_result_keeps_terminal_audit(
+    dispatcher_components, tmp_path, kind,
+):
+    from dataclasses import asdict
+    from kestrel_sdk.signals import SignalMode, Status
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+    from kestrel_sovereign.tool_effect_store import (
+        ToolEffectReconciliationRequired, ToolEffectOperationConflict,
+        ToolEffectAttemptSuperseded, ToolEffectAttemptClosed,
+    )
+    c = dispatcher_components
+    template = tmp_path / "typed-audit.md"
+    template.write_text("payload: {payload}")
+    c.registry.register(_cognition_reg(template, name="original_typed_audit"))
+    if kind in {"sdk", "audit"}:
+        original = receipt(kind)
+    elif kind == "stop":
+        original = InvocationCancelledError("original acknowledged Stop")
+    elif kind == "reconcile":
+        original = ToolEffectReconciliationRequired({"unsettled": 1})
+    else:
+        original = {"conflict": ToolEffectOperationConflict, "superseded": ToolEffectAttemptSuperseded,
+            "closed": ToolEffectAttemptClosed, "ordinary": OSError}[kind]("private original diagnostic")
+    async def execute(_prompt):
+        raise original
+    c.agent.process_input = execute
+    signal = _signal("original_typed_audit", mode=SignalMode.COGNITION)
+    result = await c.dispatcher.dispatch_signal(signal)
+    expected = Status.COALESCED if kind == "stop" else Status.FAILED
+    assert result.status is expected
+    json.dumps(asdict(result))
+    await c.dispatcher._drain_outcome_log_tasks()
+    rows = await c.backend.fetch_all("SELECT status, error FROM signal_log WHERE id = ?", (signal.id,))
+    assert len(rows) == 1, "Typed cognition result lost its original terminal audit"
+    assert rows[0][0] == expected.value
+    if kind not in {"ordinary", "stop"}:
+        assert "private original diagnostic" not in rows[0][1]
+        assert "_original_error" not in json.dumps(asdict(result))

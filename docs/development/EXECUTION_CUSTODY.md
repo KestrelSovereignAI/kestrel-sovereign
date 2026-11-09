@@ -2464,3 +2464,11 @@ content-free failed result before durable settlement.
 A completed cancelled cognition task is harvested before reading its physical
 result, because native `Task.result()` can consume its original cancellation
 cause. Successful results still share the canonical completion observation.
+
+Owned gather retains late sibling terminal delivery through the shared rule,
+even after a successful FIRST_COMPLETED winner or an earlier ordinary failure.
+A cancellation-shaped SDK/audit source is not ordinary sibling cleanup.
+Typed cognition failures and Stop dispositions are constructed by the same
+failure-result factory that schedules their audit. The queued and returned
+result have the same identity until public normalization, so the original
+terminal audit is submitted once without exposing private reconciliation data.

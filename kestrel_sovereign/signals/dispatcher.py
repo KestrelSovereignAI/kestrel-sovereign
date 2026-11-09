@@ -7046,23 +7046,14 @@ class SignalDispatcher:
             # Cooperative Stop is neither a provider failure nor retry
             # authority. Preserve the ordinary route audit while carrying a
             # typed disposition to the durable settlement boundary below.
-            stopped = self._fail(
+            return self._fail(
                 signal,
                 start,
                 Status.COALESCED,
                 error=f"stop_acknowledged: {error}",
                 registration=registration,
                 audit=audit,
-            )
-            return _StoppedCognitionResult(
-                signal_id=stopped.signal_id,
-                status=stopped.status,
-                mode=stopped.mode,
-                duration_ms=stopped.duration_ms,
-                turn_id=stopped.turn_id,
-                artifact=stopped.artifact,
-                action_result=stopped.action_result,
-                error=stopped.error,
+                result_factory=_StoppedCognitionResult,
             )
         except HoldTurnRefusal:
             return self._hold_signal_disposition(
@@ -7099,10 +7090,10 @@ class SignalDispatcher:
 
             failure = tool_effect_failure(e)
             if failure is not None and failure.reconciliation_required:
-                failed = self._fail(signal, start, Status.FAILED,
+                return self._fail(signal, start, Status.FAILED,
                     error=f'{failure.code}: {failure.message}',
-                    registration=registration, audit=audit)
-                return _ReconciliationCognitionResult(**vars(failed), original_error=e)
+                    registration=registration, audit=audit,
+                    result_factory=functools.partial(_ReconciliationCognitionResult, original_error=e))
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
             # `_route_under_locks` calls `_fail` without it. Catch
@@ -8191,8 +8182,10 @@ class SignalDispatcher:
         error: Optional[str],
         registration: Optional[SourceRegistration] = None,
         audit: Optional[_ConstitutionAudit] = None,
+        result_factory: Callable[..., SignalResult] = SignalResult,
     ) -> SignalResult:
-        result = self._failure_result(signal, start, error=error, status=status)
+        result = self._failure_result(signal, start, error=error, status=status,
+            result_factory=result_factory)
         if registration is not None:
             self._schedule_outcome_log(signal, registration, result, audit=audit)
         return result
@@ -8204,10 +8197,11 @@ class SignalDispatcher:
         *,
         error: Optional[str],
         status: Status = Status.FAILED,
+        result_factory: Callable[..., SignalResult] = SignalResult,
     ) -> SignalResult:
         """Build a failure result without committing an outcome yet."""
 
-        return SignalResult(
+        return result_factory(
             signal_id=signal.id,
             status=status,
             mode=signal.mode,

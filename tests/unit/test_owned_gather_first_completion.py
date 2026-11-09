@@ -120,3 +120,53 @@ async def test_owned_gather_default_waits_but_race_retires_peer(policy):
     finally:
         release.set()
         await await_owned_task(owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner_error", [False, True])
+@pytest.mark.parametrize("kind", ["ordinary_cancel", "cancel_unknown", "cancel_sdk", "cancel_audit"])
+async def test_owned_gather_retains_late_terminal_sibling_after_race(tmp_path, winner_error, kind):
+    from kestrel_sovereign.execution_custody import (
+        _explicit_control_chain, is_tool_execution_terminal_error,
+    )
+    from tests.unit.test_execution_custody_review32 import receipt
+    from tests.utils.original_failure import OriginalFailure
+
+    entered = asyncio.Event()
+    original = (asyncio.CancelledError("ordinary sibling withdrawal")
+        if kind == "ordinary_cancel" else receipt(kind))
+    source = OriginalFailure.capture(original)
+    earlier = OSError("earlier race winner failed")
+    effect = tmp_path / "late-native-sibling-effect"
+    children = []
+    async def sibling():
+        children.append(asyncio.current_task())
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            effect.write_text("one original effect before uncertain completion")
+            raise original
+    async def winner():
+        children.append(asyncio.current_task())
+        await entered.wait()
+        if winner_error:
+            raise earlier
+        return "winner"
+    task = create_owned_task(gather_owned([sibling(), winner()],
+        return_when=asyncio.ALL_COMPLETED if winner_error else asyncio.FIRST_COMPLETED,
+        retain_originals=True, isolate_control_originals=True), retain_originals=True)
+    try:
+        outcome = await await_owned_task(task)
+        if kind != "ordinary_cancel":
+            assert outcome.error is not None and is_tool_execution_terminal_error(outcome.error), (
+                "Gather discarded late original terminal sibling uncertainty")
+            source.assert_retained(outcome.error)
+        elif not winner_error:
+            assert outcome.error is None and outcome.result == [None, "winner"]
+        if winner_error:
+            assert earlier in tuple(_explicit_control_chain(outcome.error))
+        assert effect.read_text() == "one original effect before uncertain completion"
+        assert len(children) == 2 and all(child.done() for child in children)
+    finally:
+        await await_owned_task(task)
