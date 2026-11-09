@@ -865,6 +865,26 @@ class TestApprovalQueue:
         assert withdrawn == []  # no spurious withdrawal event
 
 
+def _approval_queue_with_reply(permission_store, *, approved, scope):
+    """Answer actual queue publication, independently of policy-read latency."""
+    replies = []
+
+    async def reply(request):
+        pending = tuple(queue.pending_requests)
+        result = await queue.submit_decision(request.id, approved, scope)
+        replies.append((request, pending, result))
+
+    queue = ApprovalQueue(permission_store=permission_store, on_request_added=reply)
+    return queue, replies
+
+
+def _assert_queued_reply(replies):
+    assert len(replies) == 1, "Approval decision bypassed actual queued request"
+    request, pending, result = replies[0]
+    assert any(member is request for member in pending)
+    assert result.in_memory and result.persisted
+
+
 # === SecurityHook Tests ===
 
 class TestSecurityHook:
@@ -1217,37 +1237,48 @@ class TestSecurityHook:
         assert logs[0]["user_choice"] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("policy_gated", [False, True])
     async def test_always_ask_prompts_under_global_auto_mode(
-        self, hook, permission_store, approval_queue
+        self, permission_store, monkeypatch, policy_gated
     ):
-        await permission_store.register_tool(
-            "ShellFeature", "rm", PermissionLevel.ALWAYS_ASK
-        )
+        await permission_store.register_tool("ShellFeature", "rm", PermissionLevel.ALWAYS_ASK)
         permission_store.set_global_auto_mode(True)
-        request_was_pending = False
+        queue, replies = _approval_queue_with_reply(permission_store, approved=True, scope="once")
+        hook = SecurityHook(permission_store, queue)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = permission_store.get_permission
 
-        async def approve_later():
-            nonlocal request_was_pending
-            await asyncio.sleep(0.05)
-            pending = approval_queue.pending_requests
-            request_was_pending = bool(pending)
-            if pending:
-                await approval_queue.submit_decision(pending[0].id, True, "once")
+        async def gated_permission(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            entered.set()
+            await release.wait()
+            return result
 
-        asyncio.create_task(approve_later())
-        input = HookInput(
-            session_id="test",
-            hook_event_name="PreToolUse",
-            tool_name="rm",
-            feature_name="ShellFeature",
-            tool_input={"command": "rm /tmp/outside-workspace"},
+        if policy_gated:
+            monkeypatch.setattr(permission_store, "get_permission", gated_permission)
+        operation = asyncio.create_task(
+            hook.execute(HookInput(
+                session_id="test", hook_event_name="PreToolUse", tool_name="rm",
+                feature_name="ShellFeature", tool_input={"command": "rm /tmp/outside-workspace"},
+            )),
+            name="security-approval-test",
         )
-
-        output = await hook.execute(input)
-
-        assert output.continue_execution is True
-        assert output.permission_decision == PermissionDecision.ALLOW
-        assert request_was_pending is True
+        try:
+            async with asyncio.timeout(5):
+                if policy_gated:
+                    await entered.wait()
+                    assert replies == [] and not operation.done()
+                    release.set()
+                output = await operation
+            assert output.continue_execution is True
+            assert output.permission_decision == PermissionDecision.ALLOW
+            _assert_queued_reply(replies)
+            assert queue.pending_requests == []
+        finally:
+            release.set()
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_auto_deny(self, hook, permission_store):
@@ -1268,97 +1299,42 @@ class TestSecurityHook:
         assert output.permission_decision == PermissionDecision.DENY
 
     @pytest.mark.asyncio
-    async def test_destructive_memory_tool_routes_to_approval_and_denies(
-        self, hook, permission_store, approval_queue
-    ):
-        """F203 (#2093): a destructive memory tool registered at ALWAYS_ASK
-        must be routed through the Sovereign approval queue and BLOCKED when
-        the Sovereign denies — not executed unconditionally."""
-        await permission_store.register_tool(
-            "MemoryFeature", "purge_conversation", PermissionLevel.ALWAYS_ASK
-        )
-
-        request_was_pending = False
-
-        async def deny_later():
-            nonlocal request_was_pending
-            await asyncio.sleep(0.05)
-            pending = approval_queue.pending_requests
-            request_was_pending = bool(pending)
-            if pending:
-                await approval_queue.submit_decision(
-                    pending[0].id, False, "user_denied"
-                )
-
-        asyncio.create_task(deny_later())
-
-        input = HookInput(
-            session_id="test",
-            hook_event_name="PreToolUse",
-            tool_name="purge_conversation",
-            feature_name="MemoryFeature",
-            tool_input={"session_id": "abc", "confirm": True},
-        )
-
-        output = await hook.execute(input)
-
-        assert request_was_pending is True, (
-            "purge_conversation must be routed to the approval queue"
-        )
+    async def test_destructive_memory_tool_routes_to_approval_and_denies(self, permission_store):
+        """A destructive memory tool remains behind the actual approval queue."""
+        await permission_store.register_tool("MemoryFeature", "purge_conversation", PermissionLevel.ALWAYS_ASK)
+        queue, replies = _approval_queue_with_reply(permission_store, approved=False, scope="user_denied")
+        hook = SecurityHook(permission_store, queue)
+        output = await hook.execute(HookInput(
+            session_id="test", hook_event_name="PreToolUse", tool_name="purge_conversation",
+            feature_name="MemoryFeature", tool_input={"session_id": "abc", "confirm": True},
+        ))
+        _assert_queued_reply(replies)
         assert output.continue_execution is False
         assert output.permission_decision == PermissionDecision.DENY
 
     @pytest.mark.asyncio
-    async def test_ask_mode_approve(self, hook, permission_store, approval_queue):
-        await permission_store.register_tool(
-            "WalletAgent", "send_tokens", PermissionLevel.ASK
-        )
-
-        # Approve in background
-        async def approve_later():
-            await asyncio.sleep(0.1)
-            pending = approval_queue.pending_requests
-            if pending:
-                await approval_queue.submit_decision(pending[0].id, True, "once")
-
-        asyncio.create_task(approve_later())
-
-        input = HookInput(
-            session_id="test",
-            hook_event_name="PreToolUse",
-            tool_name="send_tokens",
-            feature_name="WalletAgent",
-            tool_input={"amount": 50},
-        )
-
-        output = await hook.execute(input)
+    async def test_ask_mode_approve(self, permission_store):
+        await permission_store.register_tool("WalletAgent", "send_tokens", PermissionLevel.ASK)
+        queue, replies = _approval_queue_with_reply(permission_store, approved=True, scope='once')
+        hook = SecurityHook(permission_store, queue)
+        output = await hook.execute(HookInput(
+            session_id="test", hook_event_name="PreToolUse", tool_name="send_tokens",
+            feature_name="WalletAgent", tool_input={"amount": 50},
+        ))
+        _assert_queued_reply(replies)
         assert output.continue_execution is True
         assert output.permission_decision == PermissionDecision.ALLOW
 
     @pytest.mark.asyncio
-    async def test_ask_mode_deny(self, hook, permission_store, approval_queue):
-        await permission_store.register_tool(
-            "WalletAgent", "send_tokens", PermissionLevel.ASK
-        )
-
-        # Deny in background
-        async def deny_later():
-            await asyncio.sleep(0.1)
-            pending = approval_queue.pending_requests
-            if pending:
-                await approval_queue.submit_decision(pending[0].id, False, "denied")
-
-        asyncio.create_task(deny_later())
-
-        input = HookInput(
-            session_id="test",
-            hook_event_name="PreToolUse",
-            tool_name="send_tokens",
-            feature_name="WalletAgent",
-            tool_input={"amount": 50},
-        )
-
-        output = await hook.execute(input)
+    async def test_ask_mode_deny(self, permission_store):
+        await permission_store.register_tool("WalletAgent", "send_tokens", PermissionLevel.ASK)
+        queue, replies = _approval_queue_with_reply(permission_store, approved=False, scope='denied')
+        hook = SecurityHook(permission_store, queue)
+        output = await hook.execute(HookInput(
+            session_id="test", hook_event_name="PreToolUse", tool_name="send_tokens",
+            feature_name="WalletAgent", tool_input={"amount": 50},
+        ))
+        _assert_queued_reply(replies)
         assert output.continue_execution is False
         assert output.permission_decision == PermissionDecision.DENY
 
@@ -1395,33 +1371,15 @@ class TestSecurityHook:
         assert queue.pending_requests == []
 
     @pytest.mark.asyncio
-    async def test_ask_approve_always_updates_permission(
-        self, hook, permission_store, approval_queue
-    ):
-        await permission_store.register_tool(
-            "WalletAgent", "get_balance", PermissionLevel.ASK
-        )
-
-        # Approve with "always" scope
-        async def approve_always():
-            await asyncio.sleep(0.1)
-            pending = approval_queue.pending_requests
-            if pending:
-                await approval_queue.submit_decision(pending[0].id, True, "always")
-
-        asyncio.create_task(approve_always())
-
-        input = HookInput(
-            session_id="test",
-            hook_event_name="PreToolUse",
-            tool_name="get_balance",
-            feature_name="WalletAgent",
-            tool_input={},
-        )
-
-        await hook.execute(input)
-
-        # Permission should now be ALLOW
+    async def test_ask_approve_always_updates_permission(self, permission_store):
+        await permission_store.register_tool("WalletAgent", "get_balance", PermissionLevel.ASK)
+        queue, replies = _approval_queue_with_reply(permission_store, approved=True, scope="always")
+        hook = SecurityHook(permission_store, queue)
+        await hook.execute(HookInput(
+            session_id="test", hook_event_name="PreToolUse", tool_name="get_balance",
+            feature_name="WalletAgent", tool_input={},
+        ))
+        _assert_queued_reply(replies)
         level = await permission_store.get_permission("WalletAgent", "get_balance")
         assert level == PermissionLevel.ALLOW
 
@@ -1463,33 +1421,16 @@ class TestSecurityIntegration:
 
     @pytest.mark.asyncio
     async def test_full_approval_flow(self, setup):
-        store, queue, hook = setup
-
-        # Register tool with ASK permission
+        store, _, _ = setup
         await store.register_tool("MCPAgent", "execute_server", PermissionLevel.ASK)
-
-        # Start approval flow in background
-        async def user_approves():
-            await asyncio.sleep(0.1)
-            pending = queue.pending_requests
-            if pending:
-                await queue.submit_decision(pending[0].id, True, "session")
-
-        asyncio.create_task(user_approves())
-
-        # Execute hook
-        input = HookInput(
-            session_id="test-session",
-            hook_event_name="PreToolUse",
-            tool_name="execute_server",
-            feature_name="MCPAgent",
-            tool_input={"server": "test-server"},
-        )
-
-        output = await hook.execute(input)
+        queue, replies = _approval_queue_with_reply(store, approved=True, scope="session")
+        hook = SecurityHook(store, queue)
+        output = await hook.execute(HookInput(
+            session_id="test-session", hook_event_name="PreToolUse", tool_name="execute_server",
+            feature_name="MCPAgent", tool_input={"server": "test-server"},
+        ))
+        _assert_queued_reply(replies)
         assert output.continue_execution is True
-
-        # Check audit log
         logs = await store.get_audit_log(limit=1)
         assert logs[0]["decision"] == "user_approved"
         assert logs[0]["user_choice"] == "session"
