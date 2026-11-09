@@ -24,7 +24,7 @@ from kestrel_sovereign.knowledge.corpus_exclusions import (
     load_corpus_exclusions,
     validate_exclusion_id,
 )
-from tests.utils.corpus_exclusions import ExclusionAuthority
+from tests.utils.corpus_exclusions import SOVEREIGN_DID, ExclusionAuthority
 
 MERIDIAN = "did:web:agents.example:meridian"
 EMMA = "did:web:agents.example:emma"
@@ -103,6 +103,18 @@ def test_a_manifest_names_each_agents_exclusions(authority) -> None:
     assert meridian.receipt == emma.receipt == manifest.receipt
     with pytest.raises(CorpusExclusionManifestError, match="no section"):
         manifest.exclusions_for("did:web:agents.example:kite")
+
+
+def test_a_section_for_the_signer_itself_is_refused(authority) -> None:
+    """The trust root may not govern its own corpus, whichever agents a reader named."""
+    authority.admit(MERIDIAN)
+    authority.admit(SOVEREIGN_DID)
+
+    manifest = load_corpus_exclusions()
+
+    with pytest.raises(CorpusExclusionManifestError, match="external to the agent"):
+        manifest.exclusions_for(SOVEREIGN_DID)
+    assert manifest.exclusions_for(MERIDIAN).session_ids == ()
 
 
 def test_re_signing_unchanged_content_keeps_the_manifest_digest(authority) -> None:
@@ -233,3 +245,30 @@ def test_the_operator_check_fails_without_a_manifest(authority, capsys) -> None:
     assert _check(MERIDIAN) == 1
 
     assert "no manifest at" in capsys.readouterr().err
+
+
+def test_the_operator_check_judges_every_section_against_the_trust_root(
+    authority, capsys
+) -> None:
+    """A section for the agent that is itself the trust root fails the check (#3893).
+
+    No ``--agent-did`` names it: the check judges every section it lists, as
+    a build for that agent would.
+    """
+    authority.admit(MERIDIAN)
+    authority.admit(SOVEREIGN_DID)
+
+    assert _check() == 1
+
+    out = capsys.readouterr().out
+    assert f"Agent {MERIDIAN}: usable" in out
+    assert f"Agent {SOVEREIGN_DID}: REFUSED:" in out
+    assert "external to the agent" in out
+    assert out.rstrip().endswith("would refuse")
+
+    assert _check(as_json=True) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is False
+    assert {item["agent_did"]: item["usable"] for item in report["agents"]} == {
+        MERIDIAN: True, SOVEREIGN_DID: False,
+    }

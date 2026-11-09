@@ -1490,9 +1490,9 @@ class AsyncDatabase:
         await migrate_semantic_vector_projection(self)
         await migrate_semantic_governed_artifacts(self)
         # A corpus artifact names the corpus exclusion manifest it was built
-        # under (#3893), so it is served only while the host still admits that
-        # manifest. Existing rows keep NULL: built before manifests existed,
-        # they are revoked rather than served.
+        # under (#3893), so it is served only while that manifest is the
+        # host's current one. Existing rows keep NULL: built before manifests
+        # existed, consuming them is refused until they are rebuilt.
         await self.migrate_columns_once(
             "semantic_governed_artifacts",
             (

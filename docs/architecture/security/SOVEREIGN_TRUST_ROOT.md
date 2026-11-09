@@ -811,7 +811,8 @@ A build refuses, and never runs without exclusions, when:
   `max_wall_time_seconds`, so a read that does not return cannot stall the
   host;
 - the trust root is missing or ambiguous, names the building agent's own DID,
-  or did not sign the manifest;
+  or did not sign the manifest. A section for the agent that is itself the
+  signer is refused too, however the manifest was loaded;
 - an id is malformed or shortened, or names an unknown kind;
 - the manifest has no section for the building agent. "No exclusions" is a
   signed, empty section (`{}`), never an absent file or section;
@@ -831,23 +832,27 @@ read against a corpus built under another manifest refuses
 (`corpus_exclusion_manifest_changed`), so a changed manifest means a fresh
 snapshot.
 
-A corpus already handed to its consumer is governed too. Its registered
-artifact records the manifest it was built under, and consuming it
-(`consume_governed_semantic_artifact`) reads and admits the current manifest
-exactly as a build does:
+A corpus already handed to its consumer is governed too, and consumption is
+where a changed manifest takes effect. Its registered artifact records the
+receipt of the manifest it was built under (`exclusion_manifest_sequence`,
+`exclusion_manifest_sha256`). Consuming it (`consume_governed_semantic_artifact`)
+reads and admits the current manifest exactly as a build does, and serves it
+only when that receipt equals the current manifest's. Consumption refuses,
+naming the reason, when:
 
-- an unverifiable manifest (missing, forged, rolled back) refuses consumption
-  and revokes nothing;
-- once a manifest is admitted, by a build or a consumption, every active
-  corpus artifact built under another one is revoked, including one
-  registered before manifests existed. Its consumer receives the normal
-  revocation lease to delete it, and anything it built from it, such as an
-  adapter trained on it;
-- an export snapshot is not governed by the manifest and is served without
-  one.
+- the manifest is missing, fails verification or moved back;
+- the corpus was built under another manifest, whether older or registered
+  late by a build that read a manifest since replaced;
+- the corpus records no manifest: it was built before manifests existed.
 
-So installing a manifest that holds out an exam also withdraws every corpus
-that still carries it.
+A refusal leaves the corpus as it is: no build or consumption revokes a corpus
+over its manifest, so a reader holding an older manifest can never withdraw a
+newer corpus. The corpus stays registered, unusable, until its consumer rebuilds
+under the current manifest, or its retention expires. An export snapshot is
+not governed by the manifest and is served without one.
+
+So installing a manifest that holds out an exam makes every corpus that may
+still carry it unusable, and any manifest update requires a rebuild.
 
 A session exclusion holds out only material that names its session. `save_fact`
 assertions recorded before #3875 name none; exclude them by
@@ -896,7 +901,9 @@ kestrel corpus exclusions check --agent-did did:web:agents.example:meridian \
 It verifies the manifest against the trust root in the environment `kestrel
 start` launches agents with, prints every agent's section with each excluded
 id, and exits 1 when the manifest is refused or any section, or any named
-agent's missing section, would refuse a build (`--json` for a script). It
+agent's missing section, would refuse a build (`--json` for a script). Every
+section it lists is judged, named or not; one for the agent that is itself the
+trust root is refused. It
 writes nothing; the next corpus build admits the sequence.
 
 ## Migration from `constitution_path` overrides

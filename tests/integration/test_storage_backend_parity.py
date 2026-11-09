@@ -2208,16 +2208,17 @@ async def test_corpus_exclusion_manifest_holds_out_and_never_moves_back_on_eithe
             stored[1].revision_id
         ]
         assert corpus.exclusion_manifest.sequence == 2
-        # Admitting sequence 2 revoked the corpus still carrying the exam.
-        assert await storage.db.fetchall(
+        # Building under sequence 2 revoked nothing; the corpus still carrying
+        # the exam is refused when it is consumed.
+        assert sorted(await storage.db.fetchall(
             "SELECT artifact_id, exclusion_manifest_sequence FROM semantic_governed_artifacts "
             "WHERE tenant_id = ? AND kind = 'corpus_manifest' AND state = 'active'",
             (tenant,),
-        ) == [(corpus_id, 2)]
+        )) == sorted([(corpus_id, 2), (unexcluded_id, 1)])
         assert await storage.consume_governed_semantic_artifact(
             corpus_id, expected_generation=corpus.checkpoint.generation,
         )
-        with pytest.raises(GovernedArtifactError):
+        with pytest.raises(GovernedArtifactError, match="not the current manifest"):
             await storage.consume_governed_semantic_artifact(
                 unexcluded_id, expected_generation=unexcluded.checkpoint.generation,
             )
@@ -2240,9 +2241,10 @@ async def test_corpus_exclusion_manifest_holds_out_and_never_moves_back_on_eithe
             (tenant,),
         ) == (2, corpus.exclusion_manifest.manifest_sha256)
 
-        # A newer manifest withdraws the corpus at its next consumption.
+        # A newer manifest refuses the corpus at its next consumption, and
+        # withdraws nothing.
         authority.exclude(tenant, source_occurrence=[exam_source])
-        with pytest.raises(GovernedArtifactError, match="revoked"):
+        with pytest.raises(GovernedArtifactError, match="not the current manifest"):
             await storage.consume_governed_semantic_artifact(
                 corpus_id, expected_generation=corpus.checkpoint.generation,
             )
@@ -2250,12 +2252,12 @@ async def test_corpus_exclusion_manifest_holds_out_and_never_moves_back_on_eithe
             "SELECT COUNT(*) FROM semantic_governed_artifacts "
             "WHERE tenant_id = ? AND kind = 'corpus_manifest'",
             (tenant,),
-        ) == 0
+        ) == 2
         assert await storage.db.fetchval(
             "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
-            "WHERE tenant_id = ? AND kind = 'corpus_manifest' AND acknowledged_at IS NULL",
+            "WHERE tenant_id = ? AND kind = 'corpus_manifest'",
             (tenant,),
-        ) == 2
+        ) == 0
     finally:
         for assertion in stored:
             if await storage.get_assertion(assertion.assertion_id) is not None:

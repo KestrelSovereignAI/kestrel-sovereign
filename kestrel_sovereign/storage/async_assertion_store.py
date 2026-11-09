@@ -5890,36 +5890,31 @@ class AsyncAssertionStore:
             )
         return exclusion_manifest.manifest_sha256, exclusion_manifest.sequence
 
-    async def revoke_governed_corpus_artifacts_outside_manifest(self, exclusion_manifest) -> int:
-        """Revoke every active corpus artifact not built under ``exclusion_manifest``.
+    @staticmethod
+    def _corpus_manifest_refusal(
+        bound_sha256, bound_sequence, current_manifest: tuple[str, int],
+    ) -> str | None:
+        """Why a corpus row may not be served under ``current_manifest``, or ``None``.
 
-        Called once the host has admitted ``exclusion_manifest`` (#3893). A
-        corpus built under an earlier manifest, or before manifests existed,
-        may hold what the admitted one holds out, so it starts the normal
-        revocation: its consumer is asked to delete it, and anything it built
-        from it with it. Returns how many were revoked.
+        Served only when the receipt it was registered with equals the current
+        manifest's: a manifest that changed since may hold out what the corpus
+        holds, so it must be rebuilt. Nothing is written; a corpus registered
+        late, under a manifest since replaced, is refused the same way.
         """
-        manifest_sha256, sequence = self._exclusion_manifest_binding(exclusion_manifest)
-        tenant_id, _ = self._require_scope()
-        kinds = tuple(sorted(kind.value for kind in CORPUS_ARTIFACT_KINDS))
-        stale_sql = (
-            "SELECT artifact_id FROM semantic_governed_artifacts "
-            f"WHERE tenant_id = ? AND state = ? AND kind IN ({_placeholders(kinds)}) "
-            "AND (exclusion_manifest_sha256 IS NULL OR exclusion_manifest_sequence IS NULL "
-            "OR exclusion_manifest_sha256 <> ? OR exclusion_manifest_sequence <> ?)"
-        )
-        params = (tenant_id, GovernedArtifactState.ACTIVE.value, *kinds, manifest_sha256, sequence)
-        # Most builds find nothing stale: decide that without the tenant lock.
-        if not await self._database.fetchall(stale_sql, params):
-            return 0
-        async with self._mutation():
-            stale = await self._database.fetchall(stale_sql, params)
-            if not stale:
-                return 0
-            return await self._revoke_governed_artifacts_for_lineage(
-                artifact_ids=tuple(str(row[0]) for row in stale),
-                generation=await self._generation(),
+        if bound_sha256 is None or bound_sequence is None:
+            return (
+                "corpus artifact names no corpus exclusion manifest (it was built "
+                "before manifests existed); rebuild it under the current manifest"
             )
+        current_sha256, current_sequence = current_manifest
+        if (str(bound_sha256), int(bound_sequence)) == current_manifest:
+            return None
+        return (
+            "corpus artifact was built under corpus exclusion manifest sequence "
+            f"{int(bound_sequence)} ({str(bound_sha256)[:12]}), not the current "
+            f"manifest, sequence {current_sequence} ({current_sha256[:12]}); "
+            "rebuild it under the current manifest"
+        )
 
     async def consume_governed_artifact(
         self, artifact_id: str, *, expected_generation: int, exclusion_manifest=None,
@@ -5927,9 +5922,10 @@ class AsyncAssertionStore:
         """Fence serving/generation to a live, exact checkpoint-bound registry row.
 
         A corpus artifact is served only under ``exclusion_manifest``, the
-        host's current verified exclusion manifest (#3893). One built under
-        another manifest is revoked rather than served: the manifest it was
-        built under may have excluded less.
+        host's current verified exclusion manifest, and only when it was built
+        under that very manifest (#3893). Consumption is where a changed
+        manifest takes effect: any other corpus is refused, not revoked, so a
+        reader holding an older manifest can never withdraw a newer corpus.
         """
         if not isinstance(artifact_id, str) or not artifact_id:
             raise GovernedArtifactError("artifact_id must be non-empty")
@@ -5977,28 +5973,19 @@ class AsyncAssertionStore:
                 # receipt, registry removal, and pending physical-deletion
                 # work must commit before a consumer is told this artifact is
                 # unavailable.
-                refusal = "artifact retention expiry elapsed"
-            elif artifact_kind in CORPUS_ARTIFACT_KINDS and (
-                bound_sha256 is None
-                or bound_sequence is None
-                or (str(bound_sha256), int(bound_sequence)) != current_manifest
-            ):
-                await self._revoke_governed_artifacts_for_lineage(
-                    artifact_ids=(artifact_id,),
-                    generation=generation,
-                )
-                # Raised after the revocation commits, as for expiry.
-                refusal = (
-                    "corpus artifact was built under another corpus exclusion "
-                    "manifest and has been revoked"
-                )
             else:
+                if artifact_kind in CORPUS_ARTIFACT_KINDS:
+                    refusal = self._corpus_manifest_refusal(
+                        bound_sha256, bound_sequence, current_manifest
+                    )
+                    if refusal is not None:
+                        raise GovernedArtifactError(refusal)
                 return GovernedArtifactReceipt(
                     self._artifact_key(artifact_id), artifact_kind,
                     GovernedArtifactState.ACTIVE, generation,
                     self._artifact_receipt_digest(self._artifact_key(artifact_id), artifact_kind, GovernedArtifactState.ACTIVE, generation),
                 )
-        raise GovernedArtifactError(refusal)
+        raise GovernedArtifactError("artifact retention expiry elapsed")
 
     async def _authenticate_governed_artifact_consumer(
         self, authentication: GovernedArtifactConsumerAuthentication,

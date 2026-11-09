@@ -1833,17 +1833,21 @@ async def _active_artifact_ids(storage: AsyncStorage) -> set[str]:
     }
 
 
-@pytest.mark.asyncio
-async def test_a_corpus_built_before_the_exam_was_excluded_is_never_served_again(
-    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
-) -> None:
-    """The manifest a corpus was built under must still stand when it is consumed.
+_STALE_CORPUS = "built under corpus exclusion manifest sequence {} .*not the current manifest, sequence {}"
 
-    A corpus holding the exam, built before the Sovereign excluded it, stays
-    on its consumer's disk. Once a manifest that excludes the exam is
-    admitted, that corpus is revoked, so its consumer is told to delete it,
-    and consuming it refuses.
+
+@pytest.mark.asyncio
+async def test_a_corpus_built_before_the_exam_was_excluded_is_refused_until_rebuilt(
+    file_storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    """Consumption is where an added exclusion takes effect (#3893).
+
+    A corpus holding the exam, built under sequence 1, stays on its
+    consumer's disk. Once sequence 2 excludes the exam, consuming that corpus
+    refuses; it is left registered rather than revoked, and a rebuild under
+    sequence 2 is served without the exam.
     """
+    storage = file_storage
     feature, agent, governed = _fact_feature(storage)
     with live_turn(agent, None):
         exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
@@ -1853,6 +1857,7 @@ async def test_a_corpus_built_before_the_exam_was_excluded_is_never_served_again
     assert [item.assertion.revision_id for item in with_exam.examples] == [
         exam["revision_id"]
     ]
+    assert with_exam.exclusion_manifest.sequence == 1
     generation = with_exam.checkpoint.generation
     assert await governed.consume_governed_semantic_artifact(
         with_exam_id, expected_generation=generation
@@ -1861,29 +1866,35 @@ async def test_a_corpus_built_before_the_exam_was_excluded_is_never_served_again
     exclusion_authority.exclude(
         storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
     )
-    with pytest.raises(GovernedArtifactError, match="revoked"):
+    with pytest.raises(GovernedArtifactError, match=_STALE_CORPUS.format(1, 2)):
         await governed.consume_governed_semantic_artifact(
             with_exam_id, expected_generation=generation
         )
-    assert with_exam_id not in await _active_artifact_ids(storage)
-    assert await _pending_corpus_revocations(storage) == ["corpus_manifest"]
+    assert with_exam_id in await _active_artifact_ids(storage)
+    assert await _pending_corpus_revocations(storage) == []
 
-    # A corpus built under the manifest that stands is served.
-    without_exam, without_exam_id = await _registered_corpus(governed, policy)
-    assert without_exam.examples == ()
+    rebuilt, rebuilt_id = await _registered_corpus(governed, policy)
+    assert rebuilt.examples == ()
+    assert rebuilt.observability.excluded == {"explicitly_excluded": 1}
+    assert rebuilt.exclusion_manifest.sequence == 2
     assert await governed.consume_governed_semantic_artifact(
-        without_exam_id, expected_generation=without_exam.checkpoint.generation
+        rebuilt_id, expected_generation=rebuilt.checkpoint.generation
     )
+    # Rebuilding serves the new corpus; it does not reopen the old one.
+    with pytest.raises(GovernedArtifactError, match=_STALE_CORPUS.format(1, 2)):
+        await governed.consume_governed_semantic_artifact(
+            with_exam_id, expected_generation=generation
+        )
 
 
 @pytest.mark.asyncio
-async def test_a_newer_manifest_revokes_every_corpus_built_under_an_older_one(
+async def test_a_newer_manifest_leaves_older_corpora_registered_but_unusable(
     storage: AsyncStorage, exclusion_authority: ExclusionAuthority
 ) -> None:
-    """Admitting a manifest revokes stale corpora and the deltas built on them.
+    """A build under a newer manifest revokes nothing; consumption refuses.
 
-    Their consumer is asked to delete each one, whether or not it is ever
-    consumed again; an export, which no manifest governs, is left alone.
+    A corpus and the delta built on it are refused once another manifest is
+    current; an export, which no manifest governs, is still served.
     """
     feature, agent, governed = _fact_feature(storage)
     with live_turn(agent, None):
@@ -1891,26 +1902,37 @@ async def test_a_newer_manifest_revokes_every_corpus_built_under_an_older_one(
     policy = await _taught_fact_policy(storage, exam)
     base, base_id = await _registered_corpus(governed, policy)
     delta_id = str(uuid4())
-    await storage.governed_assertion_corpus_changes_since(
+    delta = await storage.governed_assertion_corpus_changes_since(
         base, policy=policy, inference_profile=None, artifact_id=delta_id,
         consumer_id="parametric-self-test", consumer_key_id="parametric-self-key-v1",
         consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY, retention_seconds=300,
     )
     export_id = str(uuid4())
-    await storage.export_assertion_snapshot(
+    exported_at, _ = await storage.export_assertion_snapshot(
         artifact_id=export_id, consumer_id="parametric-self-test",
         consumer_key_id="parametric-self-key-v1",
         consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY, retention_seconds=300,
     )
-    assert {base_id, delta_id, export_id} <= await _active_artifact_ids(storage)
 
     exclusion_authority.exclude(storage.agent_id, session=[EXAM_SESSION])
     rebuilt, rebuilt_id = await _registered_corpus(governed, policy)
 
-    assert await _active_artifact_ids(storage) == {export_id, rebuilt_id}
-    assert await _pending_corpus_revocations(storage) == [
-        "corpus_manifest", "future_corpus_candidate",
-    ]
+    assert await _active_artifact_ids(storage) == {base_id, delta_id, export_id, rebuilt_id}
+    assert await _pending_corpus_revocations(storage) == []
+    for stale_id, stale_generation in (
+        (base_id, base.checkpoint.generation),
+        (delta_id, delta.checkpoint.generation),
+    ):
+        with pytest.raises(GovernedArtifactError, match=_STALE_CORPUS.format(1, 2)):
+            await governed.consume_governed_semantic_artifact(
+                stale_id, expected_generation=stale_generation
+            )
+    assert await storage.consume_governed_semantic_artifact(
+        export_id, expected_generation=exported_at.generation
+    )
+    assert await governed.consume_governed_semantic_artifact(
+        rebuilt_id, expected_generation=rebuilt.checkpoint.generation
+    )
     assert await storage.db.fetchone(
         "SELECT exclusion_manifest_sha256, exclusion_manifest_sequence "
         "FROM semantic_governed_artifacts WHERE tenant_id = ? AND artifact_id = ?",
@@ -1919,22 +1941,42 @@ async def test_a_newer_manifest_revokes_every_corpus_built_under_an_older_one(
 
 
 @pytest.mark.asyncio
-async def test_a_corpus_is_not_served_while_no_manifest_can_be_verified(
-    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+@pytest.mark.parametrize(
+    ("break_manifest", "message"),
+    [
+        (_missing_manifest, "no manifest at"),
+        (_not_json, "not valid JSON"),
+        (_tampered, "signature verification failed"),
+        (_forged, "signature verification failed"),
+        (_no_section, "has no section for"),
+        (_no_trust_root, "no Sovereign trust root"),
+        (_agent_as_trust_root, "agent-owned DID"),
+    ],
+)
+async def test_no_corpus_is_served_while_no_manifest_can_be_verified(
+    file_storage: AsyncStorage,
+    exclusion_authority: ExclusionAuthority,
+    break_manifest,
+    message: str,
 ) -> None:
-    """An unverifiable manifest refuses consumption, but deletes nothing.
+    """A missing or unverifiable manifest refuses consumption of every corpus.
 
-    Removing the manifest is something an agent can do. Without one there is
-    no current manifest to judge the corpus against, so it is neither served
-    nor revoked; an export, which no manifest governs, is still served.
+    An agent can remove or replace the manifest. Without a verified one there
+    is no current manifest to judge a corpus against, so none is served,
+    including one built under the manifest just removed; nothing is revoked,
+    and an export, which no manifest governs, is still served.
     """
     from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
 
+    storage = file_storage
     feature, agent, governed = _fact_feature(storage)
     with live_turn(agent, None):
         exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
     policy = await _taught_fact_policy(storage, exam)
     corpus, corpus_id = await _registered_corpus(governed, policy)
+    assert await governed.consume_governed_semantic_artifact(
+        corpus_id, expected_generation=corpus.checkpoint.generation
+    )
     export_id = str(uuid4())
     exported_at, _ = await storage.export_assertion_snapshot(
         artifact_id=export_id, consumer_id="parametric-self-test",
@@ -1942,8 +1984,8 @@ async def test_a_corpus_is_not_served_while_no_manifest_can_be_verified(
         consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY, retention_seconds=300,
     )
 
-    exclusion_authority.manifest_path.unlink()
-    with pytest.raises(CorpusExclusionManifestError, match="no manifest at"):
+    break_manifest(exclusion_authority, storage.agent_id)
+    with pytest.raises(CorpusExclusionManifestError, match=message):
         await governed.consume_governed_semantic_artifact(
             corpus_id, expected_generation=corpus.checkpoint.generation
         )
@@ -1955,7 +1997,91 @@ async def test_a_corpus_is_not_served_while_no_manifest_can_be_verified(
 
 
 @pytest.mark.asyncio
-async def test_a_corpus_registered_before_manifests_existed_is_revoked(
+async def test_a_rolled_back_manifest_cannot_reopen_a_stale_corpus(
+    file_storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    """Consumption admits the manifest it reads, so putting back the old one fails.
+
+    Without that, an agent that restored the validly signed sequence 1 would
+    make a corpus built under it, exam and all, current again. Sequence 2 is
+    admitted here by a consumption alone, with no build under it.
+    """
+    from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
+
+    storage = file_storage
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    (exam_source,) = await governed.list_assertion_revision_sources(exam["revision_id"])
+    policy = await _taught_fact_policy(storage, exam)
+    older = json.loads(exclusion_authority.manifest_path.read_text())
+    with_exam, with_exam_id = await _registered_corpus(governed, policy)
+    exclusion_authority.exclude(
+        storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
+    )
+    with pytest.raises(GovernedArtifactError, match=_STALE_CORPUS.format(1, 2)):
+        await governed.consume_governed_semantic_artifact(
+            with_exam_id, expected_generation=with_exam.checkpoint.generation
+        )
+
+    exclusion_authority.write(older)
+    with pytest.raises(CorpusExclusionManifestError, match="lower than sequence 2"):
+        await governed.consume_governed_semantic_artifact(
+            with_exam_id, expected_generation=with_exam.checkpoint.generation
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_registered_after_its_manifest_was_replaced_is_not_served(
+    file_storage: AsyncStorage, exclusion_authority: ExclusionAuthority, monkeypatch
+) -> None:
+    """A build that read sequence 1 and registers after sequence 2 is refused.
+
+    Its registration is harmless: consumption rejects it, and it withdraws
+    nothing, so the corpus built meanwhile under sequence 2 stays served.
+    """
+    storage = file_storage
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    (exam_source,) = await governed.list_assertion_revision_sources(exam["revision_id"])
+    policy = await _taught_fact_policy(storage, exam)
+    register = storage._register_produced_semantic_artifact
+    paused, release = asyncio.Event(), asyncio.Event()
+
+    async def register_late(**kwargs):
+        if kwargs["exclusion_manifest"].sequence == 1:
+            paused.set()
+            await release.wait()
+        return await register(**kwargs)
+
+    monkeypatch.setattr(storage, "_register_produced_semantic_artifact", register_late)
+    late_build = asyncio.create_task(_registered_corpus(governed, policy))
+    await asyncio.wait_for(paused.wait(), 10)
+
+    exclusion_authority.exclude(
+        storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
+    )
+    current, current_id = await _registered_corpus(governed, policy)
+    assert current.examples == ()
+    release.set()
+    late, late_id = await asyncio.wait_for(late_build, 10)
+
+    assert [item.assertion.revision_id for item in late.examples] == [exam["revision_id"]]
+    assert late.exclusion_manifest.sequence == 1
+    assert await _active_artifact_ids(storage) == {late_id, current_id}
+    with pytest.raises(GovernedArtifactError, match=_STALE_CORPUS.format(1, 2)):
+        await governed.consume_governed_semantic_artifact(
+            late_id, expected_generation=late.checkpoint.generation
+        )
+    assert await governed.consume_governed_semantic_artifact(
+        current_id, expected_generation=current.checkpoint.generation
+    )
+    assert await _pending_corpus_revocations(storage) == []
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_registered_before_manifests_existed_is_refused(
     storage: AsyncStorage,
 ) -> None:
     """A corpus row with no manifest was built with no exclusions at all."""
@@ -1970,18 +2096,19 @@ async def test_a_corpus_registered_before_manifests_existed_is_revoked(
         (storage.agent_id, corpus_id),
     )
 
-    with pytest.raises(GovernedArtifactError, match="revoked"):
+    with pytest.raises(GovernedArtifactError, match="names no corpus exclusion manifest"):
         await storage.consume_governed_semantic_artifact(
             corpus_id, expected_generation=corpus.checkpoint.generation
         )
-    assert await _pending_corpus_revocations(storage) == ["corpus_manifest"]
+    assert corpus_id in await _active_artifact_ids(storage)
+    assert await _pending_corpus_revocations(storage) == []
 
 
 @pytest.mark.asyncio
 async def test_the_store_serves_a_corpus_only_under_the_manifest_it_was_built_under(
     storage: AsyncStorage,
 ) -> None:
-    """The store's own check, which holds under a concurrent admission too."""
+    """The store's own check: equal receipts or a named refusal, never a write."""
     from kestrel_sovereign.knowledge import CorpusExclusionReceipt
 
     private_key = Ed25519PrivateKey.generate()
@@ -2003,12 +2130,18 @@ async def test_the_store_serves_a_corpus_only_under_the_manifest_it_was_built_un
         served.artifact_id, expected_generation=generation, exclusion_manifest=admitted
     )
     newer = CorpusExclusionReceipt("e" * 64, admitted.sequence + 1, admitted.issued_at)
-    with pytest.raises(GovernedArtifactError, match="another corpus exclusion manifest"):
+    with pytest.raises(GovernedArtifactError, match="not the current manifest"):
         await store.consume_governed_artifact(
             stale.artifact_id, expected_generation=generation, exclusion_manifest=newer
         )
-    assert await _active_artifact_ids(storage) == {served.artifact_id}
-    assert await _pending_corpus_revocations(storage) == ["corpus_manifest"]
+    # Same sequence, other content: still not the manifest it was built under.
+    resigned = CorpusExclusionReceipt("e" * 64, admitted.sequence, admitted.issued_at)
+    with pytest.raises(GovernedArtifactError, match="not the current manifest"):
+        await store.consume_governed_artifact(
+            served.artifact_id, expected_generation=generation, exclusion_manifest=resigned
+        )
+    assert await _active_artifact_ids(storage) == {served.artifact_id, stale.artifact_id}
+    assert await _pending_corpus_revocations(storage) == []
 
 
 def test_a_corpus_registration_must_name_its_manifest_and_an_export_must_not() -> None:

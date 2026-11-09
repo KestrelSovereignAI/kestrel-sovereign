@@ -31,6 +31,13 @@ shortened or of an unknown kind; when the sequence moved back; when the agent
 has no section; and when the agent's section names a kind no producer records
 yet, which would silently match nothing. "No exclusions" is a validly signed
 manifest with an empty section for the agent, never an absent file.
+
+A corpus records the manifest it was built under (its
+:class:`~kestrel_sovereign.knowledge.corpus.CorpusExclusionReceipt`), and
+consuming it is where a changed manifest takes effect: consumption reads and
+admits the manifest exactly as a build does, and refuses a corpus whose
+receipt is not the current manifest's
+(``AsyncStorage.consume_governed_semantic_artifact``).
 """
 
 from __future__ import annotations
@@ -362,7 +369,19 @@ class VerifiedCorpusExclusionManifest:
         )
 
     def exclusions_for(self, agent_id: str) -> HostCorpusExclusions:
-        """What every corpus built for ``agent_id`` holds out under this manifest."""
+        """What every corpus built for ``agent_id`` holds out under this manifest.
+
+        Refused when the verified signer, the Sovereign trust root, is
+        ``agent_id`` itself: an agent cannot govern its own corpus, whichever
+        reader loaded the manifest and whichever agents it checked the root
+        against.
+        """
+        if agent_id == self.signer:
+            raise _refuse(
+                f"its signer and Sovereign trust root {self.signer} is the agent "
+                "the section governs; exclusion authority must be external to "
+                "the agent"
+            )
         section = self.sections.get(agent_id)
         if section is None:
             raise _refuse(

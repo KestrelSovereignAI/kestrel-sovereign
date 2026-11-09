@@ -2419,16 +2419,18 @@ class AsyncStorage:
     async def _host_corpus_exclusions(self, *, deadline: float):
         """What the host's exclusion manifest holds out of this agent's corpora (#3893).
 
-        Read and verified on every build, never cached: a replaced or removed
-        manifest takes effect on the next build. The files are read in a
-        worker thread, never on the event loop, and only until ``deadline``
-        (loop time); anything but a regular file is refused unread, so a FIFO
-        put in the manifest's place cannot hold the read open.
+        Read and verified on every build and every corpus consumption, never
+        cached: a replaced or removed manifest takes effect on the next one.
+        The files are read in a worker thread, never on the event loop, and
+        only until ``deadline`` (loop time); anything but a regular file is
+        refused unread, so a FIFO put in the manifest's place cannot hold the
+        read open.
 
         Its sequence is then admitted against the highest this agent's builds
-        have admitted before the corpus is read, so a manifest that moved back
-        refuses the build. Every corpus artifact built under another manifest
-        is revoked: it may hold what this one holds out.
+        and consumptions have admitted, so a manifest that moved back refuses.
+        Nothing else is written: a corpus built under another manifest is
+        refused when it is consumed (#3893), never revoked here, so a build
+        that read an older manifest cannot withdraw a newer corpus.
         """
         if not self._initialized:
             await self.initialize()
@@ -2440,8 +2442,7 @@ class AsyncStorage:
             admit_manifest,
         )
 
-        store = self._assertion_store()
-        agent_id = store.tenant_id
+        agent_id = self._assertion_store().tenant_id
         try:
             async with asyncio.timeout_at(deadline):
                 manifest = await asyncio.to_thread(
@@ -2455,7 +2456,6 @@ class AsyncStorage:
             ) from error
         exclusions = manifest.exclusions_for(agent_id)
         await admit_manifest(self.db, agent_id=agent_id, receipt=exclusions.receipt)
-        await store.revoke_governed_corpus_artifacts_outside_manifest(exclusions.receipt)
         return exclusions
 
     async def repair_semantic_maintenance(
@@ -2625,9 +2625,13 @@ class AsyncStorage:
         """Generation-fenced guard for a previously sealed semantic artifact.
 
         A corpus is served only under the host's exclusion manifest as it
-        stands now, read and admitted exactly as a build reads it (#3893): an
-        unverifiable manifest refuses, and a corpus built under another one
-        is revoked rather than served.
+        stands now, read and admitted exactly as a build reads it (#3893).
+        Consumption is where a changed manifest takes effect: it refuses, with
+        the reason, while the manifest is missing, unverifiable or moved back,
+        and refuses a corpus whose recorded receipt is not the current
+        manifest's, or that records none. A refused corpus is left as it is,
+        never revoked over its manifest, and is usable again only once rebuilt
+        under the current manifest.
         """
         if not self._initialized:
             await self.initialize()

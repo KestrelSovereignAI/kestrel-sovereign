@@ -680,17 +680,21 @@ builds admitted (`corpus_exclusion_watermarks`). The manifest is read in a
 worker thread within the build's own `max_wall_time_seconds`, and anything but
 a regular file (a FIFO put in its place) is refused unread.
 
-A corpus also outlives its build on the consumer's disk. Each `corpus_manifest`
-and `future_corpus_candidate` artifact records the manifest it was built under
-(`exclusion_manifest_sha256`, `exclusion_manifest_sequence`), and
+A corpus also outlives its build on the consumer's disk, so consumption is
+where a changed manifest takes effect. Each `corpus_manifest` and
+`future_corpus_candidate` artifact records the receipt of the manifest it was
+built under (`exclusion_manifest_sha256`, `exclusion_manifest_sequence`), and
 `consume_governed_semantic_artifact` reads and admits the current manifest
-exactly as a build does before serving one. An unverifiable manifest refuses
-consumption and revokes nothing. Admitting a manifest, by a build or a
-consumption, revokes every active corpus artifact built under another one,
-including one registered before manifests existed: its consumer receives the
-normal revocation lease to delete it and whatever it built from it. An export
-snapshot is not governed by the manifest and is served without one. The
-operator procedure is in
+exactly as a build does, then serves the artifact only when its receipt equals
+the current manifest's. It refuses, naming the reason, while the manifest is
+missing, unverifiable or moved back, and refuses an artifact built under
+another manifest (including one a build registered after the manifest it read
+was replaced) or recording none (built before manifests existed). A refusal
+leaves the corpus as it is: no build or consumption revokes a corpus over its
+manifest, so a reader holding an older manifest cannot withdraw a newer corpus;
+any manifest update leaves every existing corpus unusable until it is rebuilt.
+An export snapshot is not governed by the manifest and is served without one.
+The operator procedure is in
 [Corpus exclusion manifest](../security/SOVEREIGN_TRUST_ROOT.md#corpus-exclusion-manifest).
 
 Producers append the segment after their own locator with
