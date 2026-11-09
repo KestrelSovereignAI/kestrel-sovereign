@@ -58,10 +58,10 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, FrozenSet, Optional
 
 from kestrel_sdk.signals import SignalHandle
-from kestrel_sovereign._async_ownership import owned_task_error
+from kestrel_sovereign._async_ownership import owned_task_completion_error
 from kestrel_sovereign.execution_custody import (
-    execution_terminal_error,
-    is_execution_control_error,
+    execution_observation_error,
+    is_tool_execution_terminal_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,7 @@ def _outcome(
     )
 
 
-def _raise_delivery_control(error: BaseException, handle: Any = None) -> None:
+def _raise_delivery_control(error: BaseException | None, handle: Any = None) -> None:
     """Preserve the actual dispatch's first receipt before retry classification.
 
     A tracked SDK task's completion callback may already have harvested its
@@ -118,12 +118,11 @@ def _raise_delivery_control(error: BaseException, handle: Any = None) -> None:
     cause-free cancellation; use the shared original evidence, not that proxy.
     Legacy handles still preserve control carried by their own raised error.
     """
-    retained = None
+    terminal = error
     task = getattr(handle, "task", None) if isinstance(handle, SignalHandle) else None
     if isinstance(task, asyncio.Task) and task.done():
-        retained = owned_task_error(task)
-    terminal = execution_terminal_error(error, retained)
-    if terminal is not None and is_execution_control_error(terminal):
+        terminal = owned_task_completion_error(task, error)
+    if terminal is not None and is_tool_execution_terminal_error(terminal):
         raise terminal
 
 
@@ -174,6 +173,7 @@ async def await_terminal_delivery(
 
     try:
         result = await waiter()
+        _raise_delivery_control(None, handle)
     except asyncio.CancelledError as cancellation:
         _raise_delivery_control(cancellation, handle)
         current = asyncio.current_task()
@@ -298,7 +298,7 @@ def supervise_terminal_delivery(
                 try:
                     on_settled()
                 except BaseException as cleanup_error:
-                    raise execution_terminal_error(body_error, cleanup_error)
+                    raise execution_observation_error(body_error, cleanup_error, prefer_cancellation=True)
 
     return feature._track_owned_background_task(_await_and_settle(), name=task_name)
 

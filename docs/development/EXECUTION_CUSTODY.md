@@ -971,6 +971,11 @@ authority loss. Delivery retention explicitly opts into
 Core source projection and the authority predicate remain unchanged. The opt-in
 recovers exact original SDK/audit sources from canonical finite envelopes and
 excludes unrelated observer withdrawals, rather than retaining observer history.
+Signal delivery observers read the canonical original completion after a native
+success as well as after exceptions. SDK/audit uncertainty cannot authorize a
+successful checkpoint or ordinary replay restoration. Their supervisor finalizer
+uses the same finite observation composer to retain an independent finalizer
+failure without changing the original source graph or public SDK/audit type.
 Failed terminal writes remain exact-identity cleanup debt and block
 clean owner release. Cleanup liveness can update only an existing unstopped
 managed owner that still holds a leased or receipt-pending retry cognition,

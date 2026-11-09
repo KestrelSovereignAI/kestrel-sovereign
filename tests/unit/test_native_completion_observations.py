@@ -1423,3 +1423,109 @@ def test_original_terminal_delivery_projection_excludes_finite_observer_history(
             assert shared is original, "Shared delivery latch retained finite observer history"
             assert withdrawal not in tuple(execution_evidence_carriers(shared))
         assert original.__cause__ is cause
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sdk", "audit"])
+@pytest.mark.parametrize("physical_failure", [False, True])
+async def test_original_public_terminal_delivery_cannot_become_retryable_tooling_failure(tmp_path, kind, physical_failure):
+    from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
+    from kestrel_sovereign._async_ownership import _retain_owned_admission_error
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_tool_execution_terminal_error
+    from kestrel_sovereign.signals.delivery import await_terminal_delivery
+
+    error = (ResourceOutcomeUnknown("original uncertain effect") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original uncertain audit"))
+    cause = OSError("original provider diagnostic")
+    error.__cause__ = cause
+    effect = tmp_path / "original-delivery-effect"
+    async def operation():
+        effect.write_text("one original effect")
+        if physical_failure:
+            raise error
+        return SignalResult(signal_id="original-terminal-delivery", status=Status.OK,
+            mode=SignalMode.COGNITION, duration_ms=0)
+    task = create_owned_task(operation(), retain_originals=True)
+    if not physical_failure:
+        task.add_done_callback(lambda completed: _retain_owned_admission_error(completed, error))
+    handle = SignalHandle(signal_id="original-terminal-delivery", task=task)
+    observed = None
+    try:
+        try:
+            await await_terminal_delivery(handle, label="original-terminal-delivery")
+        except BaseException as failure:
+            observed = failure
+        assert observed is not None and is_tool_execution_terminal_error(observed), (
+            "Original public SDK/audit delivery authorized ordinary checkpoint restoration")
+        assert error in tuple(execution_evidence_carriers(observed))
+        assert error.__cause__ is cause
+        assert effect.read_text() == "one original effect"
+    finally:
+        await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sdk", "audit"])
+async def test_original_supervisor_finalizer_retains_independent_terminal_evidence(tmp_path, kind):
+    from kestrel_sdk.signals import SignalHandle
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
+    from kestrel_sovereign.signals.delivery import supervise_terminal_delivery
+    from tests.unit.test_detached_signal_delivery_harvest import _OwnedTaskFeature
+
+    error = (ResourceOutcomeUnknown("original uncertain effect") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original uncertain audit"))
+    error.__cause__ = OSError("original provider diagnostic")
+    original = tuple(execution_evidence_carriers(error))
+    cleanup = ValueError("original consumer finalizer failed")
+    effect = tmp_path / "original-supervised-effect"
+    async def operation():
+        effect.write_text("one original effect")
+        raise error
+    def settle():
+        raise cleanup
+    task = create_owned_task(operation(), retain_originals=True)
+    owner = _OwnedTaskFeature()
+    supervisor = supervise_terminal_delivery(owner,
+        SignalHandle(signal_id="original-terminal", task=task), label="original-terminal",
+        task_name="original-terminal-supervisor", on_settled=settle)
+    try:
+        outcome = await await_owned_task(supervisor)
+        assert tuple(execution_evidence_carriers(error)) == original
+        graph = tuple(execution_evidence_carriers(outcome.error))
+        assert error in graph and cleanup in graph, (
+            "Original supervisor finalizer failure disappeared behind terminal delivery")
+        assert isinstance(outcome.error, type(error))
+        assert effect.read_text() == "one original effect"
+    finally:
+        await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+async def test_actual_supervisor_withdrawal_retains_native_cancellation_contract(tmp_path):
+    from kestrel_sdk.signals import SignalHandle
+    from kestrel_sovereign.signals.delivery import supervise_terminal_delivery
+    from tests.unit.test_detached_signal_delivery_harvest import _OwnedTaskFeature
+
+    entered = asyncio.Event()
+    cleanup = ValueError("actual finalizer failed after supervisor withdrawal")
+    effect = tmp_path / "original-supervisor-withdrawal"
+    async def operation():
+        effect.write_text("one original effect")
+        entered.set()
+        await asyncio.Event().wait()
+    def settle():
+        raise cleanup
+    task = create_owned_task(operation(), retain_originals=True)
+    supervisor = supervise_terminal_delivery(_OwnedTaskFeature(),
+        SignalHandle(signal_id="original-withdrawal", task=task), label="original-withdrawal",
+        task_name="original-withdrawal", on_settled=settle)
+    try:
+        await entered.wait()
+        supervisor.cancel()
+        outcome = await await_owned_task(supervisor)
+        assert supervisor.cancelled(), (
+            "Actual supervisor withdrawal lost native cancellation behind finalizer failure")
+        assert cleanup in tuple(execution_evidence_carriers(outcome.error))
+        assert effect.read_text() == "one original effect" and task.done()
+    finally:
+        await await_owned_task(task)
