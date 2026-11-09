@@ -1306,3 +1306,120 @@ async def test_original_durable_route_result_reads_complete_native_receipt(tmp_p
         assert effect.read_text() == "one original physical route" and task.done()
     finally:
         await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit"])
+@pytest.mark.parametrize("completion", ["immediate", "retained", "retry-settlement"])
+async def test_original_durable_dispatch_keeps_late_terminal_delivery_nonretryable(tmp_path, monkeypatch, kind, completion):
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign._async_ownership import _retain_owned_admission_error
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_tool_execution_terminal_error
+    from kestrel_sovereign.signals import DurableConsumerRegistration
+    from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+    from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _channel_signal, _close
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "late-original-cognition.db", "did:test:late-original-cognition")
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message", agent_id=agent.did, max_attempts=0)
+    published = (ResourceOutcomeUnknown("original route late effect uncertainty") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original route late audit uncertainty") if kind == "audit"
+        else OSError("ordinary late route failure"))
+    retained = completion == "retained"
+    settlement = completion == "retry-settlement"
+    entered, release = asyncio.Event(), asyncio.Event()
+    effect, routes = tmp_path / "original-route-effects", []
+    handle = None
+
+    async def process_input(prompt):
+        task = asyncio.current_task()
+        routes.append(task)
+        effect.write_text("one original effect")
+        if kind is not None and not settlement:
+            task.add_done_callback(lambda completed: _retain_owned_admission_error(completed, published))
+        entered.set()
+        if retained:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+        if settlement:
+            raise OSError("original unsuccessful route requires exact-token retry settlement")
+        return "original route completed"
+
+    agent.process_input = process_input
+    if settlement:
+        nack = dispatcher.nack_durable_delivery
+        async def publish_after_retry(*args, **kwargs):
+            receipt = await nack(*args, **kwargs)
+            assert receipt is not None and receipt.status == "retry"
+            if kind is not None:
+                raise published
+            return receipt
+        monkeypatch.setattr(dispatcher, "nack_durable_delivery", publish_after_retry)
+    outcome = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "late-original"), source_event_id="late-original-event",
+            consumer_id=consumer.consumer_id)
+        if retained:
+            await entered.wait()
+            handle.task.cancel()
+            await await_owned_task(handle.task)
+            assert routes[0] in dispatcher._retained_durable_cognition_tasks
+            release.set()
+            await asyncio.wait({routes[0]})
+            await asyncio.sleep(0)
+            await dispatcher._drain_retained_durable_cognition_cleanup_tasks()
+        else:
+            outcome = await await_owned_task(handle.task)
+        [delivery] = await dispatcher.list_durable_deliveries()
+        terminal = kind in {"sdk", "audit"}
+        if terminal:
+            assert delivery.status == "failed" and delivery.next_attempt_at is None, (
+                "Late original tool outcome permitted durable cognition replay")
+            assert await dispatcher._durable_store.claim_delivery_for_event(
+                agent_id=agent.did, consumer_id=consumer.consumer_id, event_id=delivery.event_id,
+                executor_id="dispatcher:replacement", now=datetime.now(timezone.utc) + timedelta(hours=1)) is None
+        else:
+            expected = "acknowledged" if kind is None and completion == "immediate" else "retry"
+            assert delivery.status == expected
+        if terminal and not retained:
+            assert outcome.error is not None and is_tool_execution_terminal_error(outcome.error)
+            assert published in tuple(execution_evidence_carriers(outcome.error))
+            assert not is_execution_control_error(outcome.error), "Delivery uncertainty broadened Core authority loss"
+        assert effect.read_text() == "one original effect" and len(routes) == 1 and routes[0].done()
+    finally:
+        release.set()
+        if handle is not None:
+            await await_owned_task(handle.task)
+        for task in routes:
+            await await_owned_task(task)
+        await dispatcher._drain_retained_durable_cognition_cleanup_tasks()
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.parametrize("kind", ["sdk", "audit", "control", "ordinary"])
+def test_original_terminal_delivery_projection_excludes_finite_observer_history(kind):
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, execution_observation_error
+    original = (ResourceOutcomeUnknown("original provider uncertainty") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original audit uncertainty") if kind == "audit"
+        else ExecutionCommitOutcomeError("unknown") if kind == "control"
+        else OSError("ordinary original failure"))
+    cause = OSError("original provider diagnostic")
+    original.__cause__ = cause
+    shared = None
+    for index in range(6):
+        withdrawal = asyncio.CancelledError("finite observer", index)
+        observed = execution_observation_error(original, withdrawal)
+        assert (execution_native_source_error(observed) is original) == (kind == "control")
+        shared = execution_native_source_error(shared, observed, include_tool_terminal=True)
+        if kind == "ordinary":
+            assert shared is None
+        else:
+            assert shared is original, "Shared delivery latch retained finite observer history"
+            assert withdrawal not in tuple(execution_evidence_carriers(shared))
+        assert original.__cause__ is cause

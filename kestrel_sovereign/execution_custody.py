@@ -380,14 +380,25 @@ def _canonical_native_source_originals(error: BaseException | None) -> tuple[Bas
     return None
 
 
-def _native_source_originals(error: BaseException | None) -> tuple[BaseException, ...]:
+def _native_source_originals(error: BaseException | None, *,
+                            include_tool_terminal: bool = False) -> tuple[BaseException, ...]:
     """Flatten only canonical finite carriers, never genuine source groups."""
     if error is None:
         return ()
     sources = _canonical_native_source_originals(error)
     if sources is not None:
+        if include_tool_terminal:
+            # Finite SDK envelopes carry Core source provenance, not an
+            # authority grant. Recover their exact unmarked SDK originals
+            # without retaining the envelope's unrelated observer withdrawal.
+            originals = [*sources, *(member for member in _explicit_control_chain(error)
+                if issubclass(type(member), ResourceOutcomeUnknown)
+                and _canonical_native_source_originals(member) is None)]
+            return tuple(_enclosing_original_errors(originals))
         return sources
-    return (error,) if is_execution_control_error(error) else ()
+    terminal = (is_tool_execution_terminal_error if include_tool_terminal
+                else is_execution_control_error)
+    return (error,) if terminal(error) else ()
 
 
 def execution_observer_cancellations(error: BaseException | None) -> tuple[asyncio.CancelledError, ...]:
@@ -425,7 +436,8 @@ def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> 
     return wrapper
 
 
-def execution_native_source_error(*errors: BaseException | None) -> BaseException | None:
+def execution_native_source_error(*errors: BaseException | None,
+                                  include_tool_terminal: bool = False) -> BaseException | None:
     """Project canonical native SOURCES, never a finite observer's withdrawal.
 
     Only our freshly allocated composition carries this provenance. An
@@ -434,10 +446,13 @@ def execution_native_source_error(*errors: BaseException | None) -> BaseExceptio
     not authorize rewriting its explicit graph. Flatten canonical compositions
     before merging a shared latch, so repeated projections of the SAME sources
     cannot accumulate wrappers or previous observers.
+
+    Durable delivery may explicitly include SDK/audit terminal sources. That
+    local replay rule does not grant those errors Core control or authority.
     """
     sources = []
     for error in errors:
-        for source in _native_source_originals(error):
+        for source in _native_source_originals(error, include_tool_terminal=include_tool_terminal):
             if all(source is not prior for prior in sources):
                 sources.append(source)
     return execution_terminal_error(*sources, retain_originals=True,

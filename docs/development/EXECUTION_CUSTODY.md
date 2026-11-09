@@ -963,7 +963,15 @@ is terminal FAILED, never ordinary RETRY or terminal-ACKable; a retained route's
 late control outcome uses the same rule. Native terminal cleanup is a fixed
 original agent/consumer/delivery/owner/token CAS on the existing backend, not a
 generic SQL executor or new admission. No new provider cursor acknowledgement
-is inferred. Failed terminal writes remain exact-identity cleanup debt and block
+is inferred. SDK outcome uncertainty and unconfirmed required audits use this
+same nonretryable delivery rule through completed-result reads, claim settlement,
+retained-task cleanup and public error propagation. They do not imply Core
+authority loss. Delivery retention explicitly opts into
+`execution_native_source_error(..., include_tool_terminal=True)`; its default
+Core source projection and the authority predicate remain unchanged. The opt-in
+recovers exact original SDK/audit sources from canonical finite envelopes and
+excludes unrelated observer withdrawals, rather than retaining observer history.
+Failed terminal writes remain exact-identity cleanup debt and block
 clean owner release. Cleanup liveness can update only an existing unstopped
 managed owner that still holds a leased or receipt-pending retry cognition,
 under the canonical recovery
