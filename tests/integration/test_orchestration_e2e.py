@@ -13,7 +13,7 @@ A test's probe and calls share its ``live_call_budget``, so the deadlines of
 its sequential calls together fit inside the test's timeout.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import pytest
 import pytest_asyncio

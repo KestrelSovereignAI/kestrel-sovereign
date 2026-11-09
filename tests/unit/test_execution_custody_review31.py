@@ -126,7 +126,7 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
                 task = feature._track_owned_runtime_task(effect(), name="native-bounded-receipt")
             else:
                 task = manager._track_execution_task(
-                    effect(), task_id=str(index), authority_agent_id=agent.did,
+                    effect, task_id=str(index), authority_agent_id=agent.did,
                 )
             task.add_done_callback(lambda done: completed.set())
             await asyncio.wait_for(completed.wait(), 5)

@@ -12,7 +12,7 @@ Tests the complete cycle:
 5. Config persists across enable/disable cycles
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import pytest
 import pytest_asyncio

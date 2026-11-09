@@ -9,7 +9,7 @@ scripted tool calls, but the features and their tools are real. This
 verifies the full dispatch pipeline.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import logging
 import logging.handlers
@@ -23,6 +23,7 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.privacy import PrivacyMode
+from tests.utils.native_tool_effects import drive_native
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +218,7 @@ class TestExploreThenDirectFlow:
 
         try:
             with patch.object(agent.llm_service, "generate_with_messages", side_effect=mock_generate):
-                result = await agent._handle_orchestrator_response(
+                result = await drive_native(agent, lambda: agent._handle_orchestrator_response(
                     response=LLMResponse(
                         content="Let me check.",
                         tool_calls=[
@@ -233,7 +234,7 @@ class TestExploreThenDirectFlow:
                     force_local_only=False,
                     effective_model="test-model",
                     user_message="list all models",
-                )
+                ))
         finally:
             model_feature.execute_as_subagent = original_execute
 
@@ -257,7 +258,7 @@ class TestExploreThenDirectFlow:
                 return LLMResponse(content="Done.", tool_calls=None)
 
             with patch.object(agent.llm_service, "generate_with_messages", side_effect=mock_generate):
-                await agent._handle_orchestrator_response(
+                await drive_native(agent, lambda: agent._handle_orchestrator_response(
                     response=LLMResponse(
                         content="",
                         tool_calls=[
@@ -269,7 +270,7 @@ class TestExploreThenDirectFlow:
                     force_local_only=False,
                     effective_model="test-model",
                     user_message="list models",
-                )
+                ))
 
         direct_logs = [r for r in logs if "[DIRECT-TOOL]" in r.getMessage()]
         assert len(direct_logs) > 0, "Expected [DIRECT-TOOL] log entry for direct tool call"

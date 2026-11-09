@@ -551,8 +551,9 @@ _RESTART_REASON = (
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
+@pytest.mark.parametrize("preempt_sample", [False, True])
 async def test_a_failed_restart_stays_unhealthy_through_the_next_restart_until_a_renewal(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, preempt_sample,
 ):
     """A restarted heartbeat dies before renewing; the relay starts another,
     whose renewals keep failing. Through that thread's first lease, while
@@ -591,20 +592,39 @@ async def test_a_failed_restart_stays_unhealthy_through_the_next_restart_until_a
         await _wait_for(lambda: heartbeat.launches == 3, timeout=10)
         third_launch = heartbeat.launched_at
         samples = []
+        preempted = saw_failed_renewal = False
+
+        def observed_health():
+            nonlocal preempted, saw_failed_renewal
+            if preempt_sample and saw_failed_renewal and not preempted:
+                # A real host pause between timestamp and observation can
+                # straddle the first lease; the heartbeat thread keeps running.
+                remaining = third_launch + _HEALTHY_LEASE_SECONDS + 0.005 - time.monotonic()
+                if remaining > 0.005:
+                    time.sleep(remaining)
+                    preempted = True
+            health = _server_owner_health(agent)
+            if health[1] and "its last renewal failed (ConnectionError)" in health[1]:
+                saw_failed_renewal = True
+            return health
+
         while time.monotonic() < third_launch + _HEALTHY_LEASE_SECONDS + 0.2:
-            samples.append((time.monotonic(), _server_owner_health(agent)))
+            started = time.monotonic()
+            health = observed_health()
+            samples.append((started, time.monotonic(), health))
             await asyncio.sleep(0.005)
+        assert not preempt_sample or preempted, "Declared lease-boundary preemption did not run"
         assert heartbeat.alive
         assert heartbeat.launches == 3
         assert not heartbeat.renewed_since_launch(registry._owner_id)
         assert all(
             status == "self_fenced" and not ready
-            for _, (status, _reason, ready) in samples
+            for _, _, (status, _reason, ready) in samples
         )
         within = [
             reason
-            for sampled_at, (_status, reason, _ready) in samples
-            if sampled_at < third_launch + _HEALTHY_LEASE_SECONDS
+            for _, completed_at, (_status, reason, _ready) in samples
+            if completed_at < third_launch + _HEALTHY_LEASE_SECONDS
         ]
         assert within
         assert all(
@@ -613,10 +633,12 @@ async def test_a_failed_restart_stays_unhealthy_through_the_next_restart_until_a
                 "it yet: "
             )
             for reason in within
-        )
+        ), "Heartbeat health sample was assigned to a lease phase before observation completed"
         assert any("its last renewal failed (ConnectionError)" in r for r in within)
         # Past its first lease the newest thread's own failure is named.
-        assert samples[-1][1][1].startswith(
+        # Read here, after the loop's deadline, instead of classifying a
+        # potentially interrupted last sample as a post-lease observation.
+        assert _server_owner_health(agent)[1].startswith(
             _RESTART_REASON + "its last renewal failed (ConnectionError)"
         )
         assert not agent.operation_started.is_set()

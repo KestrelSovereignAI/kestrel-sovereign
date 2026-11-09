@@ -308,13 +308,14 @@ async def test_cli_shell_prints_typed_hold_refusal(
 
 
 @pytest.mark.asyncio
-async def test_process_input_refuses_at_unconditional_hold_seam(monkeypatch) -> None:
+async def test_process_input_refuses_at_unconditional_hold_seam(monkeypatch, native_tool_effect_agent) -> None:
     """Mutation tripwire: deleting the non-streaming check must run onward."""
 
     host = _latch(HoldScope.HOST, "hold:host", target="host")
     agent_hold = _latch(HoldScope.AGENT, "hold:agent", target="did:test:held")
     store = _Store(EffectiveHoldState(host=host, agent=agent_hold))
-    agent = _bare_agent(store)  # deliberately has no hooks manager or turn state
+    agent = await native_tool_effect_agent(did="did:test:held")
+    agent._hold_store = store
     dispositions: list[tuple[str, str]] = []
     monkeypatch.setattr(
         "kestrel_sovereign.hold.metrics.record_held_work_disposition",
@@ -335,12 +336,13 @@ async def test_process_input_refuses_at_unconditional_hold_seam(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_streaming_input_refuses_before_first_yield_or_side_effect() -> None:
+async def test_streaming_input_refuses_before_first_yield_or_side_effect(native_tool_effect_agent) -> None:
     """Mutation tripwire: deleting the streaming check must run onward."""
 
     agent_hold = _latch(HoldScope.AGENT, "hold:stream", target="did:test:held")
     store = _Store(EffectiveHoldState(host=None, agent=agent_hold))
-    agent = _bare_agent(store)
+    agent = await native_tool_effect_agent(did="did:test:held")
+    agent._hold_store = store
 
     stream = agent.process_input_streaming("do not stream")
     with pytest.raises(HoldTurnRefusal) as caught:
@@ -384,7 +386,7 @@ async def test_unheld_snapshot_admits_turn_at_the_same_boundary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_streamed_command_reuses_its_first_hold_admission_snapshot() -> None:
+async def test_streamed_command_reuses_its_first_hold_admission_snapshot(native_tool_effect_agent) -> None:
     """A command has one Hold linearization point, not two conflicting reads."""
     admitted = EffectiveHoldState(host=None, agent=None)
     later_hold = _latch(
@@ -400,8 +402,8 @@ async def test_streamed_command_reuses_its_first_hold_admission_snapshot() -> No
             return effective
 
     store = _ChangingStore(admitted)
-    agent = _bare_agent(store)
-    agent.storage = object()
+    agent = await native_tool_effect_agent(did="did:test:held")
+    agent._hold_store = store
     agent._safe_mode = False
     agent._constitution_audit_pending = False
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
@@ -422,7 +424,7 @@ async def test_streamed_command_reuses_its_first_hold_admission_snapshot() -> No
 
 
 @pytest.mark.asyncio
-async def test_streamed_command_transfers_admission_to_decorated_execution_task() -> None:
+async def test_streamed_command_transfers_admission_to_decorated_execution_task(native_tool_effect_agent) -> None:
     """The production invocation owner adopts the stream's one Hold snapshot."""
 
     from kestrel_sovereign.agent.invocation import bind_async_invocation
@@ -461,9 +463,9 @@ async def test_streamed_command_transfers_admission_to_decorated_execution_task(
             return "decorated command complete"
 
     store = _ChangingStore(admitted)
-    agent = _ProductionShapeAgent()
+    agent = await native_tool_effect_agent(did="did:test:held")
+    agent.process_input = MethodType(_ProductionShapeAgent.process_input, agent)
     agent._hold_store = store
-    agent.storage = object()
     agent._safe_mode = False
     agent._constitution_audit_pending = False
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)

@@ -433,6 +433,16 @@ class KeyRotationService:
             "agent_id_column": None,
         },
         {
+            # The effect journal indexes content with a stable random root.
+            # Rotation rewraps that root without reopening operation keys.
+            "table": "tool_effect_keys",
+            "content_column": "wrapped_key",
+            "id_column": "key_id",
+            "agent_id_column": None,
+            "optional": True,
+            "require_all": True,
+        },
+        {
             # Saved artifacts use envelope encryption; rotating the wrapped
             # index/content root leaves their owner/blob addresses stable.
             "table": "artifact_keys",

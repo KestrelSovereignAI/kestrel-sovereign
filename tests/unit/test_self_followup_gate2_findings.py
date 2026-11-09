@@ -38,9 +38,7 @@ from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_sovereign.signals.sources.self_followup import (
     TASK_NAME as SELF_FOLLOWUP,
 )
-from tests.unit.test_inline_executor_contextvar_invariant import (
-    _CodexReaderHarness,
-)
+from tests.utils.codex_inline import OwnedCallbackReader
 from tests.unit.test_self_followup_schedule import SOURCE, _drain, _schedule
 from tests.utils.scheduler_ticks import tick_and_settle
 
@@ -127,9 +125,9 @@ async def test_native_task_started_inline_from_a_follow_up_keeps_the_single_hop_
         raise AssertionError(f"unexpected inline tool {name}")
 
     make_executor = _bind_inline_executor(agent, execute_named_tool)
-    harness = _CodexReaderHarness()
+    harness = OwnedCallbackReader()
     # Spawned BEFORE either turn: its frozen context carries no chain.
-    await harness.ensure_started()
+    await harness.start()
 
     async def follow_up_turn(prompt, pre_turn_guard=None, **kwargs):
         # A self_followup source declares a pre-turn guard, which the
@@ -256,26 +254,47 @@ async def _stored_results_by_task(db):
 
 
 @pytest.mark.asyncio
-async def test_the_read_tool_door_is_real_under_durable_storage(followup_env):
+async def test_the_read_tool_door_is_real_under_durable_storage(tmp_path):
     """Positive control: each scheduled read tool really stores the intent.
 
     Without this, the redaction test below could pass on rows that never held
     the sentinel in the first place.
     """
-    agent, feature, runner, db, _backend = followup_env
-    await _persist_read_tool_outputs(agent, feature, runner)
+    from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+    from tests.unit.test_privacy_mode_durability import _booted_agent
+    from tests.utils.scheduler_ticks import dispatch_scheduled_tool
 
-    stored = await _stored_results_by_task(db)
-    for name in (*READ_TOOLS, "schedule_history"):
-        assert SENTINEL in stored.get(name, ""), (
-            f"{name} did not store the follow-up intent under durable storage; "
-            "the redaction test would be vacuous"
-        )
+    async with _booted_agent(tmp_path) as agent:
+        feature = SchedulerFeature(agent)
+        agent.features[feature.name] = feature
+        try:
+            await feature.initialize()
+            from kestrel_sovereign.features.security.permissions import PermissionLevel
+            for name in (*READ_TOOLS, "schedule_history"):
+                await agent.features["SecurityFeature"].permission_store.set_permission(
+                    "SchedulerFeature", name, PermissionLevel.ALLOW,
+                )
+            async with agent._turn_lifecycle():
+                queued = await feature.schedule_add_deadline(
+                    run_at="2099-01-01T00:00:00+00:00",
+                    task_name=SELF_FOLLOWUP,
+                    args_json=json.dumps({"intent": SENTINEL}),
+                )
+            assert queued.status is ToolResultStatus.OK, queued.error
+            for name in (*READ_TOOLS, "schedule_history"):
+                await dispatch_scheduled_tool(feature, name, {})
 
-    history = await feature.schedule_history()
-    assert SENTINEL in json.dumps(history.data or {}), (
-        "under durable storage schedule_history must still return results"
-    )
+            stored = await _stored_results_by_task(agent._raw_storage.db)
+            for name in (*READ_TOOLS, "schedule_history"):
+                assert SENTINEL in stored.get(name, ""), (
+                    f"{name} did not store the follow-up intent under durable storage; "
+                    "the redaction test would be vacuous"
+                )
+            history = await feature.schedule_history()
+            assert SENTINEL in json.dumps(history.data or {})
+        finally:
+            await feature.shutdown()
+            del agent.features[feature.name]
 
 
 @pytest.mark.asyncio

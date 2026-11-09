@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -37,6 +38,30 @@ def manager_for(backend, scope, *, owns_backend=True, **callbacks):
         include_feedback=False,
         **callbacks,
     )
+
+
+@pytest_asyncio.fixture
+async def native_feature_case_factory(native_a2a_backend_factory, native_tool_effect_agent):
+    """One real Agent owns the shared primary journal and native Task stores."""
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+
+    async with AsyncExitStack() as resources:
+        async def create(*, did='did:kestrel:recipient', tenant='tenant'):
+            backend = native_a2a_backend_factory()
+            await backend.connect()
+            agent = await native_tool_effect_agent(did=did, connected_backend=backend)
+            manager = manager_for(backend, NativeRecipientScope(did, tenant), owns_backend=False)
+            resources.push_async_callback(manager.close)
+            await manager.initialize()
+            agent.task_manager = manager
+            return SimpleNamespace(agent=agent, manager=manager)
+
+        yield create
+
+
+@pytest_asyncio.fixture
+async def native_feature_case(native_feature_case_factory):
+    return await native_feature_case_factory()
 
 
 @pytest_asyncio.fixture(params=["sqlite", "postgres"])

@@ -11,10 +11,10 @@ memory work through ``KestrelAgent._privacy_blocks_background_memory`` →
 modes on BOTH paths and lets persistent modes through.
 """
 import asyncio
-from contextlib import asynccontextmanager
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
@@ -61,35 +61,19 @@ class TestPrivacyGatePredicate:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@asynccontextmanager
-async def _passthrough():
-    yield
+async def _build_streaming_agent(mode, native_tool_effect_agent):
+    """Actual privacy/storage/input lifetime with explicit context/provider seams."""
+    from kestrel_sovereign.agent.context_manager import ContextResult
+    from kestrel_sovereign.llm.adapter import LLMResponse
 
-
-def _build_streaming_agent(mode):
-    """Mock agent wired to run the real streaming finalize path with the
-    real privacy gate, spying on _post_response_pipeline."""
-    from kestrel_sovereign.agent.streaming import StreamingMixin
-
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock()
-    privacy_agent.privacy_config = privacy_mode_to_config(mode)
-    privacy_agent.privacy_mode = MagicMock()
-    privacy_agent.privacy_mode.name = mode.value
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
-    agent.features = {}
-    agent.did = "test-did"
+    agent = await native_tool_effect_agent(did="did:test:background-memory")
+    if mode is not PrivacyMode.NORMAL:
+        transition = await agent.set_privacy_mode_with_effects(mode)
+        assert transition.applied
     agent.extension = None
     agent._cached_features_prompt = ""
-    agent.is_request_cancelled = MagicMock(return_value=False)
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent.hooks_manager = None
     agent._get_governing_constitution = AsyncMock(return_value="")
     agent.check_solvency = AsyncMock(return_value="test-model")
     agent._build_all_tools = MagicMock(return_value=[])
@@ -97,42 +81,16 @@ def _build_streaming_agent(mode):
     agent.user_prompt_template = MagicMock()
     agent.user_prompt_template.format.return_value = "rendered"
     agent.operator_signal_producer = None
+    context = ContextResult(system_prompt="system", messages=[], total_tokens=0, budget_summary={})
+    agent.context_manager = SimpleNamespace(build_context=AsyncMock(return_value=context))
 
-    ctx = MagicMock()
-    ctx.system_prompt = "system"
-    ctx.dynamic_user_context = ""
-    ctx.messages = []
-    ctx.degraded_mode = False
-    ctx.warnings = []
-    agent.context_manager = MagicMock()
-    agent.context_manager.build_context = AsyncMock(return_value=ctx)
-
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-
-    async def mock_stream_no_tools(**kwargs):
+    async def stream_no_tools(**kwargs):
         for piece in ["Hello", " ", "world"]:
             yield piece
+        yield LLMResponse(content="Hello world", tool_calls=[])
 
-    agent.llm_service = MagicMock()
-    agent.llm_service.stream_with_tool_detection = mock_stream_no_tools
-
-    # Spy on the post-response pipeline; bind the REAL gate so the test
-    # exercises the actual privacy decision, not a mock.
+    agent.llm_service.stream_with_tool_detection = stream_no_tools
     agent._post_response_pipeline = AsyncMock()
-    agent._privacy_blocks_background_memory = (
-        KestrelAgent._privacy_blocks_background_memory.__get__(agent, KestrelAgent)
-    )
-
-    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(agent)
-    agent._process_input_streaming_traced_locked = (
-        StreamingMixin._process_input_streaming_traced_locked.__get__(agent)
-    )
-    agent._persist_assistant_turn_safely = (
-        StreamingMixin._persist_assistant_turn_safely.__get__(agent)
-    )
     return agent
 
 
@@ -144,8 +102,8 @@ async def _drain_stream(agent):
 
 
 @pytest.mark.asyncio
-async def test_streaming_normal_runs_post_response_pipeline():
-    agent = _build_streaming_agent(PrivacyMode.NORMAL)
+async def test_streaming_normal_runs_post_response_pipeline(native_tool_effect_agent):
+    agent = await _build_streaming_agent(PrivacyMode.NORMAL, native_tool_effect_agent)
     text = await _drain_stream(agent)
     assert "Hello world" in text
     agent._post_response_pipeline.assert_awaited_once()
@@ -156,13 +114,21 @@ async def test_streaming_normal_runs_post_response_pipeline():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [PrivacyMode.EPHEMERAL, PrivacyMode.ISOLATED])
-async def test_streaming_volatile_modes_skip_post_response_pipeline(mode):
-    agent = _build_streaming_agent(mode)
-    text = await _drain_stream(agent)
-    assert "Hello world" in text
-    # The single privacy gate must keep the pipeline (and therefore all
-    # temporal/concept/graph/embedding writes) from ever being entered.
-    agent._post_response_pipeline.assert_not_awaited()
+async def test_streaming_volatile_modes_skip_post_response_pipeline(mode, native_tool_effect_agent):
+    agent = await _build_streaming_agent(mode, native_tool_effect_agent)
+    try:
+        text = await _drain_stream(agent)
+        assert "Hello world" in text
+        # The single privacy gate must keep the pipeline (and therefore all
+        # temporal/concept/graph/embedding writes) from ever being entered.
+        agent._post_response_pipeline.assert_not_awaited()
+        assert await agent._raw_storage.db.fetchval("SELECT COUNT(*) FROM conversation_history") == 0
+
+    finally:
+        # These tests own the volatile session they opened on the partial host.
+        agent.privacy_agent.discard_isolated_session()
+        if agent.privacy_agent.ephemeral_session is not None:
+            agent.privacy_agent.ephemeral_session.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

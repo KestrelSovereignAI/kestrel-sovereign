@@ -7,25 +7,20 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     ToolDispatchEntry,
     redact_tool_args_json,
 )
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
-from kestrel_sovereign.hooks.manager import HooksManager
+from kestrel_sdk.resources import ResourceOutcomeUnknown
+from tests.utils.native_tool_effects import drive_native
 from kestrel_sovereign.llm.adapter import ToolCall
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
 class _BrokenTool:
+    from kestrel_sdk.tools.base import ToolSchema, ToolCategory, ToolParameter
+    schema = ToolSchema("broken_tool", "Owned failing tool", ToolCategory.SYSTEM, parameters=[
+        ToolParameter("api_key", "string", "Owned argument", required=True),
+        ToolParameter("task", "string", "Owned task", required=True),
+    ])
     async def execute(self, **kwargs):
         raise ValueError("broken on purpose")
-
-
-class _Agent(OrchestratorEngineMixin, TurnLifecycleMixin):
-    def __init__(self, store):
-        self.did = "did:test:emma"
-        self._direct_tools = {"broken_tool": _BrokenTool()}
-        self._tool_to_feature = {"broken_tool": "TestFeature"}
-        self.hooks_manager = HooksManager()
-        self.observability_store = store
 
 
 class _SchemaCaptureBackend:
@@ -144,14 +139,15 @@ async def test_llm_call_observability_records_and_filters_agent_did(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_broken_direct_tool_dispatch_writes_failure_row(tmp_path):
-    backend = SQLiteBackend(str(tmp_path / "tool-dispatch.db"))
-    await backend.connect()
-    store = ObservabilityStore(backend)
-    await store.initialize()
-    try:
-        agent = _Agent(store)
-        messages = []
+async def test_broken_direct_tool_dispatch_writes_failure_row(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:emma")
+    backend = agent._raw_storage.db.backend
+    tool = _BrokenTool()
+    tool.name = "broken_tool"
+    agent.register_dynamic_tools("TestFeature", [tool])
+    messages = []
+
+    async def exercise():
         async with agent._turn_lifecycle():
             await agent._dispatch_tool_call(
                 ToolCall(
@@ -167,29 +163,30 @@ async def test_broken_direct_tool_dispatch_writes_failure_row(tmp_path):
                 session_id="sess-1",
             )
 
-        row = await backend.fetch_one(
-            """
-            SELECT agent_did, session_id, turn_id, ts, tool_name, adapter,
-                   args_redacted, result_status, error_class, error_message
-            FROM a2a_tool_dispatches
-            WHERE agent_did=?
-            """,
-            ("did:test:emma",),
-        )
-        assert row is not None
-        assert row[1] == "sess-1"
-        assert str(row[2]).startswith("turn_")
-        assert row[3] is not None
-        assert row[4] == "broken_tool"
-        assert row[5] == "TestFeature.broken_tool"
-        assert json.loads(row[6])["api_key"] == "<redacted>"
-        assert row[7] == "error"
-        assert row[8] == "ResourceOutcomeUnknown"
-        assert row[9] == "Tool outcome is unconfirmed; reconcile before retrying. Do not replay"
-        assert messages and row[9] in messages[0]["content"]
-        assert "broken on purpose" not in messages[0]["content"]
-    finally:
-        await store.close()
+
+    with pytest.raises(ResourceOutcomeUnknown):
+        await drive_native(agent, exercise)
+
+    row = await backend.fetch_one(
+        """
+        SELECT agent_did, session_id, turn_id, ts, tool_name, adapter,
+               args_redacted, result_status, error_class, error_message
+        FROM a2a_tool_dispatches
+        WHERE agent_did=?
+        """,
+        ("did:test:emma",),
+    )
+    assert row is not None
+    assert row[1] == "sess-1"
+    assert str(row[2]).startswith("turn_")
+    assert row[3] is not None
+    assert row[4] == "broken_tool"
+    assert row[5] == "TestFeature.broken_tool"
+    assert json.loads(row[6])["api_key"] == "<redacted>"
+    assert row[7] == "error"
+    assert row[8] == "ResourceOutcomeUnknown"
+    assert row[9] == "Tool outcome is unconfirmed; reconcile before retrying. Do not replay"
+    assert messages == [], "an uncertain native effect publishes no tool reply"
 
 
 def test_redact_args_json_caps_large_payloads():

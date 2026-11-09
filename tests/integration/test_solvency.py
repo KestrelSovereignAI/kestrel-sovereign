@@ -1,5 +1,5 @@
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 import pytest  # noqa: E402
 pytest.importorskip('kestrel_feature_wallet', reason='Extracted package not installed')
 

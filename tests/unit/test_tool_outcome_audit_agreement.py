@@ -7,6 +7,10 @@ the one status ``infer_tool_result_status`` computes for the call, on the
 direct, bound and feature-dispatch paths.
 """
 
+from uuid import uuid4
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sovereign.features.base import Feature
+
 import pytest
 import pytest_asyncio
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
@@ -70,14 +74,19 @@ class _Tool:
         return self.outcome()
 
 
-class _Feature:
+class _Feature(Feature):
     """A feature dispatched as a subagent, returning a fixed outcome."""
 
     tool_name = "fact_feature"
+    tool_description = "Owned feature audit outcome"
 
-    def __init__(self, outcome):
+    def __init__(self, agent, outcome):
+        super().__init__(agent)
         self.outcome = outcome
         self.calls = 0
+
+    async def initialize(self):
+        pass
 
     async def execute_as_subagent(self, *, task, context, denied_tools, model_override):
         self.calls += 1
@@ -94,28 +103,10 @@ class _Deny(Hook):
         return HookOutput.deny("host denied")
 
 
-class _Agent(OrchestratorEngineMixin, ToolRegistryMixin):
-    def __init__(self, store):
-        self.did = "did:test:outcome-audit"
-        self.features = {}
-        self._direct_tools, self._tool_to_feature, self._explored_features = {}, {}, {}
-        self._direct_tool_defs, self._pinned_features = [], set()
-        self.hooks_manager, self.observability_store = HooksManager(), store
-
-    def _register_explored_feature_tools(self, feature):
-        pass
-
-
 @pytest_asyncio.fixture
-async def host(tmp_path):
-    backend = SQLiteBackend(str(tmp_path / "outcome-audit.db"))
-    await backend.connect()
-    store = ObservabilityStore(backend)
-    await store.initialize()
-    try:
-        yield _Agent(store), backend
-    finally:
-        await store.close()
+async def host(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:outcome-audit")
+    return agent, agent.observability_store._backend
 
 
 async def _recorded(backend):
@@ -135,7 +126,9 @@ async def _assert_one_outcome(backend, expected):
 async def _dispatch(agent, name, features_by_tool_name=None):
     # A feature subagent takes a task; a direct tool only its own parameters.
     arguments = {"task": "record it"} if features_by_tool_name else {"count": 3}
-    return await agent._dispatch_tool_call(
+    for feature in (features_by_tool_name or {}).values():
+        agent.features[feature.name] = feature
+    return await drive_native(agent, lambda: agent._dispatch_tool_call(
         ToolCall(id="tc-1", name=name, arguments=arguments),
         features_by_tool_name=features_by_tool_name or {},
         known_tools={name},
@@ -143,7 +136,7 @@ async def _dispatch(agent, name, features_by_tool_name=None):
         iteration=0,
         user_message="record it",
         session_id="sess-outcome",
-    )
+     ))
 
 
 @pytest.mark.asyncio
@@ -176,7 +169,7 @@ async def test_bound_tool_records_one_outcome(host, case):
     if produce is DENIED:
         agent.hooks_manager.register(_Deny())
 
-    await bindings[0].invoke({"count": 3}, session_id="mcp-app:view-1", source="mcp-app")
+    await bindings[0].invoke({"count": 3}, session_id="mcp-app:view-1", source="mcp-app", operation_id=uuid4().hex)
 
     assert tool.calls == (0 if produce is DENIED else 1)
     await _assert_one_outcome(backend, expected)
@@ -187,7 +180,7 @@ async def test_bound_tool_records_one_outcome(host, case):
 async def test_feature_dispatch_records_one_outcome(host, case):
     agent, backend = host
     produce, expected = OUTCOMES[case]
-    feature = _Feature(None if produce is DENIED else produce)
+    feature = _Feature(agent, None if produce is DENIED else produce)
     if produce is DENIED:
         agent.hooks_manager.register(_Deny())
 
@@ -220,22 +213,29 @@ async def test_raising_direct_tool_still_records_failure(host):
     agent._direct_tools[tool.name] = tool
     agent._tool_to_feature[tool.name] = "FactFeature"
 
-    result = await _dispatch(agent, tool.name)
+    with pytest.raises(ResourceOutcomeUnknown):
+        await _dispatch(agent, tool.name)
 
-    assert result == {"success": False,
-        "error": "Tool outcome is unconfirmed; reconcile before retrying. Do not replay"}
-    await _assert_one_outcome(backend, "error")
+    assert tool.calls == 1
+    # A terminal failure has no delivered tool-response event. Its mandatory
+    # dispatch and native effect receipt still record the failed uncertainty.
+    assert await _recorded(backend) == ([], ["error"])
+    assert await agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
 
 
 @pytest.mark.asyncio
 async def test_raising_feature_still_records_failure(host):
     agent, backend = host
-    feature = _Feature(RAISES)
+    feature = _Feature(agent, RAISES)
 
-    result = await _dispatch(agent, feature.tool_name, {feature.tool_name: feature})
+    with pytest.raises(ResourceOutcomeUnknown):
+        await _dispatch(agent, feature.tool_name, {feature.tool_name: feature})
 
-    assert result == {"success": False, "error": "broken on purpose"}
-    await _assert_one_outcome(backend, "error")
+    assert feature.calls == 1
+    assert await _recorded(backend) == ([], ["error"])
+    assert await agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
 
 
 @pytest.mark.asyncio
@@ -248,9 +248,13 @@ async def test_raising_bound_tool_still_records_failure(host):
     )
 
     with pytest.raises(ResourceOutcomeUnknown):
-        await bindings[0].invoke({"count": 3}, session_id="mcp-app:view-1", source="mcp-app")
+        await bindings[0].invoke({"count": 3}, session_id="mcp-app:view-1", source="mcp-app", operation_id=uuid4().hex)
 
-    await _assert_one_outcome(backend, "error")
+    # A terminal failure has no delivered tool-response event. Its mandatory
+    # dispatch and native effect receipt still record the failed uncertainty.
+    assert await _recorded(backend) == ([], ["error"])
+    assert await agent.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
 
 
 def test_tool_result_status_reads_the_envelope_not_its_constructors():

@@ -468,8 +468,8 @@ jobs:
         # These are at least nineteen complete local runs; the slowest
         # process wall time rounds up to 2.6 minutes.
         # Those measurements cover the historical fifteen-case baseline.
-        # This expanded lane collects 47 cases, including the real host-process
-        # restart campaign. Its 41 non-Docker cases pass locally; six Docker
+        # This expanded lane collects 56 cases, including the real host-process
+        # restart, journal boot and callback-inventory campaigns. Six Docker
         # cases require this CI job. The complete expanded lane's duration must
         # be established on the current PR tree, not inferred from the baseline.
         # The ratio is the integration tier's observed runner spread. Its
@@ -478,12 +478,20 @@ jobs:
           uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
           tests/integration/test_mcp_apps_host.py
           tests/integration/test_mcp_permission_host_restart.py
+          tests/integration/test_mcp_permission_unknown_restart.py
+          tests/integration/test_tool_effect_host_boot.py
+          tests/unit/test_async_ownership.py::test_repeated_withdrawal_does_not_accumulate_completion_callbacks
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12
 
   # Unit tests (no services needed)
   unit-tests:
+    name: unit-tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     # Explicit `contents: read` so this job does NOT inherit the wider grant
     # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
     # caller's permissions when they declare none, which would hand this
@@ -585,7 +593,11 @@ jobs:
         # tripped first. --maxfail bounds a truly broken tree without hiding
         # the set. Reading a red run now means reading every failure, which is
         # what tells you flake from regression.
-        run: uv run pytest tests/unit/ -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
+        # The complete suite outgrew one session: 36,894 tests passed before
+        # the 35-minute limit in PR #3999. Each worker records its original
+        # collection and deterministic selection. The coverage job proves
+        # both shards contain every collected node exactly once.
+        run: uv run pytest tests/unit/ -p tests.utils.unit_sharding --unit-shard=${{ matrix.shard }} --unit-shard-count=2 --unit-shard-manifests=unit-shard-manifests -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --durations=50
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in
@@ -634,13 +646,41 @@ jobs:
           KESTREL_REQUIRE_POSTGRES_TESTS: "1"
 
       - name: Run voice playback JavaScript tests
+        if: matrix.shard == 1
         run: >-
           node --test
           tests/js/test_voice_playback.mjs
           tests/js/test_voice_playback_worklet.mjs
 
       - name: Run frontend JavaScript tests
+        if: matrix.shard == 1
         run: npm run test:js
+
+      - name: Upload unit shard collection manifests
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-shard-${{ matrix.shard }}
+          path: unit-shard-manifests/*.json
+          if-no-files-found: error
+
+  unit-shard-coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: unit-shard-*
+          path: unit-shard-manifests
+          merge-multiple: true
+      - name: Verify complete disjoint unit collection
+        run: python tests/utils/unit_sharding.py --verify unit-shard-manifests --count 2
 
   # Fail-fast across the parallel tiers.
   #
@@ -945,7 +985,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    needs: [lint-and-imports, unit-tests]
+    needs: [lint-and-imports, unit-tests, unit-shard-coverage]
     if: >-
       (github.event_name != 'push' || github.ref != 'refs/heads/main')
       && needs.lint-and-imports.outputs.run_expensive != 'false'

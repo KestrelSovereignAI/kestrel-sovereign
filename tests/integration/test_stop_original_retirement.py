@@ -1,6 +1,6 @@
 """A bounded server Stop close cannot erase a still-live native settlement."""
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import asyncio
 

@@ -2185,6 +2185,14 @@ class CodexAdapter(LLMAdapter):
 
         terminal_error: BaseException | None = None
 
+        def reply_delivery_failed(error):
+            nonlocal terminal_error
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            terminal_error = execution_observation_error(terminal_error, error)
+            if terminal_errors is not None:
+                terminal_errors.append(terminal_error)
+            return terminal_error
+
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
             nonlocal terminal_error
             task = asyncio.current_task()
@@ -2216,6 +2224,7 @@ class CodexAdapter(LLMAdapter):
         # close the create_task-before-first-timeslice Stop race by itself.
         if active_handlers is not None:
             setattr(handler, "_codex_active_tasks", active_handlers)
+        handler._codex_reply_delivery_failed = reply_delivery_failed
         return handler
 
     def _make_codex_approval_handler(
@@ -2923,6 +2932,8 @@ class CodexAdapter(LLMAdapter):
         active_inline_tool_handlers: set[asyncio.Task[Any]] = set()
         inline_terminal_errors: list[BaseException] = []
         unregisters: List[Callable[[], None]] = []
+        from kestrel_sovereign._async_ownership import OwnedCallbackScope
+        callback_scope = OwnedCallbackScope()
         if tool_executor is not None and dyn:
             # Only register an item/tool/call handler when tools were
             # actually advertised this turn. A handler on a text-only
@@ -2937,14 +2948,13 @@ class CodexAdapter(LLMAdapter):
             # the dispatcher routes by ``params.threadId``. Without
             # scoping, a second turn's registration would silently
             # overwrite an in-flight turn's handler.
+            inline_handler = self._make_tool_call_handler(
+                tool_executor, thread_id, allowed_tools, executed_log,
+                tool_aliases, active_inline_tool_handlers, inline_terminal_errors,
+            )
+            inline_handler._codex_native_callback_scope = callback_scope
             unregisters.append(app.register_server_request_handler(
-                "item/tool/call",
-                self._make_tool_call_handler(
-                    tool_executor, thread_id, allowed_tools, executed_log,
-                    tool_aliases, active_inline_tool_handlers,
-                    inline_terminal_errors,
-                ),
-                thread_id=thread_id,
+                "item/tool/call", inline_handler, thread_id=thread_id,
             ))
 
         # Defense in depth: explicit native approval handlers always decline,
@@ -3035,7 +3045,8 @@ class CodexAdapter(LLMAdapter):
                 )
             from kestrel_sovereign.execution_custody import require_execution_work
             require_execution_work()
-            await app.request("turn/start", turn_params, timeout=60)
+            async with callback_scope.wait():
+                await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
             final_text: Optional[str] = None
@@ -3081,7 +3092,12 @@ class CodexAdapter(LLMAdapter):
                 app, sink, est_payload_tokens, thread_id=thread_id,
                 cancel_token=cancel_token,
             )) as _owned_forwarder_2982:
-                async for ev in _owned_forwarder_2982:
+                while True:
+                    try:
+                        async with callback_scope.wait():
+                            ev = await anext(_owned_forwarder_2982)
+                    except StopAsyncIteration:
+                        break
                     raise_if_cancelled(cancel_token)
                     method = ev.get("method")
                     p = ev.get("params") or {}
@@ -3376,6 +3392,7 @@ class CodexAdapter(LLMAdapter):
             raise
         finally:
             unwind_error = sys.exception()
+            callback_scope.close()
             inline_terminal_errors.extend(_cleanup_app_server_data_images(
                 temp_image_paths, retirement_owner=image_retirement_owner,
             ))
@@ -3399,12 +3416,13 @@ class CodexAdapter(LLMAdapter):
                 # Retiring them must not depend on admitting another collector
                 # Task, or an allocator refusal releases the mutex underneath
                 # an accepted effect. Close admission above, then join originals.
-                while active_inline_tool_handlers:
-                    for handler_owner in tuple(active_inline_tool_handlers):
+                while active_inline_tool_handlers or callback_scope.tasks:
+                    for handler_owner in tuple(active_inline_tool_handlers | callback_scope.tasks):
                         outcome = await await_owned_task(handler_owner)
                         # Physical settlement, not deferred callback ordering,
                         # retires this original member of the closed cohort.
                         active_inline_tool_handlers.discard(handler_owner)
+                        callback_scope.tasks.discard(handler_owner)
                         if outcome.error is not None:
                             inline_terminal_errors.append(outcome.error)
                         if outcome.cancellation is not None:

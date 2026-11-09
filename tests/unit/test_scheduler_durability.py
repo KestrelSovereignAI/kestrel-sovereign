@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from kestrel_sovereign import server
 from kestrel_sovereign.features.scheduler import feature as scheduler_feature_module
 from kestrel_sovereign.features.scheduler import runner as scheduler_runner_module
+from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import next_run
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import (
@@ -1315,81 +1316,76 @@ async def test_overdue_builtin_one_shot_waits_for_agent_ready_before_dispatch(
 ):
     """Polling cannot consume a one-shot while its built-in owner is loading."""
 
-    db = await _database(tmp_path / "post-load-one-shot.db")
-    agent_id = "did:scheduler:post-load-one-shot"
-    agent = SimpleNamespace(
-        did=agent_id,
-        agent_id=agent_id,
-        features={},
-        storage=SimpleNamespace(db=db),
-    )
-    scheduler = SchedulerFeature(agent)
-    executed = asyncio.Event()
+    from tests.unit.test_privacy_mode_durability import _booted_agent
 
-    class RestartOwner:
-        enabled = True
-        name = "RestartCoordinatorFeature"
+    async with _booted_agent(tmp_path) as agent:
+        db = agent._raw_storage.db
+        scheduler = SchedulerFeature(agent)
+        executed = asyncio.Event()
 
-        def __init__(self):
-            async def execute(**_kwargs):
+        class RestartOwner(Feature):
+            @property
+            def tool_description(self):
+                return "Owned restart dispatch probe"
+
+            async def initialize(self):
+                pass
+
+            @tool(name="restart_coordinator", description="Record the admitted restart")
+            async def restart_coordinator(self) -> dict:
                 executed.set()
                 return {"success": True}
 
-            self.tool = SimpleNamespace(
-                name="restart_coordinator",
-                execute=execute,
+        try:
+            await scheduler.initialize()
+            assert scheduler._runner is not None
+            assert scheduler._runner._task is None
+            deadline = (
+                datetime.now(timezone.utc) - timedelta(seconds=2)
+            ).isoformat()
+            added = await scheduler.schedule_add_deadline(
+                run_at=deadline,
+                task_name="restart_coordinator",
+                idempotency_key="post-load-one-shot",
             )
+            assert added.status.value == "ok"
 
-        def get_tools(self):
-            return [self.tool]
+            # Even an overdue row remains untouched throughout post-load wiring.
+            await asyncio.sleep(0.05)
+            assert await db.fetchone(
+                "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+                (added.data["task_id"],),
+            ) == (0,)
 
-    try:
-        await scheduler.initialize()
-        assert scheduler._runner is not None
-        assert scheduler._runner._task is None
-        deadline = (
-            datetime.now(timezone.utc) - timedelta(seconds=2)
-        ).isoformat()
-        added = await scheduler.schedule_add_deadline(
-            run_at=deadline,
-            task_name="restart_coordinator",
-            idempotency_key="post-load-one-shot",
-        )
-        assert added.status.value == "ok"
-
-        # Even an overdue row remains untouched throughout post-load wiring.
-        await asyncio.sleep(0.05)
-        assert await db.fetchone(
-            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
-            (added.data["task_id"],),
-        ) == (0,)
-
-        agent.features["RestartCoordinatorFeature"] = RestartOwner()
-        await scheduler.on_agent_ready(agent)
-        await asyncio.wait_for(executed.wait(), timeout=1)
-        terminal_row = None
-        for _ in range(100):
-            terminal_row = await db.fetchone(
+            agent.features["RestartCoordinatorFeature"] = RestartOwner(agent)
+            from kestrel_sovereign.features.security.permissions import PermissionLevel
+            await agent.features["SecurityFeature"].permission_store.set_permission(
+                "RestartOwner", "restart_coordinator", PermissionLevel.ALLOW,
+            )
+            await scheduler.on_agent_ready(agent)
+            await asyncio.wait_for(executed.wait(), timeout=1)
+            terminal_row = None
+            for _ in range(100):
+                terminal_row = await db.fetchone(
+                    """
+                    SELECT enabled, terminal_status
+                    FROM scheduled_tasks WHERE id = ?
+                    """,
+                    (added.data["task_id"],),
+                )
+                if terminal_row == (0, "success"):
+                    break
+                await asyncio.sleep(0.01)
+            assert terminal_row == (0, "success")
+            assert await db.fetchone(
                 """
-                SELECT enabled, terminal_status
-                FROM scheduled_tasks WHERE id = ?
+                SELECT status FROM task_execution_log
+                WHERE task_id = ?
                 """,
                 (added.data["task_id"],),
-            )
-            if terminal_row == (0, "success"):
-                break
-            await asyncio.sleep(0.01)
-        assert terminal_row == (0, "success")
-        assert await db.fetchone(
-            """
-            SELECT status FROM task_execution_log
-            WHERE task_id = ?
-            """,
-            (added.data["task_id"],),
-        ) == ("success",)
-    finally:
-        await scheduler.shutdown()
-        await db.close()
+            ) == ("success",)
+        finally:
+            await scheduler.shutdown()
 
 
 @pytest.mark.asyncio

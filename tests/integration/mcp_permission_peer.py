@@ -13,6 +13,44 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 
+class DropFirstToolReply:
+    """Lose one real native reply after the external witness was written."""
+
+    def __init__(self, app, witness: Path):
+        self.app, self.witness, self.dropped = app, witness, False
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or scope['method'] != 'POST' or scope['path'] != '/mcp':
+            return await self.app(scope, receive, send)
+        messages = []
+        while True:
+            message = await receive()
+            assert message['type'] == 'http.request'
+            messages.append(message)
+            if not message.get('more_body', False):
+                break
+        payload = json.loads(b''.join(message.get('body', b'') for message in messages))
+        index = 0
+
+        async def replay_receive():
+            nonlocal index
+            if index < len(messages):
+                message = messages[index]
+                index += 1
+                return message
+            return await receive()
+
+        async def lose_reply(message):
+            if (payload.get('method') == 'tools/call' and not self.dropped
+                    and message['type'] == 'http.response.body'):
+                assert self.witness.exists() and self.witness.read_text().splitlines()
+                self.dropped = True
+                raise ConnectionResetError('Owned MCP reply lost after its real external effect')
+            await send(message)
+
+        await self.app(scope, replay_receive, lose_reply)
+
+
 def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: str | None = None):
     """Serve finite native provider responses beside the owned MCP witness."""
     calls = 0
@@ -118,6 +156,7 @@ def main():
     parser.add_argument("--ready")
     parser.add_argument("--provider-model")
     parser.add_argument("--provider-fault", choices=["wrong_choice"])
+    parser.add_argument("--drop-first-tool-reply", action="store_true")
     args = parser.parse_args()
     tls = any((args.tls_cert, args.tls_key, args.witness, args.ready))
     if tls and not all((args.tls_cert, args.tls_key, args.witness, args.ready)):
@@ -135,6 +174,8 @@ def main():
                                     host="remote-permission.example")
     if args.provider_model:
         add_owned_provider_routes(app, args.provider_model, witness.with_suffix(".provider.jsonl"), fault=args.provider_fault)
+    if args.drop_first_tool_reply:
+        app = DropFirstToolReply(app, witness)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         ready = Path(args.ready)

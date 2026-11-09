@@ -121,6 +121,7 @@ class _Call(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     name: str = Field(min_length=1, max_length=256)
     arguments: dict
+    operation_id: str = Field(min_length=1, max_length=256)
 
 
 class _Empty(BaseModel):
@@ -132,6 +133,12 @@ def _native(value):
 
 
 def _error(error, prepared):
+    from kestrel_sovereign.api_errors import api_error_response, tool_effect_api_error
+
+    failure = tool_effect_api_error(error)
+    if failure is not None and not prepared:
+        return api_error_response(status_code=failure.status_code, code=failure.code,
+            message=failure.message, details=failure.details)
     if prepared or isinstance(error, (ResourceOutcomeUnknown, TimeoutError)):
         status, code = 503, "mcp_app_outcome_unknown_do_not_replay"
     elif isinstance(error, (HostCapabilityAccessDenied, CSRFError)):
@@ -367,7 +374,8 @@ class MCPAppsHost:
             host = original_host()
             async def build(_context, value):
                 physical = host._physical(view_id)
-                result = await host._publications.executor.invoke(physical.view, value.name, value.arguments)
+                result = await host._publications.executor.invoke(physical.view, value.name,
+                    value.arguments, operation_id=value.operation_id)
                 return JSONResponse(_native(result))
             return respond(host, request, _Action.CALL, build, _Call)
 

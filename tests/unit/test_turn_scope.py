@@ -111,47 +111,11 @@ def _observe(host: _Host) -> dict:
     }
 
 
-class _ReaderHarness:
-    """The codex reader-task topology (see #2081's regression test).
+from tests.utils.codex_inline import OwnedCallbackReader
 
-    The reader is spawned ONCE, before the turn publishes anything, so every
-    call it dispatches runs on a task carrying a frozen pre-turn context.
-    """
 
-    def __init__(self):
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._reader = None
-        self.baseline: dict = {}
-
-    async def start(self):
-        self._reader = asyncio.create_task(self._read_loop())
-        # Yield so the reader is actually running before the turn publishes.
-        await asyncio.sleep(0)
-
-    async def _read_loop(self):
-        self.baseline = dict(contextvars.copy_context().items())
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                return
-            executor, name, args, done = item
-            asyncio.create_task(self._handle(executor, name, args, done))
-
-    @staticmethod
-    async def _handle(executor, name, args, done):
-        try:
-            done.set_result(await executor(name, args))
-        except Exception as exc:  # noqa: BLE001 - re-raised via the future
-            done.set_exception(exc)
-
-    async def dispatch(self, executor, name="tool", args=None):
-        done = asyncio.get_running_loop().create_future()
-        await self._queue.put((executor, name, args or {}, done))
-        return await done
-
-    async def stop(self):
-        await self._queue.put(None)
-        await self._reader
+class _ReaderHarness(OwnedCallbackReader):
+    """Transparent replies with the same physical reader as native tool tests."""
 
 
 def _chain() -> list:
@@ -353,10 +317,16 @@ async def test_every_var_the_turn_publishes_is_declared_and_carried():
     finally:
         await harness.stop()
 
+    from kestrel_sovereign._async_ownership import _OWNED_COORDINATORS
+
+    # Physical wait ownership comes from actual task admission. It is not
+    # application turn metadata and must not become a transport carrier.
+    assert _OWNED_COORDINATORS not in turn_scoped_variables()
     published = {
         var: value
         for var, value in turn["published"].items()
-        if harness.baseline.get(var, _MISSING) is not value
+        if var is not _OWNED_COORDINATORS
+        and harness.baseline.get(var, _MISSING) is not value
     }
     assert published, "precondition: the turn published turn-scoped state"
 
@@ -502,45 +472,50 @@ class _Subagent(Feature):
 
 
 @pytest.mark.asyncio
-async def test_nested_feature_executor_carries_turn_scope_across_second_reader():
-    """Parent inline tool builds a subagent executor on the parent reader task;
-    the subagent's own tool runs on a SECOND pre-turn reader task."""
-    host = _Host()
-    host.hooks_manager = None
+async def test_nested_feature_executor_carries_turn_scope_across_second_reader(native_tool_effect_agent):
+    """A native parent and leaf run on two separately owned pre-turn readers."""
+    from kestrel_sdk.tools import ToolSchema, ToolCategory
+    from tests.utils.native_tool_effects import drive_native
+
+    host = await native_tool_effect_agent(did='did:test:nested-turn-scope')
+    host.seen = {}
     feature = _Subagent(host)
-    parent_reader = _ReaderHarness()
-    nested_reader = _ReaderHarness()
+    host.features[feature.name] = feature
+    parent_reader, nested_reader = _ReaderHarness(), _ReaderHarness()
     await parent_reader.start()
     await nested_reader.start()
 
-    async def nested_tool(**_kwargs):
-        host.seen = _observe(host)
-        return {"ok": True}
+    class Probe:
+        name = 'probe'
+        schema = ToolSchema(name, 'Read actual turn metadata', ToolCategory.UTILITY, parameters=[])
 
-    probe = MagicMock()
-    probe.name = "probe"
-    probe.execute = nested_tool
+        async def execute(self, **arguments):
+            host.seen = _observe(host)
+            return {'ok': True}
 
-    async def parent_tool(_name, _args):
-        # Built HERE, on the parent reader task, inside the parent's bind.
-        sub_executor = feature._make_feature_inline_tool_executor(
-            parts_sink=None, runtime_tools=[probe]
-        )
-        return await nested_reader.dispatch(sub_executor, "probe", {})
+    class Parent:
+        name = 'parent_probe'
+        schema = ToolSchema(name, 'Delegate to an owned reader', ToolCategory.UTILITY, parameters=[])
 
-    host.tool_impl = parent_tool
+        async def execute(self, **arguments):
+            executor = feature._make_feature_inline_tool_executor(parts_sink=None, runtime_tools=[Probe()])
+            return await nested_reader.dispatch(executor, 'probe', {})
+
+    mounted = []
+    host.register_dynamic_tools('owned-turn-parent', [Parent()],
+        on_registered=lambda tool, binding: mounted.append(binding))
+    binding, = mounted
     try:
-        turn = await _run_turn(
-            host,
-            parent_reader,
-            lambda: host._make_inline_tool_executor("chat-owner"),
-        )
+        turn = await drive_native(host, lambda: _run_turn(host, parent_reader,
+            lambda: host._make_inline_tool_executor('chat-owner'), name=binding.name))
     finally:
         await parent_reader.stop()
         await nested_reader.stop()
 
-    assert host.seen, "nested tool did not run"
+    assert host.seen, 'nested tool did not run'
     _assert_owning_turn_observed(host.seen, turn)
+    assert await host.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('RETURNED_OK',)]
 
 
 @pytest.mark.asyncio

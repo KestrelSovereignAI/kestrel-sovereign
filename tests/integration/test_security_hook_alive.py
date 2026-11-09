@@ -18,7 +18,7 @@ Tied to issue #879 follow-up.  See
 grant API and the production background.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import asyncio
 

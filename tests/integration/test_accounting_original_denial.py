@@ -179,8 +179,14 @@ async def test_aborted_accounting_preserves_original_unscoped_native_denial(
             operation.cancel()
             await asyncio.gather(operation, return_exceptions=True)
         if door == "stream":
+            repeated_failure = None
             try:
                 await stream.aclose()
             except BaseException as error:
-                if not is_execution_control_error(error):
-                    raise
+                repeated_failure = error
+            assert repeated_failure is failure, (
+                "Repeated stream close changed the original accounting outcome"
+            )
+            assert stream.retirement_task.done()
+            assert stream._iterator.producer_task.done()
+            assert recorded == [True], "Repeated close reran original accounting"

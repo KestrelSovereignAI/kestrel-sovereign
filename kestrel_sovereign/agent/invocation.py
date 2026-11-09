@@ -26,6 +26,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
     execution_terminal_error, is_execution_control_error, execution_commit_outcome,
+    is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
@@ -91,6 +92,8 @@ class InvocationProvenance:
     source_kind: str
     source_locator: str
     received_at: str
+    input_digest: str | None = None
+    operation_key: str | None = None
 
 
 _current_invocation_provenance: ContextVar[InvocationProvenance | None] = ContextVar(
@@ -103,6 +106,10 @@ _T = TypeVar("_T")
 
 class InvocationCancelledError(Exception):
     """An isolated turn ended without cancelling its long-lived caller."""
+
+
+class InvocationIdentityConflictError(ValueError):
+    """Present retry identifiers disagree about the intended operation."""
 
 
 class InvocationSelfFencedError(Exception):
@@ -148,7 +155,9 @@ def register_request_delivery(
     return registrar(request_id)
 
 
-async def admit_request_operation(agent, request_id, operation, *, name, context=None):
+async def admit_request_operation(
+    agent, request_id, operation, *, name, context=None, privacy_work_factory=None,
+):
     """Accept and bind one child, or physically retire it before returning.
 
     Registration belongs to the caller. Even canonical callback refusal must
@@ -159,14 +168,25 @@ async def admit_request_operation(agent, request_id, operation, *, name, context
     from .request_lifecycle import bind_request_operation_if_supported
     admission = OwnedTaskAdmission()
     try:
-        task = create_owned_task(operation, name=name, context=context,
-                                 retain_originals=True, admission=admission)
+        if privacy_work_factory is None:
+            task = create_owned_task(operation, name=name, context=context,
+                                     retain_originals=True, admission=admission)
+        else:
+            # Transfer only this explicitly admitted child through the held
+            # native privacy frame. Copying a token cannot transfer a foreign
+            # reentry mutex that the parent must retain until this child ends.
+            # The factory accepts a lazy body, so a refused native start has
+            # no unstarted request coroutine left outside its own inventory.
+            task = privacy_work_factory(operation, context=context)
+            admission.task = task
+            task.set_name(name)
         bind_request_operation_if_supported(agent, request_id, task)
         return task
     except BaseException as opening:
         if admission.task is not None:
             cancellation_token = object()
-            induced = not admission.task.done() and not admission.task.cancelling()
+            induced = (not admission.dispatch_refused and not admission.task.done()
+                       and not admission.task.cancelling())
             if induced:
                 admission.task.cancel(cancellation_token)
             outcome = await await_owned_task(admission.task)
@@ -221,7 +241,7 @@ def invocation_id_from_request_header(value: object) -> str:
     transport.  ``X-Request-ID`` therefore always uses RFC 3986 percent
     encoding: a client retries with the response value verbatim, and the
     server decodes it exactly once.  Body ``request_id`` / ``invocation_id`` /
-    ``id`` values remain literal Unicode and retain their existing precedence.
+    ``id`` values remain literal Unicode.
 
     This is deliberately not a best-effort decoder.  A literal percent in a
     header value must be sent as ``%25``; otherwise a value such as ``%E2`` is
@@ -286,23 +306,24 @@ def resolve_transport_invocation_id(
     body: Mapping[str, object] | object | None,
     header_request_id: object = None,
 ) -> str:
-    """Resolve one client retry identity from the shared HTTP contract.
+    """Require every present body alias and decoded header to name one intent.
 
-    Explicit body fields win over the header for backwards compatibility with
-    ``/api/agent``.  ``id`` is accepted for OpenAI-compatible clients, while
-    ``invocation_id`` lets non-Kestrel gateways name the same opaque operation
-    without overloading a provider's response identifier.
+    ``id`` remains the OpenAI-compatible alias. Body values are literal Unicode;
+    the header is decoded once before comparing identities.
     """
+    identities = []
     for field in ("request_id", "invocation_id", "id"):
         if isinstance(body, Mapping):
             value = body.get(field)
         else:
             value = getattr(body, field, None) if body is not None else None
         if value is not None:
-            return ensure_invocation_id(value)
-    if header_request_id is None:
-        return ensure_invocation_id()
-    return invocation_id_from_request_header(header_request_id)
+            identities.append(validate_invocation_id(value))
+    if header_request_id is not None:
+        identities.append(invocation_id_from_request_header(header_request_id))
+    if len(set(identities)) > 1:
+        raise InvocationIdentityConflictError("Request identity aliases identify different operations")
+    return identities[0] if identities else new_invocation_id()
 
 
 def request_provenance(
@@ -311,6 +332,8 @@ def request_provenance(
     source_kind: str,
     source_locator: str,
     received_at: str | None = None,
+    input_digest: str | None = None,
+    operation_key: str | None = None,
 ) -> InvocationProvenance:
     """Create bounded, endpoint-owned provenance for the current request.
 
@@ -331,6 +354,8 @@ def request_provenance(
         source_kind=source_kind,
         source_locator=source_locator,
         received_at=received_at,
+        input_digest=input_digest,
+        operation_key=operation_key,
     )
 
 
@@ -486,8 +511,8 @@ def bind_async_invocation(
 
                 async def preserve_failed_effects(error: BaseException) -> None:
                     nonlocal cleanup_abandoned
-                    if is_execution_control_error(error):
-                        # Authority/commit control can arrive during owned
+                    if is_tool_execution_terminal_error(error):
+                        # Terminal uncertainty can arrive during owned
                         # cleanup, before a tool marks completion. Retain the
                         # exact lifecycle identity without acknowledging Stop.
                         cleanup_abandoned = True
@@ -545,6 +570,16 @@ def bind_async_invocation(
                             )
                         parent_context = copy_context()
                         operation_context = parent_context.copy()
+                        from kestrel_sovereign.storage.privacy_wrapper import (
+                            capture_transition_lock_reentry,
+                        )
+
+                        privacy_work_factory = None
+                        if capture_transition_lock_reentry(lifecycle_owner) is not None:
+                            privacy_work_factory = (
+                                lifecycle_owner._get_privacy_transition_lock()
+                                .capture_native_work_factory(acquire_span=False)
+                            )
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
                         lock_manager = getattr(dispatcher, "lock_manager", None)
                         if lock_manager is None:
@@ -612,18 +647,23 @@ def bind_async_invocation(
                         try:
                             isolated_operation = await admit_request_operation(
                                 lifecycle_owner, invocation_id,
-                                run_isolated_operation(),
+                                (run_isolated_operation if privacy_work_factory is not None
+                                 else run_isolated_operation()),
                                 name=(
                                     "invocation-turn:"
                                     f"{invocation_log_correlation(invocation_id)}"
                                 ),
                                 context=operation_context,
+                                privacy_work_factory=privacy_work_factory,
                             )
                         except BaseException:
                             cleanup_abandoned = True
                             raise
                         try:
-                            result = await isolated_operation
+                            from kestrel_sovereign._async_ownership import owned_native_completion, owned_native_wait
+                            with owned_native_completion(isolated_operation):
+                                async with owned_native_wait((isolated_operation,)):
+                                    result = await isolated_operation
                             require_execution_work(lifecycle_owner)
                             # ``Task.cancel()`` is a no-op once the isolated
                             # child has produced a result.  Stop can linearize
@@ -663,7 +703,7 @@ def bind_async_invocation(
                             # Cancellation is a carrier, not rollback proof.
                             # Preserve native irreversible/control evidence
                             # before checkpointing or classifying typed Stop.
-                            if is_execution_control_error(error):
+                            if is_tool_execution_terminal_error(error):
                                 raise
                             # An adapter/tool batch may have returned normally
                             # before cancellation lands at a later await in the
@@ -676,7 +716,7 @@ def bind_async_invocation(
                                 and caller_task.cancelling()
                                 > caller_cancellation_baseline
                             ):
-                                raise
+                                raise error
                             is_self_fenced = getattr(
                                 type(lifecycle_owner),
                                 "is_request_self_fenced",
@@ -909,7 +949,7 @@ def bind_async_generator_invocation(
                 finally:
                     active_error = sys.exception()
                     source_close_error = None
-                    if active_error is not None and is_execution_control_error(active_error):
+                    if active_error is not None and is_tool_execution_terminal_error(active_error):
                         cleanup_abandoned = True
                     try:
                         with _exact_invocation_scope(
@@ -923,7 +963,7 @@ def bind_async_generator_invocation(
                                     await close_iterator()
                             except BaseException as close_error:
                                 source_close_error = close_error
-                                if is_execution_control_error(close_error):
+                                if is_tool_execution_terminal_error(close_error):
                                     cleanup_abandoned = True
                                 raise execution_terminal_error(active_error, source_close_error)
                             finally:

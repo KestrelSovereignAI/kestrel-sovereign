@@ -14,10 +14,10 @@ import pytest
 
 from kestrel_sovereign import execution_custody
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-from kestrel_sovereign.agent.streaming import _DeferredToolBatchCancellation
+from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 from kestrel_sovereign.execution_custody import _explicit_control_chain
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.utils.native_tool_effects import drive_native
 
 
 @pytest.mark.asyncio
@@ -26,7 +26,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
     "kind", ["native-control", "native-cancel", "ordinary", "healthy"]
 )
 async def test_parallel_tool_admission_joins_original_children_and_closes_refusal(
-    native_pg, monkeypatch, stage, kind
+    native_pg, monkeypatch, stage, kind, native_tool_effect_agent
 ):
     backend, observer, schema = native_pg
     await backend.execute("CREATE TABLE batch_effects (id INTEGER PRIMARY KEY)")
@@ -83,22 +83,20 @@ async def test_parallel_tool_admission_joins_original_children_and_closes_refusa
             accepted.append(task)
         return task
 
-    class AgentInput(OrchestratorEngineMixin):
-        _direct_tools = {
-            str(i): SimpleNamespace(schema=SimpleNamespace(is_concurrency_safe=True))
-            for i in range(3)
-        }
-        _tool_to_feature = {}
-        features = {}
+    agent = await native_tool_effect_agent(did="did:test:parallel-original-pg", connected_backend=backend)
+    agent._direct_tools = {
+        str(i): SimpleNamespace(schema=SimpleNamespace(is_concurrency_safe=True))
+        for i in range(3)
+    }
 
-        async def _dispatch_tool_call(self, call, *args, **kwargs):
-            bodies.append(asyncio.current_task())
-            await backend.execute(
-                "INSERT INTO batch_effects VALUES (?)", (int(call.name),)
-            )
-            await release.wait()
+    async def dispatch(call, *args, **kwargs):
+        bodies.append(asyncio.current_task())
+        await backend.execute(
+            "INSERT INTO batch_effects VALUES (?)", (int(call.name),)
+        )
+        await release.wait()
+    agent._dispatch_tool_call = dispatch
 
-    agent = AgentInput()
     calls = [SimpleNamespace(name=str(i), id=str(i), arguments={}) for i in range(3)]
     monkeypatch.setattr(asyncio, "create_task", create)
     outcome_error = None
@@ -109,7 +107,7 @@ async def test_parallel_tool_admission_joins_original_children_and_closes_refusa
             else agent._execute_tool_batch
         )
         try:
-            await operation(calls, {}, set(), [], 0, "native provider-free component")
+            await drive_native(agent, lambda: operation(calls, {}, set(), [], 0, "native provider-free component"))
         except BaseException as error:
             outcome_error = error
         if kind == "healthy":
@@ -155,7 +153,7 @@ async def test_parallel_tool_admission_joins_original_children_and_closes_refusa
 @pytest.mark.parametrize("stage", ["children", "batch", "deferred"])
 @pytest.mark.parametrize("kind", ["native-control", "native-cancel"])
 async def test_parallel_join_keeps_actual_outer_withdrawal_and_source(
-    native_pg, monkeypatch, stage, kind
+    native_pg, monkeypatch, stage, kind, native_tool_effect_agent
 ):
     backend, observer, schema = native_pg
     await backend.execute("CREATE TABLE joined_batch_effect (id INTEGER PRIMARY KEY)")
@@ -167,54 +165,53 @@ async def test_parallel_join_keeps_actual_outer_withdrawal_and_source(
     actual_terminal = execution_custody.execution_terminal_error
 
     def terminal(*errors, **kwargs):
-        if asyncio.current_task() is caller:
-            for error in errors:
-                if isinstance(error, asyncio.CancelledError) and error.args == (
-                    "actual batch observer withdrawal",
-                ):
-                    if error not in withdrawals:
-                        withdrawals.append(error)
+        # The native invocation owns its isolated Task. Capture the actual
+        # uniquely marked observer carrier wherever that owner composes it.
+        for error in errors:
+            if isinstance(error, asyncio.CancelledError) and error.args == (
+                "actual batch observer withdrawal",
+            ):
+                if error not in withdrawals:
+                    withdrawals.append(error)
         return actual_terminal(*errors, **kwargs)
 
-    class AgentInput(OrchestratorEngineMixin):
-        _direct_tools = {
-            str(i): SimpleNamespace(schema=SimpleNamespace(is_concurrency_safe=True))
-            for i in range(2)
-        }
-        _tool_to_feature = {}
-        features = {}
+    agent = await native_tool_effect_agent(did="did:test:parallel-original-pg", connected_backend=backend)
+    agent._direct_tools = {
+        str(i): SimpleNamespace(schema=SimpleNamespace(is_concurrency_safe=True))
+        for i in range(2)
+    }
 
-        async def _dispatch_tool_call(self, call, *args, **kwargs):
-            await backend.execute(
-                "INSERT INTO joined_batch_effect VALUES (?)", (int(call.name),)
-            )
-            bodies.append(asyncio.current_task())
-            if len(bodies) == 2:
-                ready.set()
-            try:
-                await release.wait()
-            finally:
-                if call.name == "1":
-                    try:
-                        lease.require_live()
-                    except BaseException as original:
-                        originals.append(original)
-                        original_chains.append(tuple(_explicit_control_chain(original)))
-                        if kind == "native-cancel":
-                            cancellation = asyncio.CancelledError(
-                                "actual native tool observation cancelled"
-                            )
-                            cancellation.__cause__ = original
-                            originals.append(cancellation)
-                            original_chains.append(
-                                tuple(_explicit_control_chain(cancellation))
-                            )
-                            raise cancellation
-                        raise
+    async def dispatch(call, *args, **kwargs):
+        await backend.execute(
+            "INSERT INTO joined_batch_effect VALUES (?)", (int(call.name),)
+        )
+        bodies.append(asyncio.current_task())
+        if len(bodies) == 2:
+            ready.set()
+        try:
+            await release.wait()
+        finally:
+            if call.name == "1":
+                try:
+                    lease.require_live()
+                except BaseException as original:
+                    originals.append(original)
+                    original_chains.append(tuple(_explicit_control_chain(original)))
+                    if kind == "native-cancel":
+                        cancellation = asyncio.CancelledError(
+                            "actual native tool observation cancelled"
+                        )
+                        cancellation.__cause__ = original
+                        originals.append(cancellation)
+                        original_chains.append(
+                            tuple(_explicit_control_chain(cancellation))
+                        )
+                        raise cancellation
+                    raise
+    agent._dispatch_tool_call = dispatch
 
     from kestrel_sovereign import _async_ownership
 
-    agent = AgentInput()
     operation = (
         agent._execute_tool_batch_at_stop_boundary
         if stage != "children"
@@ -222,6 +219,9 @@ async def test_parallel_join_keeps_actual_outer_withdrawal_and_source(
     )
     calls = [SimpleNamespace(name=str(i), id=str(i), arguments={}) for i in range(2)]
     monkeypatch.setattr(execution_custody, "execution_terminal_error", terminal)
+    from kestrel_sovereign.agent import invocation as invocation_module
+
+    monkeypatch.setattr(invocation_module, "execution_terminal_error", terminal)
 
     async def execute():
         # Actual production carrier from the joined batch, not a fabricated
@@ -229,10 +229,10 @@ async def test_parallel_join_keeps_actual_outer_withdrawal_and_source(
         kwargs = (
             {"defer_cancellation_to_persistence": True} if stage == "deferred" else {}
         )
-        result = await operation(
+        result = await drive_native(agent, lambda: operation(
             calls, {}, set(), [], 0, "local native callback", **kwargs
-        )
-        if isinstance(result, _DeferredToolBatchCancellation):
+        ))
+        if isinstance(result, OwnedTaskHandoff):
             result.raise_outcome()
         return result
 

@@ -187,12 +187,13 @@ def _explicit_control_chain(error: BaseException | None) -> Iterator[BaseExcepti
             continue
         seen.add(id(current))
         yield current
-        if current.__cause__ is not None:
-            pending.append(current.__cause__)
-        if isinstance(current, BaseExceptionGroup):
+        cause = BaseException.__cause__.__get__(current, type(current))
+        if cause is not None:
+            pending.append(cause)
+        if issubclass(type(current), BaseExceptionGroup):
             # Lifecycle owners explicitly group child cancellation and close
             # failures. Group members are evidence, unlike incidental context.
-            pending.extend(current.exceptions)
+            pending.extend(BaseExceptionGroup.exceptions.__get__(current, type(current)))
 
 
 def execution_evidence_carriers(error: BaseException | None) -> tuple[BaseException, ...]:
@@ -234,7 +235,7 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
             return "unknown"
         if unresolved == "committed":
             outcome = "committed"
-        if isinstance(current, ExecutionCommitOutcomeError):
+        if issubclass(type(current), ExecutionCommitOutcomeError):
             if current.commit_outcome == "unknown":
                 return "unknown"
             outcome = current.commit_outcome
@@ -244,7 +245,7 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
 
 
 def _is_execution_control_node(error: BaseException) -> bool:
-    return (isinstance(error, ExecutionAuthorityError)
+    return (issubclass(type(error), ExecutionAuthorityError)
             or bool(_acknowledged_commits(error))
             or bool(vars(error).get("_kestrel_native_retirement_debts")))
 
@@ -271,15 +272,19 @@ def is_execution_control_error(
 
 
 def is_tool_execution_terminal_error(error: BaseException | None) -> bool:
-    """Tool delivery must propagate control and mandatory audit uncertainty.
+    """Tool delivery propagates control and every reconciliation-required failure.
 
     An audit error alone is not authority loss or retirement debt. Keep this
     local delivery rule separate from the SDK-registered control predicate.
     """
-    return is_execution_control_error(error) or any(
-        isinstance(current, ToolAuditUnconfirmedError)
-        for current in _explicit_control_chain(error)
-    )
+    if is_execution_control_error(error):
+        return True
+    if error is None:
+        return False
+    from kestrel_sovereign.tools.effect_failures import tool_effect_failure
+
+    failure = tool_effect_failure(error)
+    return failure is not None and failure.reconciliation_required
 
 
 def retained_execution_error(error: BaseException) -> BaseException:
@@ -336,9 +341,9 @@ def execution_denial_scopes(error: BaseException | None) -> tuple | None:
             if not all(receipt.retired for receipt in receipts):
                 return None
             settled_commit = True
-        if isinstance(carrier, ExecutionCommitOutcomeError):
+        if issubclass(type(carrier), ExecutionCommitOutcomeError):
             return None
-        if isinstance(carrier, ExecutionAuthorityError) or vars(carrier).get("_kestrel_denied_execution_scopes"):
+        if issubclass(type(carrier), ExecutionAuthorityError) or vars(carrier).get("_kestrel_denied_execution_scopes"):
             if vars(carrier).get("_kestrel_unscoped_execution_denial"):
                 return None
             denied = vars(carrier).get("_kestrel_denied_execution_scopes")
@@ -377,14 +382,28 @@ def _canonical_native_source_originals(error: BaseException | None) -> tuple[Bas
     return None
 
 
-def _native_source_originals(error: BaseException | None) -> tuple[BaseException, ...]:
+def _native_source_originals(error: BaseException | None, *,
+                            include_tool_terminal: bool = False) -> tuple[BaseException, ...]:
     """Flatten only canonical finite carriers, never genuine source groups."""
     if error is None:
         return ()
     sources = _canonical_native_source_originals(error)
     if sources is not None:
+        if include_tool_terminal:
+            # Finite delivery envelopes carry Core source provenance, not an
+            # authority grant. Core sources are authoritative in `sources`;
+            # do not recover a finite Core refusal from its explicit leaves.
+            # Recover only additional non-Core terminal delivery originals,
+            # without retaining the envelope's unrelated observer withdrawal.
+            originals = [*sources, *(member for member in _explicit_control_chain(error)
+                if is_tool_execution_terminal_error(member)
+                and not is_execution_control_error(member)
+                and _canonical_native_source_originals(member) is None)]
+            return tuple(_enclosing_original_errors(originals))
         return sources
-    return (error,) if is_execution_control_error(error) else ()
+    terminal = (is_tool_execution_terminal_error if include_tool_terminal
+                else is_execution_control_error)
+    return (error,) if terminal(error) else ()
 
 
 def execution_observer_cancellations(error: BaseException | None) -> tuple[asyncio.CancelledError, ...]:
@@ -400,7 +419,7 @@ def execution_observer_cancellations(error: BaseException | None) -> tuple[async
         return ()
     source_ids = {id(member) for source in sources for member in _explicit_control_chain(source)}
     return tuple(member for member in _explicit_control_chain(error)
-                 if isinstance(member, asyncio.CancelledError) and id(member) not in source_ids)
+                 if issubclass(type(member), asyncio.CancelledError) and id(member) not in source_ids)
 
 
 def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> BaseException:
@@ -414,7 +433,7 @@ def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> 
     wrapper.__cause__ = error
     sources = _canonical_native_source_originals(error)
     if sources is not None:
-        if isinstance(wrapper, ExecutionCommitOutcomeError):
+        if issubclass(type(wrapper), ExecutionCommitOutcomeError):
             classified_source = ExecutionCommitOutcomeError(wrapper.commit_outcome)
             classified_source.__cause__ = execution_native_source_error(error)
             sources = (classified_source,)
@@ -422,7 +441,8 @@ def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> 
     return wrapper
 
 
-def execution_native_source_error(*errors: BaseException | None) -> BaseException | None:
+def execution_native_source_error(*errors: BaseException | None,
+                                  include_tool_terminal: bool = False) -> BaseException | None:
     """Project canonical native SOURCES, never a finite observer's withdrawal.
 
     Only our freshly allocated composition carries this provenance. An
@@ -431,10 +451,13 @@ def execution_native_source_error(*errors: BaseException | None) -> BaseExceptio
     not authorize rewriting its explicit graph. Flatten canonical compositions
     before merging a shared latch, so repeated projections of the SAME sources
     cannot accumulate wrappers or previous observers.
+
+    Durable delivery may explicitly include SDK/audit terminal sources. That
+    local replay rule does not grant those errors Core control or authority.
     """
     sources = []
     for error in errors:
-        for source in _native_source_originals(error):
+        for source in _native_source_originals(error, include_tool_terminal=include_tool_terminal):
             if all(source is not prior for prior in sources):
                 sources.append(source)
     return execution_terminal_error(*sources, retain_originals=True,
@@ -442,13 +465,16 @@ def execution_native_source_error(*errors: BaseException | None) -> BaseExceptio
 
 
 def execution_observation_error(*errors: BaseException | None,
-                                message: str = "original completion observation evidence") -> BaseException | None:
+                                message: str = "original completion observation evidence",
+                                prefer_cancellation: bool = False) -> BaseException | None:
     """Compose a Core-owned join without making observers genuine sources.
 
     A fresh group preserves even ordinary physical errors without decorating
     their graphs. Only the originals' authenticated native-source projections
     cross a later shared boundary. Genuine unmarked source groups remain whole;
     this does not authorize flattening a foreign group containing cancellation.
+    A caller retaining ordinary cancellation can request a fresh cancellation
+    envelope; its original exception graph still remains untouched.
     """
     present = []
     sources = []
@@ -475,6 +501,19 @@ def execution_observation_error(*errors: BaseException | None,
                                         isolate_control_originals=True)
     terminal = BaseExceptionGroup(message, present)
     terminal._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, tuple(sources))
+    if prefer_cancellation:
+        withdrawal = next((error for error in present
+            if issubclass(type(error), asyncio.CancelledError)), None)
+        if withdrawal is not None:
+            return execution_error_with_cause(asyncio.CancelledError(*withdrawal.args), terminal)
+    unknown = next((error for error in present
+        if isinstance(error, ResourceOutcomeUnknown)), None)
+    if unknown is not None:
+        # Preserve the public SDK outcome contract and its first diagnostic,
+        # without decorating either original provider/persistence exception.
+        envelope = (ToolAuditUnconfirmedError if isinstance(unknown, ToolAuditUnconfirmedError)
+                    else ResourceOutcomeUnknown)
+        return execution_error_with_cause(envelope(*unknown.args), terminal)
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
 
 
@@ -487,7 +526,7 @@ def execution_finite_error(*errors: BaseException | None, retain_originals: bool
     independent failures in its original graph. Ordinary no-control callers
     retain their existing selection and caused-cancellation policy.
     """
-    native = any(is_execution_control_error(error) for error in errors)
+    native = any(is_tool_execution_terminal_error(error) for error in errors)
     return execution_terminal_error(
         *errors, retain_originals=retain_originals or native,
         prefer_cancellation=prefer_cancellation,
@@ -516,7 +555,14 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
     present = tuple(error for error in errors if error is not None)
     if isolate_control_originals:
         retain_originals = True
-        if any(is_execution_control_error(error) for error in present):
+        # Delivery uncertainty also belongs to its original source. Isolation
+        # protects that graph without granting it Core control or authority.
+        if any(is_tool_execution_terminal_error(error) for error in present):
+            if not any(is_execution_control_error(error) for error in present):
+                # Use the one finite observation composer for SDK/audit-only
+                # delivery. Its public typed envelope preserves the first
+                # diagnostic without decorating either original source.
+                return execution_observation_error(*present, prefer_cancellation=prefer_cancellation)
             unique = []
             for error in present:
                 if all(error is not prior for prior in unique):
@@ -572,7 +618,7 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
         for error in present:
             for carrier in _explicit_control_chain(error):
                 commits.extend(receipt for receipt in _acknowledged_commits(carrier) if receipt not in commits)
-                unresolved = (carrier.commit_outcome if isinstance(carrier, ExecutionCommitOutcomeError)
+                unresolved = (carrier.commit_outcome if issubclass(type(carrier), ExecutionCommitOutcomeError)
                     else vars(carrier).get("_kestrel_unresolved_commit_outcome"))
                 if unresolved in {"committed", "unknown"}:
                     if unresolved_commit is None or unresolved == "unknown":
@@ -587,7 +633,7 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
                 state = vars(carrier)
                 denied = state.get("_kestrel_denied_execution_scopes", ())
                 unscoped_denial |= bool(state.get("_kestrel_unscoped_execution_denial"))
-                if isinstance(carrier, ExecutionAuthorityError) and not denied:
+                if issubclass(type(carrier), ExecutionAuthorityError) and not denied:
                     unscoped_denial = True
                 denied_scopes.extend(scope for scope in denied if scope not in denied_scopes)
         if debts:
@@ -623,21 +669,21 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
     for error in present:
         # OwnedAsyncIterator carries source cleanup debt as the explicit cause
         # of cancellation. A failed checkpoint is not a successful Stop.
-        if isinstance(error, asyncio.CancelledError) and error.__cause__ is not None:
+        if issubclass(type(error), asyncio.CancelledError) and error.__cause__ is not None:
             return retain(error.__cause__)
     if prefer_cancellation:
         for error in present:
-            if isinstance(error, asyncio.CancelledError):
+            if issubclass(type(error), asyncio.CancelledError):
                 return retain(error)
-    if present and isinstance(present[0], GeneratorExit):
+    if present and issubclass(type(present[0]), GeneratorExit):
         # GeneratorExit is the source's ordinary close request, not caller
         # cancellation. A later cancellation while joining that close must
         # still reach the closer after cleanup settles. Control evidence was
         # already selected above, so it cannot be demoted by this rule.
-        return retain(next((error for error in present[1:] if not isinstance(error, GeneratorExit)), present[0]))
-    if present and isinstance(present[0], (asyncio.CancelledError, GeneratorExit)):
+        return retain(next((error for error in present[1:] if not issubclass(type(error), GeneratorExit)), present[0]))
+    if present and issubclass(type(present[0]), (asyncio.CancelledError, GeneratorExit)):
         for error in present[1:]:
-            if not isinstance(error, (asyncio.CancelledError, GeneratorExit)):
+            if not issubclass(type(error), (asyncio.CancelledError, GeneratorExit)):
                 return retain(error)
     return retain(present[0]) if present else None
 
@@ -862,10 +908,14 @@ def _execution_cleanup_requested() -> bool:
     )
 
 
-def current_execution_custody(owner: Any = None) -> tuple[ExecutionCustody, ...]:
-    """Capture immutable scope membership, retaining shared revocation state."""
+def current_execution_custody(
+    owner: Any = None, *, captured: tuple[ExecutionCustody, ...] | None = None,
+) -> tuple[ExecutionCustody, ...]:
+    """Read original scopes and shared, cumulative stream restrictions."""
 
-    ambient = _CURRENT_CUSTODY.get()
+    ambient = _CURRENT_CUSTODY.get() if captured is None else captured
+    for state in _STREAM_CLEANUP.get():
+        ambient += tuple(scope for scope in state.scopes if scope not in ambient)
     retained = getattr(owner, "_execution_custody", None)
     if isinstance(retained, ExecutionCustody) and retained not in ambient:
         return (retained, *ambient)
@@ -883,6 +933,20 @@ def require_execution_work(owner: Any = None) -> None:
             terminal = execution_terminal_error(terminal, denial)
     if terminal is not None:
         raise terminal
+
+
+def capture_execution_work_check(owner: Any = None) -> Callable[[], None]:
+    """Retain only a work check through the original native worker handoff.
+
+    Its copied context retains the SAME mutable stream restriction records.
+    Calling it performs no SQL and cannot admit work or replace an owner.
+    A fresh context copy permits concurrent read-only checks of that evidence.
+    """
+    from contextvars import copy_context
+    captured = copy_context()
+    def check():
+        captured.copy().run(require_execution_work, owner)
+    return check
 
 
 def refuse_unfenced_executor(owner: Any = None) -> None:
@@ -905,7 +969,7 @@ def require_execution_backend(
             _identity_anchor_access.require_live()
         except BaseException as denial:
             terminal = execution_terminal_error(terminal, denial)
-    captured = current_execution_custody() if scopes is None else scopes
+    captured = current_execution_custody(captured=scopes)
     for scope in captured:
         try:
             scope.require_work()
@@ -931,16 +995,25 @@ async def lock_execution_authority(
     connection: Any, backend_type: str,
     scopes: tuple[ExecutionCustody, ...] | None = None,
 ) -> None:
-    captured = current_execution_custody() if scopes is None else scopes
-    require_execution_backend(backend_type, captured)
-    for scope in captured:
-        try:
-            await scope.fence.lock_and_validate(connection)
-        except ExecutionAuthorityError as error:
-            scope._retain_denial(error)
-            raise
-        # Cancellation-resistant validators must not republish a lost scope.
+    captured = current_execution_custody(captured=scopes)
+    validated = set()
+    while True:
         require_execution_backend(backend_type, captured)
+        for scope in captured:
+            if scope in validated:
+                continue
+            try:
+                await scope.fence.lock_and_validate(connection)
+            except ExecutionAuthorityError as error:
+                scope._retain_denial(error)
+                raise
+            validated.add(scope)
+            # Cancellation-resistant validators must not republish a lost scope.
+            require_execution_backend(backend_type, captured)
+        latest = current_execution_custody(captured=captured)
+        if latest == captured:
+            return
+        captured = latest
 
 
 @contextmanager
@@ -1400,7 +1473,7 @@ async def close_native_execution_stream(
             )
     if outcome.error is not None or outcome.cancellation is not None:
         if (outcome.error is None and outcome.cancellation is not None
-            and (original is None or isinstance(original, GeneratorExit))
+            and (original is None or issubclass(type(original), GeneratorExit))
             and not is_execution_control_error(original)):
             # Plain GeneratorExit is the iterator's close protocol, not an
             # independent failure. Attaching it beneath actual withdrawal
@@ -1471,7 +1544,7 @@ class NativeExecutionStreamOwner:
                     # canonical original control; an ordinary SDK status error
                     # must not mask this later observer cancellation.
                     self.handles[:] = [retained for retained in self.handles if retained is not handle]
-                    if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(terminal):
+                    if issubclass(type(error), asyncio.CancelledError) and not is_execution_control_error(terminal):
                         terminal = error
                     else:
                         terminal = execution_terminal_error(
@@ -1641,7 +1714,7 @@ async def await_execution_work_group(
             return await await_execution_work(owner, operation)
         except BaseException as error:
             if (
-                isinstance(error, Exception)
+                issubclass(type(error), Exception)
                 and return_exceptions
                 and not is_execution_control_error(error)
                 and not execution_cleanup_debts(error)
@@ -1751,11 +1824,17 @@ class ExecutionStreamLifecycle:
     The factory receives the lazy body and its original context. Registration
     finishes before any body step, including under an eager task factory.
     Nested forwarders inherit this same lifetime only inside source work.
+    ``owner_started`` registers the physical producer. ``resource_started``
+    additionally receives its forwarder and retained retirement task when a
+    feature must retain the entire resource through cleanup settlement.
     """
 
     owner_factory: Callable
-    owner_started: Callable
+    owner_started: Callable[[Any, asyncio.Task], None] | None
     require_work: Callable
+    descendant_lifecycle: Callable[[], "ExecutionStreamLifecycle"] | None = None
+    cleanup_factory: Callable | None = None
+    resource_started: Callable[[Any, asyncio.Task, Any], None] | None = None
 
 
 _STREAM_LIFECYCLE: ContextVar[tuple[asyncio.Task, ExecutionStreamLifecycle] | None] = ContextVar("execution_stream_lifecycle", default=None)
@@ -1791,6 +1870,11 @@ class _ExecutionForwarder:
         # A deferred HTTP response may never be consumed at all.
         self._owner_context = context
         self._iterator = None
+        self._consumer_started = asyncio.Event()
+        self._producer_started = False
+        self._source_closed = False
+        self._close_operation = None
+        self._close_requested = asyncio.Event()
         inherited = _STREAM_LIFECYCLE.get()
         self._lifecycle = lifecycle if lifecycle is not None else (
             inherited[1] if inherited is not None and inherited[0] is asyncio.current_task() else None
@@ -1799,10 +1883,92 @@ class _ExecutionForwarder:
     def __aiter__(self):
         return self
 
-    async def __anext__(self):
+    def _retain_consumer_restrictions(self):
         additional = current_execution_custody(self._runtime_owner)
         self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
         self._cleanup_state.scopes = self._scopes
+
+    async def _ensure_iterator(self):
+        if self._iterator is None:
+            from kestrel_sovereign._async_ownership import create_owned_iterator
+            from kestrel_sovereign.llm.call_progress import inherit_call_progress
+
+            inherit_call_progress(self._owner_context)
+            self._reserve_close_owner()
+            if self._close_operation.admission_error is not None:
+                raise self._close_operation.admission_error
+            def started(iterator, task):
+                self._iterator = iterator
+                task.add_done_callback(lambda _: self._close_requested.set())
+                if self._lifecycle is not None and self._lifecycle.owner_started is not None:
+                    self._lifecycle.owner_started(iterator, task)
+                if self._lifecycle is not None and self._lifecycle.resource_started is not None:
+                    self._lifecycle.resource_started(iterator, task, self)
+            with self._turn_scope.bind():
+                self._iterator = await create_owned_iterator(
+                    self._produce, operation="execution-stream-forward",
+                    owner_context=self._owner_context,
+                    owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
+                    owner_started=started,
+                )
+
+    def _reserve_close_owner(self):
+        if self._close_operation is None:
+            from kestrel_sovereign._async_ownership import OwnedOperation
+            factory = None if self._lifecycle is None else self._lifecycle.cleanup_factory
+            self._close_operation = OwnedOperation(
+                self._close_when_requested() if factory is None else self._close_when_requested,
+                retirement_resource=self, retain_originals=True,
+                context=self._owner_context.copy(), owner_factory=factory)
+
+    async def _close_when_requested(self):
+        await self._close_requested.wait()
+        with bind_execution_cleanup(self._runtime_owner, self._scopes):
+            await self._close()
+
+    @property
+    def retirement_task(self):
+        return None if self._close_operation is None else self._close_operation.task
+
+    @property
+    def terminal_error(self):
+        from kestrel_sovereign._async_ownership import owned_task_error
+        task = self.retirement_task
+        return execution_observation_error(
+            None if self._iterator is None else self._iterator.terminal_error,
+            owned_task_error(task) if task is not None and task.done() else None)
+
+    @property
+    def cleanup_error(self):
+        original = None if self._iterator is None else self._iterator.cleanup_error
+        return original or (None if self._source_closed else self.terminal_error)
+
+    async def _retire_failed_step(self, error):
+        try:
+            await self.aclose()
+        except BaseException as cleanup_error:
+            raise execution_observation_error(error, cleanup_error)
+        if not is_execution_control_error(error):
+            with _bind_captured_custody(self._scopes):
+                require_execution_work(self._runtime_owner)
+        raise error
+
+    async def reserve(self):
+        """Own the original worker now; leave payload dispatch to the first pull."""
+        if self._source_closed or self._source_exhausted or self._cleanup_state.requested:
+            raise ExecutionAuthorityError("closed execution stream cannot reserve native work")
+        self._retain_consumer_restrictions()
+        try:
+            with _bind_captured_custody(self._scopes):
+                if self._lifecycle is not None:
+                    self._lifecycle.require_work()
+                await self._ensure_iterator()
+        except BaseException as error:
+            await self._retire_failed_step(error)
+        return self
+
+    async def __anext__(self):
+        self._retain_consumer_restrictions()
         try:
             with _bind_captured_custody(self._scopes), bind_native_execution_admission_snapshot(self._native_admission):
                 if self._lifecycle is not None:
@@ -1811,19 +1977,8 @@ class _ExecutionForwarder:
                 # reentry only for validation, never across consumer delivery.
                 with self._turn_scope.bind():
                     await require_native_execution_admission(self._runtime_owner)
-                if self._iterator is None:
-                    from kestrel_sovereign._async_ownership import create_owned_iterator
-                    from kestrel_sovereign.llm.call_progress import (
-                        inherit_call_progress,
-                    )
-                    inherit_call_progress(self._owner_context)
-                    with self._turn_scope.bind():
-                        self._iterator = await create_owned_iterator(
-                            self._produce, operation="execution-stream-forward",
-                            owner_context=self._owner_context,
-                            owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
-                            owner_started=None if self._lifecycle is None else self._lifecycle.owner_started,
-                        )
+                await self._ensure_iterator()
+                self._consumer_started.set()
                 item = await anext(self._iterator)
                 require_execution_work(self._runtime_owner)
                 if self._lifecycle is not None:
@@ -1831,24 +1986,24 @@ class _ExecutionForwarder:
                 with self._turn_scope.bind():
                     await require_native_execution_admission(self._runtime_owner)
         except BaseException as error:
-            # Admission can fail while ENTERING the original binding, before
-            # the next native pull. The suspended producer still has to retire.
-            try:
-                await self.aclose()
-            except BaseException as cleanup_error:
-                raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
-            if not is_execution_control_error(error):
-                with _bind_captured_custody(self._scopes):
-                    require_execution_work(self._runtime_owner)
-            raise error
+            # Admission can fail before the original source is advanced.
+            await self._retire_failed_step(error)
         return item
 
     async def _produce(self):
+        self._producer_started = True
         error = None
-        lifetime_token = _STREAM_LIFECYCLE.set(
-            None if self._lifecycle is None else (asyncio.current_task(), self._lifecycle)
-        )
+        lifetime_token = None
         try:
+            await self._consumer_started.wait()
+            inherited = self._lifecycle
+            if inherited is not None and inherited.descendant_lifecycle is not None:
+                inherited.require_work()
+                inherited = inherited.descendant_lifecycle()
+                if not isinstance(inherited, ExecutionStreamLifecycle):
+                    raise TypeError("native descendant stream lifecycle is unavailable")
+            lifetime_token = _STREAM_LIFECYCLE.set(
+                None if inherited is None else (asyncio.current_task(), inherited))
             with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
                 while True:
                     with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner), bind_native_execution_admission_snapshot(self._native_admission):
@@ -1871,7 +2026,8 @@ class _ExecutionForwarder:
             self._cleanup_state.requested = True
             raise
         finally:
-            _STREAM_LIFECYCLE.reset(lifetime_token)
+            if lifetime_token is not None:
+                _STREAM_LIFECYCLE.reset(lifetime_token)
             # Carrier admission itself can fail before source advancement.
             # Already-acquired handles still need physical cleanup in that case.
             close = getattr(self._source, "aclose", None)
@@ -1883,6 +2039,7 @@ class _ExecutionForwarder:
                         self._source_exhausted = False
                         self._cleanup_state.requested = True
                         raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+            self._source_closed = True
 
     async def aclose(self):
         # Normal EOF completes this source, not a queued child's independent
@@ -1890,11 +2047,52 @@ class _ExecutionForwarder:
         # synchronously before the source owner is cancelled.
         if not self._source_exhausted:
             self._cleanup_state.requested = True
-        await close_execution_stream(
-            self._runtime_owner,
-            self._source if self._iterator is None else self._iterator,
-            self._scopes,
-        )
+        with bind_execution_cleanup(self._runtime_owner, self._scopes):
+            self._reserve_close_owner()
+            self._close_requested.set()
+            outcome = await self._close_operation.observe()
+            error = execution_observation_error(outcome.error, outcome.cancellation)
+            if error is not None:
+                raise error
+
+    async def _close(self):
+        error = None
+        try:
+            if self._iterator is None:
+                await self._close_unstarted_source()
+            else:
+                await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
+        except BaseException as caught:
+            error = caught
+        if (self._iterator is not None and (error is None or self._iterator._closed
+                or self._iterator.producer_task.done())):
+            # Terminal delivery can precede the actual native producer's
+            # epilogue. A successful/no-op iterator close is no substitute for
+            # joining that producer AND its watcher. Failed, unstarted closer
+            # admission instead retains its explicit debt without a new close.
+            try:
+                outcome = await self._iterator.join_source_owners(
+                    closing=True, body_close_acknowledged=self._source_closed)
+            except BaseException as observation_error:
+                error = execution_observation_error(error, observation_error)
+            else:
+                error = execution_observation_error(error, outcome.error, outcome.cancellation)
+        # A reserved owner can fail before entering _produce. Its completed
+        # Task then cannot run the source-closing finally. Never close a source
+        # concurrently with a live producer, or retry its failed physical close.
+        if (self._iterator is not None and not self._producer_started
+                and self._iterator.producer_task.done()):
+            try:
+                await self._close_unstarted_source()
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+        if error is not None:
+            raise error
+
+    async def _close_unstarted_source(self):
+        if not self._source_closed:
+            await close_execution_stream(self._runtime_owner, self._source, self._scopes)
+            self._source_closed = True
 
 
 async def close_execution_stream(
@@ -1907,7 +2105,7 @@ async def close_execution_stream(
     if callable(close):
         with bind_execution_cleanup(owner, captured):
             outcome = await await_owned_operation(close(), retirement_resource=stream, retain_originals=True)
-            error = execution_terminal_error(outcome.error, outcome.cancellation, retain_originals=True, isolate_control_originals=True)
+            error = execution_observation_error(outcome.error, outcome.cancellation)
             if error is not None:
                 raise error
 
@@ -1926,7 +2124,7 @@ async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
         try:
             await iterator.aclose()
         except BaseException as cleanup_error:
-            raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+            raise execution_observation_error(error, cleanup_error)
 
 
 def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = (), lifecycle: ExecutionStreamLifecycle | None = None) -> AsyncIterator[Any]:
@@ -1936,6 +2134,16 @@ def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody
     ClosingStreamingResponse). Construction does not dispatch source work.
     """
     return _ExecutionForwarder(owner, stream, captured_custody, lifecycle=lifecycle)
+
+
+async def reserve_execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = (), lifecycle: ExecutionStreamLifecycle | None = None) -> AsyncIterator[Any]:
+    """Reserve the canonical source owner before the original admission retires.
+
+    No source payload runs until an admitted consumer pull. Later consumers
+    retain cumulative custody in this SAME owner. Callers must close the handle
+    even if no pull happens; failed native construction closes its source.
+    """
+    return await _ExecutionForwarder(owner, stream, captured_custody, lifecycle=lifecycle).reserve()
 
 
 turn_scoped(

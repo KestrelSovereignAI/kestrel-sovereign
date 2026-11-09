@@ -7,7 +7,7 @@ the user saw and what the LLM observed. The actual narration verdict
 is tested in ``test_narration_check.py``; this test guards the
 plumbing between the marker boundary, orchestrator, and hook.
 """
-from contextlib import asynccontextmanager
+from tests.utils.native_streaming import streaming_agent
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,9 +15,6 @@ import pytest
 from kestrel_sdk.llm import ToolCallStarted
 
 
-@asynccontextmanager
-async def _passthrough():
-    yield
 
 
 class _CapturingHooks:
@@ -53,70 +50,18 @@ class _CapturingHooks:
         return None
 
 
-def _build_mock_agent():
-    from kestrel_sovereign.agent.streaming import StreamingMixin
 
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock()
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
-    agent.features = {}
-    agent.did = "did:test"
-    agent.extension = None
-    agent._cached_features_prompt = ""
-    agent.is_request_cancelled = MagicMock(return_value=False)
-    agent._maybe_audit = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent.hooks_manager = None
-    agent._get_governing_constitution = AsyncMock(return_value="")
-    agent.check_solvency = AsyncMock(return_value="test-model")
-    agent._build_all_tools = MagicMock(return_value=[])
-    agent.user_prompt_template = MagicMock()
-    agent.user_prompt_template.format.return_value = "rendered"
-
-    ctx = MagicMock()
-    ctx.system_prompt = "system"
-    ctx.dynamic_user_context = ""
-    ctx.messages = []
-    agent.context_manager = MagicMock()
-    agent.context_manager.build_context = AsyncMock(return_value=ctx)
-
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-
-    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(agent)
-    agent._process_input_streaming_traced_locked = (
-        StreamingMixin._process_input_streaming_traced_locked.__get__(agent)
-    )
-    agent._persist_assistant_turn_safely = (
-        StreamingMixin._persist_assistant_turn_safely.__get__(agent)
-    )
-    agent._fire_post_response_hook = (
-        StreamingMixin._fire_post_response_hook.__get__(agent)
-    )
-    agent._emit_revising_event = (
-        StreamingMixin._emit_revising_event.__get__(agent)
-    )
-    return agent
 
 
 @pytest.mark.asyncio
-async def test_post_response_hook_receives_narration_fields_when_tools_fire():
+async def test_post_response_hook_receives_narration_fields_when_tools_fire(native_tool_effect_agent):
     """Streaming path with marker + tool execution: the POST_RESPONSE
     hook input must carry pre_tool_prose (snapshot at marker
     boundary), tool_calls (LLM-issued shape), and tool_results
     (envelopes from the orchestrator)."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = _build_mock_agent()
+    agent = await streaming_agent(native_tool_effect_agent)
 
     hooks = _CapturingHooks()
     agent.hooks_manager = hooks
@@ -133,7 +78,6 @@ async def test_post_response_hook_receives_narration_fields_when_tools_fire():
             tool_calls=[ToolCall(id="tc-1", name="save_fact", arguments={"fact": "color=teal"})],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
     agent.emit_event = AsyncMock()
 
@@ -181,17 +125,16 @@ async def test_post_response_hook_receives_narration_fields_when_tools_fire():
 
 
 @pytest.mark.asyncio
-async def test_post_response_hook_no_tools_omits_narration_fields():
+async def test_post_response_hook_no_tools_omits_narration_fields(native_tool_effect_agent):
     """When no tool calls fire, the new fields stay None — the
     narration check should treat them as 'nothing to verify'."""
-    agent = _build_mock_agent()
+    agent = await streaming_agent(native_tool_effect_agent)
     hooks = _CapturingHooks()
     agent.hooks_manager = hooks
 
     async def stream():
         yield "Hello! No tools needed."
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     async for _ in agent.process_input_streaming("hi", session_id="s2"):
@@ -205,14 +148,14 @@ async def test_post_response_hook_no_tools_omits_narration_fields():
 
 
 @pytest.mark.asyncio
-async def test_marker_never_fires_falls_back_to_pre_tool_buffer():
+async def test_marker_never_fires_falls_back_to_pre_tool_buffer(native_tool_effect_agent):
     """Defensive: some adapter/path may yield tool_calls without
     emitting a ToolCallStarted marker (e.g. legacy plugin not yet on
     SDK 0.7). The pre_tool_prose passed to the hook must still be
     populated — falls back to the buffered text-before-LLMResponse."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = _build_mock_agent()
+    agent = await streaming_agent(native_tool_effect_agent)
     agent.emit_event = AsyncMock()
     hooks = _CapturingHooks()
     agent.hooks_manager = hooks
@@ -225,7 +168,6 @@ async def test_marker_never_fires_falls_back_to_pre_tool_buffer():
             tool_calls=[ToolCall(id="tc-1", name="save", arguments={})],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     async def post_tool(*, tool_results=None, **kw):

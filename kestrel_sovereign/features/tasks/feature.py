@@ -248,6 +248,7 @@ class TaskFeature(Feature):
             failed (so the LLM cannot claim "all steps ran" while a step
             errored), ERROR if input was malformed or no steps ran.
         """
+        host = self.agent
         if not self.task_manager:
             return ToolResult.failed("Task manager not available")
 
@@ -419,20 +420,18 @@ class TaskFeature(Feature):
                         break
 
                 except Exception as e:
+                    if task is not None or observed_outcome_unknown(e):
+                        # A returned Task proves the handler completed. A
+                        # failed result reader is completion uncertainty, not
+                        # a transport failure that permits another execution.
+                        from kestrel_sovereign.tools.effect_journal import record_tool_effect_completion_failure
+
+                        e = record_tool_effect_completion_failure(host, e)
                     if is_execution_control_error(e):
-                        raise
+                        raise e
                     # The error itself, a cause or an exception-group member
                     # may say the step's effect may already have happened.
                     unknown = e if observed_outcome_unknown(e) else None
-                    if unknown is None and task is not None and task_outcome_unknown(task):
-                        # The task says its effect may already have happened.
-                        # Failing to read its result does not make it safe to
-                        # run again.
-                        unknown = ResourceOutcomeUnknown(
-                            f"Step {i} outcome is unknown; its result could "
-                            f"not be read: {e}"
-                        )
-                        unknown.__cause__ = e
                     if unknown is not None:
                         report_flattened_outcome_unknown(unknown)
                         last_error = None

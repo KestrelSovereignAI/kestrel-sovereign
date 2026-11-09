@@ -139,7 +139,8 @@ async def docker_peer(tmp_path):
 
 
 @asynccontextmanager
-async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None, provider_fault: str | None = None):
+async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None,
+                     provider_fault: str | None = None, drop_first_tool_reply: bool = False):
     hostname = "remote-permission.example"
     _, client_context, certificate = make_tls_contexts(tmp_path, hostname, ip_addresses=())
     ready, witness = tmp_path / "peer-ready.json", tmp_path / "remote-witness"
@@ -151,6 +152,7 @@ async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None
             "--witness", str(witness), "--ready", str(ready),
             *(["--provider-model", provider_model] if provider_model is not None else []),
             *(["--provider-fault", provider_fault] if provider_fault is not None else []),
+            *(["--drop-first-tool-reply"] if drop_first_tool_reply else []),
             env={"PATH": os.environ["PATH"], "PYTHONUNBUFFERED": "1"},
             stdout=output, stderr=asyncio.subprocess.STDOUT,
         )

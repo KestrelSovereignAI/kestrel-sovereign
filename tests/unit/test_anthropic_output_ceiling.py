@@ -740,46 +740,25 @@ async def test_real_sdk_finished_response_is_untouched():
 
 
 @pytest.mark.asyncio
-async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown():
+async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown(
+    native_tool_effect_agent, monkeypatch,
+):
     """prose → tool_use start → max_tokens cut, driven through the real
     ``StreamingMixin`` turn with the real adapter's output. The client sees
     the prose and the notice with no revise signal for the dropped call,
     and the persisted assistant row is exactly that text."""
-    from contextlib import asynccontextmanager
-
     from kestrel_sovereign.agent.streaming import (
-        StreamingMixin,
         _parse_stream_sentinels,
     )
 
-    @asynccontextmanager
-    async def _passthrough():
-        yield
-
-    persisted: List[Dict[str, Any]] = []
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock(
-        side_effect=lambda role, content, **kw: persisted.append(
-            {"role": role, "content": content, **kw}
-        )
-    )
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
+    agent = await native_tool_effect_agent(did="did:test:anthropic-stream-cut")
+    await agent._raw_storage.initialize()
     agent.features = {}
-    agent.did = "test-did"
     agent.extension = None
     agent._cached_features_prompt = ""
-    agent.is_request_cancelled = MagicMock(return_value=False)
     agent.emit_event = AsyncMock()
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent.hooks_manager = None
     agent.operator_signal_producer = None
     agent._get_governing_constitution = AsyncMock(return_value="")
     agent.check_solvency = AsyncMock(return_value="claude-opus-5")
@@ -794,10 +773,6 @@ async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown():
     context_result.semantic_recall_dependencies = ()
     agent.context_manager = MagicMock()
     agent.context_manager.build_context = AsyncMock(return_value=context_result)
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
     agent._emit_revising_event = AsyncMock()
 
     adapter = AnthropicAdapter()
@@ -810,18 +785,10 @@ async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown():
         ):
             yield item
 
-    agent.llm_service = MagicMock()
-    agent.llm_service.stream_with_tool_detection = stream_with_tool_detection
+    monkeypatch.setattr(agent.llm_service, "stream_with_tool_detection", stream_with_tool_detection)
     agent._handle_orchestrator_response_streaming = MagicMock(
         side_effect=AssertionError("a dropped tool call must not be dispatched"),
     )
-    for name in (
-        "process_input_streaming",
-        "_process_input_streaming_traced_locked",
-        "_persist_assistant_turn_safely",
-    ):
-        setattr(agent, name, getattr(StreamingMixin, name).__get__(agent))
-
     live = [chunk async for chunk in agent.process_input_streaming(
         "answer the design questions", session_id="sess-1",
     )]
@@ -832,9 +799,12 @@ async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown():
     shown = _parse_stream_sentinels(wire)[0]
     assert shown == f"Let me check the repo.\n\n{NOTICE}"
 
+    persisted = await agent.privacy_agent.get_conversation_history(session_id="sess-1")
     rows = [row for row in persisted if row["role"] == "assistant"]
     assert len(rows) == 1
     assert rows[0]["content"] == shown
+    assert await agent._raw_storage.db.fetchval("SELECT COUNT(*) FROM tool_effect_claims") == 0
+    assert await agent._raw_storage.db.fetchval("SELECT state FROM tool_effect_operations") == "CLOSED"
 
 
 @pytest.mark.asyncio

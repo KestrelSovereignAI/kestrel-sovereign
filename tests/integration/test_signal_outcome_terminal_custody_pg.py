@@ -20,6 +20,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_rejected_completion_callback_physically_joins_original_writer,
     test_handler_cannot_terminalize_through_scheduler_after_cutoff,
     test_visible_journal_does_not_admit_ui_work_after_cutoff,
+    test_visible_journal_keeps_independent_tool_source_without_finite_core_denial,
     test_accepted_payload_is_not_replaced_after_cutoff,
     test_owner_withdrawal_retains_actual_original_journal_commit,
     test_terminal_snapshot_matches_canonical_handler_envelope,
@@ -1100,7 +1101,8 @@ async def test_postgres_reconnect_never_invokes_application_password_provider(di
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     original_pool = c.backend._pool
-    credential = unquote(urlsplit(original_pool._connect_args[0]).password)
+    encoded_password = urlsplit(original_pool._connect_args[0]).password
+    credential = unquote(encoded_password) if encoded_password is not None else None
     armed, calls, effects = [], [], []
     def password():
         if armed:
@@ -1994,8 +1996,9 @@ async def dispatcher_components(native_pg):
         try:
             await dispatcher.shutdown_durable_delivery()
         except BaseException as error:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-            assert is_execution_control_error(error)
+            from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+            # The declared writer-uncertainty cases also retain SDK/audit sources.
+            assert is_tool_execution_terminal_error(error)
 
 
 async def test_original_journal_keeps_acknowledged_commit_after_reset_identity_loss(

@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
+import httpx
 
 from kestrel_sovereign.agent.privacy_state import SavedModelPreference
 from kestrel_sovereign.command_handler import CommandHandler
@@ -12,7 +13,6 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
-    PrivacyEnforcingStorage,
 )
 
 
@@ -110,63 +110,34 @@ class _FakeLLMService:
         return {"ollama:local"}
 
 
-class _FakeStorage:
-    def __init__(self):
-        self.modes = []
-
-    def set_privacy_mode(self, mode):
-        self.modes.append(mode)
 
 
-def _make_agent_with_privacy_transition(llm_service):
-    agent = KestrelAgent.__new__(KestrelAgent)
-    agent._privacy_mode = PrivacyMode.NORMAL
-    agent.storage = _FakeStorage()
+async def _make_agent_with_privacy_transition(llm_service, native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:privacy-model-restore")
     agent.llm_service = llm_service
-    agent.features = {}
-    agent.privacy_agent = MagicMock()
-    agent.privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed from normal to isolated.")
-    from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
-    agent.privacy_agent.evaluate_transition = MagicMock(
-        side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False)
-    )
     return agent
 
 
-def _make_lease_guarded_agent(initial_mode=PrivacyMode.NORMAL):
-    """Build a real wrapper/agent pair without starting the full runtime."""
-    from kestrel_sovereign.features.privacy.feature import (
-        PrivacyTransitionDecision,
-    )
-
-    wrapper = PrivacyEnforcingStorage(MagicMock(), initial_mode)
-    agent = KestrelAgent.__new__(KestrelAgent)
+async def _make_lease_guarded_agent(native_tool_effect_agent, initial_mode=PrivacyMode.NORMAL):
+    """Initialized native storage and real policy, without READY publication."""
+    agent = await native_tool_effect_agent(did="did:test:privacy-fact-lease")
     agent._privacy_mode = initial_mode
-    agent.storage = wrapper
-    agent.features = {}
+    agent.storage.set_privacy_mode(initial_mode)
+    agent.privacy_agent.set_mode(initial_mode)
     agent.llm_service = None
-    agent.privacy_agent = MagicMock()
-    agent.privacy_agent.evaluate_transition = MagicMock(
-        side_effect=lambda mode: PrivacyTransitionDecision(
-            target=mode,
-            requires_confirmation=False,
-        )
-    )
-    agent.privacy_agent.set_mode = MagicMock(
-        side_effect=lambda mode: f"Privacy mode changed to {mode.value}."
-    )
-    return agent, wrapper
+    return agent, agent.storage
 
 
-def test_privacy_mode_endpoint_returns_retryable_conflict_during_fact_lease():
+@pytest.mark.asyncio
+async def test_privacy_mode_endpoint_returns_retryable_conflict_during_fact_lease(native_tool_effect_agent):
     """POST never turns a linearization refusal into a 500 or false success."""
-    agent, wrapper = _make_lease_guarded_agent()
+    agent, wrapper = await _make_lease_guarded_agent(native_tool_effect_agent)
     app, original = _prepare_app(agent)
     wrapper._acquire_explicit_fact_lease()
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                refused = client.post(
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://owned-privacy.invalid") as client:
+                refused = await client.post(
                     "/api/agent/privacy-mode",
                     headers={
                         "X-API-Key": "test-key",
@@ -187,7 +158,7 @@ def test_privacy_mode_endpoint_returns_retryable_conflict_during_fact_lease():
                 assert wrapper.privacy_mode is PrivacyMode.NORMAL
 
                 wrapper._release_explicit_fact_lease()
-                applied = client.post(
+                applied = await client.post(
                     "/api/agent/privacy-mode",
                     headers={
                         "X-API-Key": "test-key",
@@ -205,16 +176,17 @@ def test_privacy_mode_endpoint_returns_retryable_conflict_during_fact_lease():
         _restore_app(app, original)
 
 
-def test_privacy_confirm_endpoint_preserves_pending_target_during_fact_lease():
+@pytest.mark.asyncio
+async def test_privacy_confirm_endpoint_preserves_pending_target_during_fact_lease(native_tool_effect_agent):
     """A 409 confirmation remains retryable after the fact operation exits."""
-    agent, wrapper = _make_lease_guarded_agent(PrivacyMode.PUBLIC)
+    agent, wrapper = await _make_lease_guarded_agent(native_tool_effect_agent, PrivacyMode.PUBLIC)
     agent._pending_privacy_transition = PrivacyMode.EPHEMERAL
     app, original = _prepare_app(agent)
     wrapper._acquire_explicit_fact_lease()
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                refused = client.post(
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://owned-privacy.invalid") as client:
+                refused = await client.post(
                     "/api/agent/privacy-mode/confirm",
                     headers={
                         "X-API-Key": "test-key",
@@ -237,7 +209,7 @@ def test_privacy_confirm_endpoint_preserves_pending_target_during_fact_lease():
                 )
 
                 wrapper._release_explicit_fact_lease()
-                applied = client.post(
+                applied = await client.post(
                     "/api/agent/privacy-mode/confirm",
                     headers={
                         "X-API-Key": "test-key",
@@ -255,13 +227,13 @@ def test_privacy_confirm_endpoint_preserves_pending_target_during_fact_lease():
         _restore_app(app, original)
 
 
-def _post_privacy_modes(agent, *modes):
+async def _post_privacy_modes(agent, *modes):
     app, original = _prepare_app(agent)
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://owned-privacy.invalid") as client:
                 return [
-                    client.post(
+                    await client.post(
                         "/api/agent/privacy-mode",
                         headers={
                             "X-API-Key": "test-key",
@@ -275,14 +247,15 @@ def _post_privacy_modes(agent, *modes):
         _restore_app(app, original)
 
 
-def test_privacy_mode_endpoint_returns_unpinned_agent_to_default_routing():
+@pytest.mark.asyncio
+async def test_privacy_mode_endpoint_returns_unpinned_agent_to_default_routing(native_tool_effect_agent):
     """An agent with no mandate goes back to default routing on leaving a
     local-only mode (#3554): neither the first configured route nor the
     forced local model is invented as the mandate it returns to."""
     llm_service = _FakeLLMService()
-    agent = _make_agent_with_privacy_transition(llm_service)
+    agent = await _make_agent_with_privacy_transition(llm_service, native_tool_effect_agent)
 
-    isolated_response, normal_response = _post_privacy_modes(
+    isolated_response, normal_response = await _post_privacy_modes(
         agent, "isolated", "normal"
     )
 
@@ -324,12 +297,13 @@ def test_privacy_mode_endpoint_reports_deidentified_storage_fail_closed():
         _restore_app(app, original)
 
 
-def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition():
+@pytest.mark.asyncio
+async def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition(native_tool_effect_agent):
     llm_service = _FakeLLMService()
     llm_service._pref = {"vendor": "anthropic", "model": "claude-sonnet-4-5", "route": "api"}
-    agent = _make_agent_with_privacy_transition(llm_service)
+    agent = await _make_agent_with_privacy_transition(llm_service, native_tool_effect_agent)
 
-    _, response = _post_privacy_modes(agent, "isolated", "normal")
+    _, response = await _post_privacy_modes(agent, "isolated", "normal")
 
     assert response.status_code == 200
     assert response.json()["model_switched"] == {
@@ -340,15 +314,14 @@ def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transi
     assert llm_service.calls[-1] == ("claude-sonnet-4-5", "anthropic", "api")
 
 
-def test_agent_level_privacy_transition_switches_to_local_model():
+@pytest.mark.asyncio
+async def test_agent_level_privacy_transition_switches_to_local_model(native_tool_effect_agent):
     llm_service = _FakeLLMService()
-    agent = _make_agent_with_privacy_transition(llm_service)
+    agent = await _make_agent_with_privacy_transition(llm_service, native_tool_effect_agent)
 
-    import asyncio
+    result = await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
 
-    result = asyncio.run(agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED))
-
-    assert result.message == "Privacy mode changed from normal to isolated."
+    assert result.message.startswith("Privacy mode changed from normal to isolated.")
     assert result.model_switched == {
         "vendor": "ollama",
         "route": "local",
@@ -359,13 +332,12 @@ def test_agent_level_privacy_transition_switches_to_local_model():
     assert agent._privacy_saved_preference == SavedModelPreference(None, None, None)
 
 
-def test_agent_level_anonymous_transition_switches_to_local_model():
+@pytest.mark.asyncio
+async def test_agent_level_anonymous_transition_switches_to_local_model(native_tool_effect_agent):
     llm_service = _FakeLLMService()
-    agent = _make_agent_with_privacy_transition(llm_service)
+    agent = await _make_agent_with_privacy_transition(llm_service, native_tool_effect_agent)
 
-    import asyncio
-
-    result = asyncio.run(agent.set_privacy_mode_with_effects(PrivacyMode.ANONYMOUS))
+    result = await agent.set_privacy_mode_with_effects(PrivacyMode.ANONYMOUS)
 
     assert result.allows_cloud_llm is False
     assert result.model_switched == {
@@ -376,14 +348,13 @@ def test_agent_level_anonymous_transition_switches_to_local_model():
     assert llm_service.calls == [("llama3.2:3b", "ollama", "local")]
 
 
-def test_privacy_command_path_uses_agent_level_model_transition():
+@pytest.mark.asyncio
+async def test_privacy_command_path_uses_agent_level_model_transition(native_tool_effect_agent):
     llm_service = _FakeLLMService()
-    agent = _make_agent_with_privacy_transition(llm_service)
+    agent = await _make_agent_with_privacy_transition(llm_service, native_tool_effect_agent)
     handler = CommandHandler(agent)
 
-    import asyncio
+    result = await handler._cmd_privacy("!privacy isolated")
 
-    result = asyncio.run(handler._cmd_privacy("!privacy isolated"))
-
-    assert result == "Privacy mode changed from normal to isolated."
+    assert result.startswith("Privacy mode changed from normal to isolated.")
     assert llm_service.calls == [("llama3.2:3b", "ollama", "local")]

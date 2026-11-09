@@ -1,134 +1,55 @@
 """Active-session privacy transition contracts."""
 
 import asyncio
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
+from kestrel_sovereign.privacy import PrivacyMode
 
 
-class _PrivacyConfig:
-    def __init__(self, allows_cloud: bool = True):
-        self._allows_cloud = allows_cloud
-
-    def allows_cloud_llm(self):
-        return self._allows_cloud
-
-    def is_ephemeral(self):
-        return False
-
-    def uses_temp_storage(self):
-        return False
-
-    def requires_deidentification(self):
-        return False
-
-
-class _PrivacyAgent:
-    def __init__(self):
-        self.privacy_config = _PrivacyConfig(allows_cloud=True)
-        self.privacy_mode = PrivacyMode.NORMAL
-        self.conversations = []
-
-    async def add_conversation(self, role, content, metadata=None, session_id=None,
-                               rendered_content=None):
-        self.conversations.append((role, content, metadata, session_id, rendered_content))
-
-    async def get_conversation_history(self, limit=50, session_id=None):
-        return []
-
-    def evaluate_transition(self, mode):
-        from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
-        # This harness only exercises non-destructive transitions.
-        return PrivacyTransitionDecision(target=mode, requires_confirmation=False)
-
-    def set_mode(self, mode):
-        self.privacy_mode = mode
-        self.privacy_config = _PrivacyConfig(allows_cloud=privacy_mode_to_config(mode).allows_cloud_llm())
-        return f"Privacy mode changed to {mode.value}."
-
-
-class _LLMService:
+class _StreamProbe:
     def __init__(self):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.force_local_only_values = []
-        self.providers = [
-            {"name": "openai", "model": "gpt-5-mini"},
-            {"name": "ollama", "model": "llama3.2:3b"},
-        ]
 
     async def stream_with_tool_detection(self, **kwargs):
+        from kestrel_sovereign.llm.adapter import LLMResponse
+
         self.force_local_only_values.append(kwargs["force_local_only"])
         self.started.set()
         yield "hello"
         await self.release.wait()
         yield " world"
-
-    def _get_local_provider_names(self):
-        return ["ollama"]
-
-    def get_model_preference(self):
-        return {"provider": "openai", "model": "gpt-5-mini"}
-
-    @asynccontextmanager
-    async def mandate_change(self):
-        yield
-
-    def set_model_preference(self, model, vendor=None, route=None):
-        self.model_preference = {"provider": provider, "model": model}
+        yield LLMResponse(content="hello world", tool_calls=[])
 
 
-class _ObservabilityStore:
-    async def log_metric(self, **kwargs):
-        return None
+async def _make_streaming_agent(native_tool_effect_agent):
+    from kestrel_sovereign.agent.context_manager import ContextResult
 
-    async def log_tool_call(self, **kwargs):
-        return "event-1"
-
-    async def log_tool_response(self, **kwargs):
-        return None
-
-
-def _make_streaming_agent():
-    agent = KestrelAgent.__new__(KestrelAgent)
-    agent.did = "did:test:privacy-active-session"
-    agent._privacy_mode = PrivacyMode.NORMAL
-    agent.storage = MagicMock()
-    agent.storage.set_privacy_mode = MagicMock()
-    agent.privacy_agent = _PrivacyAgent()
-    agent.llm_service = _LLMService()
-    agent.features = {}
-    agent.hooks_manager = None
-    agent.context_manager = MagicMock()
-    # ContextResult now carries dynamic_user_context (issue #703) — per-turn
-    # retrieved content that belongs in the user message, not system.
-    agent.context_manager.build_context = AsyncMock(
-        return_value=SimpleNamespace(
-            system_prompt="system",
-            messages=[],
-            dynamic_user_context="",
-        )
-    )
+    agent = await native_tool_effect_agent(did="did:test:privacy-active-session")
+    stream = _StreamProbe()
+    agent.llm_service.stream_with_tool_detection = stream.stream_with_tool_detection
+    agent.storage.set_privacy_mode = MagicMock(wraps=agent.storage.set_privacy_mode)
+    context = ContextResult(system_prompt="system", messages=[], total_tokens=0, budget_summary={})
+    agent.context_manager = SimpleNamespace(build_context=AsyncMock(return_value=context))
     agent.user_prompt_template = "{context}{query}"
     agent._cached_features_prompt = ""
     agent.extension = None
-    agent.observability_store = _ObservabilityStore()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent._maybe_audit = AsyncMock(return_value=None)
     agent._get_governing_constitution = AsyncMock(return_value="constitution")
     agent.check_solvency = AsyncMock(return_value="gpt-5-mini")
     agent._build_all_tools = MagicMock(return_value=[])
-    return agent
+    agent._post_response_pipeline = AsyncMock()
+    return agent, stream
 
 
 @pytest.mark.asyncio
-async def test_privacy_transition_waits_for_active_stream_before_switching_modes():
-    agent = _make_streaming_agent()
+async def test_privacy_transition_waits_for_active_stream_before_switching_modes(native_tool_effect_agent):
+    agent, stream = await _make_streaming_agent(native_tool_effect_agent)
 
     chunks = []
 
@@ -137,7 +58,7 @@ async def test_privacy_transition_waits_for_active_stream_before_switching_modes
             chunks.append(chunk)
 
     stream_task = asyncio.create_task(consume_stream())
-    await agent.llm_service.started.wait()
+    await stream.started.wait()
     await asyncio.sleep(0)
 
     transition_task = asyncio.create_task(
@@ -147,9 +68,9 @@ async def test_privacy_transition_waits_for_active_stream_before_switching_modes
 
     assert transition_task.done() is False
     assert agent._privacy_mode == PrivacyMode.NORMAL
-    assert agent.llm_service.force_local_only_values == [False]
+    assert stream.force_local_only_values == [False]
 
-    agent.llm_service.release.set()
+    stream.release.set()
     await stream_task
     transition = await transition_task
 
@@ -162,10 +83,10 @@ async def test_privacy_transition_waits_for_active_stream_before_switching_modes
 
 
 @pytest.mark.asyncio
-async def test_streaming_omits_briefing_after_session_was_briefed():
-    agent = _make_streaming_agent()
+async def test_streaming_omits_briefing_after_session_was_briefed(native_tool_effect_agent):
+    agent, stream = await _make_streaming_agent(native_tool_effect_agent)
     agent._session_briefed = True
-    agent.llm_service.release.set()
+    stream.release.set()
 
     chunks = [
         chunk

@@ -9,6 +9,7 @@ import pytest
 
 from tests.utils.virtual_clock import (
     AdvanceableClock,
+    AdvanceableClockLoop,
     advanceable_loop_clock,
     await_within_hang_guard,
     pinned_loop_clock,
@@ -176,3 +177,44 @@ async def test_wait_for_thread_event_names_the_step_it_waited_for() -> None:
         await wait_for_thread_event(
             threading.Event(), step="the worker starting", seconds=0.01
         )
+
+
+def test_advanceable_loop_keeps_native_polls_live_after_manual_progress() -> None:
+    loop = AdvanceableClockLoop()
+
+    async def observe() -> None:
+        start = loop.time()
+        loop.advance(400)
+        await await_within_hang_guard(
+            asyncio.sleep(0.001), step="native retirement poll after manual progress",
+        )
+        assert loop.time() >= start + 400
+
+    try:
+        loop.run_until_complete(observe())
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["ordinary", "cancel", "sdk-cancel"])
+async def test_hang_guard_reads_owned_original_completion_after_native_capture(tmp_path, kind):
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    original = RuntimeError("original native completion") if kind == "ordinary" else asyncio.CancelledError("original native cancellation")
+    if kind == "sdk-cancel":
+        original.__cause__ = ResourceOutcomeUnknown("original native effect uncertain")
+    cause = original.__cause__
+    witness = tmp_path / "original-guard-effect"
+    async def operation():
+        witness.write_text("one original native effect")
+        raise original
+    task = create_owned_task(operation(), retain_originals=True)
+    await asyncio.wait({task})
+    try:
+        with pytest.raises(type(original)) as caught:
+            await await_within_hang_guard(task, step="original native completion")
+        assert caught.value is original, "Hang guard consumed the original native completion receipt"
+        assert original.__cause__ is cause and witness.read_text() == "one original native effect"
+    finally:
+        await await_owned_task(task)

@@ -8,7 +8,7 @@ This module provides reusable fixtures for:
 - Common test utilities
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import tempfile
 import shutil
@@ -28,6 +28,12 @@ from typing import Generator
 from tests.shared import host_runtime_isolation as _host_runtime_isolation
 
 _SESSION_ISOLATION_ROOT = _host_runtime_isolation.install_session_guard()
+
+# Native CI disables third-party pytest autoload. Bind the public factory at
+# the repository root so every test tier receives the same real Agent fixture.
+from kestrel_sovereign.testing.fixtures import (
+    native_tool_effect_agent as native_tool_effect_agent,
+)
 
 # Import shared test infrastructure for resource cleanup
 from tests.shared.pytest_cleanup_plugin import (

@@ -15,7 +15,8 @@ A test's probe and calls share its ``live_call_budget``, so their deadlines
 together fit inside the test's timeout.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
+from tests.utils.native_tool_effects import drive_native
 
 import os
 import pytest
@@ -84,7 +85,10 @@ async def kestrel_agent(llm_service, temp_db):
         did="did:test:agent_tools_test",
         storage_path=str(temp_db),
         llm_service=llm_service,
-        privacy_mode=PrivacyMode.NORMAL
+        privacy_mode=PrivacyMode.NORMAL,
+        # Exercise the real model-tool host and mandatory security lifecycle.
+        # Unrelated optional schedulers must not race a skipped live-route test.
+        allowed_features={"ModelAgent"},
     )
 
     # Initialize async storage
@@ -231,6 +235,11 @@ async def test_kestrel_agent_has_task_manager(kestrel_agent):
 @pytest.mark.asyncio
 async def test_kestrel_agent_features_registered(kestrel_agent):
     """The model feature contributes the same native skills as its host catalog."""
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+    assert set(kestrel_agent.features) == MANDATORY_FEATURES | {"ModelAgent"}, (
+        "Tool-routing fixture started unrelated optional feature lifecycles"
+    )
     providers = kestrel_agent.task_manager.get_provider_skills()
     feature = kestrel_agent.features["ModelAgent"]
     assert "ModelAgent" in providers
@@ -385,7 +394,7 @@ async def test_e2e_feature_as_a2a_agent(kestrel_agent, usable_model_list, live_c
     task.metadata.update({"skill": "list_models", "args": {}})
 
     result_task = await bounded_live_call(
-        model_feature.handle_task(task),
+        drive_native(kestrel_agent, lambda: model_feature.handle_task(task)),
         budget=live_call_budget,
         what="ModelAgent handle_task(list_models)",
         waiting_on=describe_discovery_routes(kestrel_agent.llm_service),

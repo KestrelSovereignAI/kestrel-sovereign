@@ -20,7 +20,7 @@ import toml
 
 from kestrel_sdk.computer_use import ActionRequest, Click, TypeText
 from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 from tests.shared.local_docker import LocalDockerUnavailable, local_docker_socket
 
 

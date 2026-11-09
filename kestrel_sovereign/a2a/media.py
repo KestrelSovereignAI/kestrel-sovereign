@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from email import policy
 from typing import Any
 
+from kestrel_sdk._frozen_json import freeze_json, thaw_json
 from kestrel_sdk.native_a2a.types import AgentSkill, Part
 from kestrel_sdk.native_a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 
@@ -23,13 +24,17 @@ def skill_input_modes(
     return tuple(selected.input_modes or defaults)
 
 
-def encode_inline_json(value: Any) -> bytes:
+def encode_inline_json(value: Any, *, sort_keys: bool = False) -> bytes:
     """Retain exact local JSON values in standard inline content.
 
     Escaping makes surrogateescaped filesystem names representable without
     losing bytes, and avoids protobuf Struct's binary64 conversion of ints.
+    Sorted object keys give durable local identities one deterministic encoding
+    over that same value domain. Invalid keys and non-finite values are refused.
     """
-    return json.dumps(value, allow_nan=False, ensure_ascii=True).encode("utf-8")
+    frozen = freeze_json(value, path='Native inline JSON')
+    return json.dumps(thaw_json(frozen.value), allow_nan=False, ensure_ascii=True,
+        sort_keys=sort_keys).encode("utf-8")
 
 
 def _media_type(value: str, *, allow_range: bool) -> tuple[str, str]:

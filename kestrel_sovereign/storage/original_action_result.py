@@ -226,28 +226,11 @@ class _OriginalActionResultCustody(_OriginalResultCustody):
                 or asyncio.current_task() is not self._writer_admission.task):
             raise ExecutionAuthorityError('Original action result native cleanup owner differs')
 
-    def has_acknowledged_commit(self):
-        return self._sqlite_committed_connection is self._backing or any(r.acknowledged for r in self._acknowledgments)
-
     def acknowledged(self, backend):
         self.require_original(backend)
         if not self.has_acknowledged_commit():
             raise ExecutionAuthorityError('Original action result has no native commit evidence')
         self._phase = 'acknowledged'
-
-    def write_refusal(self, reason, cause=None):
-        from kestrel_sovereign.execution_custody import _FINITE_NATIVE_SOURCES, _native_source_originals
-        refusal = ExecutionAuthorityError('Original action result write refused: '+reason)
-        refusal.__cause__ = cause
-        finite = BaseExceptionGroup('original action result write refusal', [refusal])
-        finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, _native_source_originals(cause))
-        return finite
-
-    def retain_committed(self, error):
-        # Shared native ACK/reset classification, without granting signal or
-        # action authority. This method uses only actual native receipt facts.
-        from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome
-        return _OriginalSignalOutcome.retain_committed(self, error)
 
     async def not_dispatched(self, original, fact):
         _closed_action_result(self)

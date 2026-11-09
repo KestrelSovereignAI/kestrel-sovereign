@@ -14,6 +14,11 @@ that no user was watching for in signal-driven cognition turns.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
+from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
+from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sdk.tools.result import ToolResult
+from tests.utils.native_tool_effects import drive_native
+from tests.unit.test_tool_concurrency import FakeToolCall
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 
@@ -32,6 +37,7 @@ class _Feature:
 
 def _bind_helper(agent) -> str:
     """Return the bound helper method for tests to call directly."""
+    agent._feature_for_tool_owner = ToolRegistryMixin._feature_for_tool_owner.__get__(agent)
     return OrchestratorEngineMixin._security_feature_name_for_tool.__get__(agent)
 
 
@@ -81,50 +87,40 @@ class TestSecurityFeatureNameForTool:
 
 @pytest.mark.asyncio
 class TestDirectToolDispatchUsesPascalcaseFeatureName:
-    async def test_dispatch_threads_pascalcase_to_hooks(self):
-        """End-to-end on the dispatch path: ``_execute_tool_with_hooks`` must
-        receive the PascalCase ``feature_name`` so the security hook's
-        ``permission_store.get_permission("TaskFeature", ...)`` lookup hits
-        the historical row."""
+    async def test_dispatch_threads_pascalcase_to_hooks(self, native_tool_effect_agent, monkeypatch):
+        """Real registered tool, journal and hooks retain the canonical owner name."""
+        observed = []
 
-        agent = MagicMock()
-        agent._direct_tools = {}
-        agent._tool_to_feature = {"respond_to_a2a_task": "task_feature"}
-        agent.features = {
-            "TaskFeature": _Feature("TaskFeature", "task_feature"),
-        }
-        agent._execute_tool_with_hooks = AsyncMock(return_value={"result": "ok"})
-        agent.observability_store = MagicMock()
-        agent.observability_store.log_tool_response = AsyncMock()
+        class TaskFeature(Feature):
+            @property
+            def tool_description(self):
+                return "Owned direct security-name probe"
 
-        tool = MagicMock()
-        tool.execute = AsyncMock(return_value={"result": "ok"})
-        agent._direct_tools["respond_to_a2a_task"] = tool
+            async def initialize(self):
+                pass
 
-        tool_call = MagicMock()
-        tool_call.name = "respond_to_a2a_task"
+            @tool(name="respond_to_a2a_task", description="Record one owned response")
+            async def respond_to_a2a_task(self, task_id: str, content: str, state: str) -> ToolResult:
+                observed.append((task_id, content, state))
+                return ToolResult.ok(confirmation="Recorded the response")
 
-        # Bind the real helper too — otherwise the MagicMock auto-attribute
-        # returns a MagicMock instead of the PascalCase string, masking the
-        # fix this test is here to enforce.
-        agent._security_feature_name_for_tool = (
-            OrchestratorEngineMixin._security_feature_name_for_tool.__get__(agent)
-        )
-        dispatch = OrchestratorEngineMixin._dispatch_direct_tool.__get__(agent)
-        await dispatch(
-            tool_call=tool_call,
-            tool_name="respond_to_a2a_task",
-            args={"task_id": "abc", "content": "ok", "state": "completed"},
-            dispatch_start=0.0,
-            dispatch_event_id="evt_1427",
-            session_id="any-session",
-        )
-
+        agent = await native_tool_effect_agent(did="did:test:security-name")
+        feature = TaskFeature(agent)
+        agent.features[feature.name] = feature
+        selected, = feature.get_tools()
+        agent._direct_tools[selected.name] = selected
+        agent._tool_to_feature[selected.name] = feature.tool_name
+        monkeypatch.setattr(agent, "_execute_tool_with_hooks",
+            AsyncMock(wraps=agent._execute_tool_with_hooks))
+        args = {"task_id": "abc", "content": "ok", "state": "completed"}
+        event = await agent.observability_store.log_tool_call(
+            agent_name=agent.did, tool_name=selected.name, session_id="any-session")
+        await drive_native(agent, lambda: agent._dispatch_direct_tool(
+            tool_call=FakeToolCall("owned-call", selected.name, args),
+            tool_name=selected.name, args=args, dispatch_start=0.0,
+            dispatch_event_id=event, session_id="any-session",
+        ))
         agent._execute_tool_with_hooks.assert_awaited_once()
-        kwargs = agent._execute_tool_with_hooks.await_args.kwargs
-        assert kwargs["feature_name"] == "TaskFeature", (
-            f"Expected feature_name='TaskFeature' (PascalCase, matching "
-            f"the historical permission DB rows), got "
-            f"{kwargs['feature_name']!r}. See #1427 — when this regresses, "
-            "signal-driven cognition turns queue approvals indefinitely."
-        )
+        assert agent._execute_tool_with_hooks.await_args.kwargs["feature_name"] == "TaskFeature"
+        assert observed == [("abc", "ok", "completed")]
+        assert await agent._raw_storage.db.fetchone("SELECT state FROM tool_effect_claims") == ("RETURNED_OK",)

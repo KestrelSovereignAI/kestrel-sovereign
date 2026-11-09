@@ -374,21 +374,20 @@ async def test_active_host_sweeps_expired_staging_without_owner_return(host, mon
 
 
 @pytest.mark.asyncio
-async def test_keyless_agent_boots_without_advertising_artifacts(temp_db, monkeypatch):
+async def test_normal_agent_without_data_key_refuses_durable_effect_boot(temp_db, monkeypatch):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
-    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+    from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
+    from kestrel_sovereign.tool_effect_store import ToolEffectIntegrityError
     monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
     monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
     llm = LLMService()
     agent = KestrelAgent(did="did:test:keyless-artifact-boot", storage_path=str(temp_db),
                          llm_service=llm, privacy_mode=PrivacyMode.NORMAL)
     try:
-        await agent.initialize()
-        assert agent.features
-        assert "ArtifactsFeature" not in agent.features
-        assert any(item.feature_name == "ArtifactsFeature" and "KESTREL_DATA_KEY" in item.reason
-                   for item in agent.rejected_feature_contributions)
+        with pytest.raises(ToolEffectIntegrityError, match="tool effect journal requires encryption"):
+            await agent.initialize()
+        assert agent.tool_effect_store is None
     finally:
         await shutdown_fixture_agent(agent)
         await llm.close()
@@ -439,11 +438,11 @@ async def test_keyed_real_boot_omits_subagent_claim_and_survives_wrong_artifact_
     from cryptography.fernet import Fernet
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
-    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+    from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
     monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
     wrapped = None
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
     for restart in (False, True):
-        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
         llm = LLMService()
         agent = KestrelAgent(did="did:test:keyed-artifact-boot", storage_path=str(temp_db),
                              llm_service=llm, privacy_mode=PrivacyMode.NORMAL)
@@ -460,9 +459,13 @@ async def test_keyed_real_boot_omits_subagent_claim_and_survives_wrong_artifact_
             repo = feature._service.repository
             assert repo._index_key is None
             if not restart:
-                assert not await repo.db.table_exists("artifact_keys")
-                await repo.initialize()  # Simulate a store opened before the restart.
-                wrapped = (await repo.db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = 'v1'"))[0]
+                assert await repo.db.table_exists("artifact_keys")
+                assert not await repo.db.fetchone("SELECT 1 FROM artifact_keys")
+                await repo.initialize()  # Envelope opening remains lazy until use.
+                # Damage only the optional artifact envelope. The host key
+                # must still open the native effect journal on the next boot.
+                wrapped = Fernet(Fernet.generate_key()).encrypt(b"unavailable artifact envelope")
+                await repo.db.execute("UPDATE artifact_keys SET wrapped_key = ? WHERE key_id = 'v1'", (wrapped,))
             else:
                 assert (await repo.db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = 'v1'"))[0] == wrapped
         finally:

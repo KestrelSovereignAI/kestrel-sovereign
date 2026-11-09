@@ -22,9 +22,9 @@ asserts the part is drained on the turn task for turns 1, 2 AND 3.
 """
 from __future__ import annotations
 
-import asyncio
-
 import pytest
+
+from tests.utils.codex_inline import OwnedCallbackReader
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.parts import (
@@ -50,56 +50,10 @@ class _Agent(OrchestratorEngineMixin):
         return {"ok": True, "tool": name}
 
 
-class _CodexReaderHarness:
-    """Reproduces the codex app-server reader-task topology.
-
-    ``ensure_started`` spawns the reader loop ONCE (mirrors
-    ``codex_app_server.py`` ``ensure_started`` -> ``_spawn`` @433) — deliberately
-    from inside the FIRST turn's ``part_collector`` so the reader freezes a copy
-    of turn-1's context. Each ``dispatch`` mirrors the reader spawning a per-call
-    handler task (``codex_app_server.py`` @873) that runs the inline executor.
-    """
-
-    def __init__(self):
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._reader = None
-
-    async def ensure_started(self):
-        if self._reader is None:
-            # Spawned once; inherits (freezes) the CURRENT turn's context.
-            self._reader = asyncio.create_task(self._read_loop())
-
-    async def _read_loop(self):
-        while True:
-            executor, name, args, done = await self._queue.get()
-            if executor is None:
-                return
-            # Each server->client tool call runs in its OWN task, inheriting
-            # THIS reader's frozen context — not the calling turn's.
-            asyncio.create_task(self._handle(executor, name, args, done))
-
-    async def _handle(self, executor, name, args, done):
-        try:
-            result = await executor(name, args)
-            done.set_result(result)
-        except Exception as exc:  # pragma: no cover - defensive
-            done.set_exception(exc)
-
-    async def dispatch(self, executor, name, args):
-        done = asyncio.get_event_loop().create_future()
-        await self._queue.put((executor, name, args, done))
-        return await done
-
-    async def stop(self):
-        if self._reader is not None:
-            await self._queue.put((None, None, None, None))
-            await self._reader
-
-
 @pytest.mark.asyncio
 async def test_inline_emit_part_lands_on_owning_turn_across_reader_boundary():
     agent = _Agent()
-    harness = _CodexReaderHarness()
+    harness = OwnedCallbackReader()
 
     async def run_turn(turn_no: int):
         drained_on_turn = []
@@ -109,7 +63,8 @@ async def test_inline_emit_part_lands_on_owning_turn_across_reader_boundary():
             executor = agent._make_inline_tool_executor(f"session-{turn_no}")
             # First turn also starts the long-lived reader — freezing turn-1's
             # context, exactly like ensure_started awaited inside _run_turn.
-            await harness.ensure_started()
+            if turn_no == 1:
+                await harness.start()
             # The tool call is dispatched on a reader-spawned task.
             eff_args, result = await harness.dispatch(
                 executor, f"whatsapp_link_{turn_no}", {"turn": turn_no},

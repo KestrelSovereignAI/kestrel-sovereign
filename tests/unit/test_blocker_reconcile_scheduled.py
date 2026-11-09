@@ -46,6 +46,7 @@ from kestrel_sovereign.features.strategic_memory.workflow_runs import (
     WorkflowRunsNotAssessed,
 )
 from tests.utils.ledger_storage import without_row_attestations
+from tests.utils.scheduler_ticks import dispatch_scheduled_tool
 
 SELF_REPO = "KestrelSovereignAI/kestrel-sovereign"
 SCAN_REPOS = [
@@ -97,12 +98,13 @@ def _patched(github, token="t"):
     )
 
 
-async def _feature(tmp_path, blockers, *, scan_repos=SCAN_REPOS):
-    agent = MagicMock()
-    agent.agent_id = "did:test:reconcile"
+async def _feature(tmp_path, blockers, *, scan_repos=SCAN_REPOS, agent=None):
+    if agent is None:
+        agent = MagicMock()
+        agent.agent_id = "did:test:reconcile"
+        agent.storage = without_row_attestations(MagicMock())
+        agent.storage.graph = None
     agent.agent_data_dir = str(tmp_path)
-    agent.storage = without_row_attestations(MagicMock())
-    agent.storage.graph = None
     (tmp_path / "STRATEGY.yaml").write_text(
         _yaml.dump(
             {
@@ -476,7 +478,7 @@ async def test_no_reconcile_is_seeded_without_strategic_memory():
 
 @pytest.mark.asyncio
 async def test_the_scheduled_run_resolves_a_closed_issue_without_manual_action(
-    tmp_path,
+    tmp_path, native_tool_effect_agent,
 ):
     """The registered cron source, with the seeded args, through the real
     scheduler tool lookup and the real tool: the row is resolved on disk."""
@@ -486,14 +488,14 @@ async def test_the_scheduled_run_resolves_a_closed_issue_without_manual_action(
         cron_source_name,
     )
 
+    agent = await native_tool_effect_agent(did="did:test:reconcile")
     feature = await _feature(
         tmp_path,
         [{"id": "blk_3519", "issue": "#3519", "title": "morning signal gap",
-          "severity": "high", "blocked_since": "2026-10-02"}],
+          "severity": "high", "blocked_since": "2026-10-02"}], agent=agent,
     )
     agent = feature.agent
     agent.features = {"StrategicMemoryFeature": feature}
-    agent.hooks_manager = None
     scheduler = SchedulerFeature(agent)
     [registration] = [
         r
@@ -509,7 +511,8 @@ async def test_the_scheduled_run_resolves_a_closed_issue_without_manual_action(
     )
 
     with token, get:
-        outcome = await registration.handler(json.loads(seeded[1]))
+        outcome = await dispatch_scheduled_tool(scheduler, "strategy_reconcile_blockers",
+            json.loads(seeded[1]), dispatch=lambda _name, args: registration.handler(args))
 
     assert json.loads(outcome)["status"] == "ok"
     [row] = _ledger_on_disk(tmp_path)[BLOCKERS_KEY]
@@ -518,7 +521,7 @@ async def test_the_scheduled_run_resolves_a_closed_issue_without_manual_action(
 
 
 @pytest.mark.asyncio
-async def test_a_scheduled_run_that_cannot_check_names_why(tmp_path):
+async def test_a_scheduled_run_that_cannot_check_names_why(tmp_path, native_tool_effect_agent):
     """A failed run must say which prerequisite was missing, in signal_log."""
     from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
     from kestrel_sovereign.signals.sources.scheduler import (
@@ -526,10 +529,10 @@ async def test_a_scheduled_run_that_cannot_check_names_why(tmp_path):
         cron_source_name,
     )
 
-    feature = await _feature(tmp_path, [{"id": "blk_1", "issue": "#1", "title": "t"}])
+    agent = await native_tool_effect_agent(did="did:test:reconcile")
+    feature = await _feature(tmp_path, [{"id": "blk_1", "issue": "#1", "title": "t"}], agent=agent)
     agent = feature.agent
     agent.features = {"StrategicMemoryFeature": feature}
-    agent.hooks_manager = None
     scheduler = SchedulerFeature(agent)
     [registration] = [
         r
@@ -542,7 +545,8 @@ async def test_a_scheduled_run_that_cannot_check_names_why(tmp_path):
 
     with patch(f"{_MOD}.get_github_token", return_value=None):
         with pytest.raises(RuntimeError, match=r"failed \(NO_GITHUB_TOKEN\)"):
-            await registration.handler({"apply": "yes"})
+            await dispatch_scheduled_tool(scheduler, "strategy_reconcile_blockers",
+                {"apply": "yes"}, dispatch=lambda _name, args: registration.handler(args))
 
     recorded = _ledger_on_disk(tmp_path)[RECONCILIATION_KEY]
     assert recorded["ran"] is False

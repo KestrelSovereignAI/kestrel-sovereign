@@ -134,7 +134,7 @@ class TestDispatchLogic:
     """_dispatch routing without a real subprocess."""
 
     def _client(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         # This transport-only fixture has never started or retired a process.
         # Keep the production failed-startup cache fence in its initial state.
         c._close_task = None
@@ -206,7 +206,7 @@ class TestServerRequestHandlerRegistration:
     """Per-method async handlers + default fallbacks."""
 
     def _client(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._pending = {}
         c._turn_sinks = {}
         c._server_request_handlers = {}
@@ -329,7 +329,7 @@ class TestTurnIteration:
     async def test_iter_stops_on_turn_completed(self):
         import asyncio
 
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._closed_error = None
         q: asyncio.Queue = asyncio.Queue()
         for ev in [
@@ -346,7 +346,7 @@ class TestTurnIteration:
     async def test_iter_raises_on_closed(self):
         import asyncio
 
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._closed_error = CodexAppServerError("gone")
         q: asyncio.Queue = asyncio.Queue()
         q.put_nowait({"__closed__": True})
@@ -357,7 +357,7 @@ class TestTurnIteration:
     async def test_iter_raises_on_bridge_protocol_error(self):
         import asyncio
 
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._closed_error = None
         q: asyncio.Queue = asyncio.Queue()
         q.put_nowait({
@@ -379,7 +379,7 @@ class TestIdleWatchdogInflightServerRequest:
     """
 
     def _client(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._server_request_handlers = {}
         c._inflight_server_requests = {}
         c._turn_sinks = {}
@@ -572,7 +572,7 @@ class TestInvoluntaryExitRecovery:
         futures and ``endpoints/agent.py``), so cross-session stderr
         content must not surface in the user-visible error.
         """
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._proc = MagicMock()
         c._proc.returncode = 137  # OOM-kill style code, distinctive
         c._proc.stdout = _AsyncIterableMock([])
@@ -618,7 +618,7 @@ class TestInvoluntaryExitRecovery:
     async def test_read_loop_exit_with_no_stderr_emits_no_diagnostic_log(self, caplog):
         """Negative case: when the ring buffer is empty, no stderr-tail
         log line fires — keeps the happy-path log surface clean."""
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._proc = MagicMock()
         c._proc.returncode = 0
         c._proc.stdout = _AsyncIterableMock([])
@@ -652,7 +652,7 @@ class TestInvoluntaryExitRecovery:
 
     @pytest.mark.asyncio
     async def test_read_loop_exit_resets_initialized_and_proc(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._proc = MagicMock()
         c._proc.returncode = 0
         c._proc.stdout = _AsyncIterableMock([])  # ends immediately
@@ -692,7 +692,7 @@ class TestInvoluntaryExitRecovery:
 
         monkeypatch.setenv("HOME", str(tmp_path))
 
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._binary = "/usr/bin/true"  # cheap, exits immediately
         c._closed_error = CodexAppServerError("prior-instance gone")
         c._pending = {}
@@ -747,7 +747,7 @@ class TestInvoluntaryExitRecovery:
         monkeypatch.setenv("HOME", str(runtime_home))
         monkeypatch.setenv("CODEX_HOME", str(source_home))
 
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="unused-offline-codex")
         c._binary = "/usr/bin/true"
         c._closed_error = None
         c._pending = {}

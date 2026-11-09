@@ -2404,6 +2404,15 @@ async def test_dead_question_resident_refuses_new_sends_before_delivery(
         await asyncio.gather(*agent.tasks, return_exceptions=True)
 
 
+@asynccontextmanager
+async def native_question_cleanup_errors():
+    """Keep native originals while letting pytest retire every other fixture."""
+    try:
+        yield
+    except (asyncio.CancelledError, BaseExceptionGroup) as error:
+        raise AssertionError("Native question fixture retained shutdown control") from error
+
+
 @pytest_asyncio.fixture
 async def native_question_peer(local_native_peer):
     from kestrel_sovereign.features.peers.feature import PeersFeature
@@ -2420,22 +2429,128 @@ async def native_question_peer(local_native_peer):
     feature = PeersFeature(p.sender)
     feature._peer_router, feature._peer_requester = p.directory, p.requester
     feature._own_name = "Sender"
+    quiescing = False
+    active_passes = set()
+    changed, parked = asyncio.Event(), asyncio.Event()
+
+    def retain_pass(operation):
+        async def observed(*args, **kwargs):
+            if quiescing:
+                await parked.wait()
+            owner = asyncio.current_task()
+            active_passes.add(owner)
+            try:
+                return await operation(*args, **kwargs)
+            finally:
+                active_passes.remove(owner)
+                changed.set()
+
+        return observed
+
+    async def stop_supervisor():
+        nonlocal quiescing
+        # Functional fixture cleanup starts between original observation
+        # passes, after their real SQL/native acknowledgements. Both resident
+        # loops still run concurrently during the test itself.
+        quiescing = True
+        async with asyncio.timeout(5):
+            while active_passes:
+                changed.clear()
+                await changed.wait()
+        await feature._cancel_owned_background_tasks()
+
     try:
         await feature.post_all_features_loaded(p.sender)
-        yield SimpleNamespace(**vars(p), feature=feature, dispatcher=dispatcher)
+        supervisor = feature._question_supervisor
+        supervisor._read_pass = retain_pass(supervisor._read_pass)
+        supervisor._deadline_iteration = retain_pass(supervisor._deadline_iteration)
+        yield SimpleNamespace(
+            **vars(p), feature=feature, dispatcher=dispatcher,
+            stop_supervisor=stop_supervisor,
+        )
     finally:
         async def join_signal_tasks():
             await asyncio.gather(*signal_agent.tasks, return_exceptions=True)
 
-        try:
+        async with native_question_cleanup_errors():
             async with AsyncExitStack() as cleanup:
                 cleanup.push_async_callback(join_signal_tasks)
                 cleanup.push_async_callback(dispatcher.shutdown_durable_delivery)
                 cleanup.push_async_callback(feature.shutdown)
-        except asyncio.CancelledError as error:
-            # Report the original cancellation/receipt as a fixture failure,
-            # so pytest still runs unrelated fixture finalizers in this worker.
-            raise AssertionError("Native question fixture retained shutdown cancellation") from error
+                cleanup.push_async_callback(stop_supervisor)
+
+
+@pytest.mark.parametrize("phase", ["read", "deadline"])
+async def test_native_question_fixture_joins_original_observation_before_stop(
+    native_question_peer, monkeypatch, phase,
+):
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+
+    p = native_question_peer
+    supervisor = p.feature._question_supervisor
+    unsettled = supervisor.store.unsettled
+    entered, release = asyncio.Event(), asyncio.Event()
+    readers = set()
+
+    async def retain_original_read():
+        rows = await unsettled()  # Real primary-ledger SQL, never a fake read.
+        # Select the actual resident loop for fault scheduling, not authority.
+        index = 0 if phase == "read" else 1
+        if asyncio.current_task().get_name() != f"native-question-service:{index}":
+            return rows
+        readers.add(asyncio.current_task())
+        entered.set()
+        await release.wait()
+        return rows
+
+    monkeypatch.setattr(supervisor.store, "unsettled", retain_original_read)
+    supervisor.notify()
+    stopping = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        stopping = create_owned_task(p.stop_supervisor())
+        _, pending = await asyncio.wait({stopping}, timeout=.05)
+        assert pending == {stopping}, (
+            "Native question fixture cancelled its original observation before settlement"
+        )
+        assert readers and all(not reader.done() for reader in readers)
+        release.set()
+        outcome = await asyncio.wait_for(await_owned_task(stopping), 5)
+        assert outcome.error is outcome.cancellation is None
+        assert p.feature._question_supervisor_task.done()
+    finally:
+        release.set()
+        if stopping is not None:
+            await await_owned_task(stopping)
+
+
+@pytest.mark.parametrize("carrier", ["cancellation", "mixed"])
+async def test_native_question_fixture_retains_control_after_real_shutdown(
+    native_question_peer, carrier,
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, execution_evidence_carriers,
+    )
+
+    p = native_question_peer
+    withdrawal = asyncio.CancelledError("original fixture withdrawal")
+    native = ExecutionCommitOutcomeError("unknown")
+    original = (withdrawal if carrier == "cancellation" else
+        BaseExceptionGroup("original native fixture control", [native, withdrawal]))
+    await p.stop_supervisor()
+    # Inject the original terminal carrier only after the actual feature has
+    # physically retired. No cleanup failure is discarded or treated as ACK.
+    with pytest.raises(BaseException) as caught:
+        async with native_question_cleanup_errors():
+            await p.feature.shutdown()
+            raise original
+    assert type(caught.value) is AssertionError, (
+        "Native question control escaped pytest-safe fixture retirement"
+    )
+    assert caught.value.__cause__ is original
+    assert any(error is withdrawal for error in execution_evidence_carriers(caught.value))
+    if carrier == "mixed":
+        assert any(error is native for error in execution_evidence_carriers(caught.value))
 
 
 async def test_public_question_sender_retains_live_submission_ownership_until_receipt(
@@ -2588,8 +2703,7 @@ async def test_native_follow_up_client_settles_its_original_question_on_read(
     assert first.data["sent"] is True
     # Prove that the follow-up client's receipt owns this settlement. Resident
     # recovery must not hide a missing root-question acknowledgement.
-    p.feature._question_supervisor_task.cancel()
-    await asyncio.gather(p.feature._question_supervisor_task, return_exceptions=True)
+    await p.stop_supervisor()
     followed = await p.feature.send_a2a_task(
         "Peer", "Additional context", continue_dispatch_id=first.data["dispatch_id"]
     )

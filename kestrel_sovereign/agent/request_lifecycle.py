@@ -18,6 +18,7 @@ import time
 from contextvars import ContextVar
 from enum import Enum
 from typing import Dict, List, Optional
+from weakref import ReferenceType, ref
 
 from kestrel_sovereign.agent.invocation import invocation_log_correlation
 
@@ -33,7 +34,7 @@ class RequestCompletionDisposition(str, Enum):
     ABANDONED = "abandoned"
 
 
-_current_request_generation: ContextVar[tuple[int, str, int] | None] = ContextVar(
+_current_request_generation: ContextVar[tuple[int, str, int, ReferenceType[asyncio.Task] | None] | None] = ContextVar(
     "kestrel_current_request_generation",
     default=None,
 )
@@ -55,6 +56,27 @@ def bind_request_operation_if_supported(
         raise TypeError("request operation binder must be callable")
     binder(request_id, operation)
     return True
+
+
+def capture_request_stream_binding_if_supported(agent: object, request_id: str):
+    """Capture one stream's producer and Stop handoff before response driving."""
+    try:
+        inspect.getattr_static(agent, "bind_request_operation")
+    except AttributeError:
+        return None
+    try:
+        inspect.getattr_static(agent, "capture_request_operation_binding")
+    except AttributeError as error:
+        raise TypeError("original request binding publisher is unavailable") from error
+    capture = getattr(agent, "capture_request_operation_binding")
+    if not callable(capture):
+        raise TypeError("original request binding publisher must be callable")
+    publish = capture(request_id)
+
+    def owner_started(iterator, producer):
+        publish(producer, cancel_via=iterator.owner_task)
+
+    return owner_started
 
 
 class RequestLifecycleMixin:
@@ -250,7 +272,15 @@ class RequestLifecycleMixin:
         # Preserve the legacy "current request" fallback for callers that
         # do not yet pass an explicit request ID.
         self._current_request_id = request_id
-        _current_request_generation.set((id(self), request_id, generation))
+        try:
+            registrar = asyncio.current_task()
+        except RuntimeError:
+            registrar = None
+        # A copied generation identifies bookkeeping, not a native owner.
+        # Keep the original registrar weakly so inherited contexts cannot
+        # retain a completed request Task or impersonate its registration.
+        _current_request_generation.set((id(self), request_id, generation,
+            ref(registrar) if registrar is not None else None))
         self._consume_pending_request_cancellation(request_id, generation)
         return generation
 
@@ -314,51 +344,77 @@ class RequestLifecycleMixin:
         )
         return True
 
-    def bind_request_operation(
-        self,
-        request_id: str,
-        operation: asyncio.Task,
-    ) -> None:
-        """Bind cancellable turn work to the current request generation."""
+    def capture_request_operation_binding(self, request_id: str):
+        """Delegate only this original active delivery's binding publication.
 
-        if not isinstance(operation, asyncio.Task):
-            raise TypeError("request operation must be an asyncio task")
-        generation = self._request_generation_for_current_task(request_id)
+        A response may later be driven by another Task. This explicit closure
+        grants it publication for the captured generation, not work authority
+        from copied ContextVars or from the caller's eventual active projection.
+        """
+        generation = self._request_generation_for_current_task(request_id, original_only=True)
         if generation is None:
-            raise RuntimeError("request operation requires an active generation")
-        operations = getattr(self, "_request_operation_tasks", None)
-        if not isinstance(operations, dict):
-            operations = {}
-            self._request_operation_tasks = operations
+            raise RuntimeError("request operation requires its original active generation")
+        registration = _current_request_generation.get()
         key = (request_id, generation)
-        owners = operations.setdefault(key, set())
-        owners.add(operation)
 
-        def release(completed: asyncio.Task) -> None:
-            current = operations.get(key)
-            if not isinstance(current, set):
-                return
-            current.discard(completed)
-            if not current:
-                operations.pop(key, None)
+        def publish(operation, *, cancel_via=None):
+            if not isinstance(operation, asyncio.Task):
+                raise TypeError("request operation must be an asyncio task")
+            cancellation = operation if cancel_via is None else cancel_via
+            if not isinstance(cancellation, asyncio.Task):
+                raise TypeError("request cancellation target must be an asyncio task")
+            counts = getattr(self, "_active_request_generation_counts", {})
+            if counts.get(key, 0) <= 0:
+                raise RuntimeError("original request binding publication is retired")
+            operations = getattr(self, "_request_operation_tasks", None)
+            if not isinstance(operations, dict):
+                operations = {}
+                self._request_operation_tasks = operations
+            owners = operations.setdefault(key, {})
+            owners[operation] = cancellation
 
-        try:
-            operation.add_done_callback(release)
-            if self.is_request_cancelled(request_id):
-                operation.cancel()
-        except BaseException:
-            # The caller still owns this accepted Task and must physically
-            # retire it before releasing the request generation. Undo only
-            # this failed binding, including partial callback publication.
-            operation.remove_done_callback(release)
-            release(operation)
-            raise
+            def release(completed: asyncio.Task) -> None:
+                current = operations.get(key)
+                if not isinstance(current, dict):
+                    return
+                current.pop(completed, None)
+                if not current:
+                    operations.pop(key, None)
+
+            # This is the captured generation's cancellation query only. The
+            # weak registrar and exact operation inventory still determine
+            # native ownership; no foreign driver becomes that registrar.
+            token = _current_request_generation.set(registration)
+            try:
+                try:
+                    operation.add_done_callback(release)
+                    if self.is_request_cancelled(request_id):
+                        from kestrel_sovereign._async_ownership import cancel_owned_task
+                        cancel_owned_task(cancellation)
+                except BaseException:
+                    operation.remove_done_callback(release)
+                    release(operation)
+                    raise
+            finally:
+                _current_request_generation.reset(token)
+
+        return publish
+
+    def bind_request_operation(self, request_id: str, operation: asyncio.Task) -> None:
+        """Publish from the original owner through the same revocable binder."""
+        self.capture_request_operation_binding(request_id)(operation)
 
     def _request_generation_for_current_task(
         self,
         request_id: str,
+        *, original_only: bool = False,
     ) -> int | None:
-        """Resolve this task's delivery generation, then the active fallback."""
+        """Resolve a generation, optionally requiring its exact native owner.
+
+        Fresh journal ingress must belong to the original registering Task or
+        an actual operation in this generation's canonical binding inventory.
+        The ordinary active projection remains bookkeeping, never that proof.
+        """
 
         bound = _current_request_generation.get()
         if (
@@ -366,7 +422,24 @@ class RequestLifecycleMixin:
             and bound[0] == id(self)
             and bound[1] == request_id
         ):
+            if original_only:
+                try:
+                    task = asyncio.current_task()
+                except RuntimeError:
+                    return None
+                key = (request_id, bound[2])
+                counts = getattr(self, "_active_request_generation_counts", {})
+                if task is None or counts.get(key, 0) <= 0:
+                    return None
+                registrar = bound[3]() if bound[3] is not None else None
+                operations = getattr(self, "_request_operation_tasks", {})
+                if task is not registrar and not any(
+                    task is operation for operation in operations.get(key, ())
+                ):
+                    return None
             return bound[2]
+        if original_only:
+            return None
         generations = getattr(self, "_active_request_generations", None)
         if not isinstance(generations, dict):
             return None
@@ -591,9 +664,10 @@ class RequestLifecycleMixin:
         if isinstance(operations, dict):
             for generation in generations:
                 for operation in tuple(
-                    operations.get((target_request_id, generation), set())
+                    operations.get((target_request_id, generation), {}).values()
                 ):
-                    operation.cancel()
+                    from kestrel_sovereign._async_ownership import cancel_owned_task
+                    cancel_owned_task(operation)
         logging.info(
             "Cancelled request lifecycle: %s",
             invocation_log_correlation(target_request_id),

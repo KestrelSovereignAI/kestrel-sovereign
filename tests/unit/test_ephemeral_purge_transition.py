@@ -15,7 +15,6 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
 from kestrel_sovereign.storage.privacy_wrapper import (
@@ -42,53 +41,37 @@ def _report_from_counts(counts):
     )
 
 
-def _make_agent(*, initial_mode=PrivacyMode.EPHEMERAL, leak_breakdown=None):
-    """Build a minimally-wired KestrelAgent for transition tests.
-
-    Side-steps __init__ (which requires storage paths, LLM service, etc.)
-    and constructs only the surface the transition method touches.
-    """
-    leak_breakdown = leak_breakdown or {"conversation_history": 0, "graph_nodes": 0}
-
-    permission_store = MagicMock()
-    permission_store.log_decision = AsyncMock()
-    security_feature = MagicMock(permission_store=permission_store)
-
-    agent = KestrelAgent.__new__(KestrelAgent)
-    agent._privacy_mode = initial_mode
-    agent.did = "did:test:agent"
-
-    storage = MagicMock()
-    storage.purge_ephemeral_session = AsyncMock(
-        return_value=_report_from_counts(leak_breakdown)
-    )
-    storage.set_privacy_mode = MagicMock()
-    agent.storage = storage
-
-    privacy_agent = MagicMock()
-    privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed.")
-    # New contract: the agent consults evaluate_transition before applying.
-    # These exits are all non-destructive (never PUBLIC→EPHEMERAL).
-    privacy_agent.evaluate_transition = MagicMock(
-        side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False)
-    )
-    agent.privacy_agent = privacy_agent
-
-    agent.features = {"Security": security_feature}
-    agent.llm_service = MagicMock()
-    agent.llm_service.providers = []
-    agent.llm_service.get_model_preference = MagicMock(return_value={})
-    agent.llm_service.set_model_preference = MagicMock()
-    return agent, storage, permission_store
+@pytest.fixture
+def _make_agent(native_tool_effect_agent, monkeypatch):
+    """Real Agent/storage policy with explicit purge and audit fault seams."""
+    async def create(*, initial_mode=PrivacyMode.EPHEMERAL, leak_breakdown=None):
+        agent = await native_tool_effect_agent(did="did:test:agent")
+        if initial_mode is not PrivacyMode.NORMAL:
+            result = await agent.set_privacy_mode_with_effects(initial_mode)
+            assert result.applied
+        storage = agent.storage
+        leak_breakdown = (leak_breakdown if leak_breakdown is not None else
+            {"conversation_history": 0, "graph_nodes": 0})
+        monkeypatch.setattr(storage, "purge_ephemeral_session",
+            AsyncMock(return_value=_report_from_counts(leak_breakdown)))
+        monkeypatch.setattr(storage, "set_privacy_mode",
+            MagicMock(wraps=storage.set_privacy_mode))
+        monkeypatch.setattr(agent.privacy_agent, "set_mode",
+            MagicMock(wraps=agent.privacy_agent.set_mode))
+        permission_store = MagicMock()
+        permission_store.log_decision = AsyncMock()
+        agent.features = {"Security": MagicMock(permission_store=permission_store)}
+        return agent, storage, permission_store
+    return create
 
 
 @pytest.mark.asyncio
-async def test_clean_ephemeral_exit_calls_purge_and_skips_audit():
+async def test_clean_ephemeral_exit_calls_purge_and_skips_audit(_make_agent):
     """Happy path: agent leaves EPHEMERAL with no leaks. Purge fires
     (defense-in-depth must always run) but audit log is silent —
     nothing to report.
     """
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
         leak_breakdown={"conversation_history": 0, "graph_nodes": 0},
     )
@@ -104,11 +87,11 @@ async def test_clean_ephemeral_exit_calls_purge_and_skips_audit():
 
 
 @pytest.mark.asyncio
-async def test_leaked_ephemeral_exit_writes_audit_with_breakdown():
+async def test_leaked_ephemeral_exit_writes_audit_with_breakdown(_make_agent):
     """When the storage purge reports leaks, the agent records a
     security_audit_log entry with the agent DID, the reason, and the
     per-table breakdown so the operator can investigate."""
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
         leak_breakdown={"conversation_history": 3, "graph_nodes": 1},
     )
@@ -129,11 +112,11 @@ async def test_leaked_ephemeral_exit_writes_audit_with_breakdown():
 
 
 @pytest.mark.asyncio
-async def test_normal_to_ephemeral_does_not_purge():
+async def test_normal_to_ephemeral_does_not_purge(_make_agent):
     """Entering EPHEMERAL has nothing to purge — the rail only fires on
     EXIT. Going INTO EPHEMERAL is a privacy contract change, not a
     session close."""
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.NORMAL,
     )
 
@@ -144,13 +127,13 @@ async def test_normal_to_ephemeral_does_not_purge():
 
 
 @pytest.mark.asyncio
-async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically():
+async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically(_make_agent):
     """PUBLIC→EPHEMERAL is data-destructive: the transition must be STAGED, not
     applied, until confirmed — the split-state fix. Before confirm no state
     holder changes (the bug flipped agent + wrapper while the privacy agent
     stayed PUBLIC and kept persisting). After confirm all holders move together.
     """
-    agent, storage, permission_store = _make_agent(initial_mode=PrivacyMode.PUBLIC)
+    agent, storage, permission_store = await _make_agent(initial_mode=PrivacyMode.PUBLIC)
     # Simulate the real privacy agent flagging this specific transition.
     agent.privacy_agent.evaluate_transition = MagicMock(
         return_value=PrivacyTransitionDecision(
@@ -180,8 +163,8 @@ async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically
 
 
 @pytest.mark.asyncio
-async def test_confirm_with_nothing_pending_is_a_safe_noop():
-    agent, storage, _ = _make_agent(initial_mode=PrivacyMode.NORMAL)
+async def test_confirm_with_nothing_pending_is_a_safe_noop(_make_agent):
+    agent, storage, _ = await _make_agent(initial_mode=PrivacyMode.NORMAL)
     result = await agent.confirm_privacy_transition()
     assert result.requires_confirmation is False
     assert result.applied is False  # no-op is distinguishable from an apply
@@ -190,10 +173,10 @@ async def test_confirm_with_nothing_pending_is_a_safe_noop():
 
 
 @pytest.mark.asyncio
-async def test_normal_to_isolated_does_not_purge():
+async def test_normal_to_isolated_does_not_purge(_make_agent):
     """Non-EPHEMERAL transitions never trigger the rail. Soft-deleted
     NORMAL data must not be touched by an unrelated mode switch."""
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.NORMAL,
     )
 
@@ -203,11 +186,11 @@ async def test_normal_to_isolated_does_not_purge():
 
 
 @pytest.mark.asyncio
-async def test_ephemeral_to_ephemeral_does_not_purge():
+async def test_ephemeral_to_ephemeral_does_not_purge(_make_agent):
     """A no-op EPHEMERAL → EPHEMERAL transition (e.g. UI re-confirms
     the same mode) shouldn't fire the rail. The session is still
     open."""
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
     )
 
@@ -217,13 +200,13 @@ async def test_ephemeral_to_ephemeral_does_not_purge():
 
 
 @pytest.mark.asyncio
-async def test_audit_failure_does_not_block_purge_or_transition():
+async def test_audit_failure_does_not_block_purge_or_transition(_make_agent):
     """If the audit write itself blows up (db locked, table missing),
     the agent must still complete the transition. The leak has already
     been scrubbed at this point — the audit is the breadcrumb, not
     the safety net.
     """
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
         leak_breakdown={"conversation_history": 1, "graph_nodes": 0},
     )
@@ -232,20 +215,21 @@ async def test_audit_failure_does_not_block_purge_or_transition():
     # Should not raise
     result = await agent._set_privacy_mode_with_effects_locked(PrivacyMode.NORMAL)
 
-    assert result.message == "Privacy mode changed."
+    assert result.message.startswith("Privacy mode changed from ephemeral to normal.")
+    assert result.applied
     storage.purge_ephemeral_session.assert_awaited_once()
     storage.set_privacy_mode.assert_called_once_with(PrivacyMode.NORMAL)
 
 
 @pytest.mark.asyncio
-async def test_required_purge_failure_blocks_transition_and_stays_ephemeral():
+async def test_required_purge_failure_blocks_transition_and_stays_ephemeral(_make_agent):
     """#2673: if a required no-trace purge sweep fails (corrupt DB, lock), the
     EPHEMERAL exit must be REFUSED — the agent cannot claim a clean transition
     it could not certify. It stays in EPHEMERAL (the safe, more restrictive
     state) and the failure is audited as ``purge_failed`` (distinct from a
     leak).
     """
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
     )
     storage.purge_ephemeral_session.side_effect = RuntimeError("DB locked")
@@ -274,13 +258,13 @@ async def test_required_purge_failure_blocks_transition_and_stays_ephemeral():
 
 
 @pytest.mark.asyncio
-async def test_partial_required_sweep_failure_blocks_transition():
+async def test_partial_required_sweep_failure_blocks_transition(_make_agent):
     """#2673: even a SINGLE required content-store failure (with the others
     clean) must block the exit — a partial certification is no certification.
     A FAILED sweep is distinguishable from a clean zero via the structured
     report, so it cannot be waved through as ``conversation_history: 0``.
     """
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
     )
     # conversation_history clean, graph_nodes FAILED, channel_messages clean.
@@ -303,12 +287,12 @@ async def test_partial_required_sweep_failure_blocks_transition():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_purge_failure_records_durable_audit_and_does_not_raise():
+async def test_shutdown_purge_failure_records_durable_audit_and_does_not_raise(_make_agent):
     """#2673 shutdown-time failure: an EPHEMERAL agent exiting while its purge
     fails must NOT report false success. Shutdown stays bounded and the failure
     is recorded as durable ``purge_failed`` audit evidence rather than swallowed.
     """
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
     )
     storage.purge_ephemeral_session.side_effect = RuntimeError("DB locked at shutdown")
@@ -329,7 +313,7 @@ async def test_shutdown_purge_failure_records_durable_audit_and_does_not_raise()
 
 
 @pytest.mark.asyncio
-async def test_shutdown_purge_timeout_records_durable_audit():
+async def test_shutdown_purge_timeout_records_durable_audit(_make_agent):
     """#2673 shutdown-time timeout: a purge that hangs past the shutdown budget
     is bounded by the timeout and reported as a durable ``purge_failed`` audit
     (failure=shutdown-purge-timeout), never a best-effort success.
@@ -343,7 +327,7 @@ async def test_shutdown_purge_timeout_records_durable_audit():
     from kestrel_sovereign.kestrel_agent import KESTREL_SHUTDOWN_AUDIT_TAIL_FRACTION
     from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
     )
     purge_started = asyncio.Event()
@@ -375,7 +359,7 @@ async def test_shutdown_purge_timeout_records_durable_audit():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_audit_write_is_bounded_by_budget():
+async def test_shutdown_audit_write_is_bounded_by_budget(_make_agent):
     """#2673: a hung/locked audit DB after a purge timeout must NOT overrun the
     shutdown budget. The durable audit tail is carved from the supplied budget,
     so ``_purge_ephemeral_on_shutdown`` stays bounded even when BOTH the purge
@@ -385,7 +369,7 @@ async def test_shutdown_audit_write_is_bounded_by_budget():
     import asyncio
     import time
 
-    agent, storage, permission_store = _make_agent(
+    agent, storage, permission_store = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
     )
 
@@ -405,11 +389,11 @@ async def test_shutdown_audit_write_is_bounded_by_budget():
 
 
 @pytest.mark.asyncio
-async def test_audit_skipped_when_security_feature_missing():
+async def test_audit_skipped_when_security_feature_missing(_make_agent):
     """Slim test setups don't load SecurityFeature. The rail still
     purges and logs a WARNING, but writes no audit entry.
     """
-    agent, storage, _ = _make_agent(
+    agent, storage, _ = await _make_agent(
         initial_mode=PrivacyMode.EPHEMERAL,
         leak_breakdown={"conversation_history": 1, "graph_nodes": 0},
     )

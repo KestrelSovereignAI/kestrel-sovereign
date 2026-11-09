@@ -50,6 +50,7 @@ async def test_overlapping_memory_calls_do_not_borrow_peer_retirement(
     release_a, release_b = asyncio.Event(), asyncio.Event()
     withdrawals = {a: [], b: []}
     accepted, refused = [], []
+    refusal_seen = asyncio.Event()
     original_refusal = RuntimeError(
         "actual second request memory Task admission refused"
     )
@@ -95,6 +96,7 @@ async def test_overlapping_memory_calls_do_not_borrow_peer_retirement(
         )
         if target and accepted:
             refused.append((coroutine, operation))
+            refusal_seen.set()
             raise original_refusal
         task = (
             previous(loop, coroutine, **kwargs)
@@ -141,6 +143,14 @@ async def test_overlapping_memory_calls_do_not_borrow_peer_retirement(
             )
             owners.append(second)
             if door == "admission":
+                # Match the other doors' observed native milestone. A request
+                # must settle its OWN accepted child before publishing refusal;
+                # the one-second assertion excludes only the still-blocked peer.
+                await asyncio.wait_for(refusal_seen.wait(), 5)
+                assert len(accepted) == 1 and len(refused) == 1
+                for child in accepted:
+                    await asyncio.wait_for(await_owned_task(child), 5)
+                assert not first.done() and not withdrawals[a]
                 done, _ = await asyncio.wait([second], timeout=1)
                 assert second in done, (
                     "request refusal borrowed a peer's outstanding join"

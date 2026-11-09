@@ -121,7 +121,7 @@ async def test_refused_native_http_close_keeps_actual_handle_and_debt():
 async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
     tmp_path, failure
 ):
-    lock, producers, refused = ReentrantTransitionLock(), [], []
+    lock, producers, published, refused = ReentrantTransitionLock(), [], [], []
     path = tmp_path / "must-not-dispatch.db"
     refusal = RuntimeError("original stream " + failure + " refused")
     loop, factory = (
@@ -143,9 +143,16 @@ async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
             await db.close()
 
     def started(iterator, owner):
-        producers.append(owner)
+        published.append(owner)
         if failure == "registration":
             raise refusal
+
+    native_factory = lock.capture_native_work_factory()
+
+    def accept_producer(run, context):
+        owner = native_factory(run, context=context)
+        producers.append(owner)
+        return owner
 
     def refuse_watcher(loop, coroutine, **kwargs):
         if _operation_name(coroutine).endswith("._watch_owner_cancellation"):
@@ -156,7 +163,7 @@ async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
         return asyncio.Task(coroutine, loop=loop, **kwargs)
 
     lifecycle = ExecutionStreamLifecycle(
-        lock.capture_native_work_factory(), started, lambda: None
+        accept_producer, started, lambda: None
     )
     stream = execution_stream(Host(), source(), lifecycle=lifecycle)
     try:
@@ -173,6 +180,7 @@ async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
         else:
             assert caught.value is refusal
         assert producers
+        assert published == ([] if failure == 'watcher' else producers)
         _, pending = await asyncio.wait(producers, timeout=0.1)
         assert not pending, (
             "original producer stranded at the constructor dispatch barrier"

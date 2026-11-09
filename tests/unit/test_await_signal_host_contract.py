@@ -74,20 +74,11 @@ class _Rig(SimpleNamespace):
 
 
 @pytest.fixture
-async def rig(tmp_path):
-    agent = KestrelAgent(did="did:test:3484", storage_path=":memory:")
-    # Everything `process_input` touches before its lock span is stubbed, so
-    # a turn exercises the real CONVERSATION -> privacy acquisition. The
-    # storage and context stubs also let a real privacy transition apply.
-    agent.storage = SimpleNamespace(set_privacy_mode=lambda mode: None)
-    agent.context_manager = object()
-    agent.bootstrap_service = None
-    agent._safe_mode = False
-    agent._maybe_audit = AsyncMock()
-    agent._maybe_refresh_user_byok_resolver = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+async def rig(tmp_path, native_tool_effect_agent):
+    from tests.unit.test_non_streaming_turn_privacy_span import _turn_agent
+
+    agent = await _turn_agent("did:test:3484", native_tool_effect_agent)
     agent.prepare_and_refresh_all_feature_context_clauses = AsyncMock()
-    agent.privacy_agent = PrivacyAgent(storage=None, initial_mode=PrivacyMode.NORMAL)
 
     backend = SQLiteBackend(str(tmp_path / "await-contract.db"))
     await backend.connect()

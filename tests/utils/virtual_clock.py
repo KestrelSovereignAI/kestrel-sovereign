@@ -112,6 +112,14 @@ class AdvanceableClock:
         self._skipped += seconds
 
 
+class AdvanceableClockLoop(VirtualClockLoop):
+    """Manual deadline jumps while real native I/O polls keep advancing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._clock = AdvanceableClock(lambda: asyncio.BaseEventLoop.time(self))
+
+
 @contextmanager
 def advanceable_loop_clock() -> Iterator[AdvanceableClock]:
     """Let an ``async`` test jump the running loop's clock forward.
@@ -177,6 +185,14 @@ async def await_within_hang_guard(
         raise AssertionError(
             f"{step} did not happen within the {seconds:g}s hang guard"
         )
+    # Core's owned completion callback may already have harvested the one-shot
+    # native cancellation. Reconcile that exact receipt before observing its
+    # result; foreign Futures keep their existing native observation semantics.
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_native_completion
+    admission = getattr(future, "_kestrel_owned_admission", None)
+    if type(admission) is OwnedTaskAdmission and admission.task is future:
+        with owned_native_completion(future):
+            return future.result()
     return future.result()
 
 

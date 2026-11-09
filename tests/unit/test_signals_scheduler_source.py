@@ -25,13 +25,29 @@ from kestrel_sdk.signals import (
     SignalMode,
     Status,
 )
+from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
 from kestrel_sdk.tools.result import ToolResult
 
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from tests.utils.scheduler_ticks import tick_and_settle
+
+
+class _SourceToolFeature(Feature):
+    tool_description = 'Original scheduler source tool'
+
+    def __init__(self, agent, name, tools):
+        super().__init__(agent)
+        self.name, self._tools = name, tools
+
+    async def initialize(self):
+        pass
+
+    def get_tools(self):
+        return self._tools
 
 
 def _NO_REASON_CODES(task_name: str) -> frozenset[str]:
@@ -196,8 +212,8 @@ def test_state_mutating_tasks_declare_memory():
 
 
 def test_build_cron_registrations_match_cron_tasks_table():
-    async def _lookup(name, args):
-        return None
+    async def _lookup(name, args, complete):
+        return complete(None)
 
     regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     assert len(regs) == len(CRON_TASKS)
@@ -207,8 +223,8 @@ def test_build_cron_registrations_match_cron_tasks_table():
 
 
 def test_action_registrations_have_handler_artifact_have_artifact_handler():
-    async def _lookup(name, args):
-        return f"lookup:{name}"
+    async def _lookup(name, args, complete):
+        return complete(f"lookup:{name}")
 
     regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     for reg in regs:
@@ -243,7 +259,7 @@ def test_builtin_handlers_override_tool_lookup():
     handler."""
     captured = []
 
-    async def lookup(name, args):
+    async def lookup(name, args, complete):
         raise AssertionError("lookup should not be called for builtins")
 
     async def fake_backup(args):
@@ -282,9 +298,9 @@ async def test_user_scheduled_signal_dispatch_uses_cron_action_source(
     agent, registry, dispatcher, backend = dispatcher_components
     captured = []
 
-    async def fake_lookup(name, args):
+    async def fake_lookup(name, args, complete):
         captured.append((name, args))
-        return f"ran:{name}"
+        return complete(f"ran:{name}")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
@@ -319,8 +335,8 @@ async def test_artifact_task_dispatches_through_artifact_handler(
     the Signal envelope → result.artifact carries the workflow output."""
     agent, registry, dispatcher, _ = dispatcher_components
 
-    async def fake_lookup(name, args):
-        return f"briefing:{name}"
+    async def fake_lookup(name, args, complete):
+        return complete(f"briefing:{name}")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
@@ -370,8 +386,8 @@ async def test_json_shaped_string_artifact_is_not_a_scheduler_envelope(
     agent, registry, dispatcher, _ = dispatcher_components
     artifact = json.dumps({"error": "quoted error text from a report"})
 
-    async def fake_lookup(name, args):
-        return artifact
+    async def fake_lookup(name, args, complete):
+        return complete(artifact)
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
@@ -396,7 +412,7 @@ async def test_handler_exception_becomes_failed_status(
     """Raised tool details stay in trusted logs, not durable audit errors."""
     agent, registry, dispatcher, _ = dispatcher_components
 
-    async def lookup_raises(name, args):
+    async def lookup_raises(name, args, complete):
         raise RuntimeError("tool blew up")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_raises):
@@ -425,21 +441,23 @@ async def test_handler_exception_becomes_failed_status(
 
 @pytest.mark.asyncio
 async def test_failed_tool_result_becomes_failed_status(
-    dispatcher_components, caplog,
+    dispatcher_components, caplog, native_tool_effect_agent,
 ):
     """The production lookup rejects failure before its JSON boundary."""
     agent, registry, dispatcher, backend = dispatcher_components
     private_marker = "private-consolidation-detail-2907"
-    failed_tool = MagicMock()
+    failed_tool = MagicMock(spec=AgentTool)
     failed_tool.name = "memory_consolidate"
     failed_tool.execute = AsyncMock(
         return_value=ToolResult.failed(private_marker).to_dict()
     )
-    memory_feature = MagicMock()
-    memory_feature.enabled = True
-    memory_feature.get_tools.return_value = [failed_tool]
+    execution_agent = await native_tool_effect_agent(did=agent.did)
+    memory_feature = _SourceToolFeature(execution_agent, "MemoryFeature", [failed_tool])
     agent.features = {"MemoryFeature": memory_feature}
-    scheduler_feature = SchedulerFeature(agent)
+    execution_agent.features = agent.features
+    scheduler_feature = SchedulerFeature(execution_agent)
+    dispatcher = SignalDispatcher(agent=execution_agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=SignalLogStore(backend))
 
     for reg in build_cron_registrations(
         tool_lookup=scheduler_feature._lookup_raw_tool_result,
@@ -458,7 +476,21 @@ async def test_failed_tool_result_becomes_failed_status(
         logging.ERROR,
         logger="kestrel_sovereign.signals.sources.scheduler",
     ):
-        result = await dispatcher.dispatch_signal(signal)
+        observed = []
+
+        async def execute(name, arguments):
+            observed.append(await dispatcher.dispatch_signal(signal))
+            return scheduler_feature._translate_signal_result(observed[-1], name)
+
+        db = execution_agent.tool_effect_store.database
+        runner = SchedulerRunner(db, execution_agent.did, execute)
+        try:
+            await runner._ensure_tables()
+            await _seed_due_schedule(db, execution_agent.did, 'failed-result', 'memory_consolidate')
+            await tick_and_settle(runner)
+            result, = observed
+        finally:
+            await runner.stop()
 
     assert result.status == Status.FAILED
     assert "scheduled tool memory_consolidate failed" in (result.error or "")
@@ -488,8 +520,8 @@ async def test_permission_block_is_expected_outcome_without_dispatcher_traceback
         decision="ask",
     )
 
-    async def lookup_blocked(name, args):
-        return blocked
+    async def lookup_blocked(name, args, complete):
+        return complete(blocked)
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_blocked):
         registry.register(reg)
@@ -553,9 +585,9 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
         decision="ask",
     )
 
-    async def lookup(name, args):
+    async def lookup(name, args, complete):
         if name == "restart_coordinator":
-            return blocked
+            return complete(blocked)
         raise AssertionError(f"unexpected lookup for {name}")
 
     agent.sleep = sleep
@@ -696,7 +728,7 @@ async def test_builtin_json_envelopes_follow_scheduler_result_contract(
         else run_trash_retention
     )
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -775,7 +807,7 @@ async def test_backup_without_sync_service_is_a_successful_skipped_dispatch(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -811,7 +843,7 @@ async def test_backup_without_targets_is_a_successful_skipped_dispatch(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -858,7 +890,7 @@ async def test_backup_with_failed_targets_is_a_failed_dispatch(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -903,7 +935,7 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -965,7 +997,7 @@ async def test_real_sleep_privacy_skip_then_export_failure_names_the_export(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, task_args):
+    async def unused_lookup(name, task_args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -1027,7 +1059,7 @@ async def test_real_sleep_nonterminal_reports_remain_successful_cron_dispatches(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, task_args):
+    async def unused_lookup(name, task_args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -1080,7 +1112,7 @@ async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, task_args):
+    async def unused_lookup(name, task_args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -1113,8 +1145,8 @@ async def test_signal_log_writes_redacted_args(dispatcher_components):
     in a debuggable form without blowing the column."""
     agent, registry, dispatcher, backend = dispatcher_components
 
-    async def lookup(name, args):
-        return "ok"
+    async def lookup(name, args, complete):
+        return complete("ok")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)
@@ -1152,13 +1184,13 @@ async def test_concurrent_memory_tasks_serialize(dispatcher_components):
     order = []
     order_lock = asyncio.Lock()
 
-    async def lookup(name, args):
+    async def lookup(name, args, complete):
         async with order_lock:
             order.append(f"start:{name}")
         await asyncio.sleep(0.05)
         async with order_lock:
             order.append(f"end:{name}")
-        return None
+        return complete(None)
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)
@@ -1210,13 +1242,14 @@ async def _seed_due_schedule(db, agent_id, schedule_id, task_name, *, cron="@dai
     return due_at
 
 
-def _barrier_scheduler(agent, registry):
+def _barrier_scheduler(agent, registry, *, execution_agent=None):
     """A SchedulerFeature wired exactly as initialize() wires its sources."""
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
+    execution = feature if execution_agent is None else SchedulerFeature(execution_agent)
     for registration in build_cron_registrations(
-        tool_lookup=feature._lookup_raw_tool_result,
-        reason_codes_lookup=feature._declared_reason_codes,
+        tool_lookup=execution._lookup_raw_tool_result,
+        reason_codes_lookup=execution._declared_reason_codes,
         builtin_handlers=feature._builtin_cron_handlers(),
     ):
         registry.register(registration)
@@ -1225,17 +1258,21 @@ def _barrier_scheduler(agent, registry):
 
 @pytest.mark.asyncio
 async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
-    dispatcher_components,
+    dispatcher_components, native_tool_effect_agent,
 ):
     """#2474: a due restart_coordinator whose owner has not loaded yet must
     not be recorded as a (skipped) success nor advance its cron. Once the
     owner loads and the post_all_features_loaded barrier completes, the SAME
     occurrence executes exactly once and a later tick never re-runs it."""
     agent, registry, dispatcher, backend = dispatcher_components
+    execution_agent = await native_tool_effect_agent(did=agent.did)
+    execution_agent.features = {}
+    dispatcher = SignalDispatcher(agent=execution_agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=SignalLogStore(backend))
     agent.dispatcher = dispatcher
     agent.features = {}
     agent._post_all_features_loaded_complete = False
-    feature = _barrier_scheduler(agent, registry)
+    feature = _barrier_scheduler(agent, registry, execution_agent=execution_agent)
 
     owner_ran = asyncio.Event()
     calls = []
@@ -1245,12 +1282,11 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
         owner_ran.set()
         return {"success": True, "restarted": False}
 
-    owner = SimpleNamespace(
-        name="RestartCoordinatorFeature",
-        get_tools=lambda: [SimpleNamespace(name="restart_coordinator", execute=execute)],
-    )
+    owner = _SourceToolFeature(execution_agent, "RestartCoordinatorFeature", [
+        SimpleNamespace(name="restart_coordinator", execute=execute,
+            schema=ToolSchema("restart_coordinator", "Owned restart counter", ToolCategory.UTILITY))])
 
-    db = AsyncDatabase(backend)
+    db = execution_agent.tool_effect_store.database
     runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
     await runner.start(polling=False)
     due_at = await _seed_due_schedule(
@@ -1278,6 +1314,7 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
 
     # The owner finishes loading, then the lifecycle barrier completes.
     agent.features = {"RestartCoordinatorFeature": owner}
+    execution_agent.features = agent.features
     agent._post_all_features_loaded_complete = True
     # The deferred claim is recovered once its lease lapses (expire it in the
     # database rather than sleeping out the lease interval).

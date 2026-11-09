@@ -3522,6 +3522,7 @@ async def chat_completions(request: Request, http_response: Response):
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/v1/chat/completions",
+            body=data,
         )
 
         assistant_text = await agent.process_input(
@@ -3574,6 +3575,14 @@ async def chat_completions(request: Request, http_response: Response):
         # particular) when it was actually a routing problem.
         raise
     except Exception as e:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        from kestrel_sovereign.api_errors import tool_effect_api_error
+
+        if is_execution_control_error(e):
+            raise
+        effect_error = tool_effect_api_error(e)
+        if effect_error is not None:
+            raise effect_error from e
         logger.error(f"Error in chat_completions: {e}", exc_info=True)
         declined = advised_wait_exceeding_budget(e)
         if declined is not None:

@@ -91,7 +91,7 @@ import time
 import weakref
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import InitVar, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from enum import Enum
@@ -119,6 +119,7 @@ from kestrel_sovereign.execution_custody import (
     execution_finite_error,
     execution_observation_error,
     is_execution_control_error,
+    is_tool_execution_terminal_error,
     require_execution_work,
 )
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
@@ -277,6 +278,19 @@ class DurableAdmissionResult:
 @dataclass
 class _StoppedCognitionResult(SignalResult):
     """Typed terminal no-op produced by an acknowledged cooperative Stop."""
+
+
+@dataclass(kw_only=True)
+class _ReconciliationCognitionResult(SignalResult):
+    """Tool effects require reconciliation; no automatic cognition replay."""
+
+    __slots__ = ("_original_error",)
+    original_error: InitVar[BaseException]
+
+    def __post_init__(self, original_error):
+        if not isinstance(original_error, BaseException):
+            raise TypeError("A reconciliation result requires its original failure")
+        self._original_error = original_error
 
 
 @dataclass
@@ -910,6 +924,8 @@ class SignalDispatcher:
                 f"durable_cognition_route:{id(self)}", default=False
             )
         )
+        self._original_signal_effect_provenance = contextvars.ContextVar(
+            f'original_signal_effect_provenance:{id(self)}', default=None)
         # Cancellation-resistant cognition turns are intentionally retained
         # rather than abandoned.  Both sets are bounded by the one in-flight
         # cursor delivery per dispatcher/consumer and expose exact ownership
@@ -1247,6 +1263,7 @@ class SignalDispatcher:
         # signal emitted by durable cognition is a new source unit and must not
         # inherit its parent's defer contract.
         durable_route_token = self._durable_cognition_route.set(False)
+        effect_provenance_token = self._original_signal_effect_provenance.set(None)
         # A durable cognition route defers *its own* outcome until the exact
         # delivery ACK/NACK boundary. ContextVars are copied into awaited and
         # background child dispatches, so inheriting that mutable list would
@@ -1359,16 +1376,16 @@ class SignalDispatcher:
                     _durable_admission.set_result(staged_admission.result())
                 return result
         except _DurableDeliveryShuttingDownError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 admission_error = error
                 raise
             return self._durable_shutdown_signal_result(signal, start)
         except asyncio.CancelledError as error:
-            if is_execution_control_error(error) or execution_commit_outcome(error) is not None:
+            if is_tool_execution_terminal_error(error) or execution_commit_outcome(error) is not None:
                 admission_error = error
             raise
         except BaseException as e:
-            if is_execution_control_error(e) or execution_commit_outcome(e) is not None:
+            if is_tool_execution_terminal_error(e) or execution_commit_outcome(e) is not None:
                 admission_error = e
                 raise
             if not isinstance(e, Exception):
@@ -1416,6 +1433,7 @@ class SignalDispatcher:
             if original_acceptance is not None:
                 self._accepted_signal_outcomes.pop(original_acceptance, None)
             self._durable_cognition_route.reset(durable_route_token)
+            self._original_signal_effect_provenance.reset(effect_provenance_token)
 
     async def enqueue_signal(
         self, signal: Signal, *, source_event_id: Optional[str] = None,
@@ -1583,7 +1601,9 @@ class SignalDispatcher:
         async def await_settlement_release() -> None:
             await settlement_release.wait()
 
-        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task, cancel_owned_task, is_owned_task_cancellation,
+        )
         from kestrel_sovereign.agent.invocation import admit_request_operation
         operation = None
         completion_callback = None
@@ -1607,7 +1627,7 @@ class SignalDispatcher:
                 from kestrel_sovereign._async_ownership import owned_task_error
                 owner_error = owned_task_error(completed_owner)
                 unresolved_control = (
-                    owner_error is not None and is_execution_control_error(owner_error)
+                    owner_error is not None and is_tool_execution_terminal_error(owner_error)
                 )
                 # Race matrix for the single release invariant:
                 #
@@ -1655,11 +1675,11 @@ class SignalDispatcher:
             if completion_callback is not None:
                 owner.remove_done_callback(completion_callback)
             if operation is not None:
-                operation.cancel()
+                cancel_owned_task(operation)
                 outcome = await await_owned_task(operation)
                 opening = execution_finite_error(
                     opening,
-                    outcome.error if is_execution_control_error(outcome.error) else None,
+                    None if is_owned_task_cancellation(operation, outcome.error) else outcome.error,
                     outcome.cancellation, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
@@ -3211,7 +3231,7 @@ class SignalDispatcher:
                 journal._ordinary_writer_failure if journal is not None else None)
             if journal is not None and observed_error is not None and not journal.has_acknowledged_commit():
                 self._record_original_outcome_loss(journal, journal._identity[0], observed_error)
-                if (outcome.cancellation is None and isinstance(observed_error, Exception) and not is_execution_control_error(observed_error)
+                if (outcome.cancellation is None and isinstance(observed_error, Exception) and not is_tool_execution_terminal_error(observed_error)
                         and execution_commit_outcome(observed_error) is None):
                     observed_error = None  # ordinary audit loss, not a failed handler
             originals.extend((journal.retain_observation(observed_error),
@@ -3222,7 +3242,7 @@ class SignalDispatcher:
                 complete, publication_error, _ = reconciliation
                 if journal is not None and publication_error is not None and not journal.has_acknowledged_commit():
                     self._record_original_outcome_loss(journal, journal._identity[0], publication_error)
-                    if (outcome.cancellation is None and isinstance(publication_error, Exception) and not is_execution_control_error(publication_error)
+                    if (outcome.cancellation is None and isinstance(publication_error, Exception) and not is_tool_execution_terminal_error(publication_error)
                             and execution_commit_outcome(publication_error) is None):
                         publication_error = None
                 publication_error = (journal.retain_observation(publication_error)
@@ -3333,7 +3353,7 @@ class SignalDispatcher:
                         # until mandatory CAS repair settles. Native UNKNOWN
                         # is different: a later no-match cannot reconcile an
                         # acknowledgement already lost on this original CAS.
-                        if is_execution_control_error(error):
+                        if is_tool_execution_terminal_error(error):
                             raise
                         withdrawal = withdrawal or error
                         continue
@@ -3452,13 +3472,13 @@ class SignalDispatcher:
             raise error
 
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
-        """One existing bounded safety latch for this runtime's native writers."""
-        if error is not None and is_execution_control_error(error):
+        """Retain original terminal delivery evidence from native writers."""
+        if error is not None and is_tool_execution_terminal_error(error):
             from kestrel_sovereign.execution_custody import (
                 execution_native_source_error,
             )
             self._outcome_log_control_error = execution_native_source_error(
-                self._outcome_log_control_error, error,
+                self._outcome_log_control_error, error, include_tool_terminal=True,
             )
 
     def _runtime_owner_cleanup_required(self) -> bool:
@@ -4295,7 +4315,7 @@ class SignalDispatcher:
                             lease_token=delivery.lease_token,
                         )
                     except BaseException as error:
-                        if is_execution_control_error(error):
+                        if is_tool_execution_terminal_error(error):
                             report_loss(error)
                             return
                         if not isinstance(error, Exception):
@@ -4322,7 +4342,7 @@ class SignalDispatcher:
                         return
                     expires_at = renewed.lease_expires_at
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     report_loss(error)
                     return
                 if not isinstance(error, Exception):
@@ -4351,7 +4371,7 @@ class SignalDispatcher:
             # Harvest its original control evidence only after it is terminal.
             outcome = await await_owned_task(task)
             child_error = outcome.error
-            if isinstance(child_error, asyncio.CancelledError) and not is_execution_control_error(child_error):
+            if isinstance(child_error, asyncio.CancelledError) and not is_tool_execution_terminal_error(child_error):
                 child_error = None  # Our requested cancellation of the renewer.
             renewal_error = lost.result() if lost.done() else None
             terminal = execution_observation_error(
@@ -4721,7 +4741,7 @@ class SignalDispatcher:
                                         exc, cleanup_exc, retain_originals=True,
                                         isolate_control_originals=True,
                                     )
-                                if is_execution_control_error(exc):
+                                if is_tool_execution_terminal_error(exc):
                                     raise
                                 if isinstance(exc, Exception):
                                     logger.error(
@@ -4750,7 +4770,7 @@ class SignalDispatcher:
                         **persistence_kwargs,
                     )
         except Exception as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             logger.exception(
                 "Failed to persist durable signal event %s (source=%s)",
@@ -4880,7 +4900,7 @@ class SignalDispatcher:
                             persisted.event_id,
                         )
                 except Exception as error:
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         raise
                     logger.exception(
                         "Could not upgrade legacy durable channel redelivery: event=%s",
@@ -5304,7 +5324,7 @@ class SignalDispatcher:
                 # coroutine if the READY wrapper never entered it.
                 operation.close()
                 try:
-                    if is_execution_control_error(terminal):
+                    if is_tool_execution_terminal_error(terminal):
                         await self._terminalize_failed_cognition(delivery, terminal)
                     else:
                         await self.nack_durable_delivery(
@@ -5349,7 +5369,7 @@ class SignalDispatcher:
             from kestrel_sovereign.execution_custody import _explicit_control_chain
             errors = (outcome.error, outcome.cancellation)
             cancellation_only = all(error is None or (
-                type(error) is asyncio.CancelledError and not is_execution_control_error(error)
+                type(error) is asyncio.CancelledError and not is_tool_execution_terminal_error(error)
                 and all(type(member) is asyncio.CancelledError for member in _explicit_control_chain(error)))
                 for error in errors)
             # An ordinary Stop with no independent failure retains native
@@ -5475,9 +5495,10 @@ class SignalDispatcher:
 
     @staticmethod
     def _completed_cognition_was_stopped(task):
-        from kestrel_sovereign._async_ownership import owned_task_error
-        return (task is not None and task.done() and owned_task_error(task) is None
-                and isinstance(task.result(), _StoppedCognitionResult))
+        if task is None or not task.done():
+            return False
+        outcome = SignalDispatcher._completed_cognition_outcome(task)
+        return outcome.error is None and isinstance(outcome.result, _StoppedCognitionResult)
 
     @asynccontextmanager
     async def _own_cognition_claim(self, delivery, routing_admission, *, journal_completion=()):
@@ -5514,11 +5535,11 @@ class SignalDispatcher:
                 if routing_task in self._retained_durable_cognition_tasks:
                     # This actual callback owns the exact claim even between
                     # physical completion and its next event-loop turn.
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         self._retain_cognition_native_control(delivery, error)
                         self._rearm_cleanup_runtime_owner_heartbeat()
                 elif routing_task is not None and not routing_task.done():
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         error = await self._settle_cognition_control(delivery, error, routing_task)
                     else:
                         await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
@@ -5526,9 +5547,9 @@ class SignalDispatcher:
                     # Never undo an ACK/final receipt. A committed retry NACK
                     # is different: control loss must retire its still-owned
                     # retry capability, rather than leave effects replayable.
-                    if settlement.retry_pending and is_execution_control_error(error):
+                    if settlement.retry_pending and is_tool_execution_terminal_error(error):
                         await self._terminalize_failed_cognition(delivery, error)
-                elif is_execution_control_error(error):
+                elif is_tool_execution_terminal_error(error):
                     error = await self._settle_cognition_control(delivery, error, routing_task)
                 elif self._completed_cognition_was_stopped(routing_task):
                     # A proven operator Stop must never become replayable
@@ -5585,7 +5606,7 @@ class SignalDispatcher:
                 use_live_signal=use_live_signal,
             )
         except BaseException as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             if not isinstance(error, Exception):
                 raise
@@ -5602,7 +5623,7 @@ class SignalDispatcher:
                     retry_delay=retry_delay,
                 )
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                     raise
                 if not isinstance(error, Exception):
@@ -5680,7 +5701,7 @@ class SignalDispatcher:
         try:
             hold_admission = await get_effective_hold_state(self._agent)
         except HoldStateError as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 await self._terminalize_failed_cognition(delivery, exc)
                 raise
             result = self._failure_result(
@@ -5695,7 +5716,7 @@ class SignalDispatcher:
                     delivery=delivery,
                 )
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                     raise
                 if not isinstance(error, Exception):
@@ -5722,7 +5743,7 @@ class SignalDispatcher:
                     delivery=delivery,
                 )
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                     raise
                 if not isinstance(error, Exception):
@@ -5738,7 +5759,7 @@ class SignalDispatcher:
         try:
             await self._begin_durable_cognition_execution(delivery)
         except BaseException as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 await self._terminalize_failed_cognition(delivery, exc)
                 raise
             if not isinstance(exc, Exception):
@@ -5780,8 +5801,13 @@ class SignalDispatcher:
                         from kestrel_sovereign.hold.enforcement import (
                             _reuse_turn_admission_snapshot,
                         )
+                        from kestrel_sovereign.signals.effect_provenance import signal_effect_provenance
 
+                        provenance = signal_effect_provenance(delivery.event,
+                            agent_id=self._agent.did, canonical_signal=routing_signal)
                         route_token = self._durable_cognition_route.set(True)
+                        provenance_token = self._original_signal_effect_provenance.set(
+                            provenance)
                         try:
                             with _reuse_turn_admission_snapshot(
                                 self._agent, hold_admission
@@ -5792,6 +5818,7 @@ class SignalDispatcher:
                                     start,
                                 )
                         finally:
+                            self._original_signal_effect_provenance.reset(provenance_token)
                             self._durable_cognition_route.reset(route_token)
 
                     from kestrel_sovereign._async_ownership import create_owned_task
@@ -5866,7 +5893,7 @@ class SignalDispatcher:
                 outcome = await await_owned_task(routing_task)
                 error = execution_observation_error(error, outcome.error, outcome.cancellation)
             error = execution_observation_error(lease_loss_error, error)
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
                 raise error
             if routing_task is not None:
@@ -5885,7 +5912,7 @@ class SignalDispatcher:
                 outcome = await await_owned_task(routing_task)
                 error = execution_observation_error(error, outcome.error, outcome.cancellation)
             error = execution_observation_error(lease_loss_error, error)
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
             elif routing_task is not None:
                 # Acceptance is not successful publication. A failed start
@@ -5932,7 +5959,7 @@ class SignalDispatcher:
                             error=failure.error or "Durable cognition routing was cancelled",
                         )
                 except BaseException as error:
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         await self._terminalize_failed_cognition(delivery, error)
                         raise
                     if not isinstance(error, Exception):
@@ -5964,7 +5991,7 @@ class SignalDispatcher:
                     lease_token=delivery.lease_token or "",
                 )
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                     raise
                 if not isinstance(error, Exception):
@@ -6011,7 +6038,7 @@ class SignalDispatcher:
                     error="Completed cognition delivery ACK was not accepted",
                 )
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                     raise
                 if not isinstance(error, Exception):
@@ -6040,7 +6067,7 @@ class SignalDispatcher:
                     delivery=delivery,
                 )
             except BaseException as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                 raise
             self._finalize_deferred_durable_outcome(
@@ -6075,15 +6102,26 @@ class SignalDispatcher:
         )
         return result
 
+    @staticmethod
+    def _cognition_result_is_terminal(result):
+        """One finality rule for immediate and retained route results."""
+        return isinstance(result, (_ReconciliationCognitionResult, _StoppedCognitionResult)) or result.status in {
+            Status.DROPPED_VALIDATION,
+            Status.DROPPED_CYCLE,
+        }
+
     async def _settle_cognition_non_delivery(self, delivery, result, *, consumer_id, retry_delay) -> bool:
         """Persist one source withdrawal or unsuccessful route under its exact lease."""
         # Rate limits, quiet hours, coalescing, and cognition failures are
         # recoverable for cursor-owning ingress. Validation/cycle refusal is a
         # proven terminal no-op and may be acknowledged idempotently.
-        terminal = isinstance(result, _StoppedCognitionResult) or result.status in {
-            Status.DROPPED_VALIDATION,
-            Status.DROPPED_CYCLE,
-        }
+        reconciliation = isinstance(result, _ReconciliationCognitionResult)
+        if reconciliation:
+            # Returned reconciliation and raised terminal failure own the
+            # same exact-token terminalizer, including failed-write debt.
+            await self._terminalize_failed_cognition(delivery, result._original_error)
+            return False
+        terminal = self._cognition_result_is_terminal(result)
         try:
             released = await self.nack_durable_delivery(
                 consumer_id=consumer_id,
@@ -6092,7 +6130,7 @@ class SignalDispatcher:
                 error=result.error or f"Cognition delivery returned {result.status.value}",
                 retry_delay=retry_delay,
                 terminal=terminal,
-                terminal_ackable=terminal,
+                terminal_ackable=terminal and not reconciliation,
             )
             # An ordinary NACK correctly refuses an expired lease.  This
             # dispatcher still owns a live managed token, however, so it can
@@ -6107,10 +6145,10 @@ class SignalDispatcher:
                     lease_token=delivery.lease_token or "",
                     error=result.error or f"Cognition delivery returned {result.status.value}",
                     terminal=terminal,
-                    terminal_ackable=terminal,
+                    terminal_ackable=terminal and not reconciliation,
                 )
         except BaseException as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 await self._terminalize_failed_cognition(delivery, error)
             raise
         # TERMINAL is an external receipt, not a route-level interpretation.
@@ -6177,17 +6215,19 @@ class SignalDispatcher:
         self._rearm_cleanup_runtime_owner_heartbeat()
 
         def completed(completed_task: asyncio.Task[SignalResult]) -> None:
-            from kestrel_sovereign._async_ownership import owned_task_error
             # First canonical harvest precedes releasing the physical owner;
             # Task.result() can erase a cancellation cause on a second read.
-            error = owned_task_error(completed_task)
+            outcome = self._completed_cognition_outcome(completed_task)
+            result = outcome.result
+            error = execution_observation_error(outcome.error,
+                result._original_error if isinstance(result, _ReconciliationCognitionResult) else None)
             debt = getattr(self, "_retained_cognition_control_debt", {}).get(delivery.delivery_id)
             from kestrel_sovereign.execution_custody import (
                 execution_native_source_error,
             )
-            retained_error = execution_native_source_error(control_error, debt[1] if debt else None)
-            if error is not None and is_execution_control_error(error):
-                retained_error = execution_native_source_error(retained_error, error)
+            retained_error = execution_native_source_error(control_error, debt[1] if debt else None, include_tool_terminal=True)
+            if error is not None and is_tool_execution_terminal_error(error):
+                retained_error = execution_native_source_error(retained_error, error, include_tool_terminal=True)
             elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # The route's final disposition was already made visible when
                 # retention began.  Harvest this late exception so it cannot
@@ -6212,7 +6252,7 @@ class SignalDispatcher:
                 self._rearm_cleanup_runtime_owner_heartbeat()
             self._retained_durable_cognition_tasks.discard(completed_task)
             cleanup = asyncio.create_task(
-                self._release_retained_durable_cognition_task(delivery, retained_error),
+                self._release_retained_durable_cognition_task(delivery, retained_error, result=result),
                 name=(
                     "durable_cognition_retained_cleanup:"
                     f"{delivery.delivery_id}"
@@ -6224,7 +6264,7 @@ class SignalDispatcher:
                 from kestrel_sovereign._async_ownership import owned_task_error
                 error = owned_task_error(cleanup_task)
                 self._retained_durable_cognition_cleanup_tasks.discard(cleanup_task)
-                if error is not None and is_execution_control_error(error):
+                if error is not None and is_tool_execution_terminal_error(error):
                     self._retain_cognition_native_control(delivery, error)
                     self._rearm_cleanup_runtime_owner_heartbeat()
                 elif error is not None and not isinstance(error, asyncio.CancelledError):
@@ -6239,13 +6279,17 @@ class SignalDispatcher:
 
     async def _release_retained_durable_cognition_task(
         self, delivery: DurableDelivery, control_error: BaseException | None = None,
-        *, observe_failure: bool = False,
+        *, observe_failure: bool = False, result: SignalResult | None = None,
     ) -> None:
         """Requeue one exact retained lease only after its task is terminal."""
 
         if control_error is not None:
             await self._terminalize_failed_cognition(delivery, control_error)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            return
+        if result is not None and self._cognition_result_is_terminal(result):
+            await self._settle_cognition_non_delivery(delivery, result,
+                consumer_id=delivery.consumer_id, retry_delay=timedelta())
             return
         try:
             released = await self.release_durable_delivery_after_task(
@@ -6255,7 +6299,7 @@ class SignalDispatcher:
                 error="Cognition task settled after durable lease loss",
             )
         except BaseException as error:
-            if is_execution_control_error(error) or observe_failure:
+            if is_tool_execution_terminal_error(error) or observe_failure:
                 # Observation may report a failed release, but it cannot
                 # withdraw this exact token's existing settlement owner.
                 # The canonical terminalizer retains debt BEFORE any await.
@@ -6303,21 +6347,21 @@ class SignalDispatcher:
         return error
 
     def _retain_cognition_native_control(self, delivery, *errors):
-        """One source-only boundary for every existing cognition-debt writer."""
+        """Retain source-only terminal delivery evidence without observer history."""
         from kestrel_sovereign.execution_custody import (
             _native_source_originals,
             execution_native_source_error,
         )
         prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
         previous = None if prior is None else prior[1]
-        sources = _native_source_originals(previous)
-        incoming = tuple(source for error in errors for source in _native_source_originals(error))
+        sources = _native_source_originals(previous, include_tool_terminal=True)
+        incoming = tuple(source for error in errors for source in _native_source_originals(error, include_tool_terminal=True))
         if previous is not None and incoming and all(
             any(source is old for old in sources) for source in incoming
         ):
             retained = previous
         else:
-            retained = execution_native_source_error(previous, *errors)
+            retained = execution_native_source_error(previous, *errors, include_tool_terminal=True)
         if retained is not None:
             self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
         return retained
@@ -6387,7 +6431,7 @@ class SignalDispatcher:
                     for resource, owner in execution_cleanup_debts(retained_error)
                 )
                 retained = (retained_error if already_unadmitted else
-                            execution_native_source_error(terminal) or retained_error)
+                            execution_native_source_error(terminal, include_tool_terminal=True) or retained_error)
                 self._retain_cognition_native_control(delivery, retained)
                 if task is None:
                     raise terminal
@@ -6421,7 +6465,11 @@ class SignalDispatcher:
             raise terminal
 
     async def _apply_cognition_control_terminal(self, delivery, error):
-        reason = f"execution_control_unresolved: {type(error).__name__}: {error}"[:500]
+        from kestrel_sovereign.tools.effect_failures import tool_effect_failure
+        failure = tool_effect_failure(error)
+        detail = (f"{failure.code}: {failure.message}" if failure is not None
+            and failure.reconciliation_required else f"{type(error).__name__}: {error}")
+        reason = f"execution_control_unresolved: {detail}"[:500]
         backend = self._durable_store.backend
         if backend.backend_type == "postgres":
             # Ordinary admission is deliberately still denied. Only the fixed
@@ -6461,6 +6509,26 @@ class SignalDispatcher:
         )
 
     @staticmethod
+    def _completed_cognition_outcome(task):
+        """Read the original physical result AND canonical completion receipt."""
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskOutcome, owned_native_completion, owned_task_error,
+        )
+        if task.cancelled():
+            # Snapshot native cancellation before Task.result consumes its
+            # original cause. The canonical harvester retains that same receipt.
+            return OwnedTaskOutcome(result=None, error=owned_task_error(task), cancellation=None)
+        result = None
+        try:
+            with owned_native_completion(task):
+                result = task.result()
+        except BaseException as error:
+            if isinstance(result, _ReconciliationCognitionResult):
+                error = execution_observation_error(error, result._original_error)
+            return OwnedTaskOutcome(result=result, error=error, cancellation=None)
+        return OwnedTaskOutcome(result=result, error=None, cancellation=None)
+
+    @staticmethod
     def _completed_durable_cognition_result(
         task: asyncio.Task[SignalResult],
         *,
@@ -6469,14 +6537,17 @@ class SignalDispatcher:
     ) -> Optional[SignalResult]:
         """Return a settled route result without leaking task cancellation."""
 
+        outcome = SignalDispatcher._completed_cognition_outcome(task)
+        if outcome.error is None:
+            return outcome.result
         try:
-            return task.result()
+            raise outcome.error
         except asyncio.CancelledError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             return None
         except Exception as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             logger.exception(
                 "Durable cognition route task failed outside its result contract: "
@@ -6644,7 +6715,7 @@ class SignalDispatcher:
             if not await self._agent_is_held():
                 return None
         except HoldStateError as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             result = self._failure_result(
                 signal,
@@ -6852,7 +6923,7 @@ class SignalDispatcher:
                 )
 
             except Exception as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 logger.exception(
                     "Handler raised for signal %s (source=%s, mode=%s)",
@@ -6956,7 +7027,7 @@ class SignalDispatcher:
                         span.set_attribute(KESTREL_TURN_ID, result.turn_id)
                 return result
         except InvocationSelfFencedError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             # Losing the distributed owner lease is a fail-closed
             # infrastructure decision, not receipt-backed evidence that an
@@ -6970,28 +7041,19 @@ class SignalDispatcher:
                 audit=audit,
             )
         except InvocationCancelledError as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             # Cooperative Stop is neither a provider failure nor retry
             # authority. Preserve the ordinary route audit while carrying a
             # typed disposition to the durable settlement boundary below.
-            stopped = self._fail(
+            return self._fail(
                 signal,
                 start,
                 Status.COALESCED,
                 error=f"stop_acknowledged: {error}",
                 registration=registration,
                 audit=audit,
-            )
-            return _StoppedCognitionResult(
-                signal_id=stopped.signal_id,
-                status=stopped.status,
-                mode=stopped.mode,
-                duration_ms=stopped.duration_ms,
-                turn_id=stopped.turn_id,
-                artifact=stopped.artifact,
-                action_result=stopped.action_result,
-                error=stopped.error,
+                result_factory=_StoppedCognitionResult,
             )
         except HoldTurnRefusal:
             return self._hold_signal_disposition(
@@ -7002,7 +7064,7 @@ class SignalDispatcher:
                 audit=audit,
             )
         except HoldStateError as exc:
-            if is_execution_control_error(exc):
+            if is_tool_execution_terminal_error(exc):
                 raise
             # A final turn-start read can fail after the earlier source
             # snapshot. Durable routing recognizes this typed outage and
@@ -7024,6 +7086,14 @@ class SignalDispatcher:
         except Exception as e:
             if is_execution_control_error(e):
                 raise
+            from kestrel_sovereign.tools.effect_failures import tool_effect_failure
+
+            failure = tool_effect_failure(e)
+            if failure is not None and failure.reconciliation_required:
+                return self._fail(signal, start, Status.FAILED,
+                    error=f'{failure.code}: {failure.message}',
+                    registration=registration, audit=audit,
+                    result_factory=functools.partial(_ReconciliationCognitionResult, original_error=e))
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
             # `_route_under_locks` calls `_fail` without it. Catch
@@ -7131,8 +7201,8 @@ class SignalDispatcher:
                 outcome = await await_owned_task(task)
                 error = outcome.error
                 # Our withdrawal/cleanup cancellation is expected only when
-                # the worker carries no stronger native control receipt.
-                if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
+                # the worker carries no terminal delivery receipt.
+                if isinstance(error, asyncio.CancelledError) and not is_tool_execution_terminal_error(error):
                     error = None
                 return error, outcome.cancellation
 
@@ -7292,7 +7362,7 @@ class SignalDispatcher:
                     if isinstance(value, str):
                         constitution_text = value
                 except Exception as error:
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         raise
                     logger.exception(
                         "_get_governing_constitution raised for signal %s; "
@@ -7352,7 +7422,7 @@ class SignalDispatcher:
                     if isinstance(refreshed, str) and refreshed:
                         audit.constitution_hash = refreshed
                 except Exception as error:
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         raise
                     logger.exception(
                         "Post-anchor constitution_hash refresh raised for "
@@ -7419,7 +7489,7 @@ class SignalDispatcher:
                             SystemPromptNamespaceError,
                         )
 
-                        if is_execution_control_error(exc) or isinstance(exc, SystemPromptNamespaceError):
+                        if is_tool_execution_terminal_error(exc) or isinstance(exc, SystemPromptNamespaceError):
                             raise
                         logger.exception(
                             "Inline-format doctrine resolution failed for "
@@ -7610,7 +7680,7 @@ class SignalDispatcher:
                         )
 
                         if (not isinstance(exc, Exception)
-                            or is_execution_control_error(exc)
+                            or is_tool_execution_terminal_error(exc)
                             or isinstance(exc, SystemPromptNamespaceError)):
                             # Receipt registration and causation binding happen
                             # before doctrine resolution. This validation error is
@@ -7631,6 +7701,12 @@ class SignalDispatcher:
             # receipt in the process-input/terminal-NACK crash window.
             if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
                 process_input_kwargs["invocation_id"] = signal.id
+            if _agent_accepts_kwarg(self._agent.process_input, 'invocation_provenance'):
+                from kestrel_sovereign.signals.effect_provenance import signal_effect_provenance
+
+                process_input_kwargs['invocation_provenance'] = (
+                    self._original_signal_effect_provenance.get()
+                    or signal_effect_provenance(signal, agent_id=self._agent.did))
             if pre_turn_guard is not None:
                 # Bind the signal now; evaluate inside the turn's span. The turn
                 # decides an admission, it does not read signal envelopes, so what
@@ -7821,7 +7897,7 @@ class SignalDispatcher:
             if asyncio.iscoroutine(value):
                 await value
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             logger.exception(
                 "agent.ensure_doctrine_bundle_anchored raised; "
@@ -7861,7 +7937,7 @@ class SignalDispatcher:
                     value = await value
                 audit.constitution_hash = value
             except Exception as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 logger.exception(
                     "agent.get_constitution_hash raised for signal %s; "
@@ -7882,7 +7958,7 @@ class SignalDispatcher:
                     value = await value
                 anchored_hash = value
             except Exception as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 logger.exception(
                     "agent.get_anchored_doctrine_bundle_hash raised for "
@@ -7898,7 +7974,7 @@ class SignalDispatcher:
                     value = await value
                 live_hash = value
             except Exception as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 logger.exception(
                     "agent.compute_live_doctrine_bundle_hash raised for "
@@ -7991,7 +8067,7 @@ class SignalDispatcher:
             if asyncio.iscoroutine(value):
                 value = await value
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             logger.exception(
                 "agent.verify_constitution_echo raised for signal %s",
@@ -8106,8 +8182,10 @@ class SignalDispatcher:
         error: Optional[str],
         registration: Optional[SourceRegistration] = None,
         audit: Optional[_ConstitutionAudit] = None,
+        result_factory: Callable[..., SignalResult] = SignalResult,
     ) -> SignalResult:
-        result = self._failure_result(signal, start, error=error, status=status)
+        result = self._failure_result(signal, start, error=error, status=status,
+            result_factory=result_factory)
         if registration is not None:
             self._schedule_outcome_log(signal, registration, result, audit=audit)
         return result
@@ -8119,10 +8197,11 @@ class SignalDispatcher:
         *,
         error: Optional[str],
         status: Status = Status.FAILED,
+        result_factory: Callable[..., SignalResult] = SignalResult,
     ) -> SignalResult:
         """Build a failure result without committing an outcome yet."""
 
-        return SignalResult(
+        return result_factory(
             signal_id=signal.id,
             status=status,
             mode=signal.mode,
@@ -8180,7 +8259,7 @@ class SignalDispatcher:
                         prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
                         **_audit_to_log_kwargs(audit))
                 except Exception as error:
-                    if is_execution_control_error(error) or execution_commit_outcome(error) is not None:
+                    if is_tool_execution_terminal_error(error) or execution_commit_outcome(error) is not None:
                         raise
                     self._record_original_outcome_loss(journal, signal.id, error)
                     self._release_durable_admission(reservation)
@@ -8205,7 +8284,7 @@ class SignalDispatcher:
                 # for its loss. Accepted writers own their own one outcome.
                 if journal is not None:
                     self._record_original_outcome_loss(journal, signal.id, opening)
-                    if (isinstance(opening, Exception) and not is_execution_control_error(opening)
+                    if (isinstance(opening, Exception) and not is_tool_execution_terminal_error(opening)
                             and execution_commit_outcome(opening) is None):
                         logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
                         return
@@ -8239,7 +8318,7 @@ class SignalDispatcher:
             error = owned_task_error(task)
             if journal is not None and error is not None:
                 self._record_original_outcome_loss(journal, signal.id, error)
-            if error is not None and is_execution_control_error(error):
+            if error is not None and is_tool_execution_terminal_error(error):
                 self._retain_durable_writer_control(error)
             elif error is not None and not isinstance(error, asyncio.CancelledError):
                 # _log_safe reports storage/UI errors itself.  This is a
@@ -8287,7 +8366,7 @@ class SignalDispatcher:
             writer = publication.task
             if writer is None:
                 self._record_original_outcome_loss(journal, signal.id, error)
-                if (isinstance(error, Exception) and not is_execution_control_error(error)
+                if (isinstance(error, Exception) and not is_tool_execution_terminal_error(error)
                         and execution_commit_outcome(error) is None):
                     logger.error('Original outcome writer allocation failed for %s', signal.id, exc_info=True)
                     return
@@ -8320,7 +8399,7 @@ class SignalDispatcher:
             logger.error("Signal outcome observation failed after COMMIT for %s" if committed
                          else "Failed to write signal_log entry for %s", signal.id,
                          exc_info=(type(exc), exc, exc.__traceback__))
-            if is_execution_control_error(exc) or execution_commit_outcome(exc) is not None:
+            if is_tool_execution_terminal_error(exc) or execution_commit_outcome(exc) is not None:
                 self._retain_durable_writer_control(exc)
                 raise execution_observation_error(exc, withdrawal)
             if not isinstance(exc, Exception) or withdrawal is not None:
@@ -8331,7 +8410,7 @@ class SignalDispatcher:
     def _record_original_outcome_loss(self, journal, signal_id, error):
         """Exactly one unacknowledged original row, even if its Task never starts."""
         if journal is not None:
-            if (isinstance(error, Exception) and not is_execution_control_error(error)
+            if (isinstance(error, Exception) and not is_tool_execution_terminal_error(error)
                     and execution_commit_outcome(error) is None
                     and not journal.has_acknowledged_commit()):
                 # Best-effort loss is suppressed only for a healthy observer.
@@ -8456,7 +8535,7 @@ class SignalDispatcher:
             receipt = await emit("signal_completed", payload)
         except BaseException as error:
             self._record_surface(signal.id, SURFACE_EMIT_FAILED)
-            if (is_execution_control_error(error) or execution_commit_outcome(error) is not None
+            if (is_tool_execution_terminal_error(error) or execution_commit_outcome(error) is not None
                     or not isinstance(error, Exception)):
                 if journal is not None:
                     raise journal.retain_committed(error)

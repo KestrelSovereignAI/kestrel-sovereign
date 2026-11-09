@@ -82,7 +82,15 @@ async def test_unbound_stream_control_bypasses_ordinary_accounting(outcome, carr
         service._log_llm_call.assert_not_awaited()
         service._track_model_usage.assert_not_awaited()
     finally:
-        await stream.aclose()
+        from kestrel_sovereign._async_ownership import await_owned_operation
+        closed = await await_owned_operation(stream.aclose(), retain_originals=True)
+        if outcome == "denied" and carrier == "direct":
+            assert closed.error is closed.cancellation is None
+        else:
+            # Retirement cannot erase COMMIT/UNKNOWN or a genuine native
+            # cancellation simply because the terminal reader saw it first.
+            assert closed.error is error
+            assert closed.cancellation is None
 
 
 @pytest.mark.asyncio

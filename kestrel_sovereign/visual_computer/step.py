@@ -69,6 +69,7 @@ class _StepAdmission:
     generation: object
     backend_scope: object
     work_scopes: tuple
+    work_check: object
     expires_at: object
 
 
@@ -80,7 +81,7 @@ class _OriginalVisualStep:
 
         if type(runtime) is not VisualComputerRuntime or type(intent) is not StepIntent:
             raise ExecutionAuthorityError("Original visual step host required")
-        from kestrel_sovereign.execution_custody import current_execution_custody
+        from kestrel_sovereign.execution_custody import current_execution_custody, capture_execution_work_check
         from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
         database = runtime.repository.db
@@ -106,6 +107,7 @@ class _OriginalVisualStep:
             backend.connection_generation if type(backend) is SQLiteBackend else None,
             getattr(backend, "_execution_custody", None),
             current_execution_custody(backend),
+            capture_execution_work_check(backend),
             min(
                 context.expires_at,
                 session.expires_at,
@@ -159,6 +161,7 @@ class _OriginalVisualStep:
             raise ResourceConflict("Original visual step retired")
         for scope in a.work_scopes:
             scope.require_work()
+        a.work_check()
         if a.backend_scope is not None:
             a.backend_scope.require_work()
         a.act()

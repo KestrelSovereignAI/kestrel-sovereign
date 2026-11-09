@@ -12,7 +12,6 @@ import base64
 import hashlib
 import hmac
 import json
-import secrets
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -29,6 +28,8 @@ from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_commit_outcome
+from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
+from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
 from .step import PlanningRecord, StepIntent
 from .runpod_quote_storage import _RunpodEnvironmentEnvelope
 
@@ -126,7 +127,10 @@ class VisualCustodyRepository:
                 raise CustodyIntegrityError("visual custody requires encryption")
             if self.db.owns_open_transaction is not False:
                 raise ResourceConflict("visual custody requires an outermost transaction")
-            try:
+            with repository_initialization_errors(
+                integrity_error=CustodyIntegrityError,
+                unknown_message="visual custody initialization requires reconciliation",
+            ):
                 async with self.db.migration_lock("visual-computer-custody-v1"):
                     binary = "BYTEA" if self.db.backend_type == "postgres" else "BLOB"
                     for sql in (
@@ -138,16 +142,16 @@ class VisualCustodyRepository:
                     ):
                         await self.db.execute(sql)
                     row = await self.db.fetchone("SELECT wrapped_key FROM visual_computer_keys WHERE key_id = ?", ("v1",))
-                    if row is None:
-                        if await self.db.fetchone("SELECT 1 FROM visual_computer_requests LIMIT 1"):
-                            raise CustodyIntegrityError("original visual custody key is missing")
-                        key = secrets.token_bytes(32)
-                        await self.db.execute("INSERT INTO visual_computer_keys (key_id, wrapped_key) VALUES (?, ?)", ("v1", cipher.encrypt(key)))
-                    else:
-                        try:
-                            key = cipher.decrypt(bytes(row[0]))
-                        except DecryptionError:
-                            raise CustodyIntegrityError("original visual custody key is unavailable") from None
+                    key, new_envelope = resolve_envelope_key(
+                        cipher, bytes(row[0]) if row is not None else None,
+                        has_dependents=bool(await self.db.fetchone("SELECT 1 FROM visual_computer_requests LIMIT 1")) if row is None else False,
+                        integrity_error=CustodyIntegrityError,
+                        missing_message="original visual custody key is missing",
+                        unavailable_message="original visual custody key is unavailable",
+                        invalid_message="invalid visual custody envelope key",
+                    )
+                    if new_envelope is not None:
+                        await self.db.execute("INSERT INTO visual_computer_keys (key_id, wrapped_key) VALUES (?, ?)", ("v1", new_envelope))
                     # These indexed flags are projections of authenticated
                     # payloads, never an independent authority/ownership store.
                     for table, column in (("visual_computer_requests", "released"),
@@ -190,12 +194,6 @@ class VisualCustodyRepository:
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_retired_requests ON visual_computer_requests (owner, retired, released)")
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_pending_actions ON visual_computer_actions (owner, session_key, pending)")
                     await self.db.execute("DELETE FROM visual_computer_actions WHERE pending = 0 AND EXISTS (SELECT 1 FROM visual_computer_requests r WHERE r.owner = visual_computer_actions.owner AND r.session_key = visual_computer_actions.session_key AND r.released = 1)")
-            except TransactionError as error:
-                if execution_commit_outcome(error) is not None:
-                    raise ResourceOutcomeUnknown("visual custody initialization requires reconciliation") from error
-                if isinstance(error.__cause__, CustodyIntegrityError):
-                    raise error.__cause__ from None
-                raise
             self._key = key
 
     def _address(self, *parts, key=None):

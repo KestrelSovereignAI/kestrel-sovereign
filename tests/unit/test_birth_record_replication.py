@@ -1256,6 +1256,7 @@ async def test_an_absent_identity_still_refuses_with_or_without_an_anchor(
 
     from kestrel_sovereign.agent.boot import BootContext
     from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
+    from tests.utils.aiosqlite_workers import normal_close_schedule
 
     creds, agent, runtime, storage = await _storage_phase_agent(
         tmp_path, "Nameless Bird",
@@ -1264,7 +1265,13 @@ async def test_an_absent_identity_still_refuses_with_or_without_an_anchor(
         # An anchor that exists but holds nothing to copy.
         (tmp_path / "kestrel_prime.db").unlink()
         empty = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
-        await empty.close()
+        # This test exercises identity refusal, not filesystem close latency.
+        # Join the real close and worker on the canonical normal schedule.
+        async with normal_close_schedule() as finish:
+            await finish(
+                empty.backend._connection, empty.close(),
+                retained_closes=empty.backend._retired_connection_closes,
+            )
         assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
 
         with patch("kestrel_sovereign.kestrel_agent.AsyncStorage", return_value=storage), \

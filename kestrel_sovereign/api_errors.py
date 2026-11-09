@@ -46,6 +46,16 @@ class ApiHTTPException(HTTPException):
         self.details = details
 
 
+def tool_effect_api_error(error: BaseException) -> ApiHTTPException | None:
+    """Classify known journal failures without reflecting exception content."""
+    from kestrel_sovereign.tools.effect_failures import tool_effect_failure
+
+    failure = tool_effect_failure(error)
+    return (ApiHTTPException(failure.status_code, code=failure.code,
+            message=failure.message, details=failure.details)
+        if failure is not None else None)
+
+
 def rate_limited_until(
     declined: AdvisedWaitExceedsRetryBudget, *, now: datetime | None = None
 ) -> ApiHTTPException:

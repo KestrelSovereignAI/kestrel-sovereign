@@ -2327,9 +2327,9 @@ class PostgresBackend(DatabaseBackend):
               AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits AS h
                   WHERE h.inhparent OPERATOR(pg_catalog.=) c.oid OR h.inhrelid OPERATOR(pg_catalog.=) c.oid)
-              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid OPERATOR(pg_catalog.=) c.oid)
+              AND ($4::pg_catalog.bool OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid OPERATOR(pg_catalog.=) c.oid))
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class OPERATOR(pg_catalog.=) c.oid)
-              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid OPERATOR(pg_catalog.=) c.oid AND k.contype OPERATOR(pg_catalog.=) 'c')
+              AND ($4::pg_catalog.bool OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid OPERATOR(pg_catalog.=) c.oid AND k.contype OPERATOR(pg_catalog.=) 'c'))
               AND NOT EXISTS (
                   SELECT 1 FROM pg_catalog.pg_index AS i WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid
                     AND (i.indexprs IS NOT NULL OR
@@ -2370,7 +2370,8 @@ class PostgresBackend(DatabaseBackend):
                   JOIN pg_catalog.pg_namespace AS tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
                   WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
                     AND (tn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' OR a.attgenerated OPERATOR(pg_catalog.<>) '' OR a.attidentity OPERATOR(pg_catalog.<>) ''))
-        ''', name, _POSTGRES_FIRST_NORMAL_OBJECT_ID, table == 'signal_log')
+        ''', name, _POSTGRES_FIRST_NORMAL_OBJECT_ID, table == 'signal_log',
+            table in {'tool_effect_operations', 'tool_effect_claims'})
         if row is None or row['relation_name'] != table:
             return None
         fields = dict(row)
@@ -2388,6 +2389,13 @@ class PostgresBackend(DatabaseBackend):
             expected = {name: builtin[{'TEXT':'text','BLOB':'bytea','BIGINT':'int8'}[kind]] for name, kind in profile_columns.items()}
         if len(types) != len(columns) or any(oid != expected[name] for name, oid in zip(columns, types)):
             return None
+        if table in {'tool_effect_operations', 'tool_effect_claims'}:
+            from .tool_effect_relation import _tool_effect_program_identity
+
+            programs = await _tool_effect_program_identity(connection, fields)
+            if programs is None:
+                return None
+            fields['program_identity'] = programs
         return _OriginalPostgresJournalRelation(**fields)
 
     async def _capture_original_signal_outcome_relation(self, journal, *, role="primary"):
@@ -2512,7 +2520,7 @@ class PostgresBackend(DatabaseBackend):
                 if await native._original_journal_principal() != journal._postgres_pool.principal:
                     raise journal.write_refusal('native_principal_changed')
                 journal.require_original(self)
-                from .native_row_custody import _current_row, _current_step
+                from .native_row_custody import _current_row, _current_step, _native_auxiliary_roles
                 current = _current_row(journal)
                 step = _current_step(journal)
                 async with self._tracked_native_transaction(connection, state.scopes, state,
@@ -2530,13 +2538,13 @@ class PostgresBackend(DatabaseBackend):
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name, journal=journal) != relation:
                         raise journal.write_refusal('destination_changed')
                     journal.require_original(self)
-                    if step:
-                        for role, accepted in zip(("owners", "requests"), journal._aux_relations):
+                    if _native_auxiliary_roles(journal):
+                        for role, accepted in zip(_native_auxiliary_roles(journal), journal._aux_relations):
                             await connection.execute(f'LOCK TABLE ONLY {accepted.qualified_name} IN SHARE UPDATE EXCLUSIVE MODE')
                             journal.require_original(self)
                             if await self._read_original_signal_outcome_relation(connection, accepted.qualified_name, journal=journal, role=role) != accepted:
                                 raise journal.write_refusal('auxiliary_destination_changed')
-                        if journal._mode == "claim":
+                        if step and journal._mode == "claim":
                             owners = journal._aux_relations[0].qualified_name
                             status = await connection.execute(f'UPDATE {owners} SET generation = generation + 1 WHERE owner = $1', journal._identity[0])
                             journal.require_original(self)
@@ -2545,7 +2553,7 @@ class PostgresBackend(DatabaseBackend):
                     values = self._strip_tz(entry.values)
                     status = await connection.execute(query, *values)
                     journal.require_original(self)
-                    if status != ('INSERT 0 1' if step and journal._mode == 'claim' else 'UPDATE 1' if relation.relation_name in {'visual_computer_actions', 'visual_computer_requests'} else 'INSERT 0 1'):
+                    if status != ('INSERT 0 1' if step and journal._mode == 'claim' else 'UPDATE 1' if relation.relation_name in {'visual_computer_actions', 'visual_computer_requests', 'tool_effect_operations'} else 'INSERT 0 1'):
                         raise journal.write_refusal('row_count')
                     matches = await connection.fetch(match_query, *values)
                     journal.require_original(self)
@@ -2554,8 +2562,8 @@ class PostgresBackend(DatabaseBackend):
                     journal.require_original(self)
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name, journal=journal) != relation:
                         raise journal.write_refusal('destination_changed')
-                    if step:
-                        for role, accepted in zip(("owners", "requests"), journal._aux_relations):
+                    if _native_auxiliary_roles(journal):
+                        for role, accepted in zip(_native_auxiliary_roles(journal), journal._aux_relations):
                             if await self._read_original_signal_outcome_relation(connection, accepted.qualified_name, journal=journal, role=role) != accepted:
                                 raise journal.write_refusal('auxiliary_destination_changed')
                     journal.require_original(self)

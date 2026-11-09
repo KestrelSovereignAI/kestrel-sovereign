@@ -15,8 +15,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
 )
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-from kestrel_sovereign.agent.streaming import _DeferredToolBatchCancellation
+from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCustody,
@@ -30,6 +29,8 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.utils.native_streaming import streaming_agent
+from tests.utils.native_tool_effects import drive_native
 
 
 @pytest.mark.asyncio
@@ -45,7 +46,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
     ],
 )
 async def test_original_batch_receipt_survives_aborted_source_handoff(
-    native_pg, monkeypatch, mode
+    native_pg, monkeypatch, mode, native_tool_effect_agent
 ):
     backend, observer, schema = native_pg
     await observer.execute(f'CREATE TABLE "{schema}".handoff_checkpoints (id INTEGER)')
@@ -128,53 +129,47 @@ async def test_original_batch_receipt_survives_aborted_source_handoff(
 
     monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", exit)
 
-    class AgentInput(OrchestratorEngineMixin):
-        features = _tool_to_feature = {}
-        _direct_tools = {
-            "native": SimpleNamespace(schema=SimpleNamespace(is_concurrency_safe=True))
-        }
+    agent = await streaming_agent(native_tool_effect_agent, connected_backend=backend)
+    # Declared tool schema and dispatch component; Agent/privacy/journal and
+    # the actual batch producer retain their original native implementation.
+    agent._direct_tools = {
+        "native": SimpleNamespace(schema=SimpleNamespace(is_concurrency_safe=True))
+    }
 
-        def is_request_cancelled(self, request_id=None):
-            return False
+    async def dispatch(*args, **kwargs):
+        token = native_active.set(True)
+        tool_scope = ExecutionCustody(
+            ProcessRuntimeExecutionFence("actual-tool-component")
+        )
+        try:
+            with bind_execution_custody_snapshot((tool_scope,)):
+                await backend.execute(
+                    "INSERT INTO effects VALUES (1, 'actual native tool')"
+                )
+            if mode == "post-validation":
+                entered.set()
+                await release.wait()
+                runtime.revoke("actual original reader admission retired")
+                lease.require_live()
+        except BaseException as error:
+            original_sources.append(error)
+            source_chains.append(tuple(_explicit_control_chain(error)))
+            raise
+        finally:
+            native_active.reset(token)
 
-        def _visible_features_by_tool_name(self):
-            return {}
+    agent._dispatch_tool_call = dispatch
+    execute_batch = agent._execute_tool_batch_at_stop_boundary
 
-        def _known_tool_names(self):
-            return {"native"}
+    async def observe_batch(*args, **kwargs):
+        # Same actual source Task and real producer result, no synthetic ACK.
+        source_owners.append(asyncio.current_task())
+        result = await execute_batch(*args, **kwargs)
+        if isinstance(result, OwnedTaskHandoff):
+            batch_receipts.append(result)
+        return result
 
-        async def _dispatch_tool_call(self, *args, **kwargs):
-            token = native_active.set(True)
-            tool_scope = ExecutionCustody(
-                ProcessRuntimeExecutionFence("actual-tool-component")
-            )
-            try:
-                with bind_execution_custody_snapshot((tool_scope,)):
-                    await backend.execute(
-                        "INSERT INTO effects VALUES (1, 'actual native tool')"
-                    )
-                if mode == "post-validation":
-                    entered.set()
-                    await release.wait()
-                    runtime.revoke("actual original reader admission retired")
-                    lease.require_live()
-            except BaseException as error:
-                original_sources.append(error)
-                source_chains.append(tuple(_explicit_control_chain(error)))
-                raise
-            finally:
-                native_active.reset(token)
-
-        async def _execute_tool_batch_at_stop_boundary(self, *args, **kwargs):
-            # Transparent producer observation: same actual source Task and
-            # same result from the real batch, not a fabricated receipt.
-            source_owners.append(asyncio.current_task())
-            result = await super()._execute_tool_batch_at_stop_boundary(*args, **kwargs)
-            if isinstance(result, _DeferredToolBatchCancellation):
-                batch_receipts.append(result)
-            return result
-
-    agent = AgentInput()
+    agent._execute_tool_batch_at_stop_boundary = observe_batch
     response = LLMResponse(
         content="", tool_calls=[ToolCall(id="native", name="native", arguments={})]
     )
@@ -206,7 +201,7 @@ async def test_original_batch_receipt_survives_aborted_source_handoff(
                     reader_errors.append(error)
                     raise
                 received.append(item)
-                assert isinstance(item, _DeferredToolBatchCancellation)
+                assert isinstance(item, OwnedTaskHandoff)
                 # Actual continuation handshake confirms delivery before the
                 # caller's checkpoint, matching StreamingMixin's continue.
                 with pytest.raises(StopAsyncIteration):
@@ -216,7 +211,7 @@ async def test_original_batch_receipt_survives_aborted_source_handoff(
                 )
                 item.raise_outcome()
 
-    reader = create_owned_task(read(), retain_originals=True)
+    reader = create_owned_task(drive_native(agent, read), retain_originals=True)
     try:
         await asyncio.wait_for(entered.wait(), 5)
         if mode in {

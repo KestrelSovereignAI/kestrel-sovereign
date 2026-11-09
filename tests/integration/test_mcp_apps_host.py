@@ -4,6 +4,8 @@ No model or operator resources participate. The installed MCP feature is an
 explicit dependency of the dedicated MCP CI job, never an import-or-skip.
 """
 
+from uuid import uuid4
+
 import asyncio
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -28,6 +30,7 @@ from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security import private_delivery
@@ -91,7 +94,7 @@ class Boundary:
 
 
 @pytest_asyncio.fixture
-async def apps_boundary(tmp_path, monkeypatch):
+async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent):
     from kestrel_feature_mcp.connection import bind_tool_caller
     from kestrel_feature_mcp.feature import MCPAgent
     from tests.integration.mcp_permission_peer import create_server
@@ -119,10 +122,7 @@ async def apps_boundary(tmp_path, monkeypatch):
                     await peer_task
                     raise RuntimeError("native MCP peer exited before startup")
                 await asyncio.sleep(0.01)
-        agent = KestrelAgent(did="did:test:owned-apps-host", storage_path=str(tmp_path / "agent.db"),
-                             allowed_features=set(), sync_enabled=False)
-        cleanup.push_async_callback(agent.llm_service.close)
-        agent.privacy_agent = PrivacyAgent(agent._raw_storage, agent.privacy_mode)
+        agent = await native_tool_effect_agent(did='did:test:owned-apps-host')
         backend = SQLiteBackend(str(tmp_path / "audit.db"))
         await backend.connect()
         cleanup.push_async_callback(backend.close)
@@ -171,7 +171,7 @@ async def apps_boundary(tmp_path, monkeypatch):
             with caller_context_scope(request.state.caller), part_collector(host=agent, session_id=value["session_id"]):
                 try:
                     return await initial.binding.invoke({"marker": value["marker"]},
-                        session_id=value["session_id"], source="chat")
+                        session_id=value["session_id"], source="chat", operation_id=uuid4().hex)
                 except ResourceOutcomeUnknown:
                     return JSONResponse({"error": "outcome_unknown_do_not_replay"}, status_code=503)
 
@@ -254,7 +254,7 @@ async def test_app_tool_uses_original_core_one_shot_approval_and_required_audit(
     await b.permissions.set_permission("mcp:owned-apps", tool.binding.name, PermissionLevel.ASK)
     url = f"/api/mcp/apps/views/{view}/tools/call?session_id=original-chat"
     call = asyncio.create_task(b.client.post(url, headers=b.headers(),
-        json={"name": "mutate_marker", "arguments": {"marker": "approved"}}))
+        json={"name": "mutate_marker", "arguments": {"marker": "approved"}, "operation_id": uuid4().hex}))
     try:
         approval = await asyncio.wait_for(b.requests.get(), 5)
         assert not call.done() and b.markers == ["once"]

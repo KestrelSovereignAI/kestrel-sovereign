@@ -6,11 +6,9 @@ import inspect
 import pytest
 
 from kestrel_sovereign.command_handler import CommandHandler
-from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
-    PrivacyEnforcingStorage,
 )
 
 
@@ -49,28 +47,10 @@ async def test_privacy_command_without_mode_returns_current_status():
 
 
 @pytest.mark.asyncio
-async def test_privacy_command_reports_retry_and_succeeds_after_fact_lease():
+async def test_privacy_command_reports_retry_and_succeeds_after_fact_lease(native_tool_effect_agent):
     """!privacy does not propagate or claim a refused transition."""
-    from kestrel_sovereign.features.privacy.feature import (
-        PrivacyTransitionDecision,
-    )
-
-    wrapper = PrivacyEnforcingStorage(MagicMock(), PrivacyMode.NORMAL)
-    agent = KestrelAgent.__new__(KestrelAgent)
-    agent._privacy_mode = PrivacyMode.NORMAL
-    agent.storage = wrapper
-    agent.features = {}
-    agent.llm_service = None
-    agent.privacy_agent = MagicMock()
-    agent.privacy_agent.evaluate_transition = MagicMock(
-        side_effect=lambda mode: PrivacyTransitionDecision(
-            target=mode,
-            requires_confirmation=False,
-        )
-    )
-    agent.privacy_agent.set_mode = MagicMock(
-        return_value="Privacy mode changed from normal to isolated."
-    )
+    agent = await native_tool_effect_agent(did="did:test:privacy-command")
+    wrapper = agent.storage
     handler = CommandHandler(agent)
 
     wrapper._acquire_explicit_fact_lease()
@@ -83,6 +63,6 @@ async def test_privacy_command_reports_retry_and_succeeds_after_fact_lease():
         wrapper._release_explicit_fact_lease()
 
     applied = await handler._cmd_privacy("!privacy isolated")
-    assert applied == "Privacy mode changed from normal to isolated."
+    assert applied.startswith("Privacy mode changed from normal to isolated.")
     assert agent.privacy_mode is PrivacyMode.ISOLATED
     assert wrapper.privacy_mode is PrivacyMode.ISOLATED
