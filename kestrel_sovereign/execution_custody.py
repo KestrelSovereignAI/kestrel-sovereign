@@ -491,7 +491,9 @@ def execution_observation_error(*errors: BaseException | None,
     if unknown is not None:
         # Preserve the public SDK outcome contract and its first diagnostic,
         # without decorating either original provider/persistence exception.
-        return execution_error_with_cause(ResourceOutcomeUnknown(*unknown.args), terminal)
+        envelope = (ToolAuditUnconfirmedError if isinstance(unknown, ToolAuditUnconfirmedError)
+                    else ResourceOutcomeUnknown)
+        return execution_error_with_cause(envelope(*unknown.args), terminal)
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
 
 
@@ -536,6 +538,11 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
         # Delivery uncertainty also belongs to its original source. Isolation
         # protects that graph without granting it Core control or authority.
         if any(is_tool_execution_terminal_error(error) for error in present):
+            if not any(is_execution_control_error(error) for error in present):
+                # Use the one finite observation composer for SDK/audit-only
+                # delivery. Its public typed envelope preserves the first
+                # diagnostic without decorating either original source.
+                return execution_observation_error(*present, prefer_cancellation=prefer_cancellation)
             unique = []
             for error in present:
                 if all(error is not prior for prior in unique):

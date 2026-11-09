@@ -710,14 +710,20 @@ async def test_failed_native_codex_callback_notifies_only_its_original_turn(priv
 
 
 @pytest.mark.asyncio
-async def test_sdk_unknown_envelope_keeps_first_message_and_immutable_originals():
-    from kestrel_sovereign.execution_custody import execution_observation_error
-    first = ResourceOutcomeUnknown('failed task could not be recorded')
-    second = ResourceOutcomeUnknown('provider reply lost')
+@pytest.mark.parametrize("kind", ["sdk", "audit"])
+@pytest.mark.parametrize("composition", ["observation", "terminal"])
+async def test_sdk_unknown_envelope_keeps_first_message_and_immutable_originals(kind, composition):
+    from kestrel_sovereign.execution_custody import (
+        ToolAuditUnconfirmedError, execution_observation_error, execution_terminal_error,
+    )
+    error_type = ToolAuditUnconfirmedError if kind == "audit" else ResourceOutcomeUnknown
+    first = error_type('failed task could not be recorded')
+    second = error_type('provider reply lost')
     first_cause, second_cause = ValueError('original task write'), ValueError('original provider')
     first.__cause__, second.__cause__ = first_cause, second_cause
-    observed = execution_observation_error(first, second)
-    assert isinstance(observed, ResourceOutcomeUnknown), 'finite join erased public SDK outcome type'
+    observed = (execution_observation_error(first, second) if composition == "observation" else
+        execution_terminal_error(first, second, retain_originals=True, isolate_control_originals=True))
+    assert type(observed) is error_type, 'finite join erased public SDK outcome type'
     assert str(observed) == str(first)
     assert observed is not first and observed is not second
     assert first.__cause__ is first_cause and second.__cause__ is second_cause
