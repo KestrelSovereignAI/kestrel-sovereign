@@ -6971,6 +6971,12 @@ class PrivacyEnforcingStorage:
         return getattr(self._storage, "llm_service", None)
 
     @property
+    def native_retirement_owner(self) -> "PrivacyEnforcingStorage | None":
+        """Preserve native retirement custody without exposing raw storage."""
+        owner = getattr(self._storage, "native_retirement_owner", None)
+        return self if owner is self._storage else None
+
+    @property
     def minimum_close_timeout_s(self) -> float:
         """Preserve the underlying storage's optional close-budget contract."""
         return getattr(self._storage, "minimum_close_timeout_s", 0.0)

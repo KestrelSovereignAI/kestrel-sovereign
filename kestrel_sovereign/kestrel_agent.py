@@ -11046,14 +11046,12 @@ Expected Duration: {expected_duration}
         run_storage = hasattr(self.storage, "close")
         if storage_close_timeout is None:
             storage_close_timeout = _minimum_storage_close_timeout(self.storage)
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
-
         # Native storage owns physical backend retirement even when its close
         # reservation is zero (PostgreSQL). A cancelled observer must retain
         # that original owner, never close the coroutine joining its backend.
         native_storage_resource = (
             self.storage
-            if isinstance(getattr(self.storage, "db", None), AsyncDatabase)
+            if getattr(self.storage, "native_retirement_owner", None) is self.storage
             else None
         )
         if storage_preclose_timeout is None:

@@ -484,6 +484,56 @@ jobs:
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12
 
+  mcp-gateway-seam:
+    runs-on: ubuntu-latest
+    env:
+      # Match the measured shared-runner WAL checkpoint allowance used by
+      # the other native integration lanes. The process fixture carries this
+      # explicit setting into its child and composes the enclosing guards.
+      KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S: "5.0"
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Install the host and released MCP feature
+        run: uv sync --python 3.14 --locked --extra mcp-integration
+      - name: Install the native Docker MCP CLI for the owned Gateway campaign
+        env:
+          MCP_GATEWAY_VERSION: "0.44.3"
+          MCP_GATEWAY_ARCHIVE_SHA256: "e4df4c2dcc013011519da70a546589d8db0c1461a0050070239339675cfca98c"
+        run: |
+          set -euo pipefail
+          plugin_dir="$RUNNER_TEMP/mcp-toolkit"
+          mkdir -p "$plugin_dir"
+          archive="$plugin_dir/docker-mcp.tar.gz"
+          curl --fail --location --silent --show-error --max-time 90 \
+            "https://github.com/docker/mcp-gateway/releases/download/v${MCP_GATEWAY_VERSION}/docker-mcp-linux-amd64.tar.gz" \
+            --output "$archive"
+          echo "$MCP_GATEWAY_ARCHIVE_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$plugin_dir" docker-mcp
+          "$plugin_dir/docker-mcp" version
+          echo "MCP_TEST_DOCKER_PLUGIN=$plugin_dir/docker-mcp" >> "$GITHUB_ENV"
+          echo "MCP_TEST_DOCKER_HOST=unix:///var/run/docker.sock" >> "$GITHUB_ENV"
+      - name: Exercise the native Gateway and stdio ownership campaign
+        # The same native CLI0.44.3 campaign passed 36 cases in536.61s on
+        # macOS Docker, with public SDK0.52.0/MCP0.15.0 and the Core wheel.
+        # The added witness-failure cleanup case raises this cohort to37.
+        # Its first combined Linux measurement is a required PR/release gate.
+        # Legacy56-case permissions keep their existing480s session unchanged.
+        run: >-
+          uv run --no-sync python -m pytest
+          tests/integration/test_mcp_gateway_permission_boundary.py
+          tests/integration/test_mcp_permission_peer_stdio.py
+          -q --timeout=120 --session-timeout=720
+        timeout-minutes: 15
+
   # Unit tests (no services needed)
   unit-tests:
     name: unit-tests (${{ matrix.shard }})

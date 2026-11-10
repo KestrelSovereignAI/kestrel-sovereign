@@ -15,7 +15,7 @@ import pytest_asyncio
 from kestrel_sdk.resources import ResourceConflict
 
 from tests.integration.mcp_permission_peers import (
-    MCPTestPeer, docker_peer, https_peer, owned_provider_network,
+    MCPTestPeer, docker_peer, gateway_peer, https_peer, owned_provider_network,
 )
 from tests.utils.native_tool_effects import drive_native
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
@@ -235,8 +235,14 @@ async def mcp_boundary(request, tmp_path, monkeypatch, native_tool_effect_agent)
     assert "site-packages" in str(Path(kestrel_feature_mcp.__file__).resolve())
     identity = uuid.uuid4().hex
     async with AsyncExitStack() as cleanup:
-        peer = await cleanup.enter_async_context(
-            docker_peer(tmp_path) if request.param == "container" else https_peer(tmp_path, monkeypatch))
+        factories = {
+            "container": lambda: docker_peer(tmp_path),
+            "remote": lambda: https_peer(tmp_path, monkeypatch),
+            "gateway": lambda: gateway_peer(tmp_path, monkeypatch),
+            "gateway-held": lambda: gateway_peer(tmp_path, monkeypatch, hold_tool_reply=True),
+            "gateway-lingering": lambda: gateway_peer(tmp_path, monkeypatch, linger_after_stdio=True),
+        }
+        peer = await cleanup.enter_async_context(factories[request.param]())
         agent = await native_tool_effect_agent(did=f'did:test:mcp-seam-{identity}')
         await agent._raw_storage.initialize()
         enablement = FeatureEnablementStore(agent._raw_storage.db.backend)
@@ -268,11 +274,14 @@ async def mcp_boundary(request, tmp_path, monkeypatch, native_tool_effect_agent)
         await feature.initialize()
         cleanup.push_async_callback(feature.shutdown)
         agent.features[feature.name] = feature
-        loaded = await feature.load_tool(peer.selector)
+        loaded = await peer.load(feature)
         assert loaded.status.value == 'ok', loaded.to_dict()
         initial_manager = feature.manager
-        container = loaded.data['container' if peer.kind == 'container' else 'connection']
-        owner = f'mcp:{peer.kind}:' + container
+        if peer.kind == "gateway":
+            container, owner = "gateway", "mcp:gateway"
+        else:
+            container = loaded.data['container' if peer.kind == 'container' else 'connection']
+            owner = f'mcp:{peer.kind}:' + container
         handles = [name for name, candidate in agent._tool_to_feature.items() if candidate == owner]
         assert len(handles) == 1
         assert handles[0].endswith('__record_marker'), agent._direct_tool_defs
@@ -306,7 +315,7 @@ async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary):
                and row['decision'] == 'auto_denied' for row in audit)
 
 
-async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary):
+async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary, approved_timeout=5):
     peer = mcp_boundary
     await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.ASK)
     first = peer.invoke('approved-once')
@@ -315,7 +324,7 @@ async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_bou
     assert request.tool_args == {'marker': 'approved-once'}
     assert await peer.witness() == []
     assert await peer.queue.submit_decision(request.id, True, scope='once')
-    result = await peer.result_with_witness(asyncio.wait_for(first, 5), ['approved-once'])
+    result = await peer.result_with_witness(asyncio.wait_for(first, approved_timeout), ['approved-once'])
     assert result['status'] == 'ok'
     assert not await peer.queue.submit_decision(request.id, True, scope='once')
     second = peer.invoke('not-approved-again')
@@ -331,13 +340,13 @@ async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_bou
     assert decisions.count('user_denied') == 1
 
 
-async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary):
+async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary, approved_timeout=5):
     peer = mcp_boundary
     await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.ASK)
     pending = peer.invoke('approved-for-old-connection')
     request = await asyncio.wait_for(peer.requests.get(), 5)
     original = peer.current_connection()
-    reloaded = await peer.feature.load_tool(peer.selector)
+    reloaded = await peer.peer.load(peer.feature)
     assert reloaded.status.value == 'ok', reloaded.to_dict()
     current = peer.current_connection()
     assert current is not original and not original.is_connected
@@ -346,7 +355,7 @@ async def test_pending_approval_cannot_execute_against_a_replacement_connection(
     fresh = peer.invoke('approved-for-new-connection')
     following = await asyncio.wait_for(peer.requests.get(), 5)
     assert await peer.queue.submit_decision(following.id, True, scope='once')
-    result = await peer.result_with_witness(asyncio.wait_for(fresh, 5), ['approved-for-new-connection'])
+    result = await peer.result_with_witness(asyncio.wait_for(fresh, approved_timeout), ['approved-for-new-connection'])
     assert result['status'] == 'ok'
 
 
