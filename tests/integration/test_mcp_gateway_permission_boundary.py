@@ -290,7 +290,8 @@ async def test_concurrent_native_profiles_cannot_retire_each_others_server(mcp_b
         await boundary.feature.shutdown()
 
 
-async def test_native_configured_profile_retains_values_and_template_namespace(tmp_path, monkeypatch):
+@pytest.mark.parametrize("close_failure", [None, OSError("owned native connection close epilogue"), asyncio.CancelledError("owned native connection close cancellation")], ids=["normal-close", "failed-close", "cancelled-close"])
+async def test_native_configured_profile_retains_values_and_template_namespace(tmp_path, monkeypatch, close_failure):
     from kestrel_feature_mcp.gateway import DockerMCPGateway
     from kestrel_feature_mcp.connection import MCPConnection
     from tests.integration.mcp_permission_peers import gateway_peer
@@ -298,28 +299,52 @@ async def test_native_configured_profile_retains_values_and_template_namespace(t
     async with gateway_peer(tmp_path, monkeypatch, configured=True) as peer:
         gateway = DockerMCPGateway()
         connection = None
+        original_process = None
+        original_configuration = None
+        expected = pytest.raises(type(close_failure)) if close_failure is not None else nullcontext()
         try:
-            token = await gateway.start([peer.selector])
-            exported = gateway._config_directory / "configured-profile-proof.json"
-            exported.touch(mode=0o600)
-            await gateway._profile_command(["export", gateway._profile_id, str(exported)])
-            configured = json.loads(exported.read_text())
-            definition, = configured["servers"]
-            assert definition["snapshot"]["server"]["name"] == peer.selector
-            assert definition["config"] == {"mode": "owned-configured-mode"}
-            assert definition["tools"] == ["record_marker"]
-            assert definition["secrets"] == "owned-source-binding"
-            assert configured["secrets"]["owned-source-binding"] == {"provider": "docker-desktop-store"}
-            connection = MCPConnection(gateway.endpoint_url, headers={"Authorization": "Bearer " + token})
-            tools = await connection.connect()
-            assert [tool.name for tool in tools] == ["record_marker"]
-            result = await connection.call_tool("record_marker", {"marker": "configured-native-profile"})
-            assert not result.is_error
-            assert await peer.witness(None, None) == ["configured-native-profile"]
+            with expected as caught:
+                try:
+                    token = await gateway.start([peer.selector])
+                    original_process = gateway.process
+                    original_configuration = gateway._config_directory
+                    exported = gateway._config_directory / "configured-profile-proof.json"
+                    exported.touch(mode=0o600)
+                    await gateway._profile_command(["export", gateway._profile_id, str(exported)])
+                    configured = json.loads(exported.read_text())
+                    definition, = configured["servers"]
+                    assert definition["snapshot"]["server"]["name"] == peer.selector
+                    assert definition["config"] == {"mode": "owned-configured-mode"}
+                    assert definition["tools"] == ["record_marker"]
+                    assert definition["secrets"] == "owned-source-binding"
+                    assert configured["secrets"]["owned-source-binding"] == {"provider": "docker-desktop-store"}
+                    connection = MCPConnection(gateway.endpoint_url, headers={"Authorization": "Bearer " + token})
+                    if close_failure is not None:
+                        original_close = connection.close
+
+                        async def close_then_fail():
+                            await original_close()
+                            raise close_failure
+
+                        monkeypatch.setattr(connection, "close", close_then_fail)
+                    tools = await connection.connect()
+                    assert [tool.name for tool in tools] == ["record_marker"]
+                    result = await connection.call_tool("record_marker", {"marker": "configured-native-profile"})
+                    assert not result.is_error
+                    assert await peer.witness(None, None) == ["configured-native-profile"]
+                finally:
+                    peer.remember_gateway(gateway)
+                    try:
+                        if connection is not None:
+                            await connection.close()
+                    finally:
+                        await gateway.stop()
+            if close_failure is not None:
+                assert caught.value is close_failure
+            assert gateway.process is None and original_process.poll() is not None, "connection close failure skipped independent Gateway retirement"
+            assert gateway._profile_id is None and not original_configuration.exists()
         finally:
-            peer.remember_gateway(gateway)
-            if connection is not None:
-                await connection.close()
+            # Explicit test-owner reconciliation on a deliberately broken guard.
             await gateway.stop()
 
 
@@ -455,3 +480,28 @@ async def test_native_startup_timeout_survives_independent_retirement_failure(tm
             if gateway._process_env is not None:
                 gateway._process_env['DOCKER_HOST'] = original_host
             await gateway.stop()
+
+
+async def test_gateway_fixture_diagnostics_cannot_skip_original_process_retirement(tmp_path, monkeypatch):
+    from kestrel_feature_mcp.gateway import DockerMCPGateway
+    from tests.integration.mcp_permission_peers import gateway_peer
+
+    gateway = DockerMCPGateway()
+    process = None
+    private = None
+    try:
+        with pytest.raises(AssertionError):
+            async with gateway_peer(tmp_path, monkeypatch) as peer:
+                peer.remember_gateway(gateway)
+                await gateway.start([peer.selector])
+                peer.remember_gateway(gateway)
+                process = gateway.process
+                private = gateway._config_directory
+                # Only this fixture's private source configuration is changed.
+                (Path(os.environ["DOCKER_CONFIG"]) / "config.json").write_text("{}")
+        assert process is not None
+        assert process.poll() is not None, "fixture diagnostic failure skipped original Gateway retirement"
+        assert gateway.process is None and gateway._profile_id is None
+        assert not private.exists()
+    finally:
+        await gateway.stop()

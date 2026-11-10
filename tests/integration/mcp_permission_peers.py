@@ -210,7 +210,8 @@ class GatewayTestPeer(MCPTestPeer):
         return result
 
     def remember_gateway(self, gateway):
-        self.gateways.append(gateway)
+        if all(known is not gateway for known in self.gateways):
+            self.gateways.append(gateway)
         for name in gateway.requested_servers:
             self.container_server_names.add(name)
             if gateway._profile_id is not None:
@@ -306,22 +307,39 @@ async def gateway_peer(tmp_path, monkeypatch, *, linger_after_stdio=False, confi
                 try:
                     yield peer
                 finally:
-                    assert (config / "config.json").read_text() == original_configuration
-                    diagnostics = [{"profile": gateway._profile_id,
-                        "pending_profile": gateway._profile_pending,
-                        "process_retired": gateway.process is None,
-                        "stdout": gateway._recent_output()} for gateway in peer.gateways]
-                    (tmp_path / "native-gateway-diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
-                    (tmp_path / "native-gateway-external-witness.json").write_text(
-                        json.dumps(await peer.witness(None, None)))
-                    remaining = await peer.containers()
-                    for container in remaining:
-                        await asyncio.to_thread(container.remove, force=True)
-                    assert not remaining, "Feature shutdown left owned Gateway containers running"
+                    # Diagnostics are observations, never prerequisites for
+                    # retiring independent original fixture resources. Preserve
+                    # their pre-reconciliation oracles and every cleanup error.
+                    async with AsyncExitStack() as retirement:
+                        retirement.push_async_callback(_retire_remembered_gateways, peer)
+                        retirement.push_async_callback(_remove_owned_gateway_containers, peer)
+                        retirement.push_async_callback(_retire_remembered_gateways, peer)
+                        assert (config / "config.json").read_text() == original_configuration
+                        diagnostics = [{"profile": gateway._profile_id,
+                            "pending_profile": gateway._profile_pending,
+                            "process_retired": gateway.process is None,
+                            "stdout": gateway._recent_output()} for gateway in peer.gateways]
+                        (tmp_path / "native-gateway-diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
+                        (tmp_path / "native-gateway-external-witness.json").write_text(
+                            json.dumps(await peer.witness(None, None)))
+                        remaining = await peer.containers()
+                        assert not remaining, "Feature shutdown left owned Gateway containers running"
             finally:
                 await asyncio.to_thread(volume.reload)
                 assert volume.attrs["Labels"]["kestrel.mcp.permission.owner"] == identity
                 await asyncio.to_thread(volume.remove)
+
+
+async def _retire_remembered_gateways(peer):
+    async with AsyncExitStack() as retirement:
+        for gateway in tuple(peer.gateways):
+            retirement.push_async_callback(gateway.stop)
+
+
+async def _remove_owned_gateway_containers(peer):
+    async with AsyncExitStack() as retirement:
+        for container in await peer.containers():
+            retirement.push_async_callback(asyncio.to_thread, container.remove, force=True)
 
 
 async def run_owned_mcp_cli(arguments):
