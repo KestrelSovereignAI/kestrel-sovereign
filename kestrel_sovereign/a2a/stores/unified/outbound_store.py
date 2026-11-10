@@ -20,9 +20,8 @@ from kestrel_sdk.native_a2a.types import (
 )
 from kestrel_sdk.native_a2a.utils.constants import PROTOCOL_VERSION_1_0
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
-from kestrel_sdk.native_a2a.utils.versioning import major_minor
 from google.protobuf.json_format import MessageToDict, SerializeToJsonError
-from packaging.version import InvalidVersion
+from packaging.version import InvalidVersion, Version
 
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label
 from kestrel_sovereign.a2a.native_sender import native_request_digest
@@ -48,6 +47,12 @@ class OutboundDispatchConflict(NativeStoreConflict):
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _major_minor(version: str) -> tuple[int, int]:
+    """Protocol compatibility is the Major.Minor release (A2A 1.0.1 §3.6)."""
+    release = Version(version)
+    return release.major, release.minor
 
 
 def _text(value: str, field: str) -> None:
@@ -320,13 +325,13 @@ class OutboundStore(UnifiedStoreBase):
             raise ValueError("Native outbound verb must be message, question or task")
         validate_proto_required_fields(interface)
         try:
-            interface_release = major_minor(interface.protocol_version)
+            interface_release = _major_minor(interface.protocol_version)
         except InvalidVersion as error:
             raise ValueError(
                 "Native outbound creation requires the selected native recipient interface"
             ) from error
         if (
-            interface_release != major_minor(PROTOCOL_VERSION_1_0)
+            interface_release != _major_minor(PROTOCOL_VERSION_1_0)
             or interface.protocol_binding not in {"JSONRPC", "HTTP+JSON"}
             or interface.tenant != recipient.tenant
             or request.tenant != recipient.tenant
