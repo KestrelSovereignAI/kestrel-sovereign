@@ -24,7 +24,6 @@ from kestrel_sovereign.tool_effect_store import (
 )
 from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
 from kestrel_sovereign.turn_scope import turn_scoped
-from kestrel_sovereign.agent.tool_allowlist import registry_generation
 
 
 class ToolEffectJournalUnavailable(ResourceError):
@@ -336,6 +335,11 @@ async def execute_tool_effect(
     turn.require_live(owner)
     turn.require_confirmed()
     turn.privacy_lock.require_native_scope(turn.privacy_scope)
+    # This is a live execution query, not an error-classification dependency.
+    # Importing the agent package during journal initialization loops through
+    # streaming -> effect_invocation -> this unfinished module.
+    from kestrel_sovereign.agent.tool_allowlist import registry_generation
+
     prepared = _current_registration.get()
     if prepared is not None and prepared.owner is not owner:
         prepared = None
