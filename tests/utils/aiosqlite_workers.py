@@ -455,16 +455,16 @@ async def wait_for_lifecycle_checkpoint(
     Lifecycle regressions should fail because the owner completed, failed, or
     cancelled before reaching the expected checkpoint—not because a busy CI
     runner did not schedule two cooperating tasks within a one-second wall
-    clock window.  ``harness_timeout`` remains a generous deadlock guard; it
-    is not part of the behavior being asserted.
+    clock window. ``harness_timeout`` is a real-thread deadlock guard,
+    independent of the loop clock whose production deadlines a test controls.
     """
     checkpoint_task = asyncio.ensure_future(checkpoint)
     awaited: set[asyncio.Future[Any]] = {checkpoint_task, lifecycle_task}
     try:
-        done, _pending = await asyncio.wait(
-            awaited,
-            timeout=harness_timeout,
-            return_when=asyncio.FIRST_COMPLETED,
+        done, _pending = await await_within_hang_guard(
+            asyncio.wait(awaited, return_when=asyncio.FIRST_COMPLETED),
+            step=f"Lifecycle and {description}",
+            seconds=harness_timeout,
         )
         # Fail closed when both tasks become ready in the same event-loop
         # turn.  A completed lifecycle cannot prove that it was still live
