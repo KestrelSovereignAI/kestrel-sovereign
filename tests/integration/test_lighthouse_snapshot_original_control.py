@@ -115,6 +115,9 @@ async def native_snapshot(tmp_path, monkeypatch):
 
         async def upload_car(self, *args, **kwargs):
             try:
+                admission = state.get("upload_admission_barrier")
+                if admission is not None:
+                    await admission.wait()
                 return await original_upload(self, *args, **kwargs)
             except BaseException as error:
                 if state.get("upload_failure_as_cancel") and isinstance(
