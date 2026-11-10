@@ -5,9 +5,6 @@ from dataclasses import dataclass
 from functools import wraps
 import inspect
 
-from kestrel_sovereign.agent.invocation import (
-    current_invocation_id, current_invocation_provenance,
-)
 from kestrel_sovereign.auth import CallerContext, CallerRole, current_caller_context
 from kestrel_sovereign.execution_custody import execution_observation_error
 from kestrel_sovereign.tools.effect_journal import (
@@ -19,6 +16,10 @@ from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 
 
 def _operation_namespace():
+    # Invocation metadata is needed only inside a running operation. Eager
+    # imports enter agent streaming while this decorator module is unfinished.
+    from kestrel_sovereign.agent.invocation import current_invocation_provenance
+
     provenance = current_invocation_provenance()
     if provenance is not None and provenance.source_kind == 'signal':
         return ['signal', provenance.source_locator]
@@ -68,6 +69,8 @@ async def _journal_operation(owner, *, namespace, client_key, request):
     from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects
 
     require_persistent_tool_effects(owner)
+    from kestrel_sovereign.agent.invocation import current_invocation_id
+
     turn = await admit_tool_effect_turn(owner,
         namespace=namespace, client_key=client_key, request=request,
         invocation_id=current_invocation_id())
@@ -100,7 +103,7 @@ async def journal_tool_operation(owner, operation: ToolEffectOperation):
 async def run_scheduled_tool_operation(owner, *, feature_name, tool_name, arguments, operation):
     """Admit a tool from its original durable, revocable scheduler occurrence."""
     from copy import deepcopy
-    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.invocation import bind_async_invocation, current_invocation_id
     from kestrel_sovereign.features.scheduler.runner import get_current_scheduler_execution
     from kestrel_sovereign.tools.effect_journal import logical_operation_key
 
@@ -133,6 +136,10 @@ async def run_scheduled_tool_operation(owner, *, feature_name, tool_name, argume
 
 
 async def _open_journal_turn(owner, arguments, route):
+    from kestrel_sovereign.agent.invocation import (
+        current_invocation_id, current_invocation_provenance,
+    )
+
     invocation_id = current_invocation_id()
     if invocation_id is None:
         raise ToolEffectJournalUnavailable('tool_effect_invocation_unavailable')
