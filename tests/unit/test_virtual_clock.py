@@ -20,7 +20,8 @@ from tests.utils.virtual_clock import (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed", [False, True])
-async def test_wait_observation_preserves_exact_futures_outcomes_and_bounds(failed):
+@pytest.mark.parametrize("keyword", [False, True])
+async def test_wait_observation_preserves_exact_futures_outcomes_and_bounds(failed, keyword):
     future = asyncio.get_running_loop().create_future()
     original = RuntimeError("original wait member failure") if failed else object()
     if failed:
@@ -28,14 +29,22 @@ async def test_wait_observation_preserves_exact_futures_outcomes_and_bounds(fail
     else:
         future.set_result(original)
     real_wait = asyncio.wait
-    with observe_asyncio_waits() as observations:
-        done, pending = await asyncio.wait(
-            {future}, timeout=0.25, return_when=asyncio.FIRST_COMPLETED,
-        )
+    try:
+        with observe_asyncio_waits() as observations:
+            arguments = () if keyword else ({future},)
+            keywords = {"fs": {future}} if keyword else {}
+            done, pending = await asyncio.wait(
+                *arguments, timeout=0.25, return_when=asyncio.FIRST_COMPLETED,
+                **keywords,
+            )
+    finally:
+        # An observation/signature failure must still retrieve the already
+        # completed original's exception rather than leave a late warning.
+        observed_error = future.exception()
     assert observations == [(frozenset({future}), 0.25)]
     assert done == {future} and not pending and asyncio.wait is real_wait
     if failed:
-        assert future.exception() is original
+        assert observed_error is original
     else:
         assert future.result() is original
 
