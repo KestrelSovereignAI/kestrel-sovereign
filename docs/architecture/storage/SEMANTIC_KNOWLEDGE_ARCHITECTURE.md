@@ -661,6 +661,45 @@ prior digest. A consumer that persists its policy restores it with
 `GovernedCorpusPolicy.from_mapping`, which refuses unknown fields rather than
 dropping them.
 
+A consumer's policy is not where held-out material is decided, though: a
+consumer that names no exclusions would train on it (#3893). The host corpus
+capability therefore reads the host's Sovereign-signed exclusion manifest
+(`kestrel_sovereign.knowledge.corpus_exclusions`) on every build and holds out
+the ids it names for the building agent, by the same rules and with the same
+`explicitly_excluded` reason, whatever the policy excludes. The policy and its
+digest stay the consumer's own; the snapshot and each incremental read carry
+the manifest's receipt (`exclusion_manifest`: signed-content digest, sequence,
+`issued_at`), which the snapshot hash covers, and an incremental read refuses a
+base built under another manifest (`corpus_exclusion_manifest_changed`). A
+build refuses rather than run without exclusions when the manifest is missing,
+unreadable or not signed by the operator-pinned trust root, when an id is
+malformed, shortened or of an unknown kind, when the agent has no section, when
+its section names saved items (no producer records them yet, so they would
+match nothing), and when the sequence is lower than the highest this agent's
+builds admitted (`corpus_exclusion_watermarks`). The manifest is read in a
+worker thread within the build's own `max_wall_time_seconds`, and anything but
+a regular file (a FIFO put in its place) is refused unread.
+
+A corpus also outlives its build on the consumer's disk, so consumption is
+where a changed manifest takes effect. Each `corpus_manifest` and
+`future_corpus_candidate` artifact records the receipt of the manifest it was
+built under (`exclusion_manifest_sha256`, `exclusion_manifest_sequence`), and
+`consume_governed_semantic_artifact` reads and admits the current manifest
+exactly as a build does, then serves the artifact only when its receipt equals
+the current manifest's, and that manifest is still the one the agent's
+watermark records, read in the same transaction as the artifact row. It
+refuses, naming the reason, while the manifest is missing, unverifiable or
+moved back, or once a newer one was admitted after it was read, and refuses an
+artifact built under
+another manifest (including one a build registered after the manifest it read
+was replaced) or recording none (built before manifests existed). A refusal
+leaves the corpus as it is: no build or consumption revokes a corpus over its
+manifest, so a reader holding an older manifest cannot withdraw a newer corpus;
+any manifest update leaves every existing corpus unusable until it is rebuilt.
+An export snapshot is not governed by the manifest and is served without one.
+The operator procedure is in
+[Corpus exclusion manifest](../security/SOVEREIGN_TRUST_ROOT.md#corpus-exclusion-manifest).
+
 Producers append the segment after their own locator with
 `with_source_reference`, so a stem a reader matches by prefix still leads it
 (#3875). `save_fact` and the strategy-ledger projection name the session of the

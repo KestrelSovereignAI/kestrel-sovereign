@@ -16,6 +16,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from kestrel_sovereign._regular_file import read_regular_file
+
 
 SOVEREIGN_TRUST_ROOT_ENV = "KESTREL_SOVEREIGN_TRUST_ROOT_PATH"
 MAX_TRUST_ROOT_BYTES = 1024 * 1024
@@ -88,8 +90,9 @@ def load_sovereign_trust_root(
 
     trust_root_path = next(iter(unique_paths))
     try:
-        with trust_root_path.open("rb") as trust_root_file:
-            raw = trust_root_file.read(MAX_TRUST_ROOT_BYTES + 1)
+        # A FIFO here would block a plain open until something wrote to it;
+        # an agent that can replace this file could stall its reader (#3893).
+        raw = read_regular_file(trust_root_path, max_bytes=MAX_TRUST_ROOT_BYTES)
         if len(raw) > MAX_TRUST_ROOT_BYTES:
             raise SovereignTrustRootError(
                 f"Sovereign trust-root file {trust_root_path} exceeds the "

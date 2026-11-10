@@ -15,11 +15,12 @@ becoming trainable data.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import MISSING, dataclass, fields as dataclass_fields
+from dataclasses import MISSING, dataclass, fields as dataclass_fields, replace
 from enum import Enum
 import hashlib
 import json
 import math
+import re
 from time import monotonic
 from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
@@ -454,6 +455,101 @@ class GovernedCorpusPolicy:
         return _digest(self.to_mapping())
 
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusExclusionReceipt:
+    """Which Sovereign-signed exclusion manifest a corpus was built under (#3893).
+
+    ``manifest_sha256`` is the digest of the manifest's signed content, so a
+    manifest re-signed without change keeps it. A snapshot and its incremental
+    reads carry it, and the snapshot hash covers it.
+    """
+
+    manifest_sha256: str
+    sequence: int
+    issued_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest_sha256, str) or not _SHA256_HEX.fullmatch(
+            self.manifest_sha256
+        ):
+            raise GovernedCorpusError(
+                "exclusion manifest digest must be 64 lowercase hex characters"
+            )
+        if type(self.sequence) is not int or self.sequence < 1:
+            raise GovernedCorpusError("exclusion manifest sequence must be a positive integer")
+        if not isinstance(self.issued_at, str) or not self.issued_at:
+            raise GovernedCorpusError("exclusion manifest issued_at must be non-empty")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "manifest_sha256": self.manifest_sha256,
+            "sequence": self.sequence,
+            "issued_at": self.issued_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HostCorpusExclusions:
+    """Material the host holds out of every corpus it builds for one agent (#3893).
+
+    Read from the Sovereign-signed exclusion manifest
+    (:mod:`kestrel_sovereign.knowledge.corpus_exclusions`), never from the
+    consumer, so a consumer whose policy names no exclusions cannot leave them
+    out. They are applied together with the policy's own exclusion sets, by
+    the same rules, and recorded on the corpus as ``receipt``. The policy, and
+    therefore its digest, is left as the consumer supplied it.
+    """
+
+    receipt: CorpusExclusionReceipt
+    saved_item_ids: tuple[str, ...] = ()
+    session_ids: tuple[str, ...] = ()
+    source_occurrence_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, CorpusExclusionReceipt):
+            raise GovernedCorpusError("host exclusions need their manifest receipt")
+        for name in ("saved_item_ids", "session_ids", "source_occurrence_ids"):
+            object.__setattr__(
+                self, name, _ordered_texts(getattr(self, name), name, allow_empty=True)
+            )
+
+    def governing(self, policy: GovernedCorpusPolicy) -> GovernedCorpusPolicy:
+        """``policy`` with these exclusions added to its own, for eligibility only."""
+        return replace(
+            policy,
+            excluded_saved_item_ids=tuple(
+                set(policy.excluded_saved_item_ids).union(self.saved_item_ids)
+            ),
+            excluded_session_ids=tuple(
+                set(policy.excluded_session_ids).union(self.session_ids)
+            ),
+            excluded_source_occurrence_ids=tuple(
+                set(policy.excluded_source_occurrence_ids).union(
+                    self.source_occurrence_ids
+                )
+            ),
+        )
+
+
+def _host_exclusions(value: object) -> HostCorpusExclusions | None:
+    if value is not None and not isinstance(value, HostCorpusExclusions):
+        raise GovernedCorpusError("exclusions must be HostCorpusExclusions or null")
+    return value
+
+
+def _governing_policy(
+    policy: GovernedCorpusPolicy, exclusions: HostCorpusExclusions | None
+) -> GovernedCorpusPolicy:
+    return policy if exclusions is None else exclusions.governing(policy)
+
+
+def _receipt_of(exclusions: HostCorpusExclusions | None) -> CorpusExclusionReceipt | None:
+    return None if exclusions is None else exclusions.receipt
+
+
 _POLICY_FIELDS = dataclass_fields(GovernedCorpusPolicy)
 _POLICY_REQUIRED_KEYS = frozenset(
     item.name for item in _POLICY_FIELDS
@@ -553,8 +649,15 @@ class GovernedCorpusSnapshot:
     snapshot_hash: str
     observability: GovernedCorpusObservability
     verified: bool = True
+    exclusion_manifest: CorpusExclusionReceipt | None = None
 
     def __post_init__(self) -> None:
+        if self.exclusion_manifest is not None and not isinstance(
+            self.exclusion_manifest, CorpusExclusionReceipt
+        ):
+            raise GovernedCorpusError(
+                "snapshot exclusion_manifest must be CorpusExclusionReceipt or null"
+            )
         if self.schema_version != CORPUS_SCHEMA_VERSION:
             raise GovernedCorpusError("unsupported corpus snapshot schema version")
         if self.checkpoint.tenant_id != self.tenant_id:
@@ -591,6 +694,7 @@ class GovernedCorpusDelta:
     tombstones: tuple[GovernedCorpusTombstone, ...]
     snapshot_hash: str
     observability: GovernedCorpusObservability
+    exclusion_manifest: CorpusExclusionReceipt | None = None
 
     @property
     def since_generation(self) -> int:
@@ -666,9 +770,17 @@ class GovernedAssertionCorpusService:
         semantic_capabilities=None,
         prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
         allow_prior_verified_snapshot: bool = False,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusSnapshot:
+        """Build one corpus.
+
+        ``exclusions`` are the host's own (:class:`HostCorpusExclusions`),
+        held out on top of the policy's; the host corpus capability always
+        supplies them.
+        """
         if not isinstance(limits, GovernedCorpusLimits):
             raise GovernedCorpusError("limits must be GovernedCorpusLimits")
+        exclusions = _host_exclusions(exclusions)
         try:
             async with asyncio.timeout(limits.max_wall_time_seconds):
                 return await self._snapshot(
@@ -680,6 +792,7 @@ class GovernedAssertionCorpusService:
                     semantic_capabilities=semantic_capabilities,
                     prior_verified_snapshot=prior_verified_snapshot,
                     allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+                    exclusions=exclusions,
                 )
         except TimeoutError as error:
             raise GovernedCorpusBudgetExceeded(
@@ -697,6 +810,7 @@ class GovernedAssertionCorpusService:
         semantic_capabilities=None,
         prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
         allow_prior_verified_snapshot: bool = False,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusSnapshot:
         if not isinstance(policy, GovernedCorpusPolicy):
             raise GovernedCorpusError("policy must be GovernedCorpusPolicy")
@@ -757,6 +871,7 @@ class GovernedAssertionCorpusService:
             policy=policy,
             limits=limits,
             started=started,
+            exclusions=exclusions,
         )
         final_checkpoint = await self._event_checkpoint()
         if not self._same_checkpoint(checkpoint, final_checkpoint):
@@ -773,9 +888,17 @@ class GovernedAssertionCorpusService:
         inference_limits=None,
         maintenance_limits=None,
         semantic_capabilities=None,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusDelta:
+        """Read additions and tombstones after ``snapshot``.
+
+        Only under the exclusion manifest ``snapshot`` was built under: a
+        changed manifest may hold out what the base already holds, so it
+        needs a fresh snapshot.
+        """
         if not isinstance(limits, GovernedCorpusLimits):
             raise GovernedCorpusError("limits must be GovernedCorpusLimits")
+        exclusions = _host_exclusions(exclusions)
         try:
             async with asyncio.timeout(limits.max_wall_time_seconds):
                 return await self._changes_since(
@@ -786,6 +909,7 @@ class GovernedAssertionCorpusService:
                     inference_limits=inference_limits,
                     maintenance_limits=maintenance_limits,
                     semantic_capabilities=semantic_capabilities,
+                    exclusions=exclusions,
                 )
         except TimeoutError as error:
             raise GovernedCorpusBudgetExceeded(
@@ -802,11 +926,15 @@ class GovernedAssertionCorpusService:
         inference_limits=None,
         maintenance_limits=None,
         semantic_capabilities=None,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusDelta:
         if not isinstance(snapshot, GovernedCorpusSnapshot):
             raise GovernedCorpusError("snapshot must be GovernedCorpusSnapshot")
         if snapshot.policy.digest != policy.digest:
             raise GovernedCorpusError("incremental reads require the same corpus policy")
+        receipt = _receipt_of(exclusions)
+        if snapshot.exclusion_manifest != receipt:
+            raise GovernedCorpusUnavailable("corpus_exclusion_manifest_changed")
         started = monotonic()
         head = await self._event_checkpoint()
         readiness = await self._storage.semantic_maintenance_training_readiness(
@@ -855,7 +983,9 @@ class GovernedAssertionCorpusService:
             candidates = await self._storage.assertion_inference_inputs(
                 AssertionQuery(assertion_ids=changed_ids, limit=limits.max_assertions)
             )
-            built, excluded = await self._examples(candidates, policy, limits, started)
+            built, excluded = await self._examples(
+                candidates, policy, limits, started, exclusions=exclusions
+            )
             additions = tuple(built)
         tombstones = tuple(
             GovernedCorpusTombstone(
@@ -870,7 +1000,7 @@ class GovernedAssertionCorpusService:
             if not change.eligible
         ) + await self._session_attestation_tombstones(
             snapshot,
-            policy=policy,
+            policy=_governing_policy(policy, exclusions),
             limits=limits,
             started=started,
             generation=head.generation,
@@ -878,7 +1008,7 @@ class GovernedAssertionCorpusService:
                 change.assertion_id for change in changes if change.assertion_id
             ),
         )
-        snapshot_hash = _digest({
+        canonical = {
             "base": snapshot.snapshot_hash,
             "checkpoint": [head.generation, head.latest_event_id],
             "additions": [example.content_hash for example in additions],
@@ -887,7 +1017,10 @@ class GovernedAssertionCorpusService:
                 "revision_id": tombstone.revision_id, "operation": tombstone.operation,
                 "generation": tombstone.generation, "reason": tombstone.reason,
             } for tombstone in tombstones],
-        })
+        }
+        if receipt is not None:
+            canonical["exclusion_manifest"] = receipt.to_mapping()
+        snapshot_hash = _digest(canonical)
         observability = GovernedCorpusObservability(
             considered=len(changes), included=len(additions), excluded=dict(sorted(excluded.items())),
             snapshot_hash=snapshot_hash, policy_digest=policy.digest,
@@ -903,10 +1036,13 @@ class GovernedAssertionCorpusService:
             tombstones,
             snapshot_hash,
             observability,
+            receipt,
         )
 
-    async def _build_snapshot(self, *, candidates, checkpoint, capability_versions, policy, limits, started) -> GovernedCorpusSnapshot:
-        examples, excluded = await self._examples(candidates, policy, limits, started)
+    async def _build_snapshot(self, *, candidates, checkpoint, capability_versions, policy, limits, started, exclusions=None) -> GovernedCorpusSnapshot:
+        examples, excluded = await self._examples(
+            candidates, policy, limits, started, exclusions=exclusions
+        )
         canonical = {
             "schema_version": CORPUS_SCHEMA_VERSION,
             "tenant_id": checkpoint.tenant_id,
@@ -915,6 +1051,11 @@ class GovernedAssertionCorpusService:
             "policy": policy.to_mapping(),
             "examples": [example.content_hash for example in examples],
         }
+        receipt = _receipt_of(exclusions)
+        # Absent without a manifest, so such a corpus keeps the hash it had
+        # before manifests existed.
+        if receipt is not None:
+            canonical["exclusion_manifest"] = receipt.to_mapping()
         snapshot_hash = _digest(canonical)
         observability = GovernedCorpusObservability(
             considered=len(candidates), included=len(examples), excluded=dict(sorted(excluded.items())),
@@ -926,9 +1067,13 @@ class GovernedAssertionCorpusService:
             CorpusCheckpoint(checkpoint.tenant_id, checkpoint.generation, checkpoint.latest_event_id),
             dict(sorted(capability_versions.items())), policy,
             tuple(examples), snapshot_hash, observability,
+            exclusion_manifest=receipt,
         )
 
-    async def _examples(self, candidates, policy, limits, started) -> tuple[list[GovernedCorpusExample], dict[str, int]]:
+    async def _examples(self, candidates, policy, limits, started, *, exclusions=None) -> tuple[list[GovernedCorpusExample], dict[str, int]]:
+        # The host's exclusions decide eligibility; every digest an example
+        # carries stays the consumer's policy digest.
+        governing = _governing_policy(policy, exclusions)
         self._check_time(limits, started)
         validations = dict(
             await self._storage.assertion_validation_statuses(tuple(candidates))
@@ -960,7 +1105,7 @@ class GovernedAssertionCorpusService:
             )
             reason, sources = await self._govern_lineage(
                 assertion,
-                policy=policy,
+                policy=governing,
                 validation=validation,
                 validation_cache=validations,
                 limits=limits,
@@ -1417,9 +1562,10 @@ class GovernedAssertionCorpusService:
 
 __all__ = [
     "CORPUS_SCHEMA_VERSION", "CorpusCheckpoint", "CorpusEligibilityDecision", "CorpusEligibilityReason",
-    "CorpusValidationStatus", "GovernedAssertionCorpusService", "GovernedCorpusBudgetExceeded",
-    "GovernedCorpusDelta", "GovernedCorpusError", "GovernedCorpusExample", "GovernedCorpusLimits",
-    "GovernedCorpusObservability", "GovernedCorpusPolicy", "GovernedCorpusSnapshot",
-    "GovernedCorpusStorage", "GovernedCorpusTombstone", "GovernedCorpusUnavailable",
+    "CorpusExclusionReceipt", "CorpusValidationStatus", "GovernedAssertionCorpusService",
+    "GovernedCorpusBudgetExceeded", "GovernedCorpusDelta", "GovernedCorpusError",
+    "GovernedCorpusExample", "GovernedCorpusLimits", "GovernedCorpusObservability",
+    "GovernedCorpusPolicy", "GovernedCorpusSnapshot", "GovernedCorpusStorage",
+    "GovernedCorpusTombstone", "GovernedCorpusUnavailable", "HostCorpusExclusions",
     "SessionAttestation",
 ]

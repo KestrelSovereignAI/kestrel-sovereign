@@ -305,6 +305,19 @@ cross-operation attempt burns the authority.  Non-erasure typed probes retain
 no capability receipt.  Consequently no lower-level storage call can be
 relabeled as core release evidence.
 
+The drill's corpus stage is an ordinary governed corpus build, so it reads the
+host's Sovereign-signed corpus exclusion manifest like any other (#3893);
+without one it refuses at that stage rather than build a corpus without
+exclusions. The Kite child environment inherits neither the operator's trust
+root nor their manifest. `KiteHttpHarness.prepare` therefore pins a fresh,
+test-only Sovereign root (`did:web:kite.invalid:sovereign`, its private key
+held only in the harness process) in the evidence home, signs a manifest whose
+one section names the DID `kestrel create kite --test` just minted and
+excludes nothing, and the child environment points
+`KESTREL_SOVEREIGN_TRUST_ROOT_PATH` and `KESTREL_CORPUS_EXCLUSIONS_PATH` at
+those two owner-only files. See
+[Corpus exclusion manifest](../security/SOVEREIGN_TRUST_ROOT.md#corpus-exclusion-manifest).
+
 Every catalog-created Kite home is an owner-managed temporary directory. Its
 `finally` cleanup runs after both successful and failed prepare/start/invoke
 attempts and removes the ephemeral SQLite database, signing key, nonce ledger,

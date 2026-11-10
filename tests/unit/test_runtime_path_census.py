@@ -45,6 +45,9 @@ NOT_STORAGE_ROOTS: dict[str, str] = {
     # The Sovereign-signed governing-constitution source descriptor (#2553):
     # read-only, signature-verified configuration, never a directory written.
     "KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH": "read-only signed descriptor file",
+    # The Sovereign-signed corpus exclusion manifest (#3893): read-only,
+    # signature-verified configuration every corpus build reads, never written.
+    "KESTREL_CORPUS_EXCLUSIONS_PATH": "read-only signed exclusion manifest",
     # The Kite release-evidence tool's pinned signing-key root: read-only
     # verification material the evidence runner exports to its own child.
     "KESTREL_KITE_RELEASE_EVIDENCE_ROOT": "read-only evidence trust root",

@@ -3066,6 +3066,7 @@ class KestrelAgent(
                     llm_service=self.llm_service,
                     _assertion_tenant_capability=assertion_tenant_capability,
                     semantic_capabilities=self.semantic_capabilities,
+                    sovereign_trust_root_path=getattr(self, "_sovereign_trust_root_path", None),
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
@@ -3083,6 +3084,7 @@ class KestrelAgent(
                     llm_service=self.llm_service,
                     _assertion_tenant_capability=assertion_tenant_capability,
                     semantic_capabilities=self.semantic_capabilities,
+                    sovereign_trust_root_path=getattr(self, "_sovereign_trust_root_path", None),
                 )
                 logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
         else:
@@ -3093,6 +3095,7 @@ class KestrelAgent(
                 llm_service=self.llm_service,
                 _assertion_tenant_capability=assertion_tenant_capability,
                 semantic_capabilities=self.semantic_capabilities,
+                sovereign_trust_root_path=getattr(self, "_sovereign_trust_root_path", None),
             )
             logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
 

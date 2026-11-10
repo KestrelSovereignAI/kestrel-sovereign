@@ -30,6 +30,7 @@ from kestrel_sovereign.security.assertion_tenant_resolver import (
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from tests.utils.corpus_exclusions import ExclusionAuthority
 
 EXPERIMENTAL = {
     "mode": "experimental",
@@ -250,9 +251,10 @@ async def test_sleep_uses_capabilities_through_privacy_storage_facade(
 
 @pytest.mark.asyncio
 async def test_experimental_sleep_readiness_and_corpus_share_one_durable_runtime(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     """An experimental sleep cannot become stable-only at the corpus boundary."""
+    exclusion_authority = ExclusionAuthority(tmp_path / "sovereign", monkeypatch)
     selection = semantic_capabilities_from_config(EXPERIMENTAL)
     identity_dir = tmp_path / "experimental-corpus"
     credentials = await create_kestrel_identity_async(
@@ -265,6 +267,7 @@ async def test_experimental_sleep_readiness_and_corpus_share_one_durable_runtime
     capability = _resolve_authenticated_agent_assertion_capability(
         credentials.agent_did, identity
     )
+    exclusion_authority.admit(credentials.agent_did)
     raw_storage = AsyncStorage(
         ":memory:",
         agent_id=credentials.agent_did,
