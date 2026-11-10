@@ -5,7 +5,8 @@ The Sovereign-signed exclusion manifest
 replace, though not forge. Every manifest the Sovereign ever signed verifies,
 so an agent could put back an older one that excluded less. Its ``sequence``
 only moves forward, and this table records, per agent, the highest sequence a
-governed corpus build has admitted together with that manifest's digest:
+governed corpus build or consumption has admitted together with that
+manifest's digest:
 
 * a lower sequence is refused: the manifest moved back;
 * the same sequence with another digest is refused: two different signed
@@ -75,3 +76,18 @@ async def admit_manifest(db, *, agent_id: str, receipt: CorpusExclusionReceipt) 
             "content. A changed manifest needs a higher sequence."
         )
 
+
+async def admitted_manifest(db, *, agent_id: str) -> tuple[str, int] | None:
+    """``(manifest_sha256, sequence)`` of the manifest ``agent_id`` last admitted.
+
+    ``None`` when nothing has been admitted. Read inside a corpus consumption's
+    own transaction, so a manifest a concurrent build or consumption admitted
+    after this one read the file is seen before a corpus is served.
+    """
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError("a corpus exclusion watermark is recorded per agent")
+    row = await db.fetchone(
+        f"SELECT manifest_sha256, sequence FROM {TABLE} WHERE agent_id = ?",
+        (agent_id,),
+    )
+    return None if row is None else (str(row[0]), int(row[1]))

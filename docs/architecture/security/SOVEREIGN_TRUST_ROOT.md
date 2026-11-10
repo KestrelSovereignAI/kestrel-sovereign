@@ -837,10 +837,14 @@ where a changed manifest takes effect. Its registered artifact records the
 receipt of the manifest it was built under (`exclusion_manifest_sequence`,
 `exclusion_manifest_sha256`). Consuming it (`consume_governed_semantic_artifact`)
 reads and admits the current manifest exactly as a build does, and serves it
-only when that receipt equals the current manifest's. Consumption refuses,
-naming the reason, when:
+only when that receipt equals the current manifest's. That manifest must still
+be the one the agent's watermark records when the corpus row is read, in the
+same transaction, so a newer manifest that another build or consumption
+admitted meanwhile is the current one. Consumption refuses, naming the reason,
+when:
 
-- the manifest is missing, fails verification or moved back;
+- the manifest is missing, fails verification or moved back, or a newer one
+  was admitted after this consumption read it;
 - the corpus was built under another manifest, whether older or registered
   late by a build that read a manifest since replaced;
 - the corpus records no manifest: it was built before manifests existed.

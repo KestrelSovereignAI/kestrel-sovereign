@@ -2081,6 +2081,55 @@ async def test_a_corpus_registered_after_its_manifest_was_replaced_is_not_served
 
 
 @pytest.mark.asyncio
+async def test_a_consumption_overtaken_by_a_newer_admitted_manifest_is_refused(
+    file_storage: AsyncStorage, exclusion_authority: ExclusionAuthority, monkeypatch
+) -> None:
+    """Consumption judges a corpus against the manifest the agent admitted last.
+
+    A consumption reads sequence 1, then a build installs and admits sequence
+    2, which excludes the exam, before the consumption reaches the store.
+    The store reads the watermark in the consumption's own transaction, so the
+    sequence-1 corpus, exam and all, is not served; the rebuild is.
+    """
+    storage = file_storage
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    (exam_source,) = await governed.list_assertion_revision_sources(exam["revision_id"])
+    policy = await _taught_fact_policy(storage, exam)
+    with_exam, with_exam_id = await _registered_corpus(governed, policy)
+    read_manifest = storage._host_corpus_exclusions
+    overtaken = []
+
+    async def read_then_overtaken(*, deadline):
+        exclusions = await read_manifest(deadline=deadline)
+        if not overtaken:
+            overtaken.append(exclusions.receipt.sequence)
+            exclusion_authority.exclude(
+                storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
+            )
+            overtaken.append(await _registered_corpus(governed, policy))
+        return exclusions
+
+    monkeypatch.setattr(storage, "_host_corpus_exclusions", read_then_overtaken)
+    with pytest.raises(
+        GovernedArtifactError,
+        match="admitted corpus exclusion manifest is sequence 2 .*not the sequence 1",
+    ):
+        await governed.consume_governed_semantic_artifact(
+            with_exam_id, expected_generation=with_exam.checkpoint.generation
+        )
+    assert overtaken[0] == 1
+    rebuilt, rebuilt_id = overtaken[1]
+    assert rebuilt.examples == ()
+    assert rebuilt.exclusion_manifest.sequence == 2
+    assert await governed.consume_governed_semantic_artifact(
+        rebuilt_id, expected_generation=rebuilt.checkpoint.generation
+    )
+    assert await _pending_corpus_revocations(storage) == []
+
+
+@pytest.mark.asyncio
 async def test_a_corpus_registered_before_manifests_existed_is_refused(
     storage: AsyncStorage,
 ) -> None:
@@ -2108,8 +2157,13 @@ async def test_a_corpus_registered_before_manifests_existed_is_refused(
 async def test_the_store_serves_a_corpus_only_under_the_manifest_it_was_built_under(
     storage: AsyncStorage,
 ) -> None:
-    """The store's own check: equal receipts or a named refusal, never a write."""
+    """The store's own check: equal receipts or a named refusal, never a write.
+
+    The receipt it is handed must also be the one the agent's watermark
+    records, read in the consumption's own transaction (#3893).
+    """
     from kestrel_sovereign.knowledge import CorpusExclusionReceipt
+    from kestrel_sovereign.storage.corpus_exclusion_watermarks import admit_manifest
 
     private_key = Ed25519PrivateKey.generate()
     assertion = _assertion(storage.agent_id, "store-binding-revision")
@@ -2126,19 +2180,36 @@ async def test_the_store_serves_a_corpus_only_under_the_manifest_it_was_built_un
         await store.consume_governed_artifact(
             served.artifact_id, expected_generation=generation
         )
+    # A receipt nothing has admitted is not established as current.
+    with pytest.raises(GovernedArtifactError, match="no corpus exclusion manifest has been admitted"):
+        await store.consume_governed_artifact(
+            served.artifact_id, expected_generation=generation, exclusion_manifest=admitted
+        )
+    await admit_manifest(storage.db, agent_id=storage.agent_id, receipt=admitted)
     assert await store.consume_governed_artifact(
         served.artifact_id, expected_generation=generation, exclusion_manifest=admitted
     )
+    # Same sequence, other content: not the manifest the agent admitted.
+    resigned = CorpusExclusionReceipt("e" * 64, admitted.sequence, admitted.issued_at)
+    with pytest.raises(GovernedArtifactError, match="not the sequence"):
+        await store.consume_governed_artifact(
+            served.artifact_id, expected_generation=generation, exclusion_manifest=resigned
+        )
     newer = CorpusExclusionReceipt("e" * 64, admitted.sequence + 1, admitted.issued_at)
+    await admit_manifest(storage.db, agent_id=storage.agent_id, receipt=newer)
     with pytest.raises(GovernedArtifactError, match="not the current manifest"):
         await store.consume_governed_artifact(
             stale.artifact_id, expected_generation=generation, exclusion_manifest=newer
         )
-    # Same sequence, other content: still not the manifest it was built under.
-    resigned = CorpusExclusionReceipt("e" * 64, admitted.sequence, admitted.issued_at)
-    with pytest.raises(GovernedArtifactError, match="not the current manifest"):
+    # Once a newer manifest is admitted, the receipt a consumption read before
+    # it no longer serves the corpus built under that receipt.
+    with pytest.raises(
+        GovernedArtifactError,
+        match=f"admitted corpus exclusion manifest is sequence {newer.sequence} .*"
+        f"not the sequence {admitted.sequence}",
+    ):
         await store.consume_governed_artifact(
-            served.artifact_id, expected_generation=generation, exclusion_manifest=resigned
+            served.artifact_id, expected_generation=generation, exclusion_manifest=admitted
         )
     assert await _active_artifact_ids(storage) == {served.artifact_id, stale.artifact_id}
     assert await _pending_corpus_revocations(storage) == []

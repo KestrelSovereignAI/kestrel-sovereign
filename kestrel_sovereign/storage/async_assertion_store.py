@@ -5892,14 +5892,21 @@ class AsyncAssertionStore:
 
     @staticmethod
     def _corpus_manifest_refusal(
-        bound_sha256, bound_sequence, current_manifest: tuple[str, int],
+        bound_sha256,
+        bound_sequence,
+        current_manifest: tuple[str, int],
+        admitted_manifest: tuple[str, int] | None,
     ) -> str | None:
         """Why a corpus row may not be served under ``current_manifest``, or ``None``.
 
         Served only when the receipt it was registered with equals the current
         manifest's: a manifest that changed since may hold out what the corpus
-        holds, so it must be rebuilt. Nothing is written; a corpus registered
-        late, under a manifest since replaced, is refused the same way.
+        holds, so it must be rebuilt. ``current_manifest`` must also still be
+        the one the agent's watermark records (``admitted_manifest``, read in
+        this transaction): a newer manifest a concurrent build or consumption
+        admitted after this consumption read the file is the current one.
+        Nothing is written; a corpus registered late, under a manifest since
+        replaced, is refused the same way.
         """
         if bound_sha256 is None or bound_sequence is None:
             return (
@@ -5907,6 +5914,20 @@ class AsyncAssertionStore:
                 "before manifests existed); rebuild it under the current manifest"
             )
         current_sha256, current_sequence = current_manifest
+        if admitted_manifest is None:
+            return (
+                "no corpus exclusion manifest has been admitted for this agent, so "
+                f"manifest sequence {current_sequence} ({current_sha256[:12]}) is "
+                "not established as current"
+            )
+        if admitted_manifest != current_manifest:
+            admitted_sha256, admitted_sequence = admitted_manifest
+            return (
+                "this agent's admitted corpus exclusion manifest is sequence "
+                f"{admitted_sequence} ({admitted_sha256[:12]}), not the sequence "
+                f"{current_sequence} ({current_sha256[:12]}) this consumption "
+                "read; consume again under the current manifest"
+            )
         if (str(bound_sha256), int(bound_sequence)) == current_manifest:
             return None
         return (
@@ -5923,7 +5944,10 @@ class AsyncAssertionStore:
 
         A corpus artifact is served only under ``exclusion_manifest``, the
         host's current verified exclusion manifest, and only when it was built
-        under that very manifest (#3893). Consumption is where a changed
+        under that very manifest (#3893). ``exclusion_manifest`` must also be
+        the manifest the agent's watermark records when the row is read, in
+        this transaction, so one a concurrent build or consumption admitted
+        after the caller read the file wins. Consumption is where a changed
         manifest takes effect: any other corpus is refused, not revoked, so a
         reader holding an older manifest can never withdraw a newer corpus.
         """
@@ -5975,8 +5999,15 @@ class AsyncAssertionStore:
                 # unavailable.
             else:
                 if artifact_kind in CORPUS_ARTIFACT_KINDS:
+                    from kestrel_sovereign.storage.corpus_exclusion_watermarks import (
+                        admitted_manifest,
+                    )
+
                     refusal = self._corpus_manifest_refusal(
-                        bound_sha256, bound_sequence, current_manifest
+                        bound_sha256,
+                        bound_sequence,
+                        current_manifest,
+                        await admitted_manifest(self._database, agent_id=tenant_id),
                     )
                     if refusal is not None:
                         raise GovernedArtifactError(refusal)

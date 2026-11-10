@@ -686,8 +686,11 @@ where a changed manifest takes effect. Each `corpus_manifest` and
 built under (`exclusion_manifest_sha256`, `exclusion_manifest_sequence`), and
 `consume_governed_semantic_artifact` reads and admits the current manifest
 exactly as a build does, then serves the artifact only when its receipt equals
-the current manifest's. It refuses, naming the reason, while the manifest is
-missing, unverifiable or moved back, and refuses an artifact built under
+the current manifest's, and that manifest is still the one the agent's
+watermark records, read in the same transaction as the artifact row. It
+refuses, naming the reason, while the manifest is missing, unverifiable or
+moved back, or once a newer one was admitted after it was read, and refuses an
+artifact built under
 another manifest (including one a build registered after the manifest it read
 was replaced) or recording none (built before manifests existed). A refusal
 leaves the corpus as it is: no build or consumption revokes a corpus over its
