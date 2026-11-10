@@ -385,9 +385,16 @@ class TaskManager:
             for component, stores in components:
                 if await native_store_schema_ready(backend, component):
                     continue
+                # A stored revision with an additive online upgrade takes the
+                # same path: the idempotent initializers add what it lacks.
                 for store in stores:
                     await store.initialize()
-                await publish_native_store_schema(backend, component)
+                previous = await publish_native_store_schema(backend, component)
+                if previous is not None:
+                    logger.info(
+                        "Upgraded native A2A %s store schema in place: revision %d -> %d",
+                        component.value[0], previous, component.value[1],
+                    )
         logger.info("TaskManager initialized with all stores")
 
     async def close(self) -> None:

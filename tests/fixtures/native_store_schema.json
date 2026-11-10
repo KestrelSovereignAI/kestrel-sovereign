@@ -1,0 +1,1722 @@
+{
+  "core": {
+    "indexes": {
+      "a2a_outbound_continuation_owner": {
+        "sql": "CREATE UNIQUE INDEX a2a_outbound_continuation_owner ON a2a_outbound_dispatches (sender_id, sender_tenant, parent_dispatch_id) WHERE parent_dispatch_id IS NOT NULL AND state != 'not-sent'",
+        "table": "a2a_outbound_dispatches"
+      },
+      "a2a_outbound_remote_task_owner": {
+        "sql": "CREATE UNIQUE INDEX a2a_outbound_remote_task_owner ON a2a_outbound_dispatches (sender_id, sender_tenant, recipient_id, tenant, remote_task_id) WHERE remote_task_id IS NOT NULL AND parent_dispatch_id IS NULL",
+        "table": "a2a_outbound_dispatches"
+      },
+      "a2a_outbound_sender_created": {
+        "sql": "CREATE INDEX a2a_outbound_sender_created ON a2a_outbound_dispatches (sender_id, sender_tenant, created_at DESC, dispatch_id DESC)",
+        "table": "a2a_outbound_dispatches"
+      },
+      "a2a_task_changes_forwarded": {
+        "sql": "CREATE INDEX a2a_task_changes_forwarded ON a2a_task_changes (recipient_id, tenant, forwarded_event_id) WHERE forwarded_event_id IS NOT NULL",
+        "table": "a2a_task_changes"
+      },
+      "a2a_task_changes_pending": {
+        "sql": "CREATE INDEX a2a_task_changes_pending ON a2a_task_changes (recipient_id, tenant, sequence) WHERE forwarded_event_id IS NULL",
+        "table": "a2a_task_changes"
+      },
+      "a2a_task_changes_task": {
+        "sql": "CREATE INDEX a2a_task_changes_task ON a2a_task_changes (recipient_id, tenant, task_id, sequence)",
+        "table": "a2a_task_changes"
+      },
+      "idx_llm_calls_agent": {
+        "sql": "CREATE INDEX idx_llm_calls_agent ON a2a_llm_calls(agent_did)",
+        "table": "a2a_llm_calls"
+      },
+      "idx_llm_calls_companion": {
+        "sql": "CREATE INDEX idx_llm_calls_companion ON a2a_llm_calls(companion_id)",
+        "table": "a2a_llm_calls"
+      },
+      "idx_llm_calls_model": {
+        "sql": "CREATE INDEX idx_llm_calls_model ON a2a_llm_calls(model)",
+        "table": "a2a_llm_calls"
+      },
+      "idx_llm_calls_provider": {
+        "sql": "CREATE INDEX idx_llm_calls_provider ON a2a_llm_calls(provider)",
+        "table": "a2a_llm_calls"
+      },
+      "idx_llm_calls_session": {
+        "sql": "CREATE INDEX idx_llm_calls_session ON a2a_llm_calls(session_id)",
+        "table": "a2a_llm_calls"
+      },
+      "idx_llm_calls_timestamp": {
+        "sql": "CREATE INDEX idx_llm_calls_timestamp ON a2a_llm_calls(timestamp)",
+        "table": "a2a_llm_calls"
+      },
+      "idx_obs_agent_type": {
+        "sql": "CREATE INDEX idx_obs_agent_type ON a2a_observability(agent_name, event_type)",
+        "table": "a2a_observability"
+      },
+      "idx_obs_session": {
+        "sql": "CREATE INDEX idx_obs_session ON a2a_observability(session_id)",
+        "table": "a2a_observability"
+      },
+      "idx_obs_timestamp": {
+        "sql": "CREATE INDEX idx_obs_timestamp ON a2a_observability(timestamp)",
+        "table": "a2a_observability"
+      },
+      "idx_sessions_agent": {
+        "sql": "CREATE INDEX idx_sessions_agent ON a2a_sessions(agent_name)",
+        "table": "a2a_sessions"
+      },
+      "idx_sessions_user": {
+        "sql": "CREATE INDEX idx_sessions_user ON a2a_sessions(user_id)",
+        "table": "a2a_sessions"
+      },
+      "idx_tasks_creator": {
+        "sql": "CREATE INDEX idx_tasks_creator ON a2a_tasks(creator_agent_id)",
+        "table": "a2a_tasks"
+      },
+      "idx_tasks_recipient": {
+        "sql": "CREATE INDEX idx_tasks_recipient ON a2a_tasks(recipient_agent_id)",
+        "table": "a2a_tasks"
+      },
+      "idx_tasks_session": {
+        "sql": "CREATE INDEX idx_tasks_session ON a2a_tasks(session_id)",
+        "table": "a2a_tasks"
+      },
+      "idx_tasks_status": {
+        "sql": "CREATE INDEX idx_tasks_status ON a2a_tasks(status)",
+        "table": "a2a_tasks"
+      },
+      "idx_tool_dispatches_agent_ts": {
+        "sql": "CREATE INDEX idx_tool_dispatches_agent_ts ON a2a_tool_dispatches(agent_did, ts)",
+        "table": "a2a_tool_dispatches"
+      },
+      "idx_tool_dispatches_agent_turn": {
+        "sql": "CREATE INDEX idx_tool_dispatches_agent_turn ON a2a_tool_dispatches(agent_did, turn_id, id)",
+        "table": "a2a_tool_dispatches"
+      },
+      "idx_tool_dispatches_dispatch": {
+        "sql": "CREATE INDEX idx_tool_dispatches_dispatch ON a2a_tool_dispatches(agent_did, dispatch_id)",
+        "table": "a2a_tool_dispatches"
+      },
+      "idx_tool_dispatches_parent": {
+        "sql": "CREATE INDEX idx_tool_dispatches_parent ON a2a_tool_dispatches(agent_did, parent_dispatch_id)",
+        "table": "a2a_tool_dispatches"
+      },
+      "idx_tool_dispatches_status": {
+        "sql": "CREATE INDEX idx_tool_dispatches_status ON a2a_tool_dispatches(agent_did, result_status)",
+        "table": "a2a_tool_dispatches"
+      }
+    },
+    "revision": 6,
+    "tables": {
+      "a2a_contexts": {
+        "columns": [
+          [
+            "context_id",
+            "TEXT",
+            true,
+            null,
+            3
+          ],
+          [
+            "tenant",
+            "TEXT",
+            true,
+            null,
+            2
+          ],
+          [
+            "recipient_agent_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "creator_agent_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "created_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_contexts ( context_id TEXT NOT NULL, tenant TEXT NOT NULL, recipient_agent_id TEXT NOT NULL, creator_agent_id TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (recipient_agent_id, tenant, context_id) )"
+      },
+      "a2a_llm_calls": {
+        "columns": [
+          [
+            "id",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "timestamp",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "agent_did",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "session_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "companion_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "user_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "provider",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "model",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "system_prompt_preview",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "user_prompt_preview",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "response_preview",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "input_tokens",
+            "INTEGER",
+            false,
+            null,
+            0
+          ],
+          [
+            "output_tokens",
+            "INTEGER",
+            false,
+            null,
+            0
+          ],
+          [
+            "duration_ms",
+            "INTEGER",
+            true,
+            null,
+            0
+          ],
+          [
+            "success",
+            "INTEGER",
+            false,
+            "1",
+            0
+          ],
+          [
+            "error_message",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "tool_calls",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "metadata",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_llm_calls ( id TEXT PRIMARY KEY, timestamp TEXT DEFAULT (datetime('now')), agent_did TEXT, session_id TEXT, companion_id TEXT, user_id TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, system_prompt_preview TEXT, user_prompt_preview TEXT, response_preview TEXT, input_tokens INTEGER, output_tokens INTEGER, duration_ms INTEGER NOT NULL, success INTEGER DEFAULT 1, error_message TEXT, tool_calls TEXT, metadata TEXT DEFAULT '{}' )"
+      },
+      "a2a_native_question_wakes": {
+        "columns": [
+          [
+            "sender_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "sender_tenant",
+            "TEXT",
+            true,
+            null,
+            2
+          ],
+          [
+            "question_id",
+            "TEXT",
+            true,
+            null,
+            3
+          ],
+          [
+            "wave",
+            "TEXT",
+            true,
+            null,
+            4
+          ],
+          [
+            "event_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "payload_json",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "claim_token",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "lease_until",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "handed_off_at",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "delivery_failed_at",
+            "TEXT",
+            false,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_native_question_wakes ( sender_id TEXT NOT NULL, sender_tenant TEXT NOT NULL, question_id TEXT NOT NULL, wave TEXT NOT NULL CHECK (wave IN ('answer','deadline','late-answer')), event_id TEXT NOT NULL, payload_json TEXT NOT NULL, claim_token TEXT, lease_until TEXT, handed_off_at TEXT, delivery_failed_at TEXT, PRIMARY KEY (sender_id, sender_tenant, question_id, wave), UNIQUE (sender_id, sender_tenant, event_id) )"
+      },
+      "a2a_native_questions": {
+        "columns": [
+          [
+            "sender_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "sender_tenant",
+            "TEXT",
+            true,
+            null,
+            2
+          ],
+          [
+            "question_id",
+            "TEXT",
+            true,
+            null,
+            3
+          ],
+          [
+            "dispatch_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "recipient_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "recipient_tenant",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "original_question",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "request_json",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "origin_turn_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "origin_session_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "causation_json",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "deadline",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "status",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "receiver_settled",
+            "INTEGER",
+            true,
+            null,
+            0
+          ],
+          [
+            "response_json",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "response_digest",
+            "TEXT",
+            false,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_native_questions ( sender_id TEXT NOT NULL, sender_tenant TEXT NOT NULL, question_id TEXT NOT NULL, dispatch_id TEXT NOT NULL, recipient_id TEXT NOT NULL, recipient_tenant TEXT NOT NULL, original_question TEXT NOT NULL, request_json TEXT NOT NULL, origin_turn_id TEXT NOT NULL, origin_session_id TEXT NOT NULL, causation_json TEXT NOT NULL, deadline TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('WAITING', 'RESOLVED', 'EXPIRED')), receiver_settled INTEGER NOT NULL CHECK (receiver_settled IN (0,1)), response_json TEXT, response_digest TEXT, PRIMARY KEY (sender_id, sender_tenant, question_id), UNIQUE (sender_id, sender_tenant, dispatch_id) )"
+      },
+      "a2a_native_store_schema": {
+        "columns": [
+          [
+            "component",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "revision",
+            "INTEGER",
+            true,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_native_store_schema ( component TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK (revision > 0) )"
+      },
+      "a2a_observability": {
+        "columns": [
+          [
+            "id",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "timestamp",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "agent_name",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "session_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "event_type",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "tool_name",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "duration_ms",
+            "INTEGER",
+            false,
+            null,
+            0
+          ],
+          [
+            "success",
+            "INTEGER",
+            false,
+            "1",
+            0
+          ],
+          [
+            "error_message",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "metadata",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_observability ( id TEXT PRIMARY KEY, timestamp TEXT DEFAULT (datetime('now')), agent_name TEXT NOT NULL, session_id TEXT, event_type TEXT NOT NULL, tool_name TEXT, duration_ms INTEGER, success INTEGER DEFAULT 1, error_message TEXT, metadata TEXT DEFAULT '{}' )"
+      },
+      "a2a_outbound_dispatches": {
+        "columns": [
+          [
+            "dispatch_id",
+            "TEXT",
+            true,
+            null,
+            3
+          ],
+          [
+            "sender_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "sender_tenant",
+            "TEXT",
+            true,
+            null,
+            2
+          ],
+          [
+            "recipient_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "tenant",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "signing_did",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "interface_url",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "protocol_binding",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "message_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "requested_context_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "request_digest",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "message_digest",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "dispatch_tool",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "verb",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "created_at",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "state",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "revision",
+            "BIGINT",
+            true,
+            null,
+            0
+          ],
+          [
+            "remote_task_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "remote_context_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "remote_task_state",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "response_digest",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "response_kind",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "updated_at",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "operation_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "cancel_operation_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "cancel_request_digest",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "cancel_state",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "root_dispatch_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "parent_dispatch_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_outbound_dispatches ( dispatch_id TEXT NOT NULL, sender_id TEXT NOT NULL, sender_tenant TEXT NOT NULL, recipient_id TEXT NOT NULL, tenant TEXT NOT NULL, signing_did TEXT NOT NULL, interface_url TEXT NOT NULL, protocol_binding TEXT NOT NULL, message_id TEXT NOT NULL, requested_context_id TEXT NOT NULL, request_digest TEXT NOT NULL, message_digest TEXT NOT NULL, dispatch_tool TEXT NOT NULL, verb TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('reserved', 'submitting', 'unknown', 'not-sent', 'acknowledged', 'complete')), revision BIGINT NOT NULL CHECK (revision >= 0), remote_task_id TEXT, remote_context_id TEXT, remote_task_state TEXT, response_digest TEXT, response_kind TEXT, updated_at TEXT NOT NULL, operation_id TEXT NOT NULL, cancel_operation_id TEXT, cancel_request_digest TEXT, cancel_state TEXT CHECK (cancel_state IN ('reserved', 'submitting', 'unknown', 'not-sent', 'acknowledged', 'complete')), root_dispatch_id TEXT NOT NULL, parent_dispatch_id TEXT, PRIMARY KEY (sender_id, sender_tenant, dispatch_id), UNIQUE (sender_id, sender_tenant, message_id), FOREIGN KEY (sender_id, sender_tenant, root_dispatch_id) REFERENCES a2a_outbound_dispatches (sender_id, sender_tenant, dispatch_id), FOREIGN KEY (sender_id, sender_tenant, parent_dispatch_id) REFERENCES a2a_outbound_dispatches (sender_id, sender_tenant, dispatch_id) )"
+      },
+      "a2a_protocol_schema": {
+        "columns": [
+          [
+            "singleton",
+            "INTEGER",
+            false,
+            null,
+            1
+          ],
+          [
+            "revision",
+            "INTEGER",
+            true,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_protocol_schema ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), revision INTEGER NOT NULL CHECK (revision = 1) )"
+      },
+      "a2a_sessions": {
+        "columns": [
+          [
+            "id",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "agent_name",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "user_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "state",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ],
+          [
+            "events",
+            "TEXT",
+            false,
+            "'[]'",
+            0
+          ],
+          [
+            "metadata",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ],
+          [
+            "created_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "updated_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_sessions ( id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, user_id TEXT, state TEXT DEFAULT '{}', events TEXT DEFAULT '[]', metadata TEXT DEFAULT '{}', created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')) )"
+      },
+      "a2a_task_changes": {
+        "columns": [
+          [
+            "sequence",
+            "INTEGER",
+            false,
+            null,
+            1
+          ],
+          [
+            "recipient_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "tenant",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "task_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "forwarded_event_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_task_changes ( sequence INTEGER PRIMARY KEY AUTOINCREMENT, recipient_id TEXT NOT NULL, tenant TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE, forwarded_event_id TEXT )"
+      },
+      "a2a_task_inputs": {
+        "columns": [
+          [
+            "task_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "input_revision",
+            "BIGINT",
+            true,
+            null,
+            2
+          ],
+          [
+            "message_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "request_json",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "request_digest",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "wire_request_digest",
+            "TEXT",
+            true,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_task_inputs ( task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE, input_revision BIGINT NOT NULL CHECK (input_revision >= 0), message_id TEXT NOT NULL, request_json TEXT NOT NULL, request_digest TEXT NOT NULL, wire_request_digest TEXT NOT NULL CHECK (length(wire_request_digest) = 64), PRIMARY KEY (task_id, input_revision), UNIQUE (task_id, message_id) )"
+      },
+      "a2a_tasks": {
+        "columns": [
+          [
+            "id",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "session_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "user_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "task_type",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "status",
+            "TEXT",
+            false,
+            "'submitted'",
+            0
+          ],
+          [
+            "message",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "artifacts",
+            "TEXT",
+            false,
+            "'[]'",
+            0
+          ],
+          [
+            "history",
+            "TEXT",
+            false,
+            "'[]'",
+            0
+          ],
+          [
+            "metadata",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ],
+          [
+            "created_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "updated_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "creator_agent_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "recipient_agent_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "canceled_by",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "cancel_reason",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "cancel_previous_status",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "cancel_operation_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "terminal_operation_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "lifecycle_revision",
+            "BIGINT",
+            true,
+            "0",
+            0
+          ],
+          [
+            "lifecycle_updated_at",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "status_timestamp_seconds",
+            "BIGINT",
+            false,
+            null,
+            0
+          ],
+          [
+            "status_timestamp_nanos",
+            "INTEGER",
+            false,
+            null,
+            0
+          ],
+          [
+            "tenant",
+            "TEXT",
+            true,
+            "''",
+            0
+          ],
+          [
+            "cognition_wake_eligible",
+            "INTEGER",
+            true,
+            "1",
+            0
+          ],
+          [
+            "input_revision",
+            "BIGINT",
+            true,
+            "0",
+            0
+          ],
+          [
+            "input_wake_eligible",
+            "INTEGER",
+            true,
+            "1",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_tasks ( id TEXT PRIMARY KEY, session_id TEXT, user_id TEXT, task_type TEXT NOT NULL, status TEXT DEFAULT 'submitted', message TEXT, artifacts TEXT DEFAULT '[]', history TEXT DEFAULT '[]', metadata TEXT DEFAULT '{}', created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')), creator_agent_id TEXT, recipient_agent_id TEXT, canceled_by TEXT, cancel_reason TEXT, cancel_previous_status TEXT, cancel_operation_id TEXT, terminal_operation_id TEXT, lifecycle_revision BIGINT NOT NULL DEFAULT 0, lifecycle_updated_at TEXT, status_timestamp_seconds BIGINT, status_timestamp_nanos INTEGER, tenant TEXT NOT NULL DEFAULT '', cognition_wake_eligible INTEGER NOT NULL DEFAULT 1 CHECK (cognition_wake_eligible IN (0,1)), input_revision BIGINT NOT NULL DEFAULT 0 CHECK (input_revision >= 0), input_wake_eligible INTEGER NOT NULL DEFAULT 1 CHECK (input_wake_eligible IN (0,1)) )"
+      },
+      "a2a_tool_dispatches": {
+        "columns": [
+          [
+            "id",
+            "INTEGER",
+            false,
+            null,
+            1
+          ],
+          [
+            "agent_did",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "session_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "turn_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "ts",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "tool_name",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "adapter",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "args_redacted",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "result_status",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "error_class",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "error_message",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "latency_ms",
+            "INTEGER",
+            true,
+            null,
+            0
+          ],
+          [
+            "result_size_bytes",
+            "INTEGER",
+            false,
+            null,
+            0
+          ],
+          [
+            "dispatch_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "parent_dispatch_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_tool_dispatches ( id INTEGER PRIMARY KEY AUTOINCREMENT, agent_did TEXT NOT NULL, session_id TEXT, turn_id TEXT NOT NULL, ts TEXT DEFAULT (datetime('now')), tool_name TEXT NOT NULL, adapter TEXT NOT NULL, args_redacted TEXT NOT NULL, result_status TEXT NOT NULL CHECK ( result_status IN ('success', 'error', 'empty', 'policy_denied', 'timeout') ), error_class TEXT, error_message TEXT, latency_ms INTEGER NOT NULL, result_size_bytes INTEGER, dispatch_id TEXT, parent_dispatch_id TEXT )"
+      }
+    },
+    "triggers": {
+      "a2a_tasks_authority_insert_v5": {
+        "sql": "CREATE TRIGGER a2a_tasks_authority_insert_v5 BEFORE INSERT ON a2a_tasks FOR EACH ROW WHEN NEW.creator_agent_id IS NULL OR NEW.recipient_agent_id IS NULL BEGIN SELECT RAISE(ABORT, 'A2A task requires durable authority'); END",
+        "table": "a2a_tasks"
+      },
+      "a2a_tasks_live_authority_update_v5": {
+        "sql": "CREATE TRIGGER a2a_tasks_live_authority_update_v5 BEFORE UPDATE ON a2a_tasks FOR EACH ROW WHEN NEW.status IN ('submitted', 'working', 'input-required', 'auth-required') AND (NEW.creator_agent_id IS NULL OR NEW.recipient_agent_id IS NULL) BEGIN SELECT RAISE(ABORT, 'live A2A task requires durable authority'); END",
+        "table": "a2a_tasks"
+      },
+      "a2a_tasks_terminal_replace_v5": {
+        "sql": "CREATE TRIGGER a2a_tasks_terminal_replace_v5 BEFORE INSERT ON a2a_tasks FOR EACH ROW WHEN EXISTS ( SELECT 1 FROM a2a_tasks WHERE id = NEW.id AND status IN ('completed', 'failed', 'canceled', 'rejected') ) BEGIN SELECT RAISE(IGNORE); END",
+        "table": "a2a_tasks"
+      },
+      "a2a_tasks_terminal_update_v5": {
+        "sql": "CREATE TRIGGER a2a_tasks_terminal_update_v5 BEFORE UPDATE ON a2a_tasks FOR EACH ROW WHEN OLD.status IN ('completed', 'failed', 'canceled', 'rejected') BEGIN SELECT RAISE(ABORT, 'terminal A2A task cannot be replaced'); END",
+        "table": "a2a_tasks"
+      }
+    }
+  },
+  "feedback": {
+    "indexes": {
+      "idx_feedback_agent": {
+        "sql": "CREATE INDEX idx_feedback_agent ON a2a_feedback(agent_name, status)",
+        "table": "a2a_feedback"
+      },
+      "idx_feedback_category": {
+        "sql": "CREATE INDEX idx_feedback_category ON a2a_feedback(category)",
+        "table": "a2a_feedback"
+      },
+      "idx_feedback_created": {
+        "sql": "CREATE INDEX idx_feedback_created ON a2a_feedback(created_at)",
+        "table": "a2a_feedback"
+      },
+      "idx_feedback_status": {
+        "sql": "CREATE INDEX idx_feedback_status ON a2a_feedback(status, severity)",
+        "table": "a2a_feedback"
+      }
+    },
+    "revision": 1,
+    "tables": {
+      "a2a_feedback": {
+        "columns": [
+          [
+            "id",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "agent_name",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "session_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "source",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "category",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "severity",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "status",
+            "TEXT",
+            false,
+            "'open'",
+            0
+          ],
+          [
+            "title",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "description",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "context",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ],
+          [
+            "resolution",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "created_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "updated_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ],
+          [
+            "resolved_at",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "metadata",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_feedback ( id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, session_id TEXT, source TEXT NOT NULL, category TEXT NOT NULL, severity TEXT NOT NULL, status TEXT DEFAULT 'open', title TEXT NOT NULL, description TEXT NOT NULL, context TEXT DEFAULT '{}', resolution TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')), resolved_at TEXT, metadata TEXT DEFAULT '{}' )"
+      }
+    }
+  },
+  "memory": {
+    "indexes": {
+      "idx_memory_session": {
+        "sql": "CREATE INDEX idx_memory_session ON a2a_memory(session_id)",
+        "table": "a2a_memory"
+      }
+    },
+    "revision": 1,
+    "tables": {
+      "a2a_memory": {
+        "columns": [
+          [
+            "id",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "session_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "content",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "tags",
+            "TEXT",
+            false,
+            "'[]'",
+            0
+          ],
+          [
+            "metadata",
+            "TEXT",
+            false,
+            "'{}'",
+            0
+          ],
+          [
+            "created_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_memory ( id TEXT PRIMARY KEY, session_id TEXT, content TEXT, tags TEXT DEFAULT '[]', metadata TEXT DEFAULT '{}', created_at TEXT DEFAULT (datetime('now')) )"
+      },
+      "a2a_memory_fts": {
+        "columns": [
+          [
+            "content",
+            "",
+            false,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE VIRTUAL TABLE a2a_memory_fts USING fts5( content, content='a2a_memory', content_rowid='rowid' )"
+      }
+    },
+    "triggers": {
+      "a2a_memory_ad": {
+        "sql": "CREATE TRIGGER a2a_memory_ad AFTER DELETE ON a2a_memory BEGIN INSERT INTO a2a_memory_fts(a2a_memory_fts, rowid, content) VALUES('delete', old.rowid, old.content); END",
+        "table": "a2a_memory"
+      },
+      "a2a_memory_ai": {
+        "sql": "CREATE TRIGGER a2a_memory_ai AFTER INSERT ON a2a_memory BEGIN INSERT INTO a2a_memory_fts(rowid, content) VALUES (new.rowid, new.content); END",
+        "table": "a2a_memory"
+      },
+      "a2a_memory_au": {
+        "sql": "CREATE TRIGGER a2a_memory_au AFTER UPDATE ON a2a_memory BEGIN INSERT INTO a2a_memory_fts(a2a_memory_fts, rowid, content) VALUES('delete', old.rowid, old.content); INSERT INTO a2a_memory_fts(rowid, content) VALUES (new.rowid, new.content); END",
+        "table": "a2a_memory"
+      }
+    }
+  },
+  "push": {
+    "indexes": {
+      "a2a_push_active_tasks": {
+        "sql": "CREATE INDEX a2a_push_active_tasks ON a2a_push_configs (recipient_id, tenant, task_id) WHERE state = 'active'",
+        "table": "a2a_push_configs"
+      },
+      "a2a_push_current_config": {
+        "sql": "CREATE UNIQUE INDEX a2a_push_current_config ON a2a_push_configs (recipient_id, tenant, task_id, config_id) WHERE state = 'active'",
+        "table": "a2a_push_configs"
+      },
+      "a2a_push_live_attempts": {
+        "sql": "CREATE INDEX a2a_push_live_attempts ON a2a_push_delivery_attempts (recipient_id, tenant, task_id, config_id, generation, retired)",
+        "table": "a2a_push_delivery_attempts"
+      },
+      "a2a_push_retiring_configs": {
+        "sql": "CREATE INDEX a2a_push_retiring_configs ON a2a_push_configs (recipient_id, tenant, task_id, config_id, generation) WHERE state = 'deleting'",
+        "table": "a2a_push_configs"
+      },
+      "a2a_push_unretired_processes": {
+        "sql": "CREATE INDEX a2a_push_unretired_processes ON a2a_push_delivery_attempts (recipient_id, tenant, attempt_id) WHERE retired = 0",
+        "table": "a2a_push_delivery_attempts"
+      }
+    },
+    "revision": 4,
+    "tables": {
+      "a2a_push_configs": {
+        "columns": [
+          [
+            "recipient_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "tenant",
+            "TEXT",
+            true,
+            null,
+            2
+          ],
+          [
+            "creator_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "task_id",
+            "TEXT",
+            true,
+            null,
+            3
+          ],
+          [
+            "config_id",
+            "TEXT",
+            true,
+            null,
+            4
+          ],
+          [
+            "generation",
+            "TEXT",
+            true,
+            null,
+            5
+          ],
+          [
+            "state",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "ciphertext",
+            "TEXT",
+            false,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_push_configs ( recipient_id TEXT NOT NULL, tenant TEXT NOT NULL, creator_id TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE, config_id TEXT NOT NULL, generation TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('active', 'deleting', 'deleted')), ciphertext TEXT, PRIMARY KEY (recipient_id, tenant, task_id, config_id, generation), CHECK ((state = 'deleted') = (ciphertext IS NULL)) )"
+      },
+      "a2a_push_delivery_attempts": {
+        "columns": [
+          [
+            "recipient_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "tenant",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "task_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "config_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "creator_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "generation",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "attempt_id",
+            "TEXT",
+            false,
+            null,
+            1
+          ],
+          [
+            "executor_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "owner_identity",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "retired",
+            "INTEGER",
+            true,
+            "0",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_push_delivery_attempts ( recipient_id TEXT NOT NULL, tenant TEXT NOT NULL, task_id TEXT NOT NULL, config_id TEXT NOT NULL, creator_id TEXT NOT NULL, generation TEXT NOT NULL, attempt_id TEXT PRIMARY KEY, executor_id TEXT NOT NULL, owner_identity TEXT NOT NULL CHECK (length(owner_identity) > 0), retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)), FOREIGN KEY (recipient_id, tenant, task_id, config_id, generation) REFERENCES a2a_push_configs(recipient_id, tenant, task_id, config_id, generation) )"
+      },
+      "a2a_push_subscriptions": {
+        "columns": [
+          [
+            "recipient_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "tenant",
+            "TEXT",
+            true,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            true,
+            null,
+            3
+          ],
+          [
+            "config_id",
+            "TEXT",
+            true,
+            null,
+            4
+          ],
+          [
+            "generation",
+            "TEXT",
+            true,
+            null,
+            5
+          ],
+          [
+            "creator_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "agent_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "consumer_id",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "after_sequence",
+            "BIGINT",
+            true,
+            null,
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_push_subscriptions ( recipient_id TEXT NOT NULL, tenant TEXT NOT NULL, task_id TEXT NOT NULL, config_id TEXT NOT NULL, generation TEXT NOT NULL, creator_id TEXT NOT NULL, agent_id TEXT NOT NULL, consumer_id TEXT NOT NULL, after_sequence BIGINT NOT NULL CHECK (after_sequence >= 0), PRIMARY KEY (recipient_id, tenant, task_id, config_id, generation), UNIQUE (agent_id, consumer_id), FOREIGN KEY (agent_id, consumer_id) REFERENCES durable_signal_consumers (agent_id, consumer_id), FOREIGN KEY (recipient_id, tenant, task_id, config_id, generation) REFERENCES a2a_push_configs (recipient_id, tenant, task_id, config_id, generation) ON DELETE CASCADE )"
+      }
+    },
+    "triggers": {
+      "a2a_push_task_cleanup_v1": {
+        "sql": "CREATE TRIGGER a2a_push_task_cleanup_v1 BEFORE DELETE ON a2a_tasks WHEN EXISTS (SELECT 1 FROM a2a_push_configs WHERE task_id = OLD.id AND state != 'deleted') BEGIN SELECT RAISE(ABORT, 'task has an active push configuration'); END",
+        "table": "a2a_tasks"
+      },
+      "a2a_task_changes_insert_v2": {
+        "sql": "CREATE TRIGGER a2a_task_changes_insert_v2 AFTER INSERT ON a2a_tasks WHEN EXISTS ( SELECT 1 FROM a2a_push_configs cfg JOIN a2a_push_subscriptions sub ON sub.recipient_id = cfg.recipient_id AND sub.tenant = cfg.tenant AND sub.task_id = cfg.task_id AND sub.config_id = cfg.config_id AND sub.generation = cfg.generation JOIN durable_signal_consumers consumer ON consumer.agent_id = sub.agent_id AND consumer.consumer_id = sub.consumer_id WHERE cfg.recipient_id = NEW.recipient_agent_id AND cfg.tenant = NEW.tenant AND cfg.task_id = NEW.id AND cfg.state = 'active' AND consumer.active = TRUE ) BEGIN INSERT INTO a2a_task_changes (recipient_id, tenant, task_id) VALUES (NEW.recipient_agent_id, NEW.tenant, NEW.id); END",
+        "table": "a2a_tasks"
+      },
+      "a2a_task_changes_update_v2": {
+        "sql": "CREATE TRIGGER a2a_task_changes_update_v2 AFTER UPDATE ON a2a_tasks WHEN EXISTS ( SELECT 1 FROM a2a_push_configs cfg JOIN a2a_push_subscriptions sub ON sub.recipient_id = cfg.recipient_id AND sub.tenant = cfg.tenant AND sub.task_id = cfg.task_id AND sub.config_id = cfg.config_id AND sub.generation = cfg.generation JOIN durable_signal_consumers consumer ON consumer.agent_id = sub.agent_id AND consumer.consumer_id = sub.consumer_id WHERE cfg.recipient_id = NEW.recipient_agent_id AND cfg.tenant = NEW.tenant AND cfg.task_id = NEW.id AND cfg.state = 'active' AND consumer.active = TRUE ) BEGIN INSERT INTO a2a_task_changes (recipient_id, tenant, task_id) VALUES (NEW.recipient_agent_id, NEW.tenant, NEW.id); END",
+        "table": "a2a_tasks"
+      }
+    }
+  }
+}

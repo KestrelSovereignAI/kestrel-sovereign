@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from enum import Enum
+from types import MappingProxyType
 
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 
@@ -17,10 +18,30 @@ class NativeStoreSchema(Enum):
     payload encoding. A standalone TaskStore never proves the other stores.
     """
 
-    CORE = ("core", 5)
+    CORE = ("core", 6)
     MEMORY = ("memory", 1)
     FEEDBACK = ("feedback", 1)
     PUSH = ("push", 4)
+
+
+#: Stored revisions TaskManager finishes in place, under the schema lease.
+#:
+#: Every entry is additive DDL only: re-running the component's idempotent
+#: store initializers carries the stored tables to the runtime revision and
+#: converts no row (#4002). A revision absent here, and every data conversion,
+#: stays an offline migration. A component whose DDL changes needs a new
+#: revision AND a decision recorded here or in ``data/offline_migrations.toml``;
+#: otherwise existing stores never receive the change.
+ADDITIVE_ONLINE_UPGRADES = MappingProxyType(
+    {
+        # 6: a2a_tool_dispatches.dispatch_id and parent_dispatch_id (#3995).
+        NativeStoreSchema.CORE.value[0]: frozenset({5}),
+    }
+)
+
+
+def _upgrades_online(component: str, revision: int) -> bool:
+    return revision in ADDITIVE_ONLINE_UPGRADES.get(component, frozenset())
 
 
 async def _require_native_input_schema(backend) -> None:
@@ -52,7 +73,9 @@ async def _require_native_store_revisions(backend) -> bool:
     )
     expected = dict(component.value for component in NativeStoreSchema)
     if any(
-        name not in expected or revision != expected[name] for name, revision in rows
+        name not in expected
+        or (revision != expected[name] and not _upgrades_online(name, revision))
+        for name, revision in rows
     ):
         raise NativeA2AMigrationRequired(
             "Stored native A2A store schema revision is not supported by this runtime"
@@ -75,12 +98,18 @@ async def native_store_schema_ready(backend, component: NativeStoreSchema) -> bo
     return row == (component.value[1],)
 
 
-async def publish_native_store_schema(backend, component: NativeStoreSchema) -> None:
+async def publish_native_store_schema(
+    backend, component: NativeStoreSchema
+) -> int | None:
     """Record completion in the same transaction as the component's DDL.
 
     Only the TaskManager bundle initializer publishes this proof, after every
     store in the unit succeeded. Optional components share its outer transaction.
+    A stored revision listed in ``ADDITIVE_ONLINE_UPGRADES`` is advanced in
+    place rather than inserted over. Returns the revision it replaced, or
+    ``None`` when the component had no stored revision.
     """
+    name, revision = component.value
     async with native_schema_write(backend):
         await backend.execute_script("""
             CREATE TABLE IF NOT EXISTS a2a_native_store_schema (
@@ -88,10 +117,36 @@ async def publish_native_store_schema(backend, component: NativeStoreSchema) -> 
                 revision INTEGER NOT NULL CHECK (revision > 0)
             )
         """)
-        await backend.execute(
-            "INSERT INTO a2a_native_store_schema (component, revision) VALUES (?, ?)",
-            component.value,
+        row = await backend.fetch_one(
+            "SELECT revision FROM a2a_native_store_schema WHERE component = ?",
+            (name,),
         )
+        if row is None:
+            await backend.execute(
+                "INSERT INTO a2a_native_store_schema (component, revision) VALUES (?, ?)",
+                component.value,
+            )
+            return None
+        (stored,) = row
+        if stored == revision:
+            raise RuntimeError(
+                f"Native A2A {name} store schema revision {revision} is already published"
+            )
+        if not _upgrades_online(name, stored):
+            raise NativeA2AMigrationRequired(
+                f"Stored native A2A {name} store schema revision {stored} has no "
+                f"online upgrade to revision {revision}"
+            )
+        updated = await backend.execute(
+            "UPDATE a2a_native_store_schema SET revision = ? "
+            "WHERE component = ? AND revision = ?",
+            (revision, name, stored),
+        )
+        if updated != 1:
+            raise RuntimeError(
+                f"Native A2A {name} store schema revision changed under the schema lease"
+            )
+        return stored
 
 
 async def require_native_a2a_schema(backend) -> None:

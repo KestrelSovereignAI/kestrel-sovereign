@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
-import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AbstractSet
 
 
@@ -25,12 +25,17 @@ async def booted_agent(
     provenance: str,
     features: AbstractSet[str],
     genesis: bool = True,
+    released_schema: Path | None = None,
 ):
     """A booted agent past genesis and discovery, loading only ``features``
     (Feature class names) beyond the mandatory set.
 
     ``genesis=False`` leaves the genesis audit pending, so the agent's first
-    turn runs it through its own auditor."""
+    turn runs it through its own auditor.
+
+    ``released_schema`` names a snapshot from ``tests.shared.agent_store_schema``.
+    The agent's database then starts as that release's fresh database, and the
+    agent boots across whatever upgrade its stores need (#4002)."""
     from kestrel_sovereign.bootstrap import BootstrapState
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
     from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -38,13 +43,31 @@ async def booted_agent(
     from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
     from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
-    credentials = await create_kestrel_identity_async(
-        output_dir=str(tmp_path), is_test_instance=True, agent_name=name
-    )
+    db_path = Path(tmp_path) / "kestrel_prime.db"
+    if released_schema is None:
+        credentials = await create_kestrel_identity_async(
+            output_dir=str(tmp_path), is_test_instance=True, agent_name=name
+        )
+    else:
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from tests.shared.agent_store_schema import load
+
+        Path(tmp_path).mkdir(parents=True, exist_ok=True)
+        load(db_path, released_schema)
+        database = await AsyncDatabase.sqlite(str(db_path))
+        try:
+            credentials = await create_kestrel_identity_async(
+                output_dir=str(tmp_path),
+                is_test_instance=True,
+                agent_name=name,
+                database=database,
+            )
+        finally:
+            await database.close()
     llm_service = LLMService()
     agent = KestrelAgent(
         did=credentials.agent_did,
-        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
+        storage_path=str(db_path),
         llm_service=llm_service,
         allowed_features=set(features),
     )

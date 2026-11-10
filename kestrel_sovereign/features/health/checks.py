@@ -1936,6 +1936,76 @@ async def check_signal_audit_log(agent) -> Dict[str, Any]:
     }
 
 
+async def check_tool_dispatch_audit(agent) -> Dict[str, Any]:
+    """Report when this agent's last ``a2a_tool_dispatches`` row landed (#4002).
+
+    Every dispatch-audit write on every existing agent database failed for
+    three days, because a CORE store column never reached those databases and
+    the best-effort writer swallowed the error, and no health check counted
+    the failures. Once the audit became required, every tool call failed.
+
+    The details always carry ``last_success_at`` (``None`` until a row lands
+    in this process) and ``failures`` since the store was built. ``warn`` once
+    any write failed, and the count does not reset when a later write succeeds,
+    like ``signal_audit_log``: the rows lost earlier are still lost.
+    """
+    from kestrel_sovereign.a2a.stores.unified.observability_store import (
+        ObservabilityStore,
+    )
+
+    start = time.monotonic()
+    store = getattr(agent, "observability_store", None)
+    if not isinstance(store, ObservabilityStore):
+        return {
+            "name": "tool_dispatch_audit",
+            "status": "pass",
+            "message": "No tool dispatch audit store on this agent",
+            "duration_ms": _elapsed(start),
+        }
+
+    health = store.tool_dispatch_audit_health
+    last_success = (
+        health.last_success_at.isoformat() if health.last_success_at else None
+    )
+    details: Dict[str, Any] = {
+        "last_success_at": last_success,
+        "failures": health.failures,
+    }
+    if health.failures == 0:
+        return {
+            "name": "tool_dispatch_audit",
+            "status": "pass",
+            "message": (
+                f"Last tool dispatch audit row written at {last_success}"
+                if last_success
+                else "No tool dispatch audited since start"
+            ),
+            "duration_ms": _elapsed(start),
+            "details": details,
+        }
+
+    details["last_failed_at"] = health.last_failure_at.isoformat()
+    details["last_error"] = health.last_error
+    latest_failed = (
+        health.last_success_at is None
+        or health.last_failure_at >= health.last_success_at
+    )
+    return {
+        "name": "tool_dispatch_audit",
+        "status": "warn",
+        "message": (
+            f"{health.failures} tool dispatch audit write(s) failed since start"
+            + (
+                "; the most recent write failed"
+                if latest_failed
+                else f"; the last row landed at {last_success}"
+            )
+        ),
+        "duration_ms": _elapsed(start),
+        "details": details,
+    }
+
+
 def _positive_int(value: Any) -> Optional[int]:
     """*value* when it is a positive ``int`` (not a ``bool``), else ``None``."""
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
@@ -2430,6 +2500,7 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
             check_bootstrap_state(agent),
         ),
         await check_signal_audit_log(agent),
+        await check_tool_dispatch_audit(agent),
         await check_conversation_embeddings(agent),
         await check_birth_record(agent),
         await check_model_discovery(agent),
