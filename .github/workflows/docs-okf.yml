@@ -7,7 +7,6 @@ on:
       - "QUICKSTART.md"
       - "CONTRIBUTING.md"
       - "AGENTS.md"
-      - "CLAUDE.md"
       - "KESTREL_FEATURES.md"
       - "docs/**"
       - "demos/**"

@@ -59,7 +59,7 @@ The bird has at least five mechanisms that legitimately wake it up or trigger wo
 | Approval request | [features/security/approval_queue.py:81](../../kestrel_sovereign/features/security/approval_queue.py#L81) | Both a hook AND an event | Pick one |
 | Webhook (Stripe) | [kestrel_feature_wallet/onramp/webhook_handler.py:80](https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/onramp/webhook_handler.py#L80) | Stores + fires callback | Wake the bird |
 
-Each was added at a different time by a different author. Same accretion shape as the model-selection postmortem in [CLAUDE.md](../../CLAUDE.md). With one signal, the abstraction is invisible. With five, overdue.
+Each was added at a different time by a different author. Same accretion shape as the model-selection postmortem in [AGENTS.md](../../AGENTS.md). With one signal, the abstraction is invisible. With five, overdue.
 
 The existing `emit_event` / `add_event_listener` ([agent/event_manager.py:15-33](../../kestrel_sovereign/agent/event_manager.py#L15-L33)) looks like a bus but is **agent → UI only**. The missing direction — world → agent — was never built.
 
@@ -1375,4 +1375,4 @@ The epic is shippable when:
 
 The bird started as a chat bot — one entry point, one mental model. Heartbeat was the first crack in that frame and was conceived as a periodic timer, not as one-of-N signals. Every signal added afterward solved a local problem in its author's vocabulary: scheduler author thought "cron"; A2A author thought "callback"; wallet author thought "webhook"; security author thought "hook." Three different problems, four different solutions, no consolidation.
 
-From inside the timeline this is invisible; from outside, it's the same accretion pattern documented in CLAUDE.md for model selection. The design is obvious in retrospect for the same reason every consolidation is obvious in retrospect: the abstraction only becomes visible once enough instances exist to suggest it.
+From inside the timeline this is invisible; from outside, it's the same accretion pattern documented in AGENTS.md for model selection. The design is obvious in retrospect for the same reason every consolidation is obvious in retrospect: the abstraction only becomes visible once enough instances exist to suggest it.
