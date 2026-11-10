@@ -44,12 +44,12 @@ def observe_asyncio_waits() -> Iterator[
     observations = []
 
     async def recording_wait(
-        aws: Iterable[asyncio.Future[Any]], *, timeout: float | None = None,
+        fs: Iterable[asyncio.Future[Any]], *, timeout: float | None = None,
         return_when: str = asyncio.ALL_COMPLETED,
     ):
-        if type(aws) in {set, frozenset, list, tuple}:
-            observations.append((frozenset(aws), timeout))
-        return await original_wait(aws, timeout=timeout, return_when=return_when)
+        if type(fs) in {set, frozenset, list, tuple}:
+            observations.append((frozenset(fs), timeout))
+        return await original_wait(fs, timeout=timeout, return_when=return_when)
 
     with patch.object(asyncio, "wait", recording_wait):
         yield observations
