@@ -12,9 +12,81 @@ from tests.utils.virtual_clock import (
     AdvanceableClockLoop,
     advanceable_loop_clock,
     await_within_hang_guard,
+    observe_asyncio_waits,
     pinned_loop_clock,
     wait_for_thread_event,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_wait_observation_preserves_exact_futures_outcomes_and_bounds(failed):
+    future = asyncio.get_running_loop().create_future()
+    original = RuntimeError("original wait member failure") if failed else object()
+    if failed:
+        future.set_exception(original)
+    else:
+        future.set_result(original)
+    real_wait = asyncio.wait
+    with observe_asyncio_waits() as observations:
+        done, pending = await asyncio.wait(
+            {future}, timeout=0.25, return_when=asyncio.FIRST_COMPLETED,
+        )
+    assert observations == [(frozenset({future}), 0.25)]
+    assert done == {future} and not pending and asyncio.wait is real_wait
+    if failed:
+        assert future.exception() is original
+    else:
+        assert future.result() is original
+
+
+@pytest.mark.asyncio
+async def test_wait_observation_restores_native_wait_after_invalid_input():
+    real_wait = asyncio.wait
+    with pytest.raises(ValueError, match="empty"):
+        with observe_asyncio_waits() as observations:
+            await asyncio.wait(set())
+    assert observations == [(frozenset(), None)]
+    assert asyncio.wait is real_wait
+
+
+@pytest.mark.asyncio
+async def test_wait_observation_does_not_admit_a_single_future_as_an_iterable():
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(None)
+    with observe_asyncio_waits():
+        # Native asyncio.wait refuses this shape before iterating it. A spy
+        # must not turn it into an empty collection and change the failure.
+        with pytest.raises(TypeError):
+            await asyncio.wait(future)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_wait_observation_does_not_consume_one_shot_iterables():
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(None)
+    with observe_asyncio_waits() as observations:
+        done, pending = await asyncio.wait(iter([future]))
+    assert done == {future} and not pending and not observations
+
+
+@pytest.mark.asyncio
+async def test_wait_observer_cancellation_does_not_cancel_original_member():
+    future = asyncio.get_running_loop().create_future()
+    waiter = None
+    try:
+        with observe_asyncio_waits() as observations:
+            waiter = asyncio.create_task(asyncio.wait({future}))
+            await asyncio.sleep(0)
+            assert observations == [(frozenset({future}), None)]
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert not future.done()
+    finally:
+        future.cancel()
+        if waiter is not None:
+            await asyncio.gather(waiter, return_exceptions=True)
 
 
 def test_advanceable_clock_keeps_real_time_and_jumps_forward() -> None:

@@ -30,6 +30,7 @@ from tests.utils.original_failure import OriginalFailure
 from tests.utils.virtual_clock import (
     HANG_GUARD_SECONDS,
     await_within_hang_guard,
+    pinned_loop_clock,
     wait_for_thread_event,
 )
 
@@ -403,7 +404,7 @@ async def test_lifecycle_checkpoint_wins_without_waiting_for_owner() -> None:
             checkpoint.wait(),
             owner_task,
             description="checkpoint reached",
-            harness_timeout=0.1,
+            harness_timeout=HANG_GUARD_SECONDS,
         )
         assert not owner_task.done()
     finally:
@@ -427,7 +428,7 @@ async def test_lifecycle_checkpoint_rejects_premature_completion() -> None:
             asyncio.Event().wait(),
             owner_task,
             description="checkpoint reached",
-            harness_timeout=0.1,
+            harness_timeout=HANG_GUARD_SECONDS,
         )
 
 
@@ -450,7 +451,7 @@ async def test_lifecycle_checkpoint_fails_closed_when_both_are_ready() -> None:
             checkpoint.wait(),
             owner_task,
             description="checkpoint reached",
-            harness_timeout=0.1,
+            harness_timeout=HANG_GUARD_SECONDS,
         )
 
 
@@ -472,7 +473,7 @@ async def test_lifecycle_checkpoint_reports_owner_failure() -> None:
             asyncio.Event().wait(),
             owner_task,
             description="checkpoint reached",
-            harness_timeout=0.1,
+            harness_timeout=HANG_GUARD_SECONDS,
         )
 
     assert captured.value.__cause__ is failure
@@ -492,12 +493,13 @@ async def test_lifecycle_checkpoint_reports_owner_cancellation() -> None:
             asyncio.Event().wait(),
             owner_task,
             description="checkpoint reached",
-            harness_timeout=0.1,
+            harness_timeout=HANG_GUARD_SECONDS,
         )
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_checkpoint_has_finite_deadlock_guard() -> None:
+@pytest.mark.parametrize("pin_clock", [False, True])
+async def test_lifecycle_checkpoint_has_finite_deadlock_guard(pin_clock) -> None:
     owner_release = asyncio.Event()
 
     async def owner() -> None:
@@ -505,16 +507,18 @@ async def test_lifecycle_checkpoint_has_finite_deadlock_guard() -> None:
 
     owner_task = asyncio.create_task(owner())
     try:
-        with pytest.raises(
-            AssertionError,
-            match="made no progress within the 0.001s test-harness guard",
-        ):
-            await wait_for_lifecycle_checkpoint(
-                asyncio.Event().wait(),
-                owner_task,
-                description="checkpoint reached",
-                harness_timeout=0.001,
-            )
+        with pinned_loop_clock() if pin_clock else nullcontext():
+            with pytest.raises(
+                AssertionError,
+                match="Lifecycle and checkpoint reached did not happen within the 0.001s",
+            ):
+                await await_within_hang_guard(
+                    wait_for_lifecycle_checkpoint(
+                        asyncio.Event().wait(), owner_task,
+                        description="checkpoint reached", harness_timeout=0.001,
+                    ),
+                    step="the checkpoint harness expiring independently of loop time",
+                )
     finally:
         owner_release.set()
         await owner_task
