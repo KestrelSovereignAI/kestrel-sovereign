@@ -59,6 +59,28 @@ def run_after_commit(callback: AfterCommitCallback) -> None:
         logger.exception("After-commit callback %r failed", callback)
 
 
+def call_after_backend_commit(backend: object, callback: AfterCommitCallback) -> bool:
+    """Run *callback* once the current task's writes on *backend* have committed.
+
+    Inside a transaction this task owns, *callback* runs after that
+    transaction commits and never if it rolls back; a savepoint that rolls
+    back discards what was registered inside it. With no transaction open the
+    writes committed on their own, so it runs now.
+
+    Returns ``False``, without running *callback*, when *backend* cannot
+    report its commits and a transaction may be open: whether the writes will
+    persist is then unknown.
+    """
+    register = getattr(backend, "call_after_commit", None)
+    if callable(register):
+        register(callback)
+        return True
+    if getattr(backend, "owns_open_transaction", None) is False:
+        run_after_commit(callback)
+        return True
+    return False
+
+
 class AfterCommitCallbacks:
     """The callbacks registered inside one open top-level transaction.
 

@@ -16,7 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
 )
-from .db.after_commit import AfterCommitCallback, run_after_commit
+from .db.after_commit import AfterCommitCallback, call_after_backend_commit
 from .db.sqlite import (
     CANCELLATION_CLEANUP_FINISHED,
     _minimum_close_timeout_s,
@@ -1401,14 +1401,7 @@ class AsyncDatabase:
         report its commits and a transaction may be open: whether the writes
         will persist is then unknown.
         """
-        register = getattr(self._backend, "call_after_commit", None)
-        if callable(register):
-            register(callback)
-            return True
-        if self.owns_open_transaction is False:
-            run_after_commit(callback)
-            return True
-        return False
+        return call_after_backend_commit(self._backend, callback)
 
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
