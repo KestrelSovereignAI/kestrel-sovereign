@@ -3041,7 +3041,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.14.0"
+version = "0.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -3053,9 +3053,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/04/e2/1dba79057e624b3e654ce3767f54fa45204f7e720810a6cee7259a215f89/kestrel_feature_mcp-0.14.0.tar.gz", hash = "sha256:4d9cee1fa40d27f6143298d905852a4a0fb8777bb5bc4069cce8662f3782dc77", size = 1102578, upload-time = "2026-11-07T11:44:22.656Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/18/a1e3b8cd5e7110f98eade2c01d09786b81c4d11ade5cd93efd90049cdd26/kestrel_feature_mcp-0.15.0.tar.gz", hash = "sha256:d8604b135c3143b6c8be6609ac904b9683b3ea4fe813f1331fbf9228ff19021e", size = 1109411, upload-time = "2026-11-10T20:49:35.614Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/90/2c/93f4c9572832b791e5267b2403e79a4a419ffc1e3d82dba124916f8d643f/kestrel_feature_mcp-0.14.0-py3-none-any.whl", hash = "sha256:c6f4d4eb97047470cc4d1e248eec30ad8247f0acb71e8788dcdbd47f7f6fad5b", size = 629040, upload-time = "2026-11-07T11:44:20.644Z" },
+    { url = "https://files.pythonhosted.org/packages/46/c4/f695472852da891ac56f950cc0163afccafff7d7e8653197b9e6fdaece34/kestrel_feature_mcp-0.15.0-py3-none-any.whl", hash = "sha256:9fe6952b5bcd37b45d2dc1b028fe5c54a73aee1db02be8ebbbaac9492d129053", size = 633874, upload-time = "2026-11-10T20:49:33.746Z" },
 ]
 
 [[package]]
@@ -3171,7 +3171,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.64.2"
+version = "0.64.3"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -3415,7 +3415,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.20,<4" },
     { name = "iniconfig", specifier = "==2.3.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.14.0,<1" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.15.0,<1" },
     { name = "kestrel-llms", extras = ["all"], specifier = ">=0.2.0,<0.3" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },

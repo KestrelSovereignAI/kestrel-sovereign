@@ -2,8 +2,11 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import socket
+import signal
+import threading
 
 from mcp import types
 from mcp.server import MCPServer
@@ -118,13 +121,22 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
     ])
 
 
-def create_server(witness: Path, *, apps: bool = False):
+def create_server(witness: Path, *, apps: bool = False, hold_tool_reply: bool = False):
     """One native effect witness for both permission and Apps campaigns."""
     extension = Apps()
 
     def record_marker(marker: str) -> str:
+        if hold_tool_reply:
+            # Publish barrier admission before the effect, so observing the
+            # effect proves this same native invocation cannot return yet.
+            with Path(str(witness) + ".held").open("a") as stream:
+                stream.write(marker + "\n")
         with witness.open("a") as stream:
             stream.write(marker + "\n")
+        if hold_tool_reply:
+            # This owned failure-injection peer is retired by its real
+            # container lifecycle. There is deliberately no successful reply.
+            threading.Event().wait()
         return "Recorded: " + marker
 
     if apps:
@@ -150,6 +162,7 @@ def create_server(witness: Path, *, apps: bool = False):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="streamable-http")
     parser.add_argument("--tls-cert")
     parser.add_argument("--tls-key")
     parser.add_argument("--witness")
@@ -157,7 +170,31 @@ def main():
     parser.add_argument("--provider-model")
     parser.add_argument("--provider-fault", choices=["wrong_choice"])
     parser.add_argument("--drop-first-tool-reply", action="store_true")
+    parser.add_argument("--linger-after-stdio", action="store_true")
+    parser.add_argument("--hold-tool-reply", action="store_true")
+    parser.add_argument("--require-profile-mode")
     args = parser.parse_args()
+    if args.transport == "stdio":
+        if not args.witness:
+            parser.error("Stdio mode requires an explicit witness path")
+        if any((args.tls_cert, args.tls_key, args.ready, args.provider_model,
+                args.provider_fault, args.drop_first_tool_reply)):
+            parser.error("Stdio mode cannot use HTTP/TLS or provider options")
+        if args.require_profile_mode is not None and os.environ.get("OWNED_PROFILE_MODE") != args.require_profile_mode:
+            parser.error("Native profile did not supply the required configured mode")
+        if args.linger_after_stdio:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        create_server(Path(args.witness), hold_tool_reply=args.hold_tool_reply).run(transport="stdio")
+        if args.linger_after_stdio and Path(args.witness).exists():
+            while True:
+                signal.pause()
+        return
+    if args.hold_tool_reply:
+        parser.error("Held tool reply requires stdio transport")
+    if args.linger_after_stdio:
+        parser.error("Lingering disconnect requires stdio mode")
+    if args.require_profile_mode is not None:
+        parser.error("Configured mode requires stdio transport")
     tls = any((args.tls_cert, args.tls_key, args.witness, args.ready))
     if tls and not all((args.tls_cert, args.tls_key, args.witness, args.ready)):
         parser.error("TLS mode requires certificate, key, witness and ready paths")

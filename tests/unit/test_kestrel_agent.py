@@ -2896,6 +2896,21 @@ class TestLifecycle:
                 agent._sync_service = None
                 agent.storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
 
+                from kestrel_sovereign import _async_ownership
+
+                original_create = _async_ownership.create_owned_task
+                native_closers = []
+                primary_admitted = asyncio.Event()
+
+                def observe_native_admission(*args, **kwargs):
+                    owner = original_create(*args, **kwargs)
+                    if kwargs.get("retirement_resource") is agent.storage:
+                        native_closers.append(owner)
+                        if len(native_closers) == 2:
+                            primary_admitted.set()
+                    return owner
+
+                monkeypatch.setattr(_async_ownership, "create_owned_task", observe_native_admission)
                 original_close = agent.storage.close
                 original_preclose = agent.storage.dispose_cached_sqla_factory
 
@@ -2922,6 +2937,9 @@ class TestLifecycle:
                     shutdown_task,
                     description="SQLAlchemy factory disposal started",
                 )
+                assert native_closers == [preclose_owner], (
+                    "Wrapped native pre-close was admitted without its original retirement resource"
+                )
                 preclose_bounds = [
                     timeout for originals, timeout in bounded_waits
                     if preclose_owner in originals
@@ -2940,6 +2958,12 @@ class TestLifecycle:
                     )
                 finally:
                     barrier.cancel()
+                await await_within_hang_guard(
+                    primary_admitted.wait(), step="original native primary close admission",
+                )
+                assert len(native_closers) == 2
+                assert native_closers[0] is preclose_owner and not preclose_owner.done()
+                assert preclose_owner in agent._durable_shutdown_tail_tasks
                 allow_factory_disposal.set()
                 await wait_for_lifecycle_checkpoint(
                     wait_until_aiosqlite_worker_exit_is_delayed(
