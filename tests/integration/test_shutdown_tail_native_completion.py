@@ -38,7 +38,7 @@ from tests.integration.test_lighthouse_snapshot_original_control import (
 from tests.utils.virtual_clock import await_within_hang_guard
 
 
-async def _observe_retained_native_tail(agent, checkpoint, *, step):
+async def _observe_retained_native_tail(agent, checkpoint, *, step, state=None):
     """Observe actual native progress AFTER the finite observer has returned.
 
     A bounded observer can expire before HTTP reaches its peer. That does not
@@ -50,6 +50,8 @@ async def _observe_retained_native_tail(agent, checkpoint, *, step):
     assert originals and any(not task.done() for task in originals), (
         "the finite observer must retain its pending native originals"
     )
+    if state is not None:
+        state["upload_admission_barrier"].set()
     await await_within_hang_guard(checkpoint.wait(), step=step)
     assert originals <= agent._durable_shutdown_tail_tasks, (
         "native progress replaced or forgot an original tail owner"
@@ -61,7 +63,7 @@ async def _observe_retained_native_tail(agent, checkpoint, *, step):
 
 
 @pytest_asyncio.fixture
-async def prepared_tail(native_snapshot, tmp_path):
+async def prepared_tail(native_snapshot, tmp_path, request):
     (
         db,
         target,
@@ -89,9 +91,14 @@ async def prepared_tail(native_snapshot, tmp_path):
     )
     assert agent.storage is None
     agent._sync_service = service
+    admission = asyncio.Event()
+    if not getattr(request, "param", False):
+        admission.set()
+    state["upload_admission_barrier"] = admission
     try:
         yield agent, native_snapshot
     finally:
+        admission.set()
         state["release_server"].set()
         release_close.set()
         tasks.extend(agent._durable_shutdown_tail_tasks)
@@ -100,6 +107,7 @@ async def prepared_tail(native_snapshot, tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("close_fails", [False, True])
 @pytest.mark.parametrize("cancel_waiter", [False, True])
+@pytest.mark.parametrize("prepared_tail", [False, True], indirect=True, ids=["ready-admission", "held-admission"])
 async def test_tail_deadline_joins_original_snapshot_and_preserves_actual_close_failure(
     prepared_tail, close_fails, cancel_waiter
 ):
@@ -124,7 +132,7 @@ async def test_tail_deadline_joins_original_snapshot_and_preserves_actual_close_
         tasks.extend(agent._durable_shutdown_tail_tasks)
         assert not cancelled and degraded
         originals = await _observe_retained_native_tail(
-            agent, entered, step="the original retained snapshot reaching its real HTTP peer",
+            agent, entered, step="the original retained snapshot reaching its real HTTP peer", state=state,
         )
         assert entered.is_set()
         assert agent._durable_shutdown_tail_tasks
@@ -179,6 +187,7 @@ async def test_tail_deadline_joins_original_snapshot_and_preserves_actual_close_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prepared_tail", [False, True], indirect=True, ids=["ready-admission", "held-admission"])
 async def test_tail_callback_publication_failure_keeps_accepted_original_work(
     prepared_tail,
 ):
@@ -222,7 +231,7 @@ async def test_tail_callback_publication_failure_keeps_accepted_original_work(
         assert caught.value is failure
         assert accepted and accepted[0] in agent._durable_shutdown_tail_tasks
         originals = await _observe_retained_native_tail(
-            agent, entered, step="the callback-retained original snapshot reaching its real HTTP peer",
+            agent, entered, step="the callback-retained original snapshot reaching its real HTTP peer", state=state,
         )
         assert entered.is_set() and not source_errors and not close_entered.is_set()
         assert vars(agent).get("_shutdown_control") is None
@@ -238,6 +247,7 @@ async def test_tail_callback_publication_failure_keeps_accepted_original_work(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prepared_tail", [False, True], indirect=True, ids=["ready-admission", "held-admission"])
 async def test_native_close_can_observe_completion_without_joining_its_own_parent(
     prepared_tail,
 ):
@@ -266,7 +276,7 @@ async def test_native_close_can_observe_completion_without_joining_its_own_paren
     cancelled, degraded = await agent._run_durable_shutdown_tail(0.15)
     assert not cancelled and degraded
     originals = await _observe_retained_native_tail(
-        agent, entered, step="the self-observing original closer's snapshot reaching its real HTTP peer",
+        agent, entered, step="the self-observing original closer's snapshot reaching its real HTTP peer", state=state,
     )
     assert entered.is_set()
     state["release_server"].set()
