@@ -301,46 +301,48 @@ async def test_native_configured_profile_retains_values_and_template_namespace(t
         connection = None
         original_process = None
         original_configuration = None
-        expected = pytest.raises(type(close_failure)) if close_failure is not None else nullcontext()
+        armed_failure = None
         try:
-            with expected as caught:
-                try:
-                    token = await gateway.start([peer.selector])
-                    original_process = gateway.process
-                    original_configuration = gateway._config_directory
-                    exported = gateway._config_directory / "configured-profile-proof.json"
-                    exported.touch(mode=0o600)
-                    await gateway._profile_command(["export", gateway._profile_id, str(exported)])
-                    configured = json.loads(exported.read_text())
-                    definition, = configured["servers"]
-                    assert definition["snapshot"]["server"]["name"] == peer.selector
-                    assert definition["config"] == {"mode": "owned-configured-mode"}
-                    assert definition["tools"] == ["record_marker"]
-                    assert definition["secrets"] == "owned-source-binding"
-                    assert configured["secrets"]["owned-source-binding"] == {"provider": "docker-desktop-store"}
-                    connection = MCPConnection(gateway.endpoint_url, headers={"Authorization": "Bearer " + token})
-                    if close_failure is not None:
-                        original_close = connection.close
+            try:
+                token = await gateway.start([peer.selector])
+                original_process = gateway.process
+                original_configuration = gateway._config_directory
+                exported = gateway._config_directory / "configured-profile-proof.json"
+                exported.touch(mode=0o600)
+                await gateway._profile_command(["export", gateway._profile_id, str(exported)])
+                configured = json.loads(exported.read_text())
+                definition, = configured["servers"]
+                assert definition["snapshot"]["server"]["name"] == peer.selector
+                assert definition["config"] == {"mode": "owned-configured-mode"}
+                assert definition["tools"] == ["record_marker"]
+                assert definition["secrets"] == "owned-source-binding"
+                assert configured["secrets"]["owned-source-binding"] == {"provider": "docker-desktop-store"}
+                connection = MCPConnection(gateway.endpoint_url, headers={"Authorization": "Bearer " + token})
+                tools = await connection.connect()
+                assert [tool.name for tool in tools] == ["record_marker"]
+                result = await connection.call_tool("record_marker", {"marker": "configured-native-profile"})
+                assert not result.is_error
+                assert await peer.witness(None, None) == ["configured-native-profile"]
+                if close_failure is not None:
+                    original_close = connection.close
 
-                        async def close_then_fail():
-                            await original_close()
-                            raise close_failure
+                    async def close_then_fail():
+                        await original_close()
+                        raise close_failure
 
-                        monkeypatch.setattr(connection, "close", close_then_fail)
-                    tools = await connection.connect()
-                    assert [tool.name for tool in tools] == ["record_marker"]
-                    result = await connection.call_tool("record_marker", {"marker": "configured-native-profile"})
-                    assert not result.is_error
-                    assert await peer.witness(None, None) == ["configured-native-profile"]
-                finally:
-                    peer.remember_gateway(gateway)
+                    monkeypatch.setattr(connection, "close", close_then_fail)
+                    armed_failure = close_failure
+            finally:
+                peer.remember_gateway(gateway)
+                expected = pytest.raises(type(armed_failure)) if armed_failure is not None else nullcontext()
+                with expected as caught:
                     try:
                         if connection is not None:
                             await connection.close()
                     finally:
                         await gateway.stop()
-            if close_failure is not None:
-                assert caught.value is close_failure
+                if armed_failure is not None:
+                    assert caught.value is armed_failure
             assert gateway.process is None and original_process.poll() is not None, "connection close failure skipped independent Gateway retirement"
             assert gateway._profile_id is None and not original_configuration.exists()
         finally:
@@ -505,3 +507,21 @@ async def test_gateway_fixture_diagnostics_cannot_skip_original_process_retireme
         assert not private.exists()
     finally:
         await gateway.stop()
+
+
+async def test_owned_configured_body_failure_is_not_an_expected_cleanup_failure(tmp_path, monkeypatch):
+    from kestrel_feature_mcp.connection import MCPConnection
+
+    original_call = MCPConnection.call_tool
+    body_failure = OSError("owned real tool-call epilogue")
+
+    async def call_then_fail(connection, *args, **kwargs):
+        await original_call(connection, *args, **kwargs)
+        raise body_failure
+
+    monkeypatch.setattr(MCPConnection, "call_tool", call_then_fail)
+    with pytest.raises(OSError) as caught:
+        await test_native_configured_profile_retains_values_and_template_namespace(
+            tmp_path, monkeypatch, OSError("owned expected close epilogue"),
+        )
+    assert caught.value is body_failure
