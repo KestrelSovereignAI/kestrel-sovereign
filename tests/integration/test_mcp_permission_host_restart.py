@@ -60,11 +60,19 @@ class RunningHost:
 async def native_host(home, descriptor, environment, peer, generation):
     ready = home / f'host-{generation}-ready.json'
     log_path = home / f'host-{generation}.log'
+    admissions = ready.with_suffix('.gateway-admissions')
+    if peer.kind == 'gateway':
+        admissions.mkdir(mode=0o700)
     with log_path.open('wb') as log:
         process = await asyncio.create_subprocess_exec(sys.executable, '-B',
             str(Path(__file__).with_name('mcp_permission_host.py')), str(descriptor), str(ready),
             cwd=home, env=environment, stdout=log, stderr=asyncio.subprocess.STDOUT)
         running = RunningHost({}, process, log_path)
+        if peer.kind == 'gateway':
+            import psutil
+            original_host = psutil.Process(process.pid)
+            original_host.create_time()
+            peer.read_host_admissions(original_host, admissions)
         try:
             async with asyncio.timeout(35):
                 while not ready.exists():
@@ -90,6 +98,8 @@ async def native_host(home, descriptor, environment, peer, generation):
             yield running
         finally:
             async with AsyncExitStack() as retirement:
+                if peer.kind == 'gateway':
+                    retirement.push_async_callback(peer.reconcile_host_gateways, original_host, admissions)
                 if running.state:
                     retirement.callback(peer.local_ports.discard, running.state['port'])
                     if peer.kind == 'gateway':
