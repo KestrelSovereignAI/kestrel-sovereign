@@ -148,7 +148,8 @@ async def test_closed_app_is_not_adopted_by_a_fresh_input_reader(apps_boundary):
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form', 'input_tool': 'mutate_marker'}], indirect=True)
 async def test_input_result_retains_app_view_until_actual_outer_transport_settles(apps_boundary):
     b = apps_boundary
-    row, _ = await pause_app(b)
+    row, view_id = await pause_app(b)
+    original_view = b.host._views[view_id].view
     reached, cancelled, settle = asyncio.Event(), asyncio.Event(), asyncio.Event()
     cancellations = []
 
@@ -175,6 +176,7 @@ async def test_input_result_retains_app_view_until_actual_outer_transport_settle
         drain = None
         try:
             await asyncio.wait_for(reached.wait(), 5)
+            assert len(original_view._delivery_tasks) == 1, 'The original App View did not own its actual response send'
             b.host.withdraw_private_data()
             drain = asyncio.create_task(b.host.maintain())
             await asyncio.wait_for(cancelled.wait(), 5)
