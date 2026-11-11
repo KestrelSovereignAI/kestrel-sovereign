@@ -735,6 +735,46 @@ ingress and cron dispatches behind any in-flight turn. The global order is
 CONVERSATION → privacy transition → persistence gate; nothing is acquired
 while the gate is held.
 
+**A dispatch, and any supervisor that awaits a dispatch's delivery, is its own
+unit of work and never part of the turn that enqueued it (#4023).** A Task
+copies its creator's context, and a turn's context carries two turn-scoped
+authorities:
+
+- membership of the turn's native privacy lifetime. The Task becomes a join
+  obligation of the turn's effect-journal retirement
+  (`ToolEffectTurn.close → join_native_scope`), which runs after the turn has
+  released CONVERSATION and holds the privacy-transition lock until every
+  member settles;
+- the turn's delegated CONVERSATION ownership, so a turn the Task starts while
+  the creating turn still holds CONVERSATION is treated as a re-entry into
+  that hold.
+
+A COGNITION wake for the same agent is a new turn. Enrolled in its producer's
+retirement, it takes CONVERSATION the moment the producing turn releases it,
+then waits for the privacy-transition lock the retirement still holds, while
+the retirement waits for the wake. Neither ever finishes, and the agent stays
+parked until the host restarts. On Claw this was most often the recipient's
+own `a2a.task_complete` self-wake after `respond_to_a2a_task` completed an
+inbound task from inside a turn.
+
+Every such Task is therefore created inside
+`kestrel_sovereign.signals.delivery.detached_from_enclosing_turn()`, which runs
+`outside_native_privacy_lifetime()` and `without_delegated_lock_ownership()`
+and owns no coordinator of its own:
+
+- the dispatcher's `enqueue_signal`, `enqueue_durable_cognition` and
+  `enqueue_durable_terminal` Tasks;
+- the `a2a.task_complete` and `a2a.task_submitted` wake supervisors in
+  `EventManagerMixin`, which TaskManager calls on whichever Task completed or
+  submitted the task;
+- the restart coordinator's `restart_completed_ack` supervisor, which a
+  `!restart coordinator` sweep starts from inside a turn;
+- `supervise_terminal_delivery` and `harvest_detached_delivery` in
+  `kestrel_sovereign/signals/delivery.py`.
+
+A new producer that enqueues or awaits a signal from a background Task follows
+the same rule.
+
 The same gate, held shared, is the lock the agent hands to Workflows as
 `workflow_await_signal_privacy_transition_lock` (#3484). Workflows holds it
 around an `await_signal` "privacy check, then matcher/CAS" and needs only that

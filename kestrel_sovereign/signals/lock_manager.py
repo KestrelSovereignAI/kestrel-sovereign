@@ -33,10 +33,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import Context, ContextVar
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Iterable, Optional
+from typing import AsyncIterator, Iterable, Iterator, Optional
 
 from kestrel_sdk.signals import ResourceLock
 
@@ -47,6 +47,22 @@ _delegated_lock_ownership: ContextVar[dict[int, frozenset[object]]] = ContextVar
     "kestrel_delegated_lock_ownership",
     default={},
 )
+
+
+@contextmanager
+def without_delegated_lock_ownership() -> Iterator[None]:
+    """Create Tasks that hold none of their creator's delegated locks (#4023).
+
+    A Task copies its creator's context, delegation included. Work started
+    here is its own unit: a COGNITION wake created inside a turn must queue
+    for CONVERSATION like any other turn, not be treated as a re-entry into
+    the hold of the turn that created it.
+    """
+    reset = _delegated_lock_ownership.set({})
+    try:
+        yield
+    finally:
+        _delegated_lock_ownership.reset(reset)
 
 
 # How long to wait before reporting, and then re-reporting, a contended

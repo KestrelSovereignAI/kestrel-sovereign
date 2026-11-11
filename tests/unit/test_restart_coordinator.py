@@ -32,7 +32,12 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
-from kestrel_sovereign.auth import CallerContext, caller_context_scope
+from kestrel_sovereign.auth import (
+    CallerContext,
+    caller_context_binding_scope,
+    caller_context_scope,
+    capture_caller_context_binding,
+)
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCustody,
@@ -4920,7 +4925,19 @@ async def test_inline_enqueued_wake_owns_session_for_followup_restart(tmp_path, 
     agent.process_input_should_raise = False
     agent.restart_request_reason = None
     agent.restart_feature = None
-    agent.process_input = _RealDispatchAgent.process_input.__get__(agent)
+    wake_turn = _RealDispatchAgent.process_input.__get__(agent)
+    # A wake carries its own caller, never the one of the invocation that
+    # enqueued it: the real process_input binds the dispatcher's, and the
+    # enqueuing invocation's binding is revoked when it ends, which the wake
+    # now outlives (#4023). This stub binds the test's sovereign caller in its
+    # place.
+    sovereign = capture_caller_context_binding()
+
+    async def process_input(prompt, session_id=None):
+        with caller_context_binding_scope(sovereign):
+            return await wake_turn(prompt, session_id=session_id)
+
+    agent.process_input = process_input
     agent.background_tasks = agent._background_tasks
     agent.drain_background_tasks = _RealDispatchAgent.drain_background_tasks.__get__(agent)
     feat, backend, agent = await _wire_real_dispatch_feature(agent, backend)

@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from kestrel_sovereign._async_ownership import (
     OwnedTaskAdmission, _retain_owned_admission_error, await_owned_task,
     create_owned_task, owned_task_error, raise_owned_outcome,
+    without_owned_coordinators,
 )
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.deidentification import (
@@ -232,6 +233,21 @@ def bind_transition_lock_reentry(token: Optional[object], *, replace: bool = Fal
         yield
     finally:
         _transition_lock_reentry_token.reset(reset)
+
+
+@contextmanager
+def outside_native_privacy_lifetime():
+    """Start independent work outside the caller's native privacy lifetime.
+
+    A Task created inside a turn is enrolled in the turn's native privacy
+    lifetime. The turn's effect-journal retirement, which runs after the turn
+    has released CONVERSATION, joins every such Task while still holding the
+    privacy-transition lock (#4023). Work started here is not enrolled and
+    carries no reentry token, so it takes the privacy lock as a turn of its
+    own would.
+    """
+    with without_owned_coordinators(), bind_transition_lock_reentry(None, replace=True):
+        yield
 
 
 def current_bound_reentry_token() -> Optional[object]:

@@ -48,6 +48,21 @@ def bind_owned_coordinator(coordinator):
         _OWNED_COORDINATORS.reset(reset)
 
 
+@contextmanager
+def without_owned_coordinators():
+    """Create independent work that no enclosing coordinator admits (#4023).
+
+    A Task created inside a coordinator's scope becomes that scope's join
+    obligation. Work that is its own unit, and outlives its creator's span,
+    is created with no coordinator routed, and copies none into its context.
+    """
+    reset = _OWNED_COORDINATORS.set(())
+    try:
+        yield
+    finally:
+        _OWNED_COORDINATORS.reset(reset)
+
+
 @asynccontextmanager
 async def owned_native_wait(targets):
     """Park an actual writer for exact accepted native execution owners.
