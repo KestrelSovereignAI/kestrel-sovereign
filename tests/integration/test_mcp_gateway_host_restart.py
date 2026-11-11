@@ -3,6 +3,7 @@ import sys
 import pytest
 from tests.integration.test_mcp_permission_host_restart import (
     host_campaign as host_campaign, exercise_permission_restart, exercise_approval_restart,
+    exercise_approval_decision_race,
 )
 from tests.integration.test_mcp_permission_boundary import mcp_boundary as mcp_boundary
 
@@ -18,6 +19,12 @@ async def test_native_gateway_host_restores_permission_before_another_effect(hos
 async def test_native_gateway_host_rejects_old_and_replayed_approvals(host_campaign):
     await exercise_approval_restart(host_campaign)
     host_campaign.peer.assert_restart_observed()
+
+
+@pytest.mark.parametrize('host_campaign', [{'transport': 'gateway'}], indirect=True)
+@pytest.mark.parametrize('first_approved', [False, True], ids=['deny-first', 'approve-first'])
+async def test_native_gateway_concurrent_approval_keeps_original_decision(host_campaign, first_approved):
+    await exercise_approval_decision_race(host_campaign, first_approved)
 
 
 @pytest.mark.parametrize('host_campaign', [{'transport': 'gateway'}], indirect=True)
