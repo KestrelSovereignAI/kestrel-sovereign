@@ -522,13 +522,11 @@ jobs:
           echo "MCP_TEST_DOCKER_PLUGIN=$plugin_dir/docker-mcp" >> "$GITHUB_ENV"
           echo "MCP_TEST_DOCKER_HOST=unix:///var/run/docker.sock" >> "$GITHUB_ENV"
       - name: Exercise the native Gateway and stdio ownership campaign
-        # CLI0.44.3 passed all43 Gateway/stdio cases in250.90s on Linux
-        # with public SDK0.52.0/MCP0.15.0 and AnyIO4.16.0. The two actual
-        # host-process restart cases also pass locally in51.30s, checking
-        # original processes/profiles, permission restore and stale approvals.
-        # This45-case cohort retains its finite720s session; its combined
-        # Linux measurement is a required PR/release gate. Legacy56-case
-        # permissions retain their original command and480s session.
+        # CLI0.44.3 passed all43 Gateway/stdio cases in250.90s on Linux.
+        # The six actual host/restart/reconciliation cases pass locally in
+        # 124.71s; a seventh checks physical SIGKILL after the real wait fails.
+        # This50-case cohort retains its finite720s session; actual combined
+        # Linux duration must be measured on this PR, never inferred locally.
         run: >-
           uv run --no-sync python -m pytest
           tests/integration/test_mcp_gateway_permission_boundary.py
