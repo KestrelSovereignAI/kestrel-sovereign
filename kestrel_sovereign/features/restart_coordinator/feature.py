@@ -4397,11 +4397,16 @@ class RestartCoordinatorFeature(Feature):
         # would outlive a disabled feature and later flag ``wake_delivered``
         # against torn-down state (kestrel-sovereign#2522 P2). Still
         # agent-tracked underneath, so full shutdown reaps it too.
+        # ``!restart coordinator`` sweeps from inside a turn; this supervisor
+        # awaits a wake that is a turn of its own, so it is never part of the
+        # sweeping turn (#4001).
+        from kestrel_sovereign.signals.delivery import detached_from_enclosing_turn
         try:
-            acknowledgement = self._track_owned_background_task(
-                _await_and_ack(), name=f"restart_completed_ack:{row.id}",
-                admission=admission,
-            )
+            with detached_from_enclosing_turn():
+                acknowledgement = self._track_owned_background_task(
+                    _await_and_ack(), name=f"restart_completed_ack:{row.id}",
+                    admission=admission,
+                )
         except BaseException:
             if borrowed is None:
                 release()

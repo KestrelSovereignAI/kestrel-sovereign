@@ -31,10 +31,12 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Iterable, Iterator, TypeVar
+from typing import Any, Awaitable, Iterable, TypeVar
 
 import httpx
 import pytest
+
+from kestrel_sovereign.await_chain import format_await_chain, walk_await_chain
 
 T = TypeVar("T")
 
@@ -156,74 +158,24 @@ def describe_discovery_routes(llm_service: Any) -> str:
     return f"discovery routes [{names or 'none'}]"
 
 
-def _frames(task: asyncio.Task) -> list[tuple[str, str, int]]:
-    """The task's coroutine frames, outermost first, as (name, file, line)."""
-    frames = []
-    awaited: Any = task.get_coro()
-    while awaited is not None:
-        frame = getattr(awaited, "cr_frame", None) or getattr(awaited, "gi_frame", None)
-        if frame is None:
-            break
-        frames.append((frame.f_code.co_qualname, frame.f_code.co_filename, frame.f_lineno))
-        awaited = getattr(awaited, "cr_await", None) or getattr(awaited, "gi_yieldfrom", None)
-    return frames
-
-
-def _task_tree(
-    task: asyncio.Task, depth: int = 0, seen: set | None = None
-) -> Iterator[tuple[int, asyncio.Task, list[tuple[str, str, int]], Any, list[asyncio.Task]]]:
-    """Yield ``(depth, task, frames, waiter, children)`` for ``task`` and what it waits on.
-
-    ``waiter`` is the future the task is suspended on and ``children`` the
-    running tasks behind it: a task it awaits (``process_input`` runs its turn
-    in an isolated child task) or the tasks of a ``gather``. asyncio keeps the
-    waiter as the task's ``_fut_waiter`` (3.11 through 3.14) and ``gather`` its
-    tasks as ``_children``. Neither is public API: if either moves, the walk
-    stops at the waiter instead of following it.
-    """
-    seen = set() if seen is None else seen
-    seen.add(task)
-    waiter = getattr(task, "_fut_waiter", None)
-    behind = [waiter] if isinstance(waiter, asyncio.Task) else getattr(waiter, "_children", ())
-    children = [
-        child for child in behind
-        if isinstance(child, asyncio.Task) and not child.done() and child not in seen
-    ]
-    yield depth, task, _frames(task), waiter, children
-    for child in children:
-        yield from _task_tree(child, depth + 1, seen)
-
-
 def await_chain(task: asyncio.Task) -> str:
-    """Render where ``task`` is parked: each task's frames, outermost first.
-
-    The walk follows the tasks it waits on, so the chain ends where the work
-    is actually parked rather than at the first task boundary.
-    """
-    lines = []
-    for depth, node, frames, waiter, children in _task_tree(task):
-        indent = "  " * (depth + 1)
-        lines.append(f"{indent}task {node.get_name()!r}:")
-        lines.extend(f"{indent}  {name} ({path}:{line})" for name, path, line in frames)
-        if waiter is not None and not children:
-            lines.append(f"{indent}  awaiting {waiter!r}")
-    return "\n".join(lines)
+    """Render where ``task`` is parked; see :func:`format_await_chain`."""
+    return format_await_chain(task)
 
 
 def parked_in(task: asyncio.Task) -> str:
     """Name the innermost repository code each waiting branch of ``task`` is in."""
     spots = []
-    for _, _, frames, _, children in _task_tree(task):
-        if children:
+    for node in walk_await_chain(task):
+        if node.awaited_tasks:
             continue
         own = [
-            frame for frame in frames
-            if Path(frame[1]).is_relative_to(_REPO_ROOT)
-            and "site-packages" not in Path(frame[1]).parts
+            frame for frame in node.frames
+            if Path(frame.filename).is_relative_to(_REPO_ROOT)
+            and "site-packages" not in Path(frame.filename).parts
         ]
         if own:
-            name, path, line = own[-1]
-            spots.append(f"{name} ({Path(path).name}:{line})")
+            spots.append(f"{own[-1].name} ({Path(own[-1].filename).name}:{own[-1].lineno})")
     return ", ".join(dict.fromkeys(spots)) or "an await outside this repository"
 
 

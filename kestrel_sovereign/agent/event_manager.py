@@ -496,6 +496,9 @@ class EventManagerMixin:
                 DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_completed_task,
             )
+            from kestrel_sovereign.signals.delivery import (
+                detached_from_enclosing_turn,
+            )
 
             # enqueue_durable_cognition is async and returns a SignalHandle at
             # *acceptance*; the terminal result only arrives via
@@ -504,20 +507,23 @@ class EventManagerMixin:
             # already terminal, so this signal is only its wake; the selected
             # durable consumer preserves that wake across Hold and restart.
             # The agent's tracker owns the initial enqueue and harvests its
-            # terminal result for observability (#2532).
-            self._track_background_task(
-                self._deliver_a2a_wake_until_durable(
-                    signal_factory=lambda: build_signal_for_completed_task(
-                        candidate=candidate,
-                        target_agent=self.did,
+            # terminal result for observability (#2532). This callback runs on
+            # whichever task completed the task, often a turn, possibly a
+            # co-hosted peer's; the wake is not that turn's work (#4001).
+            with detached_from_enclosing_turn():
+                self._track_background_task(
+                    self._deliver_a2a_wake_until_durable(
+                        signal_factory=lambda: build_signal_for_completed_task(
+                            candidate=candidate,
+                            target_agent=self.did,
+                        ),
+                        task_id=str(task_id),
+                        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                        label=f"a2a.task_complete[{task_id}]",
+                        cancellation_aware=False,
                     ),
-                    task_id=str(task_id),
-                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
-                    label=f"a2a.task_complete[{task_id}]",
-                    cancellation_aware=False,
-                ),
-                name=f"a2a_complete:{task_id[:8]}",
-            )
+                    name=f"a2a_complete:{task_id[:8]}",
+                )
         except Exception as e:
             # Never let a dispatcher failure break the SSE notification
             # path (browser users still get the green check). Log and
@@ -564,21 +570,26 @@ class EventManagerMixin:
                 DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_submitted_task,
             )
-
-            self._track_background_task(
-                self._deliver_a2a_wake_until_durable(
-                    signal_factory=lambda: build_signal_for_submitted_task(
-                        candidate=candidate,
-                        target_agent=self.did,
-                    ),
-                    task_id=str(task_id),
-                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
-                    label=f"a2a.task_submitted[{task_id}]",
-                    cancellation_aware=True,
-                    input_revision=candidate.input_revision,
-                ),
-                name=f"a2a_submitted:{str(task_id)[:8]}",
+            from kestrel_sovereign.signals.delivery import (
+                detached_from_enclosing_turn,
             )
+
+            # Called on the submitting task: a co-hosted sender's turn (#4001).
+            with detached_from_enclosing_turn():
+                self._track_background_task(
+                    self._deliver_a2a_wake_until_durable(
+                        signal_factory=lambda: build_signal_for_submitted_task(
+                            candidate=candidate,
+                            target_agent=self.did,
+                        ),
+                        task_id=str(task_id),
+                        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                        label=f"a2a.task_submitted[{task_id}]",
+                        cancellation_aware=True,
+                        input_revision=candidate.input_revision,
+                    ),
+                    name=f"a2a_submitted:{str(task_id)[:8]}",
+                )
         except Exception as e:
             # Same posture as task_complete: never let a dispatcher
             # failure break task creation. Log and continue — the
@@ -932,6 +943,62 @@ class EventManagerMixin:
         self_declines = vars(self).get("_a2a_self_declining_task_ids")
         if isinstance(task_id, str) and isinstance(self_declines, set):
             self_declines.discard(task_id)
+
+    async def settle_stopped_cognition_signal(self, signal) -> None:
+        """Cancel the inbound A2A task whose submission wake a Stop consumed.
+
+        Stopping a queued or running ``a2a.task_submitted`` turn ends that wake
+        for good: its delivery becomes terminal and is never redelivered. Left
+        alone, the task stays ``submitted`` with nothing left to run it, and
+        its sender sees pending work forever (#4001). The dispatcher calls this
+        before it makes the delivery terminal and before Stop reports it
+        stopped, so the sender reads ``canceled`` instead.
+
+        The cancellation runs bound to the stopped signal, so the task store
+        fences it to that wake's admitted input revision: a newer input the
+        sender added meanwhile stays live for its own wake. A task already
+        terminal or superseded needs nothing. Raises when the stopped input is
+        still live and the cancellation did not commit.
+        """
+        if getattr(signal, "source", None) != "a2a.task_submitted":
+            return
+        payload = getattr(signal, "payload", None)
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("a2a.task_submitted has no concrete durable task id")
+        from kestrel_sovereign.a2a.task_manager import (
+            TaskCancellationAuthorizationError,
+        )
+        from kestrel_sovereign.signals.context import bind_current_signal
+
+        try:
+            with bind_current_signal(signal):
+                await self.task_manager.cancel_task(
+                    task_id,
+                    reason="Stop cancelled the recipient's turn for this task",
+                    agent_name=self.did,
+                    recipient_agent_id=self.did,
+                )
+        except (TaskCancellationAuthorizationError, ValueError):
+            # The fenced cancellation matched no row. That is settled only if
+            # the stopped input is no longer the task's live, wakeable input.
+            snapshot = await self.task_manager.get_task_cancellation_snapshot(
+                task_id,
+                recipient_agent_id=self.did,
+            )
+            if (
+                snapshot is not None
+                and snapshot.state
+                in {"submitted", "working", "input-required", "auth-required"}
+                and snapshot.cognition_wake_eligible
+                and snapshot.input_wake_eligible
+                and snapshot.input_revision == payload.get("input_revision")
+            ):
+                raise
+        finally:
+            # Cancelling under this signal records it as this wake's own
+            # decline; that exemption ends with the wake.
+            self.finish_cognition_signal_execution(signal)
 
     def _on_task_cancellation_started(
         self,

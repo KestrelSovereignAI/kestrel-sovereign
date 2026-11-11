@@ -735,6 +735,21 @@ ingress and cron dispatches behind any in-flight turn. The global order is
 CONVERSATION → privacy transition → persistence gate; nothing is acquired
 while the gate is held.
 
+An enqueued dispatch also runs outside the privacy lifetime of the turn that
+enqueued it (#4001). A Task created inside a turn is otherwise enrolled in that
+turn's native privacy lifetime, and the turn's effect-journal retirement joins
+it while still holding the privacy-transition lock, after the turn has released
+CONVERSATION. A COGNITION wake for the same agent is a new turn that needs
+CONVERSATION, so a turn that took CONVERSATION in between waited for the
+privacy lock, the retirement waited for the wake, and the wake waited for
+CONVERSATION. That cycle reproduces the hangs reported in #4001.
+`enqueue_signal`,
+`enqueue_durable_cognition`, `enqueue_durable_terminal` and the A2A
+submitted/completed wake deliveries therefore create their Tasks inside
+`outside_native_privacy_lifetime()`. The A2A wakes need it most: TaskManager
+calls them on whichever task submitted or completed the task, which for a
+co-hosted peer is the sending agent's own turn.
+
 The same gate, held shared, is the lock the agent hands to Workflows as
 `workflow_await_signal_privacy_transition_lock` (#3484). Workflows holds it
 around an `await_signal` "privacy check, then matcher/CAS" and needs only that
