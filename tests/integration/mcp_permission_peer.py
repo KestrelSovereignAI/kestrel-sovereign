@@ -1,6 +1,7 @@
 """Native external MCP peer with a real filesystem side-effect witness."""
 
 import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -124,7 +125,8 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
 def create_server(witness: Path, *, apps: bool = False, hold_tool_reply: bool = False,
                   operator_input: str | None = None, input_message: str = 'Private city?',
                   input_tool: str | None = None, app_html: str | None = None, input_rounds: int = 1,
-                  input_schema: dict | None = None, input_content: dict | None = None):
+                  input_schema: dict | None = None, input_content: dict | None = None,
+                  input_barrier: tuple[asyncio.Event, asyncio.Event] | None = None):
     """One native effect witness for both permission and Apps campaigns."""
     extension = Apps()
 
@@ -166,12 +168,18 @@ def create_server(witness: Path, *, apps: bool = False, hold_tool_reply: bool = 
             raise ValueError('Owned MCP input rounds must be bounded')
         if operator_input not in {'form', 'url', 'mixed'}:
             raise ValueError('Unknown owned MCP input scenario')
+        first_input_held = False
         async def operator_round(ctx, call_next):
+            nonlocal first_input_held
             if ctx.method != 'tools/call' or (input_tool is not None and ctx.params.get('name') != input_tool):
                 return await call_next(ctx)
             with Path(str(witness) + '.input-wire').open('a') as stream:
                 stream.write(json.dumps(dict(ctx.params)) + '\n')
             responses = ctx.params.get('inputResponses')
+            if not responses and input_barrier is not None and not first_input_held:
+                first_input_held = True
+                input_barrier[0].set()
+                await input_barrier[1].wait()
             round_index = 0
             if responses:
                 state = ctx.params['requestState']

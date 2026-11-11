@@ -73,6 +73,7 @@ class Boundary:
     queue: object
     requests: object
     feature: object
+    input_barrier: object = None
 
     @property
     def markers(self):
@@ -107,6 +108,7 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request
     monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", ALICE + "," + BOB)
     witness = tmp_path / "native-witness"
     settings = getattr(request, 'param', {})
+    input_barrier = (asyncio.Event(), asyncio.Event()) if settings.get('hold_first_input') else None
     app_html = None
     if settings.get('browser_app'):
         import kestrel_feature_mcp
@@ -121,7 +123,8 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request
     native = create_server(witness, apps=True, operator_input=settings.get('operator_input'),
         input_message=settings.get('input_message', 'Private city?'), input_tool=settings.get('input_tool'),
         app_html=app_html, input_rounds=settings.get('input_rounds', 1),
-        input_schema=settings.get('input_schema'), input_content=settings.get('input_content'))
+        input_schema=settings.get('input_schema'), input_content=settings.get('input_content'),
+        input_barrier=input_barrier)
     async with AsyncExitStack() as cleanup:
         listener = socket.socket()
         cleanup.callback(listener.close)
@@ -222,7 +225,7 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request
         client = await cleanup.enter_async_context(httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=app), base_url="https://host.apps.test"))
         yield Boundary(app, client, host, agent, publications, tools, witness, backend,
-                       permissions, queue, requests, feature)
+                       permissions, queue, requests, feature, input_barrier)
 
 
 async def test_initial_result_is_private_and_reopens_without_replaying_native_tool(apps_boundary):
