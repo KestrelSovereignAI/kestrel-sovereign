@@ -11,6 +11,23 @@ from kestrel_sovereign._async_ownership import await_owned_operation, raise_owne
 
 
 @dataclass
+class OriginalHostAdmission:
+    """Original accepted subprocess custody exists before metadata can fail."""
+
+    process: object
+    created: float | None = None
+
+    @property
+    def pid(self):
+        return self.process.pid
+
+    def bind_birth(self, created):
+        if self.created is not None:
+            assert self.created == created, 'Original host admission birth changed'
+        self.created = created
+
+
+@dataclass
 class OriginalGatewayGroup:
     """A private group receipt; its leader's exit cannot retire its children.
 

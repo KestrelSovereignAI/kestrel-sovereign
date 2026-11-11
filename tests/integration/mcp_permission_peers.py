@@ -1,18 +1,25 @@
 """Owned Docker and native HTTPS peers for the same host security campaign."""
 
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import uuid
 
 from tests.utils.tls import make_tls_contexts
+
+
+def native_cli_profile_present(database, profile):
+    """Read the private native receipt and close its original SQLite handle."""
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as connection:
+        return connection.execute('SELECT id FROM working_set WHERE id=?', (profile,)).fetchone() is not None
 
 
 @dataclass
@@ -54,6 +61,33 @@ async def retire_original_gateway_process(pid, wait, exited):
     from tests.integration.mcp_gateway_custody import OriginalGatewayGroup
 
     await OriginalGatewayGroup(pid, wait, exited).retire()
+
+
+@contextmanager
+def hold_owned_witness_removal(peer, monkeypatch):
+    """Hold the real Docker reader removal; keep its original worker visible."""
+    import threading
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original = peer.client.api.remove_container
+
+    def delayed_remove(container, *args, **kwargs):
+        owned = peer.client.containers.get(container)
+        assert owned.attrs['Image'] == peer.image_id
+        assert owned.attrs['Config']['Labels']['kestrel.mcp.permission.owner'] == peer.owner
+        entered.set()
+        try:
+            assert release.wait(10), 'Test did not release its actual witness reader'
+            return original(container, *args, **kwargs)
+        finally:
+            finished.set()
+
+    with monkeypatch.context() as owner:
+        owner.setattr(peer.client.api, 'remove_container', delayed_remove)
+        try:
+            yield entered, release, finished
+        finally:
+            release.set()
 
 
 @asynccontextmanager
@@ -304,6 +338,7 @@ class GatewayTestPeer(MCPTestPeer):
     gateway_home: Path | None = None
     host_observations: dict = field(default_factory=dict)
     host_admissions: dict = field(default_factory=dict)
+    group_receipts: dict = field(default_factory=dict, repr=False)
     witness_readers: set = field(default_factory=set)
 
     async def witness(self, feature, name):
@@ -361,7 +396,6 @@ class GatewayTestPeer(MCPTestPeer):
     def observe_host_gateway(self, host_pid, snapshot):
         import psutil
         import re
-        import sqlite3
 
         assert self.gateway_home is not None and snapshot is not None
         assert re.fullmatch('kestrel-[a-f0-9]{32}', snapshot['profile'])
@@ -373,25 +407,27 @@ class GatewayTestPeer(MCPTestPeer):
         configuration = Path(snapshot['configuration']).resolve(strict=True)
         assert configuration.parent == self.gateway_home / '.docker/mcp/owned-gateways'
         database = self.gateway_home / '.docker/mcp/mcp-toolkit.db'
-        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
-            assert connection.execute('SELECT id FROM working_set WHERE id=?',
-                (snapshot['profile'],)).fetchone() == (snapshot['profile'],), (
-                'Native CLI profile receipt is missing before host shutdown')
+        assert native_cli_profile_present(database, snapshot['profile']), (
+            'Native CLI profile receipt is missing before host shutdown')
         key = host_pid, original.pid, snapshot['profile']
         from tests.integration.mcp_gateway_custody import OriginalGatewayGroup
         self.host_observations.setdefault(key, dict(process=original,
             group=OriginalGatewayGroup(original.pid, original.wait, lambda: not original.is_running()),
             profile=snapshot['profile'], configuration=configuration, database=database))
 
+    def retain_host_admission(self, host, directory):
+        retained = self.host_admissions.setdefault(directory, host)
+        assert retained is host, 'Native host admission directory belongs to another original process'
+
     def read_host_admissions(self, host, directory):
         import re
 
-        key = host.pid, host.create_time(), directory
-        self.host_admissions[key] = host
+        self.retain_host_admission(host, directory)
         records = []
         for receipt in sorted(directory.glob('kestrel-*.json')):
             record = json.loads(receipt.read_text())
-            assert record['host_pid'] == host.pid and record['host_created'] == host.create_time()
+            assert record['host_pid'] == host.pid
+            host.bind_birth(record['host_created'])
             assert re.fullmatch('kestrel-[a-f0-9]{32}', record['profile'])
             assert receipt.name == record['profile'] + '.json'
             configuration = Path(record['configuration'])
@@ -451,17 +487,29 @@ class GatewayTestPeer(MCPTestPeer):
         import psutil
         from tests.integration.mcp_gateway_custody import OriginalGatewayGroup
 
+        key = (record.get('host_pid'), record['host_created'], record['profile'], record.get('configuration'))
+        signature = dict(record, executables=tuple(record['executables']))
+        if key in self.group_receipts:
+            original, groups = self.group_receipts[key]
+            assert signature == original, 'Original native Gateway admission changed after custody capture'
+            return list(groups)
+
+        def retain(groups):
+            owned = tuple(groups)
+            self.group_receipts[key] = signature, owned
+            return list(owned)
+
         originals = self.admitted_processes(record)
         if originals:
-            return [OriginalGatewayGroup(original.pid, original.wait,
-                lambda original=original: not original.is_running()) for original in originals]
+            return retain(OriginalGatewayGroup(original.pid, original.wait,
+                lambda original=original: not original.is_running()) for original in originals)
         group = None
         if 'pid' in record:
             # Original absence was observed above; this does not retire its
             # private group or authorize adopting a later PID reuse.
             group = OriginalGatewayGroup(record['pid'], None, lambda: True)
             if not group.group_alive():
-                return []
+                return retain(())
         members = {}
         for candidate in psutil.process_iter():
             try:
@@ -473,13 +521,11 @@ class GatewayTestPeer(MCPTestPeer):
         assert len(members) == 1, 'Original native Gateway group custody is unresolved; retain profile and configuration'
         if group is not None:
             assert group.pid in members
-            return [group]
+            return retain((group,))
         identifier, original = next(iter(members.items()))
-        return [OriginalGatewayGroup(identifier, original.wait, lambda: not original.is_running())]
+        return retain((OriginalGatewayGroup(identifier, original.wait, lambda: not original.is_running()),))
 
     async def reconcile_host_gateways(self, host, directory):
-        import sqlite3
-
         records = self.read_host_admissions(host, directory)
 
         async def reconcile(record):
@@ -488,10 +534,7 @@ class GatewayTestPeer(MCPTestPeer):
                 assert group.retired(), 'Original native Gateway group is still alive'
             assert await self.containers() == [], 'Retain native profile until its owned peers retire'
             database = self.gateway_home / '.docker/mcp/mcp-toolkit.db'
-            with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
-                present = connection.execute('SELECT id FROM working_set WHERE id=?',
-                    (record['profile'],)).fetchone()
-            if present is not None:
+            if native_cli_profile_present(database, record['profile']):
                 await run_owned_mcp_cli(['profile', 'remove', record['profile']])
             if record['configuration'].exists():
                 shutil.rmtree(record['configuration'])
@@ -502,8 +545,6 @@ class GatewayTestPeer(MCPTestPeer):
 
 
     async def assert_host_retired(self, host_pid):
-        import sqlite3
-
         for (owner_pid, _pid, _profile), record in self.host_observations.items():
             if owner_pid != host_pid:
                 continue
@@ -511,10 +552,8 @@ class GatewayTestPeer(MCPTestPeer):
                 'Core host acknowledged shutdown with its original native Gateway group alive')
             assert not record['configuration'].exists(), (
                 'Core host shutdown retained its acknowledged private Gateway configuration')
-            with sqlite3.connect(record['database'].as_uri() + '?mode=ro', uri=True) as connection:
-                assert connection.execute('SELECT id FROM working_set WHERE id=?',
-                    (record['profile'],)).fetchone() is None, (
-                    'Core host shutdown retained its acknowledged native CLI profile')
+            assert not native_cli_profile_present(record['database'], record['profile']), (
+                'Core host shutdown retained its acknowledged native CLI profile')
         assert await self.containers() == [], (
             'Core host shutdown left an actual peer attached to its owned witness volume')
 
@@ -655,9 +694,8 @@ async def gateway_peer(tmp_path, monkeypatch, *, linger_after_stdio=False, confi
 
 async def _reconcile_admitted_host_gateways(peer):
     async with AsyncExitStack() as retirement:
-        for (pid, created, directory) in tuple(peer.host_admissions):
+        for directory, host in tuple(peer.host_admissions.items()):
             # Retain the original birth receipt even after the host has exited.
-            host = peer.host_admissions[(pid, created, directory)]
             retirement.push_async_callback(peer.reconcile_host_gateways, host, directory)
 
 
@@ -668,10 +706,44 @@ async def _retire_remembered_gateways(peer):
 
 
 async def _remove_owned_gateway_containers(peer):
+    from docker.errors import APIError, NotFound
+    from kestrel_sovereign._async_process import DEFAULT_REAP_TIMEOUT_SECONDS
+    from kestrel_sovereign._async_ownership import await_owned_operation, raise_owned_outcome
+
+    def retire_original(container):
+        try:
+            container.reload()
+        except NotFound:
+            return  # The exact inventoried original ID is physically absent.
+        if container.attrs['State']['Status'] != 'removing':
+            try:
+                container.remove(force=True)
+            except NotFound:
+                return
+            except APIError as error:
+                if error.status_code != 409:
+                    raise
+                try:
+                    container.reload()
+                except NotFound:
+                    return
+                if container.attrs['State']['Status'] != 'removing':
+                    raise  # A different daemon conflict is not retirement.
+        try:
+            container.wait(condition='removed', timeout=DEFAULT_REAP_TIMEOUT_SECONDS)
+            container.reload()
+        except NotFound:
+            return
+        raise AssertionError('Original owned Docker container remains after removal acknowledgement')
+
+    async def remove(container):
+        raise_owned_outcome(await await_owned_operation(asyncio.to_thread(retire_original, container)),
+            operation='original owned Docker container retirement')
+
     async def remove_inventory():
         async with AsyncExitStack() as retirement:
             for container in await peer._container_inventory():
-                retirement.push_async_callback(asyncio.to_thread, container.remove, force=True)
+                retirement.push_async_callback(remove, container)
 
     async with AsyncExitStack() as retirement:
         retirement.push_async_callback(remove_inventory)

@@ -523,9 +523,9 @@ jobs:
           echo "MCP_TEST_DOCKER_HOST=unix:///var/run/docker.sock" >> "$GITHUB_ENV"
       - name: Exercise the native Gateway and stdio ownership campaign
         # CLI0.44.3 passed all43 Gateway/stdio cases in250.90s on Linux.
-        # The six actual host/restart/reconciliation cases pass locally in
-        # 124.71s; a seventh checks physical SIGKILL after the real wait fails.
-        # This50-case cohort retains its finite720s session; actual combined
+        # Nine host/restart/reconciliation cases include physical SIGKILL,
+        # unpublished admission recovery and deferred native reader removal.
+        # This52-case cohort retains its finite720s session; actual combined
         # Linux duration must be measured on this PR, never inferred locally.
         run: >-
           uv run --no-sync python -m pytest

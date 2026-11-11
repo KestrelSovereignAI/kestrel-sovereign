@@ -120,7 +120,7 @@ async def test_original_admitted_gateway_zombie_is_joined_before_receipt_release
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform == 'win32', reason='Original POSIX process group requires process groups')
-@pytest.mark.parametrize('custody', ['original-waiter', 'private-admission'])
+@pytest.mark.parametrize('custody', ['original-waiter', 'private-admission', 'unpublished-intent'])
 async def test_original_gateway_child_retires_after_its_leader_has_exited(tmp_path, custody):
     import asyncio
     import os
@@ -156,7 +156,10 @@ async def test_original_gateway_child_retires_after_its_leader_has_exited(tmp_pa
             leader.stdin.write(b'x')
             leader.stdin.flush()
             assert await asyncio.to_thread(leader.wait, 2) == 0
-            with pytest.raises(TimeoutError):
+            if custody == 'unpublished-intent':
+                record = {key: value for key, value in record.items() if key not in {'pid', 'created'}}
+            expected = psutil.TimeoutExpired if custody == 'unpublished-intent' else TimeoutError
+            with pytest.raises(expected):
                 if custody == 'original-waiter':
                     await retire_original_gateway_process(leader.pid, leader.wait,
                         lambda: leader.poll() is not None)
@@ -174,6 +177,11 @@ async def test_original_gateway_child_retires_after_its_leader_has_exited(tmp_pa
                     assert group.pid == leader.pid
                     await group.retire()
             assert not descendant.is_running(), 'Original Gateway leader exit abandoned its stopped child'
+            if custody == 'unpublished-intent':
+                recovered = peer.admitted_groups(record)
+                assert recovered == [group] and recovered[0] is group, (
+                    'Unpublished admission discarded its original terminal receipt')
+                assert group.retired()
         finally:
             if descendant is not None:
                 if descendant.is_running():
@@ -213,3 +221,53 @@ def test_native_launch_intent_refuses_a_foreign_session_with_matching_profile(tm
             if child.poll() is None:
                 child.terminate()
             child.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('metadata', ['constructor', 'birth'])
+@pytest.mark.skipif(sys.platform == 'win32', reason='Native host admission regression uses a private FIFO')
+async def test_native_host_retains_cleanup_before_disappearing_metadata(tmp_path, monkeypatch, metadata):
+    import asyncio
+    import os
+    import psutil
+    from cryptography.fernet import Fernet
+    from tests.integration.mcp_permission_peers import GatewayTestPeer
+    from tests.integration.test_mcp_permission_host_restart import native_host, owned_host_environment
+
+    home = tmp_path / 'host'
+    home.mkdir(mode=0o700)
+    descriptor = home / 'held-descriptor'
+    os.mkfifo(descriptor, mode=0o600)
+    peer = GatewayTestPeer('gateway', 'unused', gateway_home=home)
+    environment = owned_host_environment(home, api_key='owned-metadata-admission',
+        data_key=Fernet.generate_key().decode())
+    native_spawn, native_process = asyncio.create_subprocess_exec, psutil.Process
+    accepted = {}
+
+    async def exited_before_publication(*args, **kwargs):
+        process = await native_spawn(*args, **kwargs)
+        accepted['process'] = process
+        if metadata == 'birth':
+            accepted['native_identity'] = native_process(process.pid)
+        process.kill()
+        await process.wait()
+        if metadata == 'birth':
+            accepted['native_identity']._create_time = None
+        return process
+
+    def original_identity(pid=None, *args, **kwargs):
+        if metadata == 'birth' and pid == accepted['process'].pid:
+            return accepted['native_identity']
+        return native_process(pid, *args, **kwargs)
+
+    async def attempt():
+        async with native_host(home, descriptor, environment, peer, 1):
+            raise AssertionError('Exited native host published readiness')
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(asyncio, 'create_subprocess_exec', exited_before_publication)
+        boundary.setattr(psutil, 'Process', original_identity)
+        outcome, = await asyncio.gather(attempt(), return_exceptions=True)
+    assert accepted['process'].returncode is not None
+    assert len(peer.host_admissions) == 1, 'Accepted native host lost cleanup before metadata lookup'
+    assert isinstance(outcome, AssertionError) and 'Owned host failed' in str(outcome), repr(outcome)
