@@ -477,12 +477,53 @@ jobs:
         run: >-
           uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
           tests/integration/test_mcp_apps_host.py
+          tests/integration/test_mcp_input_host.py
           tests/integration/test_mcp_permission_host_restart.py
           tests/integration/test_mcp_permission_unknown_restart.py
           tests/integration/test_tool_effect_host_boot.py
           tests/unit/test_async_ownership.py::test_repeated_withdrawal_does_not_accumulate_completion_callbacks
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12
+
+  mcp-input-browser:
+    runs-on: ubuntu-24.04
+    needs: lint-and-imports
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Check out the released MCP browser support
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: KestrelSovereignAI/kestrel-feature-mcp
+          ref: v0.16.0
+          path: native-mcp-browser-support
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Install the host and public MCP package
+        run: uv sync --python 3.14 --locked --extra mcp-integration
+      - name: Exercise native operator forms with installed runtime packages
+        run: >-
+          uv run --no-sync python tests/native_mcp/run_input_browser.py
+          --mcp-source native-mcp-browser-support
+          --output "${{ runner.temp }}/mcp-input-browser"
+      - name: Retire the original browser namespace
+        if: always()
+        run: >-
+          uv run --no-sync python tests/native_mcp/run_input_browser.py
+          --mcp-source native-mcp-browser-support
+          --output "${{ runner.temp }}/mcp-input-browser" --cleanup
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: mcp-input-browser-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mcp-input-browser/
+          if-no-files-found: error
 
   mcp-gateway-seam:
     runs-on: ubuntu-latest

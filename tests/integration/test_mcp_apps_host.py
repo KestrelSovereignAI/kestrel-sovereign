@@ -11,6 +11,7 @@ import json
 import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from pathlib import Path
 import socket
 from types import SimpleNamespace
 
@@ -46,6 +47,13 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(30)]
 API_KEY = "owned-apps-host-api-key"
 ALICE, BOB = "alice@apps.test", "bob@apps.test"
+
+
+@pytest.fixture
+def mcp_browser_support():
+    root = Path(os.environ['MCP_TEST_BROWSER_SUPPORT']).resolve(strict=True)
+    assert (root / 'web/test-support/parent-browser-build.mjs').is_file()
+    return root
 
 
 class OwnedAuditStore(ObservabilityStore):
@@ -112,10 +120,9 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request
     app_html = None
     if settings.get('browser_app'):
         import kestrel_feature_mcp
-        from pathlib import Path
         assert Path('/.dockerenv').is_file(), 'Browser App production requires an owned namespace'
         build = await asyncio.create_subprocess_exec('node', 'web/test-support/parent-browser-build.mjs', 'input-app',
-            cwd=Path(kestrel_feature_mcp.__file__).resolve().parent.parent,
+            cwd=request.getfixturevalue('mcp_browser_support'),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         output, errors = await asyncio.wait_for(build.communicate(), 10)
         assert build.returncode == 0, errors.decode()
