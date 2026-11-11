@@ -1386,17 +1386,39 @@ class OwnedAsyncIterator(Generic[_T]):
             return cancel_owned_task(self._owner)
         return False
 
-    async def _publish_item(self, item: _T) -> bool:
-        if self._stop.is_set():
-            return False
-        async with owned_native_yield():
-            await self._items.put((self, item))
-            self._waiting_for_continue = True
+    async def _wait_for_callback_continuation(self) -> None:
+        """Reconcile THIS frame before cancellation releases its emission lock."""
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        cancellation = None
+        while True:
             try:
                 await self._continue.wait()
-            finally:
-                self._waiting_for_continue = False
-        self._continue.clear()
+                break
+            except asyncio.CancelledError as error:
+                cancellation = execution_observation_error(
+                    cancellation, error, prefer_cancellation=True)
+        if cancellation is not None:
+            raise cancellation
+
+    async def _publish_item(self, item: _T, *, retain_handoff: bool = False) -> bool:
+        if self._stop.is_set():
+            return False
+        try:
+            async with owned_native_yield():
+                await self._items.put((self, item))
+                self._waiting_for_continue = True
+                try:
+                    if retain_handoff:
+                        await self._wait_for_callback_continuation()
+                    else:
+                        await self._continue.wait()
+                finally:
+                    self._waiting_for_continue = False
+        finally:
+            # Reconcile even a cancelled emitter before a sibling can publish
+            # and accidentally consume this frame's outstanding continuation.
+            self._continue.clear()
         return not self._stop.is_set()
 
     async def _run(self) -> None:
@@ -1409,15 +1431,30 @@ class OwnedAsyncIterator(Generic[_T]):
                     emission_lock = asyncio.Lock()
 
                     async def emit(item: _T) -> bool:
+                        from anyio import CancelScope, lowlevel
+
                         # One frame owns the ORIGINAL continuation handoff.
                         # Another child cannot consume that frame's ACK.
                         # A sibling may already own the handoff. Relinquish
                         # this writer BEFORE waiting for its mutex, and restore
                         # only after releasing it, so neither emitter can pin
                         # the writer needed by the other's continuation.
-                        async with owned_native_yield():
-                            async with emission_lock:
-                                return await self._publish_item(item)
+                        # A level cancellation must not spin the original
+                        # writer-restoration loop. Shield through restoration,
+                        # not only through the frame's continuation wait.
+                        with CancelScope(shield=True) as handoff_scope:
+                            async with owned_native_yield():
+                                async with emission_lock:
+                                    # No frame has been published yet. Deliver
+                                    # pending level cancellation before new IO.
+                                    handoff_scope.shield = False
+                                    try:
+                                        await lowlevel.checkpoint_if_cancelled()
+                                    finally:
+                                        handoff_scope.shield = True
+                                    result = await self._publish_item(item, retain_handoff=True)
+                        await lowlevel.checkpoint_if_cancelled()
+                        return result
 
                     result = await source.producer(emit)
                     if result is not None:

@@ -8,6 +8,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
+import anyio
 
 from kestrel_sovereign._async_ownership import (
     OwnedCallbackScope,
@@ -402,6 +403,98 @@ async def test_concurrent_callback_emitters_do_not_hold_writer_while_waiting_for
                 if not original.done():
                     original.cancel()
         await await_owned_task(original_parent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancellation", ["task", "scope"])
+@pytest.mark.parametrize("ending", ["advance", "stop"])
+@pytest.mark.parametrize("repeated", [False, True])
+async def test_cancelled_emitter_keeps_its_original_handoff_until_its_ack_or_stop(
+    tmp_path: Path, cancellation: str, ending: str, repeated: bool,
+):
+    second_ready, second_returned = asyncio.Event(), asyncio.Event()
+    children, scopes, descriptors, retired, owners, closed, controls, results = [], {}, {}, {}, {}, set(), [], {}
+    withdrawal = object()
+    later_withdrawal = object()
+
+    async def produce(emit):
+        async def child(name):
+            descriptor = os.open(tmp_path / name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            descriptors[name] = descriptor
+            owners[name] = asyncio.current_task()
+            with anyio.CancelScope() as scope:
+                scopes[name] = scope
+                try:
+                    os.write(descriptor, name.encode())
+                    if name == "second":
+                        second_ready.set()
+                    results[name] = await emit(name)
+                    if name == "second":
+                        second_returned.set()
+                except asyncio.CancelledError as error:
+                    controls.append(error)
+                    raise
+                finally:
+                    os.close(descriptor)
+                    closed.add(name)
+                    retired[name] = asyncio.current_task()
+
+        async with asyncio.TaskGroup() as tasks:
+            children.append(tasks.create_task(child("first")))
+            children.append(tasks.create_task(child("second")))
+
+    source = await create_owned_iterator(
+        lambda: OwnedCallbackSource(produce), operation="cancelled original emitter")
+    try:
+        assert await anext(source) == "first"
+        await second_ready.wait()
+        if cancellation == "task":
+            children[0].cancel(withdrawal)
+        else:
+            scopes["first"].cancel()
+        completed, _ = await asyncio.wait({children[0]}, timeout=.01)
+        assert not completed, "Emitter abandoned its outstanding frame before ACK or Stop"
+        if repeated:
+            if cancellation == "task":
+                children[0].cancel(later_withdrawal)
+            else:
+                scopes["first"].cancel()
+            completed, _ = await asyncio.wait({children[0]}, timeout=.01)
+            assert not completed, "Repeated cancellation abandoned the outstanding frame"
+        assert closed == set() and controls == []
+        os.fstat(descriptors["first"])
+        os.fstat(descriptors["second"])
+        if ending == "advance":
+            assert await anext(source) == "second"
+            completed, _ = await asyncio.wait({children[1]}, timeout=.01)
+            assert not completed and not second_returned.is_set(), "Second emitter consumed first frame's ACK"
+            os.fstat(descriptors["second"])
+            with pytest.raises(StopAsyncIteration):
+                await anext(source)
+            assert results == {"second": True}
+        else:
+            await source.aclose()
+            assert results == {"second": False}
+        assert closed == {"first", "second"} and owners == retired
+        assert len(controls) == 1 and isinstance(controls[0], asyncio.CancelledError)
+        if cancellation == "task":
+            assert len(controls[0].args) == 1 and controls[0].args[0] is withdrawal
+            if repeated:
+                from kestrel_sovereign.execution_custody import _explicit_control_chain
+                originals = tuple(_explicit_control_chain(controls[0]))
+                for marker in (withdrawal, later_withdrawal):
+                    assert any(error is not controls[0] and isinstance(error, asyncio.CancelledError)
+                               and len(error.args) == 1 and error.args[0] is marker
+                               for error in originals)
+        assert all(task.done() for task in children)
+        assert source.producer_task.done() and source.owner_task.done()
+        for descriptor in descriptors.values():
+            with pytest.raises(OSError) as captured:
+                os.fstat(descriptor)
+            assert captured.value.errno == errno.EBADF
+    finally:
+        await source.aclose()
 
 
 @pytest.mark.asyncio
