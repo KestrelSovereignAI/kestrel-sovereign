@@ -725,7 +725,8 @@ class EventManagerMixin:
         would recreate the wake once every retention period.
         """
 
-        from kestrel_sovereign.signals import DurableAdmissionDisposition
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        from kestrel_sovereign.signals import ACKNOWLEDGED, DurableAdmissionDisposition
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
         )
@@ -761,11 +762,60 @@ class EventManagerMixin:
             live_changed_since=horizons[SUBMITTED_SOURCE],
             terminal_changed_since=horizons[COMPLETE_SOURCE],
         )
+        async def submission_wake(source_event_id: str):
+            return await self.dispatcher.get_durable_delivery_for_source_event(
+                consumer_id=SUBMITTED_CONSUMER,
+                source=SUBMITTED_SOURCE,
+                source_event_id=source_event_id,
+            )
+
+        async def settle_undelivered(task_id: str, delivery) -> None:
+            # The dispatcher ends the task when its wake ends undelivered; this
+            # catches a process that stopped before it could (#4001). One task
+            # that cannot be settled must not refuse the boot or the rest.
+            try:
+                await self.settle_undelivered_cognition_wake(
+                    source=delivery.event.source,
+                    target_agent=delivery.event.target_agent,
+                    source_event_id=delivery.event.source_event_id,
+                    stopped=False,
+                    cause=f"wake {delivery.status}",
+                )
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
+                logging.exception(
+                    "Could not settle A2A task %s, whose submission wake ended "
+                    "undelivered; it stays live until a later boot",
+                    task_id,
+                )
+
         unadmitted: list[str] = []
         for candidate in tasks:
             task = candidate.task
             state = task.status.state
             if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
+                original = await submission_wake(
+                    submitted_input_identity(task.id, candidate.input_revision)
+                )
+                if (
+                    original is not None
+                    and original.is_terminal
+                    and original.status != ACKNOWLEDGED
+                ):
+                    # The input's wake ended without running, and nothing runs
+                    # it again; a replacement would be refused the same way.
+                    await settle_undelivered(task.id, original)
+                    continue
+                if (
+                    state == TaskState.TASK_STATE_WORKING
+                    and original is not None
+                    and not original.is_terminal
+                ):
+                    # A crash mid-turn leaves the submission wake live, and
+                    # its own retry resumes this work. A second identity
+                    # would run the same task twice at recovery.
+                    continue
                 signal = build_signal_for_submitted_task(
                     candidate, target_agent=self.did
                 )
@@ -783,21 +833,6 @@ class EventManagerMixin:
                         working_revision=candidate.lifecycle_revision,
                     )
                 )
-                if state == TaskState.TASK_STATE_WORKING:
-                    original = (
-                        await self.dispatcher.get_durable_delivery_for_source_event(
-                            consumer_id=SUBMITTED_CONSUMER,
-                            source=SUBMITTED_SOURCE,
-                            source_event_id=submitted_input_identity(
-                                task.id, candidate.input_revision
-                            ),
-                        )
-                    )
-                    if original is not None and not original.is_terminal:
-                        # A crash mid-turn leaves the submission wake live, and
-                        # its own retry resumes this work. A second identity
-                        # would run the same task twice at recovery.
-                        continue
             else:
                 signal = build_signal_for_completed_task(
                     candidate,
@@ -820,6 +855,12 @@ class EventManagerMixin:
                     "leaving it failed",
                     task.id,
                 )
+                if consumer_id == SUBMITTED_CONSUMER:
+                    # A WORKING wake for this input failed after the input's
+                    # submission wake was acknowledged.
+                    failed = await submission_wake(source_event_id)
+                    if failed is not None:
+                        await settle_undelivered(task.id, failed)
             elif receipt.disposition is DurableAdmissionDisposition.NOT_ADMITTED:
                 unadmitted.append(str(task.id))
         if unadmitted:
@@ -944,61 +985,102 @@ class EventManagerMixin:
         if isinstance(task_id, str) and isinstance(self_declines, set):
             self_declines.discard(task_id)
 
-    async def settle_stopped_cognition_signal(self, signal) -> None:
-        """Cancel the inbound A2A task whose submission wake a Stop consumed.
+    async def settle_undelivered_cognition_wake(
+        self,
+        *,
+        source: str,
+        target_agent: str,
+        source_event_id: str | None,
+        stopped: bool,
+        cause: str,
+    ) -> bool:
+        """End the inbound A2A task whose submission wake ended undelivered.
 
-        Stopping a queued or running ``a2a.task_submitted`` turn ends that wake
-        for good: its delivery becomes terminal and is never redelivered. Left
-        alone, the task stays ``submitted`` with nothing left to run it, and
-        its sender sees pending work forever (#4001). The dispatcher calls this
-        before it makes the delivery terminal and before Stop reports it
-        stopped, so the sender reads ``canceled`` instead.
+        A durable wake that ends without running its turn is never delivered
+        again: a Stop consumed it, the dispatcher refused it before or after
+        persisting it, or a retry was refused because its tool operation needs
+        reconciliation. Nothing else wakes the recipient for that input, so a
+        task left ``submitted`` or ``working`` waits forever and its sender
+        sees nothing fail (#4001). The dispatcher calls this wherever such a
+        wake becomes terminal, and boot reconciliation calls it for one already
+        terminal. A stopped wake cancels the task; any other ends it failed,
+        naming ``cause``.
 
-        The cancellation runs bound to the stopped signal, so the task store
-        fences it to that wake's admitted input revision: a newer input the
-        sender added meanwhile stays live for its own wake. A task already
-        terminal or superseded needs nothing. Raises when the stopped input is
-        still live and the cancellation did not commit.
+        The wake is named by its durable identity, never its payload, which a
+        privacy mode may elide. The write is bound to the wake's own admitted
+        input, and to a task still waiting on it, in the same statement: a
+        newer input the creator added meanwhile stays live for its own wake,
+        and a task that asked for input meanwhile is left alone. A task no
+        longer waiting on this input needs nothing. Returns whether this call
+        ended the task; raises when the input still waits and the write did
+        not commit.
         """
-        if getattr(signal, "source", None) != "a2a.task_submitted":
-            return
-        payload = getattr(signal, "payload", None)
-        task_id = payload.get("task_id") if isinstance(payload, dict) else None
-        if not isinstance(task_id, str) or not task_id:
-            raise ValueError("a2a.task_submitted has no concrete durable task id")
+        if source != "a2a.task_submitted":
+            return False
+        if target_agent != self.did:
+            raise ValueError("The undelivered A2A wake belongs to another recipient")
+        from kestrel_sovereign.a2a.stores.unified.task_store import (
+            TaskMutationAuthorizationError,
+        )
         from kestrel_sovereign.a2a.task_manager import (
             TaskCancellationAuthorizationError,
         )
         from kestrel_sovereign.signals.context import bind_current_signal
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            admitted_input_signal,
+            parse_submitted_input_identity,
+        )
 
+        task_id, input_revision = parse_submitted_input_identity(source_event_id)
+        if not await self._input_awaits_its_wake(task_id, input_revision):
+            return False
+        wake = admitted_input_signal(task_id, input_revision, target_agent=self.did)
         try:
-            with bind_current_signal(signal):
-                await self.task_manager.cancel_task(
-                    task_id,
-                    reason="Stop cancelled the recipient's turn for this task",
-                    agent_name=self.did,
-                    recipient_agent_id=self.did,
-                )
-        except (TaskCancellationAuthorizationError, ValueError):
-            # The fenced cancellation matched no row. That is settled only if
-            # the stopped input is no longer the task's live, wakeable input.
-            snapshot = await self.task_manager.get_task_cancellation_snapshot(
-                task_id,
-                recipient_agent_id=self.did,
-            )
-            if (
-                snapshot is not None
-                and snapshot.state
-                in {"submitted", "working", "input-required", "auth-required"}
-                and snapshot.cognition_wake_eligible
-                and snapshot.input_wake_eligible
-                and snapshot.input_revision == payload.get("input_revision")
-            ):
+            with bind_current_signal(wake):
+                if stopped:
+                    await self.task_manager.cancel_task(
+                        task_id,
+                        reason="Stop cancelled the recipient's turn for this task",
+                        agent_name=self.did,
+                        recipient_agent_id=self.did,
+                    )
+                else:
+                    await self.task_manager.fail_task(
+                        task_id,
+                        "the recipient's wake for this task ended without "
+                        f"completing it and will not run again ({cause})",
+                        agent_name=self.did,
+                        recipient_agent_id=self.did,
+                    )
+        except (
+            TaskCancellationAuthorizationError,
+            TaskMutationAuthorizationError,
+            ValueError,
+        ):
+            # The fenced write matched no row: settled, unless the input still
+            # waits on this wake.
+            if await self._input_awaits_its_wake(task_id, input_revision):
                 raise
+            return False
         finally:
-            # Cancelling under this signal records it as this wake's own
-            # decline; that exemption ends with the wake.
-            self.finish_cognition_signal_execution(signal)
+            # A write under this wake's identity records it as the wake's own
+            # decline; that exemption ends here.
+            self.finish_cognition_signal_execution(wake)
+        return True
+
+    async def _input_awaits_its_wake(self, task_id: str, input_revision: int) -> bool:
+        """Whether only the submission wake for this input would run the task."""
+        snapshot = await self.task_manager.get_task_cancellation_snapshot(
+            task_id,
+            recipient_agent_id=self.did,
+        )
+        return (
+            snapshot is not None
+            and snapshot.state in {"submitted", "working"}
+            and snapshot.cognition_wake_eligible
+            and snapshot.input_wake_eligible
+            and snapshot.input_revision == input_revision
+        )
 
     def _on_task_cancellation_started(
         self,

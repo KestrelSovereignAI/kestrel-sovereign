@@ -72,6 +72,15 @@ def private_event(signal):
     )
 
 
+def identity(event):
+    """The durable identity the settlement hook names a wake by."""
+    return {
+        "source": event.source,
+        "target_agent": event.target_agent,
+        "source_event_id": event.source_event_id,
+    }
+
+
 async def test_old_private_event_never_rehydrates_as_new_input(manager):
     task = await manager.create_task(request(), creator_agent_id="did:creator")
     first = wake(await snapshot(manager, task), manager)
@@ -493,3 +502,293 @@ async def test_historical_task_cannot_be_rebuilt_as_a_new_input_wake(manager):
     candidate = replace(await snapshot(manager, task), cognition_wake_eligible=False)
     with pytest.raises(ValueError, match="not eligible"):
         wake(candidate, manager)
+
+
+@pytest.mark.parametrize("stopped", [True, False], ids=["stopped", "failed"])
+async def test_an_undelivered_wake_ends_only_the_input_it_carried(manager, stopped):
+    """#4001: a submission wake that ended without running ends its task, and
+    only for the input it carried. A newer input the creator added meanwhile
+    stays live for its own wake. Both wakes are payload-elided, as under a
+    volatile privacy mode: the input identity alone settles them."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    stale = private_event(wake(await snapshot(manager, task), manager))
+    await manager.continue_task(followup(manager, task), creator_agent_id="did:creator")
+    recipient = owner(manager)
+
+    assert not await recipient.settle_undelivered_cognition_wake(
+        **identity(stale), stopped=stopped, cause="dropped_cycle"
+    )
+    current = await snapshot(manager, task)
+    assert current.task.status.state == TaskState.TASK_STATE_SUBMITTED
+    assert current.input_revision == 1
+
+    assert await recipient.settle_undelivered_cognition_wake(
+        **identity(private_event(wake(current, manager))),
+        stopped=stopped,
+        cause="dropped_cycle",
+    )
+    settled = await snapshot(manager, task)
+    text = settled.task.status.message.parts[0].text
+    if stopped:
+        assert settled.task.status.state == TaskState.TASK_STATE_CANCELED
+        assert "Stop cancelled" in text
+    else:
+        assert settled.task.status.state == TaskState.TASK_STATE_FAILED
+        assert "dropped_cycle" in text
+    # Settling the same wake again finds nothing left to end.
+    assert not await recipient.settle_undelivered_cognition_wake(
+        **identity(private_event(wake(current, manager))),
+        stopped=stopped,
+        cause="dropped_cycle",
+    )
+
+
+@pytest.mark.parametrize("stopped", [True, False], ids=["stopped", "failed"])
+async def test_an_undelivered_wake_spares_an_input_that_lands_while_it_settles(
+    manager, stopped
+):
+    """The creator adds an input after the settlement read the task and before
+    it wrote: the write is fenced to the wake's own input, so the newer input
+    stays live for its own wake."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    stale = private_event(wake(await snapshot(manager, task), manager))
+    recipient = owner(manager)
+    read = recipient._input_awaits_its_wake
+    reads = []
+
+    async def read_then_continue(task_id, input_revision):
+        awaits = await read(task_id, input_revision)
+        if not reads:
+            await manager.continue_task(
+                followup(manager, task), creator_agent_id="did:creator"
+            )
+        reads.append(awaits)
+        return awaits
+
+    recipient._input_awaits_its_wake = read_then_continue
+
+    assert not await recipient.settle_undelivered_cognition_wake(
+        **identity(stale), stopped=stopped, cause="dropped_cycle"
+    )
+    assert reads == [True, False]
+    current = await snapshot(manager, task)
+    assert current.task.status.state == TaskState.TASK_STATE_SUBMITTED
+    assert current.input_revision == 1
+
+
+async def test_an_undelivered_wake_leaves_a_task_awaiting_input_alone(manager):
+    """A task that asked its creator for input is not waiting on the wake, so a
+    stale wake for that input ending does not fail it."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    stale = private_event(wake(await snapshot(manager, task), manager))
+    await manager.update_status(
+        task.id, TaskState.TASK_STATE_INPUT_REQUIRED, recipient_agent_id=manager.did
+    )
+
+    assert not await owner(manager).settle_undelivered_cognition_wake(
+        **identity(stale), stopped=False, cause="dropped_validation"
+    )
+    assert (await snapshot(manager, task)).task.status.state == (
+        TaskState.TASK_STATE_INPUT_REQUIRED
+    )
+
+
+@pytest.mark.parametrize("stopped", [True, False], ids=["stopped", "failed"])
+async def test_an_undelivered_wake_spares_a_task_that_asks_for_input_while_it_settles(
+    manager, stopped
+):
+    """The recipient's worker asks the creator for input after the settlement
+    read the task and before it wrote. The store refuses the write in the same
+    statement, so the task stays input-required instead of being cancelled or
+    failed out from under the question its creator now sees."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    stale = private_event(wake(await snapshot(manager, task), manager))
+    recipient = owner(manager)
+    read = recipient._input_awaits_its_wake
+    reads = []
+
+    async def read_then_ask_for_input(task_id, input_revision):
+        awaits = await read(task_id, input_revision)
+        if not reads:
+            await manager.update_status(
+                task.id,
+                TaskState.TASK_STATE_INPUT_REQUIRED,
+                recipient_agent_id=manager.did,
+            )
+        reads.append(awaits)
+        return awaits
+
+    recipient._input_awaits_its_wake = read_then_ask_for_input
+
+    assert not await recipient.settle_undelivered_cognition_wake(
+        **identity(stale), stopped=stopped, cause="dropped_cycle"
+    )
+    assert reads == [True, False]
+    current = await snapshot(manager, task)
+    assert current.task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    assert current.input_revision == 0
+
+
+async def test_an_undelivered_wake_for_another_recipient_is_refused(manager):
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    foreign = replace(
+        private_event(wake(await snapshot(manager, task), manager)),
+        target_agent="did:kestrel:someone-else",
+    )
+    with pytest.raises(ValueError, match="another recipient"):
+        await owner(manager).settle_undelivered_cognition_wake(
+            **identity(foreign), stopped=False, cause="dropped_cycle"
+        )
+    assert (await snapshot(manager, task)).task.status.state == (
+        TaskState.TASK_STATE_SUBMITTED
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING],
+    ids=["submitted", "working"],
+)
+async def test_boot_reconcile_ends_a_task_whose_wake_already_failed(manager, state):
+    """#4001 backstop: a process that stopped between failing a submission
+    wake and ending its task leaves the task live, with no wake left to run
+    it. Boot reconciliation ends it, rather than leaving it for its sender to
+    wait on or minting another wake for the same refused input."""
+    import copy
+
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    try:
+        identity = submitted_input_identity(task.id, 0)
+        await dispatcher.dispatch_signal(
+            copy.deepcopy(wake(await snapshot(manager, task), manager)),
+            source_event_id=identity,
+        )
+        original = await dispatcher.get_durable_delivery_for_source_event(
+            consumer_id=consumer, source=SOURCE_NAME, source_event_id=identity
+        )
+        claimed = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer,
+            event_id=original.event_id,
+            executor_id=dispatcher._durable_delivery_owner,
+        )
+        failed = await dispatcher.nack_durable_delivery(
+            consumer_id=consumer,
+            delivery_id=claimed.delivery_id,
+            lease_token=claimed.lease_token,
+            error="execution_control_unresolved: tool_effect_reconciliation_required",
+            terminal=True,
+        )
+        assert failed.status == "failed"
+        if state == TaskState.TASK_STATE_WORKING:
+            await manager.update_status(task.id, state, recipient_agent_id=manager.did)
+
+        await agent.reconcile_a2a_cognition_wakes()
+
+        settled = await snapshot(manager, task)
+        assert settled.task.status.state == TaskState.TASK_STATE_FAILED
+        assert "wake failed" in settled.task.status.message.parts[0].text
+        assert [d.status for d in await dispatcher.list_durable_deliveries(
+            consumer_id=consumer
+        )] == ["failed"]
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_failed_wake_settlement_retains_native_commit_uncertainty(manager):
+    """#4001 round 3: the task write that settles a failed submission wake can
+    end with its commit outcome unknown. That is native control, not an
+    ordinary settlement failure: it propagates, and stays retained as the
+    delivery's debt. The retry, at the owner's shutdown drain here, settles
+    only the task. The failed row's CAS committed once and is never written
+    again."""
+    import copy
+    import gc
+
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        ToolAuditUnconfirmedError,
+        execution_commit_outcome,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    closed = False
+    try:
+        identity_key = submitted_input_identity(task.id, 0)
+        await dispatcher.dispatch_signal(
+            copy.deepcopy(wake(await snapshot(manager, task), manager)),
+            source_event_id=identity_key,
+        )
+        original = await dispatcher.get_durable_delivery_for_source_event(
+            consumer_id=consumer, source=SOURCE_NAME, source_event_id=identity_key
+        )
+        claimed = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer,
+            event_id=original.event_id,
+            executor_id=dispatcher._durable_delivery_owner,
+        )
+        # Each backend has its own exact-token failed-row CAS; count both.
+        store = dispatcher._durable_store
+        failed_row_writes = []
+
+        def counted(owner, name):
+            write = getattr(owner, name)
+
+            async def counted_write(**kwargs):
+                failed_row_writes.append(kwargs["delivery_id"])
+                return await write(**kwargs)
+
+            setattr(owner, name, counted_write)
+
+        if store.backend.backend_type == "postgres":
+            counted(store.backend, "fail_cognition_delivery")
+        else:
+            counted(store, "release_managed_delivery_after_task")
+        uncertain = ExecutionCommitOutcomeError("unknown")
+        save = manager.task_store.save_recipient_lifecycle
+        writes = {"uncertain": 1}
+
+        async def save_once_uncertain(*args, **kwargs):
+            if writes["uncertain"]:
+                writes["uncertain"] -= 1
+                raise uncertain
+            return await save(*args, **kwargs)
+
+        manager.task_store.save_recipient_lifecycle = save_once_uncertain
+
+        with pytest.raises(BaseException) as raised:
+            await dispatcher._terminalize_failed_cognition(
+                claimed, ToolAuditUnconfirmedError("audit failed")
+            )
+        assert execution_commit_outcome(raised.value) == "unknown"
+        delivery_id = claimed.delivery_id
+        assert failed_row_writes == [delivery_id]
+        assert [d.status for d in await dispatcher.list_durable_deliveries(
+            consumer_id=consumer
+        )] == ["failed"]
+        assert delivery_id in dispatcher._retained_cognition_control_debt
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_SUBMITTED
+        )
+        # Only the dispatcher's own retained debt may keep this delivery's
+        # snapshot, and with it the failed row's receipt, alive.
+        del claimed, original, raised
+        gc.collect()
+
+        closed = True
+        await close_input_dispatcher(agent, dispatcher)
+
+        assert writes["uncertain"] == 0
+        assert failed_row_writes == [delivery_id]
+        assert not dispatcher._retained_cognition_control_debt
+        assert not dispatcher._failed_cognition_source_debt
+        settled = await snapshot(manager, task)
+        assert settled.task.status.state == TaskState.TASK_STATE_FAILED
+        assert "tool_effect_outcome_unconfirmed" in settled.task.status.message.parts[0].text
+    finally:
+        if not closed:
+            await close_input_dispatcher(agent, dispatcher)

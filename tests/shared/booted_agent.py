@@ -26,6 +26,7 @@ async def booted_agent(
     features: AbstractSet[str],
     genesis: bool = True,
     released_schema: Path | None = None,
+    identity: str | None = None,
 ):
     """A booted agent past genesis and discovery, loading only ``features``
     (Feature class names) beyond the mandatory set.
@@ -35,7 +36,12 @@ async def booted_agent(
 
     ``released_schema`` names a snapshot from ``tests.shared.agent_store_schema``.
     The agent's database then starts as that release's fresh database, and the
-    agent boots across whatever upgrade its stores need (#4002)."""
+    agent boots across whatever upgrade its stores need (#4002).
+
+    ``identity`` is the DID of an agent an earlier ``booted_agent`` call left
+    in ``tmp_path``. The same agent then boots again on its own database, as
+    after a host restart, past the genesis and discovery it already
+    recorded (#4001)."""
     from kestrel_sovereign.bootstrap import BootstrapState
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
     from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -44,7 +50,13 @@ async def booted_agent(
     from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
     db_path = Path(tmp_path) / "kestrel_prime.db"
-    if released_schema is None:
+    if identity is not None:
+        if released_schema is not None:
+            raise ValueError("a restarted agent boots on its own database")
+        if not db_path.exists():
+            raise FileNotFoundError(f"no agent database to restart at {db_path}")
+        did = identity
+    elif released_schema is None:
         credentials = await create_kestrel_identity_async(
             output_dir=str(tmp_path), is_test_instance=True, agent_name=name
         )
@@ -64,9 +76,11 @@ async def booted_agent(
             )
         finally:
             await database.close()
+    if identity is None:
+        did = credentials.agent_did
     llm_service = LLMService()
     agent = KestrelAgent(
-        did=credentials.agent_did,
+        did=did,
         storage_path=str(db_path),
         llm_service=llm_service,
         allowed_features=set(features),
@@ -77,9 +91,10 @@ async def booted_agent(
         assert loaded == MANDATORY_FEATURES | features, (
             f"the agent loaded {sorted(loaded)}, not only the features asked for"
         )
-        if genesis:
-            await complete_deterministic_genesis_audit(agent, provenance=provenance)
-        await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
+        if identity is None:
+            if genesis:
+                await complete_deterministic_genesis_audit(agent, provenance=provenance)
+            await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
         yield agent
     finally:
         await shutdown_fixture_agent(agent)

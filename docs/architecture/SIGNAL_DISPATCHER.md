@@ -491,6 +491,56 @@ unadmitted attempts; each caller separately receives its actual allocation error
 with the original native receipt. A later admitted cleanup must settle the same
 delivery/token through its real CAS, without reviving ordinary runtime work.
 
+#### A wake that ends undelivered ends the work it carried
+
+A durable cognition wake that becomes terminal without running its turn is
+never delivered again. For an inbound A2A task that wake is the only thing that
+would run the task, so a task left `submitted` or `working` waits forever and its
+sender sees nothing fail (#4001). Four routes reached that state: Stop cancelled
+a queued or running wake, a retained route settled the delivery after its
+dispatch was cancelled, a retry after restart was refused because the tool
+operation its first attempt opened needs reconciliation (#3999), and the
+dispatcher refused the wake as a cycle before persisting any delivery.
+
+The rule is keyed on the wake becoming terminal, not on the route. Every point
+where that happens calls the agent's `settle_undelivered_cognition_wake` with
+the wake's durable identity (`source`, `target_agent`, `source_event_id`):
+
+- `dispatch_signal`, for a durable cognition enqueue refused by validation or
+  cycle detection, settles **before** it publishes the TERMINAL admission. No
+  delivery exists, so no delivery writer would see the refusal, and its
+  producer stops on TERMINAL. If the settlement cannot commit, the admission is
+  NOT_ADMITTED instead: the producer retries the handoff and, with it, the
+  settlement. Boot reconciliation rebuilds the same refused wake, so a process
+  that stopped meanwhile settles it at the next boot.
+- `_settle_cognition_non_delivery`, for a stopped, validation-dropped or
+  cycle-dropped result, settles **before** its terminal-ACKable NACK. If the
+  settlement cannot commit, the delivery is released for retry instead, and a
+  Stop does not report the work stopped.
+- `_terminalize_failed_cognition`, for a failed terminalization, settles
+  **after** its CAS commits, since that row stands whatever follows, and never
+  inside that CAS. A native commit or control outcome from the settlement
+  propagates and is retained as the delivery's control debt, as the row's own
+  would be: readiness and owner retirement refuse while it stands, and the
+  owner's retirement drain retries only the settlement. The row's
+  original-token receipt outlives it, so the CAS is not written again.
+
+A stopped wake cancels the task; any other ends it `failed`, naming the cause.
+The write is bound to the wake's own admitted input, read from its
+`source_event_id`, so it is fenced as that wake's turn is: a newer input the
+creator added meanwhile stays live. The identity's kind,
+`UNDELIVERED_WAKE_SETTLEMENT_KIND`, also fences the write to a task still
+`submitted` or `working`, in the same statement: a worker that asks the creator
+for input after the settler read the task wins. A task no longer waiting on the
+input (terminal, or asking for input) is left alone. Boot's
+`reconcile_a2a_cognition_wakes` settles a live task whose submission wake is
+already terminal and unacknowledged, which covers a process that stopped between
+the two writes, and mints no replacement wake for it.
+
+An agent with no durable cognition consumer delivers its A2A wakes through
+`enqueue_signal`, where no wake is terminal or retried; this rule does not
+cover that configuration.
+
 #### Resuming on a wait handle instead of holding a turn
 
 A held wait (`wait("<kind>:<handle>")`, or any `run_wait_loop` caller) is

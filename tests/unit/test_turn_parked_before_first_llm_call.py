@@ -231,13 +231,17 @@ async def test_a_signal_a_turn_dispatches_leaves_the_turn_queued_behind_it_runna
         assert not agent._get_privacy_transition_lock().locked()
 
 
-async def test_an_inbound_a2a_wake_is_not_enrolled_in_the_submitting_turn(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("callback", ["_on_task_submitted", "_on_background_task_complete"])
+async def test_an_a2a_wake_is_not_enrolled_in_the_turn_that_announced_it(
+    tmp_path, monkeypatch, callback
 ):
-    """TaskManager calls ``_on_task_submitted`` on the submitting task: for a
-    co-hosted sender, that sender's own turn. The wake belongs to the
-    recipient, so the submitting turn's retirement must not join it."""
+    """TaskManager announces a task on whichever task changed it: a submission
+    on the sender's turn (for a co-hosted sender, that sender's own turn), a
+    completion on the turn that answered it with ``respond_to_a2a_task``, the
+    11-10 Claw shape. The wake is its own turn, so the announcing turn's
+    retirement must not join it."""
     import kestrel_sovereign.agent.event_manager as event_manager
+    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
 
     async with booted_agent(
         tmp_path / "agent", name="Recipient", provenance="test:4001-a2a", features=set()
@@ -253,14 +257,19 @@ async def test_an_inbound_a2a_wake_is_not_enrolled_in_the_submitting_turn(
             event_manager, "require_native_task_snapshot", lambda candidate, _did: candidate
         )
         candidate = SimpleNamespace(
-            task=SimpleNamespace(id="task-4001"), input_revision=1
+            task=Task(
+                id="task-4001",
+                status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
+            ),
+            ownership=SimpleNamespace(creator_agent_id="did:kestrel:creator-4001"),
+            input_revision=1,
         )
         in_span = []
 
         async def generate(kwargs):
             lock = agent._get_privacy_transition_lock()
             in_span.append(lock._scope_for(asyncio.current_task()) is not None)
-            agent._on_task_submitted(candidate)
+            getattr(agent, callback)(candidate)
             return LLMResponse(content=REPLY)
 
         _script_replies(agent, monkeypatch, generate)
@@ -353,20 +362,121 @@ async def test_a_restart_wake_a_turn_sweeps_leaves_the_turn_queued_behind_it_run
         assert not agent._get_privacy_transition_lock().locked()
 
 
+SENDER = "did:kestrel:sender-4001"
+
+
+async def _submit_task(agent, *, metadata=None):
+    """An inbound A2A work order from ``SENDER``; its wake is enqueued."""
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
+
+    manager = agent.task_manager
+    return await manager.create_task(
+        SendMessageRequest(
+            tenant=manager.task_store.scope.tenant,
+            message=new_text_message(
+                "Please do this", context_id="context-4001", role=Role.ROLE_USER
+            ),
+            metadata=metadata,
+        ),
+        creator_agent_id=SENDER,
+    )
+
+
+def _looping_causation(agent):
+    """Native causation metadata naming a wake this recipient already ran.
+
+    Its submission wake is ``(recipient, a2a.task_submitted)`` again, so the
+    dispatcher refuses it as a cycle before it persists any delivery.
+    """
+    from datetime import UTC, datetime
+
+    from kestrel_sdk.signals import CausationFrame
+
+    from kestrel_sovereign.a2a.extensions import (
+        causation_metadata,
+        serialize_chain_for_metadata,
+    )
+
+    frame = CausationFrame(
+        agent_id=agent.did,
+        source="a2a.task_submitted",
+        signal_id="sig-earlier-4001",
+        turn_id="turn-earlier-4001",
+        depth=1,
+        emitted_at=datetime.now(UTC),
+    )
+    return causation_metadata(serialize_chain_for_metadata([frame]))
+
+
+async def _sender_state(agent, task):
+    """The task's state as its sender reads it."""
+    seen = await agent.task_manager.get_task_for_creator(
+        task.id, SENDER, recipient_agent_id=agent.did
+    )
+    return seen.status.state
+
+
+async def _submission_deliveries(agent):
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        DURABLE_COGNITION_CONSUMER_ID,
+    )
+
+    return await agent.dispatcher.list_durable_deliveries(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID
+    )
+
+
+async def _until(agent, predicate, label):
+    """Poll an async predicate; fail with every await chain if it never holds."""
+    deadline = asyncio.get_running_loop().time() + SETTLE_SECONDS
+    while not await predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            pytest.fail(f"{label}\n{_await_chains(agent)}")
+        await asyncio.sleep(0.02)
+
+
+async def _wait_until_queued(agent):
+    while agent._get_lock_manager().active_hold_diagnostics()[0][
+        "blocked_acquirers"
+    ] == 0:
+        await asyncio.sleep(0.01)
+
+
+async def _stop_agent(agent, receipts):
+    request = StopRequest(
+        scope=StopScope.AGENT,
+        actor_id="operator",
+        target=agent.agent_id,
+        target_agent_id=agent.agent_id,
+    )
+    outcomes = await asyncio.wait_for(
+        _authority(agent, receipts).stop(request), SETTLE_SECONDS
+    )
+    return [outcome.disposition for outcome in outcomes]
+
+
+def _gate_resident_drain(agent, monkeypatch):
+    """Hold the resident drainer before its next scan until the event is set."""
+    gate = asyncio.Event()
+    scan = agent.dispatcher._drainable_durable_deliveries
+
+    async def gated(*args, **kwargs):
+        await gate.wait()
+        return await scan(*args, **kwargs)
+
+    monkeypatch.setattr(agent.dispatcher, "_drainable_durable_deliveries", gated)
+    return gate
+
+
 async def test_stopping_a_queued_a2a_wake_cancels_the_task_its_sender_waits_on(
     tmp_path, monkeypatch
 ):
     """The 11-10 Claw shape: Stop cancels a queued turn carrying an inbound A2A
     work order. The task must end where its sender can see it, not stay
     ``submitted`` after its only wake was consumed."""
-    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
-    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
+    from kestrel_sdk.native_a2a.types import TaskState
 
-    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-        DURABLE_COGNITION_CONSUMER_ID,
-    )
-
-    sender = "did:kestrel:sender-4001"
     database, receipts = await _receipt_store(tmp_path)
     try:
         async with booted_agent(
@@ -376,85 +486,27 @@ async def test_stopping_a_queued_a2a_wake_cancels_the_task_its_sender_waits_on(
             parked = await _park_after_begin(agent, monkeypatch)
             first = asyncio.create_task(agent.process_input("one", session_id="s"))
             await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
-            manager = agent.task_manager
-            task = await manager.create_task(
-                SendMessageRequest(
-                    tenant=manager.task_store.scope.tenant,
-                    message=new_text_message(
-                        "Please do this", context_id="context-4001", role=Role.ROLE_USER
-                    ),
-                ),
-                creator_agent_id=sender,
-            )
-            while agent._get_lock_manager().active_hold_diagnostics()[0][
-                "blocked_acquirers"
-            ] == 0:
-                await asyncio.sleep(0.01)
+            task = await _submit_task(agent)
+            await _wait_until_queued(agent)
 
-            request = StopRequest(
-                scope=StopScope.AGENT,
-                actor_id="operator",
-                target=agent.agent_id,
-                target_agent_id=agent.agent_id,
-            )
-            outcomes = await asyncio.wait_for(
-                _authority(agent, receipts).stop(request), SETTLE_SECONDS
-            )
-
-            assert [outcome.disposition for outcome in outcomes] == [
-                StopDisposition.STOPPED
-            ], outcomes
+            assert await _stop_agent(agent, receipts) == [StopDisposition.STOPPED]
             await _settle(agent, (first,), "the stopped turn")
-            seen = await manager.get_task_for_creator(
-                task.id, sender, recipient_agent_id=agent.did
-            )
-            assert seen.status.state == TaskState.TASK_STATE_CANCELED
-            deliveries = await agent.dispatcher.list_durable_deliveries(
-                consumer_id=DURABLE_COGNITION_CONSUMER_ID
-            )
-            assert [d.status for d in deliveries] == ["terminal_ackable"]
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_CANCELED
+            assert [d.status for d in await _submission_deliveries(agent)] == [
+                "terminal_ackable"
+            ]
     finally:
         await database.close()
-
-
-async def test_a_stopped_wake_cancels_only_the_input_it_carried(manager):
-    """A Stop settles the exact input its wake carried. A newer input the
-    sender added meanwhile stays live for its own wake."""
-    from kestrel_sdk.native_a2a.types import TaskState
-
-    from tests.unit.test_a2a_native_input_fencing import followup, owner, snapshot, wake
-    from tests.unit.test_a2a_native_task_manager import request
-
-    task = await manager.create_task(request(), creator_agent_id="did:creator")
-    stale = wake(await snapshot(manager, task), manager)
-    await manager.continue_task(followup(manager, task), creator_agent_id="did:creator")
-    recipient = owner(manager)
-
-    await recipient.settle_stopped_cognition_signal(stale)
-    current = await snapshot(manager, task)
-    assert current.task.status.state == TaskState.TASK_STATE_SUBMITTED
-    assert current.input_revision == 1
-
-    await recipient.settle_stopped_cognition_signal(wake(current, manager))
-    cancelled = await snapshot(manager, task)
-    assert cancelled.task.status.state == TaskState.TASK_STATE_CANCELED
-    assert "Stop cancelled" in cancelled.task.status.message.parts[0].text
 
 
 async def test_a_stop_that_cannot_cancel_the_task_leaves_its_wake_to_retry(
     tmp_path, monkeypatch
 ):
     """When the task cannot be cancelled, the stop is not durably final: the
-    wake is not consumed, so the work still runs, and Stop does not claim the
-    work stopped."""
-    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
-    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
+    wake is released for retry rather than consumed, and Stop does not claim
+    the work stopped. The retry then ends the task where its sender sees it."""
+    from kestrel_sdk.native_a2a.types import TaskState
 
-    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-        DURABLE_COGNITION_CONSUMER_ID,
-    )
-
-    sender = "did:kestrel:sender-4001"
     database, receipts = await _receipt_store(tmp_path)
     try:
         async with booted_agent(
@@ -464,49 +516,202 @@ async def test_a_stop_that_cannot_cancel_the_task_leaves_its_wake_to_retry(
             parked = await _park_after_begin(agent, monkeypatch)
             first = asyncio.create_task(agent.process_input("one", session_id="s"))
             await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
+            task = await _submit_task(agent)
+            await _wait_until_queued(agent)
+            drain = _gate_resident_drain(agent, monkeypatch)
             manager = agent.task_manager
-            task = await manager.create_task(
-                SendMessageRequest(
-                    tenant=manager.task_store.scope.tenant,
-                    message=new_text_message(
-                        "Please do this", context_id="context-4001", role=Role.ROLE_USER
-                    ),
-                ),
-                creator_agent_id=sender,
-            )
-            while agent._get_lock_manager().active_hold_diagnostics()[0][
-                "blocked_acquirers"
-            ] == 0:
-                await asyncio.sleep(0.01)
+            real_cancel = manager.cancel_task
+            failures = {"left": 1}
 
             async def cancel_task(*args, **kwargs):
-                raise OSError("database is locked")
+                if failures["left"]:
+                    failures["left"] -= 1
+                    raise OSError("database is locked")
+                return await real_cancel(*args, **kwargs)
 
             monkeypatch.setattr(manager, "cancel_task", cancel_task)
-            request = StopRequest(
-                scope=StopScope.AGENT,
-                actor_id="operator",
-                target=agent.agent_id,
-                target_agent_id=agent.agent_id,
-            )
-            outcomes = await asyncio.wait_for(
-                _authority(agent, receipts).stop(request), SETTLE_SECONDS
-            )
 
-            assert [outcome.disposition for outcome in outcomes] != [
-                StopDisposition.STOPPED
-            ], outcomes
+            assert await _stop_agent(agent, receipts) != [StopDisposition.STOPPED]
             await _settle(agent, (first,), "the stopped turn")
-            seen = await manager.get_task_for_creator(
-                task.id, sender, recipient_agent_id=agent.did
-            )
-            assert seen.status.state == TaskState.TASK_STATE_SUBMITTED
-            deliveries = await agent.dispatcher.list_durable_deliveries(
-                consumer_id=DURABLE_COGNITION_CONSUMER_ID
-            )
-            assert [d.status for d in deliveries] == ["retry"], deliveries
+            assert failures["left"] == 0
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
+            assert [d.status for d in await _submission_deliveries(agent)] == ["retry"]
+
+            drain.set()
+
+            async def settled():
+                return await _sender_state(agent, task) != TaskState.TASK_STATE_SUBMITTED
+
+            await _until(agent, settled, "the retried wake never ended its task")
+            assert all(d.is_terminal for d in await _submission_deliveries(agent))
     finally:
         await database.close()
+
+
+async def test_a_stop_settled_after_its_dispatch_was_cancelled_still_ends_the_task(
+    tmp_path, monkeypatch
+):
+    """Stop cancels the wake's turn, and its dispatch is itself cancelled before
+    it can settle the delivery. The retained route's cleanup settles it
+    instead, and must end the task with it (round-2 self-review, #4001)."""
+    from contextlib import asynccontextmanager
+
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    async with booted_agent(
+        tmp_path / "agent", name="Recipient", provenance="test:4001-retained", features=set()
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        parked = await _park_after_begin(agent, monkeypatch)
+        renewal = agent.dispatcher._renew_durable_cognition_lease
+        route_finished = asyncio.Event()
+
+        @asynccontextmanager
+        async def renewal_that_outlives_the_route(delivery):
+            async with renewal(delivery) as lost:
+                yield lost
+            route_finished.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            agent.dispatcher,
+            "_renew_durable_cognition_lease",
+            renewal_that_outlives_the_route,
+        )
+        task = await _submit_task(agent)
+        await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
+        handle = agent._a2a_submitted_signal_handles[task.id]
+        assert agent.cancel_current_request(handle.signal_id)
+        await asyncio.wait_for(route_finished.wait(), SETTLE_SECONDS)
+        handle.cancel()
+        await asyncio.gather(handle.task, return_exceptions=True)
+
+        async def settled():
+            deliveries = await _submission_deliveries(agent)
+            return bool(deliveries) and all(d.is_terminal for d in deliveries)
+
+        await _until(agent, settled, "the retained route never settled its delivery")
+        assert await _sender_state(agent, task) == TaskState.TASK_STATE_CANCELED
+
+
+@pytest.mark.parametrize("phase", ["queued", "in_flight"])
+async def test_a_wake_interrupted_by_shutdown_ends_its_task_after_the_restart(
+    tmp_path, monkeypatch, phase
+):
+    """The 11-11 restart route: the host shuts down while an inbound A2A wake
+    is queued behind a parked turn, or is itself running. After the restart
+    its retry is refused, because the tool operation its first attempt opened
+    needs reconciliation (#3999). That refusal must end the task where its
+    sender sees it, not leave it ``submitted`` with no wake left to run it."""
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    home = tmp_path / "agent"
+    queued_turn = None
+    async with booted_agent(
+        home, name="Recipient", provenance="test:4001-restart-route", features=set()
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        parked = await _park_after_begin(agent, monkeypatch)
+        if phase == "queued":
+            queued_turn = asyncio.create_task(agent.process_input("one", session_id="s"))
+            await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
+            task = await _submit_task(agent)
+            await _wait_until_queued(agent)
+        else:
+            task = await _submit_task(agent)
+            await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
+        did = agent.did
+    if queued_turn is not None:
+        # The caller owns its own turn; a host's request teardown cancels it.
+        queued_turn.cancel()
+        await asyncio.gather(queued_turn, return_exceptions=True)
+
+    async with booted_agent(
+        home,
+        name="Recipient",
+        provenance="test:4001-restart-route",
+        features=set(),
+        identity=did,
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+
+        async def ended():
+            return await _sender_state(agent, task) != TaskState.TASK_STATE_SUBMITTED
+
+        await _until(agent, ended, "the restarted agent left the task submitted")
+        assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
+        assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
+
+
+async def test_a_cycle_refused_submission_wake_fails_the_task_its_sender_waits_on(
+    tmp_path, monkeypatch
+):
+    """Round-3 self-review: the dispatcher refuses a submission wake as a cycle
+    before it persists a delivery, so no delivery terminal writer ever sees
+    it, and its producer stops on the TERMINAL admission. The refusal itself
+    must end the task where its sender sees it."""
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    async with booted_agent(
+        tmp_path / "agent", name="Recipient", provenance="test:4001-cycle", features=set()
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        task = await _submit_task(agent, metadata=_looping_causation(agent))
+
+        async def ended():
+            return await _sender_state(agent, task) != TaskState.TASK_STATE_SUBMITTED
+
+        await _until(agent, ended, "the cycle-refused wake left its task submitted")
+        seen = await agent.task_manager.get_task_for_creator(
+            task.id, SENDER, recipient_agent_id=agent.did
+        )
+        assert seen.status.state == TaskState.TASK_STATE_FAILED
+        assert "dropped_cycle" in seen.status.message.parts[0].text
+        assert await _submission_deliveries(agent) == []
+
+
+async def test_a_cycle_refused_wake_left_unsettled_is_settled_by_the_next_boot(
+    tmp_path, monkeypatch
+):
+    """When the refusal cannot settle its task, the wake is left unadmitted, not
+    TERMINAL: its producer keeps retrying, and the next boot's reconciliation
+    rebuilds the same refused wake and settles it then."""
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    home = tmp_path / "agent"
+    async with booted_agent(
+        home, name="Recipient", provenance="test:4001-cycle-boot", features=set()
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        attempts = []
+
+        async def unavailable(**identity):
+            attempts.append(identity["source_event_id"])
+            raise OSError("database is locked")
+
+        monkeypatch.setattr(agent, "settle_undelivered_cognition_wake", unavailable)
+        task = await _submit_task(agent, metadata=_looping_causation(agent))
+
+        async def retried():
+            return len(attempts) >= 2
+
+        await _until(agent, retried, "the unsettled refusal was not retried")
+        assert len(set(attempts)) == 1
+        assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
+        assert await _submission_deliveries(agent) == []
+        did = agent.did
+
+    # The settlement stays patched on that first agent only.
+    async with booted_agent(
+        home,
+        name="Recipient",
+        provenance="test:4001-cycle-boot",
+        features=set(),
+        identity=did,
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
+        assert await _submission_deliveries(agent) == []
 
 
 async def test_a_turn_parked_after_begin_is_stopped_and_the_queued_turn_runs(

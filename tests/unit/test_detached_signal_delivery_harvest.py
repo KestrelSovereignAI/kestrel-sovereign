@@ -266,15 +266,17 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
     "original,mints",
     [
         (None, True),
-        (SimpleNamespace(is_terminal=True), True),
-        (SimpleNamespace(is_terminal=False), False),
+        (SimpleNamespace(is_terminal=True, status="acknowledged"), True),
+        (SimpleNamespace(is_terminal=False, status="leased"), False),
     ],
     ids=["no-original", "original-finished", "original-still-live"],
 )
 async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
     original, mints
 ):
-    """A live submission wake resumes its own work; a second would duplicate it."""
+    """A live submission wake resumes its own work; a second would duplicate it.
+    One that ended without running is settled instead; see
+    ``test_boot_reconcile_ends_a_task_whose_wake_already_failed``."""
 
     agent = _Agent()
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(

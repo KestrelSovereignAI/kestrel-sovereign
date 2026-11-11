@@ -934,6 +934,10 @@ class SignalDispatcher:
         self._retained_durable_cognition_tasks: set[asyncio.Task[SignalResult]] = set()
         self._retained_durable_cognition_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
+        # A failed cognition row whose source work is not settled yet: the
+        # delivery and the cause its task is failed with (#4001). Settling
+        # never replays the committed failed-row CAS.
+        self._failed_cognition_source_debt: dict[str, tuple[DurableDelivery, str]] = {}
         self._cognition_control_terminal_owners: dict[tuple[str, ...], asyncio.Task[None]] = {}
         self._cognition_control_terminal_receipts: dict[tuple[str, ...], weakref.ReferenceType] = {}
         # Channel ingress ACKs after its selected delivery is durable, not
@@ -1316,14 +1320,15 @@ class SignalDispatcher:
                     original_acceptance = _AcceptedSignalOutcome(
                         asyncio.current_task(), _OriginalSignalOutcome._signal_identity(signal), registration)
                     self._accepted_signal_outcomes[original_acceptance] = None
+                resolved_source_event_id = (
+                    source_event_id
+                    if source_event_id is not None
+                    else getattr(signal, "source_event_id", None)
+                )
                 result = await self._run(
                     signal,
                     start,
-                    source_event_id=(
-                        source_event_id
-                        if source_event_id is not None
-                        else getattr(signal, "source_event_id", None)
-                    ),
+                    source_event_id=resolved_source_event_id,
                     durable_admission=staged_admission,
                     durable_delivery_consumer_id=_durable_delivery_consumer_id,
                     durable_terminal_consumer_id=_durable_terminal_consumer_id,
@@ -1359,10 +1364,16 @@ class SignalDispatcher:
                     # this exact signal.  Every other unresolved outcome,
                     # notably persistence failure, leaves the source cursor
                     # unchanged.
+                    terminal = result.status in {
+                        Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE,
+                    }
+                    if terminal and _durable_delivery_consumer_id is not None:
+                        terminal = await self._settle_refused_cognition_source(
+                            signal, result, source_event_id=resolved_source_event_id,
+                        )
                     disposition = (
                         DurableAdmissionDisposition.TERMINAL
-                        if result.status
-                        in {Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE}
+                        if terminal
                         else DurableAdmissionDisposition.NOT_ADMITTED
                     )
                     staged_admission.set_result(
@@ -6086,10 +6097,6 @@ class SignalDispatcher:
             )
             return result
 
-        if isinstance(result, _StoppedCognitionResult):
-            result = await self._settle_stopped_cognition_source(
-                delivery, routing_signal, result, start=start,
-            )
         terminal_persisted = await self._settle_cognition_non_delivery(
             delivery, result, consumer_id=consumer_id, retry_delay=retry_delay,
         )
@@ -6114,42 +6121,63 @@ class SignalDispatcher:
         )
         return result
 
-    async def _settle_stopped_cognition_source(
-        self, delivery, signal, result, *, start,
-    ) -> SignalResult:
-        """End the source's durable work with the wake a Stop consumed (#4001).
+    async def _settle_undelivered_cognition_source(
+        self, *, source: str, target_agent: str, source_event_id: str | None,
+        stopped: bool, cause: str,
+    ) -> None:
+        """End the source work whose durable wake ended without running (#4001).
 
-        A stopped delivery is terminal and never redelivered. A source whose
-        wake carries work the sender is waiting on (an inbound A2A task) must
-        settle that work first, through the agent's own lifecycle. If it
-        cannot, the stop is not durably final: the delivery is released for
-        retry, so the work still runs, and Stop does not report it stopped.
+        A terminal wake is never redelivered. A source whose wake carries
+        work a sender waits on (an inbound A2A task) must settle it through
+        the agent's own lifecycle, or nothing ever will. Every point where a
+        durable cognition wake becomes terminal calls this, named by the
+        wake's durable identity: a refusal before persistence, before it
+        publishes TERMINAL; the terminal-ACKable NACK, before it commits; the
+        failed terminalizer, after it commits. Boot reconciliation settles a
+        task whose wake reached any of them without it.
         """
-        settle = getattr(self._agent, "settle_stopped_cognition_signal", None)
+        settle = getattr(self._agent, "settle_undelivered_cognition_wake", None)
         if not callable(settle):
-            return result
+            return
+        settled = settle(
+            source=source, target_agent=target_agent,
+            source_event_id=source_event_id, stopped=stopped, cause=cause,
+        )
+        if inspect.isawaitable(settled):
+            await settled
+
+    async def _settle_refused_cognition_source(
+        self, signal: Signal, result: SignalResult, *, source_event_id: str | None,
+    ) -> bool:
+        """Settle a durable cognition wake refused before it was persisted.
+
+        A validation or cycle refusal persists no delivery, so no terminal
+        writer ever sees it, and its producer stops retrying on TERMINAL.
+        Returns whether the refusal may be published TERMINAL: an ordinary
+        settlement failure leaves the wake NOT_ADMITTED, so its producer
+        retries the handoff and, with it, the settlement. Native control
+        propagates as this dispatch's admission error.
+        """
         try:
-            await settle(signal)
-        except BaseException as error:
-            if is_tool_execution_terminal_error(error):
-                await self._terminalize_failed_cognition(delivery, error)
-                raise
-            if not isinstance(error, Exception):
+            await self._settle_undelivered_cognition_source(
+                source=signal.source, target_agent=signal.target_agent,
+                source_event_id=source_event_id, stopped=False,
+                cause=result.status.value,
+            )
+        except Exception as error:
+            if (
+                is_tool_execution_terminal_error(error)
+                or execution_commit_outcome(error) is not None
+            ):
                 raise
             logger.exception(
-                "Stopped cognition could not settle its source's work; releasing "
-                "the delivery for retry: delivery=%s",
-                delivery.delivery_id,
+                "Refused cognition could not settle its source's work; "
+                "leaving it unadmitted for retry: signal=%s source=%s",
+                signal.id,
+                signal.source,
             )
-            return self._failure_result(
-                signal,
-                start,
-                error=(
-                    "stopped cognition could not settle its source's work: "
-                    f"{type(error).__name__}: {error}"
-                ),
-            )
-        return result
+            return False
+        return True
 
     @staticmethod
     def _cognition_result_is_terminal(result):
@@ -6171,12 +6199,42 @@ class SignalDispatcher:
             await self._terminalize_failed_cognition(delivery, result._original_error)
             return False
         terminal = self._cognition_result_is_terminal(result)
+        error = result.error or f"Cognition delivery returned {result.status.value}"
+        if terminal:
+            # Settle the wake's source work before the row becomes terminal.
+            # If it cannot, the delivery is not final: it is released for
+            # retry, and a Stop does not report the work stopped.
+            stopped = isinstance(result, _StoppedCognitionResult)
+            try:
+                await self._settle_undelivered_cognition_source(
+                    source=delivery.event.source,
+                    target_agent=delivery.event.target_agent,
+                    source_event_id=delivery.event.source_event_id,
+                    stopped=stopped,
+                    cause="stopped" if stopped else result.status.value,
+                )
+            except BaseException as settlement_error:
+                if is_tool_execution_terminal_error(settlement_error):
+                    await self._terminalize_failed_cognition(delivery, settlement_error)
+                    raise
+                if not isinstance(settlement_error, Exception):
+                    raise
+                logger.exception(
+                    "Undelivered cognition could not settle its source's work; "
+                    "releasing the delivery for retry: delivery=%s",
+                    delivery.delivery_id,
+                )
+                terminal = False
+                error = (
+                    "cognition ended undelivered, but its source's work could "
+                    f"not be settled: {type(settlement_error).__name__}: {settlement_error}"
+                )
         try:
             released = await self.nack_durable_delivery(
                 consumer_id=consumer_id,
                 delivery_id=delivery.delivery_id,
                 lease_token=delivery.lease_token or "",
-                error=result.error or f"Cognition delivery returned {result.status.value}",
+                error=error,
                 retry_delay=retry_delay,
                 terminal=terminal,
                 terminal_ackable=terminal and not reconciliation,
@@ -6192,7 +6250,7 @@ class SignalDispatcher:
                     consumer_id=consumer_id,
                     delivery_id=delivery.delivery_id,
                     lease_token=delivery.lease_token or "",
-                    error=result.error or f"Cognition delivery returned {result.status.value}",
+                    error=error,
                     terminal=terminal,
                     terminal_ackable=terminal and not reconciliation,
                 )
@@ -6418,7 +6476,63 @@ class SignalDispatcher:
     async def _terminalize_failed_cognition(
         self, delivery: DurableDelivery, error: BaseException,
     ) -> None:
-        """Keep irreversible control evidence non-retryable and non-ACKable."""
+        """Keep irreversible control evidence non-retryable and non-ACKable.
+
+        Then settle the source work of the wake that row ended (#4001). Once
+        the failed row has committed, a later call settles only the source:
+        the row's original-token receipt lives as long as the source debt
+        holds its delivery, so the CAS is never written again.
+        """
+        await self._terminalize_failed_cognition_delivery(delivery, error)
+        await self._settle_failed_cognition_source(delivery, error)
+
+    async def _settle_failed_cognition_source(
+        self, delivery: DurableDelivery, error: BaseException,
+    ) -> None:
+        """Settle a failed row's source work, retaining native uncertainty.
+
+        An ordinary failure leaves the task to boot reconciliation, which
+        settles a task whose submission wake failed. A native commit or
+        control outcome is retained as this delivery's control debt, as the
+        failed row's own would be: readiness and owner retirement refuse while
+        it stands, and the drain retries only this settlement.
+        """
+        debts = vars(self).setdefault("_failed_cognition_source_debt", {})
+        debt = debts.get(delivery.delivery_id)
+        if debt is None:
+            return
+        failed, cause = debt
+        try:
+            await self._settle_undelivered_cognition_source(
+                source=failed.event.source,
+                target_agent=failed.event.target_agent,
+                source_event_id=failed.event.source_event_id,
+                stopped=False,
+                cause=cause,
+            )
+        except BaseException as settlement_error:
+            if (
+                is_tool_execution_terminal_error(settlement_error)
+                or execution_commit_outcome(settlement_error) is not None
+            ):
+                self._retain_cognition_native_control(failed, settlement_error)
+                self._rearm_cleanup_runtime_owner_heartbeat()
+                raise execution_observation_error(error, settlement_error)
+            debts.pop(delivery.delivery_id, None)
+            if not isinstance(settlement_error, Exception):
+                raise
+            logger.exception(
+                "Failed cognition could not settle its source's work; boot "
+                "reconciliation settles it: delivery=%s",
+                delivery.delivery_id,
+            )
+            return
+        debts.pop(delivery.delivery_id, None)
+
+    async def _terminalize_failed_cognition_delivery(
+        self, delivery: DurableDelivery, error: BaseException,
+    ) -> None:
+        """Commit the exact-token failed row; the source is settled separately."""
         settlement = self._cognition_claim_settlement.get()
         if (settlement is not None and settlement.delivery is delivery
                 and settlement.receipt is not None and not settlement.retry_pending):
@@ -6555,6 +6669,12 @@ class SignalDispatcher:
         self._discard_transient_durable_handoff(delivery.delivery_id)
         self._durable_store._failed_retry_release_receipts.discard(
             (self._agent.did, delivery.consumer_id, delivery.delivery_id)
+        )
+        # The failed row committed above and stands whatever follows. Its
+        # source work is settled after this CAS, never as part of it (#4001).
+        vars(self).setdefault("_failed_cognition_source_debt", {})[delivery.delivery_id] = (
+            delivery,
+            failure.code if failure is not None else "execution_control_unresolved",
         )
 
     @staticmethod

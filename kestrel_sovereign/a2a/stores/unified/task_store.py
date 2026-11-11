@@ -83,6 +83,12 @@ _TASK_COLUMNS = (
 
 
 _TASK_SCOPE = "recipient_agent_id = ? AND tenant = ?"
+
+# The kind of a submission-wake identity that settles a wake which ended
+# without running (#4001). Bound as the current signal, it fences a write to
+# a task still waiting on that wake: the admitted input AND a live state that
+# only the wake would advance. A task that asked for input meanwhile is left.
+UNDELIVERED_WAKE_SETTLEMENT_KIND = "undelivered_wake_settlement"
 _SNAPSHOT_COLUMNS = (
     _TASK_COLUMNS + ", (SELECT request_json FROM a2a_task_inputs AS native_input "
     "WHERE native_input.task_id = a2a_tasks.id AND native_input.input_revision = a2a_tasks.input_revision), "
@@ -704,10 +710,14 @@ class TaskStore(UnifiedStoreBase):
         revision = payload.get("input_revision")
         if type(revision) is not int or revision < 0:
             raise ValueError("Task mutation requires its admitted input revision")
-        return (
-            " AND input_revision = ? AND cognition_wake_eligible = 1 AND input_wake_eligible = 1",
-            (revision,),
+        predicate = (
+            " AND input_revision = ? AND cognition_wake_eligible = 1 AND input_wake_eligible = 1"
         )
+        if signal.kind == UNDELIVERED_WAKE_SETTLEMENT_KIND:
+            # Checked in the same statement as the write: a worker that moves
+            # the task to input-required after the settler read it wins.
+            predicate += " AND status IN ('submitted', 'working')"
+        return predicate, (revision,)
 
     async def save_recipient_lifecycle(
         self,

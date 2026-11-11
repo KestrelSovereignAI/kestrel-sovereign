@@ -676,6 +676,10 @@ _ALLOWED_DIRECT_BINDS = {
     # A deferred publication runs its synchronous factory, on the same task,
     # under the collector of its chosen destination, or none when headless.
     ("agent/orchestrator_engine.py", "bind_part_collector"),
+    # Settling a wake that ended undelivered binds that wake's own input
+    # identity, built from its durable event, so the task store fences the
+    # write to that input (#4001). No turn is running; nothing is captured.
+    ("agent/event_manager.py", "bind_current_signal"),
 }
 
 
