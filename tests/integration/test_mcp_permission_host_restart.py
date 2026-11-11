@@ -362,6 +362,93 @@ async def exercise_approval_restart(c):
 async def test_old_host_approval_cannot_authorize_a_restarted_host_call(host_campaign):
     await exercise_approval_restart(host_campaign)
 
+
+async def exercise_approval_decision_race(c, first_approved):
+    """Hold real SQLite persistence while competing HTTP decisions enter CAS."""
+    from contextlib import closing
+    import sqlite3
+
+    async with native_host(c.home, c.descriptor, c.environment, c.peer, 1) as host:
+        async with host_client(c, host.state) as client:
+            owner, tool = await configure_mcp(client, c, host.state)
+            await set_permission(client, owner, tool, 'always_ask')
+            call = asyncio.create_task(invoke_marker(client))
+            decisions = []
+            try:
+                pending = await pending_approval(client, call)
+                assert (pending['feature'], pending['tool']) == (owner, tool)
+                database = Path(host.state['agent_database']).resolve(strict=True)
+                assert database.is_relative_to(c.home / 'agent')
+
+                async def snapshot():
+                    nonce = uuid.uuid4().hex
+                    response = await client.get('/api/agents/permission-host/api/security/pending',
+                        headers={'X-Owned-Registry-Observation': nonce})
+                    assert response.status_code == 200, response.text
+                    observed = await observe_registry(c, host.state, nonce)
+                    return observed['approvals'].get(pending['id'])
+
+                expected_claim = dict(status='approved' if first_approved else 'denied', scope='once')
+                with closing(sqlite3.connect(database, timeout=0)) as writer:
+                    writer.execute('BEGIN IMMEDIATE')
+                    try:
+                        first = asyncio.create_task(client.post(
+                            '/api/agents/permission-host/api/security/approve', json={
+                                'approval_id': pending['id'], 'approved': first_approved, 'scope': 'once'}))
+                        decisions.append(first)
+                        async with asyncio.timeout(3):
+                            while await snapshot() != expected_claim:
+                                assert not first.done(), 'First decision escaped its original blocked persistence'
+                                await asyncio.sleep(0)
+                        second = asyncio.create_task(client.post(
+                            '/api/agents/permission-host/api/security/approve', json={
+                                'approval_id': pending['id'], 'approved': not first_approved, 'scope': 'always'}))
+                        decisions.append(second)
+                        # A broken CAS changes the real claim before it blocks
+                        # on SQLite too. Observe that state, then release both
+                        # actual requests; a test timeout is not the oracle.
+                        async with asyncio.timeout(3):
+                            while not second.done() and await snapshot() == expected_claim:
+                                await asyncio.sleep(0)
+                        assert not first.done() and not call.done()
+                        assert await c.peer.witness(None, None) == []
+                    finally:
+                        writer.rollback()
+                first_response, second_response = await asyncio.gather(*decisions)
+                assert first_response.status_code == 200, first_response.text
+                assert first_response.json()['persisted'] is True
+                assert first_response.json()['awaiter_gone'] is False
+                assert second_response.status_code == 404, (
+                    'Concurrent decision replaced the original claimed approval', second_response.text)
+                response = await call
+                assert response.status_code == 200, response.text
+                expected_effects = ['owned-provider-effect'] if first_approved else []
+                assert await c.peer.witness(None, None) == expected_effects
+                audit = (await client.get('/api/agents/permission-host/api/security/audit')).json()['logs']
+                assert [row['decision'] for row in audit
+                    if row['feature'] == owner and row['tool'] == tool] == [
+                        'user_approved' if first_approved else 'user_denied']
+                call = asyncio.create_task(invoke_marker(client))
+                following = await pending_approval(client, call)
+                assert following['id'] != pending['id'], 'Competing decision escaped one-shot scope'
+                assert await c.peer.witness(None, None) == expected_effects
+                denied = await client.post('/api/agents/permission-host/api/security/approve', json={
+                    'approval_id': following['id'], 'approved': False, 'scope': 'once'})
+                assert denied.status_code == 200, denied.text
+                response = await call
+                assert response.status_code == 200, response.text
+                assert await c.peer.witness(None, None) == expected_effects
+            finally:
+                if not call.done():
+                    call.cancel()
+                await asyncio.gather(call, *decisions, return_exceptions=True)
+
+
+@pytest.mark.parametrize('first_approved', [False, True], ids=['deny-first', 'approve-first'])
+async def test_concurrent_host_approval_cannot_replace_original_decision(host_campaign, first_approved):
+    await exercise_approval_decision_race(host_campaign, first_approved)
+
+
 async def test_owned_host_setup_failure_preserves_original_diagnostic(tmp_path):
     home = tmp_path / 'failed-host'
     home.mkdir()

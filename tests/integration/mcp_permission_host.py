@@ -131,12 +131,15 @@ class ObservedHost:
         receipt = self.receipt / (nonce + '.json')
         temporary = receipt.with_suffix('.writing')
         journal = agent.tool_effect_store
+        security = agent.features['SecurityFeature']
         temporary.write_text(json.dumps(dict(pid=os.getpid(), did=agent.did,
             privacy_mode=agent.privacy_mode.value,
             journal_initialized=journal is not None and journal.initialized,
             journal_on_primary=journal is not None and journal.database is agent._raw_storage.db,
             mcp_tools={name: owner for name, owner in agent._tool_to_feature.items()
-                if owner.startswith('mcp:')}, gateway=gateway_snapshot(agent))))
+                if owner.startswith('mcp:')}, gateway=gateway_snapshot(agent),
+            approvals={request.id: dict(status=request.status.value, scope=request.user_decision)
+                for request in security.approval_queue.pending_requests})))
         temporary.replace(receipt)
 
 
