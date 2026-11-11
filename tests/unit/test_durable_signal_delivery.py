@@ -71,7 +71,11 @@ from kestrel_sovereign.signals.sources.channels import (
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
-from tests.utils.virtual_clock import advanceable_loop_clock, await_within_hang_guard
+from tests.utils.virtual_clock import (
+    advanceable_loop_clock,
+    await_within_hang_guard,
+    pinned_loop_clock,
+)
 
 # How long a test waits for work it set in motion before calling it hung. This
 # bounds a deadlock, not the work: a passing run returns as soon as the awaited
@@ -4858,22 +4862,46 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         return None
 
     original_owner_heartbeat = dispatcher_a._durable_store.heartbeat_runtime_owner
-    fenced_heartbeat_times: list[float] = []
+    original_owner_schedule = dispatcher_a._schedule_runtime_owner_heartbeat
+    fenced_heartbeat_times: list[datetime] = []
+    fenced_heartbeat_delays: list[float | None] = []
     repeated_fenced_heartbeat = asyncio.Event()
 
+    def observe_owner_schedule(*, retry=False):
+        if not dispatcher_a.durable_shutdown_owner_fenced:
+            return original_owner_schedule(retry=retry)
+        # Measure the real timer's requested interval in one synchronous
+        # clock domain. A host pause is not a different scheduling policy.
+        with pinned_loop_clock() as clock:
+            original_owner_schedule(retry=retry)
+            timer = dispatcher_a._runtime_owner_heartbeat_timer
+            fenced_heartbeat_delays.append(
+                None if timer is None else timer.when() - clock.time()
+            )
+
     async def observe_owner_heartbeat(**kwargs):
-        await original_owner_heartbeat(**kwargs)
         if dispatcher_a.durable_shutdown_owner_fenced:
-            committed_at = time.monotonic()
+            # Use the store's explicit clock seam, not a claim that a busy
+            # test continuation can observe every callback within 500ms.
+            # These are real committed writes; peer recovery below must read
+            # them. A callback without its original write cannot pass.
+            committed_at = (
+                fenced_heartbeat_times[-1] + dispatcher_a._runtime_owner_stale_after
+                if fenced_heartbeat_times else datetime.now(timezone.utc)
+            )
+            await original_owner_heartbeat(**{**kwargs, "now": committed_at})
             fenced_heartbeat_times.append(committed_at)
             if committed_at - fenced_heartbeat_times[0] >= (
-                2 * dispatcher_a._runtime_owner_stale_after.total_seconds()
+                2 * dispatcher_a._runtime_owner_stale_after
             ):
                 repeated_fenced_heartbeat.set()
+        else:
+            await original_owner_heartbeat(**kwargs)
 
     agent_a.process_input = hostile_turn
     dispatcher_a.renew_durable_delivery_lease = reject_renewal  # type: ignore[method-assign]
     dispatcher_a._durable_store.heartbeat_runtime_owner = observe_owner_heartbeat
+    dispatcher_a._schedule_runtime_owner_heartbeat = observe_owner_schedule
     try:
         await dispatcher_a.register_durable_consumer(consumer)
         await dispatcher_b.register_durable_consumer(consumer)
@@ -4882,14 +4910,20 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
             source_event_id="telegram:update:shutdown-owner-fence",
             consumer_id=consumer.consumer_id,
         )
-        await asyncio.wait_for(started.wait(), timeout=1)
-        assert (await asyncio.wait_for(first.wait(), timeout=1)).status is Status.FAILED
+        await await_within_hang_guard(started.wait(), step="the original hostile cognition starting")
+        assert (await await_within_hang_guard(
+            first.wait(), step="the original cognition lease loss",
+        )).status is Status.FAILED
         leased = (await dispatcher_a.list_durable_deliveries())[0]
 
         # The public shutdown is bounded. It returns with a live ownership
         # fence while the task keeps suppressing cancellation in the process.
-        assert await asyncio.wait_for(dispatcher_a.shutdown_durable_delivery(), timeout=1) is False
-        await asyncio.wait_for(repeated_cancellation.wait(), timeout=1)
+        assert await await_within_hang_guard(
+            dispatcher_a.shutdown_durable_delivery(), step="bounded durable shutdown",
+        ) is False
+        await await_within_hang_guard(
+            repeated_cancellation.wait(), step="the original cognition suppressing repeated cancellation",
+        )
         assert dispatcher_a.durable_shutdown_owner_fenced is True
         owner = await backend_a.fetch_one(
             "SELECT stopped_at FROM durable_signal_runtime_owners WHERE agent_id = ? AND owner_id = ?",
@@ -4897,23 +4931,27 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         )
         assert owner is not None and owner[0] is None
 
-        # Observe committed private fence heartbeats spanning two complete
-        # stale-owner windows before testing recovery. Waiting on the writes,
-        # rather than sleeping for an assumed scheduler cadence, stays
-        # deterministic on a loaded event loop and proves that the timer keeps
-        # the owner live after ordinary durable admission has closed.
-        await asyncio.wait_for(repeated_fenced_heartbeat.wait(), timeout=4)
-        assert all(
-            later - earlier < dispatcher_a._runtime_owner_stale_after.total_seconds()
-            for earlier, later in zip(
-                fenced_heartbeat_times, fenced_heartbeat_times[1:]
-            )
+        # Drive two complete logical stale-owner windows through actual
+        # timer-produced writes. The oracle is the peer's durable recovery
+        # decision, not elapsed wall time between test observations.
+        await await_within_hang_guard(
+            repeated_fenced_heartbeat.wait(), step="committed post-shutdown owner heartbeats",
         )
+        recovery_now = fenced_heartbeat_times[-1]
+        assert recovery_now - fenced_heartbeat_times[0] >= (
+            2 * dispatcher_a._runtime_owner_stale_after
+        )
+        assert fenced_heartbeat_delays
+        assert all(
+            delay is not None
+            and 0 < delay < dispatcher_a._runtime_owner_stale_after.total_seconds()
+            for delay in fenced_heartbeat_delays
+        ), "the original owner heartbeat timer exceeds its stale-owner window"
         assert await dispatcher_b._durable_store.recover_abandoned_leases(
             agent_id=agent_b.did,
             recovering_owner_id=dispatcher_b._durable_delivery_owner,
-            stale_before=datetime.now(timezone.utc)
-            - dispatcher_a._runtime_owner_stale_after,
+            stale_before=recovery_now - dispatcher_a._runtime_owner_stale_after,
+            now=recovery_now,
         ) == 0
 
         # Even after its lease's nominal deadline, a peer cannot reclaim while
@@ -4928,7 +4966,9 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         ) is None
 
         allow_exit.set()
-        await asyncio.wait_for(dispatcher_a.wait_for_durable_shutdown_release(), timeout=1)
+        await await_within_hang_guard(
+            dispatcher_a.wait_for_durable_shutdown_release(), step="the original fenced cognition retiring",
+        )
         assert dispatcher_a.durable_shutdown_owner_fenced is False
         owner = await backend_a.fetch_one(
             "SELECT stopped_at FROM durable_signal_runtime_owners WHERE agent_id = ? AND owner_id = ?",
@@ -4952,6 +4992,7 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
     finally:
         allow_exit.set()
         dispatcher_a._durable_store.heartbeat_runtime_owner = original_owner_heartbeat
+        dispatcher_a._schedule_runtime_owner_heartbeat = original_owner_schedule
         try:
             await dispatcher_a.shutdown_durable_delivery()
             await dispatcher_a.wait_for_durable_shutdown_release()

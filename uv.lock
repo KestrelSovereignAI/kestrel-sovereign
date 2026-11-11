@@ -280,15 +280,15 @@ wheels = [
 
 [[package]]
 name = "anyio"
-version = "4.15.1"
+version = "4.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a9/d2/f4d173e22df740bc37b1db102b386ba719b66e95b0f0d751f556b387e6d2/anyio-4.15.1.tar.gz", hash = "sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94", size = 276966, upload-time = "2026-09-05T10:42:39.44Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a1/98/7e457a3b014976887a050561955c0b76e1e7e2d6e27b78ecef2ef80518f2/anyio-4.16.0.tar.gz", hash = "sha256:59bb03251907983d1603d27c3087ddb1e93299ea2163adcdba37899a4fb12ffb", size = 310971, upload-time = "2026-11-01T11:20:07.282Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/b8/4bd346e22b28902df4d651910f5242c28d84e4a5c2435ca5c3f797ed7e2e/anyio-4.15.1-py3-none-any.whl", hash = "sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101", size = 132079, upload-time = "2026-09-05T10:42:37.923Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/16/7757fb84c819accc7d7e9af5291b261e4abb8627ee040f99e7d35ef2457a/anyio-4.16.0-py3-none-any.whl", hash = "sha256:c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026", size = 134521, upload-time = "2026-11-01T11:20:05.59Z" },
 ]
 
 [[package]]
@@ -3041,7 +3041,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.14.0"
+version = "0.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -3053,9 +3053,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/04/e2/1dba79057e624b3e654ce3767f54fa45204f7e720810a6cee7259a215f89/kestrel_feature_mcp-0.14.0.tar.gz", hash = "sha256:4d9cee1fa40d27f6143298d905852a4a0fb8777bb5bc4069cce8662f3782dc77", size = 1102578, upload-time = "2026-11-07T11:44:22.656Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/18/a1e3b8cd5e7110f98eade2c01d09786b81c4d11ade5cd93efd90049cdd26/kestrel_feature_mcp-0.15.0.tar.gz", hash = "sha256:d8604b135c3143b6c8be6609ac904b9683b3ea4fe813f1331fbf9228ff19021e", size = 1109411, upload-time = "2026-11-10T20:49:35.614Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/90/2c/93f4c9572832b791e5267b2403e79a4a419ffc1e3d82dba124916f8d643f/kestrel_feature_mcp-0.14.0-py3-none-any.whl", hash = "sha256:c6f4d4eb97047470cc4d1e248eec30ad8247f0acb71e8788dcdbd47f7f6fad5b", size = 629040, upload-time = "2026-11-07T11:44:20.644Z" },
+    { url = "https://files.pythonhosted.org/packages/46/c4/f695472852da891ac56f950cc0163afccafff7d7e8653197b9e6fdaece34/kestrel_feature_mcp-0.15.0-py3-none-any.whl", hash = "sha256:9fe6952b5bcd37b45d2dc1b028fe5c54a73aee1db02be8ebbbaac9492d129053", size = 633874, upload-time = "2026-11-10T20:49:33.746Z" },
 ]
 
 [[package]]
@@ -3171,7 +3171,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.64.1"
+version = "0.64.3"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -3387,7 +3387,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.4" },
     { name = "aiosqlite", specifier = ">=0.21.0" },
     { name = "anthropic", specifier = ">=1,<2" },
-    { name = "anyio", specifier = ">=4.7,<5" },
+    { name = "anyio", specifier = ">=4.16.0" },
     { name = "arize-phoenix", marker = "extra == 'phoenix'", specifier = ">=20.23,<21" },
     { name = "asgi-lifespan", marker = "extra == 'test'", specifier = ">=2.1.0" },
     { name = "asyncpg", specifier = ">=0.32.0" },
@@ -3415,7 +3415,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.20,<4" },
     { name = "iniconfig", specifier = "==2.3.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.14.0,<1" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.15.0,<1" },
     { name = "kestrel-llms", extras = ["all"], specifier = ">=0.2.0,<0.3" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },

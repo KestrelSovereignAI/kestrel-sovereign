@@ -16,10 +16,10 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Iterator, TypeVar
+from typing import Any, Iterator, TypeVar
 from unittest.mock import patch
 
 _T = TypeVar("_T")
@@ -27,6 +27,32 @@ _T = TypeVar("_T")
 # Bound for a wait that must finish promptly. Generous, so a GC pause on a
 # loaded xdist worker cannot fail a passing test.
 HANG_GUARD_SECONDS = 30.0
+
+
+@contextmanager
+def observe_asyncio_waits() -> Iterator[
+    list[tuple[frozenset[asyncio.Future[Any]], float | None]]
+]:
+    """Observe exact original waiters/bounds while delegating every real wait.
+
+    A bound is a policy input, not the time a busy test continuation wakes.
+    Observe only concrete builtin collections. Other shapes go unchanged to
+    native validation; copying a one-shot iterable or Future could change its
+    consumption or failure. Observation never changes completion or ownership.
+    """
+    original_wait = asyncio.wait
+    observations = []
+
+    async def recording_wait(
+        fs: Iterable[asyncio.Future[Any]], *, timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ):
+        if type(fs) in {set, frozenset, list, tuple}:
+            observations.append((frozenset(fs), timeout))
+        return await original_wait(fs, timeout=timeout, return_when=return_when)
+
+    with patch.object(asyncio, "wait", recording_wait):
+        yield observations
 
 
 class VirtualClock:

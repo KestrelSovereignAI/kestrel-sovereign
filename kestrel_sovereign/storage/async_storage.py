@@ -352,6 +352,15 @@ class AsyncStorage:
         return self._backend.backend_type if self._backend else "unknown"
 
     @property
+    def native_retirement_owner(self) -> "AsyncStorage | None":
+        """Identify the lifecycle owner without granting database access.
+
+        Shutdown observers must retain the original native close task even
+        when its backend requires no extra close reservation (PostgreSQL).
+        """
+        return self if isinstance(self.db, AsyncDatabase) else None
+
+    @property
     def minimum_close_timeout_s(self) -> float:
         """Minimum time an outer guard must reserve for storage close.
 

@@ -158,11 +158,12 @@ def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
         for raw in dependencies
         if Requirement(raw).name == "kestrel-feature-mcp"
     ]
-    floor = Version("0.14.0")
+    floor = Version("0.15.0")
     _assert_requirement_floor(requirement, floor)
     assert not requirement.specifier.contains("0.11.2")
     assert not requirement.specifier.contains("0.12.0")
     assert not requirement.specifier.contains("0.13.0")
+    assert not requirement.specifier.contains("0.14.1")
     assert requirement.specifier.contains(floor)
     (package,) = [
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
@@ -388,6 +389,27 @@ def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
     ]
     assert locked_metadata == locked_direct
     assert any(package["name"] == "tzdata" for package in _lock()["package"])
+
+
+def test_anyio_requires_native_cancellation_preserving_connection_completion():
+    """Every consumer must receive the real shutdown fix, including installs."""
+    direct = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "anyio"
+    ]
+    assert len(direct) == 1
+    _assert_requirement_floor(direct[0], Version("4.16.0"))
+    assert Version("4.15.1") not in direct[0].specifier
+    assert Version("4.16.0") in direct[0].specifier
+    assert Version("4.17.0") in direct[0].specifier
+    root = _locked_root_package(_lock())
+    assert [
+        requirement
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "anyio"
+    ] == [{"name": "anyio", "specifier": ">=4.16.0"}]
+    _assert_locked_floors({"anyio": "4.16.0"})
 
 
 def test_asyncpg_runtime_probe_supports_current_minor_releases():
