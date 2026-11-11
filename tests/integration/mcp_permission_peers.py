@@ -51,33 +51,9 @@ class MCPTestPeer:
 
 async def retire_original_gateway_process(pid, wait, exited):
     """Retire one actual admitted session; native and orphan waiters stay original."""
-    import signal
-    from kestrel_sovereign._async_ownership import await_owned_operation, raise_owned_outcome
+    from tests.integration.mcp_gateway_custody import OriginalGatewayGroup
 
-    async def join():
-        raise_owned_outcome(await await_owned_operation(asyncio.to_thread(wait, 5)),
-            operation='original native Gateway retirement')
-
-    def signal_original_group(value):
-        try:
-            assert os.getpgid(pid) == pid
-            os.killpg(pid, value)
-        except ProcessLookupError:
-            # A zombie may no longer have a process group. Its original wait
-            # still has to reap/join it; a missing group is not that receipt.
-            pass
-
-    async def force_if_live():
-        if not exited():
-            signal_original_group(signal.SIGKILL)
-            await join()
-
-    if exited():
-        return
-    async with AsyncExitStack() as retirement:
-        retirement.push_async_callback(force_if_live)
-        signal_original_group(signal.SIGTERM)
-        await join()
+    await OriginalGatewayGroup(pid, wait, exited).retire()
 
 
 @asynccontextmanager
@@ -89,6 +65,7 @@ async def owned_gateway_network(monkeypatch, peer, settings):
     import hashlib
     import psutil
     import re
+    from tests.integration.mcp_gateway_custody import OriginalGatewayGroup
 
     home = Path(settings['home']).resolve(strict=True)
     plugin = Path(settings['plugin']).resolve(strict=True)
@@ -155,6 +132,8 @@ async def owned_gateway_network(monkeypatch, peer, settings):
                     intent.replace(receipt)
             super().__init__(arguments, *args, **kwargs)
             if gateway:
+                self._owned_gateway_group = OriginalGatewayGroup(self.pid, self.wait,
+                    lambda: self.poll() is not None)
                 accepted.append((self, port))
                 if admission is not None:
                     admission.update(pid=self.pid, created=psutil.Process(self.pid).create_time())
@@ -163,8 +142,7 @@ async def owned_gateway_network(monkeypatch, peer, settings):
                     temporary.replace(receipt)
 
     async def retire(process):
-        await retire_original_gateway_process(process.pid, process.wait,
-            lambda: process.poll() is not None)
+        await process._owned_gateway_group.retire()
 
     with monkeypatch.context() as ownership:
         ownership.setattr(subprocess, 'Popen', OwnedGatewayPopen)
@@ -177,13 +155,13 @@ async def owned_gateway_network(monkeypatch, peer, settings):
                 async with AsyncExitStack() as cleanup:
                     for process, _port in accepted:
                         cleanup.push_async_callback(retire, process)
-                    assert all(process.poll() is not None for process, _port in accepted), (
-                        'Core host shutdown left an original native Gateway process alive')
+                    assert all(process._owned_gateway_group.retired() for process, _port in accepted), (
+                        'Core host shutdown left an original native Gateway group alive')
             finally:
                 if settings.get('reconciliation_receipt') is not None:
                     Path(settings['reconciliation_receipt']).write_text(json.dumps(dict(
                         original_processes=len(accepted),
-                        all_retired=all(process.poll() is not None for process, _port in accepted))))
+                        all_retired=all(process._owned_gateway_group.retired() for process, _port in accepted))))
 
 
 @contextmanager
@@ -400,7 +378,9 @@ class GatewayTestPeer(MCPTestPeer):
                 (snapshot['profile'],)).fetchone() == (snapshot['profile'],), (
                 'Native CLI profile receipt is missing before host shutdown')
         key = host_pid, original.pid, snapshot['profile']
+        from tests.integration.mcp_gateway_custody import OriginalGatewayGroup
         self.host_observations.setdefault(key, dict(process=original,
+            group=OriginalGatewayGroup(original.pid, original.wait, lambda: not original.is_running()),
             profile=snapshot['profile'], configuration=configuration, database=database))
 
     def read_host_admissions(self, host, directory):
@@ -425,17 +405,14 @@ class GatewayTestPeer(MCPTestPeer):
         import psutil
 
         def matches(process):
-            return (process.create_time() >= record['host_created']
-                and '--profile=' + record['profile'] in process.cmdline()
-                and str(Path(process.exe()).resolve()) in record['executables']
-                and os.getpgid(process.pid) == process.pid)
+            return self.admitted_profile_group(record, process) == process.pid
 
         if 'pid' in record:
             try:
                 original = psutil.Process(record['pid'])
+                assert original.create_time() == record['created'], 'Original native Gateway PID was reused'
             except psutil.NoSuchProcess:
                 return []
-            assert original.create_time() == record['created'], 'Original native Gateway PID was reused'
             try:
                 if original.status() != psutil.STATUS_ZOMBIE:
                     assert matches(original), 'Original native Gateway admission no longer matches its receipt'
@@ -460,16 +437,55 @@ class GatewayTestPeer(MCPTestPeer):
         assert len(found) <= 1, 'Native launch intent has multiple original process candidates'
         return found
 
+    def admitted_profile_group(self, record, process):
+        """Attest a current member of the private original native session."""
+        if (process.create_time() < record.get('created', record['host_created'])
+                or '--profile=' + record['profile'] not in process.cmdline()
+                or str(Path(process.exe()).resolve()) not in record['executables']):
+            return None
+        group = os.getpgid(process.pid)
+        return group if os.getsid(process.pid) == group else None
+
+    def admitted_groups(self, record):
+        """Retain the group even if its original leader has already been reaped."""
+        import psutil
+        from tests.integration.mcp_gateway_custody import OriginalGatewayGroup
+
+        originals = self.admitted_processes(record)
+        if originals:
+            return [OriginalGatewayGroup(original.pid, original.wait,
+                lambda original=original: not original.is_running()) for original in originals]
+        group = None
+        if 'pid' in record:
+            # Original absence was observed above; this does not retire its
+            # private group or authorize adopting a later PID reuse.
+            group = OriginalGatewayGroup(record['pid'], None, lambda: True)
+            if not group.group_alive():
+                return []
+        members = {}
+        for candidate in psutil.process_iter():
+            try:
+                admitted = self.admitted_profile_group(record, candidate)
+                if admitted is not None and ('pid' not in record or admitted == record['pid']):
+                    members.setdefault(admitted, candidate)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+                continue  # Missing observations never grant group authority.
+        assert len(members) == 1, 'Original native Gateway group custody is unresolved; retain profile and configuration'
+        if group is not None:
+            assert group.pid in members
+            return [group]
+        identifier, original = next(iter(members.items()))
+        return [OriginalGatewayGroup(identifier, original.wait, lambda: not original.is_running())]
+
     async def reconcile_host_gateways(self, host, directory):
         import sqlite3
 
         records = self.read_host_admissions(host, directory)
 
         async def reconcile(record):
-            for original in self.admitted_processes(record):
-                await retire_original_gateway_process(original.pid, original.wait,
-                    lambda: not original.is_running())
-            assert not self.admitted_processes(record), 'Original native Gateway is still alive'
+            for group in self.admitted_groups(record):
+                await group.retire()
+                assert group.retired(), 'Original native Gateway group is still alive'
             assert await self.containers() == [], 'Retain native profile until its owned peers retire'
             database = self.gateway_home / '.docker/mcp/mcp-toolkit.db'
             with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
@@ -491,8 +507,8 @@ class GatewayTestPeer(MCPTestPeer):
         for (owner_pid, _pid, _profile), record in self.host_observations.items():
             if owner_pid != host_pid:
                 continue
-            assert not record['process'].is_running(), (
-                'Core host acknowledged shutdown with its original native Gateway alive')
+            assert record['group'].retired(), (
+                'Core host acknowledged shutdown with its original native Gateway group alive')
             assert not record['configuration'].exists(), (
                 'Core host shutdown retained its acknowledged private Gateway configuration')
             with sqlite3.connect(record['database'].as_uri() + '?mode=ro', uri=True) as connection:
