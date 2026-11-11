@@ -31,6 +31,8 @@ from kestrel_sdk.signals import (
 from kestrel_sovereign.agent.invocation import InvocationCancelledError
 from kestrel_sovereign.await_chain import format_await_chain
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+from kestrel_sovereign.signals.context import get_current_signal
+from kestrel_sovereign.signals.sources.a2a import SOURCE_NAME as COMPLETION_WAKE
 from kestrel_sovereign.stop import StopCleanupRegistry
 from kestrel_sovereign.stop.authority import CancellationAuthority
 from kestrel_sovereign.stop.receipt import StopReceiptStore
@@ -63,6 +65,22 @@ def _script_replies(agent, monkeypatch, generate=None):
     monkeypatch.setattr(
         agent.llm_service, "stream_with_tool_detection", stream_with_tool_detection
     )
+
+
+def _woken_by(sources):
+    """A scripted model that records the source of the wake whose turn called it.
+
+    Ending a task gives its agent an ``a2a.task_complete`` wake, and that
+    wake's turn calls the model. A test that a failed submission wake ran no
+    cognition must tell those calls apart from the ones it rules out.
+    """
+
+    async def generate(kwargs):
+        signal = get_current_signal()
+        sources.append(None if signal is None else signal.source)
+        return LLMResponse(content=REPLY)
+
+    return generate
 
 
 def _await_chains(agent) -> str:
@@ -463,6 +481,7 @@ async def test_a_wake_interrupted_by_shutdown_ends_its_task_after_the_restart(
         await _until(agent, ended, "the restarted agent left the task submitted")
         assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
         assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
+        await _until_completion_wake_settled(agent)
 
 
 _SETTLEMENT_FAULT = "inject_4001_task_settlement_fault"
@@ -550,6 +569,7 @@ async def test_a_failed_wake_whose_task_write_failed_is_settled_without_a_restar
             assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
             assert await agent.dispatcher.owed_cognition_wake_settlements() == []
             assert agent.dispatcher.unresolved_cognition_control == ()
+            await _until_completion_wake_settled(agent)
     finally:
         fault.close()
 
@@ -637,17 +657,13 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
         "runtime_owner_stale_after",
         timedelta(seconds=0.6),
     )
-    model_calls = []
-
-    async def no_cognition(kwargs):
-        model_calls.append(kwargs)
-        return LLMResponse(content=REPLY)
+    woken_by = []
 
     try:
         async with booted_agent(
             home, name="Recipient", provenance=provenance, features=set(), identity=did
         ) as agent:
-            _script_replies(agent, monkeypatch, no_cognition)
+            _script_replies(agent, monkeypatch, _woken_by(woken_by))
 
             async def retried_against_the_fault():
                 return len(settlements) >= 3
@@ -671,7 +687,8 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
             assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
             assert await agent.dispatcher.owed_cognition_wake_settlements() == []
             assert failed_row_writes == []
-            assert model_calls == []
+            await _until_completion_wake_settled(agent)
+            assert set(woken_by) <= {COMPLETION_WAKE}
     finally:
         fault.close()
 
@@ -746,16 +763,12 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
         "runtime_owner_stale_after",
         timedelta(seconds=0.6),
     )
-    model_calls = []
-
-    async def no_cognition(kwargs):
-        model_calls.append(kwargs)
-        return LLMResponse(content=REPLY)
+    woken_by = []
 
     async with booted_agent(
         home, name="Recipient", provenance=provenance, features=set(), identity=did
     ) as agent:
-        _script_replies(agent, monkeypatch, no_cognition)
+        _script_replies(agent, monkeypatch, _woken_by(woken_by))
 
         async def lost_the_race():
             return bool(raced) and [d.status for d in await _submission_deliveries(agent)] == [
@@ -778,7 +791,8 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
         # The row was written once, by the refused retry; the heartbeat wrote
         # only the task.
         assert len(failed_row_writes) == 1
-        assert model_calls == []
+        await _until_completion_wake_settled(agent)
+        assert set(woken_by) <= {COMPLETION_WAKE}
 
 
 async def test_a_cycle_refused_submission_wake_fails_the_task_its_sender_waits_on(
@@ -811,6 +825,7 @@ async def test_a_cycle_refused_submission_wake_fails_the_task_its_sender_waits_o
         assert refused.event.caller_identity is None
         assert refused.event.causation_chain == []
         assert await agent.dispatcher.owed_cognition_wake_settlements() == []
+        await _until_completion_wake_settled(agent)
 
 
 async def test_a_cycle_refused_wake_whose_settlement_fails_is_settled_by_the_heartbeat(
@@ -868,6 +883,7 @@ async def test_a_cycle_refused_wake_whose_settlement_fails_is_settled_by_the_hea
         await _until(agent, ended, "the refused wake's task was left submitted")
         assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
         assert await agent.dispatcher.owed_cognition_wake_settlements() == []
+        await _until_completion_wake_settled(agent)
 
 
 async def test_a_turn_parked_after_begin_is_stopped_and_the_queued_turn_runs(
@@ -1017,7 +1033,7 @@ async def test_a_scheduled_tool_holding_the_memory_lock_before_its_body_is_stopp
     lock and its tool parks before the body runs. Stop cancels it, the memory
     lock is released, and the body never runs."""
     import json
-    from datetime import datetime, timedelta, timezone
+    from datetime import UTC, datetime, timedelta
 
     from kestrel_sovereign.features.base import Feature, tool
     from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
@@ -1070,7 +1086,7 @@ async def test_a_scheduled_tool_holding_the_memory_lock_before_its_body_is_stopp
     runner = SchedulerRunner(database, owner.did, execute, owner_id="scheduler-4001")
     try:
         await runner._ensure_tables()
-        due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        due = (datetime.now(UTC) - timedelta(seconds=2)).isoformat()
         await database.execute(
             """INSERT INTO scheduled_tasks
             (id,agent_id,task_name,cron_expression,args_json,enabled,next_run_at,
