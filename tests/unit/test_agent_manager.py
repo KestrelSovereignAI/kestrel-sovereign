@@ -13153,13 +13153,13 @@ class TestLoadFromConfig:
     async def test_batch_ready_hook_is_bounded_by_signed_deadline(self, tmp_path):
         parent_did = "did:test:batch-deadline-parent"
         child_did = "did:test:batch-deadline-child"
+        # The signed lifetime is spent from inside the ready hook on a pinned
+        # loop clock. A near-expiry wall-clock receipt instead let a loaded
+        # xdist worker use it up during onboarding, one stage early.
         parent, mandate = _signed_restored_mandate(
             parent_did,
             child_did,
-            ttl_seconds=2,
-            created_at=(
-                datetime.now(timezone.utc) - timedelta(seconds=1.4)
-            ).isoformat(),
+            ttl_seconds=_WALL_CLOCK_MANDATE_TTL,
         )
         child = _make_mock_agent(child_did)
         child._persisted_spawn_mandate = mandate
@@ -13172,7 +13172,9 @@ class TestLoadFromConfig:
         wake_effects: list[str] = []
 
         async def wake_after_expiry(_agent):
-            await asyncio.sleep(1.0)
+            # The signed lifetime ends while the ready hook is still running.
+            clock.advance(_PINNED_SIGNED_LIFETIME)
+            await asyncio.Event().wait()
             wake_effects.append("dispatched")
 
         manager._run_hosted_agent_ready_hooks = AsyncMock(
@@ -13187,11 +13189,18 @@ class TestLoadFromConfig:
             }
         )
 
-        with patch(
-            "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
-            return_value=0.5,
+        with (
+            pinned_loop_clock() as clock,
+            patch(
+                "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+                return_value=_PINNED_SIGNED_LIFETIME,
+            ),
         ):
-            assert await manager.load_from_config(config) == 0
+            loaded = await await_within_hang_guard(
+                manager.load_from_config(config),
+                step="batch load past the signed readiness deadline",
+            )
+        assert loaded == 0
         assert wake_effects == []
         assert manager.get_agent("BatchDeadlineChild") is None
         assert manager.get_children(parent_did) == []

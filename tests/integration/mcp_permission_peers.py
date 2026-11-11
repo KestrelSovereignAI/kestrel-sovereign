@@ -569,14 +569,23 @@ class GatewayTestPeer(MCPTestPeer):
         return await self._container_inventory()
 
     async def _container_inventory(self):
+        from docker.errors import NotFound
+
         # The unique fixture volume and immutable image identify our peers
         # across real host processes. CLI name labels are descriptive only.
         volume = await asyncio.to_thread(self.client.volumes.get, self.volume)
         assert volume.attrs['Labels']['kestrel.mcp.permission.owner'] == self.owner
-        containers = await asyncio.to_thread(self.client.containers.list, all=True,
-            filters={'volume': self.volume})
-        for container in containers:
-            await asyncio.to_thread(container.reload)
+        # Listing and inspecting are separate daemon reads. A peer that is
+        # removed between them (a retiring Gateway's own container) is absent
+        # from the inventory, not a failure to read it.
+        listed = await asyncio.to_thread(self.client.containers.list, all=True,
+            filters={'volume': self.volume}, ignore_removed=True)
+        containers = []
+        for container in listed:
+            try:
+                await asyncio.to_thread(container.reload)
+            except NotFound:
+                continue
             labels = container.attrs['Config']['Labels']
             if labels.get('kestrel.mcp.permission.owner') == self.owner:
                 # A failed removal can retain our own read-only witness reader.
@@ -591,6 +600,7 @@ class GatewayTestPeer(MCPTestPeer):
             assert container.attrs['HostConfig']['NetworkMode'] == 'none'
             assert any(mount['Name'] == self.volume and mount['Destination'] == '/tmp'
                        for mount in container.attrs['Mounts'] if mount['Type'] == 'volume')
+            containers.append(container)
         return containers
 
 
