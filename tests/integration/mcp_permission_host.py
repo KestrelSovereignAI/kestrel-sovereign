@@ -1,5 +1,6 @@
 """Launch the real Core app over one private, process-owned HTTP listener."""
 
+from contextlib import AsyncExitStack
 import argparse
 import asyncio
 import faulthandler
@@ -15,8 +16,20 @@ import pytest
 import uvicorn
 
 from tests.integration.mcp_permission_peers import (
-    MCPTestPeer, owned_https_network, owned_provider_network,
+    MCPTestPeer, owned_https_network, owned_provider_network, owned_gateway_network,
 )
+
+
+def gateway_snapshot(agent):
+    """Observe an actual MCP feature's original native process and profile."""
+    feature = agent.features.get('MCPAgent')
+    manager = getattr(feature, 'gateway_manager', None)
+    gateway = getattr(manager, 'gateway', None)
+    if gateway is None or gateway.process is None:
+        return None
+    assert gateway.process.poll() is None
+    return dict(pid=gateway.process.pid, profile=gateway._profile_id,
+        configuration=str(gateway._config_directory), servers=list(gateway.requested_servers))
 
 
 class ObservedHost:
@@ -91,8 +104,8 @@ class ObservedHost:
             privacy_mode=agent.privacy_mode.value,
             journal_initialized=journal is not None and journal.initialized,
             journal_on_primary=journal is not None and journal.database is agent._raw_storage.db,
-            remote_tools={name: owner for name, owner in agent._tool_to_feature.items()
-                if owner.startswith('mcp:remote:')})))
+            mcp_tools={name: owner for name, owner in agent._tool_to_feature.items()
+                if owner.startswith('mcp:')}, gateway=gateway_snapshot(agent))))
         temporary.replace(receipt)
 
 
@@ -117,64 +130,65 @@ async def serve(descriptor, ready):
         from kestrel_sovereign import server
         from kestrel_sovereign.agent.boot import BootPhaseState
 
-        peer = MCPTestPeer('remote', spec['selector'], provider_url=spec['provider_url'],
+        peer = MCPTestPeer(spec.get('transport', 'remote'), spec['selector'], provider_url=spec['provider_url'],
             tls_certificate=Path(spec['certificate']))
         with pytest.MonkeyPatch.context() as network:
-            with owned_https_network(network, peer), owned_provider_network(network, peer):
-                observations = home / 'observations'
-                observations.mkdir(exist_ok=True)
-                observed = ObservedHost(server.app, spec['agent_name'], observations)
-                runtime = uvicorn.Server(uvicorn.Config(observed,
-                    host='127.0.0.1', port=port, access_log=False,
-                    timeout_graceful_shutdown=5, log_config=None))
-                serving = asyncio.create_task(runtime.serve(sockets=[listener]))
-                try:
-                    async with asyncio.timeout(30):
-                        while not runtime.started:
-                            if serving.done():
-                                await serving
-                                raise RuntimeError('Owned native host failed before readiness')
-                            await asyncio.sleep(0.01)
-                    agent = server.app.state.agent_manager.get_agent(spec['agent_name'])
-                    assert agent is not None and agent._boot_state is BootPhaseState.READY
-                    assert not agent._safe_mode
-                    from kestrel_sovereign import kestrel_agent as agent_module
+            async with owned_gateway_network(network, peer, spec.get('gateway')) as gateway:
+                with owned_https_network(network, peer, gateway=gateway), owned_provider_network(network, peer, gateway=gateway):
+                    observations = home / 'observations'
+                    observations.mkdir(exist_ok=True)
+                    observed = ObservedHost(server.app, spec['agent_name'], observations)
+                    runtime = uvicorn.Server(uvicorn.Config(observed,
+                        host='127.0.0.1', port=port, access_log=False,
+                        timeout_graceful_shutdown=5, log_config=None))
+                    serving = asyncio.create_task(runtime.serve(sockets=[listener]))
+                    try:
+                        async with asyncio.timeout(30):
+                            while not runtime.started:
+                                if serving.done():
+                                    await serving
+                                    raise RuntimeError('Owned native host failed before readiness')
+                                await asyncio.sleep(0.01)
+                        agent = server.app.state.agent_manager.get_agent(spec['agent_name'])
+                        assert agent is not None and agent._boot_state is BootPhaseState.READY
+                        assert not agent._safe_mode
+                        from kestrel_sovereign import kestrel_agent as agent_module
 
-                    prefix_floor = max(float(agent_module.SHUTDOWN_TIMEOUT),
-                        agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S)
-                    if 'KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S' in os.environ:
-                        from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
-                        from kestrel_sovereign.multi_agent import agent_manager
+                        prefix_floor = max(float(agent_module.SHUTDOWN_TIMEOUT),
+                            agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S)
+                        if 'KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S' in os.environ:
+                            from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
+                            from kestrel_sovereign.multi_agent import agent_manager
 
-                        reserve_native_shutdown_budget(agent, network,
-                            lifecycle_module=agent_manager)
-                    close_budget = agent._raw_storage.db.backend.minimum_close_timeout_s
-                    tail = agent._durable_tail_minimum_budget(
-                        close_budget,
-                        agent_module._minimum_storage_potential_preclose_timeout(agent.storage))
-                    prefix, reserved = agent_module._resolve_shutdown_budget(tail)
-                    journal = getattr(agent, 'tool_effect_store', None)
-                    if agent.privacy_config.allows_persistent_storage():
-                        assert journal is not None, 'Owned host did not initialize its tool effect journal'
-                        assert journal.initialized, 'Owned host published readiness before journal initialization'
-                        assert journal.database is agent._raw_storage.db
-                    else:
-                        assert journal is None, 'Volatile boot opened durable journal metadata'
-                    temporary = ready.with_suffix('.starting')
-                    temporary.write_text(json.dumps(dict(port=port, pid=os.getpid(),
-                        did=agent.did, server_source=server.__file__,
-                        sqlite_close_timeout_s=close_budget,
-                        shutdown_prefix_floor_s=prefix_floor,
-                        shutdown_prefix_s=prefix, shutdown_tail_s=reserved,
-                        agent_shutdown_timeout_s=agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S,
-                        journal_initialized=journal is not None and journal.initialized,
-                        agent_database=str(agent.storage_path))))
-                    temporary.replace(ready)
-                    await serving
-                finally:
-                    if not serving.done():
-                        runtime.should_exit = True
-                        await asyncio.wait_for(serving, 30)
+                            reserve_native_shutdown_budget(agent, network,
+                                lifecycle_module=agent_manager)
+                        close_budget = agent._raw_storage.db.backend.minimum_close_timeout_s
+                        tail = agent._durable_tail_minimum_budget(
+                            close_budget,
+                            agent_module._minimum_storage_potential_preclose_timeout(agent.storage))
+                        prefix, reserved = agent_module._resolve_shutdown_budget(tail)
+                        journal = getattr(agent, 'tool_effect_store', None)
+                        if agent.privacy_config.allows_persistent_storage():
+                            assert journal is not None, 'Owned host did not initialize its tool effect journal'
+                            assert journal.initialized, 'Owned host published readiness before journal initialization'
+                            assert journal.database is agent._raw_storage.db
+                        else:
+                            assert journal is None, 'Volatile boot opened durable journal metadata'
+                        temporary = ready.with_suffix('.starting')
+                        temporary.write_text(json.dumps(dict(port=port, pid=os.getpid(),
+                            did=agent.did, server_source=server.__file__,
+                            sqlite_close_timeout_s=close_budget,
+                            shutdown_prefix_floor_s=prefix_floor,
+                            shutdown_prefix_s=prefix, shutdown_tail_s=reserved,
+                            agent_shutdown_timeout_s=agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S,
+                            journal_initialized=journal is not None and journal.initialized,
+                            agent_database=str(agent.storage_path), gateway=gateway_snapshot(agent))))
+                        temporary.replace(ready)
+                        await serving
+                    finally:
+                        if not serving.done():
+                            runtime.should_exit = True
+                            await asyncio.wait_for(serving, 30)
 
 
 def main():

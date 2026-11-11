@@ -4,7 +4,7 @@ import json
 import uuid
 
 from tests.integration.test_mcp_permission_host_restart import (
-    configure_remote, host_campaign as host_campaign, host_client, native_host,
+    configure_mcp, host_campaign as host_campaign, host_client, native_host,
     observe_registry,
     pytestmark as pytestmark, set_permission,
 )
@@ -20,7 +20,7 @@ async def test_restarted_host_does_not_replay_a_lost_remote_effect(host_campaign
     path = '/api/agents/permission-host/api/agent/invoke'
     async with native_host(c.home, c.descriptor, c.environment, c.peer, 1) as first:
         async with host_client(c, first.state) as client:
-            owner, tool = await configure_remote(client, c, first.state)
+            owner, tool = await configure_mcp(client, c, first.state)
             await set_permission(client, owner, tool, 'allow')
             original = await client.post(path, json=payload)
             assert await c.peer.witness(None, None) == ['owned-provider-effect']
@@ -36,7 +36,7 @@ async def test_restarted_host_does_not_replay_a_lost_remote_effect(host_campaign
                 headers={'X-Owned-Registry-Observation': nonce})
             assert permissions.status_code == 200, permissions.text
             observed = await observe_registry(c, second.state, nonce)
-            assert observed['remote_tools'] == {tool: owner}
+            assert observed['mcp_tools'] == {tool: owner}
             remote, = [entry for entry in permissions.json()['tree']
                 if entry['name'] == owner]
             restored, = [entry for entry in remote['tools']
