@@ -4,8 +4,10 @@ from contextlib import AsyncExitStack
 import argparse
 import asyncio
 import faulthandler
+import functools
 import json
 import logging
+import math
 import re
 from pathlib import Path
 import socket
@@ -35,19 +37,30 @@ def gateway_snapshot(agent):
 class ObservedHost:
     """Record actual registry state after requests; never change app behavior."""
     def __init__(self, app, agent_name, receipt, *, shutdown_trace_interval=1.0):
+        if not math.isfinite(shutdown_trace_interval) or shutdown_trace_interval <= 0:
+            raise ValueError('Shutdown observation interval must be finite and positive')
         self.app, self.agent_name, self.receipt = app, agent_name, receipt
         self.shutdown_trace_interval = shutdown_trace_interval
 
     async def __call__(self, scope, receive, send):
         if scope['type'] == 'lifespan':
             pending_snapshot = None
+            interval = self.shutdown_trace_interval
+
+            def snapshot():
+                nonlocal pending_snapshot, interval
+                self.record_shutdown_tasks()
+                # A single early snapshot misses a later SQLite/native close.
+                # Back off while preserving the original lifecycle deadline.
+                interval *= 2
+                pending_snapshot = asyncio.get_running_loop().call_later(interval, snapshot)
 
             async def observe_lifespan():
                 nonlocal pending_snapshot
                 event = await receive()
                 if event['type'] == 'lifespan.shutdown':
                     pending_snapshot = asyncio.get_running_loop().call_later(
-                        self.shutdown_trace_interval, self.record_shutdown_tasks)
+                        interval, snapshot)
                 return event
 
             try:
@@ -69,8 +82,9 @@ class ObservedHost:
         self.record_registry(nonce)
 
     def record_shutdown_tasks(self):
-        """Report original awaits without observing locals or changing owners."""
+        """Report original awaits and worker metadata without changing owners."""
         logger = logging.getLogger(__name__)
+        logger.warning('Owned shutdown snapshot')
         # Capture normal Python frame references while holding the interpreter
         # lock. The process-wide crash timer belongs to pytest/the launcher;
         # an individual lifespan observer must not replace or cancel it.
@@ -79,8 +93,25 @@ class ObservedHost:
             for thread_id, frame in frames.items():
                 logger.warning('Owned shutdown thread: %s', thread_id)
                 traceback.print_stack(frame, file=sys.stderr)
+                worker = frame
+                while worker is not None:
+                    if (worker.f_globals.get('__name__') == 'aiosqlite.core'
+                            and worker.f_code.co_name == '_connection_worker_thread'):
+                        # Observe only the current function and completion bits,
+                        # never SQL, parameters, results, or Future.exception().
+                        function = worker.f_locals.get('function')
+                        if isinstance(function, functools.partial):
+                            function = function.func
+                        future = worker.f_locals.get('future')
+                        logger.warning(
+                            'Owned shutdown SQLite worker: thread=%s function=%s '
+                            'future_done=%s future_cancelled=%s', thread_id,
+                            getattr(function, '__qualname__', type(function).__name__),
+                            future.done() if future is not None else None,
+                            future.cancelled() if future is not None else None)
+                    worker = worker.f_back
         finally:
-            del frames, frame
+            del frames, frame, worker
         for task in asyncio.all_tasks():
             logger.warning('Owned shutdown pending task: %s', task.get_name())
             task.print_stack(file=sys.stderr)
