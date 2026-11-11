@@ -38,26 +38,10 @@ async def test_native_sigterm_runs_gateway_reconciliation_before_signal_replay(h
 
 async def test_cancelled_witness_reader_joins_before_volume_inventory(tmp_path, monkeypatch):
     import asyncio
-    import threading
-    from tests.integration.mcp_permission_peers import gateway_peer
+    from tests.integration.mcp_permission_peers import gateway_peer, hold_owned_witness_removal
 
     async with gateway_peer(tmp_path, monkeypatch) as peer:
-        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
-        original = peer.client.api.remove_container
-
-        def delayed_remove(container, *args, **kwargs):
-            owned = peer.client.containers.get(container)
-            assert owned.attrs['Image'] == peer.image_id
-            assert owned.attrs['Config']['Labels']['kestrel.mcp.permission.owner'] == peer.owner
-            entered.set()
-            try:
-                assert release.wait(10), 'Test did not release its actual witness reader'
-                return original(container, *args, **kwargs)
-            finally:
-                finished.set()
-
-        with monkeypatch.context() as reader_owner:
-            reader_owner.setattr(peer.client.api, 'remove_container', delayed_remove)
+        with hold_owned_witness_removal(peer, monkeypatch) as (entered, release, finished):
             reader = asyncio.create_task(peer.witness(None, None))
             inventory = None
             try:
@@ -84,19 +68,25 @@ async def test_cancelled_witness_reader_joins_before_volume_inventory(tmp_path, 
                 assert await asyncio.to_thread(finished.wait, 10)
 
 @pytest.mark.parametrize('host_campaign', [{'transport': 'gateway'}], indirect=True)
-@pytest.mark.parametrize('before_readiness', [False, True], ids=['ready', 'before-ready'])
-async def test_parent_retires_original_gateway_after_forced_host_exit(host_campaign, before_readiness):
+@pytest.mark.parametrize('before_readiness,unpublished,deferred_reader', [
+    (False, False, False), (True, False, False), (True, True, False), (True, True, True),
+], ids=['ready', 'before-ready', 'unpublished-intent', 'unpublished-intent-deferred'])
+async def test_parent_retires_original_gateway_after_forced_host_exit(
+    host_campaign, monkeypatch, before_readiness, unpublished, deferred_reader,
+):
     import asyncio
     import json
     import os
     import shutil
     import signal
     import psutil
+    from contextlib import ExitStack
     from tests.integration.test_mcp_permission_host_restart import (
         native_host, host_client, configure_mcp,
     )
     from tests.integration.mcp_permission_peers import (
         _remove_owned_gateway_containers, run_owned_mcp_cli,
+        hold_owned_witness_removal, native_cli_profile_present,
     )
 
     c = host_campaign
@@ -123,6 +113,8 @@ async def test_parent_retires_original_gateway_after_forced_host_exit(host_campa
     task = asyncio.create_task(run_host())
     original = host = None
     profile = configuration = None
+    reader = release_reader = finished_reader = None
+    reader_scope = ExitStack()
     try:
         if before_readiness:
             ready = str(c.home / 'host-2-ready.json')
@@ -150,34 +142,79 @@ async def test_parent_retires_original_gateway_after_forced_host_exit(host_campa
         configuration, = configurations
         assert configuration.name.startswith('kestrel-') and configuration.is_dir()
         assert os.getpgid(original.pid) == original.pid
+        if unpublished:
+            intent = {key: value for key, value in record.items() if key not in {'pid', 'created'}}
+            temporary = receipt.with_suffix('.withheld')
+            temporary.write_text(json.dumps(intent))
+            temporary.replace(receipt)
+            # This campaign exercises recovery AFTER actual attestation. A
+            # never-observed launch remains unresolved rather than guessed gone.
+            owner = c.peer.host_admissions[admissions]
+            observed, = c.peer.read_host_admissions(owner, admissions)
+            recovered, = c.peer.admitted_groups(observed)
+            assert recovered.pid == original.pid and not recovered.retired()
+        if deferred_reader:
+            entered, release_reader, finished_reader = reader_scope.enter_context(
+                hold_owned_witness_removal(c.peer, monkeypatch))
+            reader = asyncio.create_task(c.peer.witness(None, None))
+            assert await asyncio.to_thread(entered.wait, 10)
         host.kill()
         released.set()
+        if deferred_reader:
+            async with asyncio.timeout(10):
+                while not any(signature['profile'] == profile and any(group.retired() for group in groups)
+                        for signature, groups in c.peer.group_receipts.values()):
+                    assert not task.done(), 'Host reconciliation escaped its original witness worker'
+                    await asyncio.sleep(0.01)
+            assert not task.done() and not reader.done()
+            assert configuration.exists(), 'Private configuration retired before its original witness worker'
+            database = c.peer.gateway_home / '.docker/mcp/mcp-toolkit.db'
+            assert native_cli_profile_present(database, profile)
+            release_reader.set()
+            await reader
+            assert await asyncio.to_thread(finished_reader.wait, 10)
+            reader_scope.close()
         error, = await asyncio.gather(task, return_exceptions=True)
         assert isinstance(error, AssertionError), repr(error)
         assert not original.is_running(), 'Host fixture abandoned its original admitted native Gateway'
-        assert not configuration.exists(), 'Host fixture retained its original admitted private configuration'
-        import sqlite3
+        if deferred_reader and configuration.exists():
+            assert str(error) == 'Retain native profile until its owned peers retire', repr(error)
+            assert reader.done() and await asyncio.to_thread(finished_reader.wait, 10)
+            # A deferred native container is not a truthful first-pass ACK.
+            # Physically finish that original, then resume the retained receipt.
+            await _remove_owned_gateway_containers(c.peer)
+            owner = c.peer.host_admissions[admissions]
+            await c.peer.reconcile_host_gateways(owner, admissions)
+        assert not configuration.exists(), ('Host fixture retained its original admitted private configuration', repr(error))
         database = c.peer.gateway_home / '.docker/mcp/mcp-toolkit.db'
-        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
-            assert connection.execute('SELECT id FROM working_set WHERE id=?', (profile,)).fetchone() is None
+        assert not native_cli_profile_present(database, profile)
+        if unpublished:
+            owner = c.peer.host_admissions[admissions]
+            groups = tuple(c.peer.group_receipts.values())
+            await c.peer.reconcile_host_gateways(owner, admissions)
+            await c.peer.reconcile_host_gateways(owner, admissions)
+            assert tuple(c.peer.group_receipts.values()) == groups, 'Repeated cleanup replaced original group custody'
     finally:
         # Independent test reconciliation is never credited to the fixture.
         # Only the original captured process and its private resources qualify.
         released.set()
+        if release_reader is not None:
+            release_reader.set()
         if host is not None and host.is_running():
             host.kill()
         await asyncio.gather(task, return_exceptions=True)
+        if reader is not None:
+            await asyncio.gather(reader, return_exceptions=True)
+            assert await asyncio.to_thread(finished_reader.wait, 10)
+        reader_scope.close()
         if original is not None and original.is_running():
             assert os.getpgid(original.pid) == original.pid
             os.killpg(original.pid, signal.SIGTERM)
             await asyncio.to_thread(original.wait, 5)
         await _remove_owned_gateway_containers(c.peer)
         if profile is not None:
-            import sqlite3
             database = c.peer.gateway_home / '.docker/mcp/mcp-toolkit.db'
-            with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
-                retained = connection.execute('SELECT id FROM working_set WHERE id=?', (profile,)).fetchone()
-            if retained:
+            if native_cli_profile_present(database, profile):
                 await run_owned_mcp_cli(['profile', 'remove', profile])
         if configuration is not None and configuration.exists():
             shutil.rmtree(configuration)

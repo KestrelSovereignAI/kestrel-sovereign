@@ -68,12 +68,18 @@ async def native_host(home, descriptor, environment, peer, generation):
             str(Path(__file__).with_name('mcp_permission_host.py')), str(descriptor), str(ready),
             cwd=home, env=environment, stdout=log, stderr=asyncio.subprocess.STDOUT)
         running = RunningHost({}, process, log_path)
-        if peer.kind == 'gateway':
-            import psutil
-            original_host = psutil.Process(process.pid)
-            original_host.create_time()
-            peer.read_host_admissions(original_host, admissions)
+        from tests.integration.mcp_gateway_custody import OriginalHostAdmission
+        original_host = OriginalHostAdmission(process) if peer.kind == 'gateway' else None
         try:
+            if original_host is not None:
+                import psutil
+                peer.retain_host_admission(original_host, admissions)
+                try:
+                    original_host.bind_birth(psutil.Process(process.pid).create_time())
+                except psutil.NoSuchProcess:
+                    await process.wait()
+                    raise AssertionError('Owned host failed before metadata admission: ' + log_path.read_text())
+                peer.read_host_admissions(original_host, admissions)
             async with asyncio.timeout(35):
                 while not ready.exists():
                     if process.returncode is not None:
@@ -98,7 +104,7 @@ async def native_host(home, descriptor, environment, peer, generation):
             yield running
         finally:
             async with AsyncExitStack() as retirement:
-                if peer.kind == 'gateway':
+                if original_host is not None:
                     retirement.push_async_callback(peer.reconcile_host_gateways, original_host, admissions)
                 if running.state:
                     retirement.callback(peer.local_ports.discard, running.state['port'])
