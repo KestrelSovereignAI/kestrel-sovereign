@@ -492,6 +492,9 @@ class EventManagerMixin:
             return
 
         try:
+            from kestrel_sovereign.signals.delivery import (
+                detached_from_enclosing_turn,
+            )
             from kestrel_sovereign.signals.sources.a2a import (
                 DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_completed_task,
@@ -504,20 +507,23 @@ class EventManagerMixin:
             # already terminal, so this signal is only its wake; the selected
             # durable consumer preserves that wake across Hold and restart.
             # The agent's tracker owns the initial enqueue and harvests its
-            # terminal result for observability (#2532).
-            self._track_background_task(
-                self._deliver_a2a_wake_until_durable(
-                    signal_factory=lambda: build_signal_for_completed_task(
-                        candidate=candidate,
-                        target_agent=self.did,
+            # terminal result for observability (#2532). This callback runs on
+            # whichever task completed the task, often this agent's own turn;
+            # the wake is not that turn's work (#4023).
+            with detached_from_enclosing_turn():
+                self._track_background_task(
+                    self._deliver_a2a_wake_until_durable(
+                        signal_factory=lambda: build_signal_for_completed_task(
+                            candidate=candidate,
+                            target_agent=self.did,
+                        ),
+                        task_id=str(task_id),
+                        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                        label=f"a2a.task_complete[{task_id}]",
+                        cancellation_aware=False,
                     ),
-                    task_id=str(task_id),
-                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
-                    label=f"a2a.task_complete[{task_id}]",
-                    cancellation_aware=False,
-                ),
-                name=f"a2a_complete:{task_id[:8]}",
-            )
+                    name=f"a2a_complete:{task_id[:8]}",
+                )
         except Exception as e:
             # Never let a dispatcher failure break the SSE notification
             # path (browser users still get the green check). Log and
@@ -560,25 +566,31 @@ class EventManagerMixin:
         task = candidate.task
         task_id = task.id
         try:
+            from kestrel_sovereign.signals.delivery import (
+                detached_from_enclosing_turn,
+            )
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_submitted_task,
             )
 
-            self._track_background_task(
-                self._deliver_a2a_wake_until_durable(
-                    signal_factory=lambda: build_signal_for_submitted_task(
-                        candidate=candidate,
-                        target_agent=self.did,
+            # Called on the submitting task, which can be the sender's turn;
+            # the recipient's wake is never part of it (#4023).
+            with detached_from_enclosing_turn():
+                self._track_background_task(
+                    self._deliver_a2a_wake_until_durable(
+                        signal_factory=lambda: build_signal_for_submitted_task(
+                            candidate=candidate,
+                            target_agent=self.did,
+                        ),
+                        task_id=str(task_id),
+                        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                        label=f"a2a.task_submitted[{task_id}]",
+                        cancellation_aware=True,
+                        input_revision=candidate.input_revision,
                     ),
-                    task_id=str(task_id),
-                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
-                    label=f"a2a.task_submitted[{task_id}]",
-                    cancellation_aware=True,
-                    input_revision=candidate.input_revision,
-                ),
-                name=f"a2a_submitted:{str(task_id)[:8]}",
-            )
+                    name=f"a2a_submitted:{str(task_id)[:8]}",
+                )
         except Exception as e:
             # Same posture as task_complete: never let a dispatcher
             # failure break task creation. Log and continue — the

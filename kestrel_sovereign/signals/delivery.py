@@ -48,14 +48,27 @@ Producers in the second group hand the wait to a supervisor task via
 :class:`~kestrel_sovereign.waits.reconciler.WaitReconciler` is the other
 sanctioned shape (enqueue on one tick, harvest at the top of the next, backed
 by a durable pending row). Do not invent a third.
+
+Detachment
+----------
+A dispatch, and any supervisor that awaits a dispatch's delivery, is its own
+unit of work and never part of the turn that enqueued it (#4023). Every one is
+created inside :func:`detached_from_enclosing_turn`: the dispatcher's
+``enqueue_*`` Tasks, :func:`supervise_terminal_delivery`,
+:func:`harvest_detached_delivery`, and each producer's own supervisor (the A2A
+submitted and completed wakes, the restart coordinator's
+``restart.completed`` acknowledgement). A Task created from turn context
+without it joins that turn's retirement, and a COGNITION wake then deadlocks
+the agent; see :func:`detached_from_enclosing_turn`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, FrozenSet, Optional
+from typing import Any, Awaitable, Callable, FrozenSet, Iterator, Optional
 
 from kestrel_sdk.signals import SignalHandle
 from kestrel_sovereign._async_ownership import owned_task_completion_error
@@ -63,6 +76,8 @@ from kestrel_sovereign.execution_custody import (
     execution_observation_error,
     is_tool_execution_terminal_error,
 )
+from kestrel_sovereign.signals.lock_manager import without_delegated_lock_ownership
+from kestrel_sovereign.storage.privacy_wrapper import outside_native_privacy_lifetime
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +102,34 @@ STATUS_TOOLING_ERROR = "tooling_error"
 # ``dispatch_cancelled``: there the caller is healthy and the dispatch died,
 # here the caller itself is going away.
 STATUS_SUPERVISOR_CANCELLED = "supervisor_cancelled"
+
+
+@contextmanager
+def detached_from_enclosing_turn() -> Iterator[None]:
+    """Create Tasks that are their own unit of work, not the current turn's.
+
+    A Task copies its creator's context, and inside a turn that context
+    carries two turn-scoped authorities (#4023):
+
+    * membership of the turn's native privacy lifetime. The Task becomes a
+      join obligation of the turn's effect-journal retirement, which runs
+      after the turn has released CONVERSATION and holds the
+      privacy-transition lock until every member settles;
+    * the turn's delegated CONVERSATION ownership, so a turn the Task starts
+      while the creating turn still holds CONVERSATION is treated as a
+      re-entry into that hold rather than queued.
+
+    A signal dispatch is neither part of its creator's turn nor a re-entry
+    into it: a COGNITION wake is a new turn that queues for CONVERSATION and
+    the privacy lock as any other turn does. The same holds for a supervisor
+    that awaits that wake's delivery. Enrolled, either one deadlocks the
+    agent: the retirement waits for the wake while holding the privacy lock,
+    and the wake, having taken CONVERSATION, waits for that lock. Every
+    dispatch and delivery supervisor is created in here. It owns no
+    coordinator of its own.
+    """
+    with outside_native_privacy_lifetime(), without_delegated_lock_ownership():
+        yield
 
 
 @dataclass(frozen=True)
@@ -300,7 +343,8 @@ def supervise_terminal_delivery(
                 except BaseException as cleanup_error:
                     raise execution_observation_error(body_error, cleanup_error, prefer_cancellation=True)
 
-    return feature._track_owned_background_task(_await_and_settle(), name=task_name)
+    with detached_from_enclosing_turn():
+        return feature._track_owned_background_task(_await_and_settle(), name=task_name)
 
 
 def harvest_detached_delivery(
@@ -341,4 +385,5 @@ def harvest_detached_delivery(
                 outcome.describe(),
             )
 
-    return track(_enqueue_and_harvest(), name=task_name)
+    with detached_from_enclosing_turn():
+        return track(_enqueue_and_harvest(), name=task_name)

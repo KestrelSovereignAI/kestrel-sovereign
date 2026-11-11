@@ -142,6 +142,7 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_verified,
 )
 from kestrel_sovereign.signals.correlation import durable_correlation_values
+from kestrel_sovereign.signals.delivery import detached_from_enclosing_turn
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
     EXPIRED_INITIAL_HANDOFF_ERROR,
@@ -1452,9 +1453,12 @@ class SignalDispatcher:
             _durable_admission=durable_admission,
         )
         options = {"admission": admission} if admission is not None else {}
-        task = self._agent._track_background_task(
-            coro, name=f"signal_dispatch:{signal.source}:{signal.id}", **options,
-        )
+        # The dispatch is its own unit of work, never a join obligation of
+        # the turn that enqueued it (#4023).
+        with detached_from_enclosing_turn():
+            task = self._agent._track_background_task(
+                coro, name=f"signal_dispatch:{signal.source}:{signal.id}", **options,
+            )
         return SignalDispatchHandle(
             signal_id=signal.id,
             task=task,
@@ -1514,9 +1518,12 @@ class SignalDispatcher:
         try:
             resident_context = self._resident_timer_context()
             self._live_durable_cognition_event_ids.add(enqueued_signal_id)
-            task = self._agent._track_background_task(
-                coro, name=f"durable_cognition:{consumer_id}:{enqueued_signal_id}", admission=accepted,
-            )
+            # A woken turn needs CONVERSATION; the enqueuing turn's
+            # retirement must not wait for it (#4023).
+            with detached_from_enclosing_turn():
+                task = self._agent._track_background_task(
+                    coro, name=f"durable_cognition:{consumer_id}:{enqueued_signal_id}", admission=accepted,
+                )
             self._own_durable_task(task)
             task.add_done_callback(release_live_admission, context=resident_context)
         except BaseException as original:
@@ -1710,9 +1717,10 @@ class SignalDispatcher:
             _durable_terminal_consumer_id=consumer_id,
             _durable_admission_fence=admission_fence,
         )
-        task = self._agent._track_background_task(
-            coro, name=f"durable_terminal:{consumer_id}:{signal.id}"
-        )
+        with detached_from_enclosing_turn():
+            task = self._agent._track_background_task(
+                coro, name=f"durable_terminal:{consumer_id}:{signal.id}"
+            )
         self._own_durable_task(task)
         return SignalDispatchHandle(
             signal_id=signal.id,
