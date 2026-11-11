@@ -504,62 +504,78 @@ dispatcher refused the wake as a cycle.
 
 What is owed is a query, not process state. Settlement is owed exactly while a
 delivery of a settling consumer is failed or terminal-ACKable in durable
-storage and the work it carried still waits on it. The agent names its settling
+storage, its settlement is not recorded on it (`settled_at`), and the work it
+carried still waits on it. The agent names its settling
 consumers (`undelivered_cognition_wake_consumers`: the `a2a.task_submitted`
 consumer) and judges one row (`undelivered_cognition_wake_owed`). The row's
 source-event identity records the exact task and input its wake carried, so the
 judgement reads only that task at that input revision: `submitted` or
 `working`, with both wake-eligibility flags set. Neither the task's age nor its
 live lifecycle since decides it: a `working` recovery wake still owes its input
-after another writer moves the task back to `submitted`. The dispatcher's
-`owed_cognition_wake_settlements` reads those consumers' terminal rows one
-status at a time, in bounded delivery-ID keyset pages on a partial index of
-terminal rows (`idx_durable_signal_deliveries_terminal_page`), so a page reads
-only the rows it returns. The index is additive DDL the store ensures at every
-startup. Boot mints no new wake
-for an owed input: a replacement would be refused as its wake was, and a live
-wake beside the terminal row would leave the next pass ending work that wake
-still runs.
+after another writer moves the task back to `submitted`. The pass reads those
+consumers' unsettled terminal rows one status at a time, in bounded delivery-ID
+keyset pages on a partial index of unsettled terminal rows
+(`idx_durable_signal_deliveries_unsettled_terminal`), so a page reads only the
+rows it returns. Once durable state shows a row's work can never be owed again
+(`undelivered_cognition_wake_released`: its task ended, moved past that input,
+or is gone), the pass records the row settled (`record_delivery_settled`) and
+never reads it again. Each pass therefore reads what may still be owed, not the
+terminal history. Not owed is not enough to record it, since a task that asked
+for input can be working on the same input again. The `settled_at` column and
+the index are additive DDL the store ensures at every startup. Boot mints no new
+wake for an input an unsettled terminal row names (`unsettled_cognition_wakes`,
+which reads only the ledger): a replacement would be refused as its wake was,
+and a live wake beside the terminal row would leave the next pass ending work
+that wake still runs.
 
 A terminal row is that debt's only record, so retention keeps it. The durable
 retention sweep (`purge_expired_durable_deliveries`) holds every failed or
-terminal-ACKable row of a settling consumer past its deadline, and releases only
-those whose work can never be owed again (`undelivered_cognition_wake_released`):
-its task ended, moved past that input, or is gone. Not owed is not enough, since
-a task that asked for input can be working on the same input again. Held is the
-default, so a row that turns terminal while the sweep runs is kept for a later
-one.
+terminal-ACKable row of a settling consumer past its deadline until the pass
+records it settled; the sweep itself reads no task.
 
 There is one settlement point, the dispatcher's settlement pass
 (`_settle_owed_cognition_sources`). The runtime-owner heartbeat runs it at the
 end of each pass that completes its ordinary sweeps, and boot reconciliation
 runs it before any consumer starts (`settle_owed_cognition_sources`). Nothing
-settles before a delivery's own terminal CAS has committed: a Stop's
-terminal-ACKable NACK and the failed-row terminalizer only ask for a prompt
-heartbeat once their row stands. A stale owner whose CAS lost therefore leaves
-no terminal row, and never touches the task its successor now runs.
+settles before a delivery's own terminal CAS has committed: a NACK or release
+that leaves a settling consumer's row failed or terminal-ACKable (a Stop, a
+refusal, a spent last attempt) and the failed-row terminalizer only ask for a
+prompt heartbeat once their row stands. A row of any other consumer asks for
+nothing. A stale owner whose CAS lost therefore leaves no terminal row, and
+never touches the task its successor now runs.
 
 No failure type decides a retry. A storage error, a lifecycle compare-and-set
-lost to a concurrent task writer, or anything else leaves the row owed, and the
-next pass finds it again; a row stops being owed only when durable state shows
-the task settled or its input superseded. A settlement whose commit outcome is
+lost to a concurrent task writer, a task that cannot be read, or anything else
+leaves the row owed; the pass goes on to the next row, boot is not refused, and
+the next pass finds it again. A row stops being owed only when durable state
+shows the task settled or its input superseded. A settlement whose commit outcome is
 unknown, or whose execution authority is gone, is native control: the pass
 retains it as that delivery's settlement control and stops, and boot refuses.
 It is kept in its own ledger, apart from the debt of the delivery's own
 terminal write, so a late terminalizer or retained cleanup of that row clears
-only the row's debt and never the settlement's. The heartbeat logs it. While it stands the heartbeat does no ordinary work, owner
-retirement refuses, and the host is not ready: `/health` fails and
+only the row's debt and never the settlement's. The heartbeat logs it. While it
+stands owner retirement refuses and the host is not ready: `/health` fails and
 `/health/detailed` names the deliveries in a `durable_cognition_control` check
-(`SignalDispatcher.unresolved_cognition_control`). The retirement drain retries
-only the fenced write, which returns at once when the earlier write committed;
-any failure keeps the debt, so shutdown never reports a deferred settlement as
-done. The row's CAS is never written again.
+(`SignalDispatcher.unresolved_cognition_control`). It guards no lease, so it
+never puts the owner heartbeat into its cleanup branch: on PostgreSQL that
+branch refreshes an owner only while it leases cognition, and a peer would
+reclaim this live owner's other leases. The heartbeat keeps its ordinary work,
+and each pass, like the retirement drain, retries only the fenced write, which
+returns at once when the earlier write committed. Each pass retries it whether
+or not its row is still unsettled: a peer that settled the same work records
+the row settled, and retention may then remove it, which takes the row out of
+the pass but leaves this process's control standing. The retry reads the work's
+own state, so it returns once nothing is owed. The control ends when a retry
+returns; any failure keeps it, so shutdown never reports a deferred settlement
+as done. The row's CAS is never written again.
 
 The write itself is the agent's `settle_undelivered_cognition_wake`, named by
 the wake's durable identity (`source`, `target_agent`, `source_event_id`) and
 never its payload, which a privacy mode may elide. A Stop's row
 (`stop_acknowledged`) cancels the task, as the Stop asked; any other row fails
-it, naming a code its sender may read. The write is bound to the wake's own
+it, naming a code its sender may read: the reconciliation failure, or the
+status that refused the wake (`dropped_cycle`, `dropped_validation`), which a
+refused wake's row records. The write is bound to the wake's own
 admitted input, so it is fenced as that wake's turn is: a newer input the
 creator added meanwhile stays live. The identity's kind,
 `UNDELIVERED_WAKE_SETTLEMENT_KIND`, also fences the write to a task still

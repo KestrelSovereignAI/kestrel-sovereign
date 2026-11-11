@@ -54,9 +54,23 @@ FAILED = "failed"
 TERMINAL_ACKABLE = "terminal_ackable"
 _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED, TERMINAL_ACKABLE})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
-# The rows a settlement pass pages through: terminal, never acknowledged
-# (#4001). The terminal-page index and its query share this predicate.
-_TERMINAL_PAGE_PREDICATE = f"status IN ('{FAILED}', '{TERMINAL_ACKABLE}')"
+
+
+def _unsettled_terminal_predicate(alias: str = "") -> str:
+    """The rows a settlement pass reads: terminal, unacknowledged, unsettled.
+
+    A failed or terminal-ACKable row stays here until the settlement of the
+    work its wake carried is recorded on it (``settled_at``), so the pass
+    reads only what may still be owed (#4001). The index, its page query and
+    the retention hold share this predicate; SQLite uses a partial index only
+    when the query repeats the index's own terms.
+    """
+    return (
+        f"{alias}status IN ('{FAILED}', '{TERMINAL_ACKABLE}') "
+        f"AND {alias}settled_at IS NULL"
+    )
+
+
 _DEACTIVATED_CONSUMER_ERROR = "durable consumer deactivated"
 # The emitting dispatcher's first lease on a payload-elided delivery expired
 # (or its transfer failed) before any worker claimed it. The row is released
@@ -1407,6 +1421,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 terminal_at {ts_type},
                 created_at {ts_type} {ts_default},
                 updated_at {ts_type} {ts_default},
+                settled_at {ts_type},
                 UNIQUE (agent_id, consumer_id, event_id),
                 FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
                     ON DELETE CASCADE,
@@ -1476,6 +1491,9 @@ class DurableSignalStore(UnifiedStoreBase):
                 "replay_retained",
                 f"{bool_type} NOT NULL DEFAULT {'TRUE' if self.is_postgres else '1'}",
             )
+            # When the settlement of the work a terminal wake carried was
+            # recorded, so the row leaves the settlement pass (#4001).
+            await self._ensure_column(self.DELIVERIES, "settled_at", ts_type)
             source_state = await self._source_sequence_schema_state()
             await self._ensure_source_sequence_state()
             if self.is_postgres:
@@ -3432,12 +3450,13 @@ class DurableSignalStore(UnifiedStoreBase):
             f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_event "
             f"ON {self.DELIVERIES}(event_id, status)"
         )
-        # Terminal rows a settlement pass pages through in delivery-ID order
-        # (#4001). Partial, so live claim traffic never maintains it.
+        # Unsettled terminal rows a settlement pass pages through in
+        # delivery-ID order (#4001). Partial, so neither live claim traffic
+        # nor settled history is in it.
         await self._backend.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_terminal_page "
+            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_unsettled_terminal "
             f"ON {self.DELIVERIES}(agent_id, consumer_id, status, delivery_id) "
-            f"WHERE {_TERMINAL_PAGE_PREDICATE}"
+            f"WHERE {_unsettled_terminal_predicate()}"
         )
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
@@ -5594,7 +5613,7 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return [self._row_to_delivery(row) for row in rows]
 
-    async def list_terminal_deliveries_page(
+    async def list_unsettled_terminal_deliveries_page(
         self,
         *,
         agent_id: str,
@@ -5602,15 +5621,15 @@ class DurableSignalStore(UnifiedStoreBase):
         status: str,
         after_delivery_id: str,
         limit: int,
-        retention_expired_before: Optional[datetime] = None,
     ) -> list[DurableDelivery]:
-        """One keyset page of a consumer's rows in one terminal status.
+        """One keyset page of a consumer's unsettled rows in one terminal status.
 
         The rows after ``after_delivery_id`` (``""`` for the first page), in
-        delivery-ID order. The status is a literal in the statement, so the
-        terminal index serves both the range and the order and a page reads
-        only the rows it returns (#4001). With ``retention_expired_before``,
-        only rows whose event's retention ended before it.
+        delivery-ID order, whose settlement is not yet recorded
+        (:meth:`record_delivery_settled`). The status is a literal in the
+        statement, so the unsettled-terminal index serves both the range and
+        the order: a page reads only the rows it returns, and settled history
+        is never read again (#4001).
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("consumer_id", consumer_id)
@@ -5620,25 +5639,49 @@ class DurableSignalStore(UnifiedStoreBase):
             raise ValueError("after_delivery_id must be a delivery ID string")
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
-        where = [
-            "d.agent_id = ?",
-            "d.consumer_id = ?",
-            f"d.status = '{status}'",
-            # SQLite uses a partial index only when the query repeats the
-            # index's own predicate; an implying equality is not enough.
-            f"d.{_TERMINAL_PAGE_PREDICATE}",
-            "d.delivery_id > ?",
-        ]
-        params: list[Any] = [agent_id, consumer_id, after_delivery_id]
-        if retention_expired_before is not None:
-            where.append("e.retention_until < ?")
-            params.append(self.to_timestamp_param(_as_utc(retention_expired_before)))
+        where = (
+            "d.agent_id = ? AND d.consumer_id = ? "
+            f"AND d.status = '{status}' AND {_unsettled_terminal_predicate('d.')} "
+            "AND d.delivery_id > ?"
+        )
         rows = await self._backend.fetch_all(
-            self._delivery_select_sql(" AND ".join(where))
-            + " ORDER BY d.delivery_id LIMIT ?",
-            tuple(params + [limit]),
+            self._delivery_select_sql(where) + " ORDER BY d.delivery_id LIMIT ?",
+            (agent_id, consumer_id, after_delivery_id, limit),
         )
         return [self._row_to_delivery(row) for row in rows]
+
+    async def record_delivery_settled(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Record that the work a terminal row's wake carried is settled.
+
+        The caller has read from durable state that the work can never be
+        owed again. The row keeps its terminal status and error; it only
+        leaves the settlement pass and the retention hold (#4001). Returns
+        whether this call recorded it.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        now = _as_utc(now or self.now_utc())
+        updated = await self._backend.execute(
+            f"UPDATE {self.DELIVERIES} SET settled_at = ?, updated_at = ? "
+            "WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ? "
+            f"AND {_unsettled_terminal_predicate()}",
+            (
+                self.to_timestamp_param(now),
+                self.to_timestamp_param(now),
+                agent_id,
+                consumer_id,
+                delivery_id,
+            ),
+        )
+        return updated == 1
 
     async def source_history_is_drained(
         self, boundary: DurableSourceBoundary
@@ -5700,7 +5743,6 @@ class DurableSignalStore(UnifiedStoreBase):
         limit: int | None = None,
         now: datetime | None = None,
         held_consumers: Iterable[str] = (),
-        released_event_ids: Iterable[str] = (),
     ) -> tuple[str, ...]:
         """Return the exact deleted IDs of this agent's terminal event history.
 
@@ -5712,11 +5754,9 @@ class DurableSignalStore(UnifiedStoreBase):
         cannot safely identify another ledger's original references to retire.
 
         A failed or terminal-ACKable row of one of ``held_consumers`` keeps
-        its event past retention unless that event is in
-        ``released_event_ids``: such a row can be the only record that work
-        its wake carried is still owed a settlement (#4001). Held is the
-        default, so a row that turns terminal after its caller decided what
-        to release is kept for a later sweep.
+        its event past retention until its settlement is recorded
+        (:meth:`record_delivery_settled`): such a row can be the only record
+        that work its wake carried is still owed a settlement (#4001).
         """
         self._require_nonempty("agent_id", agent_id)
         if source is not None:
@@ -5724,9 +5764,8 @@ class DurableSignalStore(UnifiedStoreBase):
         if limit is not None and (type(limit) is not int or limit <= 0):
             raise ValueError("Retention batch limit must be a positive integer")
         held = tuple(sorted(set(held_consumers)))
-        released = tuple(sorted(set(released_event_ids)))
-        for value in (*held, *released):
-            self._require_nonempty("held consumer or released event", value)
+        for value in held:
+            self._require_nonempty("held consumer", value)
         now = _as_utc(now or self.now_utc())
         where = ["e.agent_id = ?", "e.retention_until < ?"]
         parameters: list[Any] = [agent_id, self.to_timestamp_param(now)]
@@ -5739,21 +5778,13 @@ class DurableSignalStore(UnifiedStoreBase):
             f"AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}'))"
         )
         if held:
-            hold = (
+            where.append(
                 f"NOT EXISTS (SELECT 1 FROM {self.DELIVERIES} h "
                 "WHERE h.event_id = e.event_id AND h.consumer_id IN ("
                 + ", ".join("?" for _ in held)
-                + f") AND h.status IN ('{FAILED}', '{TERMINAL_ACKABLE}'))"
+                + f") AND {_unsettled_terminal_predicate('h.')})"
             )
             parameters.extend(held)
-            if released:
-                hold = (
-                    f"({hold} OR e.event_id IN ("
-                    + ", ".join("?" for _ in released)
-                    + "))"
-                )
-                parameters.extend(released)
-            where.append(hold)
         bound = ""
         if limit is not None:
             bound = "LIMIT ?"

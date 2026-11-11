@@ -758,21 +758,30 @@ class EventManagerMixin:
             live_changed_since=horizons[SUBMITTED_SOURCE],
             terminal_changed_since=horizons[COMPLETE_SOURCE],
         )
-        # An input owed a settlement gets no new wake: a replacement would be
-        # refused as its wake was, and a live one beside the terminal row
-        # would leave the next pass ending work that wake still runs (#4001).
-        owed_inputs = {
-            parse_submitted_input_identity(delivery.event.source_event_id)
-            for delivery in await self.dispatcher.owed_cognition_wake_settlements()
-            if delivery.event.source == SUBMITTED_SOURCE
-        }
+        # An input an unsettled terminal wake names gets no new wake: a
+        # replacement would be refused as its wake was, and a live one beside
+        # the terminal row would leave the next pass ending work that wake
+        # still runs (#4001). Only the ledger is read here, never a task, so
+        # no task's read can refuse this boot. Such a row whose task is still
+        # a live candidate at that input is exactly one still owed.
+        owed_inputs = set()
+        for delivery in await self.dispatcher.unsettled_cognition_wakes():
+            if delivery.event.source != SUBMITTED_SOURCE:
+                continue
+            try:
+                owed_inputs.add(
+                    parse_submitted_input_identity(delivery.event.source_event_id)
+                )
+            except ValueError:
+                # A row without a canonical identity names no input.
+                continue
         # The settlement pass's first run: end the work of every wake that
         # ended undelivered, before anything is minted. A task it ends here
         # is still a live candidate above, and is skipped below; the
         # completion it causes wakes the agent as any other does. A task it
-        # cannot settle now stays owed to the owner heartbeat's next pass, so
-        # it neither refuses this boot nor waits for another. Native control
-        # it meets refuses the boot.
+        # cannot read or settle now stays owed to the owner heartbeat's next
+        # pass, so it neither refuses this boot nor waits for another. Native
+        # control it meets refuses the boot.
         await self.dispatcher.settle_owed_cognition_sources()
 
         unadmitted: list[str] = []
@@ -993,8 +1002,8 @@ class EventManagerMixin:
         input it carried, whatever the task's live lifecycle has done since:
         a WORKING recovery wake's lifecycle revision is not part of what it
         owes. The work is owed exactly while the task still waits on that
-        input (#4001). The dispatcher's settlement pass asks this of every
-        failed or terminal-ACKable row of
+        input (#4001). The dispatcher's ``owed_cognition_wake_settlements``
+        asks this of every unsettled failed or terminal-ACKable row of
         :meth:`undelivered_cognition_wake_consumers`.
         """
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
@@ -1019,13 +1028,14 @@ class EventManagerMixin:
     ) -> bool:
         """Whether no later state can make a terminal wake's work owed again.
 
-        The dispatcher's retention sweep keeps a settling consumer's terminal
-        row, its debt's only record, until this says yes (#4001). Not owed is
-        not enough: a live task can move between its live states at the same
-        input, so one that asked for input can be working on it again. Only a
-        task that is gone, has ended, has moved past this input, or never
-        admitted wakes for its input (both flags are fixed at creation) is
-        released for good.
+        A settling consumer's terminal row is its debt's only record. The
+        dispatcher's settlement pass records the row settled, which takes it
+        out of every later pass and out of the retention hold, only once this
+        says yes (#4001). Not owed is not enough: a live task can move between
+        its live states at the same input, so one that asked for input can be
+        working on it again. Only a task that is gone, has ended, has moved
+        past this input, or never admitted wakes for its input (both flags are
+        fixed at creation) is released for good.
         """
         from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_from_label
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
@@ -1070,8 +1080,8 @@ class EventManagerMixin:
         reconciliation. Nothing else wakes the recipient for that input, so a
         task left ``submitted`` or ``working`` waits forever and its sender
         sees nothing fail (#4001). This is the one write that ends it, and
-        only the dispatcher's settlement pass makes it, for every terminal
-        row :meth:`undelivered_cognition_wake_owed` finds owed. A wake refused
+        only the dispatcher's settlement pass makes it, for every unsettled
+        terminal row whose work still waits on its wake. A wake refused
         before it persisted has such a row too: the dispatcher records the
         refusal as one. A stopped wake cancels the task; any other ends it
         failed, naming ``cause``.

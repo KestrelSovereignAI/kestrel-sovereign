@@ -666,17 +666,32 @@ async def claimed_submission_wake(manager, dispatcher, consumer, task, *, revisi
     )
 
 
+async def earlier_terminal_row(dispatcher, consumer, claimed, *, error, terminal_ackable=False):
+    """End a claimed wake's row as an earlier process commits it.
+
+    The write goes to the ledger directly: this dispatcher made none, so it
+    neither brings its own settlement pass forward nor learns of the row
+    except by reading it.
+    """
+    return await dispatcher._durable_store.nack_delivery(
+        agent_id=dispatcher._agent.did,
+        consumer_id=consumer,
+        delivery_id=claimed.delivery_id,
+        lease_token=claimed.lease_token,
+        error=error,
+        terminal=True,
+        terminal_ackable=terminal_ackable,
+    )
+
+
 async def failed_submission_wake(manager, dispatcher, consumer, task, *, revision=0):
     """A wake row a refused retry left failed, as an earlier process commits it."""
     claimed = await claimed_submission_wake(
         manager, dispatcher, consumer, task, revision=revision
     )
-    failed = await dispatcher.nack_durable_delivery(
-        consumer_id=consumer,
-        delivery_id=claimed.delivery_id,
-        lease_token=claimed.lease_token,
+    failed = await earlier_terminal_row(
+        dispatcher, consumer, claimed,
         error="execution_control_unresolved: tool_effect_reconciliation_required",
-        terminal=True,
     )
     assert failed.status == "failed"
     return failed
@@ -782,13 +797,9 @@ async def test_owed_settlements_are_terminal_wakes_whose_input_still_waits(
     try:
         failed = await failed_submission_wake(manager, dispatcher, consumer, tasks["failed"])
         refused = await claimed_submission_wake(manager, dispatcher, consumer, tasks["refused"])
-        refused = await dispatcher.nack_durable_delivery(
-            consumer_id=consumer,
-            delivery_id=refused.delivery_id,
-            lease_token=refused.lease_token,
-            error="stop_acknowledged: operator Stop",
-            terminal=True,
-            terminal_ackable=True,
+        refused = await earlier_terminal_row(
+            dispatcher, consumer, refused,
+            error="stop_acknowledged: operator Stop", terminal_ackable=True,
         )
         assert refused.status == "terminal_ackable"
         await claimed_submission_wake(manager, dispatcher, consumer, tasks["leased"])
@@ -828,10 +839,8 @@ async def test_owed_settlements_are_terminal_wakes_whose_input_still_waits(
             consumer_id=consumer, event_id=recovery.event_id,
             executor_id=dispatcher._durable_delivery_owner,
         )
-        recovery = await dispatcher.nack_durable_delivery(
-            consumer_id=consumer, delivery_id=recovery.delivery_id,
-            lease_token=recovery.lease_token, error="durable consumer deactivated",
-            terminal=True,
+        recovery = await earlier_terminal_row(
+            dispatcher, consumer, recovery, error="durable consumer deactivated",
         )
 
         owed = await dispatcher.owed_cognition_wake_settlements()
@@ -1006,9 +1015,10 @@ async def test_a_settlement_whose_commit_is_unknown_stops_the_pass_as_control(
 ):
     """#4001: a settlement write whose commit outcome is unknown, even one
     arriving as a cancellation, is native control, not an ordinary failure.
-    The pass retains it as that delivery's control debt and settles nothing
-    beside it, and the owner heartbeat takes its cleanup branch, running no
-    further settlement, until owner retirement resolves it."""
+    The pass retains it as that delivery's settlement control and settles
+    nothing beside it. The control guards no lease, so the owner heartbeat
+    stays on its ordinary branch: its pass retries the fenced write, which
+    here commits, ends the control, and settles the rest."""
     from kestrel_sovereign.execution_custody import (
         ExecutionCommitOutcomeError,
         execution_commit_outcome,
@@ -1042,14 +1052,19 @@ async def test_a_settlement_whose_commit_is_unknown_stops_the_pass_as_control(
         assert not dispatcher._retained_cognition_control_debt
         (debt,) = dispatcher._source_settlement_control.values()
         assert debt[0].delivery_id in {row.delivery_id for row in failed}
-        assert dispatcher._runtime_owner_cleanup_required()
-
-        await dispatcher._heartbeat_runtime_owner()
-
-        assert len(attempts) == 1
+        assert not dispatcher._runtime_owner_cleanup_required()
         for task in tasks:
             assert (await snapshot(manager, task)).task.status.state == (
                 TaskState.TASK_STATE_SUBMITTED
+            )
+
+        await dispatcher._heartbeat_runtime_owner()
+
+        assert len(attempts) == 3
+        assert dispatcher.unresolved_cognition_control == ()
+        for task in tasks:
+            assert (await snapshot(manager, task)).task.status.state == (
+                TaskState.TASK_STATE_FAILED
             )
     finally:
         await close_input_dispatcher(agent, dispatcher)
@@ -1174,12 +1189,9 @@ async def failed_recovery_wake(manager, dispatcher, consumer, task):
         event_id=recovery.event_id,
         executor_id=dispatcher._durable_delivery_owner,
     )
-    failed = await dispatcher.nack_durable_delivery(
-        consumer_id=consumer,
-        delivery_id=recovery.delivery_id,
-        lease_token=recovery.lease_token,
+    failed = await earlier_terminal_row(
+        dispatcher, consumer, recovery,
         error="execution_control_unresolved: tool_effect_reconciliation_required",
-        terminal=True,
     )
     assert failed.status == "failed"
     return failed
@@ -1267,12 +1279,12 @@ async def test_a_terminal_wake_older_than_the_replay_horizon_is_still_settled(ma
 async def test_retention_holds_a_terminal_wake_until_its_work_is_settled(manager):
     """Final self-review of wo-4001-6: a terminal wake row is the only record
     that its task is owed a settlement, and the retention sweep deletes any
-    expired event whose deliveries are all terminal. A row past its deadline
-    whose work is still owed is kept until that work is settled; one whose
-    task ended is released. Not owed is not enough to release: a task that
-    asked for input can work on the same input again, and then owes it.
-    Held is the default: a sweep that releases nothing keeps every such row,
-    so one that turns terminal while the sweep decides is kept for the next."""
+    expired event whose deliveries are all terminal. A settling consumer's
+    terminal row is kept past its deadline until the settlement pass records
+    it settled, which it does once the row's work can never be owed again:
+    its task ended, by the pass or elsewhere. Not owed is not enough: a task
+    that asked for input can work on the same input again, and then owes it.
+    The sweep itself reads no task (#4001)."""
     from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
 
     owed_task, settled_task, asking_task = [
@@ -1304,10 +1316,8 @@ async def test_retention_holds_a_terminal_wake_until_its_work_is_settled(manager
         assert await dispatcher._durable_store.purge_expired(
             agent_id=agent.did, held_consumers=[consumer],
         ) == ()
+        assert await dispatcher.purge_expired_durable_deliveries() == 0
         assert await rows() == {owed.event_id, settled.event_id, asking.event_id}
-
-        assert await dispatcher.purge_expired_durable_deliveries() == 1
-        assert await rows() == {owed.event_id, asking.event_id}
         assert [d.event_id for d in await dispatcher.owed_cognition_wake_settlements()] == [
             owed.event_id
         ]
@@ -1316,7 +1326,7 @@ async def test_retention_holds_a_terminal_wake_until_its_work_is_settled(manager
         assert (await snapshot(manager, owed_task)).task.status.state == (
             TaskState.TASK_STATE_FAILED
         )
-        assert await dispatcher.purge_expired_durable_deliveries() == 1
+        assert await dispatcher.purge_expired_durable_deliveries() == 2
         assert await rows() == {asking.event_id}
 
         # The task works on the same input again; its wake is long gone.
@@ -1456,7 +1466,6 @@ async def test_a_late_row_cleanup_keeps_the_settlement_control_it_did_not_create
         assert not dispatcher._retained_cognition_control_debt
         assert list(dispatcher._source_settlement_control) == [original.delivery_id]
         assert dispatcher.unresolved_cognition_control == (original.delivery_id,)
-        assert dispatcher._runtime_owner_cleanup_required()
         assert (await snapshot(manager, task)).task.status.state == (
             TaskState.TASK_STATE_SUBMITTED
         )
@@ -1472,6 +1481,55 @@ async def test_a_late_row_cleanup_keeps_the_settlement_control_it_did_not_create
     finally:
         if not closed:
             await close_input_dispatcher(agent, dispatcher)
+
+
+@pytest.mark.parametrize("row", ["recorded", "purged"])
+async def test_a_peer_settlement_ends_the_control_this_owner_retains(manager, row):
+    """Self-review of wo-4001-7: one owner's settlement of a failed wake meets
+    an unknown commit and retains it as control. A peer owner sharing the
+    database then settles the same task and records the row settled; once
+    recorded, retention may remove the row. Either takes the row out of the
+    unsettled scan, so before the fix the first owner's heartbeat never
+    retried its control and the owner stayed unready for good. Its next pass
+    now settles the control from the task's own state: it ends the control
+    and writes nothing, since nothing is owed (#4001)."""
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    peer_agent, peer, _ = await input_dispatcher(manager)
+    try:
+        assert peer._durable_delivery_owner != dispatcher._durable_delivery_owner
+        failed = await failed_submission_wake(manager, dispatcher, consumer, task)
+        faults = [ExecutionCommitOutcomeError("unknown")]
+        attempts = fault_task_writes(manager, faults)
+        await dispatcher._heartbeat_runtime_owner()
+        assert faults == []
+        assert dispatcher.unresolved_cognition_control == (failed.delivery_id,)
+
+        await peer._heartbeat_runtime_owner()
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_FAILED
+        )
+        assert peer.unresolved_cognition_control == ()
+        assert await peer.unsettled_cognition_wakes() == []
+        if row == "purged":
+            await _expire_wake_event(peer, failed)
+            assert await peer.purge_expired_durable_deliveries() == 1
+            assert await peer.list_durable_deliveries(consumer_id=consumer) == []
+        writes = len(attempts)
+
+        await dispatcher._heartbeat_runtime_owner()
+
+        assert dispatcher.unresolved_cognition_control == ()
+        assert not dispatcher._source_settlement_control
+        assert len(attempts) == writes
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_FAILED
+        )
+    finally:
+        await close_input_dispatcher(peer_agent, peer)
+        await close_input_dispatcher(agent, dispatcher)
 
 
 async def test_a_settlement_page_reads_only_the_rows_it_returns(manager):
@@ -1506,7 +1564,7 @@ async def test_a_settlement_page_reads_only_the_rows_it_returns(manager):
             for literal in ("'failed'", "'terminal_ackable'")
             if f"d.status = {literal}" in sql
         }
-        index = re.compile(rf"\bidx_{store.DELIVERIES}_terminal_page\b")
+        index = re.compile(rf"\bidx_{store.DELIVERIES}_unsettled_terminal\b")
         for sql, params in pages:
             if store.backend.backend_type == "postgres":
                 async with store.backend.transaction():
@@ -1520,5 +1578,210 @@ async def test_a_settlement_page_reads_only_the_rows_it_returns(manager):
                 plan = "\n".join(str(row[-1]) for row in rows)
                 assert index.search(plan), plan
                 assert "TEMP B-TREE" not in plan, plan
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+
+
+def count_task_reads(manager, *, poisoned=frozenset()):
+    """Count the settlement's task reads; raise a storage error for some tasks."""
+    from kestrel_sdk.storage.database.interface import QueryError
+
+    read = manager.get_task_cancellation_snapshot
+    reads = []
+
+    async def counted(task_id, **kwargs):
+        reads.append(task_id)
+        if task_id in poisoned:
+            raise QueryError("task row cannot be read")
+        return await read(task_id, **kwargs)
+
+    manager.get_task_cancellation_snapshot = counted
+    return reads
+
+
+async def test_a_settled_wake_leaves_the_settlement_pass(manager):
+    """PR #4029 merge review: every heartbeat paged through every terminal
+    row of the submission consumer and read its task, so the pass grew with
+    the whole retention window's terminal history. Once durable state shows a
+    row's work can never be owed again, the pass records it settled and never
+    reads it again. A row that may still be owed (a task that asked for input
+    at that input) stays, so a pass reads what may be owed (#4001)."""
+    settled = [
+        await manager.create_task(request(), creator_agent_id="did:creator")
+        for _ in range(3)
+    ]
+    asking = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    try:
+        for task in (*settled, asking):
+            await failed_submission_wake(manager, dispatcher, consumer, task)
+        await manager.update_status(
+            asking.id, TaskState.TASK_STATE_INPUT_REQUIRED, recipient_agent_id=manager.did
+        )
+
+        await dispatcher._heartbeat_runtime_owner()
+        for task in settled:
+            assert (await snapshot(manager, task)).task.status.state == (
+                TaskState.TASK_STATE_FAILED
+            )
+
+        reads = count_task_reads(manager)
+        await dispatcher._heartbeat_runtime_owner()
+
+        assert set(reads) == {asking.id}
+        assert [d.event.source_event_id for d in await dispatcher.unsettled_cognition_wakes()] == [
+            submitted_input_identity(asking.id, 0)
+        ]
+        assert [d.status for d in await dispatcher.list_durable_deliveries(
+            consumer_id=consumer
+        )] == ["failed"] * 4
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_a_task_that_cannot_be_read_neither_stops_the_pass_nor_refuses_boot(
+    manager,
+):
+    """PR #4029 merge review: one terminal row whose task read keeps raising
+    aborted the whole settlement pass, and refused every boot. It now stays
+    owed and the pass goes on: the other tasks are settled, boot completes
+    without minting a second wake for that input, and the heartbeat settles
+    it once it can be read (#4001)."""
+    tasks = [
+        await manager.create_task(request(), creator_agent_id="did:creator")
+        for _ in range(3)
+    ]
+    poisoned = tasks[1]
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    try:
+        for task in tasks:
+            await failed_submission_wake(manager, dispatcher, consumer, task)
+        reads = count_task_reads(manager, poisoned={poisoned.id})
+
+        await agent.reconcile_a2a_cognition_wakes()
+
+        assert poisoned.id in reads
+        states = {
+            task.id: (await snapshot(manager, task)).task.status.state for task in tasks
+        }
+        assert states == {
+            tasks[0].id: TaskState.TASK_STATE_FAILED,
+            poisoned.id: TaskState.TASK_STATE_SUBMITTED,
+            tasks[2].id: TaskState.TASK_STATE_FAILED,
+        }
+        assert len(await dispatcher.list_durable_deliveries(consumer_id=consumer)) == 3
+        assert dispatcher.unresolved_cognition_control == ()
+
+        del manager.get_task_cancellation_snapshot
+        await dispatcher._heartbeat_runtime_owner()
+
+        assert (await snapshot(manager, poisoned)).task.status.state == (
+            TaskState.TASK_STATE_FAILED
+        )
+        assert await dispatcher.unsettled_cognition_wakes() == []
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_only_a_settling_consumer_row_brings_the_settlement_pass_forward(
+    manager,
+):
+    """PR #4029 merge review: every terminal row of any consumer brought the
+    owner heartbeat forward, while a submission row that failed by spending
+    its last attempt brought nothing. A terminal row of a consumer that
+    settles nothing leaves the heartbeat at its own beat; a submission row
+    that exhausts its attempts is settled promptly, without waiting a beat
+    (#4001)."""
+    from kestrel_sovereign.signals import DurableConsumerRegistration
+    from kestrel_sovereign.signals.durable import DurableSignalStore
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    loop = asyncio.get_running_loop()
+    try:
+        await dispatcher.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id="workflows:wait:4001",
+                source="a2a.task_submitted",
+                agent_id=agent.did,
+                max_attempts=0,
+            )
+        )
+        claimed = await claimed_submission_wake(manager, dispatcher, consumer, task)
+        other = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id="workflows:wait:4001", event_id=claimed.event_id,
+            executor_id="workflows-worker",
+        )
+        due = dispatcher._runtime_owner_heartbeat_timer.when()
+        assert due - loop.time() > 1.0
+
+        ended = await dispatcher.nack_durable_delivery(
+            consumer_id="workflows:wait:4001", delivery_id=other.delivery_id,
+            lease_token=other.lease_token, error="workflow gave up", terminal=True,
+        )
+        assert ended.status == "failed"
+        assert not dispatcher._owed_settlement_pass_requested
+        assert dispatcher._runtime_owner_heartbeat_timer.when() == due
+
+        # The submission row was persisted with a finite budget, and this
+        # ordinary retry spends its last attempt.
+        store = dispatcher._durable_store
+        await store.backend.execute(
+            f"UPDATE {DurableSignalStore.DELIVERIES} SET max_attempts = 1 "
+            "WHERE delivery_id = ?",
+            (claimed.delivery_id,),
+        )
+        exhausted = await dispatcher.nack_durable_delivery(
+            consumer_id=consumer, delivery_id=claimed.delivery_id,
+            lease_token=claimed.lease_token, error="turn failed",
+        )
+        assert exhausted.status == "failed"
+        assert dispatcher._owed_settlement_pass_requested
+
+        deadline = loop.time() + 5.0
+        while (await snapshot(manager, task)).task.status.state != (
+            TaskState.TASK_STATE_FAILED
+        ):
+            assert loop.time() < deadline, "the exhausted wake was never settled"
+            await asyncio.sleep(0.02)
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+
+
+@pytest.mark.parametrize("refused_as", ["dropped_cycle", "dropped_validation"])
+async def test_a_wake_refused_after_it_persisted_is_settled_under_its_own_status(
+    manager, refused_as,
+):
+    """PR #4029 merge review: a terminal no-op row that was not a Stop told
+    the sender ``dropped_validation`` whatever refused it, a cycle drop
+    included. The row now records the status that refused it, and the
+    settlement names that status (#4001)."""
+    from kestrel_sdk.signals import SignalResult, Status
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    try:
+        claimed = await claimed_submission_wake(manager, dispatcher, consumer, task)
+        result = SignalResult(
+            signal_id=claimed.event.event_id,
+            status=Status(refused_as),
+            mode=claimed.event.mode,
+            duration_ms=0,
+            error="refused after the wake persisted",
+        )
+        assert await dispatcher._settle_cognition_non_delivery(
+            claimed, result, consumer_id=consumer, retry_delay=timedelta()
+        )
+        (row,) = await dispatcher.list_durable_deliveries(consumer_id=consumer)
+        assert row.status == "terminal_ackable"
+        assert dispatcher._undelivered_wake_disposition(row) == (False, refused_as)
+
+        await dispatcher._settle_owed_cognition_sources()
+
+        seen = await manager.get_task_for_creator(
+            task.id, "did:creator", recipient_agent_id=manager.did
+        )
+        assert seen.status.state == TaskState.TASK_STATE_FAILED
+        assert f"({refused_as})" in seen.status.message.parts[0].text
     finally:
         await close_input_dispatcher(agent, dispatcher)
