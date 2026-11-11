@@ -121,7 +121,10 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
     ])
 
 
-def create_server(witness: Path, *, apps: bool = False, hold_tool_reply: bool = False):
+def create_server(witness: Path, *, apps: bool = False, hold_tool_reply: bool = False,
+                  operator_input: str | None = None, input_message: str = 'Private city?',
+                  input_tool: str | None = None, app_html: str | None = None, input_rounds: int = 1,
+                  input_schema: dict | None = None, input_content: dict | None = None):
     """One native effect witness for both permission and Apps campaigns."""
     extension = Apps()
 
@@ -153,10 +156,48 @@ def create_server(witness: Path, *, apps: bool = False, hold_tool_reply: bool = 
         def mutate_marker(marker: str) -> types.CallToolResult:
             return native_result(marker)
 
-        extension.add_html_resource("ui://witness/app.html", "<!doctype html><p>Owned native MCP App</p>")
+        extension.add_html_resource("ui://witness/app.html", app_html if app_html is not None
+            else "<!doctype html><p>Owned native MCP App</p>")
 
     server = MCPServer("permission-boundary-witness", extensions=[extension] if apps else [])
     server.tool()(record_marker)
+    if operator_input is not None:
+        if type(input_rounds) is not int or not 1 <= input_rounds <= 4:
+            raise ValueError('Owned MCP input rounds must be bounded')
+        if operator_input not in {'form', 'url', 'mixed'}:
+            raise ValueError('Unknown owned MCP input scenario')
+        async def operator_round(ctx, call_next):
+            if ctx.method != 'tools/call' or (input_tool is not None and ctx.params.get('name') != input_tool):
+                return await call_next(ctx)
+            with Path(str(witness) + '.input-wire').open('a') as stream:
+                stream.write(json.dumps(dict(ctx.params)) + '\n')
+            responses = ctx.params.get('inputResponses')
+            round_index = 0
+            if responses:
+                state = ctx.params['requestState']
+                round_index = 1 if state == 'server-owned-state' else int(state.removeprefix('server-owned-state-'))
+                assert 1 <= round_index <= input_rounds
+                if 'private-url-key' in responses:
+                    assert responses['private-url-key']['action'] == 'decline'
+                form = responses.get('private-form-key')
+                if form is None or form['action'] != 'accept':
+                    return types.CallToolResult(is_error=True,
+                        content=[types.TextContent(type='text', text='Operator input declined')])
+                assert form['content'] == (input_content if input_content is not None else {'city': 'owned-private-answer'})
+            if round_index < input_rounds:
+                inputs = {}
+                if operator_input in {'form', 'mixed'}:
+                    inputs['private-form-key'] = types.ElicitRequest(params=types.ElicitRequestFormParams(
+                        message=input_message, requested_schema=(input_schema if input_schema is not None
+                            else {'type': 'object', 'properties': {'city': {'type': 'string'}}, 'required': ['city']})))
+                if operator_input in {'url', 'mixed'}:
+                    inputs['private-url-key'] = types.ElicitRequest(params=types.ElicitRequestURLParams(
+                        message='Private URL consent?', elicitation_id='owned-consent',
+                        url='https://issuer.input.test/authorize'))
+                return types.InputRequiredResult(input_requests=inputs, request_state=(
+                    'server-owned-state' if round_index == 0 else f'server-owned-state-{round_index + 1}'))
+            return await call_next(ctx)
+        server.middleware.append(operator_round)
     return server
 
 
@@ -169,6 +210,7 @@ def main():
     parser.add_argument("--ready")
     parser.add_argument("--provider-model")
     parser.add_argument("--provider-fault", choices=["wrong_choice"])
+    parser.add_argument('--operator-input', choices=['form', 'url', 'mixed'])
     parser.add_argument("--drop-first-tool-reply", action="store_true")
     parser.add_argument("--linger-after-stdio", action="store_true")
     parser.add_argument("--hold-tool-reply", action="store_true")
@@ -184,7 +226,8 @@ def main():
             parser.error("Native profile did not supply the required configured mode")
         if args.linger_after_stdio:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        create_server(Path(args.witness), hold_tool_reply=args.hold_tool_reply).run(transport="stdio")
+        create_server(Path(args.witness), hold_tool_reply=args.hold_tool_reply,
+            operator_input=args.operator_input).run(transport="stdio")
         if args.linger_after_stdio and Path(args.witness).exists():
             while True:
                 signal.pause()
@@ -201,7 +244,7 @@ def main():
     if args.provider_model and not tls:
         parser.error("The owned provider requires TLS mode")
     witness = Path(args.witness) if tls else Path("/tmp/permission-witness")
-    server = create_server(witness)
+    server = create_server(witness, operator_input=args.operator_input)
 
     if not tls:
         server.run(transport="streamable-http", host="0.0.0.0", port=8000,

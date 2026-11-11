@@ -221,6 +221,32 @@ class MCPAppsHost:
         # The baseline does not call View.require_current(), which calls us.
         reader.baseline_check()
 
+    def current_call_session_id(self):
+        """The original authenticated App call, never an ambient chat selector."""
+        reader = self._reader.get()
+        if reader is None:
+            return None
+        if not reader.active or reader.baseline_check is None or reader.physical is None:
+            raise HostCapabilityAccessDenied('Original MCP App call is unavailable')
+        reader.baseline_check()
+        reader.physical.view.require_current()
+        return reader.session_id
+
+    @asynccontextmanager
+    async def borrow_input_view(self, view, *, request):
+        """Reauthenticate a fresh input continuation against the original View."""
+        async with self._resolve_context(request) as context:
+            async with self._operation(context, _Action.CALL) as check:
+                identifier = next((key for key, physical in self._views.items()
+                    if physical.view is view), None)
+                if identifier is None:
+                    raise ResourceConflict('Original MCP input View is unavailable')
+                self._physical(identifier)
+                check()
+                async with self._transport_operation(context, None, check) as transport:
+                    yield transport
+                    check()
+
     @asynccontextmanager
     async def _resolve_context(self, request):
         self._require_live(request)
@@ -395,8 +421,15 @@ class MCPAppsHost:
             host = original_host()
             async def build(_context, value):
                 physical = host._physical(view_id)
-                result = await host._publications.executor.invoke(physical.view, value.name,
-                    value.arguments, operation_id=value.operation_id)
+                executor = host._publications.executor
+                try:
+                    result = await executor.invoke(physical.view, value.name,
+                        value.arguments, operation_id=value.operation_id)
+                except ResourceConflict as error:
+                    pending = executor.input_required(error, physical.view)
+                    if pending is None:
+                        raise
+                    return JSONResponse({'input_required': pending}, status_code=202)
                 return JSONResponse(_native(result))
             return respond(host, request, _Action.CALL, build, _Call)
 

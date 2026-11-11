@@ -176,7 +176,7 @@ class _GovernedToolBinding:
             ),
             name="bound-tool-invocation", cancel_on_caller_cancellation=True,
             finalize=finalize,
-            tool_operation=ToolEffectOperation('mcp_app', operation_id, self.owner,
+            tool_operation=ToolEffectOperation('mcp_input' if source == 'mcp-input' else 'mcp_app', operation_id, self.owner,
                 self.name, deepcopy(call.arguments), session_id),
         )
         error = outcome.error

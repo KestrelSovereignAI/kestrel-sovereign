@@ -3,6 +3,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import json
 from typing import Optional
 
 from kestrel_sovereign.security.sovereign_key import sovereign_key_fingerprint
@@ -92,6 +94,18 @@ class CallerContext:
     @property
     def is_sovereign(self) -> bool:
         return self.role == CallerRole.SOVEREIGN
+
+
+def caller_identity_digest(caller: CallerContext) -> str:
+    """Stable attribution across restart, never an authentication credential.
+
+    Equal-looking subjects in different roles or authentication lanes remain
+    distinct. Raw operator identities need not become database selectors.
+    """
+    if type(caller) is not CallerContext:
+        raise TypeError('Caller identity requires a native CallerContext')
+    value = [caller.role.value, caller.auth_method.value, caller.identity]
+    return hashlib.sha256(json.dumps(value, separators=(',', ':')).encode()).hexdigest()
 
 
 @dataclass
