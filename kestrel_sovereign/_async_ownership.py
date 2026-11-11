@@ -12,7 +12,7 @@ import asyncio
 import contextvars
 import inspect
 import math
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
@@ -115,7 +115,12 @@ class OwnedCallbackScope:
         for coordinator in self.coordinators:
             coordinator.register_callback_scope(self)
 
-    def start(self, operation, *, name=None, on_completion=None):
+    def start(self, operation, *, name=None, context=None, on_completion=None):
+        """Accept original work with an explicitly selected execution context.
+
+        The retained privacy factory owns resource-lifetime admission separately;
+        a fresh context need not inherit the caller's validators or private data.
+        """
         if self.closed:
             raise RuntimeError("native callback admission is closed")
         if len(self.factories) > 1:
@@ -128,8 +133,10 @@ class OwnedCallbackScope:
                 raise opening
             return await operation()
 
-        task = (self.factories[0](run, name=name, on_completion=on_completion) if self.factories else
-                create_owned_task(run(), name=name, retain_originals=True, on_completion=on_completion))
+        task = (self.factories[0](run, name=name, context=context,
+                                 on_completion=on_completion) if self.factories else
+                create_owned_task(run(), name=name, context=context,
+                                  retain_originals=True, on_completion=on_completion))
         # Physical acceptance precedes cohort publication. Keep that exact
         # owner even when an observer/coordinator refuses its publication.
         self.tasks.add(task)
@@ -1049,6 +1056,29 @@ class PendingOwnedTask(Generic[_T]):
             execution_observation_error(pending, self.cancellation, self.observation_error))
 
 
+@dataclass(frozen=True)
+class OwnedCallbackSource(Generic[_T]):
+    """Run an async callback producer in the iterator's original source Task.
+
+    Each emitter call is the same one-item handshake as an iterator yield.
+    Structured children may emit concurrently; their handoffs are serialized.
+    The producer must physically join those children before returning.
+    False means its consumer requested close; the producer must stop emitting
+    and retire its own resources before returning None. A false handoff is NOT
+    a physical-close acknowledgment. Closing requests that cooperative handoff;
+    it never cancels the producer through an already-running finally. A producer
+    that cannot yet return remains original pending work, not a successful close.
+    The original Task and cancellation watcher
+    remain owned and joined by OwnedAsyncIterator, including late cleanup.
+    """
+
+    producer: Callable[[Callable[[_T], Awaitable[bool]]], Awaitable[None]] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not callable(self.producer):
+            raise TypeError("Owned callback source requires a callable producer")
+
+
 class OwnedAsyncIterator(Generic[_T]):
     """Keep every interaction with an async iterator in one owner task.
 
@@ -1062,7 +1092,7 @@ class OwnedAsyncIterator(Generic[_T]):
 
     def __init__(
         self,
-        iterator_factory: Callable[[], AsyncIterator[_T]],
+        iterator_factory: Callable[[], AsyncIterator[_T] | OwnedCallbackSource[_T]],
         *,
         operation: str,
         cleanup_requested: Callable[[], bool] | None = None,
@@ -1078,6 +1108,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._stop = asyncio.Event()
         self._item_outstanding = False
         self._waiting_for_continue = False
+        self._callback_source = False
         self._interrupt_after_continue = False
         self._closed = False
         self._owner_cancelled_by_close = False
@@ -1343,28 +1374,96 @@ class OwnedAsyncIterator(Generic[_T]):
                 if not self._owner.done():
                     self._cancel_owner_if_running()
 
-    def _cancel_owner_if_running(self) -> None:
+    def _cancel_owner_if_running(self) -> bool:
+        if self._callback_source:
+            # A callback owns its body AND finally. Its existing false-emission
+            # protocol requests retirement without injecting Task.cancel into
+            # an unknown active phase and turning aborted cleanup into an ACK.
+            self._stop.set()
+            self._continue.set()
+            return False
         if not self._owner.done() and not self._owner.cancelling():
-            cancel_owned_task(self._owner)
+            return cancel_owned_task(self._owner)
+        return False
+
+    async def _wait_for_callback_continuation(self) -> None:
+        """Reconcile THIS frame before cancellation releases its emission lock."""
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        cancellation = None
+        while True:
+            try:
+                await self._continue.wait()
+                break
+            except asyncio.CancelledError as error:
+                cancellation = execution_observation_error(
+                    cancellation, error, prefer_cancellation=True)
+        if cancellation is not None:
+            raise cancellation
+
+    async def _publish_item(self, item: _T, *, retain_handoff: bool = False) -> bool:
+        if self._stop.is_set():
+            return False
+        try:
+            async with owned_native_yield():
+                await self._items.put((self, item))
+                self._waiting_for_continue = True
+                try:
+                    if retain_handoff:
+                        await self._wait_for_callback_continuation()
+                    else:
+                        await self._continue.wait()
+                finally:
+                    self._waiting_for_continue = False
+        finally:
+            # Reconcile even a cancelled emitter before a sibling can publish
+            # and accidentally consume this frame's outstanding continuation.
+            self._continue.clear()
+        return not self._stop.is_set()
 
     async def _run(self) -> None:
         iterator: AsyncIterator[_T] | None = None
         try:
-            iterator = self._iterator_factory()
+            source = self._iterator_factory()
             try:
-                async for item in iterator:
-                    if self._stop.is_set():
-                        break
-                    async with owned_native_yield():
-                        await self._items.put((self, item))
-                        self._waiting_for_continue = True
-                        try:
-                            await self._continue.wait()
-                        finally:
-                            self._waiting_for_continue = False
-                    self._continue.clear()
-                    if self._stop.is_set():
-                        break
+                if isinstance(source, OwnedCallbackSource):
+                    self._callback_source = True
+                    emission_lock = asyncio.Lock()
+
+                    async def emit(item: _T) -> bool:
+                        from anyio import CancelScope, lowlevel
+
+                        # One frame owns the ORIGINAL continuation handoff.
+                        # Another child cannot consume that frame's ACK.
+                        # A sibling may already own the handoff. Relinquish
+                        # this writer BEFORE waiting for its mutex, and restore
+                        # only after releasing it, so neither emitter can pin
+                        # the writer needed by the other's continuation.
+                        # A level cancellation must not spin the original
+                        # writer-restoration loop. Shield through restoration,
+                        # not only through the frame's continuation wait.
+                        with CancelScope(shield=True) as handoff_scope:
+                            async with owned_native_yield():
+                                async with emission_lock:
+                                    # No frame has been published yet. Deliver
+                                    # pending level cancellation before new IO.
+                                    handoff_scope.shield = False
+                                    try:
+                                        await lowlevel.checkpoint_if_cancelled()
+                                    finally:
+                                        handoff_scope.shield = True
+                                    result = await self._publish_item(item, retain_handoff=True)
+                        await lowlevel.checkpoint_if_cancelled()
+                        return result
+
+                    result = await source.producer(emit)
+                    if result is not None:
+                        raise TypeError("Owned callback producer must return None")
+                else:
+                    iterator = source
+                    async for item in iterator:
+                        if not await self._publish_item(item):
+                            break
             except BaseException as error:
                 # Import lazily: execution_custody also uses this primitive.
                 # A cancellation carrying authority/commit evidence is not
@@ -1437,7 +1536,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._stop.set()
         self._continue.set()
         if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
-            self._owner_cancelled_by_close = cancel_owned_task(self._owner)
+            self._owner_cancelled_by_close = self._cancel_owner_if_running()
         outcome = await self.join_source_owners(closing=True)
         if self._construction_error is not None and outcome.error is None:
             # Reconcile ONLY the original constructor task reservation, after
@@ -1792,6 +1891,7 @@ async def run_blocking_operation(
 
 __all__ = [
     "OwnedAsyncIterator",
+    "OwnedCallbackSource",
     "OwnedTaskOutcome",
     "PendingOwnedTask",
     "await_owned_task",
