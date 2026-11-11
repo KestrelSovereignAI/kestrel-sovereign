@@ -58,22 +58,25 @@ async def retire_original_gateway_process(pid, wait, exited):
         raise_owned_outcome(await await_owned_operation(asyncio.to_thread(wait, 5)),
             operation='original native Gateway retirement')
 
+    def signal_original_group(value):
+        try:
+            assert os.getpgid(pid) == pid
+            os.killpg(pid, value)
+        except ProcessLookupError:
+            # A zombie may no longer have a process group. Its original wait
+            # still has to reap/join it; a missing group is not that receipt.
+            pass
+
     async def force_if_live():
         if not exited():
-            assert os.getpgid(pid) == pid
-            os.killpg(pid, signal.SIGKILL)
+            signal_original_group(signal.SIGKILL)
             await join()
 
     if exited():
         return
     async with AsyncExitStack() as retirement:
         retirement.push_async_callback(force_if_live)
-        try:
-            assert os.getpgid(pid) == pid
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            assert exited(), 'Original native Gateway exit is unconfirmed'
-            return
+        signal_original_group(signal.SIGTERM)
         await join()
 
 
@@ -433,7 +436,16 @@ class GatewayTestPeer(MCPTestPeer):
             except psutil.NoSuchProcess:
                 return []
             assert original.create_time() == record['created'], 'Original native Gateway PID was reused'
-            assert matches(original), 'Original native Gateway admission no longer matches its receipt'
+            try:
+                if original.status() != psutil.STATUS_ZOMBIE:
+                    assert matches(original), 'Original native Gateway admission no longer matches its receipt'
+            except psutil.ZombieProcess:
+                # The verified original can exit between status and cmdline.
+                # Its arguments disappear, but its original waiter still owns
+                # the unreaped PID. Return it for physical join, never as gone.
+                pass
+            except psutil.NoSuchProcess:
+                return []  # The original was already reaped during observation.
             return [original]
         # Intent is durable before Popen. A forced host exit between actual
         # creation and PID publication must not orphan that admitted process.
