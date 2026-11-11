@@ -58,13 +58,16 @@ async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, mo
                 await provider.client.close()
 
 
-@pytest.mark.parametrize("permission,decision,witness,fault", [
-    (PermissionLevel.DENY, "auto_denied", [], None),
-    (PermissionLevel.ALLOW, "auto_allowed", ["owned-provider-effect"], None),
-    (PermissionLevel.ALLOW, None, [], "wrong_choice"),
+@pytest.mark.parametrize("permission,decision,witness,fault,operator_input", [
+    (PermissionLevel.DENY, "auto_denied", [], None, None),
+    (PermissionLevel.ALLOW, "auto_allowed", ["owned-provider-effect"], None, None),
+    (PermissionLevel.ALLOW, None, [], "wrong_choice", None),
+    (PermissionLevel.ALLOW, "auto_allowed", [], None, 'form'),
 ])
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monkeypatch, permission, decision, witness, fault, streaming):
+async def test_full_boot_http_invoke_governs_external_mcp_effect(
+    tmp_path, monkeypatch, permission, decision, witness, fault, streaming, operator_input,
+):
     """Drive actual agent boot, HTTP invoke, provider SDK and native MCP."""
     import json
     import httpx2
@@ -74,6 +77,7 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monke
     from kestrel_sovereign.api_errors import register_api_error_handlers
     from kestrel_sovereign.endpoints.agent import router
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.feature_registry import get_package_for_feature
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
     from kestrel_sovereign.rate_limit import limiter
@@ -97,13 +101,17 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monke
         runtime.setenv("KESTREL_DATA_KEY_FILE", str(data_key))
         runtime.setenv("KESTREL_DATA_KEY", data_key.read_text().strip())
         peer = await cleanup.enter_async_context(https_peer(
-            tmp_path, runtime, provider_model="owned-permission-model", provider_fault=fault))
+            tmp_path, runtime, provider_model="owned-permission-model", provider_fault=fault,
+            operator_input=operator_input))
         dials = cleanup.enter_context(owned_provider_network(runtime, peer))
+        package = get_package_for_feature('MCPAgent')
+        assert package is not None
         (tmp_path / "kestrel.toml").write_text(
             '[llm]\nroute_priority=["deepseek:api"]\n'
             '[llm.vendors.deepseek.routes.api]\n'
             'api_key="owned-synthetic-provider-key"\n'
-            f'base_url={json.dumps(peer.provider_url)}\nmodel="owned-permission-model"\n')
+            f'base_url={json.dumps(peer.provider_url)}\nmodel="owned-permission-model"\n'
+            + (f'[features.{json.dumps(package.name)}.config.inputs]\nenabled=true\n' if operator_input else ''))
         identity = await create_kestrel_identity_async(output_dir=str(tmp_path), is_test_instance=True,
             agent_name="OwnedNativeInvoke", did_web_domain="owned-native-invoke.invalid",
             genesis_auditor=deterministic_safe_genesis_auditor,
@@ -143,6 +151,9 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monke
         app.add_middleware(PrivateDeliveryMiddleware)
         register_api_error_handlers(app)
         app.include_router(router)
+        if operator_input:
+            assert feature._input_host is not None, 'Saved input settings did not survive full native boot'
+            app.include_router(feature.get_router())
         client = await cleanup.enter_async_context(httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=app), base_url="https://owned-console.invalid",
             headers={"X-API-Key": "owned-native-invoke-key"}))
@@ -168,6 +179,63 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monke
         if fault is None:
             assert result.status_code == 200, result.text
             assert decisions == [decision], {"response": result.text, "provider_requests": peer.provider_requests()}
+            if operator_input:
+                after_calls = len([r for r in peer.provider_requests() if r['path'].endswith('/chat/completions')])
+                assert after_calls - before_calls == 1, 'Input wait retained the model loop instead of returning control'
+                assert 'waiting for operator input' in result.text
+                listed = await client.get('/api/mcp/inputs', params={'session_id': 'owned-native-permission'})
+                assert listed.status_code == 200, listed.text
+                row, = listed.json()['inputs']
+                if not streaming:
+                    from fastapi import Request
+                    from kestrel_sdk.signals import RedactionPolicy, ResourceLock, Signal, SignalMode, SourceRegistration, Trust
+                    from kestrel_sovereign.auth import caller_context_scope
+                    template = tmp_path / 'owned-input-wake.md'
+                    template.write_text('Record the owned marker using the connected MCP tool.')
+                    agent.signal_registry.register(SourceRegistration(name='owned.mcp.input', schema=dict,
+                        default_mode=SignalMode.COGNITION, allowed_modes=frozenset({SignalMode.COGNITION}),
+                        prompt_template=template, trust=Trust.TRUSTED, resources=frozenset(),
+                        log_redaction=RedactionPolicy(summarize=lambda _payload: '', store_raw_trusted=False)))
+                    signal = Signal(source='owned.mcp.input', kind='once', mode=SignalMode.COGNITION,
+                        payload={}, target_agent=agent.did, caller='owned-test-timer', origin_trust=Trust.TRUSTED)
+                    @app.post('/api/owned-input-wake')
+                    async def wake(request: Request):
+                        with caller_context_scope(request.state.caller):
+                            outcome = await agent.dispatcher.dispatch_signal(signal)
+                            return {'status': outcome.status.value, 'error': outcome.error}
+                    locks = agent._get_lock_manager()
+                    wake_call = None
+                    try:
+                        # Real CONVERSATION contention: a queued wake must not
+                        # turn its inherited HTTP credential into an approver.
+                        async with locks.acquire({ResourceLock.CONVERSATION}, label='owned-input-contention'):
+                            wake_call = asyncio.create_task(client.post('/api/owned-input-wake'))
+                            async with asyncio.timeout(5):
+                                while not any(d['blocked_acquirers'] for d in locks.active_hold_diagnostics()
+                                        if d['resource'] == ResourceLock.CONVERSATION.value):
+                                    assert not wake_call.done(), ('Signal did not reach the real conversation lock: '
+                                        + wake_call.result().text)
+                                    await asyncio.sleep(.01)
+                        woke = await asyncio.wait_for(wake_call, 15)
+                        assert woke.status_code == 200 and woke.json()['status'] == 'ok', woke.text
+                        assert await peer.witness(feature, loaded.data['connection']) == []
+                        assert await feature._input_host.store.database.fetchall(
+                            'SELECT reason FROM mcp_input_decisions') == [('no_approver',)]
+                        after_wake = await client.get('/api/mcp/inputs', params={'session_id': 'owned-native-permission'})
+                        assert after_wake.json()['inputs'] == [row]
+                        assert await feature._input_host.store.database.fetchone(
+                            'SELECT COUNT(*) FROM mcp_inputs') == (1,), 'Unattended signal created an operator wait'
+                    finally:
+                        if wake_call is not None:
+                            if not wake_call.done(): wake_call.cancel()
+                            await asyncio.gather(wake_call, return_exceptions=True)
+                continued = await client.post('/api/mcp/inputs/' + row['request_id'] + '/responses',
+                    params={'session_id': 'owned-native-permission'}, json={'revision': row['revision'],
+                        'operation_id': uuid.uuid4().hex, 'responses': {'private-form-key': {
+                            'action': 'accept', 'content': {'city': 'owned-private-answer'}}}})
+                assert continued.status_code == 200, continued.text
+                assert continued.json()['state'] == 'RESOLVED'
+                assert await peer.witness(feature, loaded.data['connection']) == ['owned-provider-effect']
         else:
             if streaming:
                 from kestrel_sovereign.llm.completion_protocol import GenerationProtocolError

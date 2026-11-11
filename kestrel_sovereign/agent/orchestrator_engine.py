@@ -1013,6 +1013,8 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
     if turn is not None:
         turn.require_confirmed()
     try:
+        if turn is not None:
+            turn.require_effect_admission()
         result = await operation()
         if turn is not None:
             turn.require_confirmed()
@@ -4244,11 +4246,12 @@ class OrchestratorEngineMixin:
                 (#2841).
         """
         _init_constants()
+        from kestrel_sovereign.tools.effect_journal import TOOL_INPUT_REQUIRED_MESSAGE, tool_effect_input_waiting
         if max_iterations is None:
             max_iterations = MAX_TOOL_ITERATIONS
 
         if isinstance(response, str):
-            return response
+            return TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response
 
         # Build message history for multi-turn tool calling
         messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
@@ -4259,7 +4262,8 @@ class OrchestratorEngineMixin:
         )
 
         if not response.has_tool_calls:
-            if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+            if (not tool_effect_input_waiting(self) and feature_tools
+                    and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or "")):
                 # #2841: this array now carries replayed history, and the repair
                 # helper appends another exchange and calls the provider WITHOUT
                 # pruning. Size it here or a near-budget turn overflows on the
@@ -4299,7 +4303,7 @@ class OrchestratorEngineMixin:
                         "role": "assistant",
                         "content": response.content or "",
                     })
-                return response.content or ""
+                return TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response.content or ""
 
         # Add initial assistant response with tool calls
         messages.append(self._build_assistant_tool_history_msg(response))
@@ -4325,6 +4329,9 @@ class OrchestratorEngineMixin:
             )
             if isinstance(batch_result, OwnedTaskHandoff):
                 batch_result.raise_outcome()
+
+            if tool_effect_input_waiting(self):
+                return TOOL_INPUT_REQUIRED_MESSAGE
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
@@ -4718,11 +4725,12 @@ class OrchestratorEngineMixin:
             Text chunks as they arrive from the LLM
         """
         _init_constants()
+        from kestrel_sovereign.tools.effect_journal import TOOL_INPUT_REQUIRED_MESSAGE, tool_effect_input_waiting
         if max_iterations is None:
             max_iterations = MAX_TOOL_ITERATIONS
 
         if isinstance(response, str):
-            yield response
+            yield TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response
             return
 
         messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
@@ -4733,7 +4741,8 @@ class OrchestratorEngineMixin:
         )
 
         if not response.has_tool_calls:
-            if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+            if (not tool_effect_input_waiting(self) and feature_tools
+                    and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or "")):
                 # #2841: see the non-streaming site — prune before repairing.
                 messages = OrchestratorEngineMixin._prune_repair_messages(
                     self, messages, feature_tools, history_ids,
@@ -4756,7 +4765,7 @@ class OrchestratorEngineMixin:
                     yield response
                     return
             if not response.has_tool_calls:
-                yield response.content or ""
+                yield TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response.content or ""
                 return
 
         messages.append(self._build_assistant_tool_history_msg(response))
@@ -4785,6 +4794,10 @@ class OrchestratorEngineMixin:
 
         for iteration in range(max_iterations):
             if _cancelled():
+                return
+
+            if tool_effect_input_waiting(self):
+                yield TOOL_INPUT_REQUIRED_MESSAGE
                 return
 
             # Stream tool starts for user visibility as typed in-band
@@ -4882,6 +4895,10 @@ class OrchestratorEngineMixin:
                 # pre-tool prose; the assistant turn persists with that
                 # partial visible text plus the ``cancelled`` metadata
                 # marker set by the persist helper.
+                return
+
+            if tool_effect_input_waiting(self):
+                yield TOOL_INPUT_REQUIRED_MESSAGE
                 return
 
             all_tools = self._build_all_tools()

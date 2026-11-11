@@ -139,6 +139,7 @@ from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.mcp_apps import MCPAppsHostMixin
 from kestrel_sovereign.mcp_oauth import MCPOAuthHostMixin
+from kestrel_sovereign.mcp_input import MCPInputHostMixin
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
@@ -1086,6 +1087,7 @@ class KestrelAgent(
     TurnLifecycleMixin,
     MCPAppsHostMixin,
     MCPOAuthHostMixin,
+    MCPInputHostMixin,
 ):
     """
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.
@@ -5450,6 +5452,7 @@ class KestrelAgent(
         if mode != self._privacy_mode:
             self._withdraw_mcp_apps_for_privacy_transition()
             self._withdraw_mcp_oauth_for_privacy_transition()
+            self._withdraw_mcp_input_for_privacy_transition()
 
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None

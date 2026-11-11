@@ -7,6 +7,8 @@ explicit dependency of the dedicated MCP CI job, never an import-or-skip.
 from uuid import uuid4
 
 import asyncio
+import json
+import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 import socket
@@ -94,7 +96,7 @@ class Boundary:
 
 
 @pytest_asyncio.fixture
-async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent):
+async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request):
     from kestrel_feature_mcp.connection import bind_tool_caller
     from kestrel_feature_mcp.feature import MCPAgent
     from tests.integration.mcp_permission_peer import create_server
@@ -104,7 +106,22 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent):
     monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "1")
     monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", ALICE + "," + BOB)
     witness = tmp_path / "native-witness"
-    native = create_server(witness, apps=True)
+    settings = getattr(request, 'param', {})
+    app_html = None
+    if settings.get('browser_app'):
+        import kestrel_feature_mcp
+        from pathlib import Path
+        assert Path('/.dockerenv').is_file(), 'Browser App production requires an owned namespace'
+        build = await asyncio.create_subprocess_exec('node', 'web/test-support/parent-browser-build.mjs', 'input-app',
+            cwd=Path(kestrel_feature_mcp.__file__).resolve().parent.parent,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        output, errors = await asyncio.wait_for(build.communicate(), 10)
+        assert build.returncode == 0, errors.decode()
+        app_html = output.decode()
+    native = create_server(witness, apps=True, operator_input=settings.get('operator_input'),
+        input_message=settings.get('input_message', 'Private city?'), input_tool=settings.get('input_tool'),
+        app_html=app_html, input_rounds=settings.get('input_rounds', 1),
+        input_schema=settings.get('input_schema'), input_content=settings.get('input_content'))
     async with AsyncExitStack() as cleanup:
         listener = socket.socket()
         cleanup.callback(listener.close)
@@ -138,8 +155,35 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent):
         await agent._register_feature(feature)
         cleanup.push_async_callback(agent._unregister_feature_runtime, feature, unload=True)
         assert not hasattr(feature, "enabled")
-        await feature.set_config({"apps": {"enabled": True,
-            "host": {"sandbox_url": "https://sandbox.apps.test/", "host_origin": "https://host.apps.test"},
+        host_configuration = {"sandbox_url": "https://sandbox.apps.test/", "host_origin": "https://host.apps.test"}
+        if settings.get('browser_app'):
+            origin = request.getfixturevalue('input_host_origin')
+            config = tmp_path / 'input-sandbox.json'
+            config.write_text(json.dumps({'listen': {'host': '127.0.0.1', 'port': 0}, 'sandbox': {
+                'hostOrigin': origin, 'maxMessageBytes': 2_097_152, 'maxHtmlBytes': 1_048_576, 'policy': {}}}))
+            errors = cleanup.enter_context((tmp_path / 'input-sandbox.log').open('wb'))
+            sandbox = await asyncio.create_subprocess_exec('node',
+                str(Path(kestrel_feature_mcp.__file__).parent / 'apps_sandbox/sandbox-service.mjs'),
+                '--config', str(config), env={'PATH': os.environ['PATH'], 'HOME': str(tmp_path)},
+                stdout=asyncio.subprocess.PIPE, stderr=errors)
+            async def close_sandbox():
+                if sandbox.returncode is None:
+                    sandbox.terminate()
+                try:
+                    assert await asyncio.wait_for(sandbox.wait(), 5) == 0
+                except TimeoutError:
+                    sandbox.kill()
+                    await sandbox.wait()
+                    raise
+            cleanup.push_async_callback(close_sandbox)
+            ready = json.loads(await asyncio.wait_for(sandbox.stdout.readline(), 10))
+            assert ready['event'] == 'mcp-apps-sandbox-listening'
+            host_configuration = {'host_origin': origin,
+                'sandbox_url': f'http://127.0.0.1:{ready["address"]["port"]}/proxy'}
+        await feature.set_config({**({'inputs': {'enabled': True,
+            'host': {'max_payload_bytes': settings.get('input_max_payload_bytes', 8192), 'retention_seconds': 60.0}}}
+            if settings.get('operator_input') else {}), "apps": {"enabled": True,
+            "host": host_configuration,
             "max_pending_calls": 4, "max_publications": 8, "max_views": 8,
             "max_payload_bytes": 8192, "max_publications_per_owner": 4,
             "max_views_per_owner": 4, "retention_seconds": 60.0}})

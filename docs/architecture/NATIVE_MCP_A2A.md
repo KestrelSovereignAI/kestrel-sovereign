@@ -456,19 +456,24 @@ extensible for future supported methods without claiming them today. Do not
 advertise it until the durable wait provider and tool-call result path handle
 both shapes. Register the task before releasing the originating dispatch.
 
-The Phase 0 candidate `mcp==2.3.0` does **not** ship the 2026 Tasks extension.
-Its exported `CreateTaskResult` is the old 2025 core type and must not be used
-for this extension; the required native `tasks/get`, `tasks/update` and
-`tasks/cancel` implementation is absent. Its tool-call-only result claims and
-resource/prompt parsers follow the extension's current method set; they are not
-support gaps. A6 is gated on
-[#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684): select
-an actual official extension/SDK package and revision supporting the published
-tool-call task contract, or contribute that support to the official SDK, then raise dependency
-bounds as needed. The candidate is not a ceiling to retain. No partial
-advertisement, private wire types or generic-result adapter fills this gap.
-Until that gate passes, do not advertise Tasks; surface a server's required-
-capability error clearly instead of accepting work whose result cannot be read.
+The Phase 0 candidate `mcp==2.3.0` does **not** ship concrete classes for the
+2026 Tasks extension. Its exported `CreateTaskResult` is the old 2025 core type
+and must not be used for this extension. Implement the published task contract
+through the official SDK's public `ClientExtension` and `ResultClaim` interfaces,
+with typed requests/results checked against the official 2026-07-28 schema and
+recorded schema provenance. Keep MCP on its published official Python SDK.
+This uses the SDK's extension mechanism; it does not introduce a private wire
+protocol or a generic-result adapter, and it does not require an upstream PR or
+a separate Python Tasks distribution before implementation can proceed.
+
+[#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684)
+still requires the durable task/wait provider, authorized task operations,
+tool-call result handling and interoperability tests. The method-specific
+result claims must follow the extension's published method set. Raise dependency
+bounds when required; the Phase 0 version is not a ceiling. Until the actual
+provider handles these requirements, do not advertise Tasks. Surface a server's
+required-capability error clearly instead of accepting work whose result cannot
+be retrieved.
 
 When `tasks/get` reports `input_required`, classify its `inputRequests` using
 the same machine/operator rules and policy below. Respond through
@@ -510,6 +515,31 @@ restart, key rotation or expiry. Rejected/expired state makes the continuation
 explicitly non-resumable; retain an unknown dispatch outcome if execution cannot
 be established. Never drop state and submit a fresh side effect automatically.
 Results without `resultType` remain `complete` as the SDK specifies.
+
+Core's optional `mcp-input` host owns encrypted checkpoint custody and fresh
+authenticated readers at `/api/mcp/inputs`. The MCP 0.16 tool-call path can
+persist a form checkpoint and return an audited `mcp_input` part containing only
+its reference and original chat selector. Neither is an authorization grant.
+The original effect turn records the pending input through its existing nested
+turn state and refuses another admission before approvals or network I/O.
+Both orchestrator modes return a waiting message without another model call.
+
+Submitting `/api/mcp/inputs/{reference}/responses` independently authenticates
+the principal and chat, validates the original form schema, invokes the current
+governed tool binding and atomically consumes the waiting revision before the
+native continuation. Permission denial leaves the checkpoint waiting; a claimed
+or uncertain response never becomes a fresh initial call. Completed public
+projections and next-form references remain encrypted so a reloaded card can
+recover them without replay. The response deadline does not delete historical
+encrypted reconciliation records. SQLite and PostgreSQL share the same custody
+contract on the primary database.
+
+App continuations additionally retain the original physical View and its fresh
+private reader through the actual outer HTTP send. A closed or lost View cannot
+be adopted after restart. Native private results are delivered only to that
+View; an initial App publication follows Core's normal audited part path.
+The current delivery covers forms from governed tool calls. Resource/prompt
+operator waits and durable Tasks are not established by these tool-call tests.
 
 For operator-required input, signal-driven turns and
 `NON_INTERACTIVE_SESSION_IDS` keep the shipped #3439 behavior:

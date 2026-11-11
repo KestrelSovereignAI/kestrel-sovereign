@@ -775,7 +775,7 @@ async def create_owned_mcp_catalog(path, definition, reference):
 @asynccontextmanager
 async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None,
                      provider_fault: str | None = None, drop_first_tool_reply: bool = False,
-                     provider_only: bool = False):
+                     provider_only: bool = False, operator_input: str | None = None):
     if provider_only:
         assert provider_model is not None, 'Provider-only fixture requires its finite provider model'
     hostname = "remote-permission.example"
@@ -789,6 +789,7 @@ async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None
             "--witness", str(witness), "--ready", str(ready),
             *(["--provider-model", provider_model] if provider_model is not None else []),
             *(["--provider-fault", provider_fault] if provider_fault is not None else []),
+            *(['--operator-input', operator_input] if operator_input is not None else []),
             *(["--drop-first-tool-reply"] if drop_first_tool_reply else []),
             env={"PATH": os.environ["PATH"], "PYTHONUNBUFFERED": "1"},
             stdout=output, stderr=asyncio.subprocess.STDOUT,

@@ -38,6 +38,13 @@ class ToolEffectOutcomeUnconfirmed(ResourceOutcomeUnknown):
     """A turn observed an uncertain effect and must not narrate success."""
 
 
+TOOL_INPUT_REQUIRED_MESSAGE = 'A tool is waiting for operator input. No final result has been received.'
+
+
+class ToolEffectInputRequired(ResourceConflict):
+    """A confirmed checkpoint fences further effects in its originating turn."""
+
+
 def requires_tool_effect_reconciliation(error: BaseException | None) -> bool:
     """Native ACK/retirement uncertainty also fences pre-body journal work."""
     return bool(observed_outcome_unknown(error)
@@ -125,6 +132,7 @@ class ToolEffectTurn:
     closing: bool = False
     pending: dict[asyncio.Future, asyncio.Task] = field(default_factory=dict)
     unconfirmed: list[BaseException] = field(default_factory=list)
+    operator_input_refs: list[str] = field(default_factory=list)
 
     privacy_lock: Any = field(init=False, repr=False)
     privacy_scope: Any = field(init=False, repr=False)
@@ -159,6 +167,11 @@ class ToolEffectTurn:
                 _record_uncertain_effect(self, control)
         if self.unconfirmed:
             raise ToolEffectOutcomeUnconfirmed("tool_effect_outcome_unconfirmed") from self.unconfirmed[0]
+
+    def require_effect_admission(self) -> None:
+        self.require_confirmed()
+        if self.operator_input_refs:
+            raise ToolEffectInputRequired(TOOL_INPUT_REQUIRED_MESSAGE)
 
     async def close(self, error: BaseException | None = None) -> None:
         """Join original claimants before closing admission; never cancel them."""
@@ -264,6 +277,24 @@ def current_tool_effect_turn(owner: Any) -> ToolEffectTurn | None:
     return current_tool_effect_state(owner)[0]
 
 
+def tool_effect_input_waiting(owner: Any) -> bool:
+    turn = current_tool_effect_turn(owner)
+    return turn is not None and bool(turn.operator_input_refs)
+
+
+def record_tool_effect_input_required(owner: Any, reference: str) -> None:
+    """Only a persisted host checkpoint in an actual live claim can pause work."""
+    from kestrel_sdk._validation import stable_token
+    stable_token(reference, 'input reference')
+    turn, claim = current_tool_effect_state(owner)
+    if turn is None or claim is None or claim.attempt is not turn.attempt:
+        raise ToolEffectJournalUnavailable('tool_effect_input_claim_unavailable')
+    turn.require_live(owner)
+    require_execution_work(owner)
+    turn.require_confirmed()
+    turn.operator_input_refs.append(reference)
+
+
 @contextmanager
 def bind_tool_effect_turn(
     state: tuple[ToolEffectTurn | None, ToolEffectClaim | None],
@@ -299,7 +330,7 @@ async def admit_tool_effect_turn(
     if parent is not None:
         parent.require_live(owner)
         parent.privacy_lock.require_native_scope(parent.privacy_scope)
-        parent.require_confirmed()
+        parent.require_effect_admission()
     async with owner._get_durable_persistence_gate().shared_lock():
         privacy = owner.privacy_config
         if privacy is None:
@@ -315,7 +346,8 @@ async def admit_tool_effect_turn(
         # replace this original input's live uncertainty fence in either
         # direction. Native membership was checked before admission above.
         return ToolEffectTurn(owner, store, attempt, invocation_id,
-            unconfirmed=parent.unconfirmed if parent is not None else [])
+            unconfirmed=parent.unconfirmed if parent is not None else [],
+            operator_input_refs=parent.operator_input_refs if parent is not None else [])
 
 
 async def execute_tool_effect(
@@ -333,7 +365,7 @@ async def execute_tool_effect(
     if turn is None:
         raise ToolEffectJournalUnavailable("tool_effect_attempt_unavailable")
     turn.require_live(owner)
-    turn.require_confirmed()
+    turn.require_effect_admission()
     turn.privacy_lock.require_native_scope(turn.privacy_scope)
     # This is a live execution query, not an error-classification dependency.
     # Importing the agent package during journal initialization loops through
@@ -358,6 +390,7 @@ async def execute_tool_effect(
             if store is not turn.store:
                 raise ToolEffectJournalUnavailable("tool_effect_journal_changed")
             require_execution_work(owner)
+            turn.require_effect_admission()
             try:
                 claim = await store.claim(
                     turn.attempt, registration=[generation, registration], arguments=arguments,
