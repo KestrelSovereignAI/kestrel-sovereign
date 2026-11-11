@@ -48,17 +48,33 @@ async def test_one_creators_retries_do_not_starve_older_waiting_deliveries(
             for creator in ("did:healthy-b", "did:healthy-c")
         }
         await outbox.forward_pending(limit=1000)
+        healthy_consumers = [s.consumer_id for s in await outbox.subscriptions() if s.task_id in healthy]
         runner = worker(outbox)
         runner.batch_size = 3
-        runner.transport.timeout = 0.25
+        # One deadline both fails the slow peer and bounds the healthy
+        # exchange, whose TLS handshake the fixture serializes in one accept
+        # thread. 0.25 s missed that on a loaded CI runner. 1 s stays below the
+        # drip's 1.6 s, as in the transport's own drip test.
+        runner.transport.timeout = 1
         runner.retry_delay = timedelta(milliseconds=10)
         counts = []
         for _ in range(3):
             counts.append(await runner.run_once())
             assert counts[-1] <= 3, "the worker admitted more than its finite batch"
+        # Selection is the fairness property, so read it from the ledger: a
+        # healthy delivery that missed the deadline was still admitted.
+        assert len(healthy_consumers) == 2
+        for consumer_id in healthy_consumers:
+            attempts = await outbox.backend.fetch_val(
+                "SELECT attempts FROM durable_signal_deliveries WHERE consumer_id = ?",
+                (consumer_id,),
+            )
+            assert attempts is not None and attempts >= 1, (
+                "retrying callbacks monopolized the batch ahead of healthy waiting creators"
+            )
         received = [body["task"]["id"] for path, _, body in outbound_tls.posts if path == "/healthy"]
         assert set(received) == healthy and len(received) == 2, (
-            "retrying callbacks monopolized the batch ahead of healthy waiting creators"
+            "a healthy callback was admitted but its exchange missed the delivery deadline"
         )
         assert all(count <= 3 for count in counts)
         assert len(outbound_tls.posts) <= 9
