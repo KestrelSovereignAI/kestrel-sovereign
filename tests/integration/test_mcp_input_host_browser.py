@@ -8,14 +8,13 @@ import socket
 
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
-import kestrel_feature_mcp
 import kestrel_sovereign
 import pytest
 import uvicorn
 from kestrel_sovereign import server as core_server
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 
-from tests.integration.test_mcp_apps_host import apps_boundary
+from tests.integration.test_mcp_apps_host import apps_boundary, mcp_browser_support
 from tests.integration.test_mcp_input_host import wire
 
 RICH_SCHEMA = {'type': 'object', 'properties': {
@@ -67,10 +66,22 @@ def input_host_origin(input_listener):
     {'operator_input': 'form', 'input_tool': 'mutate_marker', 'browser_app': True,
         'input_schema': {'type': 'object', 'properties': {'city': {'type': 'string', 'format': 'uri'}},
             'required': ['city']}, 'input_content': {'city': 'https://example.test/private-path'}},
+    *[{'operator_input': 'form', **mode, 'input_schema': {'type': 'object', 'properties': {
+        'city': {'type': 'string'}, 'count': {'type': 'integer', 'minimum': .5, 'maximum': 2}},
+        'required': ['city', 'count']}, 'input_content': {'city': 'owned-private-answer', 'count': 1}}
+        for mode in [{}, {'input_tool': 'mutate_marker', 'browser_app': True}]],
+    {'operator_input': 'form', 'input_schema': {'type': 'object', 'properties': {
+        'city': {'type': 'string', 'maxLength': 1}}, 'required': ['city']},
+        'input_content': {'city': '\U0001f422'}},
+    {'operator_input': 'form', 'input_schema': {'type': 'object', 'properties': {
+        'city': {'type': 'string'}, 'contact': {'type': 'string', 'format': 'email'}},
+        'required': ['city', 'contact']},
+        'input_content': {'city': 'owned-private-answer', 'contact': '"a b"@example.test'}},
 ], indirect=True)
 async def test_native_console_input_card_and_private_dom_retirement(
-    apps_boundary, tmp_path, monkeypatch, input_listener, request,
+    apps_boundary, tmp_path, monkeypatch, input_listener, request, mcp_browser_support,
 ):
+    import kestrel_feature_mcp
     assert Path('/.dockerenv').is_file(), 'Native browser tests require an owned process namespace'
     assert not Path('/var/run/docker.sock').exists() and not os.environ.get('DOCKER_HOST')
     b = apps_boundary
@@ -80,7 +91,7 @@ async def test_native_console_input_card_and_private_dom_retirement(
         tool = next(item for item in b.tools if item.tool.native_tool.name == 'mutate_marker')
         await b.permissions.set_permission('mcp:owned-apps', tool.binding.name, PermissionLevel.ALLOW)
     monkeypatch.setattr(core_server, 'SERVE_UI', True)
-    repository = Path(kestrel_feature_mcp.__file__).resolve().parent.parent
+    repository = mcp_browser_support
     build = await asyncio.create_subprocess_exec('node', 'web/test-support/parent-browser-build.mjs', 'input',
         cwd=repository, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     script, errors = await asyncio.wait_for(build.communicate(), 10)
@@ -98,7 +109,8 @@ async def test_native_console_input_card_and_private_dom_retirement(
     static = Path(kestrel_sovereign.__file__).parent / 'static'
     b.app.mount('/js', StaticFiles(directory=static / 'js'))
     b.app.mount('/shared', StaticFiles(directory=static / 'shared'))
-    b.app.mount('/features/mcpagent/static', StaticFiles(directory=repository / 'kestrel_feature_mcp/apps_sandbox'))
+    b.app.mount('/features/mcpagent/static', StaticFiles(
+        directory=Path(kestrel_feature_mcp.__file__).resolve().parent / 'apps_sandbox'))
     listener = input_listener
     server = uvicorn.Server(uvicorn.Config(b.app, log_level='error'))
     serving = asyncio.create_task(server.serve(sockets=[listener]))
