@@ -54,6 +54,9 @@ FAILED = "failed"
 TERMINAL_ACKABLE = "terminal_ackable"
 _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED, TERMINAL_ACKABLE})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
+# The rows a settlement pass pages through: terminal, never acknowledged
+# (#4001). The terminal-page index and its query share this predicate.
+_TERMINAL_PAGE_PREDICATE = f"status IN ('{FAILED}', '{TERMINAL_ACKABLE}')"
 _DEACTIVATED_CONSUMER_ERROR = "durable consumer deactivated"
 # The emitting dispatcher's first lease on a payload-elided delivery expired
 # (or its transfer failed) before any worker claimed it. The row is released
@@ -3429,6 +3432,13 @@ class DurableSignalStore(UnifiedStoreBase):
             f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_event "
             f"ON {self.DELIVERIES}(event_id, status)"
         )
+        # Terminal rows a settlement pass pages through in delivery-ID order
+        # (#4001). Partial, so live claim traffic never maintains it.
+        await self._backend.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_terminal_page "
+            f"ON {self.DELIVERIES}(agent_id, consumer_id, status, delivery_id) "
+            f"WHERE {_TERMINAL_PAGE_PREDICATE}"
+        )
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
             f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
@@ -3638,6 +3648,8 @@ class DurableSignalStore(UnifiedStoreBase):
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
         ingress_attestation: Optional[DurableIngressAttestation] = None,
         admission_fence: Any = None,
+        refused_consumer_id: Optional[str] = None,
+        refusal_error: Optional[str] = None,
     ) -> DurableEventPersistence:
         """Commit a persisted signal and all matching initial deliveries.
 
@@ -3678,7 +3690,23 @@ class DurableSignalStore(UnifiedStoreBase):
         ``admission_fence`` is an optional host-owned native transaction
         validator. It is applied only while this method persists the event
         and deliveries; no consumer or later cognition inherits its scope.
+
+        ``refused_consumer_id`` records a signal the dispatcher refused before
+        any consumer could run it (#4001). Only that consumer gets a delivery,
+        and it is committed ``failed`` with ``refusal_error``: never claimable,
+        but a durable record that its work was never delivered. A duplicate
+        source event commits nothing, so a refusal never overrides an
+        identity whose earlier attempt was already admitted.
         """
+        if (refused_consumer_id is None) != (refusal_error is None):
+            raise ValueError(
+                "refused_consumer_id and refusal_error must be set together"
+            )
+        if refused_consumer_id is not None:
+            self._require_nonempty("refused_consumer_id", refused_consumer_id)
+            self._require_nonempty("refusal_error", refusal_error)
+            if initial_lease_owner is not None:
+                raise ValueError("A refused signal has no initial reservation")
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
         self._require_nonempty("agent_id", agent_id)
@@ -3853,7 +3881,28 @@ class DurableSignalStore(UnifiedStoreBase):
                 )
                 delivery_ids: list[str] = []
                 initial_reservations: list[DurableInitialDeliveryReservation] = []
+                if refused_consumer_id is not None:
+                    consumer_rows = [
+                        row for row in consumer_rows if row[0] == refused_consumer_id
+                    ]
+                    if not consumer_rows:
+                        raise RuntimeError(
+                            "A refused signal's consumer is not an active "
+                            "registration for its source"
+                        )
                 for consumer_id, selector, max_attempts, lease_seconds in consumer_rows:
+                    if refused_consumer_id is not None:
+                        delivery_id = await self._insert_delivery_locked(
+                            agent_id=agent_id,
+                            consumer_id=consumer_id,
+                            event_id=signal.id,
+                            max_attempts=int(max_attempts),
+                            now=now,
+                            failed_error=refusal_error,
+                        )
+                        if delivery_id is not None:
+                            delivery_ids.append(delivery_id)
+                        continue
                     if not self._matches_selector(selector_event, selector):
                         continue
                     reservation_token = None
@@ -5487,8 +5536,6 @@ class DurableSignalStore(UnifiedStoreBase):
         rebuildable_sources: Optional[Iterable[str]] = None,
         claim_executor_id: Optional[str] = None,
         runtime_owner_stale_before: Optional[datetime] = None,
-        after_delivery_id: Optional[str] = None,
-        retention_expired_before: Optional[datetime] = None,
     ) -> list[DurableDelivery]:
         """List observable delivery state within one agent/tenant only.
 
@@ -5498,11 +5545,6 @@ class DurableSignalStore(UnifiedStoreBase):
         row of any other source stores no caller and can run only from its
         provider's redelivery (#3392). A claimable window must use the same
         runtime-owner staleness cutoff as its subsequent native claim.
-
-        With ``after_delivery_id``, list one keyset page in delivery-ID order:
-        the rows after that ID (``""`` for the first page). With
-        ``retention_expired_before``, list only rows whose event's retention
-        ended before it.
         """
         self._require_nonempty("agent_id", agent_id)
         if limit < 1 or limit > 1000:
@@ -5512,14 +5554,6 @@ class DurableSignalStore(UnifiedStoreBase):
         if consumer_id is not None:
             where.append("d.consumer_id = ?")
             params.append(consumer_id)
-        if after_delivery_id is not None:
-            if not isinstance(after_delivery_id, str):
-                raise ValueError("after_delivery_id must be a delivery ID string")
-            where.append("d.delivery_id > ?")
-            params.append(after_delivery_id)
-        if retention_expired_before is not None:
-            where.append("e.retention_until < ?")
-            params.append(self.to_timestamp_param(_as_utc(retention_expired_before)))
         if claim_executor_id is not None:
             self._require_nonempty("claim_executor_id", claim_executor_id)
             where.append(self._managed_retry_claim_sql(alias="d"))
@@ -5553,13 +5587,55 @@ class DurableSignalStore(UnifiedStoreBase):
                 raise ValueError("statuses must be durable delivery states")
             where.append("d.status IN (" + ", ".join("?" for _ in wanted) + ")")
             params.extend(wanted)
-        order = (
-            "d.delivery_id" if after_delivery_id is not None
-            else "d.created_at, d.delivery_id"
-        )
         rows = await self._backend.fetch_all(
             self._delivery_select_sql(" AND ".join(where))
-            + f" ORDER BY {order} LIMIT ?",
+            + " ORDER BY d.created_at, d.delivery_id LIMIT ?",
+            tuple(params + [limit]),
+        )
+        return [self._row_to_delivery(row) for row in rows]
+
+    async def list_terminal_deliveries_page(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        status: str,
+        after_delivery_id: str,
+        limit: int,
+        retention_expired_before: Optional[datetime] = None,
+    ) -> list[DurableDelivery]:
+        """One keyset page of a consumer's rows in one terminal status.
+
+        The rows after ``after_delivery_id`` (``""`` for the first page), in
+        delivery-ID order. The status is a literal in the statement, so the
+        terminal index serves both the range and the order and a page reads
+        only the rows it returns (#4001). With ``retention_expired_before``,
+        only rows whose event's retention ended before it.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        if status not in (FAILED, TERMINAL_ACKABLE):
+            raise ValueError("status must be a terminal, unacknowledged state")
+        if not isinstance(after_delivery_id, str):
+            raise ValueError("after_delivery_id must be a delivery ID string")
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        where = [
+            "d.agent_id = ?",
+            "d.consumer_id = ?",
+            f"d.status = '{status}'",
+            # SQLite uses a partial index only when the query repeats the
+            # index's own predicate; an implying equality is not enough.
+            f"d.{_TERMINAL_PAGE_PREDICATE}",
+            "d.delivery_id > ?",
+        ]
+        params: list[Any] = [agent_id, consumer_id, after_delivery_id]
+        if retention_expired_before is not None:
+            where.append("e.retention_until < ?")
+            params.append(self.to_timestamp_param(_as_utc(retention_expired_before)))
+        rows = await self._backend.fetch_all(
+            self._delivery_select_sql(" AND ".join(where))
+            + " ORDER BY d.delivery_id LIMIT ?",
             tuple(params + [limit]),
         )
         return [self._row_to_delivery(row) for row in rows]
@@ -6384,31 +6460,42 @@ class DurableSignalStore(UnifiedStoreBase):
         now: datetime,
         initial_reservation_owner: Optional[str] = None,
         initial_reservation_token: Optional[str] = None,
+        failed_error: Optional[str] = None,
     ) -> Optional[str]:
         initial_reservation = initial_reservation_owner is not None
         if initial_reservation != (initial_reservation_token is not None):
             raise ValueError(
                 "initial reservation owner and token must be set together"
             )
+        if failed_error is not None and initial_reservation:
+            raise ValueError("A failed delivery has no initial reservation")
+        status = (
+            FAILED if failed_error is not None
+            else INITIAL_RESERVED if initial_reservation
+            else PENDING
+        )
+        terminal_at = now if failed_error is not None else None
         delivery_id = secrets.token_urlsafe(18)
         inserted = await self._backend.execute(
             f"""
             INSERT OR IGNORE INTO {self.DELIVERIES} (
                 delivery_id, agent_id, consumer_id, event_id, status,
                 attempts, max_attempts, lease_owner, lease_token,
-                lease_expires_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                lease_expires_at, last_error, terminal_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 delivery_id,
                 agent_id,
                 consumer_id,
                 event_id,
-                INITIAL_RESERVED if initial_reservation else PENDING,
+                status,
                 max_attempts,
                 initial_reservation_owner,
                 initial_reservation_token,
                 None,
+                None if failed_error is None else failed_error[:500],
+                None if terminal_at is None else self.to_timestamp_param(terminal_at),
                 self.to_timestamp_param(now),
                 self.to_timestamp_param(now),
             ),

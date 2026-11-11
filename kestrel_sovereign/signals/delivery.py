@@ -51,9 +51,15 @@ by a durable pending row). Do not invent a third.
 
 Detachment
 ----------
-A supervisor, like the dispatch it awaits, is its own unit of work: it is
-created inside :func:`detached_from_enclosing_turn`, never as part of the turn
-that happened to enqueue it (#4001).
+A dispatch, and any supervisor that awaits a dispatch's delivery, is its own
+unit of work and never part of the turn that enqueued it (#4023). Every one is
+created inside :func:`detached_from_enclosing_turn`: the dispatcher's
+``enqueue_*`` Tasks, :func:`supervise_terminal_delivery`,
+:func:`harvest_detached_delivery`, and each producer's own supervisor (the A2A
+submitted and completed wakes, the restart coordinator's
+``restart.completed`` acknowledgement). A Task created from turn context
+without it joins that turn's retirement, and a COGNITION wake then deadlocks
+the agent; see :func:`detached_from_enclosing_turn`.
 """
 
 from __future__ import annotations
@@ -103,14 +109,14 @@ def detached_from_enclosing_turn() -> Iterator[None]:
     """Create Tasks that are their own unit of work, not the current turn's.
 
     A Task copies its creator's context, and inside a turn that context
-    carries two turn-scoped authorities (#4001):
+    carries two turn-scoped authorities (#4023):
 
     * membership of the turn's native privacy lifetime. The Task becomes a
       join obligation of the turn's effect-journal retirement, which runs
       after the turn has released CONVERSATION and holds the
       privacy-transition lock until every member settles;
     * the turn's delegated CONVERSATION ownership, so a turn the Task starts
-      while the creating turn still holds CONVERSATION is refused as a
+      while the creating turn still holds CONVERSATION is treated as a
       re-entry into that hold rather than queued.
 
     A signal dispatch is neither part of its creator's turn nor a re-entry
@@ -118,8 +124,9 @@ def detached_from_enclosing_turn() -> Iterator[None]:
     the privacy lock as any other turn does. The same holds for a supervisor
     that awaits that wake's delivery. Enrolled, either one deadlocks the
     agent: the retirement waits for the wake while holding the privacy lock,
-    and the wake, or a turn that took CONVERSATION before it, waits for that
-    lock. Every dispatch and delivery supervisor is created in here.
+    and the wake, having taken CONVERSATION, waits for that lock. Every
+    dispatch and delivery supervisor is created in here. It owns no
+    coordinator of its own.
     """
     with outside_native_privacy_lifetime(), without_delegated_lock_ownership():
         yield
@@ -337,9 +344,7 @@ def supervise_terminal_delivery(
                     raise execution_observation_error(body_error, cleanup_error, prefer_cancellation=True)
 
     with detached_from_enclosing_turn():
-        return feature._track_owned_background_task(
-            _await_and_settle(), name=task_name
-        )
+        return feature._track_owned_background_task(_await_and_settle(), name=task_name)
 
 
 def harvest_detached_delivery(

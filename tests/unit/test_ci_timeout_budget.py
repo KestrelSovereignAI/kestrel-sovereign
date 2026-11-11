@@ -241,6 +241,23 @@ def test_original_shutdown(tmp_path, capfd, caplog):
     assert result.returncode == 0, result.stdout
 
 
+@pytest.mark.parametrize('interval', [0, -1, float('nan'), float('inf')])
+def test_owned_lifespan_observer_requires_finite_positive_interval(tmp_path, interval):
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    with pytest.raises(ValueError, match='finite and positive'):
+        ObservedHost(None, 'unused', tmp_path, shutdown_trace_interval=interval)
+
+
+async def _wait_for_original_shutdown_snapshots(caplog):
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 1
+    while caplog.text.count('Owned shutdown snapshot') < 2 and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+
+
 def _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog):
     """Real ASGI lifespan diagnostics; this is not a Core boot/retirement test."""
     import asyncio
@@ -255,7 +272,7 @@ def _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog):
     async def lifespan(app):
         phases.append('startup')
         yield
-        await asyncio.sleep(0.15)
+        await _wait_for_original_shutdown_snapshots(caplog)
         phases.append('shutdown')
 
     observed = ObservedHost(FastAPI(lifespan=lifespan), 'unused', tmp_path,
@@ -278,6 +295,7 @@ def _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog):
     assert 'Owned shutdown pending task:' in caplog.text
     assert 'Owned shutdown await:' in caplog.text
     assert 'lifespan' in caplog.text
+    assert caplog.text.count('Owned shutdown snapshot') >= 2
     # The timer is scoped to that original lifespan, not left for another app.
     import time
     time.sleep(0.06)
@@ -300,6 +318,7 @@ async def test_owned_lifespan_observer_retires_pending_callback_on_every_exit(
     @asynccontextmanager
     async def lifespan(app):
         yield
+        await _wait_for_original_shutdown_snapshots(caplog)
         if fail_shutdown:
             raise failure
 
@@ -330,9 +349,48 @@ async def test_owned_lifespan_observer_retires_pending_callback_on_every_exit(
             'lifespan.shutdown.failed' if fail_shutdown else 'lifespan.shutdown.complete']
         # Keep the SAME loop alive beyond the diagnostic interval. TestClient
         # closing its own loop would conceal an unretired callback.
-        await asyncio.sleep(0.06)
-        assert 'Owned shutdown ' not in caplog.text
+        assert caplog.text.count('Owned shutdown snapshot') >= 2
+        diagnostic = caplog.text
+        await asyncio.sleep(0.15)
+        assert caplog.text == diagnostic
     finally:
         if not serving.done():
             serving.cancel()
         await asyncio.gather(serving, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_owned_shutdown_observer_reports_busy_original_sqlite_worker(tmp_path, caplog):
+    """Observe the actual worker's native call without reading SQL or results."""
+    import asyncio
+    import threading
+    import aiosqlite
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    entered, release = threading.Event(), threading.Event()
+
+    def original_work():
+        entered.set()
+        assert release.wait(5), 'Test did not release its original SQLite worker'
+        return 1
+
+    async with aiosqlite.connect(':memory:') as connection:
+        await connection.create_function('owned_observation_only', 0, original_work)
+
+        async def query():
+            async with connection.execute('SELECT owned_observation_only()') as cursor:
+                return await cursor.fetchone()
+
+        original = asyncio.create_task(query())
+        try:
+            assert await asyncio.to_thread(entered.wait, 1), 'Original SQLite work never entered'
+            ObservedHost(None, 'unused', tmp_path).record_shutdown_tasks()
+            assert 'Owned shutdown SQLite worker:' in caplog.text
+            assert 'function=Connection.execute' in caplog.text
+            assert 'future_done=False future_cancelled=False' in caplog.text
+            assert 'owned_observation_only' not in caplog.text
+            assert not original.done()
+        finally:
+            release.set()
+            result = await original
+        assert result == (1,)

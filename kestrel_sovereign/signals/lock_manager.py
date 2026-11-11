@@ -60,11 +60,11 @@ _delegated_lock_ownership: ContextVar[dict[int, frozenset[object]]] = ContextVar
 
 @contextmanager
 def without_delegated_lock_ownership() -> Iterator[None]:
-    """Create Tasks that hold none of their creator's delegated locks (#4001).
+    """Create Tasks that hold none of their creator's delegated locks (#4023).
 
     A Task copies its creator's context, delegation included. Work started
     here is its own unit: a COGNITION wake created inside a turn must queue
-    for CONVERSATION like any other turn, not be refused as a re-entry into
+    for CONVERSATION like any other turn, not be treated as a re-entry into
     the hold of the turn that created it.
     """
     reset = _delegated_lock_ownership.set({})

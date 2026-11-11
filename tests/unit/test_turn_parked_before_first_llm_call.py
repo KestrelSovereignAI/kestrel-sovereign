@@ -10,7 +10,10 @@ privacy-transition lock after the turn releases CONVERSATION, and joins every
 Task the turn created. A dispatched signal's COGNITION route is one of those
 and waits for CONVERSATION; a turn that took CONVERSATION in between waits for
 the privacy lock. A dispatched signal is now created outside the dispatching
-turn's privacy lifetime.
+turn's privacy lifetime; those regressions are in
+``test_wake_detached_from_enclosing_turn.py`` (#4023). This file covers Stop
+reaching a parked turn, and the settlement of work a wake that ended
+undelivered carried.
 
 Every agent here is real, on real storage; only the model is scripted.
 """
@@ -19,16 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.signals import (
-    RedactionPolicy,
     ResourceLock,
-    Signal,
-    SignalMode,
-    SourceRegistration,
 )
 
 from kestrel_sovereign.agent.invocation import InvocationCancelledError
@@ -93,23 +90,6 @@ async def _settle(agent, tasks, label):
     return done
 
 
-def _cognition_registration(tmp_path: Path, name: str) -> SourceRegistration:
-    template = tmp_path / f"{name}.md"
-    template.write_text("A signal woke you. Reply briefly.\n", encoding="utf-8")
-    return SourceRegistration(
-        name=name,
-        schema=dict,
-        default_mode=SignalMode.COGNITION,
-        allowed_modes=frozenset({SignalMode.COGNITION}),
-        prompt_template=template,
-        log_redaction=RedactionPolicy(
-            summarize=lambda _payload: "test wake",
-            store_raw_trusted=False,
-            redact_caller_identifier=True,
-        ),
-    )
-
-
 async def _park_after_begin(agent, monkeypatch):
     """Park the next turn on a future nothing resolves, just after ``begin``.
 
@@ -148,218 +128,6 @@ async def _receipt_store(tmp_path):
     store = StopReceiptStore(database)
     await store.ensure_schema()
     return database, store
-
-
-@pytest.mark.parametrize("delivery", ["enqueue_signal", "enqueue_durable_cognition"])
-async def test_a_signal_a_turn_dispatches_leaves_the_turn_queued_behind_it_runnable(
-    tmp_path, monkeypatch, delivery
-):
-    """The incident's cycle: a turn enqueues a COGNITION wake for its own agent
-    while another turn waits for CONVERSATION.
-
-    Before the fix the enqueuing turn's retirement held the privacy lock until
-    the wake's turn ended, the queued turn took CONVERSATION and waited for the
-    privacy lock, and the wake waited for CONVERSATION. All three hung.
-    ``enqueue_durable_cognition`` is the path an A2A wake takes.
-    """
-    from kestrel_sovereign.signals import DurableConsumerRegistration
-
-    async with booted_agent(
-        tmp_path / "agent", name="Waker", provenance="test:4001-dispatch", features=set()
-    ) as agent:
-        agent.signal_registry.register(_cognition_registration(tmp_path, "test.wake"))
-        if delivery == "enqueue_durable_cognition":
-            await agent.dispatcher.register_durable_consumer(
-                DurableConsumerRegistration(
-                    consumer_id="test-wake-consumer",
-                    source="test.wake",
-                    agent_id=agent.did,
-                    max_attempts=0,
-                )
-            )
-
-        async def dispatch(signal):
-            if delivery == "enqueue_signal":
-                return await agent.dispatcher.enqueue_signal(signal)
-            return await agent.dispatcher.enqueue_durable_cognition(
-                signal, source_event_id="test-wake-1", consumer_id="test-wake-consumer"
-            )
-        queued = asyncio.Event()
-        wakes = []
-        handles = []
-
-        async def generate(kwargs):
-            messages = kwargs.get("messages") or [{}]
-            if any("A signal woke you" in str(m.get("content")) for m in messages):
-                wakes.append(True)
-            elif not handles:
-                # The second turn is already waiting for CONVERSATION when this
-                # turn hands the wake to the dispatcher.
-                await asyncio.wait_for(queued.wait(), SETTLE_SECONDS)
-                handles.append(await dispatch(
-                    Signal(
-                        source="test.wake",
-                        kind="tick",
-                        mode=SignalMode.COGNITION,
-                        payload={},
-                        target_agent=agent.did,
-                    )
-                ))
-            return LLMResponse(content=REPLY)
-
-        _script_replies(agent, monkeypatch, generate)
-        first = asyncio.create_task(agent.process_input("one", session_id="s"))
-        while agent._live_turn_id is None:
-            await asyncio.sleep(0.01)
-        second = asyncio.create_task(agent.process_input("two", session_id="s"))
-        while agent._get_lock_manager().active_hold_diagnostics()[0][
-            "blocked_acquirers"
-        ] == 0:
-            await asyncio.sleep(0.01)
-        queued.set()
-
-        done = await _settle(agent, (first, second), "the dispatching and queued turns")
-        assert [task.result() for task in (first, second)] == [REPLY, REPLY]
-        assert all(task in done for task in (first, second))
-        deadline = asyncio.get_running_loop().time() + SETTLE_SECONDS
-        (handle,) = handles
-        await _settle(agent, (handle.task,), "the dispatched wake")
-        while not wakes:
-            if asyncio.get_running_loop().time() > deadline:
-                pytest.fail("the dispatched wake never reached its turn\n" + _await_chains(agent))
-            await asyncio.sleep(0.05)
-        assert not agent._get_privacy_transition_lock().locked()
-
-
-@pytest.mark.parametrize("callback", ["_on_task_submitted", "_on_background_task_complete"])
-async def test_an_a2a_wake_is_not_enrolled_in_the_turn_that_announced_it(
-    tmp_path, monkeypatch, callback
-):
-    """TaskManager announces a task on whichever task changed it: a submission
-    on the sender's turn (for a co-hosted sender, that sender's own turn), a
-    completion on the turn that answered it with ``respond_to_a2a_task``, the
-    11-10 Claw shape. The wake is its own turn, so the announcing turn's
-    retirement must not join it."""
-    import kestrel_sovereign.agent.event_manager as event_manager
-    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
-
-    async with booted_agent(
-        tmp_path / "agent", name="Recipient", provenance="test:4001-a2a", features=set()
-    ) as agent:
-        enrolled = []
-
-        async def deliver(**kwargs):
-            lock = agent._get_privacy_transition_lock()
-            enrolled.append(lock._scope_for(asyncio.current_task()))
-
-        monkeypatch.setattr(agent, "_deliver_a2a_wake_until_durable", deliver)
-        monkeypatch.setattr(
-            event_manager, "require_native_task_snapshot", lambda candidate, _did: candidate
-        )
-        candidate = SimpleNamespace(
-            task=Task(
-                id="task-4001",
-                status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
-            ),
-            ownership=SimpleNamespace(creator_agent_id="did:kestrel:creator-4001"),
-            input_revision=1,
-        )
-        in_span = []
-
-        async def generate(kwargs):
-            lock = agent._get_privacy_transition_lock()
-            in_span.append(lock._scope_for(asyncio.current_task()) is not None)
-            getattr(agent, callback)(candidate)
-            return LLMResponse(content=REPLY)
-
-        _script_replies(agent, monkeypatch, generate)
-        assert await agent.process_input("send it", session_id="s") == REPLY
-        for _ in range(100):
-            if enrolled:
-                break
-            await asyncio.sleep(0.01)
-
-    assert in_span == [True], "the callback did not run inside the turn's privacy lifetime"
-    assert enrolled == [None]
-
-
-async def test_a_restart_wake_a_turn_sweeps_leaves_the_turn_queued_behind_it_runnable(
-    tmp_path, monkeypatch
-):
-    """The restart coordinator's ACK supervisor awaits the wake it enqueued.
-
-    ``!restart coordinator`` sweeps post-restart rows from inside a turn. The
-    dispatch itself is detached, but before the fix its ACK supervisor was
-    still a join obligation of that turn: the turn's retirement held the
-    privacy lock waiting for the supervisor, the supervisor waited for the
-    wake, the wake waited for CONVERSATION and the queued turn holding it
-    waited for the privacy lock.
-    """
-    from kestrel_sovereign.features.restart_coordinator.store import (
-        get_request,
-        insert_request,
-        update_status,
-    )
-
-    monkeypatch.setenv("KESTREL_TEST_AUTO_APPROVE", "1")
-    monkeypatch.setenv("KESTREL_API_KEY", "test-4001-restart-ack")
-    async with booted_agent(
-        tmp_path / "agent",
-        name="Restarted",
-        provenance="test:4001-restart",
-        features={"RestartCoordinatorFeature"},
-    ) as agent:
-        feature = next(
-            f for f in agent.features.values()
-            if type(f).__name__ == "RestartCoordinatorFeature"
-        )
-        request = await insert_request(
-            feature._db,
-            requested_by_agent=agent.did,
-            reason="test #4001 restart wake",
-            allow_agent_request=True,
-        )
-        assert await update_status(
-            feature._db, request.id, status="completed", expected_current_status="pending"
-        )
-        queued = asyncio.Event()
-        swept = []
-
-        async def generate(kwargs):
-            messages = kwargs.get("messages") or [{}]
-            if messages[-1].get("role") == "tool" or swept:
-                return LLMResponse(content=REPLY)
-            # Only the first turn sweeps; it does so once the second turn is
-            # waiting for CONVERSATION.
-            swept.append(True)
-            await asyncio.wait_for(queued.wait(), SETTLE_SECONDS)
-            return LLMResponse(
-                content="",
-                tool_calls=[ToolCall(id="sweep-1", name="restart_coordinator", arguments={})],
-            )
-
-        _script_replies(agent, monkeypatch, generate)
-        first = asyncio.create_task(agent.process_input("sweep", session_id="s"))
-        while agent._live_turn_id is None:
-            await asyncio.sleep(0.01)
-        second = asyncio.create_task(agent.process_input("two", session_id="s"))
-        while agent._get_lock_manager().active_hold_diagnostics()[0][
-            "blocked_acquirers"
-        ] == 0:
-            await asyncio.sleep(0.01)
-        queued.set()
-
-        await _settle(agent, (first, second), "the sweeping and queued turns")
-        assert [task.result() for task in (first, second)] == [REPLY, REPLY]
-        deadline = asyncio.get_running_loop().time() + SETTLE_SECONDS
-        while not (await get_request(feature._db, request.id)).wake_delivered:
-            if asyncio.get_running_loop().time() > deadline:
-                pytest.fail(
-                    "the restart wake's ACK supervisor never recorded delivery\n"
-                    + _await_chains(agent)
-                )
-            await asyncio.sleep(0.05)
-        assert not agent._get_privacy_transition_lock().locked()
 
 
 SENDER = "did:kestrel:sender-4001"
@@ -781,7 +549,7 @@ async def test_a_failed_wake_whose_task_write_failed_is_settled_without_a_restar
             assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
             assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
             assert await agent.dispatcher.owed_cognition_wake_settlements() == []
-            assert not agent.dispatcher._retained_cognition_control_debt
+            assert agent.dispatcher.unresolved_cognition_control == ()
     finally:
         fault.close()
 
@@ -1013,104 +781,13 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
         assert model_calls == []
 
 
-async def test_a_task_its_own_turn_completes_leaves_the_next_turn_runnable(
-    tmp_path, monkeypatch
-):
-    """The fifth occurrence (11-11 02:28Z, Claw), with no restart, Stop or audit
-    failure. An inbound task's turn answers it with ``respond_to_a2a_task``.
-    The completion wakes the same agent (``a2a.task_complete``) from inside
-    that turn. Before the fix the wake was enrolled in that turn's privacy
-    lifetime: it took CONVERSATION as the turn ended and waited for the privacy
-    lock, which the turn's retirement held while it waited for the wake. The
-    wake never reached its model call, and every later turn queued behind it.
-    """
-    import re
-
-    from kestrel_sdk.native_a2a.types import TaskState
-
-    monkeypatch.setenv("KESTREL_TEST_AUTO_APPROVE", "1")
-    async with booted_agent(
-        tmp_path / "agent",
-        name="Recipient",
-        provenance="test:4001-self-wake",
-        features={"TaskFeature"},
-    ) as agent:
-        completion_wake = asyncio.Event()
-        while_wake_ran = {}
-        responded = []
-
-        async def submission_acknowledged():
-            return [d.status for d in await _submission_deliveries(agent)] == [
-                "acknowledged"
-            ]
-
-        async def generate(kwargs):
-            messages = kwargs.get("messages") or [{}]
-            if messages[-1].get("role") == "tool":
-                return LLMResponse(content=REPLY)
-            text = "\n".join(str(m.get("content")) for m in messages)
-            if "[A2A_COMPLETE]" in text and not completion_wake.is_set():
-                # Still inside the wake's turn: the turn that produced it must
-                # finish, retirement and delivery included, without it.
-                deadline = asyncio.get_running_loop().time() + SETTLE_SECONDS
-                while not await submission_acknowledged():
-                    if asyncio.get_running_loop().time() > deadline:
-                        break
-                    await asyncio.sleep(0.02)
-                while_wake_ran["producer_acknowledged"] = await submission_acknowledged()
-                completion_wake.set()
-                return LLMResponse(content=REPLY)
-            submitted = re.search(r"native A2A task `([^`]+)`", text)
-            if "[A2A_TASK_SUBMITTED]" in text and submitted and not responded:
-                responded.append(submitted.group(1))
-                return LLMResponse(
-                    content="",
-                    tool_calls=[
-                        ToolCall(
-                            id="respond-4001",
-                            name="respond_to_a2a_task",
-                            arguments={
-                                "task_id": submitted.group(1),
-                                "content": "Done.",
-                                "state": "completed",
-                            },
-                        )
-                    ],
-                )
-            return LLMResponse(content=REPLY)
-
-        _script_replies(agent, monkeypatch, generate)
-        task = await _submit_task(agent)
-
-        async def completed():
-            return await _sender_state(agent, task) == TaskState.TASK_STATE_COMPLETED
-
-        await _until(agent, completed, "the inbound task's turn never completed it")
-        assert responded == [task.id]
-        try:
-            await asyncio.wait_for(completion_wake.wait(), SETTLE_SECONDS)
-        except TimeoutError:
-            pytest.fail(
-                "the completion wake never reached its model call\n" + _await_chains(agent)
-            )
-        assert while_wake_ran == {"producer_acknowledged": True}
-
-        (after,) = await _settle(
-            agent,
-            (asyncio.create_task(agent.process_input("after", session_id="s")),),
-            "the turn after the completion wake",
-        )
-        assert after.result() == REPLY
-        assert not agent._get_privacy_transition_lock().locked()
-
-
 async def test_a_cycle_refused_submission_wake_fails_the_task_its_sender_waits_on(
     tmp_path, monkeypatch
 ):
     """Round-3 self-review: the dispatcher refuses a submission wake as a cycle
-    before it persists a delivery, so no delivery terminal writer ever sees
-    it, and its producer stops on the TERMINAL admission. The refusal itself
-    must end the task where its sender sees it."""
+    before it persists a delivery, and its producer stops on the TERMINAL
+    admission. The refusal is recorded as the wake's own failed row, so the
+    one settlement pass ends the task where its sender sees it (#4001)."""
     from kestrel_sdk.native_a2a.types import TaskState
 
     async with booted_agent(
@@ -1128,51 +805,69 @@ async def test_a_cycle_refused_submission_wake_fails_the_task_its_sender_waits_o
         )
         assert seen.status.state == TaskState.TASK_STATE_FAILED
         assert "dropped_cycle" in seen.status.message.parts[0].text
-        assert await _submission_deliveries(agent) == []
+        (refused,) = await _submission_deliveries(agent)
+        assert refused.status == "failed" and refused.attempts == 0
+        assert refused.last_error.startswith("refused: dropped_cycle:")
+        assert refused.event.caller_identity is None
+        assert refused.event.causation_chain == []
+        assert await agent.dispatcher.owed_cognition_wake_settlements() == []
 
 
-async def test_a_cycle_refused_wake_left_unsettled_is_settled_by_the_next_boot(
+async def test_a_cycle_refused_wake_whose_settlement_fails_is_settled_by_the_heartbeat(
     tmp_path, monkeypatch
 ):
-    """When the refusal cannot settle its task, the wake is left unadmitted, not
-    TERMINAL: its producer keeps retrying, and the next boot's reconciliation
-    rebuilds the same refused wake and settles it then."""
+    """When the refused wake's settlement cannot commit, the refusal stays
+    recorded and its producer is done with it: the owner heartbeat's
+    settlement pass re-finds the same row on every pass, and the task ends
+    once the fault clears, with no restart and no new wake (#4001)."""
+    from datetime import timedelta
+
     from kestrel_sdk.native_a2a.types import TaskState
 
-    home = tmp_path / "agent"
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+
+    monkeypatch.setitem(
+        SignalDispatcher.__init__.__kwdefaults__,
+        "runtime_owner_stale_after",
+        timedelta(seconds=0.6),
+    )
+    attempts = []
+    fault = {"armed": True}
+    settle = KestrelAgent.settle_undelivered_cognition_wake
+
+    async def unavailable(self, **identity):
+        attempts.append(identity["source_event_id"])
+        if fault["armed"]:
+            raise OSError("database is locked")
+        return await settle(self, **identity)
+
+    monkeypatch.setattr(KestrelAgent, "settle_undelivered_cognition_wake", unavailable)
     async with booted_agent(
-        home, name="Recipient", provenance="test:4001-cycle-boot", features=set()
+        tmp_path / "agent",
+        name="Recipient",
+        provenance="test:4001-cycle-heartbeat",
+        features=set(),
     ) as agent:
         _script_replies(agent, monkeypatch)
-        attempts = []
-
-        async def unavailable(**identity):
-            attempts.append(identity["source_event_id"])
-            raise OSError("database is locked")
-
-        monkeypatch.setattr(agent, "settle_undelivered_cognition_wake", unavailable)
         task = await _submit_task(agent, metadata=_looping_causation(agent))
 
         async def retried():
-            return len(attempts) >= 2
+            return len(attempts) >= 3
 
-        await _until(agent, retried, "the unsettled refusal was not retried")
+        await _until(agent, retried, "the refused wake's settlement was not retried")
         assert len(set(attempts)) == 1
         assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
-        assert await _submission_deliveries(agent) == []
-        did = agent.did
+        assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
 
-    # The settlement stays patched on that first agent only.
-    async with booted_agent(
-        home,
-        name="Recipient",
-        provenance="test:4001-cycle-boot",
-        features=set(),
-        identity=did,
-    ) as agent:
-        _script_replies(agent, monkeypatch)
-        assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
-        assert await _submission_deliveries(agent) == []
+        fault["armed"] = False
+
+        async def ended():
+            return await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
+
+        await _until(agent, ended, "the refused wake's task was left submitted")
+        assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
+        assert await agent.dispatcher.owed_cognition_wake_settlements() == []
 
 
 async def test_a_turn_parked_after_begin_is_stopped_and_the_queued_turn_runs(

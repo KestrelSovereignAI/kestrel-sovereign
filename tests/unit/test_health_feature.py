@@ -45,6 +45,7 @@ from kestrel_sovereign.features.health.feature import (
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db import sqlite as sqlite_backend_module
+from tests.utils.virtual_clock import HANG_GUARD_SECONDS
 
 # ============================================================================
 # Helpers
@@ -1070,14 +1071,24 @@ class TestHeartbeatCheck:
         feat._agent_id = agent.did
         feat._in_memory_history = []
 
+        # The outer wait is only a hang guard. The message and duration prove
+        # the patched database bound, not the 5s default, ended the check. A
+        # 0.2s guard here failed on a loaded xdist worker.
+        default_bound_ms = health_checks.DATABASE_HEALTH_CHECK_TIMEOUT_S * 1000
         with patch.object(
             health_checks, "DATABASE_HEALTH_CHECK_TIMEOUT_S", 0.01
         ):
-            result = await asyncio.wait_for(feat.run_once(), timeout=0.2)
+            result = await asyncio.wait_for(
+                feat.run_once(), timeout=HANG_GUARD_SECONDS
+            )
 
         assert result["status"] == "unhealthy"
         assert result["checks"][1]["name"] == "database"
         assert result["checks"][1]["status"] == "fail"
+        assert result["checks"][1]["message"] == (
+            "Database health check timed out after 0.01 seconds"
+        )
+        assert result["checks"][1]["duration_ms"] < default_bound_ms
         assert feat._in_memory_history == [result]
         db.execute.assert_not_awaited()
 

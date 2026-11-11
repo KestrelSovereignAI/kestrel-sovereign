@@ -512,8 +512,11 @@ judgement reads only that task at that input revision: `submitted` or
 `working`, with both wake-eligibility flags set. Neither the task's age nor its
 live lifecycle since decides it: a `working` recovery wake still owes its input
 after another writer moves the task back to `submitted`. The dispatcher's
-`owed_cognition_wake_settlements` reads those consumers' terminal rows in
-bounded delivery-ID pages, on the existing claim index. Boot mints no new wake
+`owed_cognition_wake_settlements` reads those consumers' terminal rows one
+status at a time, in bounded delivery-ID keyset pages on a partial index of
+terminal rows (`idx_durable_signal_deliveries_terminal_page`), so a page reads
+only the rows it returns. The index is additive DDL the store ensures at every
+startup. Boot mints no new wake
 for an owed input: a replacement would be refused as its wake was, and a live
 wake beside the terminal row would leave the next pass ending work that wake
 still runs.
@@ -541,8 +544,10 @@ lost to a concurrent task writer, or anything else leaves the row owed, and the
 next pass finds it again; a row stops being owed only when durable state shows
 the task settled or its input superseded. A settlement whose commit outcome is
 unknown, or whose execution authority is gone, is native control: the pass
-retains it as that delivery's control debt and stops, and boot refuses. The
-heartbeat logs it. While it stands the heartbeat does no ordinary work, owner
+retains it as that delivery's settlement control and stops, and boot refuses.
+It is kept in its own ledger, apart from the debt of the delivery's own
+terminal write, so a late terminalizer or retained cleanup of that row clears
+only the row's debt and never the settlement's. The heartbeat logs it. While it stands the heartbeat does no ordinary work, owner
 retirement refuses, and the host is not ready: `/health` fails and
 `/health/detailed` names the deliveries in a `durable_cognition_control` check
 (`SignalDispatcher.unresolved_cognition_control`). The retirement drain retries
@@ -561,12 +566,18 @@ creator added meanwhile stays live. The identity's kind,
 `submitted` or `working`, in the same statement: a worker that asks the creator
 for input after the settler read the task wins.
 
-A wake refused by validation or cycle detection before it is persisted has no
-row for the query to find, and its producer stops on TERMINAL. It has no lease
-or CAS either, so `dispatch_signal` makes the same fenced write before it
-publishes TERMINAL. If that write fails, the admission is NOT_ADMITTED: the
-producer retries the handoff, and with it the refusal and the write, and boot
-rebuilds the same refused wake.
+A wake refused by validation or cycle detection before it is persisted would
+leave no row for the query to find, and its producer stops on TERMINAL. So
+`dispatch_signal` records the refusal before it publishes TERMINAL: an event
+under the wake's source identity carrying only a fixed marker (no payload,
+caller or causation chain), with one `failed` delivery for its consumer that
+no one ever claims (`persist_signal(refused_consumer_id=...)`). The pass then
+settles it like any other terminal row; the refusal settles nothing itself.
+The source identity arbitrates under the durable handoff lock: when an earlier
+attempt of that identity was already admitted, nothing is recorded, and that
+delivery's own lease and terminal CAS decide its work. If the record cannot be
+committed, the admission is NOT_ADMITTED and the producer retries the handoff,
+and with it the refusal and the record.
 
 An agent with no durable cognition consumer delivers its A2A wakes through
 `enqueue_signal`, where no wake is terminal or retried; this rule does not
@@ -816,23 +827,45 @@ ingress and cron dispatches behind any in-flight turn. The global order is
 CONVERSATION → privacy transition → persistence gate; nothing is acquired
 while the gate is held.
 
-An enqueued dispatch also runs outside the privacy lifetime of the turn that
-enqueued it (#4001). A Task created inside a turn is otherwise enrolled in that
-turn's native privacy lifetime, and the turn's effect-journal retirement joins
-it while still holding the privacy-transition lock, after the turn has released
-CONVERSATION. A COGNITION wake for the same agent is a new turn that needs
-CONVERSATION, so a turn that took CONVERSATION in between waited for the
-privacy lock, the retirement waited for the wake, and the wake waited for
-CONVERSATION. That cycle reproduces the hangs reported in #4001.
-`enqueue_signal`,
-`enqueue_durable_cognition`, `enqueue_durable_terminal`, the A2A
-submitted/completed wake deliveries and the delivery supervisors that await
-them therefore create their Tasks inside `detached_from_enclosing_turn()`
-(`signals/delivery.py`). It leaves both the turn's native privacy lifetime
-and its delegated CONVERSATION ownership behind. The A2A wakes need it most:
-TaskManager calls them on whichever task submitted or completed the task,
-which is the recipient's own turn when it answers a task, and a co-hosted
-sender's turn when it submits one.
+**A dispatch, and any supervisor that awaits a dispatch's delivery, is its own
+unit of work and never part of the turn that enqueued it (#4023).** A Task
+copies its creator's context, and a turn's context carries two turn-scoped
+authorities:
+
+- membership of the turn's native privacy lifetime. The Task becomes a join
+  obligation of the turn's effect-journal retirement
+  (`ToolEffectTurn.close → join_native_scope`), which runs after the turn has
+  released CONVERSATION and holds the privacy-transition lock until every
+  member settles;
+- the turn's delegated CONVERSATION ownership, so a turn the Task starts while
+  the creating turn still holds CONVERSATION is treated as a re-entry into
+  that hold.
+
+A COGNITION wake for the same agent is a new turn. Enrolled in its producer's
+retirement, it takes CONVERSATION the moment the producing turn releases it,
+then waits for the privacy-transition lock the retirement still holds, while
+the retirement waits for the wake. Neither ever finishes, and the agent stays
+parked until the host restarts. On Claw this was most often the recipient's
+own `a2a.task_complete` self-wake after `respond_to_a2a_task` completed an
+inbound task from inside a turn.
+
+Every such Task is therefore created inside
+`kestrel_sovereign.signals.delivery.detached_from_enclosing_turn()`, which runs
+`outside_native_privacy_lifetime()` and `without_delegated_lock_ownership()`
+and owns no coordinator of its own:
+
+- the dispatcher's `enqueue_signal`, `enqueue_durable_cognition` and
+  `enqueue_durable_terminal` Tasks;
+- the `a2a.task_complete` and `a2a.task_submitted` wake supervisors in
+  `EventManagerMixin`, which TaskManager calls on whichever Task completed or
+  submitted the task;
+- the restart coordinator's `restart_completed_ack` supervisor, which a
+  `!restart coordinator` sweep starts from inside a turn;
+- `supervise_terminal_delivery` and `harvest_detached_delivery` in
+  `kestrel_sovereign/signals/delivery.py`.
+
+A new producer that enqueues or awaits a signal from a background Task follows
+the same rule.
 
 The same gate, held shared, is the lock the agent hands to Workflows as
 `workflow_await_signal_privacy_transition_lock` (#3484). Workflows holds it

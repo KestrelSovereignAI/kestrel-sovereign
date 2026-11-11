@@ -50,7 +50,7 @@ def bind_owned_coordinator(coordinator):
 
 @contextmanager
 def without_owned_coordinators():
-    """Create independent work that no enclosing coordinator admits (#4001).
+    """Create independent work that no enclosing coordinator admits (#4023).
 
     A Task created inside a coordinator's scope becomes that scope's join
     obligation. Work that is its own unit, and outlives its creator's span,

@@ -492,12 +492,12 @@ class EventManagerMixin:
             return
 
         try:
+            from kestrel_sovereign.signals.delivery import (
+                detached_from_enclosing_turn,
+            )
             from kestrel_sovereign.signals.sources.a2a import (
                 DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_completed_task,
-            )
-            from kestrel_sovereign.signals.delivery import (
-                detached_from_enclosing_turn,
             )
 
             # enqueue_durable_cognition is async and returns a SignalHandle at
@@ -508,8 +508,8 @@ class EventManagerMixin:
             # durable consumer preserves that wake across Hold and restart.
             # The agent's tracker owns the initial enqueue and harvests its
             # terminal result for observability (#2532). This callback runs on
-            # whichever task completed the task, often a turn, possibly a
-            # co-hosted peer's; the wake is not that turn's work (#4001).
+            # whichever task completed the task, often this agent's own turn;
+            # the wake is not that turn's work (#4023).
             with detached_from_enclosing_turn():
                 self._track_background_task(
                     self._deliver_a2a_wake_until_durable(
@@ -566,15 +566,16 @@ class EventManagerMixin:
         task = candidate.task
         task_id = task.id
         try:
+            from kestrel_sovereign.signals.delivery import (
+                detached_from_enclosing_turn,
+            )
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
                 DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_submitted_task,
             )
-            from kestrel_sovereign.signals.delivery import (
-                detached_from_enclosing_turn,
-            )
 
-            # Called on the submitting task: a co-hosted sender's turn (#4001).
+            # Called on the submitting task, which can be the sender's turn;
+            # the recipient's wake is never part of it (#4023).
             with detached_from_enclosing_turn():
                 self._track_background_task(
                     self._deliver_a2a_wake_until_durable(
@@ -1068,11 +1069,12 @@ class EventManagerMixin:
         persisting it, or a retry was refused because its tool operation needs
         reconciliation. Nothing else wakes the recipient for that input, so a
         task left ``submitted`` or ``working`` waits forever and its sender
-        sees nothing fail (#4001). This is the one write that ends it. The
-        dispatcher's settlement pass makes it for every terminal row
-        :meth:`undelivered_cognition_wake_owed` finds owed, and a refusal that
-        persisted no row makes it for its own wake. A stopped wake cancels
-        the task; any other ends it failed, naming ``cause``.
+        sees nothing fail (#4001). This is the one write that ends it, and
+        only the dispatcher's settlement pass makes it, for every terminal
+        row :meth:`undelivered_cognition_wake_owed` finds owed. A wake refused
+        before it persisted has such a row too: the dispatcher records the
+        refusal as one. A stopped wake cancels the task; any other ends it
+        failed, naming ``cause``.
 
         The wake is named by its durable identity, never its payload, which a
         privacy mode may elide. The write is bound to the wake's own admitted

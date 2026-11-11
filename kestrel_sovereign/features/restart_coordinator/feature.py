@@ -4399,7 +4399,7 @@ class RestartCoordinatorFeature(Feature):
         # agent-tracked underneath, so full shutdown reaps it too.
         # ``!restart coordinator`` sweeps from inside a turn; this supervisor
         # awaits a wake that is a turn of its own, so it is never part of the
-        # sweeping turn (#4001).
+        # sweeping turn (#4023).
         from kestrel_sovereign.signals.delivery import detached_from_enclosing_turn
         try:
             with detached_from_enclosing_turn():

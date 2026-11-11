@@ -242,17 +242,11 @@ def outside_native_privacy_lifetime():
     A Task created inside a turn is enrolled in the turn's native privacy
     lifetime. The turn's effect-journal retirement, which runs after the turn
     has released CONVERSATION, joins every such Task while still holding the
-    privacy-transition lock. A dispatched signal is its own unit of work, and
-    its COGNITION route is a new turn that needs CONVERSATION. If another turn
-    took CONVERSATION first, that turn waits for the privacy lock, the
-    retirement waits for the dispatch, and the dispatch waits for
-    CONVERSATION: the agent stalls until it is restarted (#4001). Work started
-    here is not enrolled and carries no reentry token, so it takes the privacy
-    lock as a turn of its own would.
+    privacy-transition lock (#4023). Work started here is not enrolled and
+    carries no reentry token, so it takes the privacy lock as a turn of its
+    own would.
     """
-    with without_owned_coordinators(), bind_transition_lock_reentry(
-        None, replace=True
-    ):
+    with without_owned_coordinators(), bind_transition_lock_reentry(None, replace=True):
         yield
 
 

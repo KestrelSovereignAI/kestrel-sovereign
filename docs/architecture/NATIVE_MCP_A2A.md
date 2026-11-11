@@ -48,8 +48,14 @@ Core consumes that extra and resolves it in its lock; base SDK consumers remain
 lightweight. Feature skill producers and the host use the same native types.
 Clean wheel and sdist installs must exercise the same wire/oracle tests as source.
 Full conformance, interoperability and host acceptance remain release gates.
-Return to the upstream distribution when a released SDK passes these same checks;
-remove the vendored implementation and switch all callers together.
+The vendored copy is Kestrel's maintained fork, not a temporary step back to
+the upstream distribution. Its update policy is in the SDK README.
+Core runs the official A2A TCK at a pinned upstream commit plus
+`tests/interop/a2a_tck/UPSTREAM.patch`. That patch only connects the suite to
+Kestrel (authentication, tenant routing) and fixes defects in the suite itself.
+It never makes the suite accept behavior the specification forbids. Re-pin only
+when a TCK change covers a requirement Kestrel must meet, or the pinned commit
+no longer runs.
 Exact versions belong in dependency locks,
 and dependency ranges must admit the releases we actually test. Old dependency
 caps are subject to migration, not reasons to downgrade the protocol target.

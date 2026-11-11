@@ -4927,9 +4927,10 @@ async def test_inline_enqueued_wake_owns_session_for_followup_restart(tmp_path, 
     agent.restart_feature = None
     wake_turn = _RealDispatchAgent.process_input.__get__(agent)
     # A wake carries its own caller, never the one of the invocation that
-    # enqueued it: the real process_input binds the dispatcher's, and turn A's
-    # binding is revoked when its invocation ends, which the wake now outlives
-    # (#4001). This stub binds the test's sovereign caller in its place.
+    # enqueued it: the real process_input binds the dispatcher's, and the
+    # enqueuing invocation's binding is revoked when it ends, which the wake
+    # now outlives (#4023). This stub binds the test's sovereign caller in its
+    # place.
     sovereign = capture_caller_context_binding()
 
     async def process_input(prompt, session_id=None):

@@ -285,9 +285,12 @@ class _StoppedCognitionResult(SignalResult):
 # the durable record that a Stop consumed the wake, so the settlement of the
 # work that wake carried reads it there (#4001).
 _STOP_ACKNOWLEDGED = "stop_acknowledged"
-# A failed row's error names the reconciliation failure code, when it has one.
+# The error that opens a refused wake's failed row (#4001).
+_REFUSED = "refused"
+# A failed row's error names the reconciliation failure code, or the status
+# that refused it, when it has one.
 _EXECUTION_CONTROL_CODE = re.compile(
-    r"^execution_control_unresolved: ([a-z][a-z0-9_]*)(?::|$)"
+    rf"^(?:execution_control_unresolved|{_REFUSED}): ([a-z][a-z0-9_]*)(?::|$)"
 )
 # How soon a pass runs once a wake's terminal row commits (#4001). It is
 # scheduling only: the pass reads what is owed from durable state.
@@ -299,15 +302,6 @@ _UNDELIVERED_WAKE_PAGE_SIZE = 100
 # held for the next sweep, which is the safe direction (#4001).
 _UNDELIVERED_WAKE_RELEASE_LIMIT = 500
 
-
-def _is_source_settlement_control(delivery: Any) -> bool:
-    """Whether retained control debt is a settlement's, not its row's (#4001).
-
-    Row debt holds the original claim, so its snapshot is leased. Only the
-    settlement pass retains a terminal row read from storage: that row
-    already stands, so its debt guards no lease and needs no CAS.
-    """
-    return isinstance(delivery, DurableDelivery) and delivery.is_terminal
 
 
 @dataclass(kw_only=True)
@@ -963,6 +957,12 @@ class SignalDispatcher:
         self._retained_durable_cognition_tasks: set[asyncio.Task[SignalResult]] = set()
         self._retained_durable_cognition_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
+        # The settlement of the work a terminal wake carried, whose commit
+        # outcome is unknown or whose execution authority is gone (#4001).
+        # Its row already stands, so it guards no lease and has no CAS; it is
+        # kept apart from the row debt above, which only a delivery's own
+        # terminalizer settles and clears.
+        self._source_settlement_control: dict[str, tuple[DurableDelivery, BaseException]] = {}
         self._cognition_control_terminal_owners: dict[tuple[str, ...], asyncio.Task[None]] = {}
         self._cognition_control_terminal_receipts: dict[tuple[str, ...], weakref.ReferenceType] = {}
         # Channel ingress ACKs after its selected delivery is durable, not
@@ -1396,8 +1396,10 @@ class SignalDispatcher:
                         Status.DROPPED_VALIDATION, Status.DROPPED_CYCLE,
                     }
                     if terminal and _durable_delivery_consumer_id is not None:
-                        terminal = await self._settle_refused_cognition_source(
-                            signal, result, source_event_id=resolved_source_event_id,
+                        terminal = await self._record_refused_cognition_wake(
+                            signal, result,
+                            consumer_id=_durable_delivery_consumer_id,
+                            source_event_id=resolved_source_event_id,
                         )
                     disposition = (
                         DurableAdmissionDisposition.TERMINAL
@@ -1493,7 +1495,7 @@ class SignalDispatcher:
         )
         options = {"admission": admission} if admission is not None else {}
         # The dispatch is its own unit of work, never a join obligation of
-        # the turn that enqueued it (#4001).
+        # the turn that enqueued it (#4023).
         with detached_from_enclosing_turn():
             task = self._agent._track_background_task(
                 coro, name=f"signal_dispatch:{signal.source}:{signal.id}", **options,
@@ -1558,7 +1560,7 @@ class SignalDispatcher:
             resident_context = self._resident_timer_context()
             self._live_durable_cognition_event_ids.add(enqueued_signal_id)
             # A woken turn needs CONVERSATION; the enqueuing turn's
-            # retirement must not wait for it (#4001).
+            # retirement must not wait for it (#4023).
             with detached_from_enclosing_turn():
                 task = self._agent._track_background_task(
                     coro, name=f"durable_cognition:{consumer_id}:{enqueued_signal_id}", admission=accepted,
@@ -3003,7 +3005,12 @@ class SignalDispatcher:
                 raise outcome.error
         except BaseException as error:
             from kestrel_sovereign._async_ownership import owned_task_error
-            debt = tuple(original for _, original in self._retained_cognition_control_debt.values())
+            debt = tuple(
+                original for _, original in (
+                    *self._retained_cognition_control_debt.values(),
+                    *getattr(self, "_source_settlement_control", {}).values(),
+                )
+            )
             completed_error = owned_task_error(completion) if completion.done() else None
             raise execution_finite_error(
                 *debt, self._outcome_log_control_error, completed_error, error,
@@ -3096,7 +3103,9 @@ class SignalDispatcher:
             await self._activate_retained_durable_shutdown_fence()
             return
 
-        if self._retained_cognition_control_debt:
+        if self._retained_cognition_control_debt or getattr(
+            self, "_source_settlement_control", None
+        ):
             # A settled route with an unpersisted control outcome still owns
             # cleanup debt. Do not let shutdown silently retire its liveness.
             self._durable_control_cleanup_fenced = True
@@ -3215,13 +3224,13 @@ class SignalDispatcher:
                 # Renewal loss may publish evidence before a stubborn route
                 # settles. A receipt is not proof that its effects have ended.
                 raise error
-            if _is_source_settlement_control(delivery):
-                # The row already stands; the debt is the unknown outcome of
-                # settling the work it ended (#4001). No CAS is written again.
-                await self._settle_retained_source_control(delivery)
-                continue
             await self._terminalize_failed_cognition(delivery, error)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+        # A settlement's row already stands; its debt is the unknown outcome
+        # of settling the work that row ended (#4001). No CAS is written
+        # again, and only a settlement that returns clears it.
+        for delivery, _ in tuple(getattr(self, "_source_settlement_control", {}).values()):
+            await self._settle_retained_source_control(delivery)
 
     async def _drain_outcome_log_tasks(self, *, finite_errors=None) -> None:
         """Join every accepted outcome log before releasing shared storage.
@@ -3553,12 +3562,16 @@ class SignalDispatcher:
         execution authority is gone. While any stands, owner retirement
         refuses and the host is not ready (#4001).
         """
-        return tuple(sorted(getattr(self, "_retained_cognition_control_debt", {})))
+        return tuple(sorted({
+            *getattr(self, "_retained_cognition_control_debt", {}),
+            *getattr(self, "_source_settlement_control", {}),
+        }))
 
     def _runtime_owner_cleanup_required(self) -> bool:
         """Keep exact owner protection until retained cognition has joined."""
         return (
             bool(self._retained_cognition_control_debt)
+            or bool(getattr(self, "_source_settlement_control", None))
             or self.durable_shutdown_owner_fenced
             or any(not task.done() for task in self._retained_durable_cognition_tasks)
         )
@@ -3718,18 +3731,16 @@ class SignalDispatcher:
             retained = await self._durable_store.backend.retain_cognition_cleanup_owner(
                 agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
             )
-            # A debt whose row is already terminal guards no lease: it is the
-            # unknown outcome of settling the work that row ended (#4001).
-            leased_debt = () if retained else tuple(
-                error for delivery, error in self._retained_cognition_control_debt.values()
-                if not _is_source_settlement_control(delivery)
-            )
-            if leased_debt:
+            # Source-settlement control guards no lease: its row already
+            # stands (#4001). Only row debt is lost protection here.
+            if not retained and self._retained_cognition_control_debt:
                 # A zero-row CAS is lost protection, not a healthy heartbeat.
                 # Keep the original debt and expose its terminal evidence; a
                 # timer retry cannot manufacture another owner's authority.
                 from kestrel_sovereign.execution_custody import execution_finite_error
-                raise execution_finite_error(*leased_debt)
+                raise execution_finite_error(*(
+                    error for _, error in self._retained_cognition_control_debt.values()
+                ))
             if not retained and any(
                 not task.done() for task in self._retained_durable_cognition_tasks
             ):
@@ -6242,25 +6253,54 @@ class SignalDispatcher:
         if inspect.isawaitable(settled):
             await settled
 
-    async def _settle_refused_cognition_source(
-        self, signal: Signal, result: SignalResult, *, source_event_id: str | None,
+    async def _record_refused_cognition_wake(
+        self, signal: Signal, result: SignalResult, *,
+        consumer_id: str, source_event_id: str | None,
     ) -> bool:
-        """Settle a durable cognition wake refused before it was persisted.
+        """Record a settling consumer's wake refused before it persisted.
 
-        A validation or cycle refusal persists no delivery, so the settlement
-        pass has no row to find, and the producer stops on TERMINAL. Nor is
-        there a lease or CAS another owner could win: the refusal settles its
-        source itself, through the same fenced write. Returns whether the
-        refusal may be published TERMINAL. Any ordinary failure leaves it
-        NOT_ADMITTED, so its producer retries the handoff, and with it the
-        refusal and the settlement; boot rebuilds the same refused wake.
-        Native control propagates as this dispatch's admission error.
+        A validation or cycle refusal would persist nothing, so the settlement
+        pass would have no row to find, and its producer stops on TERMINAL.
+        The refusal is therefore committed as its own event under the wake's
+        source identity, with one ``failed`` delivery for its consumer that no
+        one ever claims (#4001). The pass settles it like any other terminal
+        wake. The event carries only a fixed marker: no payload, caller or
+        causation chain.
+
+        The source identity arbitrates under the durable handoff lock. When
+        an earlier attempt of the same identity was already admitted, nothing
+        is committed and that delivery's own lease and terminal CAS decide its
+        work; a refused duplicate never settles it.
+
+        Returns whether the refusal may be published TERMINAL. Any ordinary
+        failure leaves it NOT_ADMITTED, so its producer retries the handoff,
+        and with it the refusal and this record. Native control propagates as
+        this dispatch's admission error.
         """
+        if (
+            consumer_id not in self._undelivered_wake_consumers()
+            or source_event_id is None
+        ):
+            return True
+        registration = self._registry.get(signal.source)
+        if registration is None:
+            return True
+        refused = replace(
+            signal,
+            payload={_DURABLE_PRIVACY_GATED_MARKER: "refused"},
+            caller=None,
+            causation_chain=[],
+            session_id=None,
+        )
         try:
-            await self._settle_undelivered_wake(
-                source=signal.source, target_agent=signal.target_agent,
-                source_event_id=source_event_id, stopped=False,
-                cause=result.status.value,
+            await self.initialize_durable_delivery()
+            persisted = await self._durable_store.persist_signal(
+                refused,
+                agent_id=self._agent.did,
+                source_event_id=source_event_id,
+                retention_days=registration.retention_days,
+                refused_consumer_id=consumer_id,
+                refusal_error=f"{_REFUSED}: {result.status.value}: {result.error or ''}",
             )
         except Exception as error:
             if (
@@ -6269,13 +6309,15 @@ class SignalDispatcher:
             ):
                 raise
             logger.warning(
-                "Refused cognition could not settle its source's work; "
-                "leaving it unadmitted for retry: signal=%s source=%s",
+                "Refused cognition could not record its refusal; leaving it "
+                "unadmitted for retry: signal=%s source=%s",
                 signal.id,
                 signal.source,
                 exc_info=True,
             )
             return False
+        if persisted.created:
+            self._request_owed_settlement_pass()
         return True
 
     @staticmethod
@@ -6319,25 +6361,27 @@ class SignalDispatcher:
     ):
         """Every failed or terminal-ACKable row of those consumers, by page.
 
-        The caller holds durable admission. Rows are read in delivery-ID
-        keyset pages, each statement bounded, and every page is read.
+        The caller holds durable admission. Rows are read per status in
+        delivery-ID keyset pages on the terminal index, so each statement
+        reads only the rows it returns, and every page is read.
         """
         for consumer_id in self._undelivered_wake_consumers():
-            after = ""
-            while True:
-                page = await self._durable_store.list_deliveries(
-                    agent_id=self._agent.did,
-                    consumer_id=consumer_id,
-                    statuses=(FAILED, TERMINAL_ACKABLE),
-                    limit=_UNDELIVERED_WAKE_PAGE_SIZE,
-                    after_delivery_id=after,
-                    retention_expired_before=retention_expired_before,
-                )
-                for delivery in page:
-                    yield delivery
-                if len(page) < _UNDELIVERED_WAKE_PAGE_SIZE:
-                    break
-                after = page[-1].delivery_id
+            for status in (FAILED, TERMINAL_ACKABLE):
+                after = ""
+                while True:
+                    page = await self._durable_store.list_terminal_deliveries_page(
+                        agent_id=self._agent.did,
+                        consumer_id=consumer_id,
+                        status=status,
+                        after_delivery_id=after,
+                        limit=_UNDELIVERED_WAKE_PAGE_SIZE,
+                        retention_expired_before=retention_expired_before,
+                    )
+                    for delivery in page:
+                        yield delivery
+                    if len(page) < _UNDELIVERED_WAKE_PAGE_SIZE:
+                        break
+                    after = page[-1].delivery_id
 
     async def _undelivered_wake_owed(self, delivery: DurableDelivery) -> bool:
         """Whether the work this terminal row's wake carried still waits on it."""
@@ -6466,20 +6510,24 @@ class SignalDispatcher:
             ):
                 self._retain_source_settlement_control(delivery, error)
             raise
-        self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+        self._source_settlement_control.pop(delivery.delivery_id, None)
 
     def _retain_source_settlement_control(
         self, delivery: DurableDelivery, error: BaseException,
     ) -> BaseException:
-        """Retain a settlement's native control as its delivery's debt.
+        """Retain a settlement's native control in its own ledger (#4001).
 
-        An unknown commit can arrive as a bare cancellation, which carries no
-        native source of its own; it is retained as it arrived.
+        It is kept apart from the delivery's row debt: a late terminalizer or
+        retained cleanup of that row clears only the row's own debt, never
+        this. An unknown commit can arrive as a bare cancellation, which
+        carries no native source of its own; it is retained as it arrived.
         """
-        retained = self._retain_cognition_native_control(delivery, error)
+        retained = self._retain_cognition_native_control(
+            delivery, error, ledger=self._source_settlement_control,
+        )
         if retained is None:
             retained = error
-            self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, error)
+            self._source_settlement_control[delivery.delivery_id] = (delivery, error)
         self._rearm_cleanup_runtime_owner_heartbeat()
         return retained
 
@@ -6732,13 +6780,18 @@ class SignalDispatcher:
             await self._terminalize_failed_cognition(delivery, error)
         return error
 
-    def _retain_cognition_native_control(self, delivery, *errors):
-        """Retain source-only terminal delivery evidence without observer history."""
+    def _retain_cognition_native_control(self, delivery, *errors, ledger=None):
+        """Retain source-only terminal delivery evidence without observer history.
+
+        ``ledger`` defaults to the delivery's row debt.
+        """
         from kestrel_sovereign.execution_custody import (
             _native_source_originals,
             execution_native_source_error,
         )
-        prior = self._retained_cognition_control_debt.get(delivery.delivery_id)
+        if ledger is None:
+            ledger = self._retained_cognition_control_debt
+        prior = ledger.get(delivery.delivery_id)
         previous = None if prior is None else prior[1]
         sources = _native_source_originals(previous, include_tool_terminal=True)
         incoming = tuple(source for error in errors for source in _native_source_originals(error, include_tool_terminal=True))
@@ -6749,7 +6802,7 @@ class SignalDispatcher:
         else:
             retained = execution_native_source_error(previous, *errors, include_tool_terminal=True)
         if retained is not None:
-            self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
+            ledger[delivery.delivery_id] = (delivery, retained)
         return retained
 
     async def _terminalize_failed_cognition(

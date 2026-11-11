@@ -7,8 +7,9 @@ This does not prove vendor OAuth refresh or remote unknown-outcome recovery.
 
 import asyncio
 from dataclasses import dataclass
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import json
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -24,7 +25,9 @@ from cryptography.fernet import Fernet
 
 import kestrel_sovereign
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
-from tests.integration.mcp_permission_peers import https_peer, owned_provider_network
+from tests.integration.mcp_permission_peers import (
+    MCPTestPeer, https_peer, gateway_peer, owned_gateway_network, owned_provider_network,
+)
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 
@@ -57,12 +60,26 @@ class RunningHost:
 async def native_host(home, descriptor, environment, peer, generation):
     ready = home / f'host-{generation}-ready.json'
     log_path = home / f'host-{generation}.log'
+    admissions = ready.with_suffix('.gateway-admissions')
+    if peer.kind == 'gateway':
+        admissions.mkdir(mode=0o700)
     with log_path.open('wb') as log:
         process = await asyncio.create_subprocess_exec(sys.executable, '-B',
             str(Path(__file__).with_name('mcp_permission_host.py')), str(descriptor), str(ready),
             cwd=home, env=environment, stdout=log, stderr=asyncio.subprocess.STDOUT)
         running = RunningHost({}, process, log_path)
+        from tests.integration.mcp_gateway_custody import OriginalHostAdmission
+        original_host = OriginalHostAdmission(process) if peer.kind == 'gateway' else None
         try:
+            if original_host is not None:
+                import psutil
+                peer.retain_host_admission(original_host, admissions)
+                try:
+                    original_host.bind_birth(psutil.Process(process.pid).create_time())
+                except psutil.NoSuchProcess:
+                    await process.wait()
+                    raise AssertionError('Owned host failed before metadata admission: ' + log_path.read_text())
+                peer.read_host_admissions(original_host, admissions)
             async with asyncio.timeout(35):
                 while not ready.exists():
                     if process.returncode is not None:
@@ -82,13 +99,18 @@ async def native_host(home, descriptor, environment, peer, generation):
                 assert state['agent_shutdown_timeout_s'] >= (
                     state['shutdown_prefix_s'] + state['shutdown_tail_s'])
             peer.local_ports.add(state['port'])
+            if peer.kind == 'gateway' and state.get('gateway') is not None:
+                peer.observe_host_gateway(state['pid'], state['gateway'])
             yield running
         finally:
-            try:
-                await running.stop()
-            finally:
+            async with AsyncExitStack() as retirement:
+                if original_host is not None:
+                    retirement.push_async_callback(peer.reconcile_host_gateways, original_host, admissions)
                 if running.state:
-                    peer.local_ports.discard(running.state['port'])
+                    retirement.callback(peer.local_ports.discard, running.state['port'])
+                    if peer.kind == 'gateway':
+                        retirement.push_async_callback(peer.assert_host_retired, running.state['pid'])
+                retirement.push_async_callback(running.stop)
 
 
 @pytest_asyncio.fixture
@@ -110,24 +132,49 @@ async def host_campaign(tmp_path, monkeypatch, request):
     peer_root = home / 'peer'
     peer_root.mkdir()
     settings = getattr(request, 'param', {})
-    async with https_peer(peer_root, monkeypatch, provider_model='owned-permission-model',
-            drop_first_tool_reply=settings.get('drop_first_tool_reply', False)) as peer:
+    transport = settings.get('transport', 'remote')
+    assert transport in {'remote', 'gateway'}
+    async with AsyncExitStack() as resources:
+        provider = await resources.enter_async_context(https_peer(
+            peer_root, monkeypatch, provider_model='owned-permission-model',
+            drop_first_tool_reply=settings.get('drop_first_tool_reply', False),
+            provider_only=transport == 'gateway'))
+        peer = provider
+        gateway_settings = None
+        if transport == 'gateway':
+            gateway_root = home / 'gateway-peer'
+            gateway_root.mkdir()
+            peer = await resources.enter_async_context(gateway_peer(gateway_root, monkeypatch))
+            peer.provider_url = provider.provider_url
+            peer.provider_witness = provider.provider_witness
+            peer.tls_certificate = provider.tls_certificate
+            plugin = Path(os.environ['MCP_TEST_DOCKER_PLUGIN']).resolve(strict=True)
+            gateway_settings = dict(home=os.environ['HOME'], plugin=str(plugin),
+                plugin_sha256=hashlib.sha256(plugin.read_bytes()).hexdigest(),
+                docker_socket=os.environ['MCP_TEST_DOCKER_HOST'].removeprefix('unix://'))
         (home / 'kestrel.toml').write_text(
             '[llm]\nroute_priority=["deepseek:api"]\n'
             '[llm.vendors.deepseek.routes.api]\napi_key="owned-synthetic-provider-key"\n'
-            'base_url=' + json.dumps(peer.provider_url) + '\nmodel="owned-permission-model"\n')
+            'base_url=' + json.dumps(provider.provider_url) + '\nmodel="owned-permission-model"\n')
         descriptor = home / 'host-test.json'
         descriptor.write_text(json.dumps(dict(agent_name='permission-host', agent_data=str(data),
-            selector=peer.selector, provider_url=peer.provider_url, certificate=str(peer.tls_certificate))))
-        settings = getattr(request, 'param', {})
+            transport=transport, selector=peer.selector, provider_url=provider.provider_url,
+            certificate=str(provider.tls_certificate), gateway=gateway_settings)))
         if 'sqlite_worker_budget' in settings:
             monkeypatch.setenv('KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S',
                 settings['sqlite_worker_budget'])
         environment = owned_host_environment(home, api_key=api_key, data_key=key)
+        if transport == 'gateway':
+            # Native CLI stores its catalog/profile DB under HOME; Kestrel's
+            # independent explicit home continues to own identity and history.
+            for name in ['HOME', 'DOCKER_CONFIG', 'DOCKER_HOST', 'DOCKER_MCP_IN_CONTAINER',
+                         'XDG_CACHE_HOME', 'KESTREL_MCP_DOCKER_CATALOG']:
+                environment[name] = os.environ[name]
         headers = {'X-API-Key': api_key, 'X-Kestrel-Allow-Destructive': 'true'}
-        with owned_provider_network(monkeypatch, peer):
-            yield SimpleNamespace(home=home, descriptor=descriptor, environment=environment,
-                peer=peer, did=identity.agent_did, headers=headers)
+        async with owned_gateway_network(monkeypatch, peer, gateway_settings) as gateway:
+            with owned_provider_network(monkeypatch, peer, gateway=gateway):
+                yield SimpleNamespace(home=home, descriptor=descriptor, environment=environment,
+                    peer=peer, did=identity.agent_did, headers=headers)
 
 
 def owned_host_environment(home, *, api_key, data_key):
@@ -160,10 +207,13 @@ async def observe_registry(campaign, state, nonce):
             await asyncio.sleep(0.001)
     observed = json.loads(receipt.read_text())
     assert observed['did'] == campaign.did and observed['pid'] == state['pid']
+    if campaign.peer.kind == 'gateway' and observed.get('gateway') is not None:
+        state['gateway'] = observed['gateway']
+        campaign.peer.observe_host_gateway(state['pid'], observed['gateway'])
     return observed
 
 
-async def configure_remote(client, campaign, state):
+async def configure_mcp(client, campaign, state):
     prefix = '/api/agents/permission-host'
     denied = await client.get(prefix + '/api/security/permissions/tree',
         headers={'X-API-Key': 'wrong-owned-key'})
@@ -181,8 +231,8 @@ async def configure_remote(client, campaign, state):
         'input': '!mcp-load ' + campaign.peer.selector, 'session_id': 'owned-host-restart'})
     assert response.status_code == 200, response.text
     observed = await observe_registry(campaign, state, nonce)
-    assert len(observed['remote_tools']) == 1, response.text
-    tool, owner = next(iter(observed['remote_tools'].items()))
+    assert len(observed['mcp_tools']) == 1, response.text
+    tool, owner = next(iter(observed['mcp_tools'].items()))
     return owner, tool
 
 
@@ -199,12 +249,12 @@ def invoke_marker(client):
         'session_id': 'owned-host-restart'})
 
 
-async def test_actual_host_process_restores_remote_permission_without_new_effect(host_campaign):
-    c = host_campaign
+async def exercise_permission_restart(c):
+    """One HTTP/storage/effect oracle shared by native MCP transports."""
     async with native_host(c.home, c.descriptor, c.environment, c.peer, 1) as first:
         assert first.state['did'] == c.did
         async with host_client(c, first.state) as client:
-            owner, tool = await configure_remote(client, c, first.state)
+            owner, tool = await configure_mcp(client, c, first.state)
             await set_permission(client, owner, tool, 'deny')
             response = await invoke_marker(client)
             assert response.status_code == 200, response.text
@@ -219,7 +269,7 @@ async def test_actual_host_process_restores_remote_permission_without_new_effect
             restored, = [entry for entry in remote['tools'] if entry['name'] == tool]
             assert restored['level'] == 'deny'
             observed = await observe_registry(c, second.state, nonce)
-            assert observed['remote_tools'] == {tool: owner}
+            assert observed['mcp_tools'] == {tool: owner}
             for level, expected in [('deny', []), ('allow', ['owned-provider-effect'])]:
                 if level == 'allow':
                     await set_permission(client, owner, tool, level)
@@ -231,6 +281,9 @@ async def test_actual_host_process_restores_remote_permission_without_new_effect
                 if entry['feature'] == owner and entry['tool'] == tool]
             assert decisions == ['auto_denied', 'auto_denied', 'auto_allowed']
 
+
+async def test_actual_host_process_restores_remote_permission_without_new_effect(host_campaign):
+    await exercise_permission_restart(host_campaign)
 
 async def pending_approval(client, call):
     async with asyncio.timeout(10):
@@ -247,11 +300,11 @@ async def pending_approval(client, call):
             await asyncio.sleep(0.01)
 
 
-async def test_old_host_approval_cannot_authorize_a_restarted_host_call(host_campaign):
-    c = host_campaign
+async def exercise_approval_restart(c):
+    """Reject stale/replayed host approvals with a real external effect witness."""
     async with native_host(c.home, c.descriptor, c.environment, c.peer, 1) as first:
         async with host_client(c, first.state) as client:
-            owner, tool = await configure_remote(client, c, first.state)
+            owner, tool = await configure_mcp(client, c, first.state)
             await set_permission(client, owner, tool, 'always_ask')
             original = asyncio.create_task(invoke_marker(client))
             try:
@@ -306,13 +359,103 @@ async def test_old_host_approval_cannot_authorize_a_restarted_host_call(host_cam
                 await asyncio.gather(current, return_exceptions=True)
 
 
+async def test_old_host_approval_cannot_authorize_a_restarted_host_call(host_campaign):
+    await exercise_approval_restart(host_campaign)
+
+
+async def exercise_approval_decision_race(c, first_approved):
+    """Hold real SQLite persistence while competing HTTP decisions enter CAS."""
+    from contextlib import closing
+    import sqlite3
+
+    async with native_host(c.home, c.descriptor, c.environment, c.peer, 1) as host:
+        async with host_client(c, host.state) as client:
+            owner, tool = await configure_mcp(client, c, host.state)
+            await set_permission(client, owner, tool, 'always_ask')
+            call = asyncio.create_task(invoke_marker(client))
+            decisions = []
+            try:
+                pending = await pending_approval(client, call)
+                assert (pending['feature'], pending['tool']) == (owner, tool)
+                database = Path(host.state['agent_database']).resolve(strict=True)
+                assert database.is_relative_to(c.home / 'agent')
+
+                async def snapshot():
+                    nonce = uuid.uuid4().hex
+                    response = await client.get('/api/agents/permission-host/api/security/pending',
+                        headers={'X-Owned-Registry-Observation': nonce})
+                    assert response.status_code == 200, response.text
+                    observed = await observe_registry(c, host.state, nonce)
+                    return observed['approvals'].get(pending['id'])
+
+                expected_claim = dict(status='approved' if first_approved else 'denied', scope='once')
+                with closing(sqlite3.connect(database, timeout=0)) as writer:
+                    writer.execute('BEGIN IMMEDIATE')
+                    try:
+                        first = asyncio.create_task(client.post(
+                            '/api/agents/permission-host/api/security/approve', json={
+                                'approval_id': pending['id'], 'approved': first_approved, 'scope': 'once'}))
+                        decisions.append(first)
+                        async with asyncio.timeout(3):
+                            while await snapshot() != expected_claim:
+                                assert not first.done(), 'First decision escaped its original blocked persistence'
+                                await asyncio.sleep(0)
+                        second = asyncio.create_task(client.post(
+                            '/api/agents/permission-host/api/security/approve', json={
+                                'approval_id': pending['id'], 'approved': not first_approved, 'scope': 'always'}))
+                        decisions.append(second)
+                        # A broken CAS changes the real claim before it blocks
+                        # on SQLite too. Observe that state, then release both
+                        # actual requests; a test timeout is not the oracle.
+                        async with asyncio.timeout(3):
+                            while not second.done() and await snapshot() == expected_claim:
+                                await asyncio.sleep(0)
+                        assert not first.done() and not call.done()
+                        assert await c.peer.witness(None, None) == []
+                    finally:
+                        writer.rollback()
+                first_response, second_response = await asyncio.gather(*decisions)
+                assert first_response.status_code == 200, first_response.text
+                assert first_response.json()['persisted'] is True
+                assert first_response.json()['awaiter_gone'] is False
+                assert second_response.status_code == 404, (
+                    'Concurrent decision replaced the original claimed approval', second_response.text)
+                response = await call
+                assert response.status_code == 200, response.text
+                expected_effects = ['owned-provider-effect'] if first_approved else []
+                assert await c.peer.witness(None, None) == expected_effects
+                audit = (await client.get('/api/agents/permission-host/api/security/audit')).json()['logs']
+                assert [row['decision'] for row in audit
+                    if row['feature'] == owner and row['tool'] == tool] == [
+                        'user_approved' if first_approved else 'user_denied']
+                call = asyncio.create_task(invoke_marker(client))
+                following = await pending_approval(client, call)
+                assert following['id'] != pending['id'], 'Competing decision escaped one-shot scope'
+                assert await c.peer.witness(None, None) == expected_effects
+                denied = await client.post('/api/agents/permission-host/api/security/approve', json={
+                    'approval_id': following['id'], 'approved': False, 'scope': 'once'})
+                assert denied.status_code == 200, denied.text
+                response = await call
+                assert response.status_code == 200, response.text
+                assert await c.peer.witness(None, None) == expected_effects
+            finally:
+                if not call.done():
+                    call.cancel()
+                await asyncio.gather(call, *decisions, return_exceptions=True)
+
+
+@pytest.mark.parametrize('first_approved', [False, True], ids=['deny-first', 'approve-first'])
+async def test_concurrent_host_approval_cannot_replace_original_decision(host_campaign, first_approved):
+    await exercise_approval_decision_race(host_campaign, first_approved)
+
+
 async def test_owned_host_setup_failure_preserves_original_diagnostic(tmp_path):
     home = tmp_path / 'failed-host'
     home.mkdir()
     repository = Path(__file__).resolve().parents[2]
     environment = dict(PATH=os.environ['PATH'], HOME=str(home), PYTHONPATH=str(repository),
         KESTREL_SKIP_DOTENV='1', PYTHON_DOTENV_DISABLED='1', PYTHONDONTWRITEBYTECODE='1')
-    peer = SimpleNamespace(local_ports=set())
+    peer = MCPTestPeer('remote', 'unused-before-descriptor-load')
     with pytest.raises(AssertionError, match='Owned host failed') as raised:
         async with native_host(home, home / 'missing-test-descriptor.json', environment, peer, 'failure'):
             pytest.fail('A missing native host descriptor must never reach readiness')

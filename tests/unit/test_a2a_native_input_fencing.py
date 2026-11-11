@@ -1,6 +1,7 @@
 """A later creator input must fence every old recipient execution and wake."""
 
 import asyncio
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -980,7 +981,7 @@ async def test_every_ordinary_settlement_failure_leaves_the_task_owed(manager, f
         else:
             assert await dispatcher._settle_owed_cognition_sources() is None
         assert faults == [] and len(attempts) == 1
-        assert not dispatcher._retained_cognition_control_debt
+        assert dispatcher.unresolved_cognition_control == ()
         assert (await snapshot(manager, task)).task.status.state == (
             TaskState.TASK_STATE_WORKING
             if fault == "lifecycle_conflict"
@@ -994,7 +995,7 @@ async def test_every_ordinary_settlement_failure_leaves_the_task_owed(manager, f
             TaskState.TASK_STATE_FAILED
         )
         assert await dispatcher.owed_cognition_wake_settlements() == []
-        assert not dispatcher._retained_cognition_control_debt
+        assert dispatcher.unresolved_cognition_control == ()
     finally:
         await close_input_dispatcher(agent, dispatcher)
 
@@ -1038,7 +1039,8 @@ async def test_a_settlement_whose_commit_is_unknown_stops_the_pass_as_control(
             with pytest.raises(asyncio.CancelledError):
                 await dispatcher._settle_owed_cognition_sources()
         assert faults == [] and len(attempts) == 1
-        (debt,) = dispatcher._retained_cognition_control_debt.values()
+        assert not dispatcher._retained_cognition_control_debt
+        (debt,) = dispatcher._source_settlement_control.values()
         assert debt[0].delivery_id in {row.delivery_id for row in failed}
         assert dispatcher._runtime_owner_cleanup_required()
 
@@ -1107,7 +1109,8 @@ async def test_an_unknown_settlement_commit_refuses_retirement_until_a_retry_ret
             del raised
             expected_row_writes = []
         assert faults == []
-        assert list(dispatcher._retained_cognition_control_debt) == [delivery_id]
+        assert dispatcher.unresolved_cognition_control == (delivery_id,)
+        assert list(dispatcher._source_settlement_control) == [delivery_id]
         assert (await snapshot(manager, task)).task.status.state == (
             TaskState.TASK_STATE_SUBMITTED
         )
@@ -1118,7 +1121,8 @@ async def test_an_unknown_settlement_commit_refuses_retirement_until_a_retry_ret
         assert faults == []
         assert execution_commit_outcome(refused.value) == "unknown"
         del refused
-        assert list(dispatcher._retained_cognition_control_debt) == [delivery_id]
+        assert dispatcher.unresolved_cognition_control == (delivery_id,)
+        assert list(dispatcher._source_settlement_control) == [delivery_id]
         assert dispatcher._durable_runtime_owner_registered
         assert (await snapshot(manager, task)).task.status.state == (
             TaskState.TASK_STATE_SUBMITTED
@@ -1127,7 +1131,7 @@ async def test_an_unknown_settlement_commit_refuses_retirement_until_a_retry_ret
         closed = True
         await close_input_dispatcher(agent, dispatcher)
 
-        assert not dispatcher._retained_cognition_control_debt
+        assert dispatcher.unresolved_cognition_control == ()
         assert not dispatcher._durable_runtime_owner_registered
         assert failed_row_writes == expected_row_writes
         settled = await snapshot(manager, task)
@@ -1330,5 +1334,191 @@ async def test_retention_holds_a_terminal_wake_until_its_work_is_settled(manager
             source=SOURCE_NAME,
             source_event_id=submitted_input_identity(owed_task.id, 0),
         ) is None
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_a_refused_duplicate_leaves_the_work_another_executor_owns_alone(
+    manager,
+):
+    """wo-4001-6 self-review: a rebuilt wake refused by a dispatcher with a
+    lower TTL used to fail its task at once, although the same input's
+    earlier attempt was already admitted and leased to another executor. A
+    refusal is now only recorded, under the source identity: the admitted
+    attempt keeps it, so nothing is recorded, and that delivery's own lease
+    and terminal CAS decide its work (#4001)."""
+    from kestrel_sdk.signals import CausationFrame
+
+    from kestrel_sovereign.a2a.extensions import (
+        causation_metadata,
+        serialize_chain_for_metadata,
+    )
+    from kestrel_sovereign.signals import OrderedLockManager, SignalDispatcher
+    from kestrel_sovereign.signals.dispatcher import DurableAdmissionDisposition
+    from kestrel_sdk.signals import Status
+
+    metadata = causation_metadata(serialize_chain_for_metadata([
+        CausationFrame(agent_id="did:creator", source="heartbeat", signal_id="earlier",
+                       turn_id=None, depth=1, emitted_at=datetime.now(UTC)),
+    ]))
+    task = await manager.create_task(request(**metadata), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    refusing = SignalDispatcher(
+        agent=agent, registry=agent.signal_registry, lock_manager=OrderedLockManager(),
+        store=dispatcher._store, ttl=1,
+    )
+    try:
+        signal = wake(await snapshot(manager, task), manager)
+        identity_key = signal.dedupe_key
+        await dispatcher.dispatch_signal(signal, source_event_id=identity_key)
+        admitted = await dispatcher.get_durable_delivery_for_source_event(
+            consumer_id=consumer, source=signal.source, source_event_id=identity_key,
+        )
+        successor = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer, event_id=admitted.event_id, executor_id="successor",
+        )
+        assert successor is not None
+
+        retry = await refusing.enqueue_durable_cognition(
+            wake(await snapshot(manager, task), manager),
+            source_event_id=identity_key,
+            consumer_id=consumer,
+        )
+        assert (await retry.wait()).status == Status.DROPPED_CYCLE
+        assert (await retry.wait_for_durable_admission()).disposition == (
+            DurableAdmissionDisposition.TERMINAL
+        )
+        await dispatcher._heartbeat_runtime_owner()
+        await refusing._heartbeat_runtime_owner()
+
+        (delivery,) = await dispatcher.list_durable_deliveries(consumer_id=consumer)
+        assert delivery.event_id == admitted.event_id
+        assert (delivery.status, delivery.lease_owner) == ("leased", "successor")
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_SUBMITTED
+        )
+        assert await dispatcher.owed_cognition_wake_settlements() == []
+    finally:
+        await refusing.shutdown_durable_delivery()
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_a_late_row_cleanup_keeps_the_settlement_control_it_did_not_create(
+    manager, monkeypatch
+):
+    """wo-4001-6 self-review: the row debt of a delivery and the settlement
+    control of the work its wake carried shared one map. A late observer of
+    the row's own terminalizer, joining after the heartbeat's settlement met
+    an unknown commit, cleared that newer control, and shutdown reported
+    success with the task still submitted and still owed. Each is now its
+    own ledger, and a row's cleanup clears only the row's debt (#4001)."""
+    from kestrel_sovereign import _async_ownership
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        ToolAuditUnconfirmedError,
+    )
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    closed = False
+    try:
+        original = await claimed_submission_wake(manager, dispatcher, consumer, task)
+        row_error = ToolAuditUnconfirmedError("required audit unavailable")
+        native_join = _async_ownership.await_owned_task
+        observer_joined, release_observer = asyncio.Event(), asyncio.Event()
+
+        async def join(owned, *args, **kwargs):
+            result = await native_join(owned, *args, **kwargs)
+            if asyncio.current_task().get_name() == "late-original-cleanup":
+                observer_joined.set()
+                await release_observer.wait()
+            return result
+
+        monkeypatch.setattr(_async_ownership, "await_owned_task", join)
+        initial = asyncio.create_task(
+            dispatcher._terminalize_failed_cognition(original, row_error),
+        )
+        late = asyncio.create_task(
+            dispatcher._release_retained_durable_cognition_task(original, row_error),
+            name="late-original-cleanup",
+        )
+        await asyncio.wait_for(observer_joined.wait(), 3)
+        await initial
+        assert not dispatcher._retained_cognition_control_debt
+
+        fault_task_writes(manager, [ExecutionCommitOutcomeError("unknown")])
+        await dispatcher._heartbeat_runtime_owner()
+        assert dispatcher.unresolved_cognition_control == (original.delivery_id,)
+
+        release_observer.set()
+        await late
+
+        assert not dispatcher._retained_cognition_control_debt
+        assert list(dispatcher._source_settlement_control) == [original.delivery_id]
+        assert dispatcher.unresolved_cognition_control == (original.delivery_id,)
+        assert dispatcher._runtime_owner_cleanup_required()
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_SUBMITTED
+        )
+
+        # Retirement retries only the settlement's fenced write, and clears
+        # the control only once that write returns.
+        closed = True
+        await close_input_dispatcher(agent, dispatcher)
+        assert dispatcher.unresolved_cognition_control == ()
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_FAILED
+        )
+    finally:
+        if not closed:
+            await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_a_settlement_page_reads_only_the_rows_it_returns(manager):
+    """wo-4001-6 self-review: the settlement pass paged terminal rows by
+    delivery ID through an index ordered by retry time, so every page
+    sorted the consumer's whole terminal history. Each page is now one
+    terminal status as a literal, a range on the terminal index that also
+    serves its order (#4001)."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    try:
+        await failed_submission_wake(manager, dispatcher, consumer, task)
+        store = dispatcher._durable_store
+        statements = []
+        fetch_all = store.backend.fetch_all
+
+        async def recorded(sql, params=()):
+            statements.append((sql, params))
+            return await fetch_all(sql, params)
+
+        store.backend.fetch_all = recorded
+        try:
+            assert len(await dispatcher.owed_cognition_wake_settlements()) == 1
+        finally:
+            store.backend.fetch_all = fetch_all
+        pages = [
+            statement for statement in statements
+            if "ORDER BY d.delivery_id LIMIT" in statement[0]
+        ]
+        assert {"'failed'", "'terminal_ackable'"} == {
+            literal for sql, _ in pages
+            for literal in ("'failed'", "'terminal_ackable'")
+            if f"d.status = {literal}" in sql
+        }
+        index = re.compile(rf"\bidx_{store.DELIVERIES}_terminal_page\b")
+        for sql, params in pages:
+            if store.backend.backend_type == "postgres":
+                async with store.backend.transaction():
+                    await store.backend.execute("SET LOCAL enable_seqscan = off")
+                    rows = await store.backend.fetch_all("EXPLAIN " + sql, params)
+                plan = "\n".join(str(row[0]) for row in rows)
+                assert index.search(plan), plan
+                assert "Sort" not in plan, plan
+            else:
+                rows = await store.backend.fetch_all("EXPLAIN QUERY PLAN " + sql, params)
+                plan = "\n".join(str(row[-1]) for row in rows)
+                assert index.search(plan), plan
+                assert "TEMP B-TREE" not in plan, plan
     finally:
         await close_input_dispatcher(agent, dispatcher)
