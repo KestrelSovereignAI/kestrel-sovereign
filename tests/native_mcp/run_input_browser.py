@@ -26,7 +26,8 @@ def tracked_files(repository):
 def wheel_inventory(wheel, repository):
     """Refuse a candidate whose packaged Core bytes differ from this checkout."""
     with zipfile.ZipFile(wheel) as archive:
-        names = [name for name in archive.namelist() if name.startswith('kestrel_sovereign/')]
+        names = [name for name in archive.namelist()
+                 if name.startswith('kestrel_sovereign/') and not name.endswith('/')]
         if not names or len(names) != len(set(names)):
             raise RuntimeError('Core wheel has an empty or duplicate runtime inventory')
         result = {}
@@ -98,6 +99,7 @@ raise SystemExit(result)
 COPY core-tests/ /core-tests/
 COPY owned/ /owned/
 RUN uv pip install --python /work/.venv/bin/python --index-url https://pypi.org/simple --no-deps --reinstall kestrel-feature-mcp=={mcp_version} /owned/{wheel.name}
+RUN uv pip check --python /work/.venv/bin/python
 ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 MCP_TEST_BROWSER_SUPPORT=/work
 WORKDIR /core-tests
 RUN /work/.venv/bin/python -I -B /owned/verify.py
