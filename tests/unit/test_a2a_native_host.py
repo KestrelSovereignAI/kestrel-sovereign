@@ -1,6 +1,7 @@
 """Native manager construction and the real host's signal boot phase."""
 
 import asyncio
+import contextvars
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -2236,8 +2237,86 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
     )
 
 
+@pytest.fixture(params=["ordinary", "connection-winner"])
+def native_question_shutdown(request):
+    """Exercise the actual feature stop alongside Happy Eyeballs cancellation.
+
+    AnyIO cancels its connection task group after a real TCP attempt wins.
+    Release that original connection immediately before feature shutdown so
+    its housekeeping and our native cancellation reach the same reader.
+    """
+    if request.param == "ordinary":
+        async def stop(feature):
+            await feature.shutdown()
+
+        yield stop
+        return
+
+    from anyio._backends._asyncio import AsyncIOBackend
+
+    from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
+    from kestrel_sovereign.execution_custody import close_native_execution_stream
+
+    native_connect = AsyncIOBackend.connect_tcp
+    native_read = NativeQuestionSupervisor._read_pass
+    reading = contextvars.ContextVar("native_question_connection_attempt", default=False)
+    connected, release = asyncio.Event(), asyncio.Event()
+    held = False
+    stopping = False
+    resumed_reads = []
+
+    async def read(supervisor, *args, **kwargs):
+        if stopping:
+            # Cleanup of a failed regression still joins the ORIGINAL reader.
+            # A second cancel is test cleanup, never the production stop policy.
+            resumed_reads.append(asyncio.current_task())
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+        token = reading.set(True)
+        try:
+            return await native_read(supervisor, *args, **kwargs)
+        finally:
+            reading.reset(token)
+
+    async def connect(cls, *args, **kwargs):
+        nonlocal held
+        stream = await native_connect(*args, **kwargs)
+        if reading.get() and not held:
+            held = True
+            connected.set()
+            try:
+                await release.wait()
+            except BaseException:
+                await close_native_execution_stream(stream)
+                raise
+        return stream
+
+    async def stop(feature):
+        nonlocal stopping
+        async with asyncio.timeout(5):
+            await connected.wait()
+        stopping = True
+        release.set()
+        try:
+            await feature.shutdown()
+        finally:
+            stopping = False
+        assert not resumed_reads, (
+            "Native question reader lost feature shutdown cancellation during "
+            "TCP connection completion and started another recovery pass"
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(NativeQuestionSupervisor, "_read_pass", read)
+        patch.setattr(AsyncIOBackend, "connect_tcp", classmethod(connect))
+        try:
+            yield stop
+        finally:
+            release.set()
+
+
 async def test_public_question_tool_uses_native_intent_and_restarts_without_legacy_rows(
-    local_native_peer, monkeypatch
+    local_native_peer, monkeypatch, native_question_shutdown
 ):
     from google.protobuf.json_format import MessageToDict
 
@@ -2286,7 +2365,7 @@ async def test_public_question_tool_uses_native_intent_and_restarts_without_lega
         )
         assert MessageToDict(task.history[0].parts[1])["data"] == {"value": 42}
         assert not await p.backend.table_exists("a2a_outbound_tasks")
-        await first.shutdown()
+        await native_question_shutdown(first)
         # No in-memory subscriber or caller turn survives the feature restart.
         await p.manager.complete_task(
             task.id, "The native answer", recipient_agent_id=p.recipient.did

@@ -117,8 +117,10 @@ dependencies = [
     # RFC 8785 for the Kestrel sender extension's complete native request digest.
     "rfc8785>=0.1.4,<1",
     # Core web framework
-    # Public cancellation checkpoint used by MCP OAuth cleanup.
-    "anyio>=4.7,<5",
+    # 4.16.0 preserves native Task.cancel() racing with a successful TCP
+    # connection's own cancellation (anyio#1214). Older versions can leave
+    # A2A question recovery running forever while feature shutdown joins it.
+    "anyio>=4.16.0",
     # Pre-1.0 router internals changed in a minor release. Advance this tested
     # current line with the native router/CSRF/frontend acceptance checks.
     "fastapi>=0.143.3,<0.144",

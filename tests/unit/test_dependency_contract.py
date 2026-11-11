@@ -391,6 +391,27 @@ def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
     assert any(package["name"] == "tzdata" for package in _lock()["package"])
 
 
+def test_anyio_requires_native_cancellation_preserving_connection_completion():
+    """Every consumer must receive the real shutdown fix, including installs."""
+    direct = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "anyio"
+    ]
+    assert len(direct) == 1
+    _assert_requirement_floor(direct[0], Version("4.16.0"))
+    assert Version("4.15.1") not in direct[0].specifier
+    assert Version("4.16.0") in direct[0].specifier
+    assert Version("4.17.0") in direct[0].specifier
+    root = _locked_root_package(_lock())
+    assert [
+        requirement
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "anyio"
+    ] == [{"name": "anyio", "specifier": ">=4.16.0"}]
+    _assert_locked_floors({"anyio": "4.16.0"})
+
+
 def test_asyncpg_runtime_probe_supports_current_minor_releases():
     """Require native retirement fixes without capping future minor releases."""
     direct = [
