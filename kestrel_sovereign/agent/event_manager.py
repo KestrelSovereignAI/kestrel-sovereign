@@ -725,7 +725,6 @@ class EventManagerMixin:
         would recreate the wake once every retention period.
         """
 
-        from kestrel_sovereign.execution_custody import is_execution_control_error
         from kestrel_sovereign.signals import ACKNOWLEDGED, DurableAdmissionDisposition
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
@@ -769,26 +768,22 @@ class EventManagerMixin:
                 source_event_id=source_event_id,
             )
 
-        async def settle_undelivered(task_id: str, delivery) -> None:
+        def undelivered(delivery) -> bool:
+            return (
+                delivery is not None
+                and delivery.is_terminal
+                and delivery.status != ACKNOWLEDGED
+            )
+
+        async def settle_undelivered(delivery) -> None:
             # The dispatcher ends the task when its wake ends undelivered; this
-            # catches a process that stopped before it could (#4001). One task
-            # that cannot be settled must not refuse the boot or the rest.
-            try:
-                await self.settle_undelivered_cognition_wake(
-                    source=delivery.event.source,
-                    target_agent=delivery.event.target_agent,
-                    source_event_id=delivery.event.source_event_id,
-                    stopped=False,
-                    cause=f"wake {delivery.status}",
-                )
-            except Exception as error:
-                if is_execution_control_error(error):
-                    raise
-                logging.exception(
-                    "Could not settle A2A task %s, whose submission wake ended "
-                    "undelivered; it stays live until a later boot",
-                    task_id,
-                )
+            # catches a process that stopped before it could (#4001). The wake
+            # joins the dispatcher's source debt, so one task that cannot be
+            # settled now neither refuses the boot nor waits for the next one:
+            # the owner heartbeat retries it. Native control propagates.
+            await self.dispatcher.settle_terminal_cognition_source(
+                delivery, cause=f"wake {delivery.status}"
+            )
 
         unadmitted: list[str] = []
         for candidate in tasks:
@@ -798,14 +793,10 @@ class EventManagerMixin:
                 original = await submission_wake(
                     submitted_input_identity(task.id, candidate.input_revision)
                 )
-                if (
-                    original is not None
-                    and original.is_terminal
-                    and original.status != ACKNOWLEDGED
-                ):
+                if undelivered(original):
                     # The input's wake ended without running, and nothing runs
                     # it again; a replacement would be refused the same way.
-                    await settle_undelivered(task.id, original)
+                    await settle_undelivered(original)
                     continue
                 if (
                     state == TaskState.TASK_STATE_WORKING
@@ -859,8 +850,8 @@ class EventManagerMixin:
                     # A WORKING wake for this input failed after the input's
                     # submission wake was acknowledged.
                     failed = await submission_wake(source_event_id)
-                    if failed is not None:
-                        await settle_undelivered(task.id, failed)
+                    if undelivered(failed):
+                        await settle_undelivered(failed)
             elif receipt.disposition is DurableAdmissionDisposition.NOT_ADMITTED:
                 unadmitted.append(str(task.id))
         if unadmitted:
@@ -1002,7 +993,7 @@ class EventManagerMixin:
         reconciliation. Nothing else wakes the recipient for that input, so a
         task left ``submitted`` or ``working`` waits forever and its sender
         sees nothing fail (#4001). The dispatcher calls this wherever such a
-        wake becomes terminal, and boot reconciliation calls it for one already
+        wake becomes terminal, and for one boot reconciliation finds already
         terminal. A stopped wake cancels the task; any other ends it failed,
         naming ``cause``.
 

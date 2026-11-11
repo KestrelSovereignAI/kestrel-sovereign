@@ -643,6 +643,316 @@ async def test_a_wake_interrupted_by_shutdown_ends_its_task_after_the_restart(
         assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
 
 
+_SETTLEMENT_FAULT = "inject_4001_task_settlement_fault"
+
+
+async def test_a_failed_wake_whose_task_write_failed_is_settled_without_a_restart(
+    tmp_path, monkeypatch
+):
+    """Final self-review of wo-4001-3: after a restart the wake's retry is
+    refused and its delivery fails, but the write that ends its task fails
+    too. A failed row is never reclaimed, so before the fix nothing settled
+    the task until the next boot, and its sender saw ``submitted``. The
+    dispatcher's owner heartbeat now retries the settlement while the host
+    runs, so clearing the fault is enough."""
+    from datetime import timedelta
+
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+
+    home = tmp_path / "agent"
+    async with booted_agent(
+        home, name="Recipient", provenance="test:4001-settle-retry", features=set()
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        parked = await _park_after_begin(agent, monkeypatch)
+        task = await _submit_task(agent)
+        await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
+        did = agent.did
+
+    # A real write fault on the agent's own database: the task cannot be
+    # marked failed while this trigger stands.
+    fault = sqlite3.connect(home / "kestrel_prime.db")
+    fault.execute(
+        f"CREATE TRIGGER {_SETTLEMENT_FAULT} BEFORE UPDATE ON a2a_tasks "
+        "WHEN NEW.status = 'failed' "
+        "BEGIN SELECT RAISE(ABORT, 'injected task settlement fault'); END"
+    )
+    fault.commit()
+    settlements = []
+    settle = KestrelAgent.settle_undelivered_cognition_wake
+
+    async def counted(self, **identity):
+        settlements.append(identity["source_event_id"])
+        return await settle(self, **identity)
+
+    monkeypatch.setattr(KestrelAgent, "settle_undelivered_cognition_wake", counted)
+    # The owner heartbeat is the recovery worker; run its cadence at test speed.
+    monkeypatch.setitem(
+        SignalDispatcher.__init__.__kwdefaults__,
+        "runtime_owner_stale_after",
+        timedelta(seconds=0.6),
+    )
+    try:
+        async with booted_agent(
+            home,
+            name="Recipient",
+            provenance="test:4001-settle-retry",
+            features=set(),
+            identity=did,
+        ) as agent:
+            _script_replies(agent, monkeypatch)
+
+            async def retried_against_the_fault():
+                deliveries = await _submission_deliveries(agent)
+                return [d.status for d in deliveries] == ["failed"] and len(settlements) >= 3
+
+            await _until(
+                agent,
+                retried_against_the_fault,
+                "the failed wake's settlement was not retried against the fault",
+            )
+            assert len(set(settlements)) == 1
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
+
+            fault.execute(f"DROP TRIGGER {_SETTLEMENT_FAULT}")
+            fault.commit()
+
+            async def ended():
+                return await _sender_state(agent, task) != TaskState.TASK_STATE_SUBMITTED
+
+            await _until(agent, ended, "the task was left submitted once the fault cleared")
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
+            assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
+
+            async def debt_cleared():
+                # The row commits before the settlement's projections return.
+                return not agent.dispatcher._failed_cognition_source_debt
+
+            await _until(agent, debt_cleared, "the settled task's debt was never cleared")
+    finally:
+        fault.close()
+
+
+async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
+    tmp_path, monkeypatch
+):
+    """Self-review of wo-4001-4: a process can stop between committing a
+    wake's failed row and settling its task. The next boot finds the row
+    already failed, and the write that ends the task fails too. Before the
+    fix boot reconciliation only logged that failure; the dispatcher held no
+    debt for the row, so the owner heartbeat retried nothing and the sender
+    saw ``submitted`` until yet another restart. The row now joins the same
+    source debt as a row the running dispatcher failed itself. Settling it
+    writes neither cognition nor the committed row again."""
+    from datetime import timedelta
+
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+    from kestrel_sovereign.signals.durable import DurableSignalStore
+
+    home = tmp_path / "agent"
+    provenance = "test:4001-boot-settle-retry"
+    async with booted_agent(
+        home, name="Recipient", provenance=provenance, features=set()
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        parked = await _park_after_begin(agent, monkeypatch)
+        task = await _submit_task(agent)
+        await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
+        did = agent.did
+
+    # The restart refuses the wake's retry and commits its failed row; the
+    # process then stops before it settles the task.
+    async def stopped_before_settling(self, **identity):
+        return False
+
+    with monkeypatch.context() as stopped:
+        stopped.setattr(
+            KestrelAgent, "settle_undelivered_cognition_wake", stopped_before_settling
+        )
+        async with booted_agent(
+            home, name="Recipient", provenance=provenance, features=set(), identity=did
+        ) as agent:
+            _script_replies(agent, monkeypatch)
+
+            async def failed():
+                return [d.status for d in await _submission_deliveries(agent)] == [
+                    "failed"
+                ]
+
+            await _until(agent, failed, "the refused retry never failed its row")
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
+
+    fault = sqlite3.connect(home / "kestrel_prime.db")
+    fault.execute(
+        f"CREATE TRIGGER {_SETTLEMENT_FAULT} BEFORE UPDATE ON a2a_tasks "
+        "WHEN NEW.status = 'failed' "
+        "BEGIN SELECT RAISE(ABORT, 'injected task settlement fault'); END"
+    )
+    fault.commit()
+    settlements = []
+    settle = KestrelAgent.settle_undelivered_cognition_wake
+
+    async def counted(self, **identity):
+        settlements.append(identity["source_event_id"])
+        return await settle(self, **identity)
+
+    failed_row_writes = []
+    write_row = DurableSignalStore.release_managed_delivery_after_task
+
+    async def counted_row_write(self, **kwargs):
+        failed_row_writes.append(kwargs["delivery_id"])
+        return await write_row(self, **kwargs)
+
+    monkeypatch.setattr(KestrelAgent, "settle_undelivered_cognition_wake", counted)
+    monkeypatch.setattr(
+        DurableSignalStore, "release_managed_delivery_after_task", counted_row_write
+    )
+    # The owner heartbeat is the recovery worker; run its cadence at test speed.
+    monkeypatch.setitem(
+        SignalDispatcher.__init__.__kwdefaults__,
+        "runtime_owner_stale_after",
+        timedelta(seconds=0.6),
+    )
+    model_calls = []
+
+    async def no_cognition(kwargs):
+        model_calls.append(kwargs)
+        return LLMResponse(content=REPLY)
+
+    try:
+        async with booted_agent(
+            home, name="Recipient", provenance=provenance, features=set(), identity=did
+        ) as agent:
+            _script_replies(agent, monkeypatch, no_cognition)
+
+            async def retried_against_the_fault():
+                return len(settlements) >= 3
+
+            await _until(
+                agent,
+                retried_against_the_fault,
+                "boot left the failed wake's settlement to no retry",
+            )
+            assert len(set(settlements)) == 1
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
+
+            fault.execute(f"DROP TRIGGER {_SETTLEMENT_FAULT}")
+            fault.commit()
+
+            async def ended():
+                return await _sender_state(agent, task) != TaskState.TASK_STATE_SUBMITTED
+
+            await _until(agent, ended, "the task was left submitted once the fault cleared")
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
+            assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
+
+            async def debt_cleared():
+                return not agent.dispatcher._failed_cognition_source_debt
+
+            await _until(agent, debt_cleared, "the settled task's debt was never cleared")
+            assert failed_row_writes == []
+            assert model_calls == []
+    finally:
+        fault.close()
+
+
+async def test_a_task_its_own_turn_completes_leaves_the_next_turn_runnable(
+    tmp_path, monkeypatch
+):
+    """The fifth occurrence (11-11 02:28Z, Claw), with no restart, Stop or audit
+    failure. An inbound task's turn answers it with ``respond_to_a2a_task``.
+    The completion wakes the same agent (``a2a.task_complete``) from inside
+    that turn. Before the fix the wake was enrolled in that turn's privacy
+    lifetime: it took CONVERSATION as the turn ended and waited for the privacy
+    lock, which the turn's retirement held while it waited for the wake. The
+    wake never reached its model call, and every later turn queued behind it.
+    """
+    import re
+
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    monkeypatch.setenv("KESTREL_TEST_AUTO_APPROVE", "1")
+    async with booted_agent(
+        tmp_path / "agent",
+        name="Recipient",
+        provenance="test:4001-self-wake",
+        features={"TaskFeature"},
+    ) as agent:
+        completion_wake = asyncio.Event()
+        while_wake_ran = {}
+        responded = []
+
+        async def submission_acknowledged():
+            return [d.status for d in await _submission_deliveries(agent)] == [
+                "acknowledged"
+            ]
+
+        async def generate(kwargs):
+            messages = kwargs.get("messages") or [{}]
+            if messages[-1].get("role") == "tool":
+                return LLMResponse(content=REPLY)
+            text = "\n".join(str(m.get("content")) for m in messages)
+            if "[A2A_COMPLETE]" in text and not completion_wake.is_set():
+                # Still inside the wake's turn: the turn that produced it must
+                # finish, retirement and delivery included, without it.
+                deadline = asyncio.get_running_loop().time() + SETTLE_SECONDS
+                while not await submission_acknowledged():
+                    if asyncio.get_running_loop().time() > deadline:
+                        break
+                    await asyncio.sleep(0.02)
+                while_wake_ran["producer_acknowledged"] = await submission_acknowledged()
+                completion_wake.set()
+                return LLMResponse(content=REPLY)
+            submitted = re.search(r"native A2A task `([^`]+)`", text)
+            if "[A2A_TASK_SUBMITTED]" in text and submitted and not responded:
+                responded.append(submitted.group(1))
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="respond-4001",
+                            name="respond_to_a2a_task",
+                            arguments={
+                                "task_id": submitted.group(1),
+                                "content": "Done.",
+                                "state": "completed",
+                            },
+                        )
+                    ],
+                )
+            return LLMResponse(content=REPLY)
+
+        _script_replies(agent, monkeypatch, generate)
+        task = await _submit_task(agent)
+
+        async def completed():
+            return await _sender_state(agent, task) == TaskState.TASK_STATE_COMPLETED
+
+        await _until(agent, completed, "the inbound task's turn never completed it")
+        assert responded == [task.id]
+        try:
+            await asyncio.wait_for(completion_wake.wait(), SETTLE_SECONDS)
+        except TimeoutError:
+            pytest.fail(
+                "the completion wake never reached its model call\n" + _await_chains(agent)
+            )
+        assert while_wake_ran == {"producer_acknowledged": True}
+
+        (after,) = await _settle(
+            agent,
+            (asyncio.create_task(agent.process_input("after", session_id="s")),),
+            "the turn after the completion wake",
+        )
+        assert after.result() == REPLY
+        assert not agent._get_privacy_transition_lock().locked()
+
+
 async def test_a_cycle_refused_submission_wake_fails_the_task_its_sender_waits_on(
     tmp_path, monkeypatch
 ):

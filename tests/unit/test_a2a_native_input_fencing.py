@@ -792,3 +792,294 @@ async def test_failed_wake_settlement_retains_native_commit_uncertainty(manager)
     finally:
         if not closed:
             await close_input_dispatcher(agent, dispatcher)
+
+
+async def claimed_submission_wake(manager, dispatcher, consumer, task):
+    """Persist a task's submission wake and claim its delivery for this owner."""
+    import copy
+
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
+
+    identity_key = submitted_input_identity(task.id, 0)
+    await dispatcher.dispatch_signal(
+        copy.deepcopy(wake(await snapshot(manager, task), manager)),
+        source_event_id=identity_key,
+    )
+    original = await dispatcher.get_durable_delivery_for_source_event(
+        consumer_id=consumer, source=SOURCE_NAME, source_event_id=identity_key
+    )
+    return await dispatcher.claim_durable_delivery_for_event(
+        consumer_id=consumer,
+        event_id=original.event_id,
+        executor_id=dispatcher._durable_delivery_owner,
+    )
+
+
+async def test_a_heartbeat_settlement_retry_that_meets_native_uncertainty_retains_it(manager):
+    """#4001 wo-4001-4: an ordinary failure leaves a failed wake's task owed,
+    and the owner heartbeat retries it. A retry whose write ends with its
+    commit outcome unknown is native control: it is retained as that
+    delivery's control debt, the heartbeat runs no further ordinary
+    settlement beside it, and the shutdown drain settles that task without
+    writing its failed row again. The other owed task is left for boot."""
+    from kestrel_sdk.storage.database.interface import QueryError
+
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        ToolAuditUnconfirmedError,
+    )
+
+    tasks = [
+        await manager.create_task(request(), creator_agent_id="did:creator")
+        for _ in range(2)
+    ]
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    closed = False
+    try:
+        claims = [
+            await claimed_submission_wake(manager, dispatcher, consumer, task)
+            for task in tasks
+        ]
+        store = dispatcher._durable_store
+        failed_row_writes = []
+        owner, name = (
+            (store.backend, "fail_cognition_delivery")
+            if store.backend.backend_type == "postgres"
+            else (store, "release_managed_delivery_after_task")
+        )
+        write = getattr(owner, name)
+
+        async def counted_write(**kwargs):
+            failed_row_writes.append(kwargs["delivery_id"])
+            return await write(**kwargs)
+
+        setattr(owner, name, counted_write)
+        faults = [
+            QueryError("database is locked"),
+            QueryError("database is locked"),
+            ExecutionCommitOutcomeError("unknown"),
+        ]
+        save = manager.task_store.save_recipient_lifecycle
+        task_writes = []
+
+        async def save_with_faults(*args, **kwargs):
+            task_writes.append(len(faults))
+            if faults:
+                raise faults.pop(0)
+            return await save(*args, **kwargs)
+
+        manager.task_store.save_recipient_lifecycle = save_with_faults
+
+        for claimed in claims:
+            await dispatcher._terminalize_failed_cognition(
+                claimed, ToolAuditUnconfirmedError("audit failed")
+            )
+        delivery_ids = [claimed.delivery_id for claimed in claims]
+        assert failed_row_writes == delivery_ids
+        assert list(dispatcher._failed_cognition_source_debt) == delivery_ids
+        assert not dispatcher._retained_cognition_control_debt
+
+        await dispatcher._retry_failed_cognition_source_settlements()
+
+        assert faults == [] and len(task_writes) == 3
+        assert list(dispatcher._retained_cognition_control_debt) == delivery_ids[:1]
+        assert list(dispatcher._failed_cognition_source_debt) == delivery_ids
+        assert dispatcher._runtime_owner_cleanup_required()
+        for task in tasks:
+            assert (await snapshot(manager, task)).task.status.state == (
+                TaskState.TASK_STATE_SUBMITTED
+            )
+
+        closed = True
+        await close_input_dispatcher(agent, dispatcher)
+
+        assert failed_row_writes == delivery_ids
+        assert not dispatcher._retained_cognition_control_debt
+        assert list(dispatcher._failed_cognition_source_debt) == delivery_ids[1:]
+        assert (await snapshot(manager, tasks[0])).task.status.state == (
+            TaskState.TASK_STATE_FAILED
+        )
+        assert (await snapshot(manager, tasks[1])).task.status.state == (
+            TaskState.TASK_STATE_SUBMITTED
+        )
+    finally:
+        if not closed:
+            await close_input_dispatcher(agent, dispatcher)
+
+
+def _cancellation_with_unknown_commit():
+    cancelled = asyncio.CancelledError()
+    cancelled._kestrel_unresolved_commit_outcome = "unknown"
+    return cancelled
+
+
+@pytest.mark.parametrize(
+    "fault, outcome",
+    [
+        ("storage", "retried"),
+        ("refusal", "left_to_boot"),
+        ("cancellation", "cancelled_and_retried"),
+        ("cancelled_commit", "control"),
+    ],
+)
+async def test_each_failed_wake_settlement_failure_keeps_the_task_owed(manager, fault, outcome):
+    """#4001 wo-4001-4: how the settlement that follows a committed failed row
+    fails decides what keeps its task owed. A storage fault stays dispatcher
+    debt for the owner heartbeat. A refusal no retry changes is logged and
+    left to boot reconciliation. A cancellation propagates with the debt kept.
+    A cancellation carrying an unknown commit outcome is native control, and
+    propagates composed with the failed row's own error."""
+    from kestrel_sdk.storage.database.interface import QueryError
+
+    from kestrel_sovereign.execution_custody import (
+        ToolAuditUnconfirmedError,
+        execution_commit_outcome,
+    )
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    try:
+        claimed = await claimed_submission_wake(manager, dispatcher, consumer, task)
+        raised = {
+            "storage": QueryError("database is locked"),
+            "refusal": RuntimeError("a defect no retry changes"),
+            "cancellation": asyncio.CancelledError(),
+            "cancelled_commit": _cancellation_with_unknown_commit(),
+        }[fault]
+        faults = [raised]
+        save = manager.task_store.save_recipient_lifecycle
+
+        async def save_with_fault(*args, **kwargs):
+            if faults:
+                raise faults.pop(0)
+            return await save(*args, **kwargs)
+
+        manager.task_store.save_recipient_lifecycle = save_with_fault
+        error = None
+        try:
+            await dispatcher._terminalize_failed_cognition(
+                claimed, ToolAuditUnconfirmedError("audit failed")
+            )
+        except BaseException as caught:
+            error = caught
+
+        delivery_id = claimed.delivery_id
+        assert faults == []
+        assert [d.status for d in await dispatcher.list_durable_deliveries(
+            consumer_id=consumer
+        )] == ["failed"]
+        owed = dispatcher._failed_cognition_source_debt
+        controlled = dispatcher._retained_cognition_control_debt
+        if outcome == "retried":
+            assert error is None
+            assert list(owed) == [delivery_id] and not controlled
+        elif outcome == "left_to_boot":
+            assert error is None
+            assert not owed and not controlled
+        elif outcome == "cancelled_and_retried":
+            assert error is raised
+            assert list(owed) == [delivery_id] and not controlled
+        else:
+            # Native control first: composed with the row's own failure, never
+            # re-raised as a bare cancellation, and never left as ordinary debt
+            # beside a write whose outcome is unknown.
+            assert error is not None and error is not raised
+            assert execution_commit_outcome(error) == "unknown"
+            assert list(owed) == [delivery_id]
+            # The heartbeat's retry does not swallow it either.
+            faults.append(_cancellation_with_unknown_commit())
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher._retry_failed_cognition_source_settlements()
+            assert faults == []
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_SUBMITTED
+        )
+        if outcome in {"retried", "cancelled_and_retried"}:
+            await dispatcher._retry_failed_cognition_source_settlements()
+            assert not dispatcher._failed_cognition_source_debt
+            assert (await snapshot(manager, task)).task.status.state == (
+                TaskState.TASK_STATE_FAILED
+            )
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_boot_settlement_of_a_failed_wake_retains_native_uncertainty(manager):
+    """#4001 wo-4001-4 self-review: boot reconciliation settles a wake whose
+    failed row an earlier process committed without settling its task. That
+    row joins the dispatcher's source debt with its committed receipt. A task
+    write whose commit outcome is unknown propagates from boot and is retained
+    as the delivery's control debt; the shutdown drain then settles only the
+    task. No failed-row CAS is written for a row this process never owned."""
+    import gc
+
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        execution_commit_outcome,
+    )
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    closed = False
+    try:
+        claimed = await claimed_submission_wake(manager, dispatcher, consumer, task)
+        # The earlier process's failed row, committed without a settlement.
+        failed = await dispatcher.nack_durable_delivery(
+            consumer_id=consumer,
+            delivery_id=claimed.delivery_id,
+            lease_token=claimed.lease_token,
+            error="execution_control_unresolved: tool_effect_reconciliation_required",
+            terminal=True,
+        )
+        assert failed.status == "failed"
+        delivery_id = claimed.delivery_id
+        del claimed, failed
+        store = dispatcher._durable_store
+        failed_row_writes = []
+        owner, name = (
+            (store.backend, "fail_cognition_delivery")
+            if store.backend.backend_type == "postgres"
+            else (store, "release_managed_delivery_after_task")
+        )
+        write = getattr(owner, name)
+
+        async def counted_write(**kwargs):
+            failed_row_writes.append(kwargs["delivery_id"])
+            return await write(**kwargs)
+
+        setattr(owner, name, counted_write)
+        faults = [ExecutionCommitOutcomeError("unknown")]
+        save = manager.task_store.save_recipient_lifecycle
+
+        async def save_once_uncertain(*args, **kwargs):
+            if faults:
+                raise faults.pop(0)
+            return await save(*args, **kwargs)
+
+        manager.task_store.save_recipient_lifecycle = save_once_uncertain
+
+        with pytest.raises(BaseException) as raised:
+            await agent.reconcile_a2a_cognition_wakes()
+        assert execution_commit_outcome(raised.value) == "unknown"
+        assert faults == []
+        assert list(dispatcher._retained_cognition_control_debt) == [delivery_id]
+        assert list(dispatcher._failed_cognition_source_debt) == [delivery_id]
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_SUBMITTED
+        )
+        # The dispatcher's own debt keeps the receipt alive, not this test.
+        del raised
+        gc.collect()
+
+        closed = True
+        await close_input_dispatcher(agent, dispatcher)
+
+        assert failed_row_writes == []
+        assert not dispatcher._retained_cognition_control_debt
+        assert not dispatcher._failed_cognition_source_debt
+        settled = await snapshot(manager, task)
+        assert settled.task.status.state == TaskState.TASK_STATE_FAILED
+        assert "wake failed" in settled.task.status.message.parts[0].text
+    finally:
+        if not closed:
+            await close_input_dispatcher(agent, dispatcher)
