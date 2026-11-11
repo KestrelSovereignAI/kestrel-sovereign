@@ -2220,6 +2220,7 @@
         "tests/integration/test_compute_security_integration.py",
         "tests/integration/test_core_only_boot.py",
         "tests/integration/test_identity_export_import.py",
+        "tests/integration/test_mcp_gateway_host_restart.py",
         "tests/integration/test_mcp_gateway_permission_boundary.py",
         "tests/integration/test_mcp_permission_boundary.py",
         "tests/integration/test_mcp_permission_host_restart.py",

@@ -21,7 +21,7 @@ def test_native_gateway_permission_campaign_cannot_drop_its_cli_or_real_cases():
     assert "MCP_TEST_DOCKER_HOST=unix:///var/run/docker.sock" in command
     campaign, = [step for step in steps if "tests/integration/test_mcp_gateway_permission_boundary.py" in step.get("run", "")]
     assert steps.index(install) < steps.index(campaign)
-    for path in ("test_mcp_gateway_permission_boundary.py", "test_mcp_permission_peer_stdio.py"):
+    for path in ("test_mcp_gateway_permission_boundary.py", "test_mcp_permission_peer_stdio.py", "test_mcp_gateway_host_restart.py"):
         assert "tests/integration/" + path in campaign["run"]
     assert "--session-timeout=720" in campaign["run"]
     legacy = workflow["jobs"]["mcp-permission-seam"]["steps"]

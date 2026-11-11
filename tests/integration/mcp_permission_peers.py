@@ -1,7 +1,7 @@
 """Owned Docker and native HTTPS peers for the same host security campaign."""
 
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
 import os
@@ -49,8 +49,100 @@ class MCPTestPeer:
         return feature.manager.owned_containers[name]["connection"]
 
 
+@asynccontextmanager
+async def owned_gateway_network(monkeypatch, peer, settings):
+    """Own original Gateway processes and admit only their real TCP listeners."""
+    if settings is None:
+        yield None
+        return
+    import hashlib
+    import psutil
+    import re
+
+    home = Path(settings['home']).resolve(strict=True)
+    plugin = Path(settings['plugin']).resolve(strict=True)
+    docker_socket = Path(settings['docker_socket']).resolve(strict=True)
+    assert hashlib.sha256(plugin.read_bytes()).hexdigest() == settings['plugin_sha256']
+    accepted = []
+    native_popen = subprocess.Popen
+
+    class GatewayNetwork:
+        def owns_docker(self, address):
+            return isinstance(address, (str, bytes)) and Path(os.fsdecode(address)).resolve() == docker_socket
+
+        def owns_listener(self, address):
+            if not isinstance(address, tuple) or address[0] not in {'127.0.0.1', '::1', 'localhost'} or address[1] == 11434:
+                return False
+            for process, port in accepted:
+                if process.poll() is not None or port != address[1]:
+                    continue
+                try:
+                    original = psutil.Process(process.pid)
+                    candidates = [original, *original.children()]
+                    for candidate in candidates:
+                        if Path(candidate.exe()).resolve() != plugin:
+                            continue
+                        if any(connection.status == psutil.CONN_LISTEN
+                               and connection.laddr.ip in {'127.0.0.1', '::1'}
+                               and connection.laddr.port == port
+                               for connection in candidate.net_connections(kind='tcp')):
+                            return process.poll() is None
+                except psutil.NoSuchProcess:
+                    continue
+            return False
+
+    class OwnedGatewayPopen(native_popen):
+        def __init__(self, arguments, *args, **kwargs):
+            gateway = isinstance(arguments, (list, tuple)) and list(arguments[:4]) == ['docker', 'mcp', 'gateway', 'run']
+            if gateway:
+                environment = kwargs.get('env') or os.environ
+                assert Path(environment['HOME']).resolve() == home
+                configuration = Path(environment['DOCKER_CONFIG']).resolve()
+                assert configuration.parent == home / '.docker/mcp/owned-gateways'
+                assert configuration.name.startswith('kestrel-'), 'Native Gateway configuration must be its owned mkdtemp directory'
+                assert json.loads((configuration / 'config.json').read_text())['features']['dynamic-tools'] == 'disabled'
+                assert environment['DOCKER_HOST'] == 'unix://' + settings['docker_socket']
+                assert re.fullmatch('[a-f0-9]{48}', environment['MCP_GATEWAY_AUTH_TOKEN'])
+                assert len(arguments) == 9 and arguments[4] == '--transport=streaming'
+                assert arguments[6] == '--host=127.0.0.1' and arguments[8] == '--long-lived'
+                assert re.fullmatch('--profile=kestrel-[a-f0-9]{32}', arguments[7])
+                assert re.fullmatch('--port=[0-9]+', arguments[5])
+                port = int(arguments[5].split('=', 1)[1])
+                assert 0 < port <= 65535 and port != 11434
+                assert kwargs.get('start_new_session') is True
+            super().__init__(arguments, *args, **kwargs)
+            if gateway:
+                accepted.append((self, port))
+
+    async def retire(process):
+        if process.poll() is not None:
+            return
+        import signal
+        assert os.getpgid(process.pid) == process.pid
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.to_thread(process.wait, 5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            await asyncio.to_thread(process.wait, 5)
+            raise
+
+    with monkeypatch.context() as ownership:
+        ownership.setattr(subprocess, 'Popen', OwnedGatewayPopen)
+        try:
+            yield GatewayNetwork()
+        finally:
+            # A fixture reconciler is never credited as the Core close ACK.
+            # Independent original processes still retire if another fails.
+            async with AsyncExitStack() as cleanup:
+                for process, _port in accepted:
+                    cleanup.push_async_callback(retire, process)
+                assert all(process.poll() is not None for process, _port in accepted), (
+                    'Core host shutdown left an original native Gateway process alive')
+
+
 @contextmanager
-def owned_provider_network(monkeypatch, peer):
+def owned_provider_network(monkeypatch, peer, *, gateway=None):
     """Permit only the exact owned TLS listener for provider and MCP traffic."""
     import socket
     from urllib.parse import urlsplit
@@ -63,6 +155,8 @@ def owned_provider_network(monkeypatch, peer):
         dials = []
 
         def require_owned(address):
+            if gateway is not None and (gateway.owns_docker(address) or gateway.owns_listener(address)):
+                return
             assert isinstance(address, tuple) and address[0] == "127.0.0.1" and address[1] in {endpoint.port, *peer.local_ports}
             dials.append(address)
 
@@ -81,28 +175,33 @@ def owned_provider_network(monkeypatch, peer):
 
 
 @contextmanager
-def owned_https_network(monkeypatch, peer):
+def owned_https_network(monkeypatch, peer, *, gateway=None):
     """Pin public-looking fixture DNS to one real, certificate-verified listener."""
     from urllib.parse import urlsplit
     import docker
     import httpcore2
 
-    endpoint = urlsplit(peer.selector)
+    endpoint = urlsplit(peer.provider_url or peer.selector)
     assert endpoint.scheme == "https" and endpoint.hostname and endpoint.port
     assert peer.tls_certificate is not None
     hostname, owned_port = endpoint.hostname, endpoint.port
     original = httpcore2.AnyIOBackend.connect_tcp
 
-    def resolve(host, requested_port, *, type, proto):
-        if host == "127.0.0.1" and requested_port in peer.local_ports:
+    def resolve(host, requested_port, family=socket.AF_UNSPEC, type=0, proto=0, flags=0):
+        # asyncio/AnyIO invoke the standard resolver with encoded hostnames.
+        # Normalize that public call contract before checking either owner.
+        host = os.fsdecode(host)
+        if (host == "127.0.0.1" and requested_port in peer.local_ports) or (
+                gateway is not None and gateway.owns_listener((host, requested_port))):
             address = "127.0.0.1"
         else:
-            assert host == hostname and requested_port == owned_port
+            assert host == hostname and requested_port == owned_port, (host, requested_port)
             address = "8.8.8.8"
         return [(socket.AF_INET, type, proto, "", (address, requested_port))]
 
     async def dial(backend, host, port, **kwargs):
-        if host == "127.0.0.1" and port in peer.local_ports:
+        if (host == "127.0.0.1" and port in peer.local_ports) or (
+                gateway is not None and gateway.owns_listener((host, port))):
             return await original(backend, host, port, **kwargs)
         allowed_hosts = {"8.8.8.8", hostname} if peer.provider_url else {"8.8.8.8"}
         assert host in allowed_hosts and port == owned_port
@@ -114,7 +213,8 @@ def owned_https_network(monkeypatch, peer):
     with monkeypatch.context() as network:
         network.setattr(socket, "getaddrinfo", resolve)
         network.setattr(httpcore2.AnyIOBackend, "connect_tcp", dial)
-        network.setattr(docker, "from_env", refuse_docker)
+        if gateway is None:
+            network.setattr(docker, "from_env", refuse_docker)
         network.setenv("SSL_CERT_FILE", str(peer.tls_certificate))
         network.delenv("SSL_CERT_DIR", raising=False)
         network.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
@@ -178,7 +278,8 @@ class GatewayTestPeer(MCPTestPeer):
     volume: str = ""
     owner: str = ""
     gateways: list = field(default_factory=list)
-    container_server_names: set = field(default_factory=set)
+    gateway_home: Path | None = None
+    host_observations: dict = field(default_factory=dict)
 
     async def witness(self, feature, name):
         return await self._read_volume_lines("permission-witness")
@@ -212,25 +313,70 @@ class GatewayTestPeer(MCPTestPeer):
     def remember_gateway(self, gateway):
         if all(known is not gateway for known in self.gateways):
             self.gateways.append(gateway)
-        for name in gateway.requested_servers:
-            self.container_server_names.add(name)
-            if gateway._profile_id is not None:
-                self.container_server_names.add(gateway._profile_id + "-" + name)
+
+    def observe_host_gateway(self, host_pid, snapshot):
+        import psutil
+        import re
+        import sqlite3
+
+        assert self.gateway_home is not None and snapshot is not None
+        assert re.fullmatch('kestrel-[a-f0-9]{32}', snapshot['profile'])
+        assert snapshot['servers'] == [self.selector]
+        original = psutil.Process(snapshot['pid'])
+        assert host_pid in {parent.pid for parent in original.parents()}, (
+            'Native Gateway receipt does not belong to the original host process')
+        assert '--profile=' + snapshot['profile'] in original.cmdline()
+        configuration = Path(snapshot['configuration']).resolve(strict=True)
+        assert configuration.parent == self.gateway_home / '.docker/mcp/owned-gateways'
+        database = self.gateway_home / '.docker/mcp/mcp-toolkit.db'
+        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
+            assert connection.execute('SELECT id FROM working_set WHERE id=?',
+                (snapshot['profile'],)).fetchone() == (snapshot['profile'],), (
+                'Native CLI profile receipt is missing before host shutdown')
+        key = host_pid, original.pid, snapshot['profile']
+        self.host_observations.setdefault(key, dict(process=original,
+            profile=snapshot['profile'], configuration=configuration, database=database))
+
+    async def assert_host_retired(self, host_pid):
+        import sqlite3
+
+        for (owner_pid, _pid, _profile), record in self.host_observations.items():
+            if owner_pid != host_pid:
+                continue
+            assert not record['process'].is_running(), (
+                'Core host acknowledged shutdown with its original native Gateway alive')
+            assert not record['configuration'].exists(), (
+                'Core host shutdown retained its acknowledged private Gateway configuration')
+            with sqlite3.connect(record['database'].as_uri() + '?mode=ro', uri=True) as connection:
+                assert connection.execute('SELECT id FROM working_set WHERE id=?',
+                    (record['profile'],)).fetchone() is None, (
+                    'Core host shutdown retained its acknowledged native CLI profile')
+        assert await self.containers() == [], (
+            'Core host shutdown left an actual peer attached to its owned witness volume')
+
+    def assert_restart_observed(self):
+        assert len(self.host_observations) == 2, 'Both original host Gateway generations must be observed'
+        assert len({key[0] for key in self.host_observations}) == 2
+        assert len({key[1] for key in self.host_observations}) == 2
+        assert len({key[2] for key in self.host_observations}) == 2, (
+            'A restarted host reused a retired native Gateway profile')
 
     async def containers(self):
-        containers = []
-        for name in self.container_server_names:
-            containers.extend(await asyncio.to_thread(self.client.containers.list, all=True,
-                filters={"label": ["docker-mcp=true", "docker-mcp-name=" + name]}))
+        # The unique fixture volume and immutable image identify our peers
+        # across real host processes. CLI name labels are descriptive only.
+        volume = await asyncio.to_thread(self.client.volumes.get, self.volume)
+        assert volume.attrs['Labels']['kestrel.mcp.permission.owner'] == self.owner
+        containers = await asyncio.to_thread(self.client.containers.list, all=True,
+            filters={'volume': self.volume})
         for container in containers:
             await asyncio.to_thread(container.reload)
-            labels = container.attrs["Config"]["Labels"]
-            assert labels["docker-mcp-name"] in self.container_server_names
-            assert labels["docker-mcp-tool-type"] == "mcp" and labels["docker-mcp-transport"] == "stdio"
-            assert container.attrs["Image"] == self.image_id
-            assert container.attrs["HostConfig"]["NetworkMode"] == "none"
-            assert any(mount["Name"] == self.volume and mount["Destination"] == "/tmp"
-                       for mount in container.attrs["Mounts"] if mount["Type"] == "volume")
+            labels = container.attrs['Config']['Labels']
+            assert labels['docker-mcp'] == 'true'
+            assert labels['docker-mcp-tool-type'] == 'mcp' and labels['docker-mcp-transport'] == 'stdio'
+            assert container.attrs['Image'] == self.image_id
+            assert container.attrs['HostConfig']['NetworkMode'] == 'none'
+            assert any(mount['Name'] == self.volume and mount['Destination'] == '/tmp'
+                       for mount in container.attrs['Mounts'] if mount['Type'] == 'volume')
         return containers
 
 
@@ -303,7 +449,7 @@ async def gateway_peer(tmp_path, monkeypatch, *, linger_after_stdio=False, confi
                     runtime.setenv("KESTREL_MCP_DOCKER_PROFILE", "default")
                 image_id = (await asyncio.to_thread(client.images.get, image)).id
                 peer = GatewayTestPeer(kind="gateway", selector=server, client=client, image=image,
-                    image_id=image_id, volume=volume.name, owner=identity)
+                    image_id=image_id, volume=volume.name, owner=identity, gateway_home=home.resolve())
                 try:
                     yield peer
                 finally:
@@ -356,7 +502,10 @@ async def create_owned_mcp_catalog(path, definition, reference):
 
 @asynccontextmanager
 async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None,
-                     provider_fault: str | None = None, drop_first_tool_reply: bool = False):
+                     provider_fault: str | None = None, drop_first_tool_reply: bool = False,
+                     provider_only: bool = False):
+    if provider_only:
+        assert provider_model is not None, 'Provider-only fixture requires its finite provider model'
     hostname = "remote-permission.example"
     _, client_context, certificate = make_tls_contexts(tmp_path, hostname, ip_addresses=())
     ready, witness = tmp_path / "peer-ready.json", tmp_path / "remote-witness"
@@ -394,7 +543,10 @@ async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None
                 f"https://{hostname}:{port}/v1" if provider_model else None,
                 witness.with_suffix(".provider.jsonl") if provider_model else None,
                 tls_certificate=certificate)
-            with owned_https_network(monkeypatch, peer):
+            # A provider-only listener is independent of the selected MCP
+            # transport. Its caller installs the explicit combined network
+            # owner; a remote MCP peer keeps its Docker-refusal contract.
+            with nullcontext() if provider_only else owned_https_network(monkeypatch, peer):
                 yield peer
         finally:
             if process.returncode is None:

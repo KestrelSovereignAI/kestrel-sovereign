@@ -7,8 +7,9 @@ This does not prove vendor OAuth refresh or remote unknown-outcome recovery.
 
 import asyncio
 from dataclasses import dataclass
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import json
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -24,7 +25,9 @@ from cryptography.fernet import Fernet
 
 import kestrel_sovereign
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
-from tests.integration.mcp_permission_peers import https_peer, owned_provider_network
+from tests.integration.mcp_permission_peers import (
+    https_peer, gateway_peer, owned_gateway_network, owned_provider_network,
+)
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 
@@ -82,13 +85,16 @@ async def native_host(home, descriptor, environment, peer, generation):
                 assert state['agent_shutdown_timeout_s'] >= (
                     state['shutdown_prefix_s'] + state['shutdown_tail_s'])
             peer.local_ports.add(state['port'])
+            if peer.kind == 'gateway' and state.get('gateway') is not None:
+                peer.observe_host_gateway(state['pid'], state['gateway'])
             yield running
         finally:
-            try:
-                await running.stop()
-            finally:
+            async with AsyncExitStack() as retirement:
                 if running.state:
-                    peer.local_ports.discard(running.state['port'])
+                    retirement.callback(peer.local_ports.discard, running.state['port'])
+                    if peer.kind == 'gateway':
+                        retirement.push_async_callback(peer.assert_host_retired, running.state['pid'])
+                retirement.push_async_callback(running.stop)
 
 
 @pytest_asyncio.fixture
@@ -110,24 +116,49 @@ async def host_campaign(tmp_path, monkeypatch, request):
     peer_root = home / 'peer'
     peer_root.mkdir()
     settings = getattr(request, 'param', {})
-    async with https_peer(peer_root, monkeypatch, provider_model='owned-permission-model',
-            drop_first_tool_reply=settings.get('drop_first_tool_reply', False)) as peer:
+    transport = settings.get('transport', 'remote')
+    assert transport in {'remote', 'gateway'}
+    async with AsyncExitStack() as resources:
+        provider = await resources.enter_async_context(https_peer(
+            peer_root, monkeypatch, provider_model='owned-permission-model',
+            drop_first_tool_reply=settings.get('drop_first_tool_reply', False),
+            provider_only=transport == 'gateway'))
+        peer = provider
+        gateway_settings = None
+        if transport == 'gateway':
+            gateway_root = home / 'gateway-peer'
+            gateway_root.mkdir()
+            peer = await resources.enter_async_context(gateway_peer(gateway_root, monkeypatch))
+            peer.provider_url = provider.provider_url
+            peer.provider_witness = provider.provider_witness
+            peer.tls_certificate = provider.tls_certificate
+            plugin = Path(os.environ['MCP_TEST_DOCKER_PLUGIN']).resolve(strict=True)
+            gateway_settings = dict(home=os.environ['HOME'], plugin=str(plugin),
+                plugin_sha256=hashlib.sha256(plugin.read_bytes()).hexdigest(),
+                docker_socket=os.environ['MCP_TEST_DOCKER_HOST'].removeprefix('unix://'))
         (home / 'kestrel.toml').write_text(
             '[llm]\nroute_priority=["deepseek:api"]\n'
             '[llm.vendors.deepseek.routes.api]\napi_key="owned-synthetic-provider-key"\n'
-            'base_url=' + json.dumps(peer.provider_url) + '\nmodel="owned-permission-model"\n')
+            'base_url=' + json.dumps(provider.provider_url) + '\nmodel="owned-permission-model"\n')
         descriptor = home / 'host-test.json'
         descriptor.write_text(json.dumps(dict(agent_name='permission-host', agent_data=str(data),
-            selector=peer.selector, provider_url=peer.provider_url, certificate=str(peer.tls_certificate))))
-        settings = getattr(request, 'param', {})
+            transport=transport, selector=peer.selector, provider_url=provider.provider_url,
+            certificate=str(provider.tls_certificate), gateway=gateway_settings)))
         if 'sqlite_worker_budget' in settings:
             monkeypatch.setenv('KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S',
                 settings['sqlite_worker_budget'])
         environment = owned_host_environment(home, api_key=api_key, data_key=key)
+        if transport == 'gateway':
+            # Native CLI stores its catalog/profile DB under HOME; Kestrel's
+            # independent explicit home continues to own identity and history.
+            for name in ['HOME', 'DOCKER_CONFIG', 'DOCKER_HOST', 'DOCKER_MCP_IN_CONTAINER',
+                         'XDG_CACHE_HOME', 'KESTREL_MCP_DOCKER_CATALOG']:
+                environment[name] = os.environ[name]
         headers = {'X-API-Key': api_key, 'X-Kestrel-Allow-Destructive': 'true'}
-        with owned_provider_network(monkeypatch, peer):
-            yield SimpleNamespace(home=home, descriptor=descriptor, environment=environment,
-                peer=peer, did=identity.agent_did, headers=headers)
+        async with owned_gateway_network(monkeypatch, peer, gateway_settings) as gateway:
+            with owned_provider_network(monkeypatch, peer, gateway=gateway):
+                yield SimpleNamespace(home=home, descriptor=descriptor, environment=environment,
+                    peer=peer, did=identity.agent_did, headers=headers)
 
 
 def owned_host_environment(home, *, api_key, data_key):
@@ -160,10 +191,13 @@ async def observe_registry(campaign, state, nonce):
             await asyncio.sleep(0.001)
     observed = json.loads(receipt.read_text())
     assert observed['did'] == campaign.did and observed['pid'] == state['pid']
+    if campaign.peer.kind == 'gateway' and observed.get('gateway') is not None:
+        state['gateway'] = observed['gateway']
+        campaign.peer.observe_host_gateway(state['pid'], observed['gateway'])
     return observed
 
 
-async def configure_remote(client, campaign, state):
+async def configure_mcp(client, campaign, state):
     prefix = '/api/agents/permission-host'
     denied = await client.get(prefix + '/api/security/permissions/tree',
         headers={'X-API-Key': 'wrong-owned-key'})
@@ -181,8 +215,8 @@ async def configure_remote(client, campaign, state):
         'input': '!mcp-load ' + campaign.peer.selector, 'session_id': 'owned-host-restart'})
     assert response.status_code == 200, response.text
     observed = await observe_registry(campaign, state, nonce)
-    assert len(observed['remote_tools']) == 1, response.text
-    tool, owner = next(iter(observed['remote_tools'].items()))
+    assert len(observed['mcp_tools']) == 1, response.text
+    tool, owner = next(iter(observed['mcp_tools'].items()))
     return owner, tool
 
 
@@ -199,12 +233,12 @@ def invoke_marker(client):
         'session_id': 'owned-host-restart'})
 
 
-async def test_actual_host_process_restores_remote_permission_without_new_effect(host_campaign):
-    c = host_campaign
+async def exercise_permission_restart(c):
+    """One HTTP/storage/effect oracle shared by native MCP transports."""
     async with native_host(c.home, c.descriptor, c.environment, c.peer, 1) as first:
         assert first.state['did'] == c.did
         async with host_client(c, first.state) as client:
-            owner, tool = await configure_remote(client, c, first.state)
+            owner, tool = await configure_mcp(client, c, first.state)
             await set_permission(client, owner, tool, 'deny')
             response = await invoke_marker(client)
             assert response.status_code == 200, response.text
@@ -219,7 +253,7 @@ async def test_actual_host_process_restores_remote_permission_without_new_effect
             restored, = [entry for entry in remote['tools'] if entry['name'] == tool]
             assert restored['level'] == 'deny'
             observed = await observe_registry(c, second.state, nonce)
-            assert observed['remote_tools'] == {tool: owner}
+            assert observed['mcp_tools'] == {tool: owner}
             for level, expected in [('deny', []), ('allow', ['owned-provider-effect'])]:
                 if level == 'allow':
                     await set_permission(client, owner, tool, level)
@@ -231,6 +265,9 @@ async def test_actual_host_process_restores_remote_permission_without_new_effect
                 if entry['feature'] == owner and entry['tool'] == tool]
             assert decisions == ['auto_denied', 'auto_denied', 'auto_allowed']
 
+
+async def test_actual_host_process_restores_remote_permission_without_new_effect(host_campaign):
+    await exercise_permission_restart(host_campaign)
 
 async def pending_approval(client, call):
     async with asyncio.timeout(10):
@@ -247,11 +284,11 @@ async def pending_approval(client, call):
             await asyncio.sleep(0.01)
 
 
-async def test_old_host_approval_cannot_authorize_a_restarted_host_call(host_campaign):
-    c = host_campaign
+async def exercise_approval_restart(c):
+    """Reject stale/replayed host approvals with a real external effect witness."""
     async with native_host(c.home, c.descriptor, c.environment, c.peer, 1) as first:
         async with host_client(c, first.state) as client:
-            owner, tool = await configure_remote(client, c, first.state)
+            owner, tool = await configure_mcp(client, c, first.state)
             await set_permission(client, owner, tool, 'always_ask')
             original = asyncio.create_task(invoke_marker(client))
             try:
@@ -305,6 +342,9 @@ async def test_old_host_approval_cannot_authorize_a_restarted_host_call(host_cam
                     current.cancel()
                 await asyncio.gather(current, return_exceptions=True)
 
+
+async def test_old_host_approval_cannot_authorize_a_restarted_host_call(host_campaign):
+    await exercise_approval_restart(host_campaign)
 
 async def test_owned_host_setup_failure_preserves_original_diagnostic(tmp_path):
     home = tmp_path / 'failed-host'
