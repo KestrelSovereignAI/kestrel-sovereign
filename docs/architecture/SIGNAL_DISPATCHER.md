@@ -516,23 +516,35 @@ the wake's durable identity (`source`, `target_agent`, `source_event_id`):
 - `_settle_cognition_non_delivery`, for a stopped, validation-dropped or
   cycle-dropped result, settles **before** its terminal-ACKable NACK. If the
   settlement cannot commit, the delivery is released for retry instead, and a
-  Stop does not report the work stopped.
+  Stop does not report the work stopped. A settlement whose commit outcome is
+  unknown, even one that arrives as a cancellation, is native control: the
+  delivery becomes a failed row, as below, never one left leased for a lease
+  expiry to redeliver. That row's source debt keeps the Stop's intent, so the
+  task is still cancelled, not failed, and keeps the unknown outcome as its
+  source's control, below.
 - `_terminalize_failed_cognition`, for a failed terminalization, settles
   **after** its CAS commits, since that row stands whatever follows, and never
   inside that CAS. A failed row is never reclaimed, so until the settlement
-  commits it stays the dispatcher's source debt for that delivery. A storage
-  failure (or a cancellation) leaves the debt in place, and the runtime-owner
-  heartbeat retries it at the end of each pass that completes its ordinary
-  sweeps: a transient database fault does not leave the task live until the
-  next restart. While any control debt stands, or once durable shutdown begins, the
-  heartbeat does no ordinary work, and a debt still owed when the process
-  stops falls to boot reconciliation. Any other failure is one no retry
-  changes; it is logged and left to boot reconciliation. A native commit or
+  commits it stays the dispatcher's source debt for that delivery. Only the
+  settlement ends that debt: it returns once the task is settled or no longer
+  waits on this wake, and raises while it still does. Any ordinary failure,
+  whatever its type, therefore leaves the debt in place: a database fault, a
+  lifecycle write that lost its compare-and-set to a concurrent task writer,
+  or a cancellation. The runtime-owner heartbeat retries it at the end of each
+  pass that completes its ordinary sweeps, logging each failure, so a
+  transient fault does not leave the task live until the next restart. While
+  any control debt stands, or once durable shutdown begins, the heartbeat does
+  no ordinary work, and a debt still owed when the process stops falls to
+  boot reconciliation. A native commit or
   control outcome from the settlement propagates and is retained as the
   delivery's control debt, as the row's own would be: readiness and owner
   retirement refuse while it stands, and the owner's retirement drain retries
   only the settlement. The row's original-token receipt outlives it, so the CAS
-  is not written again.
+  is not written again. That control is the source's, not the row's: the
+  row's receipt does not clear it, and nor does a later retry's ordinary
+  failure, which says nothing about the write whose outcome is unknown. Only a
+  settlement that returns ends it, so a retirement drain whose retry fails
+  refuses to retire the owner and keeps both debts for the next attempt.
 
 A stopped wake cancels the task; any other ends it `failed`, naming the cause.
 The write is bound to the wake's own admitted input, read from its
@@ -547,7 +559,7 @@ already terminal and unacknowledged, which covers a process that stopped between
 the two writes, and mints no replacement wake for it. It settles through the
 dispatcher's `settle_terminal_cognition_source`: the row joins the same source
 debt as a row the running dispatcher failed itself, with that row's committed
-receipt, so no CAS is written for it. A storage failure there neither refuses
+receipt, so no CAS is written for it. An ordinary failure there neither refuses
 the boot nor waits for the next one; the owner heartbeat retries it. Native
 control propagates from boot and is retained as the delivery's control debt.
 

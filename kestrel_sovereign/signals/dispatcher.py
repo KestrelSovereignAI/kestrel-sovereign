@@ -173,7 +173,6 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_TERMINAL_MARKER_VALUE,
 )
 from kestrel_sovereign.signals.store import SignalLogStore
-from kestrel_sovereign.storage.db.interface import DatabaseError
 from kestrel_sovereign.storage.db.write_audit import (
     capture_write_queries,
     requested_handler_write_audit_callback,
@@ -936,9 +935,19 @@ class SignalDispatcher:
         self._retained_durable_cognition_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
         # A failed cognition row whose source work is not settled yet: the
-        # delivery and the cause its task is failed with (#4001). Settling
-        # never replays the committed failed-row CAS.
-        self._failed_cognition_source_debt: dict[str, tuple[DurableDelivery, str]] = {}
+        # delivery, the cause its task is failed with, and whether a Stop
+        # consumed the wake, so its task is cancelled instead (#4001).
+        # Settling never replays the committed failed-row CAS.
+        self._failed_cognition_source_debt: dict[str, tuple[DurableDelivery, str, bool]] = {}
+        # Deliveries a Stop consumed whose failed row has not committed yet.
+        self._failed_cognition_stop_intents: set[str] = set()
+        # A failed row's source settlement whose commit outcome is unknown.
+        # The row's CAS receipt resolves only the row, never this: it stands
+        # as the delivery's control debt until a settlement returns.
+        self._failed_cognition_source_control: dict[str, tuple[DurableDelivery, BaseException]] = {}
+        # The same, for a settlement made before the delivery's failed row
+        # has committed. It becomes that row's source control when it does.
+        self._failed_cognition_pending_source_control: dict[str, BaseException] = {}
         self._cognition_control_terminal_owners: dict[tuple[str, ...], asyncio.Task[None]] = {}
         self._cognition_control_terminal_receipts: dict[tuple[str, ...], weakref.ReferenceType] = {}
         # Channel ingress ACKs after its selected delivery is durable, not
@@ -3178,7 +3187,7 @@ class SignalDispatcher:
                 # settles. A receipt is not proof that its effects have ended.
                 raise error
             await self._terminalize_failed_cognition(delivery, error)
-            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            self._discard_cognition_row_control(delivery.delivery_id)
 
     async def _drain_outcome_log_tasks(self, *, finite_errors=None) -> None:
         """Join every accepted outcome log before releasing shared storage.
@@ -6204,11 +6213,11 @@ class SignalDispatcher:
             return False
         terminal = self._cognition_result_is_terminal(result)
         error = result.error or f"Cognition delivery returned {result.status.value}"
+        stopped = isinstance(result, _StoppedCognitionResult)
         if terminal:
             # Settle the wake's source work before the row becomes terminal.
             # If it cannot, the delivery is not final: it is released for
             # retry, and a Stop does not report the work stopped.
-            stopped = isinstance(result, _StoppedCognitionResult)
             try:
                 await self._settle_undelivered_cognition_source(
                     source=delivery.event.source,
@@ -6218,8 +6227,17 @@ class SignalDispatcher:
                     cause="stopped" if stopped else result.status.value,
                 )
             except BaseException as settlement_error:
-                if is_tool_execution_terminal_error(settlement_error):
-                    await self._terminalize_failed_cognition(delivery, settlement_error)
+                # A settlement write whose commit outcome is unknown is native
+                # control, even when it arrives as a cancellation: the row
+                # becomes failed, retaining it, and its source stays owed.
+                if (
+                    is_tool_execution_terminal_error(settlement_error)
+                    or execution_commit_outcome(settlement_error) is not None
+                ):
+                    await self._terminalize_failed_cognition(
+                        delivery, settlement_error, stopped=stopped,
+                        source_settlement=True,
+                    )
                     raise
                 if not isinstance(settlement_error, Exception):
                     raise
@@ -6260,7 +6278,9 @@ class SignalDispatcher:
                 )
         except BaseException as error:
             if is_tool_execution_terminal_error(error):
-                await self._terminalize_failed_cognition(delivery, error)
+                await self._terminalize_failed_cognition(
+                    delivery, error, stopped=stopped,
+                )
             raise
         # TERMINAL is an external receipt, not a route-level interpretation.
         # Publish it only after this exact delivery row confirms the durable
@@ -6396,7 +6416,7 @@ class SignalDispatcher:
 
         if control_error is not None:
             await self._terminalize_failed_cognition(delivery, control_error)
-            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            self._discard_cognition_row_control(delivery.delivery_id)
             return
         if result is not None and self._cognition_result_is_terminal(result):
             await self._settle_cognition_non_delivery(delivery, result,
@@ -6477,17 +6497,50 @@ class SignalDispatcher:
             self._retained_cognition_control_debt[delivery.delivery_id] = (delivery, retained)
         return retained
 
+    def _discard_cognition_row_control(self, delivery_id: str) -> None:
+        """Clear a delivery's control debt once its terminal row stands.
+
+        The row's receipt resolves only the row. A settlement of the source
+        work that row ended, whose commit outcome is still unknown, stays the
+        delivery's control debt (#4001).
+        """
+        self._retained_cognition_control_debt.pop(delivery_id, None)
+        unresolved = vars(self).get("_failed_cognition_source_control", {}).get(delivery_id)
+        if unresolved is not None:
+            self._retained_cognition_control_debt[delivery_id] = unresolved
+
     async def _terminalize_failed_cognition(
-        self, delivery: DurableDelivery, error: BaseException,
+        self, delivery: DurableDelivery, error: BaseException, *,
+        stopped: bool = False, source_settlement: bool = False,
     ) -> None:
         """Keep irreversible control evidence non-retryable and non-ACKable.
 
         Then settle the source work of the wake that row ended (#4001). Once
         the failed row has committed, a later call settles only the source:
         the row's original-token receipt lives as long as the source debt
-        holds its delivery, so the CAS is never written again.
+        holds its delivery, so the CAS is never written again. ``stopped``
+        records that a Stop consumed the wake: its task is cancelled, as the
+        Stop asked, rather than failed. ``source_settlement`` records that
+        ``error`` came from settling that work, so its outcome is unknown:
+        it becomes the row's source control, which only a settlement that
+        returns ends. Both are recorded before the CAS, so the row's debt
+        carries them as it commits, and they outlive a CAS that has to be
+        retried.
         """
+        from kestrel_sovereign.execution_custody import execution_native_source_error
+
+        delivery_id = delivery.delivery_id
+        intents = vars(self).setdefault("_failed_cognition_stop_intents", set())
+        pending = vars(self).setdefault("_failed_cognition_pending_source_control", {})
+        if stopped:
+            intents.add(delivery_id)
+        if source_settlement:
+            pending[delivery_id] = execution_native_source_error(
+                pending.get(delivery_id), error, include_tool_terminal=True,
+            ) or error
         await self._terminalize_failed_cognition_delivery(delivery, error)
+        intents.discard(delivery_id)
+        pending.pop(delivery_id, None)
         control = await self._settle_failed_cognition_source(delivery)
         if control is not None:
             raise execution_observation_error(error, control)
@@ -6499,26 +6552,37 @@ class SignalDispatcher:
 
         The failed row is never reclaimed, so the source work it ended has no
         wake left to run it. Until it is settled it stays this dispatcher's
-        source debt. A storage failure, or a cancellation, leaves the debt in
-        place, and the owner heartbeat retries it while the process runs; boot
-        reconciliation settles it after a restart. Any other failure is one no
-        retry changes: it is logged and left to boot reconciliation. A native
-        commit or control outcome is retained as this delivery's control debt
+        source debt. The settlement alone decides when that debt ends: it
+        returns once the work is settled, or once the work no longer waits on
+        this wake, and raises while it still does. So every ordinary failure,
+        whatever its type (a storage fault, a lifecycle write that lost its
+        compare-and-set to a concurrent writer), or a cancellation, leaves the
+        debt in place: the owner heartbeat retries it while the process runs,
+        and boot reconciliation settles it after a restart. A native commit
+        or control outcome is retained as this delivery's control debt
         instead, as the failed row's own would be, and returned: readiness and
         owner retirement refuse while it stands, and the shutdown drain
         retries only this settlement.
+
+        That control is the source's, not the row's: the row's receipt never
+        clears it. Only a settlement that returns does. A later ordinary
+        failure proves nothing about the write whose commit outcome is
+        unknown, so the settlement stays deferred and that control is
+        returned again, never ``None``: a caller must not treat it as
+        settled.
         """
         debts = vars(self).setdefault("_failed_cognition_source_debt", {})
         debt = debts.get(delivery.delivery_id)
         if debt is None:
             return None
-        failed, cause = debt
+        failed, cause, stopped = debt
+        controls = vars(self).setdefault("_failed_cognition_source_control", {})
         try:
             await self._settle_undelivered_cognition_source(
                 source=failed.event.source,
                 target_agent=failed.event.target_agent,
                 source_event_id=failed.event.source_event_id,
-                stopped=False,
+                stopped=stopped,
                 cause=cause,
             )
         except BaseException as settlement_error:
@@ -6526,19 +6590,12 @@ class SignalDispatcher:
                 is_tool_execution_terminal_error(settlement_error)
                 or execution_commit_outcome(settlement_error) is not None
             ):
-                self._retain_cognition_native_control(failed, settlement_error)
+                retained = self._retain_cognition_native_control(failed, settlement_error)
+                controls[delivery.delivery_id] = (failed, retained or settlement_error)
                 self._rearm_cleanup_runtime_owner_heartbeat()
                 return settlement_error
             if not isinstance(settlement_error, Exception):
                 raise
-            if not isinstance(settlement_error, (DatabaseError, OSError)):
-                debts.pop(delivery.delivery_id, None)
-                logger.exception(
-                    "Failed cognition's source work cannot be settled by a "
-                    "retry; boot reconciliation settles it: delivery=%s",
-                    delivery.delivery_id,
-                )
-                return None
             logger.warning(
                 "Failed cognition could not settle its source's work; the "
                 "owner heartbeat retries it: delivery=%s",
@@ -6546,8 +6603,13 @@ class SignalDispatcher:
                 exc_info=True,
             )
             self._rearm_cleanup_runtime_owner_heartbeat()
-            return None
+            # An earlier write whose outcome is unknown still stands as the
+            # delivery's control debt; this failure says nothing about it.
+            unresolved = controls.get(delivery.delivery_id)
+            return None if unresolved is None else unresolved[1]
         debts.pop(delivery.delivery_id, None)
+        if controls.pop(delivery.delivery_id, None) is not None:
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
         return None
 
     async def _retry_failed_cognition_source_settlements(self) -> None:
@@ -6561,7 +6623,7 @@ class SignalDispatcher:
         Control carried by a cancellation still cancels this heartbeat.
         """
         debts = vars(self).get("_failed_cognition_source_debt", {})
-        for delivery, _cause in tuple(debts.values()):
+        for delivery, _cause, _stopped in tuple(debts.values()):
             control = await self._settle_failed_cognition_source(delivery)
             if control is None:
                 continue
@@ -6578,10 +6640,11 @@ class SignalDispatcher:
         terminal stopped before it settled the work the row ended (#4001).
         The row is already committed, so it joins the same source debt as a
         row this dispatcher failed itself, with that row's committed receipt:
-        no CAS is written for it. A storage failure leaves the owner
+        no CAS is written for it. An ordinary failure leaves the owner
         heartbeat to retry the settlement while the process runs, so clearing
-        the fault is enough. Native control is retained as the delivery's
-        debt, as for a row failed here, and raised.
+        the fault, or losing a race to a concurrent task writer, is enough.
+        Native control is retained as the delivery's debt, as for a row
+        failed here, and raised.
         """
         if not delivery.is_terminal or delivery.status == ACKNOWLEDGED:
             raise ValueError(
@@ -6590,9 +6653,9 @@ class SignalDispatcher:
             )
         debts = vars(self).setdefault("_failed_cognition_source_debt", {})
         if delivery.delivery_id not in debts:
-            debts[delivery.delivery_id] = (delivery, cause)
+            debts[delivery.delivery_id] = (delivery, cause, False)
             self._record_cognition_control_terminal_receipt(delivery)
-        failed, _cause = debts[delivery.delivery_id]
+        failed = debts[delivery.delivery_id][0]
         control = await self._settle_failed_cognition_source(failed)
         if control is not None:
             raise control
@@ -6624,7 +6687,7 @@ class SignalDispatcher:
         settlement = self._cognition_claim_settlement.get()
         if (settlement is not None and settlement.delivery is delivery
                 and settlement.receipt is not None and not settlement.retry_pending):
-            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            self._discard_cognition_row_control(delivery.delivery_id)
             return
         from kestrel_sovereign._async_ownership import (
             OwnedTaskAdmission,
@@ -6646,7 +6709,7 @@ class SignalDispatcher:
         receipts = vars(self).setdefault("_cognition_control_terminal_receipts", {})
         receipt = receipts.get(key)
         if receipt is not None and receipt() is not None:
-            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            self._discard_cognition_row_control(delivery.delivery_id)
             return
         task = owners.get(key)
         opening = None
@@ -6694,7 +6757,7 @@ class SignalDispatcher:
             self._record_cognition_control_terminal_receipt(delivery)
             if owners.get(key) is task:
                 owners.pop(key, None)
-            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            self._discard_cognition_row_control(delivery.delivery_id)
         if opening is not None or outcome.error is not None or outcome.cancellation is not None:
             terminal = execution_observation_error(
                 error, opening, outcome.error, outcome.cancellation,
@@ -6755,7 +6818,15 @@ class SignalDispatcher:
         vars(self).setdefault("_failed_cognition_source_debt", {})[delivery.delivery_id] = (
             delivery,
             failure.code if failure is not None else "execution_control_unresolved",
+            delivery.delivery_id in vars(self).get("_failed_cognition_stop_intents", ()),
         )
+        unresolved = vars(self).get("_failed_cognition_pending_source_control", {}).get(
+            delivery.delivery_id
+        )
+        if unresolved is not None:
+            vars(self).setdefault("_failed_cognition_source_control", {})[
+                delivery.delivery_id
+            ] = (delivery, unresolved)
 
     @staticmethod
     def _completed_cognition_outcome(task):

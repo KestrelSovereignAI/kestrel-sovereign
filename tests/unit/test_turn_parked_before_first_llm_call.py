@@ -427,6 +427,24 @@ async def _submission_deliveries(agent):
     )
 
 
+async def _until_completion_wake_settled(agent):
+    """Wait for the ``a2a.task_complete`` wake an ended task gives its agent.
+
+    That wake's turn runs after the test's own assertions. Leaving the agent
+    while it runs cancels it, perhaps mid-COMMIT, and a COMMIT cancelled in
+    flight is an unknown outcome the agent's teardown rightly reports.
+    """
+    from kestrel_sovereign.signals.sources.a2a import DURABLE_COGNITION_CONSUMER_ID
+
+    async def settled():
+        wakes = await agent.dispatcher.list_durable_deliveries(
+            consumer_id=DURABLE_COGNITION_CONSUMER_ID
+        )
+        return bool(wakes) and all(wake.is_terminal for wake in wakes)
+
+    await _until(agent, settled, "the ended task's completion wake never settled")
+
+
 async def _until(agent, predicate, label):
     """Poll an async predicate; fail with every await chain if it never holds."""
     deadline = asyncio.get_running_loop().time() + SETTLE_SECONDS
@@ -495,6 +513,7 @@ async def test_stopping_a_queued_a2a_wake_cancels_the_task_its_sender_waits_on(
             assert [d.status for d in await _submission_deliveries(agent)] == [
                 "terminal_ackable"
             ]
+            await _until_completion_wake_settled(agent)
     finally:
         await database.close()
 
@@ -544,6 +563,7 @@ async def test_a_stop_that_cannot_cancel_the_task_leaves_its_wake_to_retry(
 
             await _until(agent, settled, "the retried wake never ended its task")
             assert all(d.is_terminal for d in await _submission_deliveries(agent))
+            await _until_completion_wake_settled(agent)
     finally:
         await database.close()
 
@@ -860,6 +880,114 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
             assert model_calls == []
     finally:
         fault.close()
+
+
+async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_by_the_heartbeat(
+    tmp_path, monkeypatch
+):
+    """Self-review of wo-4001-4: after a restart the wake's retry is refused
+    and its row fails. Between the settlement's read of the task and its
+    write, another recipient writer moves the task SUBMITTED -> WORKING, so
+    the settlement's lifecycle compare-and-set loses and raises. Before the
+    fix the dispatcher kept the debt only for a storage error, so this one
+    was dropped: the delivery stayed failed, the sender saw ``working``, and
+    the owner heartbeat had nothing to retry. Every ordinary failure now
+    keeps the debt, and the running heartbeat settles the task, writing
+    neither cognition nor the committed row again."""
+    from datetime import timedelta
+
+    from kestrel_sdk.native_a2a.types import Task, TaskState
+
+    from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
+    from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+    from kestrel_sovereign.signals.durable import DurableSignalStore
+
+    home = tmp_path / "agent"
+    provenance = "test:4001-settle-cas-race"
+    async with booted_agent(
+        home, name="Recipient", provenance=provenance, features=set()
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        parked = await _park_after_begin(agent, monkeypatch)
+        task = await _submit_task(agent)
+        await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
+        did = agent.did
+
+    native_save = TaskStore.save_recipient_lifecycle
+    raced = []
+
+    async def concurrent_working_writer(self, value, **kwargs):
+        if not raced and value.id == task.id and (
+            value.status.state == TaskState.TASK_STATE_FAILED
+        ):
+            raced.append(value.id)
+            baseline = kwargs["baseline"]
+            working = Task.FromString(baseline.SerializeToString())
+            working.status.state = TaskState.TASK_STATE_WORKING
+            # The other writer wins the real store CAS for the same input.
+            assert await native_save(
+                self,
+                working,
+                baseline=baseline,
+                recipient_agent_id=kwargs["recipient_agent_id"],
+                expected_state=baseline.status.state,
+            ) is not None
+        return await native_save(self, value, **kwargs)
+
+    failed_row_writes = []
+    write_row = DurableSignalStore.release_managed_delivery_after_task
+
+    async def counted_row_write(self, **kwargs):
+        failed_row_writes.append(kwargs["delivery_id"])
+        return await write_row(self, **kwargs)
+
+    monkeypatch.setattr(TaskStore, "save_recipient_lifecycle", concurrent_working_writer)
+    monkeypatch.setattr(
+        DurableSignalStore, "release_managed_delivery_after_task", counted_row_write
+    )
+    # The owner heartbeat is the recovery worker; run its cadence at test speed.
+    monkeypatch.setitem(
+        SignalDispatcher.__init__.__kwdefaults__,
+        "runtime_owner_stale_after",
+        timedelta(seconds=0.6),
+    )
+    model_calls = []
+
+    async def no_cognition(kwargs):
+        model_calls.append(kwargs)
+        return LLMResponse(content=REPLY)
+
+    async with booted_agent(
+        home, name="Recipient", provenance=provenance, features=set(), identity=did
+    ) as agent:
+        _script_replies(agent, monkeypatch, no_cognition)
+
+        async def lost_the_race():
+            return bool(raced) and [d.status for d in await _submission_deliveries(agent)] == [
+                "failed"
+            ]
+
+        await _until(agent, lost_the_race, "the refused retry never failed its row")
+
+        async def ended():
+            return await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
+
+        await _until(
+            agent,
+            ended,
+            "the owner heartbeat left the task live after its settlement lost a "
+            f"lifecycle race; debt={list(agent.dispatcher._failed_cognition_source_debt)}",
+        )
+        assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
+
+        async def debt_cleared():
+            return not agent.dispatcher._failed_cognition_source_debt
+
+        await _until(agent, debt_cleared, "the settled task's debt was never cleared")
+        # The row was written once, by the refused retry; the heartbeat wrote
+        # only the task.
+        assert len(failed_row_writes) == 1
+        assert model_calls == []
 
 
 async def test_a_task_its_own_turn_completes_leaves_the_next_turn_runnable(
