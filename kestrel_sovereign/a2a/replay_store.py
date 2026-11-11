@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 
+from kestrel_sovereign.a2a.native_schema import native_schema_write
+from kestrel_sovereign.storage.db.after_commit import call_after_backend_commit
+
 
 class SharedReplayNonceStore:
     """DB-backed nonce reservation table for inbound signed A2A envelopes."""
@@ -24,24 +27,31 @@ class SharedReplayNonceStore:
         async with self._init_lock:
             if self._initialized:
                 return
-            await self._db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS a2a_replay_nonces (
-                    sender TEXT NOT NULL,
-                    nonce TEXT NOT NULL,
-                    seen_at DOUBLE PRECISION NOT NULL,
-                    expires_at DOUBLE PRECISION NOT NULL,
-                    PRIMARY KEY (sender, nonce)
+            # Distinct recipients/replicas share this table, not this Python
+            # lock. Keep table/index creation in the canonical schema unit.
+            async with native_schema_write(self._db):
+                await self._db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS a2a_replay_nonces (
+                        sender TEXT NOT NULL,
+                        nonce TEXT NOT NULL,
+                        seen_at DOUBLE PRECISION NOT NULL,
+                        expires_at DOUBLE PRECISION NOT NULL,
+                        PRIMARY KEY (sender, nonce)
+                    )
+                    """
                 )
-                """
-            )
-            await self._db.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_a2a_replay_nonces_expires
-                ON a2a_replay_nonces(expires_at)
-                """
-            )
-            self._initialized = True
+                await self._db.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_a2a_replay_nonces_expires
+                    ON a2a_replay_nonces(expires_at)
+                    """
+                )
+                if not call_after_backend_commit(self._db, self._record_initialized):
+                    raise RuntimeError("Native replay storage cannot report schema COMMIT")
+
+    def _record_initialized(self) -> None:
+        self._initialized = True
 
     async def reserve(
         self,
