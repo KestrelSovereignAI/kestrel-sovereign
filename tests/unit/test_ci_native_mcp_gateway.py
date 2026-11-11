@@ -34,7 +34,8 @@ def test_native_gateway_permission_campaign_cannot_drop_its_cli_or_real_cases():
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform == 'win32', reason='Original POSIX process retirement requires process groups')
-async def test_original_admitted_gateway_zombie_is_joined_before_receipt_release(tmp_path):
+@pytest.mark.parametrize('exit_phase', ['zombie', 'group-lookup'])
+async def test_original_admitted_gateway_zombie_is_joined_before_receipt_release(tmp_path, monkeypatch, exit_phase):
     """A real exited-but-unreaped process still has an original waiter."""
     import asyncio
     import os
@@ -61,15 +62,32 @@ async def test_original_admitted_gateway_zombie_is_joined_before_receipt_release
                 host_created=psutil.Process(os.getpid()).create_time(),
                 executables=[str(Path(original.exe()).resolve())])
             assert peer.admitted_processes(record) == [original]
-            child.stdin.write(b'x')
-            child.stdin.flush()
-            async with asyncio.timeout(2):
-                while original.status() != psutil.STATUS_ZOMBIE:
-                    await asyncio.sleep(0.01)
-            assert peer.admitted_processes(record) == [original], (
-                'Original admitted zombie lost custody before its physical join')
-            with pytest.raises(AssertionError, match='Original native Gateway PID was reused'):
-                peer.admitted_processes(dict(record, created=record['created'] - 1))
+            if exit_phase == 'zombie':
+                child.stdin.write(b'x')
+                child.stdin.flush()
+                async with asyncio.timeout(2):
+                    while original.status() != psutil.STATUS_ZOMBIE:
+                        await asyncio.sleep(0.01)
+                assert peer.admitted_processes(record) == [original], (
+                    'Original admitted zombie lost custody before its physical join')
+                with pytest.raises(AssertionError, match='Original native Gateway PID was reused'):
+                    peer.admitted_processes(dict(record, created=record['created'] - 1))
+            else:
+                native_getpgid = os.getpgid
+
+                def after_original_exit(pid):
+                    if pid == child.pid:
+                        # Close the actual race window with a real exit/reap,
+                        # then let the original OS call report its own ESRCH.
+                        child.stdin.write(b'x')
+                        child.stdin.flush()
+                        assert child.wait(timeout=2) == 0
+                    return native_getpgid(pid)
+
+                with monkeypatch.context() as boundary:
+                    boundary.setattr(os, 'getpgid', after_original_exit)
+                    assert peer.admitted_processes(record) == [original], (
+                        'Native group lookup lost the birth-verified original receipt')
             await retire_original_gateway_process(original.pid, original.wait,
                 lambda: not original.is_running())
             assert not original.is_running()

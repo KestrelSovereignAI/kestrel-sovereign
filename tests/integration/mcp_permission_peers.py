@@ -439,10 +439,11 @@ class GatewayTestPeer(MCPTestPeer):
             try:
                 if original.status() != psutil.STATUS_ZOMBIE:
                     assert matches(original), 'Original native Gateway admission no longer matches its receipt'
-            except psutil.ZombieProcess:
-                # The verified original can exit between status and cmdline.
-                # Its arguments disappear, but its original waiter still owns
-                # the unreaped PID. Return it for physical join, never as gone.
+            except (psutil.ZombieProcess, ProcessLookupError):
+                # The verified original can exit at any attestation step,
+                # including the final native group lookup. Keep its exact
+                # waiter until physical retirement is observed, never adopt
+                # another process or infer a join from missing metadata.
                 pass
             except psutil.NoSuchProcess:
                 return []  # The original was already reaped during observation.
