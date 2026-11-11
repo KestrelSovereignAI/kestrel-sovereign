@@ -121,7 +121,7 @@ _JSDELIVR_NPM_SCRIPT = re.compile(
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.51.2"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.52.1"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -492,7 +492,9 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.50.0") not in specifier
         assert Version("0.51.0") not in specifier
         assert Version("0.51.1") not in specifier
-        assert Version("0.51.2") in specifier
+        assert Version("0.51.2") not in specifier
+        assert Version("0.52.0") not in specifier
+        assert Version("0.52.1") in specifier
         assert Version("1.0.0") not in specifier
 
 
@@ -528,7 +530,7 @@ def test_sdk_native_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.51.2") <= version < Version("1.0.0") for version in sdk_versions
+        Version("0.52.1") <= version < Version("1.0.0") for version in sdk_versions
     )
 
 

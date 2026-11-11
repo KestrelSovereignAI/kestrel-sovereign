@@ -44,6 +44,7 @@ def test_input_browser_binds_the_installed_runtime_to_real_wheel_bytes(tmp_path)
     (package / '__init__.py').write_bytes(body)
     wheel = tmp_path / 'candidate.whl'
     with zipfile.ZipFile(wheel, 'w') as archive:
+        archive.writestr('kestrel_sovereign/', b'')
         archive.writestr('kestrel_sovereign/__init__.py', body)
     assert runner().wheel_inventory(wheel, tmp_path) == {
         'kestrel_sovereign/__init__.py': hashlib.sha256(body).hexdigest(),
