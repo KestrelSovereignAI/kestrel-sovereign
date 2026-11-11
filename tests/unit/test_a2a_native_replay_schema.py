@@ -99,6 +99,61 @@ async def test_rollback_does_not_cache_uncommitted_replay_schema(
         await backend.close()
 
 
+async def test_original_transaction_can_reserve_again_while_same_store_contender_waits(
+    native_a2a_backend_factory,
+):
+    async with AsyncExitStack() as resources:
+        backend, observer = [native_a2a_backend_factory() for _ in range(2)]
+        for connection in (backend, observer):
+            resources.push_async_callback(connection.close)
+            await connection.connect()
+        store = SharedReplayNonceStore(backend)
+        contender_started = asyncio.Event()
+        contender_pid = None
+
+        async def reserve_contender():
+            nonlocal contender_pid
+            if backend.backend_type == "postgres":
+                # Only the pool's other connection is available: the original
+                # owner still holds the first until its transaction commits.
+                contender_pid = (await backend.fetch_one("SELECT pg_backend_pid()"))[0]
+            contender_started.set()
+            return await store.reserve(
+                "did:replay:test", "b" * 32, now_ts=100, ttl_seconds=60,
+            )
+
+        async with asyncio.TaskGroup() as owners:
+            async with backend.transaction():
+                assert await store.reserve(
+                    "did:replay:test", "a" * 32, now_ts=100, ttl_seconds=60,
+                )
+                assert not store._initialized
+                contender = owners.create_task(reserve_contender())
+                async with asyncio.timeout(5):
+                    await contender_started.wait()
+                    if backend.backend_type == "postgres":
+                        while True:
+                            state = await observer.fetch_one(
+                                "SELECT state, wait_event_type, query FROM pg_stat_activity WHERE pid = ?",
+                                (contender_pid,),
+                            )
+                            if state is not None and state[:2] == ("active", "Lock"):
+                                break
+                            await asyncio.sleep(0.001)
+                        assert "pg_advisory_xact_lock" in state[2]
+                assert not contender.done()
+                # A competing Python lock must not keep this same original
+                # DB-transaction owner from making progress before COMMIT.
+                async with asyncio.timeout(5):
+                    assert await store.reserve(
+                        "did:replay:test", "c" * 32, now_ts=100, ttl_seconds=60,
+                    )
+                assert not store._initialized
+            assert store._initialized
+        assert contender.result() is True
+        assert await observer.fetch_one("SELECT COUNT(*) FROM a2a_replay_nonces") == (3,)
+
+
 async def test_failed_original_commit_never_acknowledges_replay_initialization(
     native_a2a_backend_factory,
 ):
