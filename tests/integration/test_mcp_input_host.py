@@ -52,13 +52,18 @@ async def answer(boundary, row, *, principal='key', session='original-chat', res
                 if responses is None else responses, **changes))
 
 
-async def pause_app(b):
+async def open_input_app(b):
     reference = await b.publish(marker='opened-once')
     opened = await b.open(reference)
     assert opened.status_code == 200, opened.text
     view_id = opened.json()['view_id']
     tool = next(item for item in b.tools if item.tool.native_tool.name == 'mutate_marker')
     await b.permissions.set_permission('mcp:owned-apps', tool.binding.name, PermissionLevel.ALLOW)
+    return view_id
+
+
+async def pause_app(b):
+    view_id = await open_input_app(b)
     called = await b.client.post('/api/mcp/apps/views/' + view_id + '/tools/call',
         params={'session_id': 'original-chat'}, headers=b.headers(),
         json={'name': 'mutate_marker', 'arguments': {'marker': 'continued-once'}, 'operation_id': uuid4().hex})
@@ -68,6 +73,48 @@ async def pause_app(b):
     assert called.json()['input_required'] == {'reference': row['request_id'], 'session_id': 'original-chat'}
     assert b.markers == ['opened-once'] and len(wire(b)) == 1
     return row, view_id
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form', 'input_tool': 'mutate_marker',
+    'hold_first_input': True}], indirect=True)
+async def test_parallel_app_calls_recheck_pending_input_before_second_native_dispatch(apps_boundary):
+    b = apps_boundary
+    view_id = await open_input_app(b)
+    original_view = b.host._views[view_id].view
+    def call(marker):
+        return b.client.post('/api/mcp/apps/views/' + view_id + '/tools/call',
+            params={'session_id': 'original-chat'}, headers=b.headers(),
+            json={'name': 'mutate_marker', 'arguments': {'marker': marker}, 'operation_id': uuid4().hex})
+    first = asyncio.create_task(call('continued-once'))
+    second = None
+    try:
+        await asyncio.wait_for(b.input_barrier[0].wait(), 5)
+        second = asyncio.create_task(call('must-not-start'))
+        async with asyncio.timeout(5):
+            while len(original_view._calls) != 2:
+                assert not second.done(), 'The parallel request did not enter the original View'
+                await asyncio.sleep(.01)
+        # Core serializes effects through its original privacy mutex. The
+        # second call is admitted to the View before the first checkpoint,
+        # then must revalidate pending input after that real mutex wait.
+        b.input_barrier[1].set()
+        response = await asyncio.wait_for(second, 5)
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            'content': [{'type': 'text', 'text':
+                'The host refused this MCP App invocation before a native result was confirmed'}],
+            'isError': True, 'resultType': 'complete',
+        }, 'A concurrent App call created a second operator wait before the first checkpoint'
+        assert len(wire(b)) == 1
+        initial = await asyncio.wait_for(first, 5)
+        assert initial.status_code == 202, initial.text
+        row, = (await pending(b)).json()['inputs']
+        resumed = await answer(b, row)
+        assert resumed.status_code == 200, resumed.text
+        assert b.markers == ['opened-once', 'continued-once'] and len(wire(b)) == 2
+    finally:
+        b.input_barrier[1].set()
+        await asyncio.gather(first, *([second] if second is not None else []), return_exceptions=True)
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'mixed'}], indirect=True)

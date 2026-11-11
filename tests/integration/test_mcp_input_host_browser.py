@@ -59,6 +59,14 @@ def input_host_origin(input_listener):
     {'operator_input': 'form', 'input_schema': RICH_SCHEMA, 'input_content': RICH_CONTENT},
     {'operator_input': 'form', 'action': 'decline'},
     {'operator_input': 'form', 'action': 'cancel'},
+    {'operator_input': 'form', 'input_schema': {'type': 'object', 'properties': {
+        'city': {'type': 'string', 'maxLength': 0},
+        'labels': {'type': 'array', 'items': {'type': 'string', 'enum': ['a', 'b']}, 'minItems': 0},
+        'optional_labels': {'type': 'array', 'items': {'type': 'string', 'enum': ['a', 'b']}, 'minItems': 1},
+    }, 'required': ['city', 'labels']}, 'input_content': {'city': '', 'labels': []}},
+    {'operator_input': 'form', 'input_tool': 'mutate_marker', 'browser_app': True,
+        'input_schema': {'type': 'object', 'properties': {'city': {'type': 'string', 'format': 'uri'}},
+            'required': ['city']}, 'input_content': {'city': 'https://example.test/private-path'}},
 ], indirect=True)
 async def test_native_console_input_card_and_private_dom_retirement(
     apps_boundary, tmp_path, monkeypatch, input_listener, request,
