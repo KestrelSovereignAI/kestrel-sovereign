@@ -492,7 +492,8 @@ async def test_stopping_a_queued_a2a_wake_cancels_the_task_its_sender_waits_on(
 ):
     """The 11-10 Claw shape: Stop cancels a queued turn carrying an inbound A2A
     work order. The task must end where its sender can see it, not stay
-    ``submitted`` after its only wake was consumed."""
+    ``submitted`` after its only wake was consumed. The settlement pass ends
+    it from the wake's committed terminal row."""
     from kestrel_sdk.native_a2a.types import TaskState
 
     database, receipts = await _receipt_store(tmp_path)
@@ -509,7 +510,11 @@ async def test_stopping_a_queued_a2a_wake_cancels_the_task_its_sender_waits_on(
 
             assert await _stop_agent(agent, receipts) == [StopDisposition.STOPPED]
             await _settle(agent, (first,), "the stopped turn")
-            assert await _sender_state(agent, task) == TaskState.TASK_STATE_CANCELED
+
+            async def cancelled():
+                return await _sender_state(agent, task) == TaskState.TASK_STATE_CANCELED
+
+            await _until(agent, cancelled, "the stopped wake's task was never cancelled")
             assert [d.status for d in await _submission_deliveries(agent)] == [
                 "terminal_ackable"
             ]
@@ -518,14 +523,26 @@ async def test_stopping_a_queued_a2a_wake_cancels_the_task_its_sender_waits_on(
         await database.close()
 
 
-async def test_a_stop_that_cannot_cancel_the_task_leaves_its_wake_to_retry(
+async def test_a_stopped_wake_whose_task_cannot_be_cancelled_is_settled_by_the_heartbeat(
     tmp_path, monkeypatch
 ):
-    """When the task cannot be cancelled, the stop is not durably final: the
-    wake is released for retry rather than consumed, and Stop does not claim
-    the work stopped. The retry then ends the task where its sender sees it."""
+    """Stop consumes a queued A2A wake, and the write that cancels its task
+    fails. Stop still reports the turn stopped: its terminal row committed
+    first, and the work it ended is settled from that row. Until the fault
+    clears, the running owner heartbeat finds the task owed on every pass
+    and retries; then the task ends cancelled, as the Stop asked, without a
+    restart (#4001)."""
+    from datetime import timedelta
+
     from kestrel_sdk.native_a2a.types import TaskState
 
+    from kestrel_sovereign.signals.dispatcher import SignalDispatcher
+
+    monkeypatch.setitem(
+        SignalDispatcher.__init__.__kwdefaults__,
+        "runtime_owner_stale_after",
+        timedelta(seconds=0.6),
+    )
     database, receipts = await _receipt_store(tmp_path)
     try:
         async with booted_agent(
@@ -537,32 +554,41 @@ async def test_a_stop_that_cannot_cancel_the_task_leaves_its_wake_to_retry(
             await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
             task = await _submit_task(agent)
             await _wait_until_queued(agent)
-            drain = _gate_resident_drain(agent, monkeypatch)
             manager = agent.task_manager
             real_cancel = manager.cancel_task
-            failures = {"left": 1}
+            faulted = {"on": True}
+            attempts = []
 
             async def cancel_task(*args, **kwargs):
-                if failures["left"]:
-                    failures["left"] -= 1
+                attempts.append(args[0])
+                if faulted["on"]:
                     raise OSError("database is locked")
                 return await real_cancel(*args, **kwargs)
 
             monkeypatch.setattr(manager, "cancel_task", cancel_task)
 
-            assert await _stop_agent(agent, receipts) != [StopDisposition.STOPPED]
+            assert await _stop_agent(agent, receipts) == [StopDisposition.STOPPED]
             await _settle(agent, (first,), "the stopped turn")
-            assert failures["left"] == 0
+
+            async def retried():
+                return len(attempts) >= 3
+
+            await _until(agent, retried, "the heartbeat never retried the settlement")
+            assert set(attempts) == {task.id}
             assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
-            assert [d.status for d in await _submission_deliveries(agent)] == ["retry"]
+            assert [d.status for d in await _submission_deliveries(agent)] == [
+                "terminal_ackable"
+            ]
 
-            drain.set()
+            faulted["on"] = False
 
-            async def settled():
-                return await _sender_state(agent, task) != TaskState.TASK_STATE_SUBMITTED
+            async def cancelled():
+                return await _sender_state(agent, task) == TaskState.TASK_STATE_CANCELED
 
-            await _until(agent, settled, "the retried wake never ended its task")
-            assert all(d.is_terminal for d in await _submission_deliveries(agent))
+            await _until(agent, cancelled, "the task was left submitted once the fault cleared")
+            assert [d.status for d in await _submission_deliveries(agent)] == [
+                "terminal_ackable"
+            ]
             await _until_completion_wake_settled(agent)
     finally:
         await database.close()
@@ -590,8 +616,11 @@ async def test_a_stop_settled_after_its_dispatch_was_cancelled_still_ends_the_ta
         async def renewal_that_outlives_the_route(delivery):
             async with renewal(delivery) as lost:
                 yield lost
-            route_finished.set()
-            await asyncio.Event().wait()
+            # Only the submission wake under test; the completion wake its
+            # cancelled task causes must run, or teardown cancels it mid-turn.
+            if delivery.event.source == "a2a.task_submitted":
+                route_finished.set()
+                await asyncio.Event().wait()
 
         monkeypatch.setattr(
             agent.dispatcher,
@@ -611,7 +640,12 @@ async def test_a_stop_settled_after_its_dispatch_was_cancelled_still_ends_the_ta
             return bool(deliveries) and all(d.is_terminal for d in deliveries)
 
         await _until(agent, settled, "the retained route never settled its delivery")
-        assert await _sender_state(agent, task) == TaskState.TASK_STATE_CANCELED
+
+        async def cancelled():
+            return await _sender_state(agent, task) == TaskState.TASK_STATE_CANCELED
+
+        await _until(agent, cancelled, "the retained route's task was never cancelled")
+        await _until_completion_wake_settled(agent)
 
 
 @pytest.mark.parametrize("phase", ["queued", "in_flight"])
@@ -673,8 +707,8 @@ async def test_a_failed_wake_whose_task_write_failed_is_settled_without_a_restar
     refused and its delivery fails, but the write that ends its task fails
     too. A failed row is never reclaimed, so before the fix nothing settled
     the task until the next boot, and its sender saw ``submitted``. The
-    dispatcher's owner heartbeat now retries the settlement while the host
-    runs, so clearing the fault is enough."""
+    owner heartbeat's settlement pass finds the task owed from durable state
+    on every pass while the host runs, so clearing the fault is enough."""
     from datetime import timedelta
 
     from kestrel_sdk.native_a2a.types import TaskState
@@ -746,12 +780,8 @@ async def test_a_failed_wake_whose_task_write_failed_is_settled_without_a_restar
             await _until(agent, ended, "the task was left submitted once the fault cleared")
             assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
             assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
-
-            async def debt_cleared():
-                # The row commits before the settlement's projections return.
-                return not agent.dispatcher._failed_cognition_source_debt
-
-            await _until(agent, debt_cleared, "the settled task's debt was never cleared")
+            assert await agent.dispatcher.owed_cognition_wake_settlements() == []
+            assert not agent.dispatcher._retained_cognition_control_debt
     finally:
         fault.close()
 
@@ -762,11 +792,11 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
     """Self-review of wo-4001-4: a process can stop between committing a
     wake's failed row and settling its task. The next boot finds the row
     already failed, and the write that ends the task fails too. Before the
-    fix boot reconciliation only logged that failure; the dispatcher held no
-    debt for the row, so the owner heartbeat retried nothing and the sender
-    saw ``submitted`` until yet another restart. The row now joins the same
-    source debt as a row the running dispatcher failed itself. Settling it
-    writes neither cognition nor the committed row again."""
+    fix boot reconciliation only logged that failure, and no process state
+    recorded the task as owed, so the sender saw ``submitted`` until yet
+    another restart. Boot's settlement pass is now the first of the owner
+    heartbeat's passes, each reading what is owed from durable state.
+    Settling it writes neither cognition nor the committed row again."""
     from datetime import timedelta
 
     from kestrel_sdk.native_a2a.types import TaskState
@@ -871,11 +901,7 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
             await _until(agent, ended, "the task was left submitted once the fault cleared")
             assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
             assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
-
-            async def debt_cleared():
-                return not agent.dispatcher._failed_cognition_source_debt
-
-            await _until(agent, debt_cleared, "the settled task's debt was never cleared")
+            assert await agent.dispatcher.owed_cognition_wake_settlements() == []
             assert failed_row_writes == []
             assert model_calls == []
     finally:
@@ -889,11 +915,12 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
     and its row fails. Between the settlement's read of the task and its
     write, another recipient writer moves the task SUBMITTED -> WORKING, so
     the settlement's lifecycle compare-and-set loses and raises. Before the
-    fix the dispatcher kept the debt only for a storage error, so this one
-    was dropped: the delivery stayed failed, the sender saw ``working``, and
-    the owner heartbeat had nothing to retry. Every ordinary failure now
-    keeps the debt, and the running heartbeat settles the task, writing
-    neither cognition nor the committed row again."""
+    fix the dispatcher kept its in-process debt only for a storage error, so
+    this one was dropped: the delivery stayed failed, the sender saw
+    ``working``, and the owner heartbeat had nothing to retry. What is owed is
+    now read from durable state on every pass, so the running heartbeat
+    settles the task, writing neither cognition nor the committed row
+    again."""
     from datetime import timedelta
 
     from kestrel_sdk.native_a2a.types import Task, TaskState
@@ -976,14 +1003,10 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
             agent,
             ended,
             "the owner heartbeat left the task live after its settlement lost a "
-            f"lifecycle race; debt={list(agent.dispatcher._failed_cognition_source_debt)}",
+            "lifecycle race",
         )
         assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
-
-        async def debt_cleared():
-            return not agent.dispatcher._failed_cognition_source_debt
-
-        await _until(agent, debt_cleared, "the settled task's debt was never cleared")
+        assert await agent.dispatcher.owed_cognition_wake_settlements() == []
         # The row was written once, by the refused retry; the heartbeat wrote
         # only the task.
         assert len(failed_row_writes) == 1
@@ -1390,3 +1413,91 @@ async def test_a_scheduled_tool_holding_the_memory_lock_before_its_body_is_stopp
         assert status != "success"
     finally:
         await runner.stop()
+
+
+async def test_an_unknown_settlement_commit_fails_readiness_until_it_resolves(
+    tmp_path, monkeypatch
+):
+    """Final self-review of wo-4001-6: the write that settles a failed wake's
+    task ends with its commit outcome unknown. The settlement pass retains
+    that as the delivery's native control, and owner retirement refuses
+    while it stands, but before the fix the heartbeat dropped the pass's
+    result and the host's readiness probe still answered ``ok``. Readiness
+    now fails, and ``/health/detailed`` names the delivery, until a
+    settlement returns."""
+    from fastapi import FastAPI
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
+    from starlette.requests import Request
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        DURABLE_COGNITION_CONSUMER_ID,
+    )
+    from tests.unit.test_a2a_native_input_fencing import (
+        failed_submission_wake,
+        fault_task_writes,
+    )
+
+    async with booted_agent(
+        tmp_path / "agent", name="Recipient", provenance="test:4001-readiness",
+        features=set(),
+    ) as agent:
+        _script_replies(agent, monkeypatch)
+        gate = _gate_resident_drain(agent, monkeypatch)
+        app = FastAPI()
+        app.state.agent = agent
+        probe = Request({"type": "http", "app": app, "state": {}})
+
+        async def detailed():
+            async def healthy(_agent):
+                return {"status": "healthy", "checks": []}
+
+            monkeypatch.setattr(server, "_agent_health_result", healthy)
+            return await server._agent_detailed_health(agent)
+
+        assert server.health_check(probe) == {"status": "ok", "agent_initialized": True}
+        task = await agent.task_manager.create_task(
+            SendMessageRequest(
+                tenant=agent.task_manager.task_store.scope.tenant,
+                message=new_text_message("Please do this", role=Role.ROLE_USER),
+            ),
+            creator_agent_id=SENDER,
+            notify_submitted=False,
+        )
+        failed = await failed_submission_wake(
+            agent.task_manager, agent.dispatcher, DURABLE_COGNITION_CONSUMER_ID, task
+        )
+        faults = [ExecutionCommitOutcomeError("unknown")]
+        fault_task_writes(agent.task_manager, faults)
+        try:
+            await agent.dispatcher._heartbeat_runtime_owner()
+
+            assert faults == []
+            assert agent.dispatcher.unresolved_cognition_control == (failed.delivery_id,)
+            assert server.health_check(probe).status_code == 503
+            report = await detailed()
+            assert report["status"] == "unhealthy"
+            (check,) = [
+                c for c in report["checks"] if c["name"] == "durable_cognition_control"
+            ]
+            assert check["status"] == "fail" and failed.delivery_id in check["message"]
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_SUBMITTED
+
+            # The retirement drain's fixed retry returns: the task is settled,
+            # and readiness recovers with the control.
+            await agent.dispatcher._settle_retained_source_control(failed)
+
+            assert agent.dispatcher.unresolved_cognition_control == ()
+            assert server.health_check(probe) == {
+                "status": "ok", "agent_initialized": True,
+            }
+            assert not [
+                c for c in (await detailed())["checks"]
+                if c["name"] == "durable_cognition_control"
+            ]
+            assert await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
+        finally:
+            gate.set()
+        await _until_completion_wake_settled(agent)

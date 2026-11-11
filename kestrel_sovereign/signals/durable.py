@@ -5487,6 +5487,8 @@ class DurableSignalStore(UnifiedStoreBase):
         rebuildable_sources: Optional[Iterable[str]] = None,
         claim_executor_id: Optional[str] = None,
         runtime_owner_stale_before: Optional[datetime] = None,
+        after_delivery_id: Optional[str] = None,
+        retention_expired_before: Optional[datetime] = None,
     ) -> list[DurableDelivery]:
         """List observable delivery state within one agent/tenant only.
 
@@ -5496,6 +5498,11 @@ class DurableSignalStore(UnifiedStoreBase):
         row of any other source stores no caller and can run only from its
         provider's redelivery (#3392). A claimable window must use the same
         runtime-owner staleness cutoff as its subsequent native claim.
+
+        With ``after_delivery_id``, list one keyset page in delivery-ID order:
+        the rows after that ID (``""`` for the first page). With
+        ``retention_expired_before``, list only rows whose event's retention
+        ended before it.
         """
         self._require_nonempty("agent_id", agent_id)
         if limit < 1 or limit > 1000:
@@ -5505,6 +5512,14 @@ class DurableSignalStore(UnifiedStoreBase):
         if consumer_id is not None:
             where.append("d.consumer_id = ?")
             params.append(consumer_id)
+        if after_delivery_id is not None:
+            if not isinstance(after_delivery_id, str):
+                raise ValueError("after_delivery_id must be a delivery ID string")
+            where.append("d.delivery_id > ?")
+            params.append(after_delivery_id)
+        if retention_expired_before is not None:
+            where.append("e.retention_until < ?")
+            params.append(self.to_timestamp_param(_as_utc(retention_expired_before)))
         if claim_executor_id is not None:
             self._require_nonempty("claim_executor_id", claim_executor_id)
             where.append(self._managed_retry_claim_sql(alias="d"))
@@ -5538,9 +5553,13 @@ class DurableSignalStore(UnifiedStoreBase):
                 raise ValueError("statuses must be durable delivery states")
             where.append("d.status IN (" + ", ".join("?" for _ in wanted) + ")")
             params.extend(wanted)
+        order = (
+            "d.delivery_id" if after_delivery_id is not None
+            else "d.created_at, d.delivery_id"
+        )
         rows = await self._backend.fetch_all(
             self._delivery_select_sql(" AND ".join(where))
-            + " ORDER BY d.created_at, d.delivery_id LIMIT ?",
+            + f" ORDER BY {order} LIMIT ?",
             tuple(params + [limit]),
         )
         return [self._row_to_delivery(row) for row in rows]
@@ -5604,6 +5623,8 @@ class DurableSignalStore(UnifiedStoreBase):
         source: str | None = None,
         limit: int | None = None,
         now: datetime | None = None,
+        held_consumers: Iterable[str] = (),
+        released_event_ids: Iterable[str] = (),
     ) -> tuple[str, ...]:
         """Return the exact deleted IDs of this agent's terminal event history.
 
@@ -5613,12 +5634,23 @@ class DurableSignalStore(UnifiedStoreBase):
         their references to these exact IDs in the SAME enclosing transaction.
         Dispatcher-facing sweeps report len(result). A deletion count alone
         cannot safely identify another ledger's original references to retire.
+
+        A failed or terminal-ACKable row of one of ``held_consumers`` keeps
+        its event past retention unless that event is in
+        ``released_event_ids``: such a row can be the only record that work
+        its wake carried is still owed a settlement (#4001). Held is the
+        default, so a row that turns terminal after its caller decided what
+        to release is kept for a later sweep.
         """
         self._require_nonempty("agent_id", agent_id)
         if source is not None:
             self._require_nonempty("source", source)
         if limit is not None and (type(limit) is not int or limit <= 0):
             raise ValueError("Retention batch limit must be a positive integer")
+        held = tuple(sorted(set(held_consumers)))
+        released = tuple(sorted(set(released_event_ids)))
+        for value in (*held, *released):
+            self._require_nonempty("held consumer or released event", value)
         now = _as_utc(now or self.now_utc())
         where = ["e.agent_id = ?", "e.retention_until < ?"]
         parameters: list[Any] = [agent_id, self.to_timestamp_param(now)]
@@ -5630,6 +5662,22 @@ class DurableSignalStore(UnifiedStoreBase):
             "WHERE d.event_id = e.event_id "
             f"AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}'))"
         )
+        if held:
+            hold = (
+                f"NOT EXISTS (SELECT 1 FROM {self.DELIVERIES} h "
+                "WHERE h.event_id = e.event_id AND h.consumer_id IN ("
+                + ", ".join("?" for _ in held)
+                + f") AND h.status IN ('{FAILED}', '{TERMINAL_ACKABLE}'))"
+            )
+            parameters.extend(held)
+            if released:
+                hold = (
+                    f"({hold} OR e.event_id IN ("
+                    + ", ".join("?" for _ in released)
+                    + "))"
+                )
+                parameters.extend(released)
+            where.append(hold)
         bound = ""
         if limit is not None:
             bound = "LIMIT ?"

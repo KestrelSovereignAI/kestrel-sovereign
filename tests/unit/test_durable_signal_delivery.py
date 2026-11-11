@@ -3511,6 +3511,7 @@ class _ReconcilingA2AAgent(_Agent):
     from kestrel_sovereign.agent.event_manager import EventManagerMixin as _Mixin
 
     reconcile_a2a_cognition_wakes = _Mixin.reconcile_a2a_cognition_wakes
+    _a2a_wake_replay_horizon = _Mixin._a2a_wake_replay_horizon
 
     def __init__(self, did: str, task, lifecycle_revision: int):
         from kestrel_sovereign.signals.sources.a2a import (

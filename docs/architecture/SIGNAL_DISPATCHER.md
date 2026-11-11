@@ -496,72 +496,77 @@ delivery/token through its real CAS, without reviving ordinary runtime work.
 A durable cognition wake that becomes terminal without running its turn is
 never delivered again. For an inbound A2A task that wake is the only thing that
 would run the task, so a task left `submitted` or `working` waits forever and its
-sender sees nothing fail (#4001). Four routes reached that state: Stop cancelled
+sender sees nothing fail (#4001). Many routes reach that state: Stop cancelled
 a queued or running wake, a retained route settled the delivery after its
 dispatch was cancelled, a retry after restart was refused because the tool
 operation its first attempt opened needs reconciliation (#3999), and the
-dispatcher refused the wake as a cycle before persisting any delivery.
+dispatcher refused the wake as a cycle.
 
-The rule is keyed on the wake becoming terminal, not on the route. Every point
-where that happens calls the agent's `settle_undelivered_cognition_wake` with
-the wake's durable identity (`source`, `target_agent`, `source_event_id`):
+What is owed is a query, not process state. Settlement is owed exactly while a
+delivery of a settling consumer is failed or terminal-ACKable in durable
+storage and the work it carried still waits on it. The agent names its settling
+consumers (`undelivered_cognition_wake_consumers`: the `a2a.task_submitted`
+consumer) and judges one row (`undelivered_cognition_wake_owed`). The row's
+source-event identity records the exact task and input its wake carried, so the
+judgement reads only that task at that input revision: `submitted` or
+`working`, with both wake-eligibility flags set. Neither the task's age nor its
+live lifecycle since decides it: a `working` recovery wake still owes its input
+after another writer moves the task back to `submitted`. The dispatcher's
+`owed_cognition_wake_settlements` reads those consumers' terminal rows in
+bounded delivery-ID pages, on the existing claim index. Boot mints no new wake
+for an owed input: a replacement would be refused as its wake was, and a live
+wake beside the terminal row would leave the next pass ending work that wake
+still runs.
 
-- `dispatch_signal`, for a durable cognition enqueue refused by validation or
-  cycle detection, settles **before** it publishes the TERMINAL admission. No
-  delivery exists, so no delivery writer would see the refusal, and its
-  producer stops on TERMINAL. If the settlement cannot commit, the admission is
-  NOT_ADMITTED instead: the producer retries the handoff and, with it, the
-  settlement. Boot reconciliation rebuilds the same refused wake, so a process
-  that stopped meanwhile settles it at the next boot.
-- `_settle_cognition_non_delivery`, for a stopped, validation-dropped or
-  cycle-dropped result, settles **before** its terminal-ACKable NACK. If the
-  settlement cannot commit, the delivery is released for retry instead, and a
-  Stop does not report the work stopped. A settlement whose commit outcome is
-  unknown, even one that arrives as a cancellation, is native control: the
-  delivery becomes a failed row, as below, never one left leased for a lease
-  expiry to redeliver. That row's source debt keeps the Stop's intent, so the
-  task is still cancelled, not failed, and keeps the unknown outcome as its
-  source's control, below.
-- `_terminalize_failed_cognition`, for a failed terminalization, settles
-  **after** its CAS commits, since that row stands whatever follows, and never
-  inside that CAS. A failed row is never reclaimed, so until the settlement
-  commits it stays the dispatcher's source debt for that delivery. Only the
-  settlement ends that debt: it returns once the task is settled or no longer
-  waits on this wake, and raises while it still does. Any ordinary failure,
-  whatever its type, therefore leaves the debt in place: a database fault, a
-  lifecycle write that lost its compare-and-set to a concurrent task writer,
-  or a cancellation. The runtime-owner heartbeat retries it at the end of each
-  pass that completes its ordinary sweeps, logging each failure, so a
-  transient fault does not leave the task live until the next restart. While
-  any control debt stands, or once durable shutdown begins, the heartbeat does
-  no ordinary work, and a debt still owed when the process stops falls to
-  boot reconciliation. A native commit or
-  control outcome from the settlement propagates and is retained as the
-  delivery's control debt, as the row's own would be: readiness and owner
-  retirement refuse while it stands, and the owner's retirement drain retries
-  only the settlement. The row's original-token receipt outlives it, so the CAS
-  is not written again. That control is the source's, not the row's: the
-  row's receipt does not clear it, and nor does a later retry's ordinary
-  failure, which says nothing about the write whose outcome is unknown. Only a
-  settlement that returns ends it, so a retirement drain whose retry fails
-  refuses to retire the owner and keeps both debts for the next attempt.
+A terminal row is that debt's only record, so retention keeps it. The durable
+retention sweep (`purge_expired_durable_deliveries`) holds every failed or
+terminal-ACKable row of a settling consumer past its deadline, and releases only
+those whose work can never be owed again (`undelivered_cognition_wake_released`):
+its task ended, moved past that input, or is gone. Not owed is not enough, since
+a task that asked for input can be working on the same input again. Held is the
+default, so a row that turns terminal while the sweep runs is kept for a later
+one.
 
-A stopped wake cancels the task; any other ends it `failed`, naming the cause.
-The write is bound to the wake's own admitted input, read from its
-`source_event_id`, so it is fenced as that wake's turn is: a newer input the
+There is one settlement point, the dispatcher's settlement pass
+(`_settle_owed_cognition_sources`). The runtime-owner heartbeat runs it at the
+end of each pass that completes its ordinary sweeps, and boot reconciliation
+runs it before any consumer starts (`settle_owed_cognition_sources`). Nothing
+settles before a delivery's own terminal CAS has committed: a Stop's
+terminal-ACKable NACK and the failed-row terminalizer only ask for a prompt
+heartbeat once their row stands. A stale owner whose CAS lost therefore leaves
+no terminal row, and never touches the task its successor now runs.
+
+No failure type decides a retry. A storage error, a lifecycle compare-and-set
+lost to a concurrent task writer, or anything else leaves the row owed, and the
+next pass finds it again; a row stops being owed only when durable state shows
+the task settled or its input superseded. A settlement whose commit outcome is
+unknown, or whose execution authority is gone, is native control: the pass
+retains it as that delivery's control debt and stops, and boot refuses. The
+heartbeat logs it. While it stands the heartbeat does no ordinary work, owner
+retirement refuses, and the host is not ready: `/health` fails and
+`/health/detailed` names the deliveries in a `durable_cognition_control` check
+(`SignalDispatcher.unresolved_cognition_control`). The retirement drain retries
+only the fenced write, which returns at once when the earlier write committed;
+any failure keeps the debt, so shutdown never reports a deferred settlement as
+done. The row's CAS is never written again.
+
+The write itself is the agent's `settle_undelivered_cognition_wake`, named by
+the wake's durable identity (`source`, `target_agent`, `source_event_id`) and
+never its payload, which a privacy mode may elide. A Stop's row
+(`stop_acknowledged`) cancels the task, as the Stop asked; any other row fails
+it, naming a code its sender may read. The write is bound to the wake's own
+admitted input, so it is fenced as that wake's turn is: a newer input the
 creator added meanwhile stays live. The identity's kind,
 `UNDELIVERED_WAKE_SETTLEMENT_KIND`, also fences the write to a task still
 `submitted` or `working`, in the same statement: a worker that asks the creator
-for input after the settler read the task wins. A task no longer waiting on the
-input (terminal, or asking for input) is left alone. Boot's
-`reconcile_a2a_cognition_wakes` settles a live task whose submission wake is
-already terminal and unacknowledged, which covers a process that stopped between
-the two writes, and mints no replacement wake for it. It settles through the
-dispatcher's `settle_terminal_cognition_source`: the row joins the same source
-debt as a row the running dispatcher failed itself, with that row's committed
-receipt, so no CAS is written for it. An ordinary failure there neither refuses
-the boot nor waits for the next one; the owner heartbeat retries it. Native
-control propagates from boot and is retained as the delivery's control debt.
+for input after the settler read the task wins.
+
+A wake refused by validation or cycle detection before it is persisted has no
+row for the query to find, and its producer stops on TERMINAL. It has no lease
+or CAS either, so `dispatch_signal` makes the same fenced write before it
+publishes TERMINAL. If that write fails, the admission is NOT_ADMITTED: the
+producer retries the handoff, and with it the refusal and the write, and boot
+rebuilds the same refused wake.
 
 An agent with no durable cognition consumer delivers its A2A wakes through
 `enqueue_signal`, where no wake is terminal or retried; this rule does not
@@ -820,11 +825,14 @@ CONVERSATION, so a turn that took CONVERSATION in between waited for the
 privacy lock, the retirement waited for the wake, and the wake waited for
 CONVERSATION. That cycle reproduces the hangs reported in #4001.
 `enqueue_signal`,
-`enqueue_durable_cognition`, `enqueue_durable_terminal` and the A2A
-submitted/completed wake deliveries therefore create their Tasks inside
-`outside_native_privacy_lifetime()`. The A2A wakes need it most: TaskManager
-calls them on whichever task submitted or completed the task, which for a
-co-hosted peer is the sending agent's own turn.
+`enqueue_durable_cognition`, `enqueue_durable_terminal`, the A2A
+submitted/completed wake deliveries and the delivery supervisors that await
+them therefore create their Tasks inside `detached_from_enclosing_turn()`
+(`signals/delivery.py`). It leaves both the turn's native privacy lifetime
+and its delegated CONVERSATION ownership behind. The A2A wakes need it most:
+TaskManager calls them on whichever task submitted or completed the task,
+which is the recipient's own turn when it answers a task, and a co-hosted
+sender's turn when it submits one.
 
 The same gate, held shared, is the lock the agent hands to Workflows as
 `workflow_await_signal_privacy_transition_lock` (#3484). Workflows holds it

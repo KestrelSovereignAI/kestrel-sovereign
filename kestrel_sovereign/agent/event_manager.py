@@ -725,7 +725,7 @@ class EventManagerMixin:
         would recreate the wake once every retention period.
         """
 
-        from kestrel_sovereign.signals import ACKNOWLEDGED, DurableAdmissionDisposition
+        from kestrel_sovereign.signals import DurableAdmissionDisposition
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
         )
@@ -743,61 +743,51 @@ class EventManagerMixin:
         )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_signal_for_submitted_task,
+            parse_submitted_input_identity,
             submitted_input_identity,
         )
 
         now = datetime.now(UTC)
-        horizons = {}
-        for source in (SUBMITTED_SOURCE, COMPLETE_SOURCE):
-            registration = self.signal_registry.get(source)
-            if registration is None:
-                raise RuntimeError(
-                    f"A2A cognition outbox reconciliation needs the {source!r} "
-                    "registration to bound its replay window"
-                )
-            horizons[source] = now - timedelta(days=registration.retention_days)
+        horizons = {
+            source: self._a2a_wake_replay_horizon(source, now)
+            for source in (SUBMITTED_SOURCE, COMPLETE_SOURCE)
+        }
         tasks = await self.task_manager.list_cognition_wake_candidates(
             recipient_agent_id=self.did,
             live_changed_since=horizons[SUBMITTED_SOURCE],
             terminal_changed_since=horizons[COMPLETE_SOURCE],
         )
-        async def submission_wake(source_event_id: str):
-            return await self.dispatcher.get_durable_delivery_for_source_event(
-                consumer_id=SUBMITTED_CONSUMER,
-                source=SUBMITTED_SOURCE,
-                source_event_id=source_event_id,
-            )
-
-        def undelivered(delivery) -> bool:
-            return (
-                delivery is not None
-                and delivery.is_terminal
-                and delivery.status != ACKNOWLEDGED
-            )
-
-        async def settle_undelivered(delivery) -> None:
-            # The dispatcher ends the task when its wake ends undelivered; this
-            # catches a process that stopped before it could (#4001). The wake
-            # joins the dispatcher's source debt, so one task that cannot be
-            # settled now neither refuses the boot nor waits for the next one:
-            # the owner heartbeat retries it. Native control propagates.
-            await self.dispatcher.settle_terminal_cognition_source(
-                delivery, cause=f"wake {delivery.status}"
-            )
+        # An input owed a settlement gets no new wake: a replacement would be
+        # refused as its wake was, and a live one beside the terminal row
+        # would leave the next pass ending work that wake still runs (#4001).
+        owed_inputs = {
+            parse_submitted_input_identity(delivery.event.source_event_id)
+            for delivery in await self.dispatcher.owed_cognition_wake_settlements()
+            if delivery.event.source == SUBMITTED_SOURCE
+        }
+        # The settlement pass's first run: end the work of every wake that
+        # ended undelivered, before anything is minted. A task it ends here
+        # is still a live candidate above, and is skipped below; the
+        # completion it causes wakes the agent as any other does. A task it
+        # cannot settle now stays owed to the owner heartbeat's next pass, so
+        # it neither refuses this boot nor waits for another. Native control
+        # it meets refuses the boot.
+        await self.dispatcher.settle_owed_cognition_sources()
 
         unadmitted: list[str] = []
         for candidate in tasks:
             task = candidate.task
             state = task.status.state
             if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
-                original = await submission_wake(
-                    submitted_input_identity(task.id, candidate.input_revision)
-                )
-                if undelivered(original):
-                    # The input's wake ended without running, and nothing runs
-                    # it again; a replacement would be refused the same way.
-                    await settle_undelivered(original)
+                if (task.id, candidate.input_revision) in owed_inputs:
                     continue
+                original = await self.dispatcher.get_durable_delivery_for_source_event(
+                    consumer_id=SUBMITTED_CONSUMER,
+                    source=SUBMITTED_SOURCE,
+                    source_event_id=submitted_input_identity(
+                        task.id, candidate.input_revision
+                    ),
+                )
                 if (
                     state == TaskState.TASK_STATE_WORKING
                     and original is not None
@@ -846,12 +836,6 @@ class EventManagerMixin:
                     "leaving it failed",
                     task.id,
                 )
-                if consumer_id == SUBMITTED_CONSUMER:
-                    # A WORKING wake for this input failed after the input's
-                    # submission wake was acknowledged.
-                    failed = await submission_wake(source_event_id)
-                    if undelivered(failed):
-                        await settle_undelivered(failed)
             elif receipt.disposition is DurableAdmissionDisposition.NOT_ADMITTED:
                 unadmitted.append(str(task.id))
         if unadmitted:
@@ -976,6 +960,98 @@ class EventManagerMixin:
         if isinstance(task_id, str) and isinstance(self_declines, set):
             self_declines.discard(task_id)
 
+    def _a2a_wake_replay_horizon(self, source: str, now: datetime) -> datetime:
+        """Oldest lifecycle change whose wake row may still exist."""
+        registration = self.signal_registry.get(source)
+        if registration is None:
+            raise RuntimeError(
+                f"A2A cognition outbox reconciliation needs the {source!r} "
+                "registration to bound its replay window"
+            )
+        return now - timedelta(days=registration.retention_days)
+
+    def undelivered_cognition_wake_consumers(self) -> frozenset[str]:
+        """Consumers whose terminal wake rows can carry work owed a settlement.
+
+        The submission wake is the only thing that advances an inbound A2A
+        task's current input, so its row, once terminal without running, is
+        the record that the input is owed a settlement (#4001).
+        """
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
+
+        return frozenset({DURABLE_COGNITION_CONSUMER_ID})
+
+    async def undelivered_cognition_wake_owed(
+        self, *, source: str, target_agent: str, source_event_id: str | None,
+    ) -> bool:
+        """Whether a terminal wake's work still waits on it, read from storage.
+
+        The wake is named by its durable identity, which records the exact
+        input it carried, whatever the task's live lifecycle has done since:
+        a WORKING recovery wake's lifecycle revision is not part of what it
+        owes. The work is owed exactly while the task still waits on that
+        input (#4001). The dispatcher's settlement pass asks this of every
+        failed or terminal-ACKable row of
+        :meth:`undelivered_cognition_wake_consumers`.
+        """
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            SOURCE_NAME,
+            parse_submitted_input_identity,
+        )
+
+        if source != SOURCE_NAME or target_agent != self.did:
+            return False
+        if getattr(self, "task_manager", None) is None:
+            return False
+        try:
+            task_id, input_revision = parse_submitted_input_identity(source_event_id)
+        except ValueError:
+            # Every submission wake is minted under a canonical identity; a
+            # row without one names no input, so none waits on it.
+            return False
+        return await self._input_awaits_its_wake(task_id, input_revision)
+
+    async def undelivered_cognition_wake_released(
+        self, *, source: str, target_agent: str, source_event_id: str | None,
+    ) -> bool:
+        """Whether no later state can make a terminal wake's work owed again.
+
+        The dispatcher's retention sweep keeps a settling consumer's terminal
+        row, its debt's only record, until this says yes (#4001). Not owed is
+        not enough: a live task can move between its live states at the same
+        input, so one that asked for input can be working on it again. Only a
+        task that is gone, has ended, has moved past this input, or never
+        admitted wakes for its input (both flags are fixed at creation) is
+        released for good.
+        """
+        from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_from_label
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            SOURCE_NAME,
+            parse_submitted_input_identity,
+        )
+
+        if source != SOURCE_NAME or target_agent != self.did:
+            return False
+        if getattr(self, "task_manager", None) is None:
+            return False
+        try:
+            task_id, input_revision = parse_submitted_input_identity(source_event_id)
+        except ValueError:
+            return True
+        snapshot = await self.task_manager.get_task_cancellation_snapshot(
+            task_id,
+            recipient_agent_id=self.did,
+        )
+        return (
+            snapshot is None
+            or task_state_from_label(snapshot.state) in TERMINAL_STATES
+            or snapshot.input_revision != input_revision
+            or not snapshot.cognition_wake_eligible
+            or not snapshot.input_wake_eligible
+        )
+
     async def settle_undelivered_cognition_wake(
         self,
         *,
@@ -992,10 +1068,11 @@ class EventManagerMixin:
         persisting it, or a retry was refused because its tool operation needs
         reconciliation. Nothing else wakes the recipient for that input, so a
         task left ``submitted`` or ``working`` waits forever and its sender
-        sees nothing fail (#4001). The dispatcher calls this wherever such a
-        wake becomes terminal, and for one boot reconciliation finds already
-        terminal. A stopped wake cancels the task; any other ends it failed,
-        naming ``cause``.
+        sees nothing fail (#4001). This is the one write that ends it. The
+        dispatcher's settlement pass makes it for every terminal row
+        :meth:`undelivered_cognition_wake_owed` finds owed, and a refusal that
+        persisted no row makes it for its own wake. A stopped wake cancels
+        the task; any other ends it failed, naming ``cause``.
 
         The wake is named by its durable identity, never its payload, which a
         privacy mode may elide. The write is bound to the wake's own admitted

@@ -577,6 +577,35 @@ def _distributed_invocation_owners_healthy(agent, manager) -> bool:
     return True
 
 
+def _unresolved_cognition_control(agent) -> tuple[str, ...]:
+    """Deliveries whose native control outcome an agent's dispatcher holds.
+
+    While any stands, the dispatcher refuses owner retirement and runs no
+    ordinary durable work, so the agent is not ready (#4001).
+    """
+
+    dispatcher = getattr(agent, "dispatcher", None)
+    try:
+        unresolved = getattr(dispatcher, "unresolved_cognition_control", ())
+    except Exception:  # pragma: no cover - health must not crash
+        return ("unreadable",)
+    if not isinstance(unresolved, tuple):
+        return ()
+    return unresolved
+
+
+def _cognition_control_resolved(agent, manager) -> bool:
+    """Whether no loaded agent holds an unresolved native control outcome."""
+
+    candidates = [agent] if agent is not None else []
+    if manager is not None:
+        try:
+            candidates.extend(manager.list_agents().values())
+        except Exception:  # pragma: no cover - public health must not crash
+            return False
+    return not any(_unresolved_cognition_control(candidate) for candidate in candidates)
+
+
 def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     """Return a controlled operator-readiness record for a restricted agent."""
     safe_mode = getattr(agent, "_safe_mode", False) is True
@@ -5191,6 +5220,7 @@ def health_check(request: Request):
     invocation_owners_healthy = _distributed_invocation_owners_healthy(
         agent, manager
     )
+    cognition_control_resolved = _cognition_control_resolved(agent, manager)
     scheduler_failures = _scheduler_readiness_failures(request.app)
     constitution_safe_mode = _constitution_safe_mode_records(agent, manager)
     any_initialized = bool(agent) or bool(manager and manager.list_agents())
@@ -5201,6 +5231,7 @@ def health_check(request: Request):
         or scheduler_failures
         or not scheduler_workers_available
         or not invocation_owners_healthy
+        or not cognition_control_resolved
     ):
         return JSONResponse(
             status_code=503,
@@ -5377,24 +5408,42 @@ async def _agent_detailed_health(agent) -> dict:
     result = _with_contribution_rejections(
         agent, await _agent_health_result(agent)
     )
-    if _distributed_invocation_owner_status(agent) == "healthy":
+    failed_checks = []
+    if _distributed_invocation_owner_status(agent) != "healthy":
+        message = "Invocation owner lease was lost; replica is fenced"
+        # Name the cause: a bare "fenced" cannot tell a transient
+        # re-acquisition window from a Stop database that has been
+        # unreachable for hours (#3337).
+        reason = _distributed_invocation_owner_fence_reason(agent)
+        if reason is not None:
+            message = f"{message} ({reason})"
+        failed_checks.append(
+            {
+                "name": "distributed_invocation_owner",
+                "status": "fail",
+                "message": message,
+                "duration_ms": 0.0,
+            }
+        )
+    unresolved = _unresolved_cognition_control(agent)
+    if unresolved:
+        failed_checks.append(
+            {
+                "name": "durable_cognition_control",
+                "status": "fail",
+                "message": (
+                    "A durable cognition write's commit outcome is unknown or "
+                    "its execution authority is gone; owner retirement refuses "
+                    "until it resolves (deliveries: " + ", ".join(unresolved) + ")"
+                ),
+                "duration_ms": 0.0,
+            }
+        )
+    if not failed_checks:
         return result
     merged = dict(result)
     checks = list(merged.get("checks", []))
-    message = "Invocation owner lease was lost; replica is fenced"
-    # Name the cause: a bare "fenced" cannot tell a transient re-acquisition
-    # window from a Stop database that has been unreachable for hours (#3337).
-    reason = _distributed_invocation_owner_fence_reason(agent)
-    if reason is not None:
-        message = f"{message} ({reason})"
-    checks.append(
-        {
-            "name": "distributed_invocation_owner",
-            "status": "fail",
-            "message": message,
-            "duration_ms": 0.0,
-        }
-    )
+    checks.extend(failed_checks)
     merged.update(
         {
             "status": "unhealthy",

@@ -89,6 +89,10 @@ class _Agent(EventManagerMixin):
         self.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
             return_value=None
         )
+        # Boot reconciliation opens with the dispatcher's settlement pass;
+        # nothing is owed unless a test says otherwise.
+        self.dispatcher.owed_cognition_wake_settlements = AsyncMock(return_value=[])
+        self.dispatcher.settle_owed_cognition_sources = AsyncMock()
         self.task_manager = MagicMock()
         self.task_manager.get_task_snapshot = AsyncMock(
             side_effect=lambda task_id: _task(task_id, state=TaskState.TASK_STATE_SUBMITTED)
