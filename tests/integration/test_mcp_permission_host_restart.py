@@ -26,7 +26,7 @@ from cryptography.fernet import Fernet
 import kestrel_sovereign
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from tests.integration.mcp_permission_peers import (
-    https_peer, gateway_peer, owned_gateway_network, owned_provider_network,
+    MCPTestPeer, https_peer, gateway_peer, owned_gateway_network, owned_provider_network,
 )
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
@@ -362,7 +362,7 @@ async def test_owned_host_setup_failure_preserves_original_diagnostic(tmp_path):
     repository = Path(__file__).resolve().parents[2]
     environment = dict(PATH=os.environ['PATH'], HOME=str(home), PYTHONPATH=str(repository),
         KESTREL_SKIP_DOTENV='1', PYTHON_DOTENV_DISABLED='1', PYTHONDONTWRITEBYTECODE='1')
-    peer = SimpleNamespace(local_ports=set())
+    peer = MCPTestPeer('remote', 'unused-before-descriptor-load')
     with pytest.raises(AssertionError, match='Owned host failed') as raised:
         async with native_host(home, home / 'missing-test-descriptor.json', environment, peer, 'failure'):
             pytest.fail('A missing native host descriptor must never reach readiness')
