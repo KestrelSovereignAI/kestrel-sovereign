@@ -3,6 +3,8 @@
 import asyncio
 import json
 import secrets
+from contextlib import asynccontextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import openai
@@ -25,6 +27,38 @@ from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 from kestrel_sovereign.storage.sqla import make_session_factory
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.integration.test_storage_backend_parity import _incepted_assertion_identity
+
+
+def observe_native_transaction_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AsyncDatabase,
+    *,
+    selected: Callable[[], bool],
+    sources: list[BaseException],
+    make_carrier: Callable[[], BaseException] | None = None,
+) -> None:
+    """Observe the actual owned transaction exit after its SQL has returned.
+
+    Forward the original context, result and exception. Record the source once;
+    a requested typed carrier must wrap that same native original explicitly.
+    This supplements each test's selected SQL observer without inventing an
+    acknowledgement or swallowing an unrelated control error.
+    """
+    original = database.transaction
+
+    @asynccontextmanager
+    async def observe(*args, **kwargs):
+        try:
+            async with original(*args, **kwargs) as transaction:
+                yield transaction
+        except BaseException as error:
+            if selected() and not sources:
+                sources.append(error)
+                if make_carrier is not None:
+                    raise make_carrier() from error
+            raise
+
+    monkeypatch.setattr(database, "transaction", observe)
 
 
 @dataclass
