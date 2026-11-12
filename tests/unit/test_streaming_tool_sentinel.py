@@ -332,3 +332,51 @@ class _M:
         self.name = name
         self.index = index
         self.id = id
+
+
+def test_input_checkpoint_retains_observed_order_and_anchors_missing_callback_events():
+    from kestrel_sovereign.agent.parts import build_part_sentinel
+    from kestrel_sovereign.agent.streaming import (
+        _build_tool_sentinel, _input_checkpoint_metadata, _parse_stream_sentinels,
+        _inline_tool_events, _stamp_tool_event_positions,
+    )
+    wire = ('unfinished' + build_part_sentinel({'type': 'notice', 'data': 'before'})
+        + _build_tool_sentinel('done', 'first')
+        + build_part_sentinel({'type': 'notice', 'data': 'between'})
+        + _build_tool_sentinel('start', 'second'))
+    events = _inline_tool_events([{'name': 'first'}, {'name': 'second'}])
+    rebased = ''.join(_input_checkpoint_metadata(wire, events))
+    text, tools, components = _parse_stream_sentinels(rebased)
+    assert text == ''
+    _stamp_tool_event_positions(events, tools)
+    assert [event['seq'] for event in events] == [1, 2, 4, 5]
+    assert [part['seq'] for part in components] == [0, 3]
+    assert all(part['pos'] == 0 for part in tools + components)
+    assert [part['data'] for part in components] == ['before', 'between']
+
+
+def test_input_checkpoint_matches_repeated_tool_names_without_reordering_observed_frames():
+    from kestrel_sovereign.agent.parts import build_part_sentinel
+    from kestrel_sovereign.agent.streaming import (
+        _build_tool_sentinel, _input_checkpoint_metadata, _parse_stream_sentinels,
+        _inline_tool_events, _stamp_tool_event_positions,
+    )
+    wire = (_build_tool_sentinel('start', 'same') + _build_tool_sentinel('done', 'same')
+        + build_part_sentinel({'type': 'notice', 'data': 'between'})
+        + _build_tool_sentinel('done', 'same'))
+    events = _inline_tool_events([{'name': 'same'}, {'name': 'same'}])
+    text, tools, components = _parse_stream_sentinels(''.join(_input_checkpoint_metadata(wire, events)))
+    assert text == ''
+    _stamp_tool_event_positions(events, tools)
+    assert [event['seq'] for event in events] == [0, 1, 3, 4]
+    assert components[0]['seq'] == 2
+
+
+def test_input_checkpoint_rejects_oversized_component_metadata():
+    import json
+    import pytest
+    from kestrel_sovereign.agent.parts import MAX_PART_PAYLOAD_BYTES, PART_SENTINEL_PREFIX
+    from kestrel_sovereign.agent.streaming import _input_checkpoint_metadata
+    wire = PART_SENTINEL_PREFIX + json.dumps({'type': 'notice', 'data': 'x' * MAX_PART_PAYLOAD_BYTES}) + '\x1e'
+    with pytest.raises(ValueError, match='invalid component metadata'):
+        _input_checkpoint_metadata(wire, [])

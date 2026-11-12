@@ -176,6 +176,7 @@ async def test_native_live_console_retracts_only_original_turn_prose(
         apps_boundary, monkeypatch, mcp_browser_support, native_console_origin, native_console_scripts, dispatch, followup):
     from fastapi import Request
     from kestrel_sovereign.endpoints import agent as agent_endpoints
+    from kestrel_sovereign.endpoints import conversations as conversation_endpoints
 
     b = apps_boundary
     registered = {item.tool.native_tool.name: item for item in b.tools}
@@ -183,10 +184,11 @@ async def test_native_live_console_retracts_only_original_turn_prose(
     prepare_streaming_agent(b.agent, tools=b.agent._build_all_tools())
     gate = asyncio.Event()
     provider_calls, _ = install_input_checkpoint_provider(b.agent, registered, monkeypatch,
-        dispatch=dispatch, followup=followup, before_tools=gate.wait, tool_markers=True)
+        dispatch=dispatch, followup=followup, before_tools=gate.wait, tool_markers=True, interleaved_parts=True)
     b.app.state.agent = b.agent
     b.app.state.limiter = agent_endpoints.limiter
     b.app.include_router(agent_endpoints.router)
+    b.app.include_router(conversation_endpoints.router)
 
     @b.app.post('/api/owned-console-bootstrap')
     async def bootstrap():
@@ -212,6 +214,8 @@ window.startOwnedStream=()=>{document.getElementById('message-input').value='Run
  window.ownedStreamDone=native.chat.sendMessage();};
 window.releaseOwnedStream=async()=>{await native.api.requestForAgent('/api/owned-release-stream',
  {method:'POST',body:'{}'},null,true); await window.ownedStreamDone;};
+window.reloadOwnedConversation=async()=>{await import('/js/identity.js');
+ await window.loadConversation('original-chat',{force:true,expectedAgent:null});};
 window.ownedConsoleReady=true;
 """
     builder = """import {build} from 'esbuild';
@@ -250,11 +254,18 @@ try {await page.goto(process.argv[1]);
  await page.evaluate(()=>window.releaseOwnedStream());
  await page.getByRole('button',{name:'Review MCP input',exact:true}).click();
  const text=await page.locator('body').innerText();
- process.stdout.write(JSON.stringify({unfinishedRemoved:!text.includes('UNFINISHED'),
+ const receipt={unfinishedRemoved:!text.includes('UNFINISHED'),
   waiting:text.includes('waiting for operator input'),
   prior:text.includes('PRIOR-CONVERSATION-MUST-REMAIN'), other:text.includes('OTHER-PANE-MUST-REMAIN'),
   forms:await page.locator('.mcp-input-card').count(),
-  toolCards:await page.locator('.tool-activity-call').count(), errors}));
+  toolCards:await page.locator('.tool-activity-call').count(), errors};
+ await page.evaluate(()=>window.reloadOwnedConversation());
+ const reloaded=await page.locator('body').innerText();
+ receipt.reloaded={unfinishedRemoved:!reloaded.includes('UNFINISHED'),
+  waiting:reloaded.includes('waiting for operator input'),
+  forms:await page.locator('.mcp-input-card').count(),
+  toolCards:await page.locator('.tool-activity-call').count()};
+ process.stdout.write(JSON.stringify(receipt));
 } catch(error) {throw new Error(JSON.stringify({message:error.message,errors,transport,body:await page.locator('body').innerText()}));}
  finally {await browser.close();}})().catch(error=>{console.error(error);process.exitCode=1});
 """
@@ -269,6 +280,7 @@ try {await page.goto(process.argv[1]);
         assert receipt['waiting'] and receipt['prior'] and receipt['other'], receipt
         assert receipt['forms'] == 1, 'Live Console duplicated its original pending form card'
         assert receipt['toolCards'] > 0 and receipt['errors'] == []
+        assert receipt['reloaded'] == {'unfinishedRemoved': True, 'waiting': True, 'forms': 1, 'toolCards': 2}, receipt
         assert b.markers == ['completed-before-input'] and len(wire(b)) == 1
         assert len(provider_calls) == (2 if followup else 1)
     finally:
