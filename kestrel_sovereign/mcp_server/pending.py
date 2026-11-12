@@ -125,7 +125,9 @@ class PendingMCPAuthorizations:
                 await self.backend.execute("""INSERT INTO mcp_server_oauth_pending
                     (agent_id, handle_hash, ciphertext, expires_at) VALUES (?, ?, ?, ?)""",
                     (self.agent_id, handle_hash, ciphertext, expires))
-        if expired:
+        # Publication follows the original COMMIT, which may itself wait.
+        # No successful handle may outlive its deadline while SQL settles.
+        if expired or expires <= self._now():
             raise ValueError("The pending MCP authorization request expired during admission")
         if quota_full:
             raise PendingMCPQuotaExceeded("The agent's pending MCP authorization quota is full")
@@ -173,4 +175,4 @@ class PendingMCPAuthorizations:
                 RETURNING ciphertext, expires_at""", (self.agent_id, handle_hash, self._now()))
                 if claimed is None or pending.expires_at <= self._now():
                     pending = None
-        return pending
+        return pending if pending is not None and pending.expires_at > self._now() else None

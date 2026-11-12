@@ -3,6 +3,7 @@
 import asyncio
 import json
 from contextlib import AsyncExitStack
+from uuid import uuid4
 
 import pytest
 from kestrel_sdk.security.exceptions import DecryptionError
@@ -221,9 +222,12 @@ async def test_native_registered_empty_path_survives_durable_parameter_round_tri
 
 
 @pytest.mark.parametrize("pending_store", ["postgres"], indirect=True)
-@pytest.mark.parametrize("operation", ["read", "claim", "create"])
+@pytest.mark.parametrize("operation,boundary", [
+    ("read", "capacity"), ("claim", "capacity"), ("create", "capacity"),
+    ("create", "pending"), ("create", "commit"), ("claim", "commit"),
+])
 async def test_native_database_lock_wait_cannot_extend_pending_authorization_expiry(
-    pending_store, native_pg, operation,
+    pending_store, native_pg, operation, boundary,
 ):
     store, clock, _peer = pending_store
     _backend, control, schema = native_pg
@@ -231,24 +235,48 @@ async def test_native_database_lock_wait_cannot_extend_pending_authorization_exp
     if handle is not None:
         clock[0] = 1599.0
     task = None
+    lock_key = int(uuid4().hex[:7], 16)
+    if boundary == "commit":
+        # An actual deferred native trigger holds COMMIT, after every SQL
+        # statement and in-transaction clock check has already completed.
+        await control.execute(f'''CREATE FUNCTION "{schema}".owned_pending_commit_wait()
+            RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                PERFORM pg_advisory_xact_lock(3679, {lock_key}); RETURN NEW; END $$''')
+        await control.execute(f'''CREATE CONSTRAINT TRIGGER owned_pending_commit_wait
+            AFTER INSERT OR UPDATE ON "{schema}".mcp_server_oauth_pending
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+            EXECUTE FUNCTION "{schema}".owned_pending_commit_wait()''')
     try:
-        async with control.transaction():
-            await control.execute(f'LOCK TABLE "{schema}".mcp_server_oauth_pending, '
-                f'"{schema}".mcp_server_oauth_capacity IN ACCESS EXCLUSIVE MODE')
-            task = asyncio.create_task(store.create("owned-provider", parameters())
-                if operation == "create" else getattr(store, operation)(handle))
-            async with asyncio.timeout(5):
-                while not await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
-                    "WHERE wait_event_type='Lock' AND query LIKE '%mcp_server_oauth_%' "
-                    "AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))"):
-                    await asyncio.sleep(0.01)
-            clock[0] = 1601.0
+        try:
+            async with control.transaction():
+                if boundary == "commit":
+                    await control.fetchval("SELECT pg_advisory_lock(3679, $1)", lock_key)
+                else:
+                    tables = f'"{schema}".mcp_server_oauth_pending'
+                    if boundary == "capacity":
+                        tables += f', "{schema}".mcp_server_oauth_capacity'
+                    await control.execute(f'LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE')
+                task = asyncio.create_task(store.create("owned-provider", parameters())
+                    if operation == "create" else getattr(store, operation)(handle))
+                async with asyncio.timeout(5):
+                    while True:
+                        await control.execute("SELECT pg_stat_clear_snapshot()")
+                        if await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                            "WHERE wait_event_type='Lock' AND (query LIKE '%mcp_server_oauth_%' "
+                            "OR query LIKE 'COMMIT%') AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))"):
+                            break
+                        await asyncio.sleep(0.01)
+                clock[0] = 1601.0
+        finally:
+            if boundary == "commit":
+                await control.fetchval("SELECT pg_advisory_unlock(3679, $1)", lock_key)
         result, = await asyncio.gather(task, return_exceptions=True)
         if operation == "create":
             assert isinstance(result, ValueError) and "expired" in str(result), (
-                "An original SQL capacity wait returned an already-expired OAuth handle"
+                "An original SQL wait returned an already-expired OAuth handle"
             )
-            assert await store.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_pending") == (0,)
+            rows = await store.backend.fetch_all("SELECT expires_at FROM mcp_server_oauth_pending")
+            assert all(row[0] <= clock[0] for row in rows)
         else:
             assert result is None, "An original SQL lock wait admitted an expired OAuth request"
     finally:
