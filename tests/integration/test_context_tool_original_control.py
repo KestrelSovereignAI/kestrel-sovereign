@@ -233,6 +233,23 @@ async def test_actual_context_producers_and_tool_consumers_preserve_control(
             return result
 
         monkeypatch.setattr(db, name, intercept)
+
+    native_transaction = db.transaction
+
+    @asynccontextmanager
+    async def observe_transaction(*args, **kwargs):
+        # INSERT ... RETURNING completes before its owning transaction releases
+        # the native connection. Observe that canonical boundary too: an ACK
+        # lost on release is raised after fetchone has already returned its ID.
+        try:
+            async with native_transaction(*args, **kwargs) as transaction:
+                yield transaction
+        except BaseException as error:
+            if armed and fired and not sources:
+                sources.append(error)
+            raise
+
+    monkeypatch.setattr(db, "transaction", observe_transaction)
     n.backend._execution_custody = ExecutionCustody(GenerationFence())
     if kind == "native-control":
         n.backend._pool = PostgresPoolAdapter(pool, lose_ack)
