@@ -517,7 +517,7 @@ be established. Never drop state and submit a fresh side effect automatically.
 Results without `resultType` remain `complete` as the SDK specifies.
 
 Core's optional `mcp-input` host owns encrypted checkpoint custody and fresh
-authenticated readers at `/api/mcp/inputs`. The MCP 0.16 tool-call path can
+authenticated readers at `/api/mcp/inputs`. The MCP 0.17 tool-call path can
 persist a form checkpoint and return an audited `mcp_input` part containing only
 its reference and original chat selector. Neither is an authorization grant.
 The original effect turn records the pending input through its existing nested
@@ -538,6 +538,8 @@ App continuations additionally retain the original physical View and its fresh
 private reader through the actual outer HTTP send. A closed or lost View cannot
 be adopted after restart. Native private results are delivered only to that
 View; an initial App publication follows Core's normal audited part path.
+Each App call uses Core's original owned child and one shared cancellation
+policy; its privacy span is acquired before the input or App persistence gate.
 The current delivery covers forms from governed tool calls. Resource/prompt
 operator waits and durable Tasks are not established by these tool-call tests.
 
