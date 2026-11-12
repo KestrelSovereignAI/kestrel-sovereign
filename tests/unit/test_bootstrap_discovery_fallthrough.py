@@ -93,7 +93,7 @@ async def test_handle_bootstrap_pending_persists_user_message_and_greeting():
     )
 
     # Greeting is returned to the caller as the assistant's response.
-    assert result == "Hi, what should I call you?"
+    assert result.content == "Hi, what should I call you?"
 
     # Two persistence calls: user first, then assistant.
     calls = privacy_agent.add_conversation.await_args_list

@@ -372,11 +372,14 @@ class TestPostResponsePipeline:
         # Raw storage with conversation store
         conv_store = AsyncMock()
         conv_store.resolve_session_id = AsyncMock(return_value="sess-1")
-        conv_store.get_full_history_with_ids = AsyncMock(
+        conv_store.get_messages_by_ids = AsyncMock(
             return_value=[
                 {"id": 100, "role": "user", "content": wrap_user_input("I am happy"), "metadata": {"session_id": "sess-1"}},
                 {"id": 101, "role": "assistant", "content": "Glad to hear!", "metadata": {"session_id": "sess-1"}},
             ]
+        )
+        conv_store.get_full_history_with_ids = AsyncMock(
+            return_value=conv_store.get_messages_by_ids.return_value
         )
         agent._raw_storage = MagicMock()
         agent._raw_storage.conversation = conv_store
@@ -402,12 +405,12 @@ class TestPostResponsePipeline:
 
         # Call the real method, bound to our mock
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "I am happy", "Glad to hear!", session_id="sess-1"
+            mock_agent, user_message_id=100, assistant_message_id=101
         )
 
         mock_agent.context_manager.memory_manager.tag_exchange.assert_awaited_once()
-        mock_agent._raw_storage.conversation.get_full_history_with_ids.assert_any_await(
-            limit=20
+        mock_agent._raw_storage.conversation.get_messages_by_ids.assert_awaited_once_with(
+            [100, 101]
         )
         call_kwargs = mock_agent.context_manager.memory_manager.tag_exchange.call_args[1]
         assert call_kwargs["user_message_id"] == 100
@@ -424,7 +427,7 @@ class TestPostResponsePipeline:
 
         # Should not raise
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "hello", "hi", session_id=None
+            mock_agent, user_message_id=100, assistant_message_id=101
         )
 
     @pytest.mark.asyncio
@@ -435,7 +438,7 @@ class TestPostResponsePipeline:
         agent = MagicMock()
         agent.memory_system = None
         # Should not raise
-        await KestrelAgent._post_response_pipeline(agent, "hi", "hello")
+        await KestrelAgent._post_response_pipeline(agent, user_message_id=100, assistant_message_id=101)
 
     @pytest.mark.asyncio
     async def test_pipeline_skips_when_no_conv_store(self):
@@ -447,7 +450,7 @@ class TestPostResponsePipeline:
         agent._raw_storage = MagicMock()
         agent._raw_storage.conversation = None
         # Should not raise
-        await KestrelAgent._post_response_pipeline(agent, "hi", "hello")
+        await KestrelAgent._post_response_pipeline(agent, user_message_id=100, assistant_message_id=101)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -468,7 +471,7 @@ class TestPostResponsePipeline:
         mock_agent.context_manager.memory_manager.tag_exchange = AsyncMock()
 
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "private raw input", "private response", session_id="s1"
+            mock_agent, user_message_id=100, assistant_message_id=101
         )
 
         mock_agent._raw_storage.conversation.get_full_history_with_ids.assert_not_awaited()
@@ -490,7 +493,7 @@ class TestPostResponsePipeline:
         )
 
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "I am happy", "Glad to hear!", session_id="sess-1"
+            mock_agent, user_message_id=100, assistant_message_id=101
         )
 
         # Give the background task a chance to run
@@ -522,7 +525,7 @@ class TestPostResponsePipeline:
         )
 
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "I am happy", "Glad to hear!", session_id="sess-1"
+            mock_agent, user_message_id=100, assistant_message_id=101
         )
 
         kwargs = mock_agent.context_manager.memory_manager.tag_exchange.await_args.kwargs
@@ -544,7 +547,7 @@ class TestPostResponsePipeline:
         )
 
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "hello", "hi", session_id=None
+            mock_agent, user_message_id=100, assistant_message_id=101
         )
 
         await asyncio.sleep(0.1)
@@ -569,7 +572,7 @@ class TestPostResponsePipeline:
 
         # Should not raise
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "hello", "hi", session_id=None
+            mock_agent, user_message_id=100, assistant_message_id=101
         )
 
         await asyncio.sleep(0.1)
