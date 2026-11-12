@@ -42,6 +42,7 @@ from kestrel_sovereign.spawn.mandate import SpawnMandate
 from kestrel_sovereign.signals import DurableSignalStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
+from kestrel_sovereign.storage.async_storage import AsyncStorage as NativeStorage
 
 
 # Phase method names in boot order — the injected-failure matrix patches one
@@ -378,7 +379,9 @@ def _boot_mocks(real_task_manager: bool = False, *, primary_backend=None):
     ``_make_agent`` because construction precedes this context manager.
 
     With ``real_task_manager`` the agent builds its real ``TaskManager`` over
-    real SQLite stores, and ``task_manager`` is ``None``.
+    the supplied primary backend, and ``task_manager`` is ``None``. That path
+    also constructs real ``AsyncStorage``: its native close owner and backend
+    reservation must reach shutdown unchanged.
     """
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.kestrel_agent.discover_features", return_value=[]
@@ -397,21 +400,19 @@ def _boot_mocks(real_task_manager: bool = False, *, primary_backend=None):
             "SOVEREIGN_IPFS_URL": "",
         },
     ):
-        storage = AsyncMock()
-        storage.initialize = AsyncMock()
-        storage.get_node = AsyncMock(return_value=None)
-        storage.add_node = AsyncMock()
-        storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
-        storage.db = MagicMock()
-        storage.close = AsyncMock()
         if real_task_manager and primary_backend is None:
             raise ValueError("Real native task-manager boot requires its actual primary backend")
-        storage._backend = (
-            _durable_backend_double() if primary_backend is None else primary_backend
-        )
-        if primary_backend is not None:
-            storage.close.side_effect = primary_backend.close
-        MockStorage.return_value = storage
+        storage = None
+        if primary_backend is None:
+            storage = AsyncMock()
+            storage.initialize = AsyncMock()
+            storage.get_node = AsyncMock(return_value=None)
+            storage.add_node = AsyncMock()
+            storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
+            storage.db = MagicMock()
+            storage.close = AsyncMock()
+            storage._backend = _durable_backend_double()
+            MockStorage.return_value = storage
 
         memory = AsyncMock()
         memory.initialize = AsyncMock()
@@ -432,12 +433,19 @@ def _boot_mocks(real_task_manager: bool = False, *, primary_backend=None):
             task_manager.close = AsyncMock()
             MockTaskManager.from_backend.return_value = task_manager
 
-        yield SimpleNamespace(
+        mocks = SimpleNamespace(
             storage=storage,
             memory=memory,
             task_manager=task_manager,
             discover_features=discover_features,
         )
+        if primary_backend is not None:
+            def native_storage(*args, **kwargs):
+                mocks.storage = NativeStorage(*args, **(kwargs | {"backend": primary_backend}))
+                return mocks.storage
+
+            MockStorage.side_effect = native_storage
+        yield mocks
 
 
 async def _cleanup(agent: KestrelAgent) -> None:
@@ -716,7 +724,8 @@ def _boot_holding_every_resource(
         "kestrel_sovereign.kestrel_agent.discover_features",
         side_effect=lambda agent, **_kw: [cls(agent) for cls in features],
     ):
-        yield SimpleNamespace(**vars(mocks), sync_service=sync_service)
+        mocks.sync_service = sync_service
+        yield mocks
 
 
 def _trust(monkeypatch, owners) -> None:
@@ -1053,6 +1062,42 @@ async def native_boot_backend(tmp_path):
         yield backend
     finally:
         await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contract", ["owner", "reservation"])
+@pytest.mark.parametrize("include_resources", [False, True])
+async def test_native_primary_boot_fixture_preserves_close_contract(
+    tmp_path, native_boot_backend, contract, include_resources
+):
+    from kestrel_sovereign.kestrel_agent import _minimum_storage_close_timeout
+
+    agent = _make_agent(tmp_path)
+    boot = _boot_holding_every_resource if include_resources else _boot_mocks
+    try:
+        with boot(real_task_manager=True, primary_backend=native_boot_backend) as mocks:
+            await agent._boot_phase_storage_privacy(
+                BootContext(custody=agent._resource_custody())
+            )
+            assert mocks.storage is agent._raw_storage, (
+                "Native boot witness lost the actual constructed storage"
+            )
+            if contract == "owner":
+                assert isinstance(agent._raw_storage.db, AsyncDatabase), (
+                    "Native boot fixture hid the actual primary database owner"
+                )
+                assert agent._raw_storage.db.backend is native_boot_backend, (
+                    "Native boot fixture replaced the original primary backend"
+                )
+                assert agent.storage.native_retirement_owner is agent.storage, (
+                    "Native boot fixture lost the original native close owner"
+                )
+            else:
+                assert _minimum_storage_close_timeout(agent.storage) == (
+                    native_boot_backend.minimum_close_timeout_s
+                ), "Native boot fixture discarded the primary close reservation"
+    finally:
+        await _cleanup(agent)
 
 
 @pytest.mark.asyncio
