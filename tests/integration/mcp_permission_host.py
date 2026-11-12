@@ -1,6 +1,6 @@
 """Launch the real Core app over one private, process-owned HTTP listener."""
 
-from contextlib import AsyncExitStack
+from contextlib import ExitStack
 import argparse
 import asyncio
 import faulthandler
@@ -160,18 +160,27 @@ async def serve(descriptor, ready):
 
     spec = json.loads(descriptor.read_text())
     home = descriptor.parent
-    with socket.socket() as listener, socket.socket() as agent_port:
+    with socket.socket() as listener, ExitStack() as agent_ports:
         listener.bind(("127.0.0.1", 0))
-        agent_port.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         native_config = home / "multi_agent.toml"
-        native_config.write_text(
-            '[host]\nbind="127.0.0.1"\nport=' + str(port) + '\n'
-            '[agents.' + spec['agent_name'] + ']\n'
-            'data_dir=' + json.dumps(spec['agent_data']) + '\n'
-            'port=' + str(agent_port.getsockname()[1]) + '\n'
-            'features=["MCPAgent","BootstrapFeature"]\nautostart=true\n'
-        )
+        entries = [dict(agent_name=spec['agent_name'], agent_data=spec['agent_data'],
+            features=spec.get('features', ["MCPAgent", "BootstrapFeature"]))]
+        entries.extend(spec.get('peer_agents', []))
+        configuration = ['[host]\nbind="127.0.0.1"\nport=' + str(port) + '\n']
+        for entry in entries:
+            agent_port = agent_ports.enter_context(socket.socket())
+            agent_port.bind(("127.0.0.1", 0))
+            configuration.append(
+                '[agents.' + json.dumps(entry['agent_name']) + ']\n'
+                'data_dir=' + json.dumps(entry['agent_data']) + '\n'
+                'port=' + str(agent_port.getsockname()[1]) + '\n'
+                'features=' + json.dumps(entry['features']) + '\nautostart=true\n')
+        native_config.write_text(''.join(configuration))
+        if spec.get('native_a2a'):
+            os.environ['KESTREL_BASE_URL'] = f'http://127.0.0.1:{port}'
+            os.environ['KESTREL_A2A_DISCOVERY_AGENT'] = spec['agent_name']
+            os.environ['KESTREL_A2A_PUSH_ENABLED'] = 'false'
         assert os.environ['KESTREL_MULTI_AGENT_CONFIG'] == str(native_config)
         from kestrel_sovereign import server
         from kestrel_sovereign.agent.boot import BootPhaseState
@@ -182,6 +191,8 @@ async def serve(descriptor, ready):
                 admission_directory=str(ready.with_suffix('.gateway-admissions')))
         peer = MCPTestPeer(spec.get('transport', 'remote'), spec['selector'], provider_url=spec['provider_url'],
             tls_certificate=Path(spec['certificate']))
+        if spec.get('native_a2a'):
+            peer.local_ports.add(port)
         with pytest.MonkeyPatch.context() as network:
             observations = home / 'observations'
             observations.mkdir(exist_ok=True)
@@ -230,7 +241,8 @@ async def serve(descriptor, ready):
                     shutdown_prefix_s=prefix, shutdown_tail_s=reserved,
                     agent_shutdown_timeout_s=agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S,
                     journal_initialized=journal is not None and journal.initialized,
-                    agent_database=str(agent.storage_path), gateway=gateway_snapshot(agent))))
+                    agent_database=str(agent.storage_path), gateway=gateway_snapshot(agent),
+                    peer_directory_url=agent.features['PeersFeature']._host_url)))
                 temporary.replace(ready)
                 await serving
             finally:

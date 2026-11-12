@@ -1,5 +1,7 @@
 """Scoped discovery and native-session admission, without the retired transport."""
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -222,3 +224,50 @@ async def test_local_roster_cannot_invent_durable_identity_from_display_fields(l
     local.state.entries = [row]
     with pytest.raises(PeerProtocolError):
         await local.directory.list_peers(local.requester)
+
+
+async def test_local_roster_credential_never_reaches_an_ambient_proxy(monkeypatch):
+    """Two real listeners distinguish host delivery from proxy credential leakage."""
+    host_requests, proxy_requests, handlers = [], [], []
+    payload = json.dumps({"agents": [{"id": "did:test:peer",
+        "name": "companion", "routing_name": "companion"}]}).encode()
+
+    async def respond(reader, writer, requests):
+        handlers.append(asyncio.current_task())
+        try:
+            requests.append(await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5))
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Connection: close\r\nContent-Length: " + str(len(payload)).encode()
+                + b"\r\n\r\n" + payload)
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    host = await asyncio.start_server(
+        lambda reader, writer: respond(reader, writer, host_requests), "127.0.0.1", 0)
+    proxy = None
+    try:
+        proxy = await asyncio.start_server(
+            lambda reader, writer: respond(reader, writer, proxy_requests), "127.0.0.1", 0)
+        host_url = f"http://127.0.0.1:{host.sockets[0].getsockname()[1]}"
+        proxy_url = f"http://127.0.0.1:{proxy.sockets[0].getsockname()[1]}"
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.setenv(name, proxy_url)
+            monkeypatch.setenv(name.lower(), proxy_url)
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        directory = LocalHostPeerDirectory(host_url, transport_key="owned-roster-credential")
+        peers = await directory.list_peers(PeerRequester("did:test:caller", object()))
+    finally:
+        host.close()
+        await host.wait_closed()
+        if proxy is not None:
+            proxy.close()
+            await proxy.wait_closed()
+        if handlers:
+            await asyncio.gather(*handlers)
+    assert proxy_requests == [], "an ambient proxy received a host roster request and credential"
+    assert len(host_requests) == 1
+    assert b"owned-roster-credential" in host_requests[0]
+    assert [peer.agent_id for peer in peers] == ["did:test:peer"]

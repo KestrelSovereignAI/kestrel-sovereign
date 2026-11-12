@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import re
 import os
 from pathlib import Path
 import socket
@@ -82,13 +83,33 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
         finished = body["messages"][-1]["role"] == "tool"
         message = {"role": "assistant", "content": "Owned provider response complete"}
         reason = "stop"
-        if candidates and not finished:
-            if len(candidates) != 1:
-                return JSONResponse({"error": "Owned provider requires one marker tool"}, status_code=400)
+        selected = candidates[0] if len(candidates) == 1 and not finished else None
+        arguments = {"marker": "owned-provider-effect"}
+        if candidates and len(candidates) != 1:
+            return JSONResponse({"error": "Owned provider requires one marker tool"}, status_code=400)
+        # A finite model script consumes the actual cognition prompt and tool
+        # schemas. Task completion still runs through the real governed tool.
+        prompt = "\n".join(m['content'] for m in body['messages']
+            if isinstance(m.get('content'), str))
+        incoming = re.search(r"\[A2A_TASK_SUBMITTED\] Peer `[^`]+` submitted native A2A task `([^`]+)`", prompt)
+        if incoming:
+            replies = [tool for tool in tools if tool['name'].endswith('respond_to_a2a_task')]
+            if len(candidates) != 1 or len(replies) != 1:
+                return JSONResponse({"error": "Owned A2A model requires the original marker and task response tools"}, status_code=400)
+            called = {call['function']['name'] for m in body['messages']
+                for call in m.get('tool_calls', [])}
+            if candidates[0]['name'] not in called:
+                selected = candidates[0]
+            elif replies[0]['name'] not in called:
+                selected = replies[0]
+                arguments = {"task_id": incoming.group(1),
+                    "content": "Owned permission evaluation complete", "state": "completed"}
+            else:
+                selected = None
+        if selected is not None:
             message = {"role": "assistant", "content": None, "tool_calls": [{
                 "id": f"owned-provider-call-{calls}", "type": "function", "function": {
-                    "name": candidates[0]["name"],
-                    "arguments": json.dumps({"marker": "owned-provider-effect"}),
+                    "name": selected["name"], "arguments": json.dumps(arguments),
                 },
             }]}
             reason = "tool_calls"
