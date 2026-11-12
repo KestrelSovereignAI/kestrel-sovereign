@@ -119,7 +119,8 @@ to every hosted agent.
 The checked-in `prod` profile nonetheless caps `max_instances` at 1, because the
 contract permitting horizontal scale is not the same thing as a substrate able
 to serve it. Each instance opens up to 10 pooled plus 4 advisory runtime
-PostgreSQL connections plus Hold's one-connection operational pool and
+PostgreSQL connections, plus the one connection that renews the durable signal
+owner (#4001), plus Hold's one-connection operational pool and
 separately bounded one-connection advisory pool on the primary database, plus
 the Distributed Stop store's one connection and its owner heartbeat's own
 connection.

@@ -4653,6 +4653,10 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
         requested_now = _as_utc(now) if now is not None else None
+        if self.is_postgres:
+            # No owner is registered without a connection of its own to be
+            # renewed on (#4001): see retain_unretired_runtime_owner.
+            await self._backend.reserve_runtime_owner_renewal()
         async with self._backend.transaction():
             await self._lock_runtime_owner_scope(agent_id=agent_id)
             # Entering this transaction may wait behind a real writer.  A
@@ -4699,11 +4703,12 @@ class DurableSignalStore(UnifiedStoreBase):
         cannot undo a retirement. Returns whether the owner was refreshed.
         ``now`` is a SQLite clock seam; PostgreSQL renews on its own clock.
 
-        Both backends renew through a fixed backend operation that the shared
-        work connection's fences cannot hold back: PostgreSQL on a pool
-        checkout that admits no work, SQLite on a connection of its own.
-        Serialization with recovery is the database's writer lock on SQLite
-        and the owner-scope advisory key on PostgreSQL.
+        Both backends renew through a fixed backend operation that ordinary
+        work cannot hold back: PostgreSQL on a one-connection pool nothing
+        else checks out from, reserved when the owner registers, and SQLite
+        on a connection of its own. Serialization with recovery is the
+        database's writer lock on SQLite and the owner-scope advisory key on
+        PostgreSQL.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)

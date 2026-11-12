@@ -504,8 +504,13 @@ Renewal is one fixed write, `retain_unretired_runtime_owner`, and it is the
 only path that renews an owner. It refreshes this owner's own existing,
 unstopped row. It never inserts a row, revives a stopped one, grants a lease or
 admits work, and on PostgreSQL it no longer depends on the owner leasing core
-cognition. On PostgreSQL it runs on the fixed cleanup connection, which needs
-no work admission (`admit_work=False`). On a SQLite file it runs on a one-shot
+cognition. On PostgreSQL it runs on a one-connection pool of its own, opened
+when the owner registers and checked out by nothing else, so ordinary work
+holding every connection of the operational or advisory pool cannot hold it
+back; it shares only the owner-scope advisory key, the transaction lock that
+serializes it with recovery. It never falls back to another pool, and closing
+the backend waits for a renewal in flight before closing that pool. This costs
+one PostgreSQL connection per backend that hosts an owner. On a SQLite file it runs on a one-shot
 connection of its own, never the shared work connection. After a cancelled
 write's rollback cannot be confirmed, that connection's cleanup fence refuses
 every later write on it until it is replaced; renewal is not one of them, and
