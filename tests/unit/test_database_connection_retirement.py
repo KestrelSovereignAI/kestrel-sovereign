@@ -17,7 +17,7 @@ from kestrel_sovereign.storage.db.polling import is_transient_database_poll_erro
 @pytest.mark.parametrize("body_failure", [False, True])
 @pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_terminated_transaction_retires_original_checkout_without_commit(
-    native_a2a_backend_factory, body_failure,
+    native_a2a_backend_factory, body_failure, monkeypatch,
 ):
     backend = native_a2a_backend_factory()
     assert backend.backend_type == "postgres"
@@ -27,6 +27,15 @@ async def test_terminated_transaction_retires_original_checkout_without_commit(
     closed = asyncio.Event()
     try:
         await backend.execute("CREATE TABLE original_session_probe (value INTEGER)")
+        original_exit = asyncpg.transaction.Transaction.__aexit__
+        exits = []
+
+        async def observe_original_exit(transaction, exc_type, exc, tb):
+            if transaction._connection is native:
+                exits.append((exc_type, exc))
+            return await original_exit(transaction, exc_type, exc, tb)
+
+        monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", observe_original_exit)
         with pytest.raises((DatabaseError, ExecutionCommitOutcomeError, BaseExceptionGroup)) as lost:
             async with backend.transaction():
                 native = backend._current_txn_conn()._con
@@ -38,22 +47,19 @@ async def test_terminated_transaction_retires_original_checkout_without_commit(
                 if body_failure:
                     await backend.fetch_val("SELECT 1")
         assert native.is_closed()
-        if body_failure:
-            assert not is_execution_control_error(lost.value), (
-                "a terminated original session retained unresolved rollback ownership"
-            )
-            assert is_transient_database_poll_error(lost.value)
-            unproven = QueryError("another driver's unproven interface failure")
-            unproven.__cause__ = asyncpg.InterfaceError("unproven original session")
-            assert not is_transient_database_poll_error(
-                ExceptionGroup("independent session failures", [lost.value, unproven])
-            ), "one closed session vouched for another session's interface error"
-        else:
-            assert is_execution_control_error(lost.value), (
-                "an accepted COMMIT owner's failed acknowledgement lost its control"
-            )
-            assert execution_commit_outcome(lost.value) == "unknown"
-            assert not is_transient_database_poll_error(lost.value)
+        assert len(exits) == 1 and exits[0][0] is not None and exits[0][1] is not None, (
+            "A physically terminated session must reach only the original rollback exit"
+        )
+        assert not is_execution_control_error(lost.value), (
+            "No COMMIT owner was accepted before the original session was lost"
+        )
+        assert execution_commit_outcome(lost.value) is None
+        assert is_transient_database_poll_error(lost.value)
+        unproven = QueryError("another driver's unproven interface failure")
+        unproven.__cause__ = asyncpg.InterfaceError("unproven original session")
+        assert not is_transient_database_poll_error(
+            ExceptionGroup("independent session failures", [lost.value, unproven])
+        ), "one closed session vouched for another session's interface error"
         assert await backend.fetch_val("SELECT COUNT(*) FROM original_session_probe") == 0
         assert await backend.fetch_val("SELECT 1") == 1
     finally:
