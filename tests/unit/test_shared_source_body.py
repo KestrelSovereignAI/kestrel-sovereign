@@ -112,7 +112,9 @@ async def test_source_and_failure_classifier_errors_remain_original(
     path = tmp_path / "original-resource"
     path.write_bytes(b"x")
     body_error = ValueError("original source failure")
+    body_graph = execution_evidence_carriers(body_error)
     predicate_errors: list[OSError] = []
+    predicate_graphs: list[tuple[BaseException, ...]] = []
     descriptors: list[int] = []
     retired: list[asyncio.Task | None] = []
 
@@ -122,6 +124,7 @@ async def test_source_and_failure_classifier_errors_remain_original(
                 raise AssertionError("The predicate state must be absent")
         except FileNotFoundError as error:
             predicate_errors.append(error)
+            predicate_graphs.append(execution_evidence_carriers(error))
             raise
 
     class Source:
@@ -150,6 +153,8 @@ async def test_source_and_failure_classifier_errors_remain_original(
         assert any(error is body_error for error in evidence)
         assert len(predicate_errors) == 1
         assert any(error is predicate_errors[0] for error in evidence)
+        assert execution_evidence_carriers(body_error) == body_graph
+        assert execution_evidence_carriers(predicate_errors[0]) == predicate_graphs[0]
         assert source.producer_task.done()
         assert retired == [source.producer_task]
         with pytest.raises(OSError) as closed:
@@ -157,6 +162,74 @@ async def test_source_and_failure_classifier_errors_remain_original(
         assert closed.value.errno == errno.EBADF
     finally:
         await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_original_closer_error_graphs_are_not_rewritten() -> None:
+    descriptors: list[int] = []
+    failures: list[tuple[OSError, tuple[BaseException, ...]]] = []
+    retired: list[asyncio.Task | None] = []
+
+    def close_original(index: int) -> None:
+        os.close(descriptors[index])
+        retired.append(asyncio.current_task())
+        try:
+            os.fstat(descriptors[index])
+        except OSError as error:
+            assert error.errno == errno.EBADF
+            failures.append((error, execution_evidence_carriers(error)))
+            raise
+        raise AssertionError("The original descriptor remained open")
+
+    class Inner:
+        def __aiter__(self) -> Inner:
+            return self
+
+        async def __anext__(self) -> bytes:
+            return b"original frame"
+
+        async def aclose(self) -> None:
+            close_original(1)
+
+    class Outer:
+        def __aiter__(self) -> Inner:
+            return Inner()
+
+        async def aclose(self) -> None:
+            close_original(0)
+
+    def acquire() -> Outer:
+        first = os.open(os.devnull, os.O_RDONLY)
+        try:
+            second = os.open(os.devnull, os.O_RDONLY)
+        except OSError:
+            os.close(first)
+            raise
+        descriptors.extend((first, second))
+        return Outer()
+
+    source = OwnedAsyncIterator(acquire, operation="immutable-original-close-errors")
+    try:
+        assert await anext(source) == b"original frame"
+        with pytest.raises(BaseException) as captured:
+            await source.aclose()
+        evidence = execution_evidence_carriers(captured.value)
+        assert len(failures) == 2
+        for error, original_graph in failures:
+            assert any(carrier is error for carrier in evidence)
+            assert execution_evidence_carriers(error) == original_graph
+        assert retired == [source.producer_task, source.producer_task]
+        assert source.producer_task.done() and source.owner_task.done()
+    finally:
+        await source.aclose()
+        for descriptor in descriptors:
+            try:
+                os.fstat(descriptor)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
+            else:
+                os.close(descriptor)
 
 
 @pytest.mark.asyncio
