@@ -5452,7 +5452,6 @@ class KestrelAgent(
         if mode != self._privacy_mode:
             self._withdraw_mcp_apps_for_privacy_transition()
             self._withdraw_mcp_oauth_for_privacy_transition()
-            self._withdraw_mcp_input_for_privacy_transition()
 
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
