@@ -2226,6 +2226,7 @@
         "tests/integration/test_mcp_permission_boundary.py",
         "tests/integration/test_mcp_permission_host_restart.py",
         "tests/integration/test_mcp_permission_peer_stdio.py",
+        "tests/integration/test_native_permission_entrypoints.py",
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_storage_backend_parity.py",
         "tests/unit/test_agent_backend_routing_contracts.py",
