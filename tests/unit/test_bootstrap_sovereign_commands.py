@@ -18,7 +18,7 @@ from kestrel_sovereign.command_policy import (
     SAFE_MODE_COMMANDS,
     SOVEREIGN_COMMANDS,
 )
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.kestrel_agent import KestrelAgent, _BootstrapReply
 
 
 async def _bootstrap_agent(*, native_tool_effect_agent) -> KestrelAgent:
@@ -39,7 +39,7 @@ async def _bootstrap_agent(*, native_tool_effect_agent) -> KestrelAgent:
     agent._turn_lifecycle = _noop_lifecycle
     agent.bootstrap_service = MagicMock()
     agent.bootstrap_service.is_bootstrap_needed = AsyncMock(return_value=True)
-    agent._handle_bootstrap = AsyncMock(return_value="onboarding greeting")
+    agent._handle_bootstrap = AsyncMock(return_value=_BootstrapReply("onboarding greeting", None, None))
     agent._post_response_pipeline = AsyncMock()
     agent.command_handler = CommandHandler(agent)
     return agent
@@ -168,7 +168,7 @@ async def test_ordinary_prompt_containing_command_tokens_stays_in_onboarding(*, 
     assert result == "onboarding greeting"
     agent.command_handler.handle.assert_not_awaited()
     agent._handle_bootstrap.assert_awaited_once()
-    agent._post_response_pipeline.assert_awaited_once()
+    agent._post_response_pipeline.assert_awaited_once_with(user_message_id=None, assistant_message_id=None)
 
 
 @pytest.mark.asyncio
