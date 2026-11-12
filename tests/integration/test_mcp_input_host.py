@@ -579,7 +579,10 @@ async def test_two_real_http_responses_cannot_execute_the_continuation_twice(app
     assert current.status_code == 200 and current.json()['state'] == 'RESOLVED'
 
 
-@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form', 'input_rounds': 2}], indirect=True)
+@pytest.mark.parametrize('apps_boundary', [
+    {'operator_input': 'form', 'input_rounds': 2},
+    {'operator_input': 'form', 'input_rounds': 2, 'input_max_pending': 1},
+], indirect=True)
 async def test_reloaded_original_card_recovers_next_native_round_without_initial_replay(apps_boundary):
     b = apps_boundary
     await pause(b)

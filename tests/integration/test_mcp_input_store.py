@@ -65,6 +65,108 @@ async def create(store, **changes):
 
 
 @pytest.mark.asyncio
+async def test_continuation_chain_reuses_one_reservation_and_keeps_uncertain_claims_counted(custody):
+    _, reopen, _ = custody
+    store = await reopen(max_pending=1)
+    first = await create(store)
+    claim = await store.claim_response(first, {}, now=101)
+    with pytest.raises(MCPInputConflict, match='capacity'):
+        await create(store, operation_id='other-operation')
+    child = await store.create(binding(operation_id='successor-operation'), checkpoint(),
+        now=102, expires_at=1000, predecessor=claim)
+    assert child.reservation_id == first.request_id == first.reservation_id
+    assert child.predecessor_id == first.request_id and first.predecessor_id is None
+    restored = await reopen(max_pending=1)
+    assert (await restored.read(first.binding, first.request_id)).state == 'RESPONDING'
+    with pytest.raises(MCPInputConflict, match='capacity'):
+        await create(restored, operation_id='other-operation')
+    await store.settle(claim, state='RESOLVED', continuation={'next_request_id': child.request_id})
+    with pytest.raises(MCPInputConflict, match='capacity'):
+        await create(restored, operation_id='other-operation')
+    assert await restored.read(child.binding, child.request_id) == child
+
+
+@pytest.mark.asyncio
+async def test_two_native_writers_cannot_fork_one_response_reservation(custody):
+    store, reopen, _ = custody
+    first = await create(store)
+    claim = await store.claim_response(first, {}, now=101)
+    second = await reopen()
+    outcomes = await asyncio.gather(*[
+        owner.create(binding(operation_id='child-' + str(index)), checkpoint(),
+            now=102, expires_at=1000, predecessor=claim)
+        for index, owner in enumerate((store, second))
+    ], return_exceptions=True)
+    assert sum(isinstance(value, MCPInputConflict) for value in outcomes) == 1
+    children = [value for value in outcomes if not isinstance(value, BaseException)]
+    assert len(children) == 1
+    assert children[0].reservation_id == first.reservation_id
+    assert await store.database.fetchone('SELECT COUNT(*) FROM mcp_inputs') == (2,)
+
+
+@pytest.mark.asyncio
+async def test_chain_listing_exposes_successor_before_its_unsettled_parent(custody, monkeypatch):
+    from uuid import UUID
+    from kestrel_sovereign import mcp_input_store
+
+    _, reopen, _ = custody
+    store = await reopen(max_pending=1)
+    ids = iter((UUID(int=1), UUID(int=2)))
+    monkeypatch.setattr(mcp_input_store, 'uuid4', lambda: next(ids))
+    first = await create(store)
+    claim = await store.claim_response(first, {}, now=101)
+    child = await store.create(binding(operation_id='successor-operation'), checkpoint(),
+        now=102, expires_at=1000, predecessor=claim)
+    rows = await store.list_for(first.binding.principal_id, first.binding.session_id, now=103)
+    assert rows == (child,), 'A consumed predecessor hid its confirmed successor at the chain capacity limit'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['secret', 'principal', 'settled'])
+async def test_successor_requires_the_exact_original_live_response_claim(custody, fault):
+    store, _, _ = custody
+    first = await create(store)
+    claim = await store.claim_response(first, {}, now=101)
+    successor_binding = binding(operation_id='successor-operation')
+    if fault == 'secret':
+        claim = replace(claim, secret='x' * 43)
+    elif fault == 'principal':
+        successor_binding = replace(successor_binding, principal_id='foreign-reader')
+    else:
+        await store.settle(claim, state='UNKNOWN')
+    with pytest.raises(MCPInputConflict):
+        await store.create(successor_binding, checkpoint(), now=102, expires_at=1000, predecessor=claim)
+    assert await store.database.fetchone('SELECT COUNT(*) FROM mcp_inputs') == (1,)
+
+
+@pytest.mark.asyncio
+async def test_descriptive_claim_cannot_change_the_authenticated_reservation(custody):
+    store, _, _ = custody
+    first = await create(store)
+    claim = await store.claim_response(first, {}, now=101)
+    description = replace(claim, record=replace(claim.record, reservation_id='forged-reservation'))
+    child = await store.create(binding(operation_id='successor-operation'), checkpoint(),
+        now=102, expires_at=1000, predecessor=description)
+    assert child.reservation_id == first.reservation_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('column', ['reservation_id', 'predecessor_id'])
+async def test_reservation_lineage_is_authenticated_with_its_checkpoint(custody, column):
+    store, _, _ = custody
+    first = await create(store)
+    claim = await store.claim_response(first, {}, now=101)
+    child = await store.create(binding(operation_id='successor-operation'), checkpoint(),
+        now=102, expires_at=1000, predecessor=claim)
+    other = await create(store, operation_id='other-reservation')
+    assert column in {'reservation_id', 'predecessor_id'}
+    await store.database.execute('UPDATE mcp_inputs SET ' + column + '=? WHERE request_id=?',
+        (other.request_id, child.request_id))
+    with pytest.raises(MCPInputIntegrityError):
+        await store.read(child.binding, child.request_id)
+
+
+@pytest.mark.asyncio
 async def test_encrypted_checkpoint_and_exact_state_survive_new_native_connection(custody):
     store, reopen, _ = custody
     record = await create(store)

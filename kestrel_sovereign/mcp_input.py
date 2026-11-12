@@ -75,6 +75,7 @@ class _Reader:
     authentication: object
     request: object = field(repr=False)
     borrowed: AsyncExitStack = field(repr=False)
+    response_claim: MCPInputClaim | None = field(default=None, repr=False)
     app_view: object = field(default=None, repr=False)
     app_transport: object = field(default=None, repr=False)
     active: bool = True
@@ -226,8 +227,10 @@ class MCPInputHost:
         binding = MCPInputBinding(self._agent_id, origin.principal_id, origin.session_id,
             origin.operation_id, connection_id, contract_digest, method)
         now = self.authority.clock().timestamp()
+        reader = self._reader.get()
+        predecessor = reader.response_claim if reader is not None else None
         record = await self.store.create(binding, payload, now=now,
-            expires_at=now + self.policy.retention_seconds)
+            expires_at=now + self.policy.retention_seconds, predecessor=predecessor)
         self._revalidate_origin(origin)
         from kestrel_sovereign.tools.effect_journal import record_tool_effect_input_required
         record_tool_effect_input_required(self.agent, record.request_id)
@@ -247,8 +250,11 @@ class MCPInputHost:
         if (not origin.allow_blocking or record.binding.principal_id != origin.principal_id
                 or record.binding.session_id != reader.session_id):
             raise HostCapabilityAccessDenied('Original MCP input response owner changed')
+        if reader.response_claim is not None:
+            raise MCPInputConflict('Original MCP input response already owns a claim')
         claim = await self.store.claim_response(record, responses, now=self.authority.clock().timestamp())
         origin.require_current()
+        reader.response_claim = claim
         return claim
 
     async def settle_response(self, claim: MCPInputClaim, *, state: str, continuation: dict):
