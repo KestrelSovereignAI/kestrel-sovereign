@@ -474,10 +474,24 @@ class GatewayTestPeer(MCPTestPeer):
         return found
 
     def admitted_profile_group(self, record, process):
-        """Attest a current member of the private original native session."""
-        if (process.create_time() < record.get('created', record['host_created'])
-                or '--profile=' + record['profile'] not in process.cmdline()
-                or str(Path(process.exe()).resolve()) not in record['executables']):
+        """Attest a current member of the private original native session.
+
+        An exiting process reads an empty command line and executable on Linux
+        once it has released its memory, before it is a zombie. That is the
+        process leaving, not a different one, so it raises the same
+        ``ProcessLookupError`` as a group lookup after its exit.
+        """
+        if process.create_time() < record.get('created', record['host_created']):
+            return None
+        command = process.cmdline()
+        if not command:
+            raise ProcessLookupError(process.pid)
+        if '--profile=' + record['profile'] not in command:
+            return None
+        executable = process.exe()
+        if not executable:
+            raise ProcessLookupError(process.pid)
+        if str(Path(executable).resolve()) not in record['executables']:
             return None
         group = os.getpgid(process.pid)
         return group if os.getsid(process.pid) == group else None

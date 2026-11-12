@@ -56,6 +56,11 @@ class BlockedDecision:
         return self.decision == PermissionDecision.ASK
 
     @property
+    def error_class(self) -> str:
+        """The ``error_class`` a refused call's dispatch row names (#3953)."""
+        return "ApprovalRequired" if self.is_ask else "PermissionDenied"
+
+    @property
     def error(self) -> str:
         prefix = (
             "Approval required"
