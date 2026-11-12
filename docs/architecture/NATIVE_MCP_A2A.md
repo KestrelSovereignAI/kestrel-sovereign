@@ -1666,7 +1666,11 @@ not evidence of an installed inbound MCP connector or subsequent reflection and
 consolidation. That acceptance remains in #1990. The embedding migrations inspect
 the same resolved PostgreSQL relation as their ALTER statements through the
 canonical database API; a same-named table in another schema cannot satisfy the
-column checks.
+column checks. Native PostgreSQL transaction exits prove committability even
+without execution scopes or callbacks, so COMMIT-as-ROLLBACK cannot publish a
+successful receipt. Optional profile-registry writes roll back inside their own
+savepoint; a lost fence commit acknowledgement preserves the committed row's
+lexical tokens instead of treating them as orphaned prework.
 
 Each PR requires a completed full-diff worktree review before creation, with
 findings fixed and meaningful regression tests. Pin the conformance runner

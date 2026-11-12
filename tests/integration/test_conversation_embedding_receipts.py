@@ -11,15 +11,20 @@ import struct
 from uuid import uuid4
 
 import pytest
+import asyncpg
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.db.postgres import PostgresBackend
-from kestrel_sovereign.storage.db.interface import TransactionError
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.storage.sqla.migrations import (
     migrate_add_embedding_profile_id,
     migrate_conversation_history_add_embedding_vec,
 )
-from tests.utils.postgres_schema import with_search_path
+from tests.utils.postgres_schema import pgvector_schema, quoted_search_path, with_search_path
 from tests.integration.native_memory_original_control import (
     native_memory_owners as native_memory_owners,
 )
@@ -27,6 +32,7 @@ from tests.integration.test_conversation_write_receipts import (
     canonical_store as canonical_store,
     canonical_receipt_database,
     prepare_owned_vector_column,
+    observe_actual_insert_attempts,
 )
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.utils.native_a2a import native_a2a_backend_factory as native_a2a_backend_factory
@@ -46,6 +52,35 @@ async def provider_receipt_store(native_memory_owners, request):
         )
         async with canonical_receipt_database(backend) as database:
             yield AsyncConversationStore(database, agent_id=n.did, llm_service=n.service)
+
+
+@pytest.fixture
+async def native_fenced_receipt_storage(native_memory_owners):
+    n = native_memory_owners
+    extension = await pgvector_schema(n.pg_storage.db)
+    dsn = with_search_path(os.environ["TEST_POSTGRES_URL"], quoted_search_path(n.schema, extension))
+    raw = AsyncStorage(
+        backend=PostgresBackend(dsn, min_pool_size=1, max_pool_size=2),
+        agent_id=n.did, llm_service=n.service,
+        _assertion_tenant_capability=n.pg_storage._assertion_tenant_capability,
+    )
+    observer = PostgresBackend(dsn, min_pool_size=1, max_pool_size=2)
+    try:
+        await raw.initialize()
+        await prepare_owned_vector_column(raw.conversation, 3)
+        await observer.connect()
+        fact = await PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL).save_explicit_fact(
+            subject="user", predicate="preferred_deploy_region", value="owned-receipt-region",
+            confidence=0.9, invocation_id=uuid4().hex,
+        )
+        yield raw, observer, {
+            "semantic_recall_dependencies": [{
+                "assertion_id": fact.assertion_id, "revision_id": fact.revision_id,
+            }],
+        }
+    finally:
+        await observer.close()
+        await raw.close()
 
 
 async def _stored_vector(store, receipt):
@@ -110,8 +145,9 @@ async def test_native_schema_shapes_keep_the_exact_inserted_id(canonical_store, 
 
 
 @pytest.mark.asyncio
-async def test_native_non_schema_insert_error_does_not_retry(canonical_store):
+async def test_native_non_schema_insert_error_does_not_retry(canonical_store, monkeypatch):
     store = canonical_store
+    attempts = observe_actual_insert_attempts(store, monkeypatch)
     # A real SQL CHECK violation replaces the former fake disk-error response.
     # SQLite's native trigger and PostgreSQL's constraint both reject the row.
     if store.db.backend_type == "postgres":
@@ -125,6 +161,7 @@ async def test_native_non_schema_insert_error_does_not_retry(canonical_store):
         )
     with pytest.raises(Exception, match="owned_refusal|owned refusal"):
         await store.add_conversation("assistant", "rejected write")
+    assert len(attempts) == 1, "Non-schema native refusal must not retry its INSERT"
     assert await store.db.fetchone(
         "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?", (store.agent_id,)
     ) == (0,)
@@ -291,3 +328,94 @@ async def test_native_embedding_migrations_leave_an_absent_relation_absent(canon
         await migrate_conversation_history_add_embedding_vec(database)
         await migrate_add_embedding_profile_id(database, table="conversation_history")
         assert not await database.table_exists("conversation_history")
+
+
+@pytest.mark.asyncio
+async def test_registry_outage_cannot_return_a_rolled_back_fenced_row(native_fenced_receipt_storage):
+    raw, observer, metadata = native_fenced_receipt_storage
+    await raw.db.execute_commit("DROP TABLE embedding_profiles")
+    receipt, write_failure = None, None
+    try:
+        receipt = await raw.add_conversation(
+            "assistant", "owned healthy embedding with unavailable registry", metadata=metadata,
+            session_id=str(uuid4()),
+        )
+    except BaseException as error:
+        write_failure = error
+    assert write_failure is None, "Registry outage must not abort the canonical message's transaction"
+    assert type(receipt) is int and receipt > 0
+    row = await observer.fetch_one(
+        "SELECT id FROM conversation_history WHERE agent_id = ? AND id = ?", (raw.agent_id, receipt),
+    )
+    assert row == (receipt,), "Fenced receipt must identify an independently committed row despite registry outage"
+
+
+@pytest.mark.asyncio
+async def test_a_swallowed_sql_failure_cannot_publish_a_successful_commit(native_fenced_receipt_storage):
+    raw, observer, _ = native_fenced_receipt_storage
+    raw.conversation._llm_service = None
+    observed = None
+    try:
+        async with raw.db.transaction():
+            await raw.add_conversation("user", "owned poisoned transaction", session_id=str(uuid4()))
+            assert not raw.db.backend._current_after_commit().pending
+            try:
+                await raw.db.execute("SELECT 1 / 0")
+            except QueryError:
+                pass
+    except TransactionError as error:
+        observed = error
+    assert observed is not None, "Aborted native transaction must never publish a successful commit"
+    assert await observer.fetch_one(
+        "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?", (raw.agent_id,),
+    ) == (0,)
+
+
+@pytest.mark.asyncio
+async def test_lost_fence_commit_ack_keeps_the_committed_rows_lexical_tokens(
+    native_fenced_receipt_storage, monkeypatch,
+):
+    raw, observer, metadata = native_fenced_receipt_storage
+    raw.conversation._llm_service = None
+    armed, fired = [], []
+    original_fetch = raw.db.fetchone
+    original_exit = asyncpg.transaction.Transaction.__aexit__
+
+    async def observe_original_insert(sql, params=()):
+        result = await original_fetch(sql, params)
+        if "INSERT INTO conversation_history" in sql:
+            owner = raw.db.backend._current_txn_conn()
+            native = owner._con if isinstance(owner, asyncpg.pool.PoolConnectionProxy) else owner
+            assert isinstance(native, asyncpg.Connection)
+            armed.append(native)
+        return result
+
+    async def lose_original_commit_ack(transaction, *args):
+        result = await original_exit(transaction, *args)
+        if (armed and not fired and transaction._connection is armed[0]
+                and not transaction._nested and args[0] is None):
+            fired.append(True)
+            raise OSError("owned acknowledgement lost after original native COMMIT")
+        return result
+
+    monkeypatch.setattr(raw.db, "fetchone", observe_original_insert)
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", lose_original_commit_ack)
+    observed = None
+    try:
+        await raw.add_conversation(
+            "assistant", "owned lexical commit acknowledgement witness", metadata=metadata,
+            session_id=str(uuid4()),
+        )
+    except BaseException as error:
+        observed = error
+    assert len(fired) == 1 and observed is not None and is_execution_control_error(observed)
+    row = await observer.fetch_one(
+        "SELECT id, lexical_index_id, lexical_index_version FROM conversation_history WHERE agent_id = ?",
+        (raw.agent_id,),
+    )
+    assert row is not None and row[1] and row[2], "The original native COMMIT must remain independently visible"
+    tokens = await observer.fetch_one(
+        "SELECT COUNT(*) FROM conversation_lexical_tokens WHERE agent_id = ? AND lexical_index_id = ?",
+        (raw.agent_id, row[1]),
+    )
+    assert tokens is not None and tokens[0] > 0, "Lost commit acknowledgement must not delete a committed row's lexical tokens"

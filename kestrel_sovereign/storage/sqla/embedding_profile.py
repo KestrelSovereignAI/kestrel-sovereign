@@ -70,36 +70,39 @@ async def upsert_embedding_profile(
 
     backend_type = getattr(db, "backend_type", None)
     try:
-        if backend_type == "postgres":
-            await db.execute(
-                """INSERT INTO embedding_profiles
-                       (id, provider, model, dim, space_id, normalized)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT (id) DO NOTHING""",
-                (
-                    profile.profile_id,
-                    profile.provider,
-                    profile.model,
-                    profile.dim,
-                    profile.space_id,
-                    bool(profile.normalized),
-                ),
-            )
-        else:
-            # SQLite. Boolean → INTEGER (0/1).
-            await db.execute(
-                """INSERT OR IGNORE INTO embedding_profiles
-                       (id, provider, model, dim, space_id, normalized)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    profile.profile_id,
-                    profile.provider,
-                    profile.model,
-                    profile.dim,
-                    profile.space_id,
-                    1 if profile.normalized else 0,
-                ),
-            )
+        # Keep an optional descriptor failure from aborting the caller's
+        # canonical write transaction. Catch only after native rollback/ACK.
+        async with db.transaction(savepoint=True):
+            if backend_type == "postgres":
+                await db.execute(
+                    """INSERT INTO embedding_profiles
+                           (id, provider, model, dim, space_id, normalized)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (id) DO NOTHING""",
+                    (
+                        profile.profile_id,
+                        profile.provider,
+                        profile.model,
+                        profile.dim,
+                        profile.space_id,
+                        bool(profile.normalized),
+                    ),
+                )
+            else:
+                # SQLite. Boolean → INTEGER (0/1).
+                await db.execute(
+                    """INSERT OR IGNORE INTO embedding_profiles
+                           (id, provider, model, dim, space_id, normalized)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        profile.profile_id,
+                        profile.provider,
+                        profile.model,
+                        profile.dim,
+                        profile.space_id,
+                        1 if profile.normalized else 0,
+                    ),
+                )
     except Exception as exc:
         if is_execution_control_error(exc):
             raise

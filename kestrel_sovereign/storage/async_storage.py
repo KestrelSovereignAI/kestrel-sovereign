@@ -653,7 +653,11 @@ class AsyncStorage:
                 if not visible:
                     return await exclude_and_persist()
                 return await persist()
-        except Exception:
+        except Exception as write_failure:
+            if is_execution_control_error(write_failure):
+                # A lost/committed fence ACK does not prove the canonical row
+                # rolled back. Its completed lexical marker still owns tokens.
+                raise
             if prepared_lexical_index_id is not None:
                 await self.conversation._discard_lexical_tokens(  # noqa: SLF001 - post-rollback token cleanup
                     prepared_lexical_index_id
