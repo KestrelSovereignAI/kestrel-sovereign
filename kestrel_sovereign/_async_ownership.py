@@ -1234,10 +1234,11 @@ class OwnedAsyncIterator(Generic[_T]):
         if self._closed:
             raise StopAsyncIteration
         received, item = await self._handoff.pull()
-        if not received and self._interrupted_by_cleanup and not self._owner.done():
+        if not received and self._interrupted_by_cleanup:
             # Do not join here. The consumer may first publish its bounded Stop
             # acknowledgement; its ``finally`` then calls ``aclose`` and owns
-            # the source cleanup through terminalization.
+            # the source cleanup through terminalization. A fast physical
+            # completion does not change this demand-interruption disposition.
             raise StopAsyncIteration
         if not received:
             self._closed = True
@@ -1403,7 +1404,7 @@ class OwnedAsyncIterator(Generic[_T]):
             self._handoff.request_stop()
 
     async def _run(self) -> None:
-        from kestrel_sovereign.execution_custody import execution_terminal_error
+        from kestrel_sovereign.execution_custody import execution_observation_error
 
         def acquire(_resources: SourceAcquisition) -> AsyncIterable[_T] | OwnedCallbackSource[_T]:
             source = self._iterator_factory()
@@ -1415,27 +1416,22 @@ class OwnedAsyncIterator(Generic[_T]):
                 acquire, self._handoff, on_body_error=self._classify_source_failure,
             )
             if outcome.retirement_errors:
-                self._cleanup_error = (
-                    outcome.retirement_errors[0] if len(outcome.retirement_errors) == 1
-                    else execution_terminal_error(
-                        *outcome.retirement_errors, retain_originals=True,
-                        isolate_control_originals=True,
-                    )
-                )
-            # Only our authenticated, individual private interrupt can be
-            # acknowledged. A late close/policy failure retains that original
-            # cancellation too. Request-reader withdrawals stay in its join.
+                # Ordinary physical errors are originals too. The finite
+                # composer retains them in a fresh carrier instead of adding
+                # the other failures to an original exception's cause graph.
+                self._cleanup_error = execution_observation_error(*outcome.retirement_errors)
+            # Acknowledge only the authenticated, causeless private producer
+            # interrupt, as before delegation. It is not the request reader's
+            # withdrawal; those remain in their actual join. Late retirement
+            # and policy failures still remain independent original failures.
             body_error = outcome.body_error
-            if (self._interrupted_by_cleanup and not outcome.retirement_errors
-                    and not outcome.observation_errors):
+            if self._interrupted_by_cleanup:
                 body_error = None
             errors = tuple(error for error in (
                 body_error, *outcome.retirement_errors, *outcome.observation_errors,
             ) if error is not None)
             if errors:
-                self._terminal_error = errors[0] if len(errors) == 1 else execution_terminal_error(
-                    *errors, retain_originals=True, isolate_control_originals=True,
-                )
+                self._terminal_error = execution_observation_error(*errors)
                 raise self._terminal_error
         finally:
             self._publish_owner_completion(self._owner)
