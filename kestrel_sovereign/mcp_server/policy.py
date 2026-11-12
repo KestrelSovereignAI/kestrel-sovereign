@@ -67,6 +67,8 @@ class MCPServerClient(BaseModel):
                 raise ValueError("A public MCP client must not configure a secret")
         elif self.client_secret is None or not self.client_secret.get_secret_value().strip():
             raise ValueError("A confidential MCP client requires a secret")
+        if tuple(str(uri) for uri in self.oauth_information().redirect_uris) != self.redirect_uris:
+            raise ValueError("The native SDK must preserve the registered redirect identity")
         return self
 
     def oauth_information(self) -> "OAuthClientInformationFull":

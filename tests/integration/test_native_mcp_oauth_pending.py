@@ -153,3 +153,36 @@ async def test_native_pending_store_refuses_unregistered_scope_or_resource(pendi
     with pytest.raises(ValueError):
         await store.create("owned-provider", request)
     assert await store.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_pending") == (0,)
+
+
+async def test_pending_admission_requires_the_registered_redirect(pending_store):
+    store, _clock, _peer = pending_store
+    request = parameters().model_copy(update={"redirect_uri": "https://other.example/callback"})
+    with pytest.raises(ValueError, match="registered"):
+        await store.create("owned-provider", request)
+    assert await store.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_pending") == (0,)
+
+
+@pytest.mark.parametrize("change", ["resource", "client", "scopes", "redirect"])
+@pytest.mark.parametrize("operation", ["read", "claim"])
+async def test_durable_pending_request_obeys_consuming_resource_and_current_registration(
+    pending_store, change, operation,
+):
+    store, _clock, _peer = pending_store
+    handle = await store.create("owned-provider", parameters())
+    config = json.loads(store.policy.model_dump_json())
+    config["clients"][0]["client_secret"] = "owned-fixture-secret"
+    resource = store.resource_url
+    if change == "resource":
+        resource = "https://kestrel.example/mcp/another"
+    elif change == "client":
+        config["clients"][0]["client_id"] = "replacement-provider"
+    elif change == "scopes":
+        config["clients"][0]["scopes"] = ["memory:write"]
+    else:
+        config["clients"][0]["redirect_uris"] = ["https://provider.example/replacement"]
+    current = PendingMCPAuthorizations(store.backend, store.agent_id, resource,
+        MCPServerPolicy.model_validate_json(json.dumps(config)), clock=store.clock)
+    assert await getattr(current, operation)(handle) is None, (
+        "A durable OAuth request bypassed the consuming resource or current client registration"
+    )

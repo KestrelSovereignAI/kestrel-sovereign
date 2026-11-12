@@ -100,3 +100,19 @@ def test_actual_official_sdk_receives_only_the_registered_client_information(pub
     assert [str(uri) for uri in information.redirect_uris] == list(client.redirect_uris)
     assert information.grant_types == ["authorization_code", "refresh_token"]
     assert information.response_types == ["code"]
+
+
+@pytest.mark.parametrize("uri", ["https://bücher.example/callback",
+    "https://PROVIDER.example/callback"])
+def test_registration_rejects_redirect_identity_changed_by_native_sdk(uri):
+    value = configured()
+    value["clients"][0]["redirect_uris"] = [uri]
+    with pytest.raises(ValidationError, match="redirect identity"):
+        MCPServerPolicy.model_validate_json(json.dumps(value))
+
+
+def test_native_sdk_preserves_a_registered_empty_path():
+    value = configured()
+    value["clients"][0]["redirect_uris"] = ["https://provider.example"]
+    client = MCPServerPolicy.model_validate_json(json.dumps(value)).clients[0]
+    assert [str(uri) for uri in client.oauth_information().redirect_uris] == ["https://provider.example"]

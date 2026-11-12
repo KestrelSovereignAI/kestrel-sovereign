@@ -81,14 +81,17 @@ class PendingMCPAuthorizations:
             await self.backend.execute("""INSERT INTO mcp_server_oauth_capacity (agent_id, revision)
                 VALUES (?, 0) ON CONFLICT (agent_id) DO NOTHING""", (self.agent_id,))
 
-    async def create(self, client_id: str, parameters: AuthorizationParams) -> str:
+    def _currently_registered(self, client_id: str, parameters: AuthorizationParams) -> bool:
+        """The consuming host's current policy controls admission and durable reads."""
         client = next((row for row in self.policy.clients if row.client_id == client_id), None)
-        if client is None or not isinstance(parameters, AuthorizationParams):
-            raise ValueError("Pending MCP authorization requires a registered client and native parameters")
-        if parameters.resource != self.resource_url:
-            raise ValueError("Pending MCP authorization has a different resource audience")
-        if not parameters.scopes or not set(parameters.scopes) <= set(client.scopes):
-            raise ValueError("Pending MCP authorization requires explicit registered scopes")
+        return (client is not None and isinstance(parameters, AuthorizationParams)
+            and parameters.resource == self.resource_url
+            and str(parameters.redirect_uri) in client.redirect_uris
+            and bool(parameters.scopes) and set(parameters.scopes) <= set(client.scopes))
+
+    async def create(self, client_id: str, parameters: AuthorizationParams) -> str:
+        if not self._currently_registered(client_id, parameters):
+            raise ValueError("Pending MCP authorization requires a registered client, redirect, scopes and resource")
         handle = secrets.token_urlsafe(32)
         handle_hash = self._handle_hash(handle)
         now = self._now()
@@ -118,12 +121,14 @@ class PendingMCPAuthorizations:
             raise PendingMCPQuotaExceeded("The agent's pending MCP authorization quota is full")
         return handle
 
-    def _decode(self, handle_hash: str, row) -> PendingMCPAuthorization:
+    def _decode(self, handle_hash: str, row) -> PendingMCPAuthorization | None:
         ciphertext, expires = row
         raw = self._cipher().decrypt(ciphertext.encode("ascii"), aad=self._aad(handle_hash, expires))
         value = json.loads(raw)
-        return PendingMCPAuthorization(value["client_id"], expires,
-            AuthorizationParams.model_validate(value["parameters"]))
+        parameters = AuthorizationParams.model_validate(value["parameters"])
+        if not self._currently_registered(value["client_id"], parameters):
+            return None
+        return PendingMCPAuthorization(value["client_id"], expires, parameters)
 
     async def read(self, handle: str) -> PendingMCPAuthorization | None:
         handle_hash = self._handle_hash(handle)
