@@ -202,7 +202,7 @@ async def deployment(request, tmp_path):
                 lambda: AsyncDatabase.postgres(schema_url),
                 f'"{vector_schema}".vector({DIM})',
             )
-            db = await dep.reboot()
+            await dep.reboot()
             try:
                 yield dep
             finally:
