@@ -277,6 +277,7 @@ Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussio
 mcp-integration = ["kestrel-feature-mcp>=0.17.0,<1"]
 # Test dependencies (not needed in production)
 test = [
+    "mcp>=2.3.0",
     "pyright==1.1.403",
     # >=9.0.3 fixes unsafe temporary-file handling in pytest's debugger.
     "pytest>=9.0.3",
@@ -422,6 +423,7 @@ dev = [
 
 # Mirror of [project.optional-dependencies.test] for uv sync compatibility
 test = [
+    "mcp>=2.3.0",
     "pyright==1.1.403",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
