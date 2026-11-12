@@ -186,3 +186,73 @@ async def test_durable_pending_request_obeys_consuming_resource_and_current_regi
     assert await getattr(current, operation)(handle) is None, (
         "A durable OAuth request bypassed the consuming resource or current client registration"
     )
+
+
+async def test_rejected_foreign_resource_claim_preserves_the_original_request(pending_store):
+    store, _clock, _peer = pending_store
+    handle = await store.create("owned-provider", parameters())
+    foreign = PendingMCPAuthorizations(store.backend, store.agent_id,
+        "https://kestrel.example/mcp/foreign", store.policy, clock=store.clock)
+    assert await foreign.claim(handle) is None
+    assert await store.claim(handle) is not None, (
+        "A rejected foreign-resource claimant consumed the original pending request"
+    )
+
+
+async def test_native_registered_empty_path_survives_durable_parameter_round_trip(pending_store):
+    store, _clock, _peer = pending_store
+    config = json.loads(store.policy.model_dump_json())
+    config["clients"][0].update(client_secret="owned-fixture-secret",
+        redirect_uris=["https://provider.example"])
+    policy = MCPServerPolicy.model_validate_json(json.dumps(config))
+    current = PendingMCPAuthorizations(store.backend, store.agent_id, store.resource_url,
+        policy, clock=store.clock)
+    # The native handler can select the sole registered URL when the client
+    # omits redirect_uri. Retain that actual SDK URL object at admission.
+    native_uri = policy.clients[0].oauth_information().validate_redirect_uri(None)
+    request = parameters().model_copy(update={"redirect_uri": native_uri,
+        "redirect_uri_provided_explicitly": False})
+    handle = await current.create("owned-provider", request)
+    pending = await current.read(handle)
+    assert pending is not None, "The native registered redirect changed during durable decoding"
+    assert str(pending.parameters.redirect_uri) == "https://provider.example"
+    claimed = await current.claim(handle)
+    assert claimed is not None and str(claimed.parameters.redirect_uri) == "https://provider.example"
+
+
+@pytest.mark.parametrize("pending_store", ["postgres"], indirect=True)
+@pytest.mark.parametrize("operation", ["read", "claim", "create"])
+async def test_native_database_lock_wait_cannot_extend_pending_authorization_expiry(
+    pending_store, native_pg, operation,
+):
+    store, clock, _peer = pending_store
+    _backend, control, schema = native_pg
+    handle = await store.create("owned-provider", parameters()) if operation != "create" else None
+    if handle is not None:
+        clock[0] = 1599.0
+    task = None
+    try:
+        async with control.transaction():
+            await control.execute(f'LOCK TABLE "{schema}".mcp_server_oauth_pending, '
+                f'"{schema}".mcp_server_oauth_capacity IN ACCESS EXCLUSIVE MODE')
+            task = asyncio.create_task(store.create("owned-provider", parameters())
+                if operation == "create" else getattr(store, operation)(handle))
+            async with asyncio.timeout(5):
+                while not await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                    "WHERE wait_event_type='Lock' AND query LIKE '%mcp_server_oauth_%' "
+                    "AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))"):
+                    await asyncio.sleep(0.01)
+            clock[0] = 1601.0
+        result, = await asyncio.gather(task, return_exceptions=True)
+        if operation == "create":
+            assert isinstance(result, ValueError) and "expired" in str(result), (
+                "An original SQL capacity wait returned an already-expired OAuth handle"
+            )
+            assert await store.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_pending") == (0,)
+        else:
+            assert result is None, "An original SQL lock wait admitted an expired OAuth request"
+    finally:
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

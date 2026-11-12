@@ -14,7 +14,7 @@ from kestrel_sdk.security.encryption import get_agent_key
 from kestrel_sdk.storage.database import DatabaseBackend
 from mcp.server.auth.provider import AuthorizationParams
 
-from .policy import MCPServerPolicy
+from .policy import MCPServerClient, MCPServerPolicy
 
 
 class PendingMCPQuotaExceeded(ValueError):
@@ -83,11 +83,20 @@ class PendingMCPAuthorizations:
 
     def _currently_registered(self, client_id: str, parameters: AuthorizationParams) -> bool:
         """The consuming host's current policy controls admission and durable reads."""
-        client = next((row for row in self.policy.clients if row.client_id == client_id), None)
+        client = self._registered_client(client_id)
         return (client is not None and isinstance(parameters, AuthorizationParams)
             and parameters.resource == self.resource_url
             and str(parameters.redirect_uri) in client.redirect_uris
             and bool(parameters.scopes) and set(parameters.scopes) <= set(client.scopes))
+
+    def _registered_client(self, client_id: str) -> MCPServerClient | None:
+        return next((row for row in self.policy.clients if row.client_id == client_id), None)
+
+    async def _lock_capacity(self) -> None:
+        capacity = await self.backend.fetch_one("UPDATE mcp_server_oauth_capacity SET revision = revision + 1 WHERE agent_id = ? RETURNING revision",
+            (self.agent_id,))
+        if capacity is None:
+            raise RuntimeError("The original MCP authorization capacity record is unavailable")
 
     async def create(self, client_id: str, parameters: AuthorizationParams) -> str:
         if not self._currently_registered(client_id, parameters):
@@ -104,19 +113,20 @@ class PendingMCPAuthorizations:
         async with self.backend.transaction():
             # UPDATE takes the original native row lock until this transaction
             # exits; a COUNT followed by INSERT alone races on PostgreSQL.
-            capacity = await self.backend.fetch_one("UPDATE mcp_server_oauth_capacity SET revision = revision + 1 WHERE agent_id = ? RETURNING revision",
-                (self.agent_id,))
-            if capacity is None:
-                raise RuntimeError("The original MCP authorization capacity record is unavailable")
+            await self._lock_capacity()
+            now = self._now()
+            expired = expires <= now
             await self.backend.execute("DELETE FROM mcp_server_oauth_pending WHERE agent_id = ? AND (expires_at <= ? OR consumed = 1)",
                 (self.agent_id, now))
             row = await self.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_pending WHERE agent_id = ?",
                 (self.agent_id,))
             quota_full = row[0] >= self.policy.max_pending_per_agent
-            if not quota_full:
+            if not quota_full and not expired:
                 await self.backend.execute("""INSERT INTO mcp_server_oauth_pending
                     (agent_id, handle_hash, ciphertext, expires_at) VALUES (?, ?, ?, ?)""",
                     (self.agent_id, handle_hash, ciphertext, expires))
+        if expired:
+            raise ValueError("The pending MCP authorization request expired during admission")
         if quota_full:
             raise PendingMCPQuotaExceeded("The agent's pending MCP authorization quota is full")
         return handle
@@ -125,8 +135,19 @@ class PendingMCPAuthorizations:
         ciphertext, expires = row
         raw = self._cipher().decrypt(ciphertext.encode("ascii"), aad=self._aad(handle_hash, expires))
         value = json.loads(raw)
-        parameters = AuthorizationParams.model_validate(value["parameters"])
-        if not self._currently_registered(value["client_id"], parameters):
+        client = self._registered_client(value["client_id"])
+        if client is None:
+            return None
+        # The SDK's registration model preserves an empty URL path, while
+        # AuthorizationParams reparses a serialized string with a slash.
+        # Re-present the exact registered native URL object, as the official
+        # authorization handler does when selecting a client's sole callback.
+        redirect = next((uri for uri in client.oauth_information().redirect_uris
+            if str(uri) == value["parameters"]["redirect_uri"]), None)
+        if redirect is None:
+            return None
+        parameters = AuthorizationParams.model_validate({**value["parameters"], "redirect_uri": redirect})
+        if not self._currently_registered(value["client_id"], parameters) or expires <= self._now():
             return None
         return PendingMCPAuthorization(value["client_id"], expires, parameters)
 
@@ -141,8 +162,15 @@ class PendingMCPAuthorizations:
         """Consume once inside the consent owner's transaction; this mints no grant."""
         handle_hash = self._handle_hash(handle)
         async with self.backend.transaction():
-            row = await self.backend.fetch_one("""UPDATE mcp_server_oauth_pending SET consumed = 1
+            await self._lock_capacity()
+            row = await self.backend.fetch_one("""SELECT ciphertext, expires_at FROM mcp_server_oauth_pending
+                WHERE agent_id = ? AND handle_hash = ? AND consumed = 0 AND expires_at > ?""",
+                (self.agent_id, handle_hash, self._now()))
+            pending = None if row is None else self._decode(handle_hash, row)
+            if pending is not None:
+                claimed = await self.backend.fetch_one("""UPDATE mcp_server_oauth_pending SET consumed = 1
                 WHERE agent_id = ? AND handle_hash = ? AND consumed = 0 AND expires_at > ?
                 RETURNING ciphertext, expires_at""", (self.agent_id, handle_hash, self._now()))
-            pending = None if row is None else self._decode(handle_hash, row)
+                if claimed is None or pending.expires_at <= self._now():
+                    pending = None
         return pending
