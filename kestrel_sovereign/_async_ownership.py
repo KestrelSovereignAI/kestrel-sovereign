@@ -1425,7 +1425,10 @@ class OwnedAsyncIterator(Generic[_T]):
             # withdrawal; those remain in their actual join. Late retirement
             # and policy failures still remain independent original failures.
             body_error = outcome.body_error
-            if self._interrupted_by_cleanup:
+            # A closer may enrich the earlier failure's graph. Authenticate
+            # its current state after retirement, not the earlier flag alone.
+            if (self._interrupted_by_cleanup
+                    and is_owned_task_cancellation(self._owner, body_error)):
                 body_error = None
             errors = tuple(error for error in (
                 body_error, *outcome.retirement_errors, *outcome.observation_errors,
