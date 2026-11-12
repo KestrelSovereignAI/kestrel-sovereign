@@ -25,7 +25,14 @@ def hold_original_sqlite_commit_ack(monkeypatch, owns_commit):
         # Selection may observe the real INSERT before choosing its owner's
         # COMMIT; earlier schema/initialization commits are not that receipt.
         selected = owns_commit(connection, function, args)
-        if function.__name__ == "commit" and selected:
+        # Owned lexical transactions send COMMIT through execute; standalone
+        # backend writes use the driver's commit method. Both must have
+        # actually returned from this exact native worker before holding ACK.
+        native_commit = function.__name__ == "commit" or (
+            function.__name__ == "execute" and args
+            and isinstance(args[0], str) and args[0].strip().upper() == "COMMIT"
+        )
+        if native_commit and selected:
             acknowledgement.entered.set()
             await acknowledgement.release.wait()
         return result
