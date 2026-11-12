@@ -977,7 +977,7 @@ TOOL_JOIN_CASES.forEach((tc, i) => {
     });
 });
 
-for (const mode of ['coalesced', 'split-prefix', 'characters', 'sealed-bubbles', 'same-packet-parts', 'foreign-turn']) {
+for (const mode of ['coalesced', 'split-prefix', 'characters', 'sealed-bubbles', 'same-packet-parts', 'foreign-turn', 'stale-generation', 'superseded-stream']) {
     test(`input checkpoint retracts only the owning turn (${mode})`, async () => {
         renderCalls.length = 0; finalizeCalls.length = 0;
         window.SharedMarkdown.renderMarkdown = text => String(text);
@@ -1013,6 +1013,8 @@ for (const mode of ['coalesced', 'split-prefix', 'characters', 'sealed-bubbles',
                     node.querySelector('.message-content')?.innerHTML.includes('OWNED-COMPONENT'));
                 assert.ok(mountedComponent, 'The component must mount before input suspension');
             }
+            if (mode === 'stale-generation') pane.generation++;
+            if (mode === 'superseded-stream') pane.activeTurnId++;
             const rid = mode === 'foreign-turn' ? 'some-other-turn' : requestId;
             const frame = `\x1eKESTREL:RETRACT:${JSON.stringify({request_id: rid})}\x1e`;
             const wire = 'UNFINISHED SECOND' + (mode === 'same-packet-parts' ? component : '') + frame + 'Waiting for operator input.';
@@ -1027,9 +1029,9 @@ for (const mode of ['coalesced', 'split-prefix', 'characters', 'sealed-bubbles',
             await sending;
             const finalText = pane.element.children.filter(node => node !== prior)
                 .map(node => node.querySelector('.message-content')?.innerHTML || '').join('');
-            if (mode === 'foreign-turn') {
+            if (['foreign-turn', 'stale-generation', 'superseded-stream'].includes(mode)) {
                 assert.match(finalText.replace(/<[^>]*>/g, ''), /UNFINISHED\s+FIRST/);
-                assert.match(finalText, /UNFINISHED SECOND/);
+                if (mode === 'foreign-turn') assert.match(finalText, /UNFINISHED SECOND/);
             } else {
                 assert.ok(!finalText.includes('UNFINISHED'),
                     'Confirmed operator input must retract unfinished prose from the live turn');
