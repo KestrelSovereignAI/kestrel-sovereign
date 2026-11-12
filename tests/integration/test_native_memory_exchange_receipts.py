@@ -210,7 +210,7 @@ async def test_streaming_persistence_returns_the_original_native_task_receipt(as
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("assistant_agent", [False], indirect=True)
+@pytest.mark.parametrize("assistant_agent", [{"is_test_instance": False}], indirect=True)
 async def test_actual_bootstrap_cognition_enriches_its_own_write_receipts(assistant_agent, monkeypatch):
     agent = assistant_agent
     await agent.bootstrap_service.set_bootstrap_state(BootstrapState.PENDING)
@@ -300,6 +300,7 @@ async def test_background_memory_retains_original_native_lease_control(native_pi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("assistant_agent", [{"owned_local_generation": True}], indirect=True)
 async def test_actual_model_cognition_enriches_original_receipts(
     native_memory_owners, assistant_agent, monkeypatch, streaming,
 ):
