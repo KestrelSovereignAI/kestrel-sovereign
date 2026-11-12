@@ -74,6 +74,20 @@ async def native_pg(native_pg_scope):
     return native_pg_scope[0]
 
 
+@pytest.fixture
+def native_pg_url(native_pg, native_pg_scope):
+    """The URL of ``native_pg``'s schema.
+
+    It requests ``native_pg`` so that every case reaching PostgreSQL through
+    this module is a ``native_pg`` consumer: that fixture name is what
+    selects a case into the required native PostgreSQL CI lane
+    (tests/shared/postgres_requirement.py). A case requesting only
+    ``native_pg_scope`` is not selected there, and the generic integration
+    lane has no TEST_POSTGRES_URL, so it skips in both.
+    """
+    return native_pg_scope[1]
+
+
 async def _heartbeat_at(dispatcher):
     store = dispatcher._durable_store
     value = await store.backend.fetch_val(
@@ -167,7 +181,7 @@ async def _hold_every_connection(pool):
 
 
 async def test_ordinary_work_holding_every_pool_connection_does_not_stop_renewal(
-    native_pg_scope, monkeypatch
+    native_pg, native_pg_url, monkeypatch
 ):
     """Self-review of #4040: ordinary work holds every connection of the
     operational pool and of the advisory pool. Renewal checks out from its
@@ -181,7 +195,7 @@ async def test_ordinary_work_holding_every_pool_connection_does_not_stop_renewal
     monkeypatch.setitem(
         SignalDispatcher.__init__.__kwdefaults__, "runtime_owner_stale_after", STALE_AFTER
     )
-    manager, schema_url = native_pg_scope
+    manager, schema_url = native_pg, native_pg_url
     task = await manager.create_task(request(), creator_agent_id="did:creator")
     agent, dispatcher, consumer = await input_dispatcher(manager)
     backend = dispatcher._durable_store.backend
@@ -219,14 +233,14 @@ async def test_ordinary_work_holding_every_pool_connection_does_not_stop_renewal
         await peer_backend.close()
 
 
-async def test_closing_the_backend_joins_a_renewal_in_flight(native_pg_scope, monkeypatch):
+async def test_closing_the_backend_joins_a_renewal_in_flight(native_pg_url, monkeypatch):
     """Self-review of #4040: closing the backend while a renewal is under way
     waits for that renewal, which commits, and only then closes renewal's
     pool. Closing it under the renewal would end the renewal, and only
     retirement may. A renewal after close gets no pool back."""
     from kestrel_sovereign.storage.db.interface import ConnectionError
 
-    _, schema_url = native_pg_scope
+    schema_url = native_pg_url
     backend = PostgresBackend(schema_url, min_pool_size=1, max_pool_size=1)
     await backend.connect()
     store = DurableSignalStore(backend)
