@@ -22,7 +22,7 @@ import pytest
 import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -216,21 +216,38 @@ class TestErrorIsolation:
     """Implicit session derivation must never break writes."""
 
     @pytest.mark.asyncio
-    async def test_derivation_failure_does_not_block_write(self):
-        """Even if the previous-message lookup fails, the message must store."""
-        db = MagicMock()
-        # First call (lookup) fails; second call (insert) succeeds
-        db.fetchall = AsyncMock(side_effect=RuntimeError("db hiccup"))
-        db.execute_commit = AsyncMock()
+    async def test_derivation_failure_does_not_block_write(self, store, caplog):
+        """A real native lookup refusal still permits the original row write."""
+        import sqlite3
+        from uuid import UUID
 
-        store = AsyncConversationStore(db, agent_id="test-agent")
-        # Should not raise
-        await store.add_conversation("user", "hello")
+        connection = store.db.backend._connection
+        assert connection is not None
+        denied = []
 
-        # The lookup really was the call that failed, and the insert was
-        # still attempted.
-        db.fetchall.assert_awaited_once()
-        db.execute_commit.assert_called_once()
+        def refuse_first_history_read(action, table, column, database, trigger):
+            if action == sqlite3.SQLITE_READ and table == "conversation_history" and not denied:
+                denied.append(column)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        await connection.set_authorizer(refuse_first_history_read)
+        try:
+            message_id = await store.add_conversation("user", "hello")
+        finally:
+            await connection.set_authorizer(None)
+
+        assert denied == ["role"], "The original native derivation SELECT must fail"
+        assert "Implicit session derivation failed; starting a fresh session" in caplog.text
+        row, = await store.db.fetchall(
+            "SELECT id, metadata FROM conversation_history WHERE agent_id = ?",
+            ("test-agent",),
+        )
+        assert type(message_id) is int and message_id == row[0] > 0, (
+            "Native derivation failure must retain the exact persistent row receipt"
+        )
+        session_id = json.loads(row[1])["session_id"]
+        assert str(UUID(session_id)) == session_id
 
 
 class TestSessionGapMinutesCentralized:
