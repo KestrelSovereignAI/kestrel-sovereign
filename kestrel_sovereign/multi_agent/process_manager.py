@@ -81,12 +81,33 @@ DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS = 120.0
 #: (#3781). An integer because that is the type uvicorn's option takes.
 SERVER_GRACEFUL_SHUTDOWN_SECONDS = 5
 
-#: How long a stop waits after SIGTERM before SIGKILL. It must cover the
-#: graceful window above and then the application's own lifespan shutdown,
-#: which stops each agent in turn under its own deadline before host features
-#: and Phoenix. The wait ends as soon as the process exits, so a clean
-#: shutdown costs only the time it takes.
-SERVER_TERMINATE_TIMEOUT_SECONDS = 60.0
+#: The host's whole stop, from SIGTERM to process exit: the one shutdown
+#: budget (#4028). ``kestrel terminate`` waits this long before SIGKILL, and
+#: the application's lifespan shutdown takes its own deadline for retained
+#: remote work from the same number (:data:`HOST_SHUTDOWN_REMOTE_WORK_SECONDS`),
+#: so the lifespan returns before the SIGKILL that would cut it off. SIGKILL
+#: is left for a process whose local cleanup is wedged. The wait ends as soon
+#: as the process exits, so a clean stop costs only the time it takes.
+HOST_SHUTDOWN_BUDGET_SECONDS = 60.0
+
+#: The part of the budget retained remote work never gets: uvicorn's graceful
+#: window, which runs before the lifespan shutdown starts, and the time the
+#: host needs after cancelling that work to finish its local cleanup (storage
+#: close), the later shutdown phases and process exit.
+HOST_SHUTDOWN_RESERVE_SECONDS = SERVER_GRACEFUL_SHUTDOWN_SECONDS + 10.0
+
+#: How long, from the start of the lifespan shutdown, the host waits for
+#: remote work a stopping agent retains (an upload in flight) before it
+#: cancels that work and names each cancelled upload.
+HOST_SHUTDOWN_REMOTE_WORK_SECONDS = (
+    HOST_SHUTDOWN_BUDGET_SECONDS - HOST_SHUTDOWN_RESERVE_SECONDS
+)
+
+#: How long a stop waits after SIGTERM before SIGKILL: the host shutdown
+#: budget. It covers the graceful window above and then the application's own
+#: lifespan shutdown, which stops each agent in turn under its own deadline
+#: before host features and Phoenix.
+SERVER_TERMINATE_TIMEOUT_SECONDS = HOST_SHUTDOWN_BUDGET_SECONDS
 
 #: How long a stop that had to send SIGKILL waits before it judges whether the
 #: process is gone. A server's whole stop therefore lasts at most

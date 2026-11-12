@@ -2,23 +2,26 @@
 Sync Service
 
 Event-driven snapshot service for SQLite persistence.
-Snapshots are triggered by lifecycle events (shutdown, scheduled backup)
-rather than continuous WAL polling.
+Snapshots are triggered by the scheduled backup and explicit requests rather
+than continuous WAL polling. Shutdown uploads nothing: it records that a
+remote snapshot is owed, and the next scheduled backup sends it, or the
+service itself once the snapshot is past its deadline (#4028).
 """
 
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import tempfile
 from contextlib import closing
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Any
 
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, owned_native_wait
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
@@ -55,6 +58,44 @@ DENIED_PATH_PARTS = {
 }
 
 DEFAULT_EMPTY_DB_WARNING_THRESHOLD = 5
+
+
+def _owed_snapshot_deadline(value: object) -> float:
+    """Validate an owed-snapshot deadline: finite seconds, not negative."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"owed snapshot deadline must be a number of seconds, not {value!r}")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"owed snapshot deadline must be finite and not negative, not {value!r}")
+    return float(value)
+
+
+OWED_SNAPSHOT_DEADLINE_ENV = "KESTREL_OWED_SNAPSHOT_DEADLINE_S"
+#: The scheduled ``backup_snapshot`` runs every four hours; an hour more.
+_OWED_SNAPSHOT_DEADLINE_FALLBACK_SECONDS = 5 * 3600.0
+
+
+def owed_snapshot_deadline_from_environment() -> float:
+    """The configured owed-snapshot deadline; refuses a malformed value."""
+    raw = os.environ.get(OWED_SNAPSHOT_DEADLINE_ENV)
+    if raw is None:
+        return _OWED_SNAPSHOT_DEADLINE_FALLBACK_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"{OWED_SNAPSHOT_DEADLINE_ENV} must be a number of seconds, not {raw!r}"
+        ) from error
+    return _owed_snapshot_deadline(value)
+
+
+#: How long a remote snapshot a shutdown recorded as owed may stay owed
+#: before the sync service sends it itself (#4028). The scheduled
+#: ``backup_snapshot`` normally sends it first. This is the delivery for an
+#: agent that schedules no backup (one whose features exclude
+#: SchedulerFeature, or whose backup schedule was paused).
+#: ``KESTREL_OWED_SNAPSHOT_DEADLINE_S`` overrides it; 0 sends an owed
+#: snapshot as soon as the service starts.
+DEFAULT_OWED_SNAPSHOT_DEADLINE_SECONDS = owed_snapshot_deadline_from_environment()
 
 
 @dataclass(frozen=True)
@@ -136,7 +177,9 @@ class SyncState:
     db_path: str
     targets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     last_snapshot: Optional[datetime] = None
-    # Change fingerprint of the DB at the last completed snapshot (#1674 P3).
+    # Change fingerprint of the DB read before the last snapshot that reached
+    # every target and began with no other snapshot in flight (#1674 P3,
+    # #4028).
     # Lets force_snapshot skip a full re-snapshot when nothing changed — so
     # idle agents stop re-dumping the whole DB (notably to S3) every cycle.
     last_fingerprint: Optional[str] = None
@@ -145,6 +188,15 @@ class SyncState:
     # otherwise a newly-added backup destination would never get its baseline
     # snapshot on an unchanged DB (#1674 P3 codex round 2).
     last_snapshot_targets: List[str] = field(default_factory=list)
+    # When a shutdown last recorded that the remote copy is behind the
+    # database: shutdown uploads nothing (#4028). Cleared by the first pass
+    # that then reaches every target and began with no other pass in flight;
+    # None when nothing is owed.
+    remote_snapshot_owed_since: Optional[datetime] = None
+    # Counts the records. A pass may clear the marker only if no record was
+    # made while it ran: the time alone cannot tell two records apart, since
+    # a later record keeps the earlier time.
+    remote_snapshot_owed_generation: int = 0
     stats: SyncStats = field(default_factory=SyncStats)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -154,6 +206,12 @@ class SyncState:
             "last_snapshot": self.last_snapshot.isoformat() if self.last_snapshot else None,
             "last_fingerprint": self.last_fingerprint,
             "last_snapshot_targets": self.last_snapshot_targets,
+            "remote_snapshot_owed_since": (
+                self.remote_snapshot_owed_since.isoformat()
+                if self.remote_snapshot_owed_since
+                else None
+            ),
+            "remote_snapshot_owed_generation": self.remote_snapshot_owed_generation,
             "stats": {
                 "total_syncs": self.stats.total_syncs,
                 "successful_syncs": self.stats.successful_syncs,
@@ -174,6 +232,14 @@ class SyncState:
             last_snapshot=datetime.fromisoformat(data["last_snapshot"]) if data.get("last_snapshot") else None,
             last_fingerprint=data.get("last_fingerprint"),
             last_snapshot_targets=data.get("last_snapshot_targets", []),
+            remote_snapshot_owed_since=(
+                datetime.fromisoformat(data["remote_snapshot_owed_since"])
+                if data.get("remote_snapshot_owed_since")
+                else None
+            ),
+            remote_snapshot_owed_generation=data.get(
+                "remote_snapshot_owed_generation", 0
+            ),
             stats=SyncStats(
                 total_syncs=stats_data.get("total_syncs", 0),
                 successful_syncs=stats_data.get("successful_syncs", 0),
@@ -186,15 +252,92 @@ class SyncState:
         )
 
 
+class SyncServiceStoppingError(RuntimeError):
+    """A snapshot was asked for after the service began to stop."""
+
+
+class SyncStateWriteError(OSError):
+    """The sync state file was not written; it still holds the previous state."""
+
+
+def _publish_state_file(path: Path, content: str) -> None:
+    """Replace ``path`` with ``content`` durably, or raise ``OSError``.
+
+    Staged in a sibling file, fsynced, moved over ``path`` and the directory
+    fsynced, so the file holds the previous state or this one, never part of
+    either.
+    """
+    descriptor, staging_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    staging = Path(staging_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as staged:
+            staged.write(content)
+            staged.flush()
+            os.fsync(staged.fileno())
+        os.replace(staging, path)
+    except BaseException:
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            logger.warning(
+                "Could not remove staged sync state %s: %s", staging, cleanup_error
+            )
+        raise
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+@dataclass
+class SnapshotPass:
+    """One ``force_snapshot`` pass in flight, on the task that asked for it."""
+
+    task: Optional[asyncio.Task]
+    #: Completes when the pass has left ``force_snapshot``; ``stop()`` waits
+    #: on it rather than on the requester's whole task.
+    done: "asyncio.Future[None]"
+    #: The target the pass is uploading to now, if any.
+    target: Optional[str] = None
+    #: Why the service cancelled the pass, once it has.
+    cancelled_at: Optional[str] = None
+    #: Whether the pass has consumed that cancellation.
+    acknowledged: bool = False
+    #: Set once every target is done; the pass is no longer cancellable.
+    settling: bool = False
+    #: Set when another pass was already in flight as this one began. That
+    #: pass copied the database earlier and its upload can land after this
+    #: one's, so this pass records nothing about what the targets hold: no
+    #: fingerprint, no owed snapshot cleared (#4028). A pass that begins
+    #: later copies the database later, so it cannot leave a target older.
+    overlapped: bool = False
+    #: What the pass raised that is not its requester's own doing:
+    #: process-control evidence, or a cancellation nobody requested (a
+    #: native callback's). ``stop()`` reports it.
+    retained_error: Optional[BaseException] = None
+
+
 class SyncService:
     """
     Event-driven snapshot service.
 
     A thin registry of sync targets with a force_snapshot() method.
     Snapshots are triggered by:
-      - Shutdown (SIGTERM / graceful exit)
       - Scheduled task (every N hours)
-      - Explicit command (!backup)
+      - Explicit request
+
+    Shutdown uploads nothing. It records that a remote snapshot is owed
+    (``record_remote_snapshot_owed``); the next scheduled backup sends it and
+    clears the record (#4028). A snapshot still owed
+    ``owed_snapshot_deadline_seconds`` after the record is sent by the
+    service's own worker, so an agent that schedules no backup still sends
+    it (``_deliver_owed_snapshot``). A pass already in flight when the service
+    stops is waited for, until the host's shutdown budget cancels it
+    (``cancel_inflight_snapshots``).
 
     No background polling. No WAL watching.
     """
@@ -210,6 +353,7 @@ class SyncService:
         policy_context_provider: Optional[Callable[[], RemoteTierPolicyContext]] = None,
         retention_policy: Optional[RetentionPolicy] = None,
         empty_db_warning_threshold: int = DEFAULT_EMPTY_DB_WARNING_THRESHOLD,
+        owed_snapshot_deadline_seconds: float = DEFAULT_OWED_SNAPSHOT_DEADLINE_SECONDS,
     ):
         self.db_path = Path(db_path)
         self.state_file = Path(state_file) if state_file else Path(f"{db_path}.sync")
@@ -222,8 +366,16 @@ class SyncService:
         self._policy_context_provider = policy_context_provider
         self._retention_policy = retention_policy or load_retention_policy()
         self.empty_db_warning_threshold = empty_db_warning_threshold
+        self.owed_snapshot_deadline_seconds = _owed_snapshot_deadline(
+            owed_snapshot_deadline_seconds
+        )
         self._state: Optional[SyncState] = None
         self._poll_task: Optional[asyncio.Task] = None
+        # Sends a snapshot still owed at its deadline; see
+        # ``_deliver_owed_snapshot``.
+        self._owed_delivery_task: Optional[asyncio.Task] = None
+        self._passes: Dict[int, SnapshotPass] = {}
+        self._stopping = False
 
     def add_target(self, target: SyncTarget) -> None:
         """Add a sync target."""
@@ -371,6 +523,7 @@ class SyncService:
     async def start(self) -> None:
         """Load state and optionally start periodic sync if wal_sync_interval is set."""
         await self._load_state()
+        self._stopping = False
         if self.wal_sync_interval and self.wal_sync_interval > 0:
             self._poll_task = asyncio.create_task(self._periodic_sync())
         logger.info(
@@ -378,29 +531,247 @@ class SyncService:
             f"({len(self._targets)} targets: "
             f"{', '.join(f'{t.name}({t.trust_tier.name})' for t in self.targets_by_trust)})"
         )
+        owed = self.remote_snapshot_owed
+        if owed is not None and self._targets:
+            due = owed + timedelta(seconds=self.owed_snapshot_deadline_seconds)
+            delay = max(0.0, (due - datetime.now(timezone.utc)).total_seconds())
+            logger.info(
+                "A remote snapshot of %s has been owed since %s; the next "
+                "scheduled backup_snapshot sends it, or this service at %s",
+                self.db_path,
+                owed.isoformat(),
+                due.isoformat(),
+            )
+            self._owed_delivery_task = asyncio.create_task(
+                self._deliver_owed_snapshot(delay),
+                name=f"sync_owed_snapshot:{self.db_path}",
+            )
+
+    @property
+    def remote_snapshot_owed(self) -> Optional[datetime]:
+        """When a shutdown recorded that the remote copy is behind, or None."""
+        return self._state.remote_snapshot_owed_since if self._state else None
+
+    async def record_remote_snapshot_owed(self) -> bool:
+        """Record that the remote copy is behind the database; True if owed.
+
+        Shutdown calls this instead of uploading (#4028). An agent database
+        is gigabytes and its upload takes many minutes, far past any stop the
+        host can wait for, so a shutdown upload was always cut off by SIGKILL.
+        The record survives the restart in the state file; the next scheduled
+        ``backup_snapshot`` sends the snapshot even when the database looks
+        unchanged, and clears the record once every target has it. A
+        snapshot no backup has sent by ``owed_snapshot_deadline_seconds``
+        after the record is sent by the service itself after its next
+        ``start()``. An
+        earlier record is kept, so the time says how long the copy has been
+        behind. A service with no upload target owes nothing, and neither
+        does a database unchanged since a pass that reached every target
+        and began with no other pass in flight.
+
+        Raises ``SyncStateWriteError`` when the record was not written: the
+        shutdown then reports this step as failed instead of the snapshot as
+        owed. The record stays in memory, so the ``stop()`` that follows
+        writes it if it can.
+        """
+        if self._state is None or not self._targets:
+            return False
+        if (
+            self._state.remote_snapshot_owed_since is None
+            and self._unchanged_since_complete_pass(self._compute_db_fingerprint())
+        ):
+            logger.info(
+                "Remote copy of %s is current; no snapshot owed", self.db_path
+            )
+            return False
+        if self._state.remote_snapshot_owed_since is None:
+            self._state.remote_snapshot_owed_since = datetime.now(timezone.utc)
+        self._state.remote_snapshot_owed_generation += 1
+        await self._save_state()
+        logger.info(
+            "Remote snapshot of %s owed to %s since %s; shutdown uploads "
+            "nothing, the next scheduled backup_snapshot sends it, or this "
+            "service after its next start once the snapshot is past its "
+            "deadline",
+            self.db_path,
+            ", ".join(self.targets),
+            self._state.remote_snapshot_owed_since.isoformat(),
+        )
+        return True
+
+    def cancel_inflight_snapshots(self, reason: str) -> List[str]:
+        """Cancel every snapshot pass in flight; describe each one cancelled.
+
+        The host calls this when its shutdown budget runs out (#4028) and a
+        stopping agent is still waiting on an upload. Each cancelled pass
+        records its current target as failed with ``reason``, skips the rest
+        and returns its results normally, so its requester and ``stop()``
+        both see a finished pass rather than a cancellation. An owed
+        snapshot stays owed.
+        """
+        cancelled = []
+        for snapshot_pass in list(self._passes.values()):
+            if (
+                snapshot_pass.cancelled_at is not None
+                or snapshot_pass.settling
+                or snapshot_pass.task is None
+            ):
+                continue
+            snapshot_pass.cancelled_at = reason
+            description = (
+                f"snapshot to {snapshot_pass.target} cancelled at {reason}"
+                if snapshot_pass.target is not None
+                else f"snapshot of {self.db_path} cancelled at {reason}"
+            )
+            logger.warning("%s", description)
+            snapshot_pass.task.cancel()
+            cancelled.append(description)
+        return cancelled
 
     async def stop(self) -> None:
-        """Cancel periodic sync and save state on shutdown."""
+        """Cancel the service's own workers, wait for passes in flight, and
+        save state.
+
+        The service's workers (the periodic sync and the owed-snapshot
+        delivery) are cancelled, their uploads with them. A pass some other
+        task started (a scheduled backup) is not cancelled here: it is remote
+        work the stop waits for, until the host's shutdown budget cancels it
+        through ``cancel_inflight_snapshots``.
+        """
+        self._stopping = True
+        workers = [
+            worker
+            for worker in (self._poll_task, self._owed_delivery_task)
+            if worker is not None
+        ]
+        # Captured now: a pass that finishes while the workers below are
+        # joined still reports what it retained. Nothing new is admitted
+        # after this. A worker's own pass ends with the worker.
+        inflight = [
+            snapshot_pass
+            for snapshot_pass in self._passes.values()
+            if snapshot_pass.task is None
+            or all(snapshot_pass.task is not worker for worker in workers)
+        ]
+        failures: List[BaseException] = []
         if self._poll_task is not None:
-            if not self._poll_task.done():
-                self._poll_task.cancel()
-            outcome = await await_owned_task(self._poll_task)
-            terminal = execution_terminal_error(
-                outcome.error, outcome.cancellation,
-                retain_originals=True, prefer_cancellation=True,
-            )
-            # Only our ordinary request to stop the worker is acknowledged.
-            # Native debt and the shutdown caller's withdrawal remain control;
-            # the exact failed worker stays retained for a later stop observer.
-            if terminal is not None and (
-                is_execution_control_error(terminal)
-                or not isinstance(terminal, asyncio.CancelledError)
-                or outcome.cancellation is not None
-            ):
-                raise terminal
-            self._poll_task = None
-        await self._save_state()
+            failure = await self._stop_worker(self._poll_task)
+            if failure is None:
+                self._poll_task = None
+            else:
+                failures.append(failure)
+        if self._owed_delivery_task is not None:
+            failure = await self._stop_worker(self._owed_delivery_task)
+            if failure is None:
+                self._owed_delivery_task = None
+            else:
+                failures.append(failure)
+        retained = await self._join_snapshot_passes(inflight)
+        if retained is not None:
+            failures.append(retained)
+        await self._save_state_logging_failure()
+        if len(failures) > 1:
+            raise execution_terminal_error(*failures, retain_originals=True)
+        if failures:
+            raise failures[0]
         logger.info("Sync service stopped")
+
+    @staticmethod
+    async def _stop_worker(worker: asyncio.Task) -> Optional[BaseException]:
+        """Cancel and join one of the service's own workers.
+
+        Returns the worker's failure, or None once it is retired. Raises the
+        stop's own withdrawal.
+        """
+        if not worker.done():
+            worker.cancel()
+        outcome = await await_owned_task(worker)
+        terminal = execution_terminal_error(
+            outcome.error, outcome.cancellation,
+            retain_originals=True, prefer_cancellation=True,
+        )
+        # Only our ordinary request to stop the worker is acknowledged.
+        # Native debt and the stopping caller's withdrawal remain control;
+        # the exact failed worker stays retained for a later stop observer.
+        if terminal is not None and (
+            is_execution_control_error(terminal)
+            or not isinstance(terminal, asyncio.CancelledError)
+            or outcome.cancellation is not None
+        ):
+            if outcome.cancellation is not None:
+                raise terminal
+            # The worker's own failure does not excuse the stop from waiting
+            # for the other passes still in flight.
+            return terminal
+        return None
+
+    async def _deliver_owed_snapshot(self, delay: float) -> None:
+        """Send a snapshot still owed once its deadline has passed (#4028).
+
+        Shutdown records a snapshot as owed and uploads nothing. The
+        scheduled ``backup_snapshot`` normally sends it; an agent that
+        schedules no backup has nothing else to. This worker sleeps until
+        ``owed_snapshot_deadline_seconds`` after the record and then sends
+        it, unless a pass has cleared it meanwhile. One attempt per start:
+        a snapshot it cannot send stays owed for the next scheduled backup
+        or the next start.
+        """
+        await asyncio.sleep(delay)
+        owed = self.remote_snapshot_owed
+        if owed is None:
+            return
+        logger.info(
+            "Sending the remote snapshot of %s owed since %s: no backup has "
+            "sent it within %.0fs",
+            self.db_path,
+            owed.isoformat(),
+            self.owed_snapshot_deadline_seconds,
+        )
+        try:
+            results = await self.snapshot_if_changed()
+        except SyncServiceStoppingError:
+            return
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logger.error(
+                "Owed remote snapshot of %s failed: %s: %s",
+                self.db_path,
+                type(error).__name__,
+                error,
+            )
+            return
+        if self.remote_snapshot_owed is not None:
+            failed = sorted(
+                name for name, result in results.items() if not result.success
+            )
+            logger.warning(
+                "Remote snapshot of %s is still owed: %s",
+                self.db_path,
+                ", ".join(failed) if failed else "a later record keeps it owed",
+            )
+
+    async def _join_snapshot_passes(
+        self, passes: List[SnapshotPass]
+    ) -> Optional[BaseException]:
+        """Wait for each of ``passes`` to finish; return what they retained."""
+        current = asyncio.current_task()
+        retained: List[BaseException] = []
+        for snapshot_pass in passes:
+            if snapshot_pass.task is current:
+                continue
+            # Declared as a join of the requester's task, so work inside the
+            # pass that observes shutdown completion does not wait on this
+            # stop in turn.
+            async with owned_native_wait(
+                () if snapshot_pass.task is None else (snapshot_pass.task,)
+            ):
+                await asyncio.wait({snapshot_pass.done})
+            if snapshot_pass.retained_error is not None:
+                retained.append(snapshot_pass.retained_error)
+        if not retained:
+            return None
+        return execution_terminal_error(*retained, retain_originals=True)
 
     async def _periodic_sync(self) -> None:
         """Background loop that triggers force_snapshot at wal_sync_interval."""
@@ -437,20 +808,25 @@ class SyncService:
 
         Skips the whole pass when the DB fingerprint is unchanged since the last
         completed snapshot — an idle agent should not re-dump its entire DB
-        (notably the full S3 upload) every cycle. Records the fingerprint only
-        after a successful snapshot so a fully-failed attempt is retried. The
-        fingerprint is conservative: it never skips a real change. Explicit
-        ``!backup`` and shutdown keep using ``force_snapshot`` (always runs)."""
+        (notably the full S3 upload) every cycle. The pass records the
+        fingerprint read before it, and only once every target confirmed its
+        snapshot and no earlier pass was still in flight as it began
+        (``_snapshot_to_targets``), so a failed or overlapped attempt is
+        retried. The pass copies the
+        database at or after that read, so a write committed while it uploads
+        still shows as a change afterwards (#4028). The fingerprint is
+        conservative: it never skips a real change. Explicit
+        requests keep using ``force_snapshot`` (always runs), and so does a
+        snapshot a shutdown recorded as owed (#4028): it is sent even when the
+        database looks unchanged."""
+        # Read with no await before the pass is admitted, so a pass that
+        # copied the database before this read is still in flight at the
+        # admission and marks this pass overlapped.
         fingerprint = self._compute_db_fingerprint()
-        current_targets = {t.name for t in self._targets}
         if (
-            fingerprint is not None
-            and self._state is not None
-            and self._state.last_snapshot is not None
-            and self._state.last_fingerprint == fingerprint
-            # Every current target must already be covered — else a newly-added
-            # destination would never get its baseline snapshot on an idle DB.
-            and current_targets.issubset(set(self._state.last_snapshot_targets))
+            self._state is not None
+            and self._state.remote_snapshot_owed_since is None
+            and self._unchanged_since_complete_pass(fingerprint)
         ):
             logger.debug("Snapshot skipped — DB unchanged since last snapshot")
             return {
@@ -463,31 +839,115 @@ class SyncService:
                     attempted=False,
                 )
             }
-        results = await self.force_snapshot()
-        # Advance the fingerprint ONLY when every target succeeded. If any
-        # target failed (transient per-target outage), leave the fingerprint
-        # so the next cycle retries rather than skipping the failed target as
-        # "unchanged" until some unrelated DB write happens to bump the
-        # fingerprint. (No targets → all() is True → record, nothing to retry.)
-        if (
+        return await self._run_snapshot_pass(fingerprint)
+
+    def _unchanged_since_complete_pass(self, fingerprint: Optional[str]) -> bool:
+        """Whether ``fingerprint`` shows the database as it was at the last
+        pass that reached every current target and began with no other pass
+        in flight (the only passes that record one). An unreadable
+        fingerprint (None) never counts as unchanged."""
+        current_targets = {t.name for t in self._targets}
+        return (
             fingerprint is not None
             and self._state is not None
-            and results
-            and all(r.success for r in results.values())
-        ):
-            completed_fingerprint = self._compute_db_fingerprint() or fingerprint
-            self._state.last_fingerprint = completed_fingerprint
-            self._state.last_snapshot_targets = sorted(
-                r.target_name for r in results.values() if r.success
-            )
-            await self._save_state()
-        return results
+            and self._state.last_snapshot is not None
+            and self._state.last_fingerprint == fingerprint
+            # Every current target must already be covered — else a newly-added
+            # destination would never get its baseline snapshot on an idle DB.
+            and current_targets.issubset(set(self._state.last_snapshot_targets))
+        )
 
     async def force_snapshot(self) -> Dict[str, SyncResult]:
-        """Snapshot to all targets. Called on shutdown, scheduled backup, or !backup."""
+        """Snapshot to all targets: the scheduled backup, the periodic sync or
+        an explicit request. Shutdown never calls this; it records the
+        snapshot as owed instead (#4028).
+
+        The pass runs on the caller's task, which can cancel it as before.
+        ``stop()`` waits for it, and the host's shutdown budget cancels it
+        through ``cancel_inflight_snapshots``."""
+        return await self._run_snapshot_pass(None)
+
+    async def _run_snapshot_pass(
+        self, fingerprint: Optional[str]
+    ) -> Dict[str, SyncResult]:
+        """One pass to every target; ``fingerprint`` is the database's, read
+        before the pass, for the pass to record, or None to record none."""
+        snapshot_pass = self._admit_snapshot_pass()
+        try:
+            return await self._snapshot_to_targets(snapshot_pass, fingerprint)
+        except BaseException as error:
+            if is_execution_control_error(error) or (
+                isinstance(error, asyncio.CancelledError)
+                and snapshot_pass.task is not None
+                and not snapshot_pass.task.cancelling()
+            ):
+                snapshot_pass.retained_error = error
+            raise
+        finally:
+            self._passes.pop(id(snapshot_pass), None)
+            if not snapshot_pass.done.done():
+                snapshot_pass.done.set_result(None)
+
+    def _admit_snapshot_pass(self) -> SnapshotPass:
+        if self._stopping:
+            raise SyncServiceStoppingError(
+                f"sync service for {self.db_path} is stopping; no new snapshot"
+            )
+        snapshot_pass = SnapshotPass(
+            task=asyncio.current_task(),
+            done=asyncio.get_running_loop().create_future(),
+        )
+        snapshot_pass.overlapped = bool(self._passes)
+        self._passes[id(snapshot_pass)] = snapshot_pass
+        return snapshot_pass
+
+    @staticmethod
+    def _acknowledges_cancellation(
+        snapshot_pass: SnapshotPass, cancellation: asyncio.CancelledError
+    ) -> bool:
+        """Whether ``cancellation`` is the service's own and nothing else's.
+
+        Only the cancellation ``cancel_inflight_snapshots`` requested is
+        consumed. A requester's cancellation, or process-control evidence,
+        still propagates.
+        """
+        if (
+            snapshot_pass.cancelled_at is None
+            or snapshot_pass.acknowledged
+            or is_execution_control_error(cancellation)
+        ):
+            return False
+        snapshot_pass.acknowledged = True
+        task = snapshot_pass.task
+        return task is None or task.uncancel() == 0
+
+    def _every_target_reached(self, results: Dict[str, SyncResult]) -> bool:
+        if not self._targets:
+            return False
+        # A destination the policy denies is owed nothing; its result is a
+        # success that was never attempted.
+        for target in self._targets:
+            result = results.get(target.name)
+            if result is None or not result.success:
+                return False
+        return True
+
+    async def _snapshot_to_targets(
+        self, snapshot_pass: SnapshotPass, fingerprint: Optional[str]
+    ) -> Dict[str, SyncResult]:
+        # A record made while this pass runs is about a later state of the
+        # database than the one this pass copies; only an earlier one can be
+        # cleared by it.
+        owed_at_start = self.remote_snapshot_owed
+        owed_generation_at_start = (
+            self._state.remote_snapshot_owed_generation if self._state else 0
+        )
         results = dict(self._policy_skips)
         successful_snapshots = 0
         for target in self._targets:
+            if snapshot_pass.cancelled_at is not None:
+                # The previous target swallowed the service's cancellation.
+                break
             if target.trust_tier in REMOTE_SYNC_TRUST_TIERS:
                 decision = self._remote_target_policy_decision()
                 if decision is not None and not decision.allowed:
@@ -499,6 +959,8 @@ class SyncService:
                         decision.reason,
                     )
                     continue
+            snapshot_pass.target = target.name
+            result: Optional[SyncResult] = None
             try:
                 # The result is what leaves this loop; the target does not.
                 # Carry the target's bounded kind on a copy so the scheduled
@@ -515,6 +977,27 @@ class SyncService:
                 self._update_stats(result)
                 if self.on_sync:
                     self.on_sync(result)
+            except asyncio.CancelledError as cancellation:
+                if not self._acknowledges_cancellation(snapshot_pass, cancellation):
+                    raise
+                # An upload that finished before a cancelled prune still
+                # reached its target.
+                if result is not None and self.on_sync:
+                    self.on_sync(result)
+                if result is None:
+                    result = SyncResult(
+                        success=False,
+                        target_name=target.name,
+                        bytes_synced=0,
+                        frames_synced=0,
+                        timestamp=datetime.now(timezone.utc),
+                        error=f"cancelled at {snapshot_pass.cancelled_at}",
+                        kind=target.kind,
+                    )
+                results[target.name] = result
+                self._update_stats(result)
+                self._record_storage_quota(target)
+                break
             except Exception as e:
                 if is_execution_control_error(e):
                     raise
@@ -533,11 +1016,58 @@ class SyncService:
                     kind=target.kind,
                 )
             self._record_storage_quota(target)
+        snapshot_pass.target = None
+        snapshot_pass.settling = True
+        if (
+            snapshot_pass.cancelled_at is not None
+            and not snapshot_pass.acknowledged
+            and snapshot_pass.task is not None
+        ):
+            # A target swallowed the cancellation; take back the request.
+            snapshot_pass.acknowledged = True
+            snapshot_pass.task.uncancel()
 
         if self._state:
             self._warn_if_repeated_empty_syncs(successful_snapshots)
             self._state.last_snapshot = datetime.now(timezone.utc)
-            await self._save_state()
+            # The fingerprint recorded and the owed record cleared both claim
+            # no target holds an older copy than this pass's. A pass already
+            # in flight as this one began can still land one (#4028).
+            holds_this_pass = not snapshot_pass.overlapped
+            # Advance the fingerprint ONLY when every target succeeded. If any
+            # target failed (transient per-target outage), leave the
+            # fingerprint so the next cycle retries rather than skipping the
+            # failed target as "unchanged" until some unrelated DB write
+            # happens to bump the fingerprint. (No targets → all() is True →
+            # record, nothing to retry.) The fingerprint recorded is the one
+            # read before the pass: a read after it would describe writes the
+            # snapshots never copied, and the next backup, or a shutdown,
+            # would take them as backed up.
+            if (
+                holds_this_pass
+                and fingerprint is not None
+                and results
+                and all(r.success for r in results.values())
+            ):
+                self._state.last_fingerprint = fingerprint
+                self._state.last_snapshot_targets = sorted(
+                    r.target_name for r in results.values() if r.success
+                )
+            if (
+                holds_this_pass
+                and owed_at_start is not None
+                and self._state.remote_snapshot_owed_generation
+                == owed_generation_at_start
+                and self._every_target_reached(results)
+            ):
+                self._state.remote_snapshot_owed_since = None
+                logger.info(
+                    "Owed remote snapshot of %s (owed since %s) sent to %s",
+                    self.db_path,
+                    owed_at_start.isoformat(),
+                    ", ".join(self.targets),
+                )
+            await self._save_state_logging_failure()
 
         return results
 
@@ -711,11 +1241,33 @@ class SyncService:
             self._state = SyncState(db_path=str(self.db_path))
 
     async def _save_state(self) -> None:
-        if self._state:
-            try:
-                with open(self.state_file, "w", encoding="utf-8") as f:
-                    json.dump(self._state.to_dict(), f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception as e:
-                logger.error(f"Failed to save sync state: {e}")
+        """Write the state file, or raise ``SyncStateWriteError``.
+
+        The file is replaced whole, so a write that fails leaves the previous
+        state. Writing it in place truncated it first, and the failure was
+        logged and dropped: a shutdown reported a remote snapshot as owed that
+        no restart could find (#4028).
+        """
+        if not self._state:
+            return
+        content = json.dumps(self._state.to_dict(), indent=2)
+        try:
+            _publish_state_file(self.state_file, content)
+        except OSError as error:
+            raise SyncStateWriteError(
+                f"sync state {self.state_file} was not written: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+
+    async def _save_state_logging_failure(self) -> None:
+        """``_save_state`` for a write whose loss is already accounted for.
+
+        The file keeps a remote snapshot it still records as owed, or an
+        older fingerprint, each costing at most one more upload. An owed
+        record that never reached the file was reported by
+        ``record_remote_snapshot_owed`` when its own write failed.
+        """
+        try:
+            await self._save_state()
+        except SyncStateWriteError as error:
+            logger.error("%s", error)

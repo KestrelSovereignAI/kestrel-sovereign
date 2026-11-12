@@ -95,6 +95,12 @@ async def prepared_tail(native_snapshot, tmp_path, request):
     if not getattr(request, "param", False):
         admission.set()
     state["upload_admission_barrier"] = admission
+    # The tail starts no upload (#4028); a scheduled backup still in flight
+    # when it runs is the snapshot its sync-stop retains.
+    state["inflight_snapshot"] = create_owned_task(
+        service.force_snapshot(), retain_originals=True
+    )
+    tasks.append(state["inflight_snapshot"])
     try:
         yield agent, native_snapshot
     finally:
@@ -695,16 +701,19 @@ async def test_borrowed_withdrawal_cannot_drop_a_completed_original_tail_failure
     agent, case = prepared_tail
     service, release_close, state, tasks = case[2], case[5], case[-2], case[-1]
     state["close_error"] = None
-    original_snapshot = service.force_snapshot
-    source = OSError("original snapshot finalizer failed after native HTTP close")
+    original_record = service.record_remote_snapshot_owed
+    source = OSError("original owed-record finalizer failed after native HTTP close")
     originals = []
 
-    async def snapshot():
+    async def record():
+        # A tail step retained past its guard while the in-flight snapshot
+        # finishes its native HTTP close, then failing ordinarily.
         originals.append(asyncio.current_task())
-        await original_snapshot()
+        await original_record()
+        await asyncio.wait({state["inflight_snapshot"]})
         raise source
 
-    monkeypatch.setattr(service, "force_snapshot", snapshot)
+    monkeypatch.setattr(service, "record_remote_snapshot_owed", record)
     await agent._run_durable_shutdown_tail(0.15)
     assert originals and originals[0] in agent._durable_shutdown_tail_tasks
     backend = SQLiteBackend(":memory:")
@@ -786,7 +795,7 @@ async def test_refused_completion_fallback_resnapshots_a_new_original_native_chi
     )
     children = []
     timeline = []
-    actual_snapshot = service.force_snapshot
+    actual_record = service.record_remote_snapshot_owed
 
     async def close():
         await release_sql.wait()
@@ -794,8 +803,11 @@ async def test_refused_completion_fallback_resnapshots_a_new_original_native_chi
 
     monkeypatch.setattr(backend, "close", close)
 
-    async def snapshot():
-        await actual_snapshot()
+    async def record():
+        # A tail step that outlives its guard behind the in-flight snapshot,
+        # then publishes a native child it cannot report.
+        await actual_record()
+        await asyncio.wait({state["inflight_snapshot"]})
         child = create_owned_task(
             backend.close(), retirement_resource=backend, retain_originals=True
         )
@@ -813,7 +825,7 @@ async def test_refused_completion_fallback_resnapshots_a_new_original_native_chi
         )
         raise failure
 
-    monkeypatch.setattr(service, "force_snapshot", snapshot)
+    monkeypatch.setattr(service, "record_remote_snapshot_owed", record)
     loop = asyncio.get_running_loop()
     previous_factory = loop.get_task_factory()
     callback_fault = OSError("original native terminal callback publication refused")

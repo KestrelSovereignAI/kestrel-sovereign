@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from kestrel_sovereign.storage.sync.gcs_transfer import (
+    make_session_abortable,
+    run_gcs_transfer,
+)
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
 from kestrel_sovereign.storage.sync.retention import (
     RetentionItem,
@@ -50,6 +54,10 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
 
     Stores consistent SQLite snapshots in GCS with content-hash dedup.
     Uses Application Default Credentials (ADC) for auth.
+
+    The library is synchronous: every call runs on a thread of its own
+    through ``run_gcs_transfer``, so cancelling a snapshot pass interrupts
+    its upload and the thread ends with it (#4028).
     """
 
     def __init__(
@@ -96,12 +104,14 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
                 if not self._project:
                     kwargs["project"] = credentials.project_id
             client = gcs_storage.Client(**kwargs)
+            # ``client._http`` is the transport every blob request uses
+            # (``Blob._get_transport``); its requests must be interruptible.
+            make_session_abortable(client._http)
             self._bucket = client.bucket(self.bucket_name)
         return self._bucket
 
     async def sync_snapshot(self, db_path: Path) -> SyncResult:
         """Upload consistent snapshot to GCS with content-hash dedup."""
-        import asyncio
         timestamp = datetime.now(timezone.utc)
 
         try:
@@ -120,7 +130,8 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
                     metadata={"skipped": True, "blob": manifest.get("blob_name")},
                 )
 
-            # Upload in thread (google-cloud-storage is synchronous)
+            # Upload on a thread of its own (google-cloud-storage is
+            # synchronous); cancelling this task interrupts it.
             blob_name = (
                 f"{self.prefix}{self.agent_id}/snapshots/"
                 f"{timestamp.strftime('%Y%m%d_%H%M%S')}.db"
@@ -152,7 +163,7 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
                         break
                 return blob_name
 
-            result_name = await asyncio.to_thread(_upload)
+            result_name = await run_gcs_transfer(_upload, label=self.name)
 
             logger.info(f"Uploaded snapshot to gs://{self.bucket_name}/{result_name} ({len(content)} bytes)")
 
@@ -205,7 +216,6 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
 
     async def prune(self, policy: RetentionPolicy) -> Dict[str, Any]:
         """Prune timestamped GCS snapshots while preserving latest.db."""
-        import asyncio
 
         snapshots_prefix = f"{self.prefix}{self.agent_id}/snapshots/"
         latest_name = f"{self.prefix}{self.agent_id}/latest.db"
@@ -240,11 +250,10 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
                 deleted.append(item.key)
             return {"deleted": len(deleted), "keys": deleted, "scanned": len(items)}
 
-        return await asyncio.to_thread(_list_and_delete)
+        return await run_gcs_transfer(_list_and_delete, label=self.name)
 
     async def restore_snapshot(self, dest_path: Path) -> Optional[SyncResult]:
         """Download the latest snapshot from GCS."""
-        import asyncio
         timestamp = datetime.now(timezone.utc)
 
         try:
@@ -255,7 +264,7 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
                     return None
                 return blob.download_as_bytes()
 
-            content = await asyncio.to_thread(_download)
+            content = await run_gcs_transfer(_download, label=self.name)
             if not content:
                 logger.info("No GCS snapshot found to restore")
                 return None
@@ -287,12 +296,11 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
 
     async def health_check(self) -> bool:
         """Check GCS bucket access."""
-        import asyncio
         try:
             def _check():
                 bucket = self._get_bucket()
                 return bucket.exists()
-            return await asyncio.to_thread(_check)
+            return await run_gcs_transfer(_check, label=self.name)
         except Exception as e:
             logger.warning(f"GCS health check failed: {e}")
             return False

@@ -1682,7 +1682,7 @@ class TestLifecycle:
         shutdown paths. If a feature shutdown is cancelled by the outer
         timeout, the sweep must NOT report a successful shutdown — but it
         must also NOT skip the safety-critical durable cleanup tail
-        (background-task cleanup, memory shutdown, final sync snapshot,
+        (background-task cleanup, memory shutdown, owed-snapshot record,
         storage close). So storage MUST still close, and CancelledError
         MUST still propagate so wait_for surfaces the timeout.
         """
@@ -3239,38 +3239,43 @@ class TestLifecycle:
                     )
 
     @pytest.mark.asyncio
-    async def test_cancellation_during_force_snapshot_completes_it_and_stops(
+    async def test_cancellation_during_owed_record_completes_it_and_stops(
         self, tmp_path
     ):
-        """Cancellation during force_snapshot: snapshot completes, stop() runs (#2409).
+        """Cancellation during the owed-snapshot record: it completes, stop() runs.
 
-        The final snapshot is shielded so cancellation neither aborts it nor
+        Shutdown uploads no snapshot (#4028); it records the remote snapshot
+        as owed. The record is shielded so cancellation neither aborts it nor
         skips the following ``stop()`` (which releases the sync worker), while
-        cancellation still propagates out of ``shutdown()``.
+        cancellation still propagates out of ``shutdown()`` (#2409).
         """
         agent = KestrelAgent(
             did="did:test:123",
             storage_path=str(tmp_path / "test.db"),
         )
 
-        snapshot_completed = asyncio.Event()
+        recorded = asyncio.Event()
         stop_called = asyncio.Event()
 
-        async def _slow_snapshot():
+        async def _slow_record():
             await asyncio.sleep(0.1)
-            snapshot_completed.set()
+            recorded.set()
+            return True
 
         async def _stop():
             stop_called.set()
 
         sync = MagicMock()
         sync.is_running = True
-        sync.force_snapshot = _slow_snapshot
+        sync.force_snapshot = AsyncMock(
+            side_effect=AssertionError("shutdown started a remote snapshot upload")
+        )
+        sync.record_remote_snapshot_owed = _slow_record
         sync.stop = _stop
         agent._sync_service = sync
 
         # A feature that cancels the whole shutdown, so cancellation is in
-        # flight when the durable tail (and its force_snapshot) runs.
+        # flight when the durable tail (and its owed record) runs.
         cancelling = MagicMock()
         cancelling.shutdown = AsyncMock(side_effect=asyncio.CancelledError())
         agent.features = {"Canceller": cancelling}
@@ -3283,8 +3288,10 @@ class TestLifecycle:
         with pytest.raises(asyncio.CancelledError):
             await agent.shutdown()
 
-        # Snapshot was NOT aborted by the in-flight cancellation...
-        assert snapshot_completed.is_set()
+        # The record was NOT aborted by the in-flight cancellation...
+        assert recorded.is_set()
+        # ...no upload started...
+        sync.force_snapshot.assert_not_awaited()
         # ...and stop() still ran...
         assert stop_called.is_set()
         # ...and storage still closed...

@@ -357,7 +357,7 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
         phases.append("host")
         raise RuntimeError("host failure")
 
-    async def fail_agents(_app) -> None:
+    async def fail_agents(_app, **_remote_work_deadline) -> None:
         phases.append("agents")
         raise RuntimeError("agent failure")
 

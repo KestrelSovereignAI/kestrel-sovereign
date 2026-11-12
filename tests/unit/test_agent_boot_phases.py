@@ -712,6 +712,7 @@ def _boot_holding_every_resource(
     sync_service.start = AsyncMock()
     sync_service.stop = AsyncMock()
     sync_service.force_snapshot = AsyncMock()
+    sync_service.record_remote_snapshot_owed = AsyncMock(return_value=True)
     with _boot_mocks(real_task_manager, primary_backend=primary_backend) as mocks, patch.dict(
         os.environ, {"GCS_BACKUP_BUCKET": "unit-test-bucket"}
     ), patch(
@@ -1247,24 +1248,32 @@ async def test_a_truthful_feature_whose_teardown_reports_retained_keeps_the_reco
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("snapshot_hangs", [True, False], ids=["abandoned", "flushed"])
-async def test_an_abandoned_sync_snapshot_keeps_the_sync_service_held(
-    tmp_path, monkeypatch, snapshot_hangs
+@pytest.mark.parametrize("record_hangs", [True, False], ids=["abandoned", "recorded"])
+async def test_an_abandoned_owed_snapshot_record_keeps_the_sync_service_held(
+    tmp_path, monkeypatch, record_hangs
 ):
-    """Work an abandoned snapshot started may outlive the worker's stop."""
+    """An abandoned owed-snapshot record may outlive the worker's stop.
+
+    Shutdown records the remote snapshot as owed instead of uploading it
+    (#4028); it never starts an upload.
+    """
     from kestrel_sovereign import kestrel_agent
 
     _trust(monkeypatch, _BOOT_OWNERS)
     release = asyncio.Event()
 
-    async def snapshot():
-        if snapshot_hangs:
+    async def record():
+        if record_hangs:
             await release.wait()
+        return True
 
     agent = _make_agent(tmp_path)
     sync_service = MagicMock()
     sync_service.is_running = True
-    sync_service.force_snapshot = snapshot
+    sync_service.force_snapshot = AsyncMock(
+        side_effect=AssertionError("shutdown started a remote snapshot upload")
+    )
+    sync_service.record_remote_snapshot_owed = record
     sync_service.stop = AsyncMock()
     agent._sync_service = sync_service
     agent.storage = AsyncMock()
@@ -1276,7 +1285,8 @@ async def test_an_abandoned_sync_snapshot_keeps_the_sync_service_held(
             await asyncio.wait_for(agent._run_durable_shutdown_tail(0.5), timeout=10)
 
         sync_service.stop.assert_awaited_once()
-        assert custody.held == (("sync_service",) if snapshot_hangs else ())
+        sync_service.force_snapshot.assert_not_awaited()
+        assert custody.held == (("sync_service",) if record_hangs else ())
     finally:
         release.set()
         await _cleanup(agent)
