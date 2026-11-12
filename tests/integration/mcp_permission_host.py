@@ -133,6 +133,10 @@ class ObservedHost:
         journal = agent.tool_effect_store
         security = agent.features['SecurityFeature']
         temporary.write_text(json.dumps(dict(pid=os.getpid(), did=agent.did,
+            live_turn_id=agent._live_turn_id,
+            pending_memory_tasks=sum(not task.done()
+                and task.get_name() == 'post_response_memory_enrichment'
+                for task in agent._background_tasks),
             privacy_mode=agent.privacy_mode.value,
             journal_initialized=journal is not None and journal.initialized,
             journal_on_primary=journal is not None and journal.database is agent._raw_storage.db,
