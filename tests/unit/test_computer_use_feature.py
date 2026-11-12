@@ -969,3 +969,73 @@ async def test_an_unknown_backend_is_refused_not_read_as_docker(tmp_path: Path, 
     envelope = await feature.shell(command="echo hi")
     assert envelope.error.startswith("readiness:backend not initialized")
     assert f"unknown backend {value!r}" in envelope.error
+
+
+# --- auto_approved_subcommands: wired into the shell tool's gate ---
+
+
+def _git_repo(root: Path) -> Path:
+    import subprocess
+
+    repo = root / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    return repo
+
+
+def _subcommand_config(root: Path, subcommands: Any) -> dict[str, Any]:
+    return {
+        **_config(root),
+        "allowed_binaries": ["git"],
+        "auto_approved_subcommands": subcommands,
+    }
+
+
+async def _make_subcommand_feature(root: Path, queue: FakeApprovalQueue, subcommands: Any):
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = ComputerUseFeature(agent)
+    feature._cfg = _subcommand_config(root, subcommands)
+    await feature.initialize()
+    return feature
+
+
+@pytest.mark.asyncio
+async def test_a_listed_git_read_runs_without_the_queue(tmp_path: Path):
+    repo = _git_repo(tmp_path)
+    queue = FakeApprovalQueue(decision=(False, "once"))
+    feature = await _make_subcommand_feature(
+        tmp_path, queue, {"git": {"allow": ["status"], "value_options": ["-C"]}}
+    )
+    envelope = await feature.shell(command=f"git -C {repo} status --short", timeout=10)
+    assert envelope.status is ToolResultStatus.OK, envelope.error
+    assert queue.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_git_write_queues_inside_an_allowed_path(tmp_path: Path):
+    """The path is allow-listed for reading, which used to be enough for
+    any git subcommand to skip the queue. ``reset`` is not listed."""
+    repo = _git_repo(tmp_path)
+    queue = FakeApprovalQueue(decision=(False, "once"))
+    feature = await _make_subcommand_feature(
+        tmp_path, queue, {"git": {"allow": ["status"], "value_options": ["-C"]}}
+    )
+    envelope = await feature.shell(command=f"git -C {repo} reset --hard", timeout=10)
+    assert envelope.status is not ToolResultStatus.OK
+    assert len(queue.calls) == 1
+    assert queue.calls[0]["args"]["rule"] == "subcommand:git:reset"
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_subcommand_policy_refuses_every_call(tmp_path: Path):
+    queue = FakeApprovalQueue()
+    feature = await _make_subcommand_feature(tmp_path, queue, {"git": {"allow": []}})
+    assert feature._backend is None
+    envelope = await feature.shell(command="git status", timeout=10)
+    assert envelope.error.startswith("readiness:backend not initialized")
+    assert "must name at least one subcommand" in envelope.error
+    assert queue.calls == []

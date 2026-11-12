@@ -68,11 +68,13 @@ from .policy import (
     BinaryPolicy,
     Decision,
     PathPolicy,
+    SubcommandPolicyError,
     command_word_is_shell_grammar,
     evaluate_argv_paths,
     first_shell_significant_character,
     quote_words_containing_shell_syntax,
     split_command,
+    subcommand_policies_from_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -412,9 +414,21 @@ class ComputerUseFeature(Feature):
             auto_bins = list(cfg_legacy)
         else:
             auto_bins = list(_DEFAULT_AUTO_APPROVED_BINS)
+        try:
+            subcommands = subcommand_policies_from_config(
+                self._cfg.get("auto_approved_subcommands"), auto_approved=auto_bins,
+            )
+        except SubcommandPolicyError as exc:
+            # No backend is built, so every call is refused at readiness:
+            # a policy that failed to load would leave its binary blessing
+            # every subcommand.
+            self._init_refusal = str(exc)
+            logger.error("ComputerUseFeature: %s. No computer-use call will run.", exc)
+            return
         self._binary_policy = BinaryPolicy(
             allow=auto_bins,
             deny=list(self._cfg.get("denied_binaries", _DEFAULT_DENIED_BINS)),
+            subcommands=subcommands,
         )
 
         granted = self._granted_capabilities()
