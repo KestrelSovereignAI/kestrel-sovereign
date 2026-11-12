@@ -10,6 +10,7 @@ import pytest_asyncio
 from cryptography.fernet import Fernet
 from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
 
+from kestrel_sovereign.llm.service import PolicyDeniedError
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.turn_provenance import WakeReplyReceipt
 from tests.shared.booted_agent import booted_agent
@@ -23,6 +24,11 @@ async def assistant_agent(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
     monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
+    # Optional provider discovery must not read an operator's AWS profile or
+    # probe EC2 metadata. NONE denies generation, not provider registration.
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no-aws-config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-credentials"))
     (tmp_path / "kestrel.toml").write_text('[llm]\nroute_priority=[]\n')
     policy = PayerPolicy.model_validate({
         **PayerPolicy.host_env_default().model_dump(),
@@ -32,7 +38,8 @@ async def assistant_agent(tmp_path, monkeypatch):
             provenance="test:1990-original-assistant-receipt", features=set(),
             payer_policy=policy) as agent:
         assert agent.llm_service.disabled
-        assert not agent.llm_service.providers
+        with pytest.raises(PolicyDeniedError, match="disabled by PayerPolicy"):
+            await agent.llm_service.get_response("Persistence fixture", "No generation permitted")
         yield agent
 
 
