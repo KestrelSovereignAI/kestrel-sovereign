@@ -273,7 +273,7 @@ Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussio
 
 [project.optional-dependencies]
 # Installed native MCP seam tests remain separate from core-only boot tests.
-mcp-integration = ["kestrel-feature-mcp>=0.16.0,<1"]
+mcp-integration = ["kestrel-feature-mcp>=0.17.0,<1"]
 # Test dependencies (not needed in production)
 test = [
     "pyright==1.1.403",

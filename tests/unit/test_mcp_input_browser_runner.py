@@ -3,10 +3,14 @@
 import hashlib
 import importlib.util
 from pathlib import Path
+import tomllib
 import warnings
 import zipfile
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
+import yaml
 
 
 def runner():
@@ -15,6 +19,19 @@ def runner():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_input_browser_support_matches_the_public_host_feature_minimum():
+    root = Path(__file__).parents[2]
+    project = tomllib.loads((root / 'pyproject.toml').read_text())['project']
+    requirement, = [Requirement(raw) for raw in project['optional-dependencies']['mcp-integration']
+                    if Requirement(raw).name == 'kestrel-feature-mcp']
+    minimum = max(Version(spec.version) for spec in requirement.specifier if spec.operator == '>=')
+    workflow = yaml.safe_load((root / '.github/workflows/ci.yml').read_text())
+    support, = [step['with'] for step in workflow['jobs']['mcp-input-browser']['steps']
+                if step.get('with', {}).get('repository') == 'KestrelSovereignAI/kestrel-feature-mcp']
+    assert support['ref'] == f'v{minimum}', (
+        'Native input acceptance must use the same public MCP release as the declared host minimum')
 
 
 @pytest.mark.parametrize('fault', ['altered', 'missing', 'duplicate', 'empty'])

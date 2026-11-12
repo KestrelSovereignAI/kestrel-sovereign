@@ -158,13 +158,14 @@ def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
         for raw in dependencies
         if Requirement(raw).name == "kestrel-feature-mcp"
     ]
-    floor = Version("0.16.0")
+    floor = Version("0.17.0")
     _assert_requirement_floor(requirement, floor)
     assert not requirement.specifier.contains("0.11.2")
     assert not requirement.specifier.contains("0.12.0")
     assert not requirement.specifier.contains("0.13.0")
     assert not requirement.specifier.contains("0.14.1")
     assert not requirement.specifier.contains("0.15.0")
+    assert not requirement.specifier.contains("0.16.0")
     assert requirement.specifier.contains(floor)
     (package,) = [
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
