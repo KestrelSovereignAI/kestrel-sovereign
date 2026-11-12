@@ -172,7 +172,6 @@ from kestrel_sovereign.spawn.mandate import (
     remaining_spawn_ttl_seconds,
 )
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.storage.db.interface import DatabaseError
 from kestrel_sovereign.storage.turn_provenance import (
     WakeReplyReceipt,
     turn_opener_metadata,

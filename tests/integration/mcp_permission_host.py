@@ -164,8 +164,8 @@ async def serve(descriptor, ready):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         native_config = home / "multi_agent.toml"
-        entries = [dict(agent_name=spec['agent_name'], agent_data=spec['agent_data'],
-            features=spec.get('features', ["MCPAgent", "BootstrapFeature"]))]
+        entries = [{'agent_name': spec['agent_name'], 'agent_data': spec['agent_data'],
+            'features': spec.get('features', ["MCPAgent", "BootstrapFeature"])}]
         entries.extend(spec.get('peer_agents', []))
         configuration = ['[host]\nbind="127.0.0.1"\nport=' + str(port) + '\n']
         for entry in entries:
