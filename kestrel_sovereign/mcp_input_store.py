@@ -269,6 +269,12 @@ class MCPInputStore(UnifiedStoreBase):
             for decision_id, input_digest, reason in entries:
                 await self.database.execute('INSERT INTO mcp_input_decisions(scope,decision_id,operation_digest,input_digest,reason,decided_at) VALUES (?,?,?,?,?,?)', (self.scope, decision_id, operation, input_digest, reason, now))
 
+    async def _locked_pending_count(self, now: float) -> int:
+        """Serialize creation and response admission under their own transaction."""
+        await self.database.execute('UPDATE mcp_input_scopes SET revision=revision+1 WHERE scope=?', (self.scope,))
+        count = await self.database.fetchone("SELECT COUNT(DISTINCT reservation_id) FROM mcp_inputs WHERE scope=? AND (state='RESPONDING' OR (state='WAITING' AND expires_at>?))", (self.scope, now))
+        return count[0]
+
     async def create(self, binding: MCPInputBinding, payload: dict, *, expires_at: float,
                      now: float, predecessor: MCPInputClaim | None = None) -> MCPInputRecord:
         self._ready()
@@ -295,15 +301,14 @@ class MCPInputStore(UnifiedStoreBase):
         ciphertext = self._encode(binding, request_id, 0, 'WAITING', expires_at, None, payload,
             reservation_id=reservation_id, predecessor_id=predecessor_id)
         async with self.write_transaction():
-            await self.database.execute('UPDATE mcp_input_scopes SET revision=revision+1 WHERE scope=?', (self.scope,))
+            count = await self._locked_pending_count(now)
             if predecessor is not None:
                 # Revalidate and lock the exact authenticated native claim
                 # through successor commit; no public helper joins this write.
                 locked = await self.database.execute("UPDATE mcp_inputs SET revision=revision WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='RESPONDING' AND claim_hash=? AND reservation_id=?", (self.scope, parent.request_id, parent_digest, parent.revision, parent_hash, reservation_id))
                 if locked != 1:
                     raise MCPInputConflict('MCP input successor requires its original live response claim')
-            count = await self.database.fetchone("SELECT COUNT(DISTINCT reservation_id) FROM mcp_inputs WHERE scope=? AND (state='RESPONDING' OR (state='WAITING' AND expires_at>?))", (self.scope, now))
-            if predecessor is None and count[0] >= self.max_pending:
+            if predecessor is None and count >= self.max_pending:
                 raise MCPInputConflict('MCP input pending capacity is exhausted')
             changed = await self.database.execute("INSERT INTO mcp_inputs(scope,request_id,operation_digest,reader_digest,binding_digest,revision,state,expires_at,claim_hash,reservation_id,predecessor_id,payload) VALUES (?,?,?,?,?,0,'WAITING',?,NULL,?,?,?) ON CONFLICT DO NOTHING", (self.scope, request_id, operation_digest, reader_digest, digest, expires_at, reservation_id, predecessor_id, ciphertext))
             if changed != 1:
@@ -330,6 +335,12 @@ class MCPInputStore(UnifiedStoreBase):
             'RESPONDING', expected.expires_at, claim_hash, actual.payload, responses,
             reservation_id=actual.reservation_id, predecessor_id=actual.predecessor_id)
         async with self.write_transaction():
+            # An arrival timestamp can predate a blocked transaction. A create
+            # may already have reused this WAITING row's expired reservation.
+            # Count it using the claim's timestamp while holding the same scope
+            # lock, so admitting it cannot exceed capacity after that release.
+            if await self._locked_pending_count(now) > self.max_pending:
+                raise MCPInputConflict('MCP input pending capacity changed before response admission')
             changed = await self.database.execute("UPDATE mcp_inputs SET revision=?,state='RESPONDING',claim_hash=?,payload=? WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='WAITING' AND expires_at=? AND expires_at>?", (revision, claim_hash, ciphertext, self.scope, expected.request_id, digest, expected.revision, expected.expires_at, now))
             if changed != 1:
                 raise MCPInputConflict('MCP input waiting revision was already consumed')

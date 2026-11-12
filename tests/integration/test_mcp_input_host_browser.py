@@ -14,7 +14,9 @@ import uvicorn
 from kestrel_sovereign import server as core_server
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 
-from tests.integration.test_mcp_apps_host import apps_boundary, mcp_browser_support
+from tests.integration.test_mcp_apps_host import (
+    apps_boundary as apps_boundary, mcp_browser_support as mcp_browser_support,
+)
 from tests.integration.test_mcp_input_host import wire
 
 RICH_SCHEMA = {'type': 'object', 'properties': {
