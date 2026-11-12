@@ -1674,6 +1674,17 @@ lexical tokens instead of treating them as orphaned prework. Savepoint exits use
 the same native ownership/acknowledgement boundary: an uncertain RELEASE cannot
 authorize a second INSERT or mint a durable top-level commit receipt.
 
+Post-response enrichment receives the actual user and assistant row IDs from
+normal, streaming and bootstrap persistence. It reads exactly those rows,
+rejects missing or wrong-role identities, and uses their canonical stored text
+for emotional and graph processing. Identical later exchanges and operator
+notices cannot replace either row; anonymized input stays anonymized in derived
+memory. Native SQL/lease control errors propagate through tagging and advisory
+schema lanes, and background owners retain the original task's terminal receipt.
+Ordinary advisory failures retain their existing partial-result behavior. These
+are memory-pipeline contracts, not inbound MCP installation or subsequent
+reflection/consolidation acceptance.
+
 Each PR requires a completed full-diff worktree review before creation, with
 findings fixed and meaningful regression tests. Pin the conformance runner
 versions/commits and record which protocol scenarios they actually support.

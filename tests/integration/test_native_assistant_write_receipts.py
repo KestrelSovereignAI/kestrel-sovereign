@@ -17,7 +17,7 @@ from tests.shared.booted_agent import booted_agent
 
 
 @pytest_asyncio.fixture
-async def assistant_agent(tmp_path, monkeypatch):
+async def assistant_agent(tmp_path, monkeypatch, request):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
     monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path))
@@ -36,7 +36,7 @@ async def assistant_agent(tmp_path, monkeypatch):
     })
     async with booted_agent(tmp_path, name="OwnedAssistantReceipts",
             provenance="test:1990-original-assistant-receipt", features=set(),
-            payer_policy=policy) as agent:
+            payer_policy=policy, is_test_instance=getattr(request, "param", True)) as agent:
         assert agent.llm_service.disabled
         with pytest.raises(PolicyDeniedError, match="disabled by PayerPolicy"):
             await agent.llm_service.get_response("Persistence fixture", "No generation permitted")

@@ -1548,12 +1548,13 @@ class StreamingMixin:
         }
         if attachments:
             _user_meta["attachments"] = attachments
-        await self.privacy_agent.add_conversation(
+        user_message_id = await self.privacy_agent.add_conversation(
             "user", wrapped_user,
             metadata=_user_meta,
             session_id=session_id,
             rendered_content=prompt,
         )
+        assistant_message_id = None
         # Apply post-build assembly via the agent helper so this path
         # uses the same route-aware budget gate as the non-streaming
         # path (#1399). Without sharing the helper, route-capped
@@ -1957,7 +1958,7 @@ class StreamingMixin:
         # ``_persist_assistant_turn_safely`` still stamps the ``cancelled``
         # marker on the empty row.
         if has_tool_calls and _stopped_generation(self, request_id) is not None:
-            await self._persist_assistant_turn_safely(
+            assistant_message_id = await self._persist_assistant_turn_safely(
                 "", metadata=None, session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
@@ -2303,7 +2304,7 @@ class StreamingMixin:
                 # their metadata exactly as before.
                 if buffer_audit:
                     meta = None
-                await self._persist_assistant_turn_safely(
+                assistant_message_id = await self._persist_assistant_turn_safely(
                     tool_final_text,
                     metadata=_with_semantic_recall_metadata(
                         meta, semantic_recall_metadata
@@ -2518,7 +2519,7 @@ class StreamingMixin:
             # branch: persisted == reloaded == released reviewed text.
             if buffer_audit:
                 inline_meta = None
-            await self._persist_assistant_turn_safely(
+            assistant_message_id = await self._persist_assistant_turn_safely(
                 final_text,
                 metadata=_with_semantic_recall_metadata(
                     inline_meta, semantic_recall_metadata
@@ -2546,7 +2547,7 @@ class StreamingMixin:
             # matching the cancel-before-dispatch path — before the audit fire /
             # STOP hook / memory pipeline.
             if _stopped_generation(self, request_id) is not None:
-                await self._persist_assistant_turn_safely(
+                assistant_message_id = await self._persist_assistant_turn_safely(
                     "", metadata=None, session_id=session_id,
                     request_id=request_id, response=tool_response,
                 )
@@ -2575,7 +2576,7 @@ class StreamingMixin:
             # cancelled row and return before metadata / persist / release /
             # memory / STOP (see the has_tool_calls branch for the full rationale).
             if _stopped_generation(self, request_id) is not None:
-                await self._persist_assistant_turn_safely(
+                assistant_message_id = await self._persist_assistant_turn_safely(
                     "", metadata=None, session_id=session_id,
                     request_id=request_id, response=tool_response,
                 )
@@ -2619,7 +2620,7 @@ class StreamingMixin:
             # as the tool branches: persisted == reloaded == released text.
             if buffer_audit:
                 _no_tool_meta = None
-            await self._persist_assistant_turn_safely(
+            assistant_message_id = await self._persist_assistant_turn_safely(
                 final_text,
                 metadata=_with_semantic_recall_metadata(
                     _no_tool_meta, semantic_recall_metadata
@@ -2649,7 +2650,7 @@ class StreamingMixin:
         # scheduled. Mirrors the non-streaming fire at kestrel_agent.py.
         post_pipeline = getattr(self, "_post_response_pipeline", None)
         if callable(post_pipeline) and not self._privacy_blocks_background_memory():
-            await post_pipeline(user_input, final_assistant_text, session_id)
+            await post_pipeline(user_message_id=user_message_id, assistant_message_id=assistant_message_id)
 
         # Fire STOP hook (streaming response cycle complete).
         #
@@ -2755,7 +2756,7 @@ class StreamingMixin:
         model: Optional[str] = None,
         provider: Optional[str] = None,
         require_success: bool = False,
-    ) -> None:
+    ) -> int | None:
         """Persist the assistant turn under cancellation-safe handling.
 
         FastAPI's ``StreamingResponse`` cancels the wrapping async
@@ -2879,6 +2880,7 @@ class StreamingMixin:
             raise pending_cancellation
         if isinstance(outcome.error, asyncio.CancelledError):
             raise outcome.error
+        return outcome.result if outcome.error is None else None
 
     async def _fire_post_response_hook(
         self,

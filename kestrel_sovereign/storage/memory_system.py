@@ -504,6 +504,8 @@ class MemorySystem:
             try:
                 await conv_store.update_message_metadata(message_id, enriched)
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(
                     f"Failed to tag message {message_id}: {e}", exc_info=True
                 )
@@ -611,6 +613,8 @@ class MemorySystem:
                     metadata=metadata,
                 )
             except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning("Schema routing failed for message %s: %s", canonical_id, exc)
 
         return derived

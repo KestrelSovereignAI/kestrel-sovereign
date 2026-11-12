@@ -119,6 +119,8 @@ class MemoryManager:
                     assistant_message_id, assistant_content, role="assistant"
                 )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"tag_exchange failed: {e}", exc_info=True)
 
         return results
