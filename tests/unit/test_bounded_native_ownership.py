@@ -2,6 +2,7 @@
 import asyncio
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, closing
 
 import pytest
@@ -326,17 +327,21 @@ async def test_original_close_wait_delegates_only_through_accepted_native_tasks(
     assert not lock.locked() and not lock._native_work and not lock._admissions
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='function')
 @pytest.mark.parametrize("receipt", ["unknown", "committed"])
-async def test_bounded_observer_preserves_late_native_commit_on_multiple_joins(tmp_path, receipt):
+@pytest.mark.parametrize('executor_workers', [None, 1])
+async def test_bounded_observer_preserves_late_native_commit_on_multiple_joins(tmp_path, receipt, executor_workers):
+    loop = asyncio.get_running_loop()
+    if executor_workers is not None:
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=executor_workers))
     path = tmp_path / "native.db"
     with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("CREATE TABLE effects(id INTEGER)")
-    entered, release = threading.Event(), threading.Event()
+    entered, release = asyncio.Event(), threading.Event()
     original = RuntimeError("native transaction acknowledgement")
     original.__cause__ = ExecutionCommitOutcomeError(receipt)
     def commit():
-        entered.set()
+        loop.call_soon_threadsafe(entered.set)
         if not release.wait(3):
             raise TimeoutError("fixture thread not released")
         with closing(sqlite3.connect(path)) as connection, connection:
@@ -345,7 +350,7 @@ async def test_bounded_observer_preserves_late_native_commit_on_multiple_joins(t
     native = create_owned_task(run_blocking_operation(commit))
     observer = create_owned_task(wait_owned_or_pending(native, cancellation_grace=.03))
     try:
-        assert await asyncio.to_thread(entered.wait, 1)
+        assert await asyncio.wait_for(entered.wait(), 1)
         observer.cancel()
         await asyncio.sleep(.01)
         observer.cancel()
