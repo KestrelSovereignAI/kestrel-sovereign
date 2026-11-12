@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import gc
 import importlib
 import inspect
 import json
@@ -839,6 +840,14 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
                 lambda providers, tools, model_override: None,
             )
 
+        if cause == "watchdog":
+            # Python 3.13 collects its oldest generation all at once, stopping
+            # the event loop while it runs: up to 0.56 s on a laptop for the
+            # garbage earlier tests leave in a worker. On CI runners the loop
+            # stalled for 1.3 to 1.5 s before this case's first chunk, and its
+            # one-second bound abandoned the provider as silent (#4040).
+            # Collected now, no full collection falls due inside the turn.
+            gc.collect()
         if _generation_is_first(path):
             bound_the_generation()
         started = loop.time()
