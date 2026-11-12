@@ -12,16 +12,21 @@ import asyncio
 import contextvars
 import inspect
 import math
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Generic, TypeVar, cast
 from weakref import WeakKeyDictionary
 
+from kestrel_sdk.native_a2a.utils.source_ownership import (
+    CallbackSource as OwnedCallbackSource,
+    SourceAcquisition,
+    SourceHandoff,
+    run_source_body,
+)
+
 _T = TypeVar("_T")
-_ITERATOR_TERMINAL = object()
-_ITERATOR_INTERRUPTED = object()
 _TASK_ERROR_UNSET = object()
 # Only used when publication of the completion callback itself failed. A
 # timer yields to the SAME native owner without another Task/collector or a
@@ -1056,27 +1061,24 @@ class PendingOwnedTask(Generic[_T]):
             execution_observation_error(pending, self.cancellation, self.observation_error))
 
 
-@dataclass(frozen=True)
-class OwnedCallbackSource(Generic[_T]):
-    """Run an async callback producer in the iterator's original source Task.
+class _CoreSourceHandoff(SourceHandoff[_T]):
+    """Project retained SDK withdrawals through Core's existing control policy."""
 
-    Each emitter call is the same one-item handshake as an iterator yield.
-    Structured children may emit concurrently; their handoffs are serialized.
-    The producer must physically join those children before returning.
-    False means its consumer requested close; the producer must stop emitting
-    and retire its own resources before returning None. A false handoff is NOT
-    a physical-close acknowledgment. Closing requests that cooperative handoff;
-    it never cancels the producer through an already-running finally. A producer
-    that cannot yet return remains original pending work, not a successful close.
-    The original Task and cancellation watcher
-    remain owned and joined by OwnedAsyncIterator, including late cleanup.
-    """
+    async def publish(self, value: _T) -> bool:
+        try:
+            return await super().publish(value)
+        except BaseExceptionGroup as withdrawals:
+            if not all(isinstance(error, asyncio.CancelledError)
+                       for error in withdrawals.exceptions):
+                raise
+            from kestrel_sovereign.execution_custody import execution_observation_error
 
-    producer: Callable[[Callable[[_T], Awaitable[bool]]], Awaitable[None]] = field(repr=False)
-
-    def __post_init__(self) -> None:
-        if not callable(self.producer):
-            raise TypeError("Owned callback source requires a callable producer")
+            # The SDK owns frame retention; only Core knows its typed control
+            # graph. Preserve every actual withdrawal and the first one's args
+            # without turning a repeated cancellation into an ordinary failure.
+            raise execution_observation_error(
+                *withdrawals.exceptions, prefer_cancellation=True,
+            )
 
 
 class OwnedAsyncIterator(Generic[_T]):
@@ -1092,7 +1094,7 @@ class OwnedAsyncIterator(Generic[_T]):
 
     def __init__(
         self,
-        iterator_factory: Callable[[], AsyncIterator[_T] | OwnedCallbackSource[_T]],
+        iterator_factory: Callable[[], AsyncIterable[_T] | OwnedCallbackSource[_T]],
         *,
         operation: str,
         cleanup_requested: Callable[[], bool] | None = None,
@@ -1103,11 +1105,9 @@ class OwnedAsyncIterator(Generic[_T]):
         self._iterator_factory = iterator_factory
         self._operation = operation
         self._cleanup_requested = cleanup_requested
-        self._items: asyncio.Queue[tuple[object, _T | None]] = asyncio.Queue()
-        self._continue = asyncio.Event()
-        self._stop = asyncio.Event()
-        self._item_outstanding = False
-        self._waiting_for_continue = False
+        self._handoff = _CoreSourceHandoff[_T](
+            yield_writer=owned_native_yield, wait_writer=self._wait_for_source,
+        )
         self._callback_source = False
         self._interrupt_after_continue = False
         self._closed = False
@@ -1180,7 +1180,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 *getattr(error, "_kestrel_native_retirement_debts", ()),
                 (self, self._owner),
             )
-            self._stop.set()
+            self._handoff.request_stop()
             cancel_owned_task(self._owner)
             if self._cancellation_owner is not None:
                 cancel_owned_task(self._cancellation_owner)
@@ -1196,7 +1196,7 @@ class OwnedAsyncIterator(Generic[_T]):
         # the original owner's terminal outcome, never a replacement body.
         if not self._terminal_published:
             self._terminal_published = True
-            self._items.put_nowait((_ITERATOR_TERMINAL, None))
+            self._handoff.publish_terminal()
 
     @property
     def terminal_error(self) -> BaseException | None:
@@ -1233,30 +1233,19 @@ class OwnedAsyncIterator(Generic[_T]):
     async def __anext__(self) -> _T:
         if self._closed:
             raise StopAsyncIteration
-        if self._item_outstanding:
-            self._item_outstanding = False
-            self._continue.set()
-            if self._interrupt_after_continue:
-                self._interrupt_after_continue = False
-                asyncio.get_running_loop().call_soon(
-                    self._cancel_owner_if_running
-                )
-
-        async with owned_native_wait((self._owner,)):
-            marker, item = await self._items.get()
-        if marker is _ITERATOR_INTERRUPTED:
+        received, item = await self._handoff.pull()
+        if not received and self._interrupted_by_cleanup and not self._owner.done():
             # Do not join here. The consumer may first publish its bounded Stop
             # acknowledgement; its ``finally`` then calls ``aclose`` and owns
             # the source cleanup through terminalization.
             raise StopAsyncIteration
-        if marker is _ITERATOR_TERMINAL:
+        if not received:
             self._closed = True
             outcome = await self.join_source_owners()
             self._terminal_consumed = outcome.cancellation is None
             raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
             raise StopAsyncIteration
 
-        self._item_outstanding = True
         return cast(_T, item)
 
     async def _watch_owner_cancellation(self) -> None:
@@ -1278,12 +1267,12 @@ class OwnedAsyncIterator(Generic[_T]):
                 self._watcher_private_cancellation = error
             if self._owner.done():
                 return
-            if self._item_outstanding:
+            if self._handoff.item_outstanding:
                 # Let the consumer resume the source once. A source already at
                 # EOF can publish its real cleanup result; a provider that
                 # blocks in the next ``anext`` is interrupted one loop turn later.
                 self._interrupt_after_continue = True
-            elif self._waiting_for_continue:
+            elif self._handoff.waiting_for_ack:
                 # The consumer already released the handshake in this event-loop
                 # turn. Let the owner publish a synchronous EOF/failure first,
                 # then interrupt only if it actually blocks in the next source step.
@@ -1379,164 +1368,93 @@ class OwnedAsyncIterator(Generic[_T]):
             # A callback owns its body AND finally. Its existing false-emission
             # protocol requests retirement without injecting Task.cancel into
             # an unknown active phase and turning aborted cleanup into an ACK.
-            self._stop.set()
-            self._continue.set()
+            self._handoff.request_stop()
             return False
         if not self._owner.done() and not self._owner.cancelling():
             return cancel_owned_task(self._owner)
         return False
 
-    async def _wait_for_callback_continuation(self) -> None:
-        """Reconcile THIS frame before cancellation releases its emission lock."""
-        from kestrel_sovereign.execution_custody import execution_observation_error
+    @asynccontextmanager
+    async def _wait_for_source(self) -> AsyncIterator[None]:
+        # SourceHandoff acknowledges its previous frame BEFORE this wait. Keep
+        # the existing EOF-before-interrupt ordering: the original producer's
+        # ACK wake precedes this one-turn cancellation translation.
+        if self._interrupt_after_continue and not self._handoff.item_outstanding:
+            self._interrupt_after_continue = False
+            asyncio.get_running_loop().call_soon(self._cancel_owner_if_running)
+        async with owned_native_wait((self._owner,)):
+            yield
 
-        cancellation = None
-        while True:
-            try:
-                await self._continue.wait()
-                break
-            except asyncio.CancelledError as error:
-                cancellation = execution_observation_error(
-                    cancellation, error, prefer_cancellation=True)
-        if cancellation is not None:
-            raise cancellation
+    def _classify_source_failure(self, error: BaseException) -> None:
+        from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
 
-    async def _publish_item(self, item: _T, *, retain_handoff: bool = False) -> bool:
-        if self._stop.is_set():
-            return False
-        try:
-            async with owned_native_yield():
-                await self._items.put((self, item))
-                self._waiting_for_continue = True
-                try:
-                    if retain_handoff:
-                        await self._wait_for_callback_continuation()
-                    else:
-                        await self._continue.wait()
-                finally:
-                    self._waiting_for_continue = False
-        finally:
-            # Reconcile even a cancelled emitter before a sibling can publish
-            # and accidentally consume this frame's outstanding continuation.
-            self._continue.clear()
-        return not self._stop.is_set()
+        if is_tool_execution_terminal_error(error):
+            return
+        close_requested = self._handoff.stopped
+        if close_requested and not isinstance(error, asyncio.CancelledError):
+            self._cleanup_error = error
+        cancellation_requested = close_requested or (
+            self._cleanup_requested is not None and self._cleanup_requested() is True
+        )
+        if cancellation_requested and is_owned_task_cancellation(self._owner, error):
+            self._interrupted_by_cleanup = True
+            # End demand promptly, but do NOT claim the original finally or
+            # registered resources are physically retired. aclose owns that join.
+            self._handoff.request_stop()
 
     async def _run(self) -> None:
-        iterator: AsyncIterator[_T] | None = None
-        try:
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        def acquire(_resources: SourceAcquisition) -> AsyncIterable[_T] | OwnedCallbackSource[_T]:
             source = self._iterator_factory()
-            try:
-                if isinstance(source, OwnedCallbackSource):
-                    self._callback_source = True
-                    emission_lock = asyncio.Lock()
+            self._callback_source = isinstance(source, OwnedCallbackSource)
+            return source
 
-                    async def emit(item: _T) -> bool:
-                        from anyio import CancelScope, lowlevel
-
-                        # One frame owns the ORIGINAL continuation handoff.
-                        # Another child cannot consume that frame's ACK.
-                        # A sibling may already own the handoff. Relinquish
-                        # this writer BEFORE waiting for its mutex, and restore
-                        # only after releasing it, so neither emitter can pin
-                        # the writer needed by the other's continuation.
-                        # A level cancellation must not spin the original
-                        # writer-restoration loop. Shield through restoration,
-                        # not only through the frame's continuation wait.
-                        with CancelScope(shield=True) as handoff_scope:
-                            async with owned_native_yield():
-                                async with emission_lock:
-                                    # No frame has been published yet. Deliver
-                                    # pending level cancellation before new IO.
-                                    handoff_scope.shield = False
-                                    try:
-                                        await lowlevel.checkpoint_if_cancelled()
-                                    finally:
-                                        handoff_scope.shield = True
-                                    result = await self._publish_item(item, retain_handoff=True)
-                        await lowlevel.checkpoint_if_cancelled()
-                        return result
-
-                    result = await source.producer(emit)
-                    if result is not None:
-                        raise TypeError("Owned callback producer must return None")
-                else:
-                    iterator = source
-                    async for item in iterator:
-                        if not await self._publish_item(item):
-                            break
-            except BaseException as error:
-                # Import lazily: execution_custody also uses this primitive.
-                # A cancellation carrying authority/commit evidence is not
-                # our private producer interrupt, even during requested close.
-                from kestrel_sovereign.execution_custody import (
-                    is_tool_execution_terminal_error,
+        try:
+            outcome = await run_source_body(
+                acquire, self._handoff, on_body_error=self._classify_source_failure,
+            )
+            if outcome.retirement_errors:
+                self._cleanup_error = (
+                    outcome.retirement_errors[0] if len(outcome.retirement_errors) == 1
+                    else execution_terminal_error(
+                        *outcome.retirement_errors, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
                 )
-                if is_tool_execution_terminal_error(error):
-                    raise
-                # An exception raised while a requested close interrupts
-                # ``anext`` belongs to generator unwinding, not ordinary
-                # source execution. Preserve that distinction for lifecycle
-                # acknowledgement at the transport boundary.
-                close_requested = self._stop.is_set()
-                cancellation_requested = close_requested
-                if (
-                    not cancellation_requested
-                    and self._cleanup_requested is not None
-                ):
-                    try:
-                        cancellation_requested = self._cleanup_requested() is True
-                    except Exception:
-                        # An observability predicate must not replace the
-                        # iterator's actual terminal failure.
-                        cancellation_requested = False
-                # A Stop marker can race a source's independent terminal
-                # failure after its final item. Only an initiated close owns a
-                # non-cancellation unwind as cleanup debt; the marker extends
-                # ownership solely to cancellation that interrupted the source.
-                if close_requested and not issubclass(type(error), asyncio.CancelledError):
-                    self._cleanup_error = error
-                if cancellation_requested and is_owned_task_cancellation(self._owner, error):
-                    self._interrupted_by_cleanup = True
-                    self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
-                    return
-                raise
-        except BaseException as error:
-            self._terminal_error = error
-            raise
+            # Only our authenticated, individual private interrupt can be
+            # acknowledged. A late close/policy failure retains that original
+            # cancellation too. Request-reader withdrawals stay in its join.
+            body_error = outcome.body_error
+            if (self._interrupted_by_cleanup and not outcome.retirement_errors
+                    and not outcome.observation_errors):
+                body_error = None
+            errors = tuple(error for error in (
+                body_error, *outcome.retirement_errors, *outcome.observation_errors,
+            ) if error is not None)
+            if errors:
+                self._terminal_error = errors[0] if len(errors) == 1 else execution_terminal_error(
+                    *errors, retain_originals=True, isolate_control_originals=True,
+                )
+                raise self._terminal_error
         finally:
-            try:
-                if iterator is not None:
-                    close_iterator = getattr(iterator, "aclose", None)
-                    if callable(close_iterator):
-                        try:
-                            await close_iterator()
-                        except BaseException as error:
-                            from kestrel_sovereign.execution_custody import (
-                                execution_terminal_error,
-                            )
-                            self._cleanup_error = error
-                            self._terminal_error = execution_terminal_error(
-                                self._terminal_error, error,
-                                retain_originals=True, isolate_control_originals=True,
-                            )
-                            raise self._terminal_error
-            finally:
-                self._publish_owner_completion(self._owner)
+            self._publish_owner_completion(self._owner)
 
     async def aclose(self) -> None:
         """Stop producing and join the source iterator's owner task."""
 
-        if self._closed:
+        if (self._closed and self._owner.done()
+                and (self._cancellation_owner is None or self._cancellation_owner.done())):
             return
-        self._closed = True
-        # Record the disposition BEFORE the producer is interrupted, so the
-        # producer's unwind reads why it was cancelled rather than guessing
-        # from the exception it happens to receive.
-        self._consumer_close.closed = True
-        self._stop.set()
-        self._continue.set()
-        if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
-            self._owner_cancelled_by_close = self._cancel_owner_if_running()
+        if not self._closed:
+            self._closed = True
+            # Demand closure is not physical retirement. Initiate Stop once;
+            # concurrent closers independently join these SAME original owners
+            # without injecting cancellation into an already-active finally.
+            self._consumer_close.closed = True
+            self._handoff.request_stop()
+            if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
+                self._owner_cancelled_by_close = self._cancel_owner_if_running()
         outcome = await self.join_source_owners(closing=True)
         if self._construction_error is not None and outcome.error is None:
             # Reconcile ONLY the original constructor task reservation, after
