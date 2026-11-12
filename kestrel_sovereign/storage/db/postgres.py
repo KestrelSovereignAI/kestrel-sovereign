@@ -1341,8 +1341,9 @@ class PostgresBackend(DatabaseBackend):
         try:
             async with self._tracked_native_transaction(connection, scopes, state,
                 admit_work=True,
-                requires_commit_proof=lambda: bool(scopes) or _native_observation_requested() or (
-                    self._current_txn_conn() is not None and self._current_after_commit().pending)):
+                # Even an unscoped writer with no callbacks must distinguish
+                # COMMIT from PostgreSQL's successful COMMIT-as-ROLLBACK reply.
+                requires_commit_proof=True):
                 await lock_execution_authority(connection, "postgres", scopes)
                 yield
                 require_execution_backend("postgres", scopes)

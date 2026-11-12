@@ -65,6 +65,20 @@ async def prepare_owned_vector_column(store, dimension):
     store._embedding_column_dim = dimension
 
 
+def observe_actual_insert_attempts(store, monkeypatch):
+    """Count actual INSERT requests without replacing a native result/error."""
+    attempts = []
+    original = store.db.fetchone
+
+    async def observe(sql, params=()):
+        if "INSERT INTO conversation_history" in sql:
+            attempts.append(sql)
+        return await original(sql, params)
+
+    monkeypatch.setattr(store.db, "fetchone", observe)
+    return attempts
+
+
 @pytest_asyncio.fixture
 async def canonical_store(native_a2a_backend_factory):
     async with canonical_receipt_database(native_a2a_backend_factory()) as database:
@@ -257,15 +271,7 @@ async def test_native_insert_without_a_row_cannot_return_a_receipt(canonical_sto
             "CREATE TRIGGER owned_suppress BEFORE INSERT ON conversation_history "
             "BEGIN SELECT RAISE(IGNORE); END"
         )
-    inserts = []
-    original_fetch = store.db.fetchone
-
-    async def observe_original_insert(sql, params=()):
-        if "INSERT INTO conversation_history" in sql:
-            inserts.append(sql)
-        return await original_fetch(sql, params)
-
-    monkeypatch.setattr(store.db, "fetchone", observe_original_insert)
+    inserts = observe_actual_insert_attempts(store, monkeypatch)
     observed = None
     try:
         if vector:
@@ -324,3 +330,13 @@ async def test_unbound_derivative_still_returns_its_excluded_row_id(
         assert row is not None and json.loads(row[0])["excluded_from_context"] is True
     finally:
         await raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session,other", [("abc%_def", "abcXYZdef"), (r"a\b", "ab")])
+async def test_real_search_preserves_literal_session_wildcards_and_backslashes(canonical_store, session, other):
+    store = canonical_store
+    own = await store.add_conversation("user", "owned needle in literal session", session_id=session)
+    await store.add_conversation("user", "owned needle in distinct session", session_id=other)
+    results = await store.search_history("needle", session_id=session)
+    assert [message["id"] for message in results] == [own], "Literal session search must not broaden or lose its stored row"
