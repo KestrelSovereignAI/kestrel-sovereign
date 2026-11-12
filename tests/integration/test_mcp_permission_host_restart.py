@@ -148,8 +148,8 @@ async def host_campaign(tmp_path, monkeypatch, request):
             genesis_audit_provenance='test:596-native-a2a-cognition')
         sender_identity = load_agent_identity(storage_dir=sender_data, master_key=key)
         recipient_identity = load_agent_identity(storage_dir=data, master_key=key)
-        peer_agents.append(dict(agent_name='a2a-sender', agent_data=str(sender_data),
-            features=['BootstrapFeature']))
+        peer_agents.append({'agent_name': 'a2a-sender', 'agent_data': str(sender_data),
+            'features': ['BootstrapFeature']})
     async with AsyncExitStack() as resources:
         provider = await resources.enter_async_context(https_peer(
             peer_root, monkeypatch, provider_model='owned-permission-model',
