@@ -1649,6 +1649,25 @@ effect and its durable terminal record.
    reusing MCP 2.x, per-agent routing, protected-resource metadata, credential
    governance and the normal memory/turn persistence path.
 
+The canonical conversation writer returns the native integer ID from its own
+`INSERT ... RETURNING id`. `AsyncStorage`, `PrivacyEnforcingStorage` and
+`PrivacyAgent` preserve that ID for persistent writes, including excluded
+semantic derivatives. Volatile writes return no persistent receipt (and the
+storage privacy wrapper rejects modes that cannot write a transcript). A
+caller-owned transaction retains final commit ownership: an external `log_turn`
+response must expose its user/assistant row IDs only after its whole exchange
+commits. Missing or nonpositive native IDs abort their insertion boundary;
+identity errors and execution-control errors never authorize a schema retry.
+Existing optional embedding/lexical schema attempts use isolated native
+savepoints and retain the exact successful insertion's ID. These contracts are
+covered by native SQLite/PostgreSQL receipt and transaction tests, plus actual
+SDK embedding calls to an owned local HTTP peer. They are storage prerequisites,
+not evidence of an installed inbound MCP connector or subsequent reflection and
+consolidation. That acceptance remains in #1990. The embedding migrations inspect
+the same resolved PostgreSQL relation as their ALTER statements through the
+canonical database API; a same-named table in another schema cannot satisfy the
+column checks.
+
 Each PR requires a completed full-diff worktree review before creation, with
 findings fixed and meaningful regression tests. Pin the conformance runner
 versions/commits and record which protocol scenarios they actually support.

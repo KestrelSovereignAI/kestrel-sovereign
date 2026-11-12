@@ -204,15 +204,6 @@ async def deployment(request, tmp_path):
             )
             db = await dep.reboot()
             try:
-                for table in TABLES:
-                    # migrate_add_embedding_profile_id probes an unscoped
-                    # information_schema, so a same-named table in another
-                    # schema can make it skip this one.
-                    await db.execute(
-                        f"ALTER TABLE {table} "
-                        "ADD COLUMN IF NOT EXISTS embedding_profile_id TEXT",
-                        (),
-                    )
                 yield dep
             finally:
                 await dep.db.close()
