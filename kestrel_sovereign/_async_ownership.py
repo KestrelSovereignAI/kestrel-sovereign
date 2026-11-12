@@ -1111,6 +1111,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._callback_source = False
         self._interrupt_after_continue = False
         self._closed = False
+        self._active_close_calls = 0
         self._owner_cancelled_by_close = False
         self._interrupted_by_cleanup = False
         self._cleanup_error: BaseException | None = None
@@ -1442,29 +1443,37 @@ class OwnedAsyncIterator(Generic[_T]):
     async def aclose(self) -> None:
         """Stop producing and join the source iterator's owner task."""
 
-        if (self._closed and self._owner.done()
+        if (self._closed and not self._active_close_calls and self._owner.done()
                 and (self._cancellation_owner is None or self._cancellation_owner.done())):
             return
-        if not self._closed:
-            self._closed = True
-            # Demand closure is not physical retirement. Initiate Stop once;
-            # concurrent closers independently join these SAME original owners
-            # without injecting cancellation into an already-active finally.
-            self._consumer_close.closed = True
-            self._handoff.request_stop()
-            if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
-                self._owner_cancelled_by_close = self._cancel_owner_if_running()
-        outcome = await self.join_source_owners(closing=True)
-        if self._construction_error is not None and outcome.error is None:
-            # Reconcile ONLY the original constructor task reservation, after
-            # its actual frame/lock cleanup AND watcher have physically joined.
-            # A real owner/closer failure keeps this debt and every other debt.
-            error = self._construction_error
-            error._kestrel_native_retirement_debts = tuple(
-                debt for debt in error._kestrel_native_retirement_debts
-                if not (debt[0] is self and debt[1] is self._owner)
-            )
-        raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
+        # These are lexical observers, not physical-retirement evidence. An
+        # overlapping call must still collect the same original outcome when
+        # both native owners finish before an earlier closer resumes. Only
+        # sequential repeats after every close returned remain quiet.
+        self._active_close_calls += 1
+        try:
+            if not self._closed:
+                self._closed = True
+                # Demand closure is not physical retirement. Initiate Stop once;
+                # concurrent closers independently join these SAME original owners
+                # without injecting cancellation into an already-active finally.
+                self._consumer_close.closed = True
+                self._handoff.request_stop()
+                if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
+                    self._owner_cancelled_by_close = self._cancel_owner_if_running()
+            outcome = await self.join_source_owners(closing=True)
+            if self._construction_error is not None and outcome.error is None:
+                # Reconcile ONLY the original constructor task reservation, after
+                # its actual frame/lock cleanup AND watcher have physically joined.
+                # A real owner/closer failure keeps this debt and every other debt.
+                error = self._construction_error
+                error._kestrel_native_retirement_debts = tuple(
+                    debt for debt in error._kestrel_native_retirement_debts
+                    if not (debt[0] is self and debt[1] is self._owner)
+                )
+            raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
+        finally:
+            self._active_close_calls -= 1
 
 
 async def create_owned_iterator(iterator_factory, **options):
