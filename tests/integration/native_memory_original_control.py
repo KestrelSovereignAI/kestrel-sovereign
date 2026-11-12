@@ -48,7 +48,7 @@ class NativeMemoryOwners:
 
 
 @pytest.fixture
-async def native_memory_owners(native_pg, tmp_path, monkeypatch):
+async def native_memory_owners(native_pg, tmp_path, monkeypatch, request):
     from kestrel_sovereign.llm import service as service_module
 
     backend, observer, schema = native_pg
@@ -180,6 +180,15 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                     await writer.drain()
                     return
                 assert header.startswith(b"POST /v1/embeddings ")
+                embedding_reply = getattr(request, "param", "valid")
+                if embedding_reply == "unavailable":
+                    payload = b'{"error":{"message":"owned embedding peer unavailable","type":"server_error"}}'
+                    writer.write(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                        + str(len(payload)).encode() + b"\r\n\r\n" + payload
+                    )
+                    await writer.drain()
+                    return
                 payload = json.dumps(
                     {
                         "object": "list",
@@ -196,6 +205,9 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                                 else [body["input"]]
                             )
                         ],
+                        "usage": {"prompt_tokens": 3, "total_tokens": 3},
+                    } if embedding_reply != "empty" else {
+                        "object": "list", "model": "local-test-embedding", "data": [],
                         "usage": {"prompt_tokens": 3, "total_tokens": 3},
                     }
                 ).encode()

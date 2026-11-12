@@ -572,8 +572,11 @@ class AsyncStorage:
                                session_id: Optional[str] = None,
                                rendered_content: Optional[str] = None,
                                model: Optional[str] = None,
-                               provider: Optional[str] = None) -> None:
-        """Add a conversation message.
+                               provider: Optional[str] = None) -> int:
+        """Add a conversation message and return its canonical row ID.
+
+        A caller-owned transaction still owns the final commit. The receipt
+        becomes durable only after that outer transaction exits successfully.
 
         Args:
             role: Message role (user, assistant, system)
@@ -610,33 +613,30 @@ class AsyncStorage:
         # the caller must retry cleanup after the transaction has exited.
         prepared_lexical_index_id = prepared.lexical_index_id
 
-        async def persist() -> None:
-            await self.conversation._persist_prepared_conversation(  # noqa: SLF001 - coordinated persistence seam
+        async def persist() -> int:
+            return await self.conversation._persist_prepared_conversation(  # noqa: SLF001 - coordinated persistence seam
                 prepared
             )
 
-        async def exclude_and_persist() -> None:
+        async def exclude_and_persist() -> int:
             self._exclude_stale_semantic_recall_derivative(prepared.metadata)
             await self.conversation._exclude_prepared_conversation_from_retrieval(  # noqa: SLF001 - coordinated persistence seam
                 prepared
             )
-            await persist()
+            return await persist()
 
         # Only semantic-recall derivatives carry the lineage field.  Normal
         # conversation writes keep their historical no-lock path.
         if "semantic_recall_dependencies" not in persisted_metadata:
-            await persist()
-            return
+            return await persist()
 
         if dependencies is None:
-            await exclude_and_persist()
-            return
+            return await exclude_and_persist()
 
         if not dependencies:
             # An explicitly empty lineage is not a semantic derivative and is
             # produced by the normal no-recall path.  Preserve that behavior.
-            await persist()
-            return
+            return await persist()
 
         try:
             assertions = self._assertion_store()
@@ -644,17 +644,15 @@ class AsyncStorage:
             # A partial/unbound storage bootstrap has no canonical authority
             # with which to validate a claimed semantic lineage.  Persisting it
             # visibly would let a caller create an unrevocable derivative.
-            await exclude_and_persist()
-            return
+            return await exclude_and_persist()
 
         try:
             async with assertions._semantic_recall_persistence_fence(
                 dependencies
             ) as visible:
                 if not visible:
-                    await exclude_and_persist()
-                    return
-                await persist()
+                    return await exclude_and_persist()
+                return await persist()
         except Exception:
             if prepared_lexical_index_id is not None:
                 await self.conversation._discard_lexical_tokens(  # noqa: SLF001 - post-rollback token cleanup

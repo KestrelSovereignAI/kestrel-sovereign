@@ -3443,9 +3443,12 @@ class PrivacyEnforcingStorage:
                                session_id: Optional[str] = None,
                                rendered_content: Optional[str] = None,
                                model: Optional[str] = None,
-                               provider: Optional[str] = None) -> None:
+                               provider: Optional[str] = None) -> int | None:
         """
-        Add a conversation entry, respecting privacy mode.
+        Add a conversation entry, returning its canonical row ID when persisted.
+
+        Session-local writes return None; a caller-owned transaction must commit
+        before a persistent row ID may be exposed as a durable receipt.
 
         - EPHEMERAL: Raises PrivacyViolationError (use in-memory buffer instead)
         - ISOLATED: Stores in session-local list
@@ -3496,7 +3499,7 @@ class PrivacyEnforcingStorage:
             logger.debug(f"Conversation stored in session ({len(self._session_conversations)} total)")
         else:
             # Store in persistent storage
-            await self._storage.add_conversation(
+            return await self._storage.add_conversation(
                 role, processed_content, metadata, session_id,
                 rendered_content=processed_rendered,
                 model=model,
