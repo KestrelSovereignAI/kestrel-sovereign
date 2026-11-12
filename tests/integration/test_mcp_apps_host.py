@@ -226,7 +226,8 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request
             host_configuration = {'host_origin': origin,
                 'sandbox_url': f'http://127.0.0.1:{ready["address"]["port"]}/proxy'}
         await feature.set_config({**({'inputs': {'enabled': True,
-            'host': {'max_payload_bytes': settings.get('input_max_payload_bytes', 8192), 'retention_seconds': 60.0}}}
+            'host': {'max_payload_bytes': settings.get('input_max_payload_bytes', 8192),
+                     'max_pending': settings.get('input_max_pending', 64), 'retention_seconds': 60.0}}}
             if settings.get('operator_input') else {}), "apps": {"enabled": True,
             "host": host_configuration,
             "max_pending_calls": 4, "max_publications": 8, "max_views": 8,
