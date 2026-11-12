@@ -12,7 +12,9 @@ from pathlib import Path
 import pytest
 
 from kestrel_sdk.native_a2a.utils.source_ownership import CallbackSource
-from kestrel_sovereign._async_ownership import OwnedAsyncIterator, OwnedCallbackSource
+from kestrel_sovereign._async_ownership import (
+    OwnedAsyncIterator, OwnedCallbackSource, await_owned_task, cancel_owned_task,
+)
 from kestrel_sovereign.execution_custody import execution_evidence_carriers
 
 
@@ -160,6 +162,61 @@ async def test_source_and_failure_classifier_errors_remain_original(
         with pytest.raises(OSError) as closed:
             os.fstat(descriptors[0])
         assert closed.value.errno == errno.EBADF
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_private_interrupt_is_rechecked_after_original_retirement() -> None:
+    entered = asyncio.Event()
+    descriptors: list[int] = []
+    interrupts: list[asyncio.CancelledError] = []
+    physical_errors: list[OSError] = []
+
+    class Source:
+        def __aiter__(self) -> Source:
+            return self
+
+        async def __anext__(self) -> bytes:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as error:
+                interrupts.append(error)
+                raise
+            raise AssertionError("The original source must be interrupted")
+
+        async def aclose(self) -> None:
+            os.close(descriptors[0])
+            try:
+                os.fstat(descriptors[0])
+            except OSError as error:
+                assert error.errno == errno.EBADF
+                physical_errors.append(error)
+                # Some closers enrich the original body failure rather than
+                # throw a second error. It is no longer a causeless private C.
+                interrupts[0].__cause__ = error
+
+    def acquire() -> Source:
+        descriptors.append(os.open(os.devnull, os.O_RDONLY))
+        return Source()
+
+    source = OwnedAsyncIterator(
+        acquire, operation="private-interrupt-with-late-original-cause",
+        cleanup_requested=lambda: True,
+    )
+    try:
+        await entered.wait()
+        assert cancel_owned_task(source.producer_task)
+        outcome = await await_owned_task(source.producer_task)
+        assert len(physical_errors) == 1
+        assert any(error is physical_errors[0]
+                   for error in execution_evidence_carriers(outcome.error))
+        with pytest.raises(BaseException) as observed:
+            await source.aclose()
+        assert any(error is physical_errors[0]
+                   for error in execution_evidence_carriers(observed.value))
+        assert source.producer_task.done() and source.owner_task.done()
     finally:
         await source.aclose()
 
