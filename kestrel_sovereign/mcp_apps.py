@@ -7,6 +7,7 @@ Neither a chat part nor a request body can supply any of those authorities.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -115,6 +116,20 @@ class _Reader:
     physical: _PhysicalView | None = None
     opened_id: str | None = None
     delivered: bool = False
+
+
+@dataclass
+class _OwnedAppCall:
+    task: asyncio.Task
+    active: bool = True
+
+    async def wait(self):
+        from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+
+        if not self.active:
+            raise ResourceConflict('Original MCP App call ownership ended')
+        outcome = await await_owned_task(self.task, cancel_on_caller_cancellation=True)
+        return raise_owned_outcome(outcome, operation='MCP App call', retain_originals=True)
 
 
 class _Call(BaseModel):
@@ -409,6 +424,34 @@ class MCPAppsHost:
 
 
 class MCPAppsHostMixin:
+    supports_owned_mcp_app_calls = True
+
+    @asynccontextmanager
+    async def mcp_app_call_scope(self, operation, *, name):
+        """Own one View child through its native execution and physical join."""
+        from kestrel_sovereign._async_ownership import (
+            OwnedCallbackScope, await_owned_task, bind_owned_coordinator,
+        )
+        from kestrel_sovereign.callbacks import invoke_host_callback
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        with bind_owned_coordinator(self._get_privacy_transition_lock()):
+            scope = OwnedCallbackScope()
+            owner = _OwnedAppCall(scope.start(lambda: invoke_host_callback(operation), name=name))
+            pending = None
+            try:
+                yield owner
+            except BaseException as error:
+                pending = error
+                raise
+            finally:
+                owner.active = False
+                scope.close()
+                outcome = await await_owned_task(owner.task)
+                terminal = execution_observation_error(pending, outcome.error, outcome.cancellation)
+                if terminal is not None and terminal is not pending:
+                    raise terminal
+
     supports_mcp_apps_host = True
 
     def create_mcp_apps_router(self, feature, *, resolve_host):
