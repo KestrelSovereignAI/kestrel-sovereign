@@ -22,6 +22,8 @@ from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
 from tests.integration.native_memory_original_control import (
     native_memory_owners as native_memory_owners,
+)
+from tests.integration.native_memory_original_control import (
     observe_native_transaction_errors,
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence
