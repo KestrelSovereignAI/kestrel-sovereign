@@ -3041,7 +3041,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.15.0"
+version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -3051,11 +3051,14 @@ dependencies = [
     { name = "kestrel-sovereign-sdk", extra = ["crypto", "httpx2"] },
     { name = "mcp" },
     { name = "pydantic" },
+    { name = "referencing" },
     { name = "requests" },
+    { name = "rfc3339-validator" },
+    { name = "rfc3986-validator" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0f/18/a1e3b8cd5e7110f98eade2c01d09786b81c4d11ade5cd93efd90049cdd26/kestrel_feature_mcp-0.15.0.tar.gz", hash = "sha256:d8604b135c3143b6c8be6609ac904b9683b3ea4fe813f1331fbf9228ff19021e", size = 1109411, upload-time = "2026-11-10T20:49:35.614Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/36/1c/bf45db1ae9da028d3144106a64847725ff7faad9d326721f73b4cecc888a/kestrel_feature_mcp-0.16.0.tar.gz", hash = "sha256:558844d3f9913f9ebc81251e5d720853867c8a040ae47a75f7ec27cc0b2d7bf6", size = 1144919, upload-time = "2026-11-12T00:47:27.334Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/c4/f695472852da891ac56f950cc0163afccafff7d7e8653197b9e6fdaece34/kestrel_feature_mcp-0.15.0-py3-none-any.whl", hash = "sha256:9fe6952b5bcd37b45d2dc1b028fe5c54a73aee1db02be8ebbbaac9492d129053", size = 633874, upload-time = "2026-11-10T20:49:33.746Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/f3/3bbd9bdcbe4e0bb82398fec17fcce0538d5f34be1bd950aa318b526d91f8/kestrel_feature_mcp-0.16.0-py3-none-any.whl", hash = "sha256:a4ee32732df4e26c8a421585049e8461dbb3f2a27deb1e03f856e2d57dc80c32", size = 649318, upload-time = "2026-11-12T00:47:25.563Z" },
 ]
 
 [[package]]
@@ -3415,7 +3418,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.20,<4" },
     { name = "iniconfig", specifier = "==2.3.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.15.0,<1" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.16.0,<1" },
     { name = "kestrel-llms", extras = ["all"], specifier = ">=0.2.0,<0.3" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
@@ -5997,6 +6000,27 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/d8/21/1ddb4c221fc8310a99956f55c2e5e21b548378bde4a662473dcdda6f4018/resend-2.19.0.tar.gz", hash = "sha256:b11191561cdb0ed7aa193212b7c8865bf635013c4d11bd81caf471d1b362be02", size = 30604, upload-time = "2025-10-31T13:59:32.274Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a0/1f/f53acaad9299a72671c4314fd42c0b332464eaf0d20ea5303e75b8a9a963/resend-2.19.0-py2.py3-none-any.whl", hash = "sha256:1a8b9fcacbe058876ebce757ac2542103ed7227caec10e5c58613ee58615acaa", size = 50881, upload-time = "2025-10-31T13:59:31.015Z" },
+]
+
+[[package]]
+name = "rfc3339-validator"
+version = "0.1.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "six" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/28/ea/a9387748e2d111c3c2b275ba970b735e04e15cdb1eb30693b6b5708c4dbd/rfc3339_validator-0.1.4.tar.gz", hash = "sha256:138a2abdf93304ad60530167e51d2dfb9549521a836871b88d7f4695d0022f6b", size = 5513, upload-time = "2021-05-12T16:37:54.178Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/44/4e421b96b67b2daff264473f7465db72fbdf36a07e05494f50300cc7b0c6/rfc3339_validator-0.1.4-py2.py3-none-any.whl", hash = "sha256:24f6ec1eda14ef823da9e36ec7113124b39c04d50a4d3d3a3c2859577e7791fa", size = 3490, upload-time = "2021-05-12T16:37:52.536Z" },
+]
+
+[[package]]
+name = "rfc3986-validator"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/88/f270de456dd7d11dcc808abfa291ecdd3f45ff44e3b549ffa01b126464d0/rfc3986_validator-0.1.1.tar.gz", hash = "sha256:3d44bde7921b3b9ec3ae4e3adca370438eccebc676456449b145d533b240d055", size = 6760, upload-time = "2019-10-28T16:00:19.144Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/51/17023c0f8f1869d8806b979a2bffa3f861f26a3f1a66b094288323fba52f/rfc3986_validator-0.1.1-py2.py3-none-any.whl", hash = "sha256:2f235c432ef459970b4306369336b9d5dbdda31b510ca1e327636e01f528bfa9", size = 4242, upload-time = "2019-10-28T16:00:13.976Z" },
 ]
 
 [[package]]
