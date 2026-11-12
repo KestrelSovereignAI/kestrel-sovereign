@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from cryptography.fernet import Fernet
+from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
 
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.turn_provenance import WakeReplyReceipt
@@ -23,8 +24,15 @@ async def assistant_agent(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
     (tmp_path / "kestrel.toml").write_text('[llm]\nroute_priority=[]\n')
+    policy = PayerPolicy.model_validate({
+        **PayerPolicy.host_env_default().model_dump(),
+        "llm": PayerSpec(vendor="local", kind=PayerKind.NONE),
+    })
     async with booted_agent(tmp_path, name="OwnedAssistantReceipts",
-            provenance="test:1990-original-assistant-receipt", features=set()) as agent:
+            provenance="test:1990-original-assistant-receipt", features=set(),
+            payer_policy=policy) as agent:
+        assert agent.llm_service.disabled
+        assert not agent.llm_service.providers
         yield agent
 
 

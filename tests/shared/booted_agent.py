@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AbstractSet
 
+from kestrel_sdk.payer_policy import PayerPolicy
+
 
 @asynccontextmanager
 async def booted_agent(
@@ -27,6 +29,7 @@ async def booted_agent(
     genesis: bool = True,
     released_schema: Path | None = None,
     is_test_instance: bool = True,
+    payer_policy: PayerPolicy | None = None,
 ):
     """A booted agent past genesis and discovery, loading only ``features``
     (Feature class names) beyond the mandatory set.
@@ -40,6 +43,9 @@ async def booted_agent(
 
     ``is_test_instance=False`` creates a separate test-owned identity with
     interactive approvals enabled; the default identity is tagged headless.
+
+    ``payer_policy`` uses the agent's normal resource policy, including an
+    explicit LLM-disabled policy for tests that exercise persistence only.
     """
     from kestrel_sovereign.bootstrap import BootstrapState
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
@@ -75,6 +81,7 @@ async def booted_agent(
         storage_path=str(db_path),
         llm_service=llm_service,
         allowed_features=set(features),
+        payer_policy=payer_policy,
     )
     try:
         await agent.initialize()
