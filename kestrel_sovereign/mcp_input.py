@@ -33,6 +33,7 @@ from kestrel_sovereign.security.capability_authority import (
 from kestrel_sovereign.security.csrf import CSRFError
 from kestrel_sovereign.security.private_delivery import AuthorizedCapabilityResponse
 from kestrel_sovereign.security.request_auth import RequestAuthenticationService, current_request_authentication
+from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 from kestrel_sovereign.tools.effect_journal import current_tool_effect_state, require_persistent_tool_effects
 
 
@@ -81,6 +82,12 @@ class _Reader:
 
 
 def _error(error, prepared):
+    from kestrel_sovereign.api_errors import api_error_response, execution_control_api_error
+
+    control = execution_control_api_error(error)
+    if control is not None:
+        return api_error_response(status_code=control.status_code, code=control.code,
+            message=control.message, details=control.details)
     if isinstance(error, (HostCapabilityAccessDenied, CSRFError)):
         status, code = 403, 'mcp_input_access_denied'
     elif isinstance(error, (ResourceOutcomeUnknown, TimeoutError)) or prepared:
@@ -202,10 +209,13 @@ class MCPInputHost:
 
     async def audit_inline_decline(self, connection_id: str, request_id: str):
         """Legacy/unsolicited callbacks have no restartable original checkpoint."""
-        self.require_current()
-        await self.store.audit_decisions(connection_id, 'inline',
-            ((request_id, 'no_restartable_state'),), now=self.authority.clock().timestamp())
-        self.require_current()
+        # Long-lived native clients can call this outside any governed turn.
+        # Read policy only after admission and retain it through native commit.
+        async with require_durable_persistence_gate(self.agent).shared():
+            self.require_current()
+            await self.store.audit_decisions(connection_id, 'inline',
+                ((request_id, 'no_restartable_state'),), now=self.authority.clock().timestamp())
+            self.require_current()
 
     async def suspend(self, origin: MCPInputOrigin, *, connection_id: str,
                       contract_digest: str, method: str, payload: dict) -> str:

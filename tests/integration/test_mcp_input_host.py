@@ -53,6 +53,88 @@ async def answer(boundary, row, *, principal='key', session='original-chat', res
                 if responses is None else responses, **changes))
 
 
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+async def test_unsolicited_input_audit_retains_privacy_until_native_commit(apps_boundary, monkeypatch):
+    b = apps_boundary
+    host = b.feature._input_host
+    entered, release = asyncio.Event(), asyncio.Event()
+    attempted, transitioned = asyncio.Event(), asyncio.Event()
+    original_write = host.store.write_transaction
+    gate = b.agent._get_durable_persistence_gate()
+    original_acquire = gate._lock.acquire
+
+    @asynccontextmanager
+    async def held_write():
+        entered.set()
+        await release.wait()
+        async with original_write():
+            yield
+
+    async def observed_acquire():
+        attempted.set()
+        await original_acquire()
+
+    async def transition():
+        async with b.agent.privacy_transition():
+            transitioned.set()
+
+    monkeypatch.setattr(host.store, 'write_transaction', held_write)
+    monkeypatch.setattr(gate._lock, 'acquire', observed_acquire)
+    audit = asyncio.create_task(host.audit_inline_decline('owned-apps-peer', 'unsolicited-request'))
+    change = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        change = asyncio.create_task(transition())
+        await asyncio.wait_for(attempted.wait(), 5)
+        assert not transitioned.is_set(), (
+            'Unsolicited MCP input audit allowed a privacy transition before its native commit')
+        release.set()
+        await asyncio.wait_for(audit, 5)
+        await asyncio.wait_for(change, 5)
+        assert await host.store.database.fetchall('SELECT reason FROM mcp_input_decisions') == [
+            ('no_restartable_state',)]
+    finally:
+        release.set()
+        await asyncio.gather(audit, *([change] if change is not None else []), return_exceptions=True)
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+@pytest.mark.parametrize('commit_outcome', ['committed', 'unknown'])
+async def test_input_settlement_preserves_native_commit_reconciliation(
+        apps_boundary, monkeypatch, commit_outcome):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    b = apps_boundary
+    await pause(b)
+    row, = (await pending(b)).json()['inputs']
+    store = b.feature._input_host.store
+    original = store.write_transaction
+
+    @asynccontextmanager
+    async def lost_acknowledgement():
+        async with original():
+            yield
+        if b.markers:
+            # The real native continuation and its terminal SQL commit have
+            # finished. Only their acknowledgement is lost at this boundary.
+            raise ExceptionGroup('private settlement detail', [ExecutionCommitOutcomeError(commit_outcome)])
+
+    monkeypatch.setattr(store, 'write_transaction', lost_acknowledgement)
+    response = await answer(b, row)
+    assert response.status_code == 500, response.text
+    error = response.json()['error']
+    assert error['code'] == 'execution_control', (
+        'Native MCP input commit uncertainty lost its execution-control classification')
+    assert error['details'] == [{'commit_outcome': commit_outcome}]
+    assert 'Reconcile' in error['message']
+    assert 'private settlement detail' not in response.text
+    assert 'no-store' in response.headers['cache-control']
+    assert await store.database.fetchall('SELECT state FROM mcp_inputs') == [('RESOLVED',)]
+    assert b.markers == ['original-marker'] and len(wire(b)) == 2
+    assert (await answer(b, row)).status_code == 409
+    assert b.markers == ['original-marker'] and len(wire(b)) == 2
+
+
 async def open_input_app(b):
     reference = await b.publish(marker='opened-once')
     opened = await b.open(reference)

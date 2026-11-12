@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timezone
 
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ from kestrel_sovereign.api_errors import (
     register_api_error_handlers,
 )
 from kestrel_sovereign.logging_config import correlation_id_var
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCommitOutcomeError
 
 
 class _Payload(BaseModel):
@@ -160,3 +162,21 @@ def test_unhandled_exception_is_sanitized_in_canonical_envelope():
     assert response.json()["error"]["code"] == "internal_error"
     assert response.json()["detail"] == "An internal error occurred."
     assert "/private/data" not in response.text
+
+
+@pytest.mark.parametrize('outcome', [None, 'committed', 'unknown'])
+def test_unhandled_control_error_retains_canonical_reconciliation(outcome):
+    app = _app()
+
+    @app.get('/control')
+    async def control_error():
+        native = ExecutionCommitOutcomeError(outcome) if outcome is not None else ExecutionAuthorityError()
+        raise ExceptionGroup('private native evidence', [native])
+
+    response = TestClient(app, raise_server_exceptions=False).get('/control')
+    assert response.status_code == 500
+    error = response.json()['error']
+    assert error['code'] == 'execution_control'
+    assert error['details'] == [{'commit_outcome': outcome}]
+    assert 'Reconcile' in error['message']
+    assert 'private native evidence' not in response.text
