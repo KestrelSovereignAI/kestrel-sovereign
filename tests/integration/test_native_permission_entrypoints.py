@@ -94,13 +94,17 @@ class NativePermissionCase:
 
 
 @pytest_asyncio.fixture
-async def native_permission_case(tmp_path, monkeypatch):
+async def native_permission_case(
+    tmp_path, monkeypatch, native_permission_inherited_environment, isolated_process_rate_limiter,
+):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
     monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path))
     monkeypatch.setenv("KESTREL_COMPUTE_ALLOW_DOCKER", "false")
     monkeypatch.setenv("KESTREL_ALLOW_LOCAL_COMPUTE", "true")
     monkeypatch.setenv("KESTREL_COMPUTE_AUTO_APPROVE_RISK", "101")
+    monkeypatch.setenv("KESTREL_TEST_AUTO_APPROVE", "false")
+    monkeypatch.setenv("KESTREL_TEST_INSTANCE_AUTO_APPROVE", "false")
     (tmp_path / "kestrel.toml").write_text('[llm]\nroute_priority=[]\n')
 
     @asynccontextmanager
@@ -124,14 +128,40 @@ async def native_permission_case(tmp_path, monkeypatch):
     yield create
 
 
+@pytest.fixture
+def native_permission_inherited_environment(request, monkeypatch):
+    setting = getattr(request, "param", None)
+    if setting is not None:
+        monkeypatch.setenv(setting, "true")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_native_approval_rate_budget_rejects_excess_unknown_decisions(native_permission_case):
+    """Spend the real endpoint budget; other cases must own a fresh bucket."""
+    async with native_permission_case() as case:
+        for _ in range(30):
+            response = await case.http.post("/api/security/approve", json={
+                "approval_id": "unknown-owned-test-request", "approved": False})
+            assert response.status_code == 404, response.text
+        excess = await case.http.post("/api/security/approve", json={
+            "approval_id": "unknown-owned-test-request", "approved": False})
+        assert excess.status_code == 429
+        assert await case.audit() == [] and not case.security.approval_queue.pending_requests
+        case.assert_effect_count(0)
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("entrypoint", ["command", "named-tool", "task-skill"])
-@pytest.mark.parametrize("permission,decision", [
-    (PermissionLevel.DENY, "auto_denied"),
-    (PermissionLevel.ALLOW, "auto_allowed"),
-    (PermissionLevel.ASK, "no_approver"),
-])
+@pytest.mark.parametrize("permission,decision,native_permission_inherited_environment", [
+    (PermissionLevel.DENY, "auto_denied", None),
+    (PermissionLevel.ALLOW, "auto_allowed", None),
+    (PermissionLevel.ASK, "no_approver", None),
+    (PermissionLevel.ASK, "no_approver", "KESTREL_TEST_AUTO_APPROVE"),
+    (PermissionLevel.ASK, "no_approver", "KESTREL_TEST_INSTANCE_AUTO_APPROVE"),
+], indirect=["native_permission_inherited_environment"],
+    ids=["deny", "allow", "headless-ask", "inherited-auto", "inherited-instance-auto"])
 async def test_native_entrypoints_share_permission_before_actual_process_effect(
     native_permission_case, entrypoint, permission, decision,
 ):
