@@ -522,11 +522,23 @@ or is gone), the pass records the row settled (`record_delivery_settled`) and
 never reads it again. Each pass therefore reads what may still be owed, not the
 terminal history. Not owed is not enough to record it, since a task that asked
 for input can be working on the same input again. The `settled_at` column and
-the index are additive DDL the store ensures at every startup. Boot mints no new
-wake for an input an unsettled terminal row names (`unsettled_cognition_wakes`,
-which reads only the ledger): a replacement would be refused as its wake was,
+the index are additive DDL the store ensures at every startup.
+
+Boot decides each input's recovery from every wake of it that is not
+acknowledged, under any identity: the original submission wake and each
+earlier recovery wake (`unacknowledged_durable_deliveries`, which reads only the
+ledger: live rows, then unsettled terminal rows, in bounded keyset pages). It
+mints no wake for an input one of them names unless that one is live under the
+very identity boot would mint, which deduplicates. A terminal one owns its
+input for the settlement pass: a replacement would be refused as its wake was,
 and a live wake beside the terminal row would leave the next pass ending work
-that wake still runs.
+that wake still runs. A live one under another identity resumes the work on
+its own retry, and a second identity would run it twice. The read comes before
+the candidate tasks and the settlement pass. A row it found live may end
+undelivered since, here or on a peer, and boot has already left its input to
+it; a row it did not find was acknowledged, or its work released, and neither
+can come to run or be owed. So no write after the read can make boot's
+decision wrong.
 
 A terminal row is that debt's only record, so retention keeps it. The durable
 retention sweep (`purge_expired_durable_deliveries`) holds every failed or
@@ -534,9 +546,16 @@ terminal-ACKable row of a settling consumer past its deadline until the pass
 records it settled; the sweep itself reads no task.
 
 There is one settlement point, the dispatcher's settlement pass
-(`_settle_owed_cognition_sources`). The runtime-owner heartbeat runs it at the
-end of each pass that completes its ordinary sweeps, and boot reconciliation
-runs it before any consumer starts (`settle_owed_cognition_sources`). Nothing
+(`_settle_owed_cognition_sources`). The runtime-owner heartbeat starts it at the
+end of each beat that completes its ordinary sweeps, and boot reconciliation
+runs it before any consumer starts (`settle_owed_cognition_sources`). The
+heartbeat never awaits it: a pass reads the work of every owed row, nothing
+bounds how long those reads take, and a renewal held back that long would let
+a peer judge this live owner dead and reclaim its leases. It runs in a task of
+its own (`_start_owed_settlement_pass`), one at a time, while the owner renews
+on its ordinary cadence; a pass still running when a row commits asks for
+another as it ends. Shutdown starts none, a running pass stops before its next
+row once shutdown closes admission, and stopping the heartbeat joins it. Nothing
 settles before a delivery's own terminal CAS has committed: a NACK or release
 that leaves a settling consumer's row failed or terminal-ACKable (a Stop, a
 refusal, a spent last attempt) and the failed-row terminalizer only ask for a
@@ -568,6 +587,21 @@ the pass but leaves this process's control standing. The retry reads the work's
 own state, so it returns once nothing is owed. The control ends when a retry
 returns; any failure keeps it, so shutdown never reports a deferred settlement
 as done. The row's CAS is never written again.
+
+Whether the owner heartbeat runs and which branch it runs are separate
+decisions. An owner that is not durably retired keeps heartbeating, whatever
+keeps it unretired: a shutdown that refused or failed (settlement control that
+stands, an ordinary error in its retry, or a stop mark that did not commit),
+retained row debt, or a retained cognition task
+(`_runtime_owner_liveness_required`). The heartbeat stops only while shutdown
+stops it and marks the owner stopped, and after that mark commits; if either
+step fails it resumes for the retry. Only debt that guards a lease routes it
+to the cleanup branch (`_runtime_owner_cleanup_required`). Once shutdown has
+closed admission, any other unretired owner's heartbeat runs no settlement
+pass, recovery or claim: it renews only this owner's own row
+(`retain_unretired_runtime_owner`), which never inserts a row or renews one
+already stopped, so a stop mark whose acknowledgement was lost stays a
+retirement.
 
 The write itself is the agent's `settle_undelivered_cognition_wake`, named by
 the wake's durable identity (`source`, `target_agent`, `source_event_id`) and

@@ -89,9 +89,10 @@ class _Agent(EventManagerMixin):
         self.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
             return_value=None
         )
-        # Boot reconciliation opens with the dispatcher's settlement pass;
-        # no terminal wake is unsettled unless a test says otherwise.
-        self.dispatcher.unsettled_cognition_wakes = AsyncMock(return_value=[])
+        # Boot reconciliation reads every unacknowledged wake, then opens with
+        # the dispatcher's settlement pass; there is none unless a test says
+        # otherwise.
+        self.dispatcher.unacknowledged_durable_deliveries = AsyncMock(return_value=[])
         self.dispatcher.settle_owed_cognition_sources = AsyncMock()
         self.task_manager = MagicMock()
         self.task_manager.get_task_snapshot = AsyncMock(
@@ -265,22 +266,43 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
     ] == ['["missing-outbox",0]', "behind-it"]
 
 
+def _wake_row(source_event_id, *, terminal=False):
+    return SimpleNamespace(
+        event=SimpleNamespace(source="a2a.task_submitted", source_event_id=source_event_id),
+        is_terminal=terminal,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "original,mints",
+    "unacknowledged,mints",
     [
-        (None, True),
-        (SimpleNamespace(is_terminal=True, status="acknowledged"), True),
-        (SimpleNamespace(is_terminal=False, status="leased"), False),
+        ([], True),
+        ([_wake_row('["mid-turn",0]')], False),
+        ([_wake_row('["mid-turn",0]', terminal=True)], False),
+        ([_wake_row('["mid-turn",0,0]')], False),
+        ([_wake_row('["mid-turn",0,0]', terminal=True)], False),
+        ([_wake_row('["mid-turn",0,1]')], True),
+        ([_wake_row('["mid-turn",1]', terminal=True)], True),
     ],
-    ids=["no-original", "original-finished", "original-still-live"],
+    ids=[
+        "none-or-acknowledged",
+        "original-still-live",
+        "original-ended-undelivered",
+        "earlier-recovery-still-live",
+        "earlier-recovery-ended-undelivered",
+        "same-identity-live",
+        "another-input-ended",
+    ],
 )
-async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
-    original, mints
+async def test_boot_reconciliation_mints_working_only_when_no_other_wake_holds_the_input(
+    unacknowledged, mints
 ):
-    """A live submission wake resumes its own work; a second would duplicate it.
-    One that ended without running is settled instead; see
-    ``test_boot_reconcile_ends_a_task_whose_wake_already_failed``."""
+    """A live wake of the input, the original or an earlier recovery wake,
+    resumes its own work, and a second identity would duplicate it. One that
+    ended without running is settled instead; see
+    ``test_boot_reconcile_ends_a_task_whose_wake_already_failed``. Only the
+    ledger read decides: acknowledged rows are absent from it (#4001)."""
 
     agent = _Agent()
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
@@ -288,9 +310,7 @@ async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
             replace(_task('mid-turn', state=TaskState.TASK_STATE_WORKING), lifecycle_revision=1)
         ]
     )
-    agent.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
-        return_value=original
-    )
+    agent.dispatcher.unacknowledged_durable_deliveries = AsyncMock(return_value=unacknowledged)
     agent.dispatcher.enqueue_durable_cognition = AsyncMock(
         side_effect=lambda *args, **kwargs: _durable_signal_handle(
             DurableAdmissionDisposition.COMMITTED
@@ -299,11 +319,10 @@ async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
 
     await agent.reconcile_a2a_cognition_wakes()
 
-    agent.dispatcher.get_durable_delivery_for_source_event.assert_awaited_once_with(
-        consumer_id="core.a2a-task-submitted-cognition-v1",
-        source="a2a.task_submitted",
-        source_event_id='["mid-turn",0]',
+    agent.dispatcher.unacknowledged_durable_deliveries.assert_awaited_once_with(
+        consumer_id="core.a2a-task-submitted-cognition-v1"
     )
+    agent.dispatcher.get_durable_delivery_for_source_event.assert_not_awaited()
     minted = [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list

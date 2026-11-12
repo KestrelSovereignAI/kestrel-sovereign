@@ -1149,6 +1149,7 @@ async def test_an_unknown_settlement_commit_fails_readiness_until_it_resolves(
     from tests.unit.test_a2a_native_input_fencing import (
         failed_submission_wake,
         fault_task_writes,
+        heartbeat,
     )
 
     async with booted_agent(
@@ -1183,7 +1184,7 @@ async def test_an_unknown_settlement_commit_fails_readiness_until_it_resolves(
         faults = [ExecutionCommitOutcomeError("unknown")]
         fault_task_writes(agent.task_manager, faults)
         try:
-            await agent.dispatcher._heartbeat_runtime_owner()
+            await heartbeat(agent.dispatcher)
 
             assert faults == []
             assert agent.dispatcher.unresolved_cognition_control == (failed.delivery_id,)

@@ -31,6 +31,7 @@ from tests.unit.test_a2a_native_input_fencing import (
     close_input_dispatcher,
     failed_submission_wake,
     fault_task_writes,
+    heartbeat,
     input_dispatcher,
     snapshot,
 )
@@ -111,13 +112,13 @@ async def test_a_settlement_control_keeps_the_owner_heartbeating(native_pg):
         faults = [ExecutionCommitOutcomeError("unknown") for _ in range(heartbeats + 1)]
         fault_task_writes(manager, faults)
 
-        await dispatcher._heartbeat_runtime_owner()
+        await heartbeat(dispatcher)
         assert dispatcher.unresolved_cognition_control == (failed.delivery_id,)
         assert not dispatcher._retained_cognition_control_debt
         beats = [await _heartbeat_at(dispatcher)]
         for _ in range(heartbeats - 1):
             await asyncio.sleep(0.02)
-            await dispatcher._heartbeat_runtime_owner()
+            await heartbeat(dispatcher)
             beats.append(await _heartbeat_at(dispatcher))
             # Each pass retried the fenced write and met the unknown commit
             # again: the control stands, and readiness still fails.

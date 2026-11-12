@@ -4755,6 +4755,37 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id=agent_id, owner_id=owner_id, now=touch_now
             )
 
+    async def retain_unretired_runtime_owner(self, *, agent_id: str, owner_id: str) -> bool:
+        """Refresh an existing owner that is not yet stopped; never revive one.
+
+        A dispatcher whose shutdown refused or failed keeps this owner
+        unretired and must stay live for peers until it retires (#4001). Unlike
+        :meth:`heartbeat_runtime_owner` this inserts nothing and never clears
+        ``stopped_at``, so a heartbeat that runs late cannot undo a retirement.
+        Returns whether the owner was refreshed.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        if self.is_postgres:
+            return await self._backend.retain_unretired_runtime_owner(
+                agent_id=agent_id, owner_id=owner_id,
+            )
+        async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
+            now = self.to_timestamp_param(self.now_utc())
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.RUNTIME_OWNERS}
+                SET heartbeat_at = CASE
+                        WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END,
+                    updated_at = CASE
+                        WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END
+                WHERE agent_id = ? AND owner_id = ? AND stopped_at IS NULL
+                """,
+                (now, now, now, now, agent_id, owner_id),
+            )
+        return updated == 1
+
     async def release_initial_reservations(
         self,
         *,
@@ -5647,6 +5678,39 @@ class DurableSignalStore(UnifiedStoreBase):
         rows = await self._backend.fetch_all(
             self._delivery_select_sql(where) + " ORDER BY d.delivery_id LIMIT ?",
             (agent_id, consumer_id, after_delivery_id, limit),
+        )
+        return [self._row_to_delivery(row) for row in rows]
+
+    async def list_live_deliveries_page(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        after_delivery_id: str,
+        limit: int,
+    ) -> list[DurableDelivery]:
+        """One keyset page of a consumer's live rows, in delivery-ID order.
+
+        Live is pending, initially reserved, leased or awaiting retry: a row
+        that can still run, or still end without running. What this reads is
+        bounded by the consumer's in-flight work, never its history (#4001).
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        if not isinstance(after_delivery_id, str):
+            raise ValueError("after_delivery_id must be a delivery ID string")
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        rows = await self._backend.fetch_all(
+            self._delivery_select_sql(
+                "d.agent_id = ? AND d.consumer_id = ? "
+                "AND d.status IN (?, ?, ?, ?) AND d.delivery_id > ?"
+            )
+            + " ORDER BY d.delivery_id LIMIT ?",
+            (
+                agent_id, consumer_id, PENDING, INITIAL_RESERVED, LEASED, RETRY,
+                after_delivery_id, limit,
+            ),
         )
         return [self._row_to_delivery(row) for row in rows]
 

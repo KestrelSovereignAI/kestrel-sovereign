@@ -2658,6 +2658,27 @@ class PostgresBackend(DatabaseBackend):
         grant a lease, acknowledge ingress, or reopen ordinary native work.
         It serializes with canonical owner recovery using its exact key.
         """
+        return await self._retain_live_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, cognition_lease_required=True,
+        )
+
+    async def retain_unretired_runtime_owner(self, *, agent_id: str, owner_id: str) -> bool:
+        """Retain an existing live owner whose retirement has not completed.
+
+        A shutdown that refused or failed leaves its owner unretired, and a
+        peer must not reclaim what it still leases (#4001). Like cognition
+        cleanup this cannot insert/revive an owner, grant a lease, or reopen
+        ordinary native work; it needs no leased cognition, since what an
+        unretired owner still guards need not be cognition.
+        """
+        return await self._retain_live_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id, cognition_lease_required=False,
+        )
+
+    async def _retain_live_runtime_owner(
+        self, *, agent_id: str, owner_id: str, cognition_lease_required: bool,
+    ) -> bool:
+        """Refresh one existing, unstopped managed owner on fixed cleanup SQL."""
         from kestrel_sovereign.signals.durable import DurableSignalStore
         from kestrel_sovereign.signals.sources import core_cognition_consumers
 
@@ -2668,6 +2689,18 @@ class PostgresBackend(DatabaseBackend):
         pool = self._pool
         if pool is None:
             raise ConnectionError("cognition cleanup requires the original backend")
+        lease_guard = ""
+        parameters: tuple = (agent_id, owner_id)
+        if cognition_lease_required:
+            lease_guard = (
+                " AND EXISTS ("
+                f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
+                "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
+                "AND delivery.consumer_id = ANY($3::text[]) "
+                "AND delivery.status IN ('leased', 'retry') "
+                "AND delivery.lease_token IS NOT NULL)"
+            )
+            parameters += (list(dict(core_cognition_consumers())),)
         async with asyncio.timeout(5):
             async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
                 async with self._tracked_native_transaction(connection, state.scopes, state):
@@ -2680,13 +2713,8 @@ class PostgresBackend(DatabaseBackend):
                         "SET heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()), "
                         "updated_at = clock_timestamp() "
                         "WHERE owner.agent_id = $1 AND owner.owner_id = $2 "
-                        "AND owner.stopped_at IS NULL AND EXISTS ("
-                        f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
-                        "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
-                        "AND delivery.consumer_id = ANY($3::text[]) "
-                        "AND delivery.status IN ('leased', 'retry') "
-                        "AND delivery.lease_token IS NOT NULL)",
-                        agent_id, owner_id, list(dict(core_cognition_consumers())),
+                        "AND owner.stopped_at IS NULL" + lease_guard,
+                        *parameters,
                     )
                     return result == "UPDATE 1"
 

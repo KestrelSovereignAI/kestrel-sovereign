@@ -748,6 +748,27 @@ class EventManagerMixin:
             submitted_input_identity,
         )
 
+        # Every wake of an input that is not acknowledged decides whether
+        # boot may mint one for it (#4001). Read before the candidates and the
+        # settlement pass, so a task the pass ends here is skipped below, and
+        # from the ledger alone, so no task's read can refuse this boot. Each
+        # row read live may since have ended undelivered, and settlement then
+        # owns its input; a row not read was acknowledged, or its work was
+        # released, and neither can change. So the decision below stands
+        # whatever such a row has done since, here or on a peer.
+        wakes_of_input: dict[tuple[str, int], list] = {}
+        for delivery in await self.dispatcher.unacknowledged_durable_deliveries(
+            consumer_id=SUBMITTED_CONSUMER
+        ):
+            if delivery.event.source != SUBMITTED_SOURCE:
+                continue
+            try:
+                named = parse_submitted_input_identity(delivery.event.source_event_id)
+            except ValueError:
+                # A row without a canonical identity names no input.
+                continue
+            wakes_of_input.setdefault(named, []).append(delivery)
+
         now = datetime.now(UTC)
         horizons = {
             source: self._a2a_wake_replay_horizon(source, now)
@@ -758,23 +779,6 @@ class EventManagerMixin:
             live_changed_since=horizons[SUBMITTED_SOURCE],
             terminal_changed_since=horizons[COMPLETE_SOURCE],
         )
-        # An input an unsettled terminal wake names gets no new wake: a
-        # replacement would be refused as its wake was, and a live one beside
-        # the terminal row would leave the next pass ending work that wake
-        # still runs (#4001). Only the ledger is read here, never a task, so
-        # no task's read can refuse this boot. Such a row whose task is still
-        # a live candidate at that input is exactly one still owed.
-        owed_inputs = set()
-        for delivery in await self.dispatcher.unsettled_cognition_wakes():
-            if delivery.event.source != SUBMITTED_SOURCE:
-                continue
-            try:
-                owed_inputs.add(
-                    parse_submitted_input_identity(delivery.event.source_event_id)
-                )
-            except ValueError:
-                # A row without a canonical identity names no input.
-                continue
         # The settlement pass's first run: end the work of every wake that
         # ended undelivered, before anything is minted. A task it ends here
         # is still a live candidate above, and is skipped below; the
@@ -789,28 +793,6 @@ class EventManagerMixin:
             task = candidate.task
             state = task.status.state
             if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
-                if (task.id, candidate.input_revision) in owed_inputs:
-                    continue
-                original = await self.dispatcher.get_durable_delivery_for_source_event(
-                    consumer_id=SUBMITTED_CONSUMER,
-                    source=SUBMITTED_SOURCE,
-                    source_event_id=submitted_input_identity(
-                        task.id, candidate.input_revision
-                    ),
-                )
-                if (
-                    state == TaskState.TASK_STATE_WORKING
-                    and original is not None
-                    and not original.is_terminal
-                ):
-                    # A crash mid-turn leaves the submission wake live, and
-                    # its own retry resumes this work. A second identity
-                    # would run the same task twice at recovery.
-                    continue
-                signal = build_signal_for_submitted_task(
-                    candidate, target_agent=self.did
-                )
-                consumer_id = SUBMITTED_CONSUMER
                 # SUBMITTED owns the callback's original source identity.
                 # WORKING is a later durable lifecycle revision: if the
                 # original wake already ACKed before a process died, reusing
@@ -824,6 +806,24 @@ class EventManagerMixin:
                         working_revision=candidate.lifecycle_revision,
                     )
                 )
+                if any(
+                    # Ended undelivered: its work belongs to the settlement
+                    # pass. A replacement would be refused as it was, or run
+                    # beside a row the next pass settles by ending its work.
+                    wake.is_terminal
+                    # Live under another identity, whether the original or an
+                    # earlier recovery wake: its own retry resumes this work,
+                    # and a second identity would run it twice.
+                    or wake.event.source_event_id != source_event_id
+                    for wake in wakes_of_input.get(
+                        (task.id, candidate.input_revision), ()
+                    )
+                ):
+                    continue
+                signal = build_signal_for_submitted_task(
+                    candidate, target_agent=self.did
+                )
+                consumer_id = SUBMITTED_CONSUMER
             else:
                 signal = build_signal_for_completed_task(
                     candidate,

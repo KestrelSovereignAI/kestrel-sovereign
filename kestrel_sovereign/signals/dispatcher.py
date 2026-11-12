@@ -997,6 +997,10 @@ class SignalDispatcher:
         # effects from the original task are still running.
         self._durable_shutdown_owner_fenced = False
         self._durable_control_cleanup_fenced = False
+        # Set only while shutdown stops the owner heartbeat and marks the
+        # owner stopped: the one span in which an unretired owner may go
+        # unrenewed, because it is being retired (#4001).
+        self._runtime_owner_retiring = False
         self._fenced_durable_shutdown_completion: Optional[asyncio.Task[None]] = None
         self._runtime_owner_fence_lock = asyncio.Lock()
         # What the UI side-channel emit actually did, per signal (#2922).
@@ -1032,6 +1036,9 @@ class SignalDispatcher:
         # A wake's terminal row committed since the last settlement pass
         # began, so the next heartbeat runs promptly (#4001).
         self._owed_settlement_pass_requested = False
+        # The settlement pass the heartbeat started, in a task of its own so
+        # that however long it reads, owner renewal goes on (#4001).
+        self._owed_settlement_task: Optional[asyncio.Task] = None
         self._durable_shutdown = False
         self._durable_cognition_stop: asyncio.Future[None] | None = None
         self._entered_durable_cognition_drainers: set[asyncio.Task] = set()
@@ -1095,9 +1102,11 @@ class SignalDispatcher:
         """Metadata owners excluded from the general sweep only after close."""
         if not self._durable_shutdown:
             return frozenset()
-        heartbeat = self._runtime_owner_heartbeat_task
-        return frozenset(self._durable_owned_tasks) | (
-            frozenset({heartbeat}) if heartbeat is not None else frozenset()
+        return frozenset(self._durable_owned_tasks) | frozenset(
+            task for task in (
+                self._runtime_owner_heartbeat_task,
+                getattr(self, "_owed_settlement_task", None),
+            ) if task is not None
         )
 
     def _cognition_stop_notice(self) -> asyncio.Future[None]:
@@ -3114,8 +3123,27 @@ class SignalDispatcher:
             self._schedule_runtime_owner_heartbeat()
         await self._drain_retained_durable_cognition_cleanup_tasks()
         self._durable_control_cleanup_fenced = False
-        await self._stop_runtime_owner_heartbeat()
-        await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
+        await self._retire_runtime_owner()
+
+    async def _retire_runtime_owner(self) -> None:
+        """Stop the owner heartbeat, then mark the owner stopped (#4001).
+
+        The heartbeat stops first, so a delayed one cannot revive the owner
+        it retires. Until that mark commits the owner is not retired: when
+        either step fails it keeps heartbeating for the retry, rather than
+        looking dead to a peer while it still holds leases.
+        """
+        self._runtime_owner_retiring = True
+        try:
+            await self._stop_runtime_owner_heartbeat()
+            async with self._runtime_owner_fence_lock:
+                pass
+            await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
+        except BaseException:
+            self._runtime_owner_retiring = False
+            self._schedule_runtime_owner_heartbeat(retry=True)
+            raise
+        self._runtime_owner_retiring = False
 
     async def _wait_for_retained_durable_cognition_cancellation(self) -> bool:
         """Request a bounded stop and report whether retained work remains."""
@@ -3176,10 +3204,7 @@ class SignalDispatcher:
         await self._drain_retained_durable_cognition_cleanup_tasks()
         self._durable_control_cleanup_fenced = False
         self._durable_shutdown_owner_fenced = False
-        await self._stop_runtime_owner_heartbeat()
-        async with self._runtime_owner_fence_lock:
-            pass
-        await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
+        await self._retire_runtime_owner()
 
     async def _release_runtime_owner_after_shutdown(
         self, *, mark_owner_stopped: bool
@@ -3563,20 +3588,42 @@ class SignalDispatcher:
         the work its wake carried) whose commit outcome is unknown or whose
         execution authority is gone. While any stands, owner retirement
         refuses and the host is not ready (#4001). Only a delivery's own row
-        debt guards a lease (:meth:`_runtime_owner_cleanup_required`).
+        debt guards a lease (:meth:`_runtime_owner_cleanup_required`); the
+        owner heartbeats whichever stands (:meth:`_runtime_owner_liveness_required`).
         """
         return tuple(sorted({
             *getattr(self, "_retained_cognition_control_debt", {}),
             *getattr(self, "_source_settlement_control", {}),
         }))
 
+    def _runtime_owner_liveness_required(self) -> bool:
+        """Whether this owner's heartbeat must keep running (#4001).
+
+        An owner that is not durably retired keeps heartbeating, whatever
+        keeps it unretired: a shutdown that refused or failed, retained row
+        debt, or a settlement's retained control. Otherwise a peer treats it
+        as dead and reclaims leases it still holds. The heartbeat stops only
+        while shutdown is retiring the owner, and once it has. Which body
+        each heartbeat runs is a separate question
+        (:meth:`_runtime_owner_cleanup_required`).
+        """
+        if getattr(self, "_runtime_owner_retiring", False):
+            return False
+        return (
+            not self._durable_shutdown
+            or self._runtime_owner_cleanup_required()
+            or self._durable_runtime_owner_registration_started
+        )
+
     def _runtime_owner_cleanup_required(self) -> bool:
-        """Keep exact owner protection until retained cognition has joined.
+        """Whether the heartbeat runs its cleanup branch: debt guards a lease.
 
         Only what guards a lease counts. A settlement's control does not: its
         row already stands, and on PostgreSQL the cleanup heartbeat refreshes
         an owner only while it leases cognition, so counting it would let a
-        peer reclaim this live owner's leases (#4001).
+        peer reclaim this live owner's leases (#4001). This chooses only the
+        heartbeat's body, never whether it runs
+        (:meth:`_runtime_owner_liveness_required`).
         """
         return (
             bool(self._retained_cognition_control_debt)
@@ -3617,8 +3664,9 @@ class SignalDispatcher:
         consumer's failed or terminal-ACKable row brings the pass forward, so
         the work that wake carried is settled promptly rather than at the
         next ordinary beat. It only schedules: the pass reads what is owed
-        from durable state. A heartbeat already running reschedules promptly
-        when it finishes, in case its pass began before the row committed.
+        from durable state. A heartbeat or pass already running reschedules
+        promptly when it finishes, in case its pass began before the row
+        committed.
         """
         if (
             status not in (FAILED, TERMINAL_ACKABLE)
@@ -3628,7 +3676,10 @@ class SignalDispatcher:
         if "_runtime_owner_stale_after" not in vars(self):
             return
         self._owed_settlement_pass_requested = True
-        if self._runtime_owner_heartbeat_task is None:
+        if (
+            self._runtime_owner_heartbeat_task is None
+            and getattr(self, "_owed_settlement_task", None) is None
+        ):
             self._schedule_runtime_owner_heartbeat(prompt=True)
 
     def _schedule_runtime_owner_heartbeat(
@@ -3642,7 +3693,7 @@ class SignalDispatcher:
         ``prompt`` brings the next heartbeat, and its settlement pass, forward
         without postponing one already due sooner (#4001).
         """
-        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
+        if not self._runtime_owner_liveness_required():
             return
         loop = asyncio.get_running_loop()
         interval = max(0.01, self._runtime_owner_stale_after.total_seconds() / 3)
@@ -3673,10 +3724,31 @@ class SignalDispatcher:
         A timer may already have spawned its agent-owned task when boot starts
         rolling back.  Merely cancelling the next ``TimerHandle`` leaves that
         in-flight task free to touch storage after the rollback has closed it.
+        The settlement pass a heartbeat started is joined too, after the
+        heartbeat, which can start one as it ends (#4001).
         """
         if self._runtime_owner_heartbeat_timer is not None:
             self._runtime_owner_heartbeat_timer.cancel()
             self._runtime_owner_heartbeat_timer = None
+        errors: list[BaseException] = []
+        # Each is joined whatever the other raised: neither may touch the
+        # store after its owner closes it.
+        for join in (self._join_runtime_owner_heartbeat, self._join_owed_settlement_pass):
+            try:
+                await join()
+            except BaseException as error:
+                errors.append(error)
+        # A completion callback may have rearmed while we were joining.
+        if self._runtime_owner_heartbeat_timer is not None:
+            self._runtime_owner_heartbeat_timer.cancel()
+            self._runtime_owner_heartbeat_timer = None
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise execution_finite_error(*errors)
+
+    async def _join_runtime_owner_heartbeat(self) -> None:
+        """Join the running heartbeat, without cancelling it."""
         task = self._runtime_owner_heartbeat_task
         try:
             if task is not None:
@@ -3697,14 +3769,114 @@ class SignalDispatcher:
         finally:
             if self._runtime_owner_heartbeat_task is task:
                 self._runtime_owner_heartbeat_task = None
-            # Its completion callback may have rearmed while we were joining.
-            if self._runtime_owner_heartbeat_timer is not None:
-                self._runtime_owner_heartbeat_timer.cancel()
-                self._runtime_owner_heartbeat_timer = None
+
+    def _start_owed_settlement_pass(self) -> None:
+        """Start a settlement pass in a task of its own (#4001).
+
+        A pass reads the work of every owed row, and nothing bounds how long
+        those reads take. Awaited inside the heartbeat it held back the next
+        renewal until it returned, so a slow pass let a peer judge this live
+        owner dead and reclaim its leases. The heartbeat therefore only starts
+        it, and renews on its own cadence while it runs. One pass runs at a
+        time: one already running asks for another when it ends, should a row
+        have committed after it began. Shutdown starts none.
+        """
+        if self._durable_shutdown or not self._undelivered_wake_consumers():
+            return
+        task = getattr(self, "_owed_settlement_task", None)
+        if task is not None:
+            if not task.done():
+                return
+            # Its completion callback was never published; harvest it here.
+            self._finish_owed_settlement_pass(task)
+        self._owed_settlement_pass_requested = False
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        admission = OwnedTaskAdmission()
+        try:
+            task = self._agent._track_background_task(
+                self._run_owed_settlement_pass(),
+                name=f"durable_signal_owed_settlement:{self._agent.did}",
+                admission=admission,
+            )
+            self._owed_settlement_task = task
+            task.add_done_callback(self._finish_owed_settlement_pass)
+        except BaseException as error:
+            # An accepted pass keeps its slot, so none runs beside it; the
+            # next heartbeat harvests it once it ends.
+            self._owed_settlement_task = admission.task
+            self._owed_settlement_pass_requested = True
+            self._retain_durable_writer_control(error)
+            raise
+
+    async def _run_owed_settlement_pass(self) -> None:
+        """One settlement pass; log native control it met (#4001).
+
+        Native control is retained as that delivery's settlement control:
+        readiness fails and owner retirement refuses while it stands. It
+        guards no lease, so the heartbeat goes on as before, and the next
+        pass retries it.
+        """
+        control = await self._settle_owed_cognition_sources()
+        if control is not None:
+            logger.error(
+                "Settling the work of an undelivered cognition wake met "
+                "unresolved native control (%s); readiness fails and owner "
+                "retirement refuses until a settlement returns: deliveries=%s",
+                type(control).__name__,
+                ", ".join(self.unresolved_cognition_control),
+            )
+
+    def _finish_owed_settlement_pass(self, task: asyncio.Task) -> None:
+        if getattr(self, "_owed_settlement_task", None) is not task:
+            return
+        self._owed_settlement_task = None
+        finish = getattr(type(self._agent), "_finish_background_task", None)
+        if callable(finish):
+            finish(self._agent, task)
+        from kestrel_sovereign._async_ownership import owned_task_error
+        error = owned_task_error(task)
+        self._retain_durable_writer_control(error)
+        if error is not None and not isinstance(
+            error, (asyncio.CancelledError, _DurableDeliveryShuttingDownError)
+        ):
+            # Every row stays owed in durable storage: the next heartbeat's
+            # pass reads it again.
+            logger.error(
+                "Durable settlement pass failed (%s); the next heartbeat runs another",
+                type(error).__name__,
+            )
+        if self._owed_settlement_pass_requested and not self._durable_shutdown:
+            self._schedule_runtime_owner_heartbeat(prompt=True)
+
+    async def _join_owed_settlement_pass(self) -> None:
+        """Join the running settlement pass, without cancelling it (#4001).
+
+        Cancelling it mid-write would turn a settlement already committing
+        into an unknown outcome. A pass refused because shutdown closed
+        admission before it began wrote nothing.
+        """
+        task = getattr(self, "_owed_settlement_task", None)
+        if task is None:
+            return
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            raise_owned_outcome,
+        )
+        try:
+            outcome = await await_owned_task(task)
+            self._finish_owed_settlement_pass(task)
+            if outcome.cancellation is None and isinstance(
+                outcome.error, _DurableDeliveryShuttingDownError
+            ):
+                return
+            raise_owned_outcome(outcome, operation="settlement pass retirement")
+        finally:
+            if getattr(self, "_owed_settlement_task", None) is task:
+                self._owed_settlement_task = None
 
     def _start_runtime_owner_heartbeat(self) -> None:
         self._runtime_owner_heartbeat_timer = None
-        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
+        if not self._runtime_owner_liveness_required():
             return
         task = self._runtime_owner_heartbeat_task
         if task is not None:
@@ -3763,28 +3935,43 @@ class SignalDispatcher:
                 agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
             )
 
+    async def _retain_unretired_runtime_owner_liveness(self) -> None:
+        """Renew an owner shutdown has not retired; admit nothing (#4001).
+
+        Shutdown has closed admission, so this runs no settlement pass,
+        recovery or claim. It refreshes only this owner's own row, and never
+        revives one already stopped: a retirement whose commit was not
+        acknowledged stays retired.
+        """
+        if not await self._durable_store.retain_unretired_runtime_owner(
+            agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+        ):
+            logger.warning(
+                "Durable signal runtime owner is stopped or gone while its "
+                "retirement is incomplete; it is not renewed: agent=%s",
+                self._agent.did,
+            )
+
     async def _heartbeat_runtime_owner(self) -> None:
-        if self._runtime_owner_cleanup_required():
+        if self._runtime_owner_cleanup_required() or self._durable_shutdown:
             # Irreversible runtime denial also denies ordinary metadata SQL.
             # Keep only the existing managed owner's cleanup liveness; this
             # fixed path cannot revive a stopped owner or admit cognition.
+            # After shutdown closes admission, an owner it has not retired
+            # (a shutdown refused or failed) keeps only its own liveness, so
+            # a peer reclaims nothing it still holds (#4001). The timer can
+            # have queued this coroutine just before shutdown flipped the
+            # lifecycle state; it then takes this branch, never admission.
             async with self._runtime_owner_fence_lock:
                 if self._runtime_owner_cleanup_required():
                     await self._retain_runtime_owner_cleanup_liveness()
-            return
-        # The timer can have queued this coroutine immediately before
-        # shutdown flips the lifecycle state.  Take the same admission as
-        # public APIs so it either completes before teardown or performs no
-        # post-close storage work at all.
-        if self._durable_shutdown:
-            if not self.durable_shutdown_owner_fenced:
-                raise _DurableDeliveryShuttingDownError(
-                    "Durable signal delivery is shutting down"
-                )
-            async with self._runtime_owner_fence_lock:
-                if not self.durable_shutdown_owner_fenced:
-                    return
-                await self._retain_runtime_owner_cleanup_liveness()
+                elif self._durable_shutdown:
+                    if not self._runtime_owner_liveness_required():
+                        # Retired, or being retired: no write may follow.
+                        raise _DurableDeliveryShuttingDownError(
+                            "Durable signal delivery is shutting down"
+                        )
+                    await self._retain_unretired_runtime_owner_liveness()
             return
 
         async with self._admit_durable_operation():
@@ -3823,20 +4010,9 @@ class SignalDispatcher:
                 for consumer_id in tuple(self._started_durable_cognition_consumers):
                     self._start_durable_cognition_drain(consumer_id)
             # A terminal wake is never claimed again, so nothing else ends the
-            # work it carried. Native control met here is retained as that
-            # delivery's settlement control: readiness fails and owner
-            # retirement refuses while it stands. It guards no lease, so this
-            # heartbeat goes on as before, and the next pass retries it.
-            self._owed_settlement_pass_requested = False
-            control = await self._settle_owed_cognition_sources()
-            if control is not None:
-                logger.error(
-                    "Settling the work of an undelivered cognition wake met "
-                    "unresolved native control (%s); readiness fails and owner "
-                    "retirement refuses until a settlement returns: deliveries=%s",
-                    type(control).__name__,
-                    ", ".join(self.unresolved_cognition_control),
-                )
+            # work it carried. The pass runs apart from this renewal, so the
+            # next one is never held back by it (#4001).
+            self._start_owed_settlement_pass()
 
     async def _recover_abandoned_initial_reservations(self) -> int:
         """Requeue stale foreign initial reservations for this tenant."""
@@ -3869,7 +4045,7 @@ class SignalDispatcher:
         error = owned_task_error(task)
         self._retain_durable_writer_control(error)
         if isinstance(error, asyncio.CancelledError):
-            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
+            if self._runtime_owner_liveness_required():
                 self._runtime_owner_heartbeat_failures += 1
                 logger.warning(
                     "Durable signal runtime-owner heartbeat was cancelled; "
@@ -3880,20 +4056,26 @@ class SignalDispatcher:
         if isinstance(error, _DurableDeliveryShuttingDownError):
             # A queued timer callback can lose the lifecycle race after
             # shutdown closes admission.  That rejection is normal, but its
-            # exception must still be retrieved before returning.
+            # exception must still be retrieved, and an owner that is not
+            # retired keeps its heartbeat (#4001).
+            self._schedule_runtime_owner_heartbeat()
             return
         if error is not None:
             logger.error("Durable signal runtime-owner heartbeat failed (%s)", type(error).__name__)
-            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
+            if self._runtime_owner_liveness_required():
                 self._runtime_owner_heartbeat_failures += 1
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
-        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
+        if not self._runtime_owner_liveness_required():
             return
         self._runtime_owner_heartbeat_failures = 0
-        if self._owed_settlement_pass_requested:
+        if (
+            getattr(self, "_owed_settlement_pass_requested", False)
+            and getattr(self, "_owed_settlement_task", None) is None
+        ):
             self._schedule_runtime_owner_heartbeat(prompt=True)
         else:
+            # A running pass asks for the next one itself when it ends.
             self._schedule_runtime_owner_heartbeat()
 
     def _discard_expired_transient_durable_handoffs(self) -> None:
@@ -6383,16 +6565,19 @@ class SignalDispatcher:
             return ()
         return tuple(sorted(consumers))
 
-    async def _unsettled_undelivered_wakes(self):
+    async def _unsettled_undelivered_wakes(self, consumers=None):
         """Every unsettled failed or terminal-ACKable row of those consumers.
 
-        The caller holds durable admission. Rows are read per status in
-        delivery-ID keyset pages on the unsettled-terminal index, so each
-        statement reads only the rows it returns. A row leaves once its
-        settlement is recorded, so what is read is what may still be owed,
-        never the settled history (#4001).
+        ``consumers`` defaults to the settling consumers. The caller holds
+        durable admission. Rows are read per status in delivery-ID keyset
+        pages on the unsettled-terminal index, so each statement reads only
+        the rows it returns. A row leaves once its settlement is recorded, so
+        what is read is what may still be owed, never the settled history
+        (#4001).
         """
-        for consumer_id in self._undelivered_wake_consumers():
+        if consumers is None:
+            consumers = self._undelivered_wake_consumers()
+        for consumer_id in consumers:
             for status in (FAILED, TERMINAL_ACKABLE):
                 after = ""
                 while True:
@@ -6448,6 +6633,41 @@ class SignalDispatcher:
             async with aclosing(self._unsettled_undelivered_wakes()) as rows:
                 return [delivery async for delivery in rows]
 
+    async def unacknowledged_durable_deliveries(
+        self, *, consumer_id: str
+    ) -> list[DurableDelivery]:
+        """Every delivery of one consumer that is not acknowledged (#4001).
+
+        Its live rows, then its unsettled terminal rows, each read in bounded
+        delivery-ID keyset pages from the ledger alone. A live row leaves
+        live only by becoming terminal or acknowledged, and a terminal row
+        leaves the unsettled set only once durable state shows its work can
+        never be owed again. Read in that order, every row that existed
+        before this read and is absent from it was acknowledged, or its work
+        released: neither can come to run, or come to be owed, later. Boot
+        decides each submission input's recovery from what this returns.
+        """
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            rows: list[DurableDelivery] = []
+            after = ""
+            while True:
+                page = await self._durable_store.list_live_deliveries_page(
+                    agent_id=self._agent.did,
+                    consumer_id=consumer_id,
+                    after_delivery_id=after,
+                    limit=_UNDELIVERED_WAKE_PAGE_SIZE,
+                )
+                rows.extend(page)
+                if len(page) < _UNDELIVERED_WAKE_PAGE_SIZE:
+                    break
+                after = page[-1].delivery_id
+            async with aclosing(
+                self._unsettled_undelivered_wakes((consumer_id,))
+            ) as terminal:
+                rows.extend([delivery async for delivery in terminal])
+            return rows
+
     async def owed_cognition_wake_settlements(self) -> list[DurableDelivery]:
         """Every terminal wake whose work still waits on it, read from storage.
 
@@ -6497,12 +6717,19 @@ class SignalDispatcher:
         scan, but not the control this process holds. Each such control is
         therefore settled from the work's own durable state too, which ends
         it once nothing is owed.
+
+        Once shutdown closes admission the pass stops before its next row,
+        so shutdown waits for one row's settlement, not a whole backlog.
+        What it leaves is still owed in durable storage, and the retirement
+        drain retries any control this process holds.
         """
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
             scanned: set[str] = set()
             async with aclosing(self._unsettled_undelivered_wakes()) as rows:
                 async for delivery in rows:
+                    if self._durable_shutdown:
+                        return None
                     scanned.add(delivery.delivery_id)
                     control = await self._settle_owed_wake_row(delivery)
                     if control is not None:
@@ -6510,6 +6737,8 @@ class SignalDispatcher:
             for delivery, _ in tuple(
                 getattr(self, "_source_settlement_control", {}).values()
             ):
+                if self._durable_shutdown:
+                    return None
                 if delivery.delivery_id in scanned:
                     continue
                 control = await self._settle_owed_wake_row(delivery)
