@@ -451,7 +451,3 @@ class MCPInputHostMixin:
                 raise HostCapabilityAccessDenied('Original MCP input host was replaced')
             return host
         return MCPInputHost.router_for(original)
-
-    def _withdraw_mcp_input_for_privacy_transition(self):
-        for host in getattr(self, '_mcp_input_hosts', ()):
-            host.withdraw()

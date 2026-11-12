@@ -466,6 +466,105 @@ async def test_new_input_host_and_native_client_recover_original_checkpoint_with
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+async def test_privacy_change_does_not_retire_the_configured_input_host(apps_boundary):
+    from kestrel_sovereign.privacy import PrivacyMode
+
+    b = apps_boundary
+    await pause(b)
+    original = b.feature._input_host
+    changed = await b.agent.set_privacy_mode_with_effects(PrivacyMode.PUBLIC)
+    assert changed.applied and b.agent.privacy_mode is PrivacyMode.PUBLIC, changed.message
+    response = await pending(b)
+    assert response.status_code == 200, (
+        'A completed privacy transition permanently retired the configured MCP input host: ' + response.text)
+    assert b.feature._input_host is original
+    await b.feature.set_config(await b.feature.get_config())
+    row, = response.json()['inputs']
+    assert (await answer(b, row)).status_code == 200
+    assert b.markers == ['original-marker'] and len(wire(b)) == 2
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+async def test_refused_privacy_change_keeps_original_input_available(apps_boundary, monkeypatch):
+    from kestrel_sovereign.privacy import PrivacyMode
+
+    b = apps_boundary
+    await pause(b)
+
+    async def unreadable_state():
+        return None
+
+    monkeypatch.setattr(b.agent, '_recorded_privacy_state', unreadable_state)
+    changed = await b.agent.set_privacy_mode_with_effects(PrivacyMode.PUBLIC)
+    assert not changed.applied and changed.persistence_failed
+    assert b.agent.privacy_mode is PrivacyMode.NORMAL
+    response = await pending(b)
+    assert response.status_code == 200, (
+        'A refused privacy transition permanently retired the original MCP input host: ' + response.text)
+    await b.feature.set_config(await b.feature.get_config())
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form', 'input_tool': 'open_marker'}], indirect=True)
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('followup', ['text', 'repair', 'empty'])
+async def test_followup_inline_input_stops_continuation_and_repair(
+        apps_boundary, monkeypatch, streaming, followup):
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    b = apps_boundary
+    initial = next(item for item in b.tools if item.tool.native_tool.name == 'record_marker')
+    input_tool = next(item for item in b.tools if item.tool.native_tool.name == 'open_marker')
+    await b.permissions.set_permission('mcp:owned-apps', initial.binding.name, PermissionLevel.ALLOW)
+    calls = []
+    prose = 'Let me check the repo now.' if followup == 'repair' else 'after-input-unverified-prose'
+
+    async def inline(kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            await kwargs['tool_executor'](input_tool.binding.name, {'marker': 'waiting-effect'})
+
+    async def generate(**kwargs):
+        await inline(kwargs)
+        return prose if followup == 'text' else LLMResponse(content=prose, tool_calls=[])
+
+    async def stream(**kwargs):
+        await inline(kwargs)
+        if followup != 'empty':
+            yield prose
+            yield LLMResponse(content=prose, tool_calls=[])
+
+    monkeypatch.setattr(b.agent.llm_service, 'generate_with_messages', generate)
+    monkeypatch.setattr(b.agent.llm_service, 'stream_with_tool_detection', stream)
+
+    @b.app.post('/api/owned-followup-input')
+    async def orchestrate(request: Request):
+        with caller_context_scope(request.state.caller), part_collector(host=b.agent, session_id='original-chat'):
+            async def operation():
+                response = LLMResponse(content='', tool_calls=[ToolCall(id=uuid4().hex,
+                    name=initial.binding.name, arguments={'marker': 'first-step'})])
+                options = dict(feature_tools=b.agent._build_all_tools(), system_prompt='Owned inline input test',
+                    force_local_only=True, effective_model='owned-unconfigured-model',
+                    user_message='Run both owned tools', session_id='original-chat', max_iterations=2)
+                if streaming:
+                    return ''.join([chunk async for chunk in b.agent._handle_orchestrator_response_streaming(
+                        response, tool_events=[], tool_results=[], **options)])
+                return await b.agent._handle_orchestrator_response_impl(response, **options)
+            outcome = await b.agent._execute_tool_operation_at_stop_boundary(operation,
+                name='owned-followup-input', tool_operation=ToolEffectOperation('owned-followup-input',
+                    uuid4().hex, 'owned-parent', 'owned-parent', {}, 'original-chat'))
+            return {'text': raise_owned_outcome(outcome, operation='owned-followup-input', retain_originals=True)}
+
+    response = await b.client.post('/api/owned-followup-input', headers=b.headers())
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1, 'A follow-up inline input checkpoint allowed another model/repair call'
+    assert 'waiting for operator input' in response.json()['text'], (
+        'A follow-up inline input checkpoint lost its waiting response')
+    assert prose not in response.json()['text'], 'Post-input continuation prose escaped the pending checkpoint'
+    assert b.markers == ['first-step'] and len(wire(b)) == 1
+    assert len((await pending(b)).json()['inputs']) == 1
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
 async def test_two_real_http_responses_cannot_execute_the_continuation_twice(apps_boundary):
     b = apps_boundary
     await pause(b)

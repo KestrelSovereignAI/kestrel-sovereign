@@ -1606,6 +1606,10 @@ class OrchestratorEngineMixin:
         lock indefinitely. The call's inline tool executor, built for
         ``executor_session_id``, suspends the bound while a tool runs.
         """
+        from kestrel_sovereign.tools.effect_journal import TOOL_INPUT_REQUIRED_MESSAGE, tool_effect_input_waiting
+
+        if tool_effect_input_waiting(self):
+            return TOOL_INPUT_REQUIRED_MESSAGE
         watchdog = LLMCallWatchdog.for_call(
             self.llm_service,
             model_override=call_kwargs.get("model_override"),
@@ -1613,12 +1617,15 @@ class OrchestratorEngineMixin:
             streaming=False,
         )
         try:
-            return await watchdog.call(self.llm_service.generate_with_messages(
+            response = await watchdog.call(self.llm_service.generate_with_messages(
                 tool_executor=self._make_inline_tool_executor(
                     executor_session_id, watchdog=watchdog,
                 ),
                 **call_kwargs,
             ))
+            # Inline adapters may have suspended a tool inside this provider
+            # call. Fence every caller, including premature-yield repair.
+            return TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response
         except Exception as exc:
             await OrchestratorEngineMixin._settle_failed_generation(
                 self, exc, session_id=call_kwargs.get("session_id"),
@@ -1638,12 +1645,24 @@ class OrchestratorEngineMixin:
         raises is settled by :meth:`_settle_failed_generation` before the
         error reaches the turn.
         """
+        from kestrel_sovereign.tools.effect_journal import TOOL_INPUT_REQUIRED_MESSAGE, tool_effect_input_waiting
+
+        if tool_effect_input_waiting(self):
+            yield TOOL_INPUT_REQUIRED_MESSAGE
+            return
         try:
             async with aclosing(watchdog.watch(
                 self.llm_service.stream_with_tool_detection(**call_kwargs)
             )) as stream:
                 async for item in stream:
+                    if tool_effect_input_waiting(self):
+                        yield TOOL_INPUT_REQUIRED_MESSAGE
+                        return
                     yield item
+                # An inline tool can suspend even if its adapter ends without
+                # another chunk or final response object.
+                if tool_effect_input_waiting(self):
+                    yield TOOL_INPUT_REQUIRED_MESSAGE
         except Exception as exc:
             await OrchestratorEngineMixin._settle_failed_generation(
                 self, exc, session_id=call_kwargs.get("session_id"),
