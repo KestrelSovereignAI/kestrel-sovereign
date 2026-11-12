@@ -11,8 +11,10 @@ it by name.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -24,9 +26,15 @@ from kestrel_sovereign.storage.sync.service import (
     OWED_SNAPSHOT_DEADLINE_ENV,
     SyncService,
     SyncServiceStoppingError,
+    SyncStateWriteError,
     owed_snapshot_deadline_from_environment,
 )
-from kestrel_sovereign.storage.sync.targets import SyncResult, SyncTarget, TrustTier
+from kestrel_sovereign.storage.sync.targets import (
+    SyncResult,
+    SyncTarget,
+    TrustTier,
+    _write_consistent_snapshot,
+)
 
 
 class _Target(SyncTarget):
@@ -513,3 +521,242 @@ def test_the_deadline_comes_from_the_environment(monkeypatch):
         monkeypatch.setenv(OWED_SNAPSHOT_DEADLINE_ENV, malformed)
         with pytest.raises(ValueError, match="owed snapshot deadline|KESTREL_OWED"):
             owed_snapshot_deadline_from_environment()
+
+
+class _CopyingTarget(_Target):
+    """Copies the database as the shipped targets do (``sqlite3.backup``),
+    then holds the upload open until released."""
+
+    def __init__(self, name: str, remote: Path):
+        super().__init__(name, blocks=True)
+        self.remote = remote
+        self.copies: list[Path] = []
+
+    async def sync_snapshot(self, db_path: Path) -> SyncResult:
+        copy = self.remote / f"{self.name.rsplit('/', 1)[-1]}-{len(self.copies)}.db"
+        _write_consistent_snapshot(Path(db_path), copy)
+        self.copies.append(copy)
+        return await super().sync_snapshot(db_path)
+
+
+def _rows(db: Path) -> int:
+    with closing(sqlite3.connect(db)) as connection:
+        return connection.execute("SELECT COUNT(*) FROM payload").fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_a_write_during_the_upload_is_still_owed_at_shutdown(tmp_path):
+    """The remote copy holds one row and the database two. The shutdown
+    records the snapshot as owed, and the next backup after the restart
+    uploads it rather than skipping it as unchanged."""
+    db = _database(tmp_path)
+    with closing(sqlite3.connect(db)) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    target = _CopyingTarget("gs://owed/agent", remote)
+    service = await _service(db, target)
+    backup = asyncio.create_task(service.snapshot_if_changed())
+    await asyncio.wait_for(target.entered.wait(), 3)
+    _write(db, "committed during the upload")
+    target.release.set()
+    results = await asyncio.wait_for(backup, 3)
+    assert results[target.name].success
+    assert (_rows(target.copies[-1]), _rows(db)) == (1, 2)
+
+    assert await service.record_remote_snapshot_owed() is True, (
+        "the backup recorded a write it never copied as backed up"
+    )
+    assert _persisted_owed(db) is not None
+    await service.stop()
+
+    after = _CopyingTarget("gs://owed/agent", remote)
+    after.release.set()
+    restarted = await _service(db, after)
+    results = await restarted.snapshot_if_changed()
+
+    assert "__unchanged__" not in results, "the next backup skipped the owed snapshot"
+    assert results[after.name].success and _rows(after.copies[-1]) == 2
+    assert restarted.remote_snapshot_owed is None and _persisted_owed(db) is None
+    await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_owed_record_that_was_not_written_raises_instead_of_reporting_owed(
+    tmp_path, caplog
+):
+    db = _database(tmp_path)
+    target = _Target("gs://owed/agent")
+    service = await _service(db, target)
+    state = Path(f"{db}.sync")
+    state.mkdir()
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(SyncStateWriteError, match=f"sync state {state} was not written"):
+            await service.record_remote_snapshot_owed()
+    assert "owed to gs://owed/agent since" not in caplog.text, (
+        "a record that was not written was logged as owed"
+    )
+
+    # The record stays in memory, so the stop that follows writes it.
+    assert service.remote_snapshot_owed is not None
+    state.rmdir()
+    await service.stop()
+    assert _persisted_owed(db) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_fails_keeps_the_previous_state_file(tmp_path, monkeypatch):
+    """The state file is replaced whole: a failed write leaves the record an
+    earlier shutdown made, and no staged file behind."""
+    db = _database(tmp_path)
+    service = await _service(db, _Target("gs://owed/agent"))
+    assert await service.record_remote_snapshot_owed() is True
+    state = Path(f"{db}.sync")
+    before = state.read_bytes()
+
+    def failing_fsync(descriptor):
+        raise OSError(errno.EIO, "simulated fsync failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", failing_fsync)
+        with pytest.raises(SyncStateWriteError, match="simulated fsync failure"):
+            await service.record_remote_snapshot_owed()
+
+    assert state.read_bytes() == before, "a failed write changed the state file"
+    assert json.loads(before)["remote_snapshot_owed_generation"] == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["agent.db", "agent.db.sync"]
+    await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_backup_whose_state_cannot_be_written_still_returns_its_uploads(
+    tmp_path, caplog
+):
+    """Losing the write after a backup leaves an older fingerprint, which
+    costs one more upload; the uploads themselves are reported."""
+    db = _database(tmp_path)
+    target = _Target("gs://owed/agent")
+    service = await _service(db, target)
+    state = Path(f"{db}.sync")
+    state.mkdir()
+
+    with caplog.at_level(logging.ERROR):
+        results = await service.snapshot_if_changed()
+        await service.stop()
+
+    assert results[target.name].success and target.calls == 1
+    assert f"sync state {state} was not written" in caplog.text
+
+
+class _LandingTarget(_Target):
+    """Copies the database as the shipped targets do and holds each upload
+    until its own gate opens. ``landed`` is the copy of the upload that
+    finished last: what a target that keeps one object then holds."""
+
+    def __init__(self, name: str, remote: Path):
+        super().__init__(name)
+        self.remote = remote
+        self.gates: list[asyncio.Event] = []
+        self.landed: Path | None = None
+
+    async def sync_snapshot(self, db_path: Path) -> SyncResult:
+        copy = self.remote / f"copy-{len(self.gates)}.db"
+        _write_consistent_snapshot(Path(db_path), copy)
+        gate = asyncio.Event()
+        self.gates.append(gate)
+        await gate.wait()
+        self.landed = copy
+        return await super().sync_snapshot(db_path)
+
+
+async def _landing_service(tmp_path: Path) -> tuple[Path, _LandingTarget, SyncService]:
+    db = _database(tmp_path)
+    with closing(sqlite3.connect(db)) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    target = _LandingTarget("gs://owed/agent", remote)
+    return db, target, await _service(db, target)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("older", ["force_snapshot", "snapshot_if_changed"])
+async def test_an_older_pass_that_lands_last_leaves_the_snapshot_owed(tmp_path, older):
+    """Two passes overlap and the older one's upload lands last, so the
+    remote holds one row and the database two. The newer pass may not record
+    the two-row database as backed up: the shutdown owes the snapshot and
+    the next backup after the restart uploads it rather than skip it as
+    unchanged."""
+    db, target, service = await _landing_service(tmp_path)
+    older_pass = asyncio.create_task(getattr(service, older)())
+    await _until(lambda: len(target.gates) == 1)
+    _write(db, "committed while the older pass uploads")
+    newer_pass = asyncio.create_task(service.snapshot_if_changed())
+    await _until(lambda: len(target.gates) == 2)
+    target.gates[1].set()
+    assert (await asyncio.wait_for(newer_pass, 3))[target.name].success
+    target.gates[0].set()
+    assert (await asyncio.wait_for(older_pass, 3))[target.name].success
+    assert (_rows(target.landed), _rows(db)) == (1, 2)
+
+    assert await service.record_remote_snapshot_owed() is True, (
+        "a pass recorded the database as backed up while an older upload "
+        "was still to land"
+    )
+    await service.stop()
+
+    after = _CopyingTarget("gs://owed/agent", target.remote)
+    after.release.set()
+    restarted = await _service(db, after)
+    results = await restarted.snapshot_if_changed()
+    assert "__unchanged__" not in results, "the next backup skipped the owed snapshot"
+    assert results[after.name].success and _rows(after.copies[-1]) == 2
+    await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_overlapped_pass_does_not_clear_an_owed_snapshot(tmp_path):
+    """A pass that copied the database before the record lands after a
+    newer pass reached every target: the remote is behind the record, so
+    it stays owed."""
+    db, target, service = await _landing_service(tmp_path)
+    older_pass = asyncio.create_task(service.force_snapshot())
+    await _until(lambda: len(target.gates) == 1)
+    _write(db, "committed before the shutdown")
+    assert await service.record_remote_snapshot_owed() is True
+    newer_pass = asyncio.create_task(service.snapshot_if_changed())
+    await _until(lambda: len(target.gates) == 2)
+    target.gates[1].set()
+    assert (await asyncio.wait_for(newer_pass, 3))[target.name].success
+    target.gates[0].set()
+    assert (await asyncio.wait_for(older_pass, 3))[target.name].success
+    assert (_rows(target.landed), _rows(db)) == (1, 2)
+
+    assert service.remote_snapshot_owed is not None, (
+        "a pass cleared the owed snapshot while an older upload was still to land"
+    )
+    assert _persisted_owed(db) is not None
+    await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_runs_alone_after_an_overlap_records_the_database(tmp_path):
+    """An overlap costs one more upload, not the change-aware skip for good."""
+    db, target, service = await _landing_service(tmp_path)
+    first = asyncio.create_task(service.force_snapshot())
+    await _until(lambda: len(target.gates) == 1)
+    second = asyncio.create_task(service.snapshot_if_changed())
+    await _until(lambda: len(target.gates) == 2)
+    for gate in target.gates:
+        gate.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 3)
+
+    alone = asyncio.create_task(service.snapshot_if_changed())
+    await _until(lambda: len(target.gates) == 3)
+    target.gates[2].set()
+    assert (await asyncio.wait_for(alone, 3))[target.name].success
+
+    assert "__unchanged__" in await service.snapshot_if_changed()
+    assert await service.record_remote_snapshot_owed() is False
+    await service.stop()

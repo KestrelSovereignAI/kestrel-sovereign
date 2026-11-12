@@ -177,7 +177,9 @@ class SyncState:
     db_path: str
     targets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     last_snapshot: Optional[datetime] = None
-    # Change fingerprint of the DB at the last completed snapshot (#1674 P3).
+    # Change fingerprint of the DB read before the last snapshot that reached
+    # every target and began with no other snapshot in flight (#1674 P3,
+    # #4028).
     # Lets force_snapshot skip a full re-snapshot when nothing changed — so
     # idle agents stop re-dumping the whole DB (notably to S3) every cycle.
     last_fingerprint: Optional[str] = None
@@ -188,7 +190,8 @@ class SyncState:
     last_snapshot_targets: List[str] = field(default_factory=list)
     # When a shutdown last recorded that the remote copy is behind the
     # database: shutdown uploads nothing (#4028). Cleared by the first pass
-    # that then reaches every target; None when nothing is owed.
+    # that then reaches every target and began with no other pass in flight;
+    # None when nothing is owed.
     remote_snapshot_owed_since: Optional[datetime] = None
     # Counts the records. A pass may clear the marker only if no record was
     # made while it ran: the time alone cannot tell two records apart, since
@@ -253,6 +256,43 @@ class SyncServiceStoppingError(RuntimeError):
     """A snapshot was asked for after the service began to stop."""
 
 
+class SyncStateWriteError(OSError):
+    """The sync state file was not written; it still holds the previous state."""
+
+
+def _publish_state_file(path: Path, content: str) -> None:
+    """Replace ``path`` with ``content`` durably, or raise ``OSError``.
+
+    Staged in a sibling file, fsynced, moved over ``path`` and the directory
+    fsynced, so the file holds the previous state or this one, never part of
+    either.
+    """
+    descriptor, staging_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    staging = Path(staging_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as staged:
+            staged.write(content)
+            staged.flush()
+            os.fsync(staged.fileno())
+        os.replace(staging, path)
+    except BaseException:
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            logger.warning(
+                "Could not remove staged sync state %s: %s", staging, cleanup_error
+            )
+        raise
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 @dataclass
 class SnapshotPass:
     """One ``force_snapshot`` pass in flight, on the task that asked for it."""
@@ -269,6 +309,12 @@ class SnapshotPass:
     acknowledged: bool = False
     #: Set once every target is done; the pass is no longer cancellable.
     settling: bool = False
+    #: Set when another pass was already in flight as this one began. That
+    #: pass copied the database earlier and its upload can land after this
+    #: one's, so this pass records nothing about what the targets hold: no
+    #: fingerprint, no owed snapshot cleared (#4028). A pass that begins
+    #: later copies the database later, so it cannot leave a target older.
+    overlapped: bool = False
     #: What the pass raised that is not its requester's own doing:
     #: process-control evidence, or a cancellation nobody requested (a
     #: native callback's). ``stop()`` reports it.
@@ -520,7 +566,13 @@ class SyncService:
         ``start()``. An
         earlier record is kept, so the time says how long the copy has been
         behind. A service with no upload target owes nothing, and neither
-        does a database unchanged since a pass that reached every target.
+        does a database unchanged since a pass that reached every target
+        and began with no other pass in flight.
+
+        Raises ``SyncStateWriteError`` when the record was not written: the
+        shutdown then reports this step as failed instead of the snapshot as
+        owed. The record stays in memory, so the ``stop()`` that follows
+        writes it if it can.
         """
         if self._state is None or not self._targets:
             return False
@@ -617,7 +669,7 @@ class SyncService:
         retained = await self._join_snapshot_passes(inflight)
         if retained is not None:
             failures.append(retained)
-        await self._save_state()
+        await self._save_state_logging_failure()
         if len(failures) > 1:
             raise execution_terminal_error(*failures, retain_originals=True)
         if failures:
@@ -756,12 +808,20 @@ class SyncService:
 
         Skips the whole pass when the DB fingerprint is unchanged since the last
         completed snapshot — an idle agent should not re-dump its entire DB
-        (notably the full S3 upload) every cycle. Records the fingerprint only
-        after a successful snapshot so a fully-failed attempt is retried. The
-        fingerprint is conservative: it never skips a real change. Explicit
+        (notably the full S3 upload) every cycle. The pass records the
+        fingerprint read before it, and only once every target confirmed its
+        snapshot and no earlier pass was still in flight as it began
+        (``_snapshot_to_targets``), so a failed or overlapped attempt is
+        retried. The pass copies the
+        database at or after that read, so a write committed while it uploads
+        still shows as a change afterwards (#4028). The fingerprint is
+        conservative: it never skips a real change. Explicit
         requests keep using ``force_snapshot`` (always runs), and so does a
         snapshot a shutdown recorded as owed (#4028): it is sent even when the
         database looks unchanged."""
+        # Read with no await before the pass is admitted, so a pass that
+        # copied the database before this read is still in flight at the
+        # admission and marks this pass overlapped.
         fingerprint = self._compute_db_fingerprint()
         if (
             self._state is not None
@@ -779,30 +839,13 @@ class SyncService:
                     attempted=False,
                 )
             }
-        results = await self.force_snapshot()
-        # Advance the fingerprint ONLY when every target succeeded. If any
-        # target failed (transient per-target outage), leave the fingerprint
-        # so the next cycle retries rather than skipping the failed target as
-        # "unchanged" until some unrelated DB write happens to bump the
-        # fingerprint. (No targets → all() is True → record, nothing to retry.)
-        if (
-            fingerprint is not None
-            and self._state is not None
-            and results
-            and all(r.success for r in results.values())
-        ):
-            completed_fingerprint = self._compute_db_fingerprint() or fingerprint
-            self._state.last_fingerprint = completed_fingerprint
-            self._state.last_snapshot_targets = sorted(
-                r.target_name for r in results.values() if r.success
-            )
-            await self._save_state()
-        return results
+        return await self._run_snapshot_pass(fingerprint)
 
     def _unchanged_since_complete_pass(self, fingerprint: Optional[str]) -> bool:
         """Whether ``fingerprint`` shows the database as it was at the last
-        pass that reached every current target. An unreadable fingerprint
-        (None) never counts as unchanged."""
+        pass that reached every current target and began with no other pass
+        in flight (the only passes that record one). An unreadable
+        fingerprint (None) never counts as unchanged."""
         current_targets = {t.name for t in self._targets}
         return (
             fingerprint is not None
@@ -822,9 +865,16 @@ class SyncService:
         The pass runs on the caller's task, which can cancel it as before.
         ``stop()`` waits for it, and the host's shutdown budget cancels it
         through ``cancel_inflight_snapshots``."""
+        return await self._run_snapshot_pass(None)
+
+    async def _run_snapshot_pass(
+        self, fingerprint: Optional[str]
+    ) -> Dict[str, SyncResult]:
+        """One pass to every target; ``fingerprint`` is the database's, read
+        before the pass, for the pass to record, or None to record none."""
         snapshot_pass = self._admit_snapshot_pass()
         try:
-            return await self._snapshot_to_targets(snapshot_pass)
+            return await self._snapshot_to_targets(snapshot_pass, fingerprint)
         except BaseException as error:
             if is_execution_control_error(error) or (
                 isinstance(error, asyncio.CancelledError)
@@ -847,6 +897,7 @@ class SyncService:
             task=asyncio.current_task(),
             done=asyncio.get_running_loop().create_future(),
         )
+        snapshot_pass.overlapped = bool(self._passes)
         self._passes[id(snapshot_pass)] = snapshot_pass
         return snapshot_pass
 
@@ -882,7 +933,7 @@ class SyncService:
         return True
 
     async def _snapshot_to_targets(
-        self, snapshot_pass: SnapshotPass
+        self, snapshot_pass: SnapshotPass, fingerprint: Optional[str]
     ) -> Dict[str, SyncResult]:
         # A record made while this pass runs is about a later state of the
         # database than the one this pass copies; only an earlier one can be
@@ -979,8 +1030,32 @@ class SyncService:
         if self._state:
             self._warn_if_repeated_empty_syncs(successful_snapshots)
             self._state.last_snapshot = datetime.now(timezone.utc)
+            # The fingerprint recorded and the owed record cleared both claim
+            # no target holds an older copy than this pass's. A pass already
+            # in flight as this one began can still land one (#4028).
+            holds_this_pass = not snapshot_pass.overlapped
+            # Advance the fingerprint ONLY when every target succeeded. If any
+            # target failed (transient per-target outage), leave the
+            # fingerprint so the next cycle retries rather than skipping the
+            # failed target as "unchanged" until some unrelated DB write
+            # happens to bump the fingerprint. (No targets → all() is True →
+            # record, nothing to retry.) The fingerprint recorded is the one
+            # read before the pass: a read after it would describe writes the
+            # snapshots never copied, and the next backup, or a shutdown,
+            # would take them as backed up.
             if (
-                owed_at_start is not None
+                holds_this_pass
+                and fingerprint is not None
+                and results
+                and all(r.success for r in results.values())
+            ):
+                self._state.last_fingerprint = fingerprint
+                self._state.last_snapshot_targets = sorted(
+                    r.target_name for r in results.values() if r.success
+                )
+            if (
+                holds_this_pass
+                and owed_at_start is not None
                 and self._state.remote_snapshot_owed_generation
                 == owed_generation_at_start
                 and self._every_target_reached(results)
@@ -992,7 +1067,7 @@ class SyncService:
                     owed_at_start.isoformat(),
                     ", ".join(self.targets),
                 )
-            await self._save_state()
+            await self._save_state_logging_failure()
 
         return results
 
@@ -1166,11 +1241,33 @@ class SyncService:
             self._state = SyncState(db_path=str(self.db_path))
 
     async def _save_state(self) -> None:
-        if self._state:
-            try:
-                with open(self.state_file, "w", encoding="utf-8") as f:
-                    json.dump(self._state.to_dict(), f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception as e:
-                logger.error(f"Failed to save sync state: {e}")
+        """Write the state file, or raise ``SyncStateWriteError``.
+
+        The file is replaced whole, so a write that fails leaves the previous
+        state. Writing it in place truncated it first, and the failure was
+        logged and dropped: a shutdown reported a remote snapshot as owed that
+        no restart could find (#4028).
+        """
+        if not self._state:
+            return
+        content = json.dumps(self._state.to_dict(), indent=2)
+        try:
+            _publish_state_file(self.state_file, content)
+        except OSError as error:
+            raise SyncStateWriteError(
+                f"sync state {self.state_file} was not written: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+
+    async def _save_state_logging_failure(self) -> None:
+        """``_save_state`` for a write whose loss is already accounted for.
+
+        The file keeps a remote snapshot it still records as owed, or an
+        older fingerprint, each costing at most one more upload. An owed
+        record that never reached the file was reported by
+        ``record_remote_snapshot_owed`` when its own write failed.
+        """
+        try:
+            await self._save_state()
+        except SyncStateWriteError as error:
+            logger.error("%s", error)

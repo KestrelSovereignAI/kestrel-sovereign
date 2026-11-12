@@ -272,6 +272,36 @@ async def test_with_healthy_targets_shutdown_keeps_local_durability_within_the_a
 
 
 @pytest.mark.asyncio
+async def test_an_owed_record_that_cannot_be_written_fails_its_shutdown_step_by_name(
+    tmp_path, host_budget, caplog
+):
+    """The shutdown does not report a snapshot as owed when its record never
+    reached the state file: it names the failed step and calls the cleanup
+    degraded."""
+    caplog.set_level(logging.INFO)
+    target = _RemoteTarget("gs://budget-test/kestrel/unwritable", blocks=False)
+    async with booted_agent(
+        tmp_path, name="BudgetUnwritable", provenance="test:host_shutdown_budget",
+        features=set(),
+    ) as agent:
+        await _install_sync(agent, target)
+        state = Path(f"{agent.storage_path}.sync")
+        state.mkdir()
+        async with _serving_host(agent, "BudgetUnwritable") as (_manager, driver):
+            await asyncio.wait_for(driver.shutdown(), host_budget)
+
+    assert "Durable shutdown step 'sync-snapshot-owed' failed" in caplog.text
+    assert f"sync state {state} was not written" in caplog.text
+    assert "owed to gs://budget-test/kestrel/unwritable since" not in caplog.text, (
+        "shutdown reported a snapshot as owed that was never recorded"
+    )
+    assert "durable cleanup was DEGRADED" in caplog.text
+    assert "Kestrel Agent async shutdown complete." not in caplog.text
+    assert "Application shutdown complete." in caplog.text
+    assert target.calls == 0, "shutdown uploaded a snapshot"
+
+
+@pytest.mark.asyncio
 async def test_cleanup_an_earlier_teardown_left_running_is_held_to_the_budget(
     tmp_path, host_budget, caplog
 ):

@@ -102,10 +102,17 @@ reach is reported at once rather than waited for.
 `HOST_SHUTDOWN_BUDGET_SECONDS` (#4028). The lifespan shutdown takes its own
 deadline from the same value: `HOST_SHUTDOWN_REMOTE_WORK_SECONDS`, the budget
 less `HOST_SHUTDOWN_RESERVE_SECONDS` (the graceful window and the time to
-finish after it). Agent shutdown starts no remote snapshot upload. When the
-database changed since the last snapshot that reached every target, it records
-the snapshot as owed, and the next scheduled `backup_snapshot` (seeded every
-four hours) sends it, even if the database looks unchanged by then. A
+finish after it). Agent shutdown starts no remote snapshot upload. It
+records the snapshot as owed unless the database is unchanged since the start
+of the last snapshot that reached every target and began with no other
+snapshot in flight: a write committed while that snapshot was uploading is a
+change, and a snapshot that begins while an earlier one uploads records
+nothing, since the earlier upload can land last. The next scheduled
+`backup_snapshot` (seeded every four hours) sends an
+owed snapshot, even if the database looks unchanged by then. A record
+the sync state file cannot take fails the shutdown step `sync-snapshot-owed`,
+naming the file, and the agent's cleanup is reported degraded; the state file
+keeps what it held before. A
 snapshot no backup has sent within `KESTREL_OWED_SNAPSHOT_DEADLINE_S` of the
 record (default five hours) is sent by the agent's sync service itself, at its
 next start if the agent was stopped by then, so an agent that schedules no
