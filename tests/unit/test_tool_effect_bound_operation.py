@@ -12,17 +12,19 @@ from kestrel_sovereign.tool_effect_store import (
     ToolEffectOperationConflict, ToolEffectReconciliationRequired,
 )
 from tests.unit.test_tool_effect_execution import owner as owner
+from tests.utils.async_waits import wait_until
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
 
 
 @pytest_asyncio.fixture
-async def bound_operation(owner, tmp_path):
+async def bound_operation(owner, tmp_path, request):
     store = ObservabilityStore(owner.tool_effect_store.database.backend, owns_backend=False)
     await store.initialize()
     owner.observability_store = store
     witness = tmp_path / 'bound-operation-effects'
+    effect_delay = getattr(request, 'param', 0.0)
 
     class FileTool:
         name = 'owned.effect'
@@ -36,6 +38,10 @@ async def bound_operation(owner, tmp_path):
             assert claims[-1] == ('STARTED',), 'Native dispatcher bypassed durable effect admission'
             assert owner.tool_effect_store.database.owns_open_transaction is False
             async with owner._get_privacy_transition_lock():
+                if effect_delay:
+                    # Real admitted I/O may outlast a test's observation slice
+                    # without losing the original held privacy frame.
+                    await asyncio.sleep(effect_delay)
                 with witness.open('a') as stream:
                     stream.write(marker + '\n')
             return {'success': True, 'marker': marker}
@@ -78,6 +84,8 @@ async def test_parallel_batch_retains_original_privacy_ownership_for_its_native_
     await _parallel_scenario(bound_operation, foreign=False)
 
 
+@pytest.mark.parametrize('bound_operation', [0.0, 0.6], indirect=True,
+    ids=['immediate', 'held-file-effect'])
 async def test_nested_foreign_parallel_batch_retains_its_original_privacy_frame(bound_operation):
     await _parallel_scenario(bound_operation, foreign=True)
 
@@ -107,8 +115,8 @@ async def _parallel_scenario(bound_operation, *, foreign):
     calling = asyncio.create_task(invoke(owner, 'original parallel intention',
         invocation_id='owned-parallel-intent'))
     try:
-        _done, pending = await asyncio.wait({calling}, timeout=0.5)
-        assert not pending, 'Parallel native tools lost the privacy frame held by their joining batch'
+        await wait_until(calling.done,
+            message='Parallel native tools did not complete their joining batch')
         await calling
         assert sorted(witness.read_text().splitlines()) == ['first', 'second']
         assert [row['name'] for row in results] == [binding.name, binding.name]
@@ -172,8 +180,8 @@ async def test_external_async_a2a_worker_retains_original_privacy_ownership(boun
     calling = asyncio.create_task(binding.invoke({}, session_id='owned-background-session',
         operation_id='owned-background-intent'))
     try:
-        _done, pending = await asyncio.wait({calling}, timeout=0.5)
-        assert not pending, 'Asynchronous A2A worker lost its joining external lifecycle privacy frame'
+        await wait_until(calling.done,
+            message='Asynchronous A2A worker did not complete its original external lifecycle')
         assert (await calling)['success'] is True
         task, = accepted
         from kestrel_sdk.native_a2a.types import TaskState
@@ -203,6 +211,8 @@ async def test_nested_external_operation_retains_its_original_privacy_frame(boun
 
 
 @pytest.mark.parametrize('lane', ['bound', 'named', 'audit'])
+@pytest.mark.parametrize('bound_operation', [0.0, 0.6], indirect=True,
+    ids=['immediate', 'held-file-effect'])
 async def test_nested_foreign_operation_retains_its_original_privacy_frame(bound_operation, lane):
     await _nested_scenario(bound_operation, lane, foreign=True)
 
@@ -250,8 +260,8 @@ async def _nested_scenario(bound_operation, lane, *, foreign):
 
     calling = asyncio.create_task(call())
     try:
-        _done, pending = await asyncio.wait({calling}, timeout=0.5)
-        assert not pending, 'Nested external tool lost its original held privacy frame'
+        await wait_until(calling.done,
+            message='Nested external tool did not complete its original operation')
         if lane == 'audit':
             from kestrel_sovereign._async_ownership import await_owned_task
 
@@ -867,7 +877,7 @@ async def test_dispatch_audit_failure_preserves_original_receipts_without_anothe
 
     async def observe_original_write(*args, **kwargs):
         try:
-            result = await write(*args, **kwargs)
+            await write(*args, **kwargs)
         except BaseException as error:
             audit_errors.append(error)
             raise
@@ -902,13 +912,11 @@ async def test_dispatch_audit_failure_preserves_original_receipts_without_anothe
 @pytest_asyncio.fixture(params=['core', 'sdk'])
 async def custom_feature_dispatch(bound_operation, request):
     kind = request.param
-    from kestrel_sdk.resources import ResourceOutcomeUnknown
     from kestrel_sovereign.features.base import Feature
     from kestrel_sdk.features.base import Feature as SDKFeature
     from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
     from kestrel_sovereign.llm.adapter import ToolCall
     from tests.unit.test_tool_effect_invocation import governed
-    from kestrel_sovereign.execution_custody import execution_evidence_carriers
 
     owner, _binding, witness = bound_operation
     original = TimeoutError('custom feature lost its original reply after a file effect')
