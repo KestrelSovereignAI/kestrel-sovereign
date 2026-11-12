@@ -1670,7 +1670,9 @@ column checks. Native PostgreSQL transaction exits prove committability even
 without execution scopes or callbacks, so COMMIT-as-ROLLBACK cannot publish a
 successful receipt. Optional profile-registry writes roll back inside their own
 savepoint; a lost fence commit acknowledgement preserves the committed row's
-lexical tokens instead of treating them as orphaned prework.
+lexical tokens instead of treating them as orphaned prework. Savepoint exits use
+the same native ownership/acknowledgement boundary: an uncertain RELEASE cannot
+authorize a second INSERT or mint a durable top-level commit receipt.
 
 Each PR requires a completed full-diff worktree review before creation, with
 findings fixed and meaningful regression tests. Pin the conformance runner
