@@ -3429,7 +3429,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["search"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
-    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.52.1,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.52.2,<1" },
     { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'observability'" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
@@ -3520,19 +3520,20 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.52.1"
+version = "0.52.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7d/a4/1cc48eaa7730f86f4434c2545ce916a8c575607682b20a16f085972b8a81/kestrel_sovereign_sdk-0.52.1.tar.gz", hash = "sha256:5f2e85b77ea303e7f342ab3664810c4b1aba339369fdcf1547bb7ba00223ef6d", size = 542524, upload-time = "2026-11-11T16:38:38.519Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/db/e3/0f6286296d138c96c61c8d3e893ff93f39bdfa2a67d2ccd5c2d7d271bedc/kestrel_sovereign_sdk-0.52.2.tar.gz", hash = "sha256:cadb3151b310448b220df9feddc4f4fa68432864c2430f424b55340a6f9b0067", size = 556979, upload-time = "2026-11-12T16:09:01.065Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/f0/156f6247e21f118857fa6a00c462443c10d002da1207e7642f6d085768e6/kestrel_sovereign_sdk-0.52.1-py3-none-any.whl", hash = "sha256:d79bd398a5f23a25fdd87ac93d80591c8b5b586e26909824b4b325816a2c1f98", size = 649031, upload-time = "2026-11-11T16:38:36.722Z" },
+    { url = "https://files.pythonhosted.org/packages/09/9f/632009519d1b048ec8bf31d90a4a964b14b4d93e4dab82aa8c2576083a29/kestrel_sovereign_sdk-0.52.2-py3-none-any.whl", hash = "sha256:dc99b44f9e72cb72ad566eb165f4c1dc8a4807ebe44eddad65cdfd9b4e0ffba2", size = 663707, upload-time = "2026-11-12T16:08:59.443Z" },
 ]
 
 [package.optional-dependencies]
 a2a = [
+    { name = "anyio" },
     { name = "certifi" },
     { name = "cryptography" },
     { name = "culsans", marker = "python_full_version < '3.13'" },
