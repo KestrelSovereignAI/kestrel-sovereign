@@ -276,6 +276,8 @@ async def test_native_database_lock_wait_cannot_extend_pending_authorization_exp
                 "An original SQL wait returned an already-expired OAuth handle"
             )
             rows = await store.backend.fetch_all("SELECT expires_at FROM mcp_server_oauth_pending")
+            if boundary == "capacity":
+                assert rows == [], "Admission already expired at its capacity lock still persisted a request"
             assert all(row[0] <= clock[0] for row in rows)
         else:
             assert result is None, "An original SQL lock wait admitted an expired OAuth request"
