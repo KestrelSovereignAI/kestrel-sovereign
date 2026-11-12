@@ -342,3 +342,102 @@ async def test_concurrent_close_cannot_acknowledge_a_pending_original_finally(
         if closers:
             await asyncio.gather(*closers)
         await source.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdraw_first", [False, True])
+async def test_overlapping_close_retains_failure_after_both_original_owners_finish(
+    withdraw_first: bool,
+) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    descriptors: list[int] = []
+    physical_errors: list[OSError] = []
+    physical_closers: list[asyncio.Task | None] = []
+    closers: list[asyncio.Task] = []
+    second_entry = {}
+
+    class Source:
+        def __aiter__(self) -> Source:
+            return self
+
+        async def __anext__(self) -> bytes:
+            return b"original frame"
+
+        async def aclose(self) -> None:
+            physical_closers.append(asyncio.current_task())
+            entered.set()
+            await release.wait()
+            os.close(descriptors[0])
+            try:
+                os.fstat(descriptors[0])
+            except OSError as error:
+                assert error.errno == errno.EBADF
+                physical_errors.append(error)
+                raise
+
+    def acquire() -> Source:
+        descriptors.append(os.open(os.devnull, os.O_RDONLY))
+        return Source()
+
+    source = OwnedAsyncIterator(acquire, operation="overlapping-close-original-failure")
+
+    async def observed_close():
+        try:
+            await source.aclose()
+        except BaseException as error:
+            return error
+        return None
+
+    try:
+        assert await anext(source) == b"original frame"
+        first = asyncio.create_task(observed_close())
+        closers.append(first)
+        await entered.wait()
+        if withdraw_first:
+            first.cancel("original-first-close-withdrawal")
+
+        async def close_after_physical_completion():
+            while not (source.producer_task.done() and source.owner_task.done()):
+                await asyncio.sleep(0)
+            second_entry["first_pending"] = not first.done()
+            return await observed_close()
+
+        closers.append(asyncio.create_task(close_after_physical_completion()))
+        release.set()
+        first_error, second_error = await asyncio.gather(*closers)
+        assert second_entry == {"first_pending": True}
+        assert source.producer_task.done() and source.owner_task.done()
+        assert physical_closers == [source.producer_task]
+        assert len(physical_errors) == 1
+        original, = physical_errors
+        assert original in execution_evidence_carriers(first_error)
+        assert original in execution_evidence_carriers(second_error), (
+            "An overlapping close ACKed the same failed original retirement"
+        )
+        if withdraw_first:
+            assert any(isinstance(error, asyncio.CancelledError)
+                and error.args == ("original-first-close-withdrawal",)
+                for error in execution_evidence_carriers(first_error))
+        assert not any(isinstance(error, asyncio.CancelledError)
+            and error.args == ("original-first-close-withdrawal",)
+            for error in execution_evidence_carriers(second_error))
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+        # A sequential repeat after all close calls returned remains quiet;
+        # it may not rerun the physical closer or re-raise an observed failure.
+        await source.aclose()
+        assert physical_closers == [source.producer_task]
+    finally:
+        release.set()
+        if closers:
+            await asyncio.gather(*closers, return_exceptions=True)
+        await source.aclose()
+        for descriptor in descriptors:
+            try:
+                os.fstat(descriptor)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
+            else:
+                os.close(descriptor)
