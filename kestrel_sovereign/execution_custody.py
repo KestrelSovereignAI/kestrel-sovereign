@@ -271,13 +271,23 @@ def is_execution_control_error(
     return any(_is_execution_control_node(current) for current in nodes)
 
 
+def is_host_control_error(error: BaseException | None) -> bool:
+    """One SDK host predicate; input suspension grants no execution authority."""
+    if is_execution_control_error(error):
+        return True
+    if error is None:
+        return False
+    from kestrel_sovereign.tools.effect_journal import _is_tool_input_control
+    return _is_tool_input_control(error)
+
+
 def is_tool_execution_terminal_error(error: BaseException | None) -> bool:
     """Tool delivery propagates control and every reconciliation-required failure.
 
     An audit error alone is not authority loss or retirement debt. Keep this
     local delivery rule separate from the SDK-registered control predicate.
     """
-    if is_execution_control_error(error):
+    if is_host_control_error(error):
         return True
     if error is None:
         return False
@@ -2193,4 +2203,4 @@ turn_scoped(
 # instead of turning it into a failed result, so an SDK feature's tool
 # propagates the same control errors Core's wrapper does (#3921). Registering
 # the same function again is a no-op.
-register_control_error_predicate(is_execution_control_error)
+register_control_error_predicate(is_host_control_error)

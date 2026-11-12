@@ -546,8 +546,11 @@ async def test_followup_inline_input_stops_continuation_and_repair(
                     force_local_only=True, effective_model='owned-unconfigured-model',
                     user_message='Run both owned tools', session_id='original-chat', max_iterations=2)
                 if streaming:
-                    return ''.join([chunk async for chunk in b.agent._handle_orchestrator_response_streaming(
-                        response, tool_events=[], tool_results=[], **options)])
+                    from kestrel_sovereign.llm.adapter import ToolInputSuspensionResponse
+                    chunks = [chunk async for chunk in b.agent._handle_orchestrator_response_streaming(
+                        response, tool_events=[], tool_results=[], **options)]
+                    return ''.join(chunk.content if isinstance(chunk, ToolInputSuspensionResponse) else chunk
+                        for chunk in chunks)
                 return await b.agent._handle_orchestrator_response_impl(response, **options)
             outcome = await b.agent._execute_tool_operation_at_stop_boundary(operation,
                 name='owned-followup-input', tool_operation=ToolEffectOperation('owned-followup-input',
@@ -562,6 +565,121 @@ async def test_followup_inline_input_stops_continuation_and_repair(
     assert prose not in response.json()['text'], 'Post-input continuation prose escaped the pending checkpoint'
     assert b.markers == ['first-step'] and len(wire(b)) == 1
     assert len((await pending(b)).json()['inputs']) == 1
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form', 'input_tool': 'open_marker'}], indirect=True)
+@pytest.mark.parametrize('followup', [False, True])
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('audit', [None, 'allow', 'deny'])
+async def test_first_stream_input_preserves_completed_receipts_without_accepting_unfinished_prose(
+        apps_boundary, monkeypatch, followup, streaming, audit):
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+    from kestrel_sovereign.tools.effect_journal import ToolInputSuspended, ToolEffectJournalUnavailable
+    from tests.utils.native_streaming import prepare_streaming_agent
+
+    b = apps_boundary
+    persisted, stopped = [], []
+    tools = b.agent._build_all_tools()
+    prepare_streaming_agent(b.agent, persisted=persisted, tools=tools)
+    audited, suspended = [], []
+    if audit is not None:
+        class InputAudit(Hook):
+            fail_closed = True
+
+            async def execute(self, value):
+                audited.append(value)
+                return HookOutput.deny('owned input checkpoint withheld') if audit == 'deny' else HookOutput.allow()
+
+        b.agent.hooks_manager.register(InputAudit(name='owned-input-audit', events=[HookEvent.POST_RESPONSE]))
+    registered = {item.tool.native_tool.name: item for item in b.tools}
+    first = registered['record_marker']
+    await b.permissions.set_permission('mcp:owned-apps', first.binding.name, PermissionLevel.ALLOW)
+    original_hooks = b.agent.hooks_manager.execute_hooks_parallel
+
+    async def observe_stop(event, value, *args, **kwargs):
+        if event == HookEvent.STOP:
+            stopped.append(value)
+        return await original_hooks(event, value, *args, **kwargs)
+
+    monkeypatch.setattr(b.agent.hooks_manager, 'execute_hooks_parallel', observe_stop)
+
+    provider_calls = []
+    async def stream(**kwargs):
+        provider_calls.append(True)
+        executed = []
+        yield 'UNFINISHED-PRE-INPUT-PROSE'
+        if followup and len(provider_calls) == 1:
+            yield LLMResponse(content='', stop_reason='tool_calls', tool_calls=[ToolCall(
+                id='owned-first-batch', name=first.binding.name,
+                arguments={'marker': 'completed-before-input'})])
+            return
+        names = ('open_marker',) if followup else ('record_marker', 'open_marker')
+        for index, name in enumerate(names):
+            registered_tool = registered[name]
+            try:
+                outcome = await kwargs['tool_executor'](registered_tool.binding.name,
+                    {'marker': 'completed-before-input' if name == 'record_marker' else 'must-wait'})
+            except ToolInputSuspended as signal:
+                suspended.append(signal)
+                raise
+            executed.append(dict(id='owned-inline-' + str(index), name=registered_tool.binding.name,
+                arguments=outcome[0], result=outcome[1], dispatch_id=outcome.dispatch_id))
+        final = LLMResponse(content='UNFINISHED-POST-INPUT-PROSE', stop_reason='completed')
+        final.executed_tool_calls = executed
+        yield final
+
+    monkeypatch.setattr(b.agent.llm_service, 'stream_with_tool_detection', stream)
+
+    async def generate(**kwargs):
+        final = None
+        async for item in stream(**kwargs):
+            if isinstance(item, LLMResponse):
+                final = item
+        assert final is not None, 'Scripted provider did not finish or suspend'
+        return final
+
+    monkeypatch.setattr(b.agent.llm_service, 'generate_with_messages', generate)
+
+    @b.app.post('/api/owned-first-stream-input')
+    async def first_stream(request: Request):
+        with caller_context_scope(request.state.caller):
+            if not streaming:
+                value = await b.agent.process_input('Run the owned tools once',
+                    session_id='original-chat', caller=request.state.caller)
+                return {'text': value}
+            return {'chunks': [chunk async for chunk in b.agent.process_input_streaming(
+                'Run the owned tools once', session_id='original-chat', caller=request.state.caller)]}
+
+    response = await b.client.post('/api/owned-first-stream-input', headers=b.headers())
+    assert response.status_code == 200, response.text
+    assert b.markers == ['completed-before-input'] and len(wire(b)) == 1
+    assistants = [row for row in persisted if row['role'] == 'assistant']
+    assert len(assistants) == 1
+    saved = assistants[0]
+    assert 'UNFINISHED' not in json.dumps(saved), (
+        'An input suspension promoted unfinished provider prose into durable conversation history')
+    if audit == 'deny':
+        assert saved['content'] == '[Response blocked by audit: response withheld by audit policy]'
+    else:
+        assert 'waiting for operator input' in saved['content']
+    assert len(stopped) == 1
+    if audit is None:
+        results = saved['metadata']['tool_results']
+        assert [row['name'] for row in results] == [registered[name].binding.name
+            for name in ('record_marker', 'open_marker')], 'Input suspension discarded completed inline tool receipts'
+        assert len(stopped[0].tool_results) == 2
+    else:
+        assert 'tool_results' not in (saved.get('metadata') or {})
+        assert stopped[0].tool_results is None and stopped[0].tool_calls is None
+        assert len(audited) == 1 and 'waiting for operator input' in audited[0].response_text
+        assert 'UNFINISHED' not in json.dumps(response.json()), 'Buffered input suspension leaked unfinished prose'
+    assert all('UNFINISHED' not in str(value.response_text) for value in stopped)
+    assert len((await pending(b)).json()['inputs']) == 1
+    assert len(suspended) == 1 and not suspended[0].turn.live
+    with pytest.raises((ToolEffectJournalUnavailable, ExecutionAuthorityError)):
+        suspended[0].require_current(b.agent)
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
@@ -671,8 +789,11 @@ async def test_orchestrator_returns_control_before_followup_model_work(apps_boun
                     force_local_only=True, effective_model='owned-unconfigured-model',
                     user_message='Run the owned tool once', session_id='original-chat', max_iterations=2)
                 if streaming:
-                    return ''.join([chunk async for chunk in b.agent._handle_orchestrator_response_streaming(
-                        response, tool_events=[], tool_results=[], **options)])
+                    from kestrel_sovereign.llm.adapter import ToolInputSuspensionResponse
+                    chunks = [chunk async for chunk in b.agent._handle_orchestrator_response_streaming(
+                        response, tool_events=[], tool_results=[], **options)]
+                    return ''.join(chunk.content if isinstance(chunk, ToolInputSuspensionResponse) else chunk
+                        for chunk in chunks)
                 return await b.agent._handle_orchestrator_response_impl(response, **options)
             outcome = await b.agent._execute_tool_operation_at_stop_boundary(operation,
                 name='owned-input-orchestrator', tool_operation=ToolEffectOperation('owned-input-orchestrator',

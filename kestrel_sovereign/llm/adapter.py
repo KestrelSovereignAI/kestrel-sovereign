@@ -171,6 +171,22 @@ class InlineToolOutcome(tuple):
         return (self[0], self[1], self.dispatch_id)
 
 
+class ToolInputSuspensionResponse(LLMResponse):
+    """Typed Core checkpoint, carrying no claim of provider completion."""
+
+    def __init__(self, suspension, owner):
+        from kestrel_sovereign.tools.effect_journal import (
+            TOOL_INPUT_REQUIRED_MESSAGE, ToolEffectJournalUnavailable,
+        )
+
+        suspension.require_current(owner)
+        if not suspension.completed:
+            raise ToolEffectJournalUnavailable('Input suspension has no original callback receipts')
+        super().__init__(content=TOOL_INPUT_REQUIRED_MESSAGE)
+        self.suspension = suspension
+        self.executed_tool_calls = list(suspension.completed)
+
+
 def inline_tool_dispatch_id(outcome: Any) -> Optional[str]:
     """The ``dispatch_id`` an inline executor's return names, if any."""
     if not isinstance(outcome, InlineToolOutcome):

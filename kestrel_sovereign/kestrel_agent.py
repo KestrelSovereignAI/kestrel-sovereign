@@ -9279,11 +9279,17 @@ Expected Duration: {expected_duration}
             user_message=user_input,
         )
 
-        # Store agent response (linked to session for resumed conversations)
+        # Keep the same actual tool receipts as streaming history. An enforcing
+        # audit releases only reviewed text, so its raw tool side channels must
+        # remain absent from both history and STOP, even on ALLOW.
         await self._persist_assistant_conversation(
             response_text,
             session_id=session_id,
-            metadata=semantic_recall_metadata,
+            metadata={
+                **(semantic_recall_metadata or {}),
+                **({"tool_results": stop_tool_results}
+                   if stop_tool_results and not audit_enforcing else {}),
+            } or None,
             response=response,
             wake_reply=wake_reply,
         )
