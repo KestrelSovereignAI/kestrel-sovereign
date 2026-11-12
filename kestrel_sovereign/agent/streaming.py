@@ -2017,9 +2017,9 @@ class StreamingMixin:
                             pending_visible_boundary = False
                             join_separator = ''
                             if not buffer_audit:
-                                entry = chunk.executed_tool_calls[-1]
-                                marker = ToolCallStarted(index=len(chunk.executed_tool_calls)-1,
-                                    id=entry['id'], name=entry['name'])
+                                entry = tool_results[-1]
+                                marker = ToolCallStarted(index=len(tool_results)-1,
+                                    id=entry['tool_call_id'], name=entry['name'])
                                 await self._emit_revising_event(marker,
                                     session_id=session_id, request_id=request_id)
                                 yield _build_revise_sentinel(marker)

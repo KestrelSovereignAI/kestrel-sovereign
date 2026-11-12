@@ -217,6 +217,40 @@ class TestServerRequestHandlerRegistration:
         return c
 
     @pytest.mark.asyncio
+    async def test_input_suspension_reaches_owning_turn_before_provider_completion(self):
+        import asyncio
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        from kestrel_sovereign.tools.effect_journal import ToolInputSuspended
+
+        client = self._client()
+        owning, unrelated = asyncio.Queue(), asyncio.Queue()
+        client._turn_sinks = {'owned-input': owning, 'unrelated': unrelated}
+        signal = ToolInputSuspended(None, [], None)
+        terminals = []
+
+        async def execute(name, arguments):
+            raise signal
+
+        handler = CodexAdapter()._make_tool_call_handler(execute, 'owned-input',
+            frozenset({'owned_tool'}), terminal_errors=terminals)
+        client.register_server_request_handler('item/tool/call', handler, thread_id='owned-input')
+        await client._handle_server_request(17, 'item/tool/call',
+            dict(threadId='owned-input', callId='owned-call', tool='owned_tool', arguments={}))
+        events = []
+        while not owning.empty():
+            events.append(owning.get_nowait())
+        assert any(event.get('__bridge_error__') is signal for event in events), (
+            'Codex input suspension waited for provider completion instead of terminating its owning turn')
+        assert unrelated.empty() and getattr(client, '_server_request_failure', None) is None
+        assert terminals == [signal]
+        for event in events:
+            owning.put_nowait(event)
+        with pytest.raises(ToolInputSuspended) as raised:
+            _ = [event async for event in client.iter_turn_events(owning, idle_timeout=5,
+                thread_id='owned-input')]
+        assert raised.value is signal
+
+    @pytest.mark.asyncio
     async def test_unscoped_handler_invoked_for_any_thread(self):
         c = self._client()
         seen = []

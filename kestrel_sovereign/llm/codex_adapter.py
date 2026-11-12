@@ -2970,6 +2970,7 @@ class CodexAdapter(LLMAdapter):
         # does, a caller that abandons the turn leaves it running on the
         # thread (see below).
         turn_ended = False
+        turn_start_response = None
         try:
             # dynamicTools are registered at thread/start; turn/start carries
             # the user input plus per-turn overrides that mirror what
@@ -3046,7 +3047,7 @@ class CodexAdapter(LLMAdapter):
             from kestrel_sovereign.execution_custody import require_execution_work
             require_execution_work()
             async with callback_scope.wait():
-                await app.request("turn/start", turn_params, timeout=60)
+                turn_start_response = await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
             final_text: Optional[str] = None
@@ -3379,7 +3380,7 @@ class CodexAdapter(LLMAdapter):
             if session_id and poisoned_turn:
                 self.reset_thread(session_id)
             raise
-        except (asyncio.CancelledError, GeneratorExit):
+        except BaseException as error:
             # The caller abandoned the turn before the app-server ended it:
             # the orchestrator's inactivity watchdog (#3552, which fires
             # before the transport's own idle timeout) or a Stop cancelled
@@ -3387,7 +3388,11 @@ class CodexAdapter(LLMAdapter):
             # be running, so the thread is poisoned exactly as by an idle
             # timeout. Invalidate it the same way, before ``finally``
             # releases the thread lock to a queued same-session call.
-            if session_id and not turn_ended:
+            from kestrel_sovereign.execution_custody import is_host_control_error
+            # Host control also ends consumption before provider completion.
+            # Retire its unfinished thread without revoking unrelated turns.
+            if session_id and not turn_ended and (
+                    isinstance(error, (asyncio.CancelledError, GeneratorExit)) or is_host_control_error(error)):
                 self.reset_thread(session_id)
             raise
         finally:
@@ -3452,6 +3457,31 @@ class CodexAdapter(LLMAdapter):
                                 "_kestrel_completed_effect_checkpointed",
                                 True,
                             )
+                from kestrel_sovereign.tools.effect_journal import tool_input_suspension
+                if not turn_ended and tool_input_suspension(unwind_error) is not None:
+                    # Original callbacks have physically settled and admission
+                    # is closed. Stop remote inference through its native RPC,
+                    # without cancelling a still-running governed tool owner.
+                    started_turn = (turn_start_response.get('turn')
+                        if isinstance(turn_start_response, dict) else None)
+                    turn_id = started_turn.get('id') if isinstance(started_turn, dict) else None
+                    if not isinstance(turn_id, str) or not turn_id.strip():
+                        inline_terminal_errors.append(CodexAppServerError(
+                            'Codex input suspension has no original turn id for interruption'))
+                    else:
+                        from kestrel_sovereign._async_ownership import await_owned_operation
+                        interrupted = await await_owned_operation(
+                            app.request('turn/interrupt', {'threadId': thread_id, 'turnId': turn_id}),
+                            name='codex-input-suspension-interrupt',
+                            retirement_resource=app, retain_originals=True,
+                        )
+                        if interrupted.error is not None:
+                            inline_terminal_errors.append(interrupted.error)
+                        elif not isinstance(interrupted.result, dict):
+                            inline_terminal_errors.append(CodexAppServerError(
+                                'Codex input suspension interruption returned an invalid acknowledgement'))
+                        if interrupted.cancellation is not None:
+                            inline_terminal_errors.append(interrupted.cancellation)
             finally:
                 try:
                     app.close_turn_sink(thread_id)

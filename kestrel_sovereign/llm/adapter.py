@@ -176,15 +176,21 @@ class ToolInputSuspensionResponse(LLMResponse):
 
     def __init__(self, suspension, owner):
         from kestrel_sovereign.tools.effect_journal import (
-            TOOL_INPUT_REQUIRED_MESSAGE, ToolEffectJournalUnavailable,
+            TOOL_INPUT_REQUIRED_MESSAGE,
         )
 
         suspension.require_current(owner)
-        if not suspension.completed:
-            raise ToolEffectJournalUnavailable('Input suspension has no original callback receipts')
         super().__init__(content=TOOL_INPUT_REQUIRED_MESSAGE)
         self.suspension = suspension
         self.executed_tool_calls = list(suspension.completed)
+
+    @classmethod
+    def from_current_turn(cls, owner):
+        """The same boundary for a batch whose receipts the caller already owns."""
+        from kestrel_sovereign.tools.effect_journal import ToolInputSuspended, current_tool_effect_turn
+        from kestrel_sovereign.turn_scope import capture_turn_scope
+
+        return cls(ToolInputSuspended(current_tool_effect_turn(owner), [], capture_turn_scope(owner)), owner)
 
 
 def inline_tool_dispatch_id(outcome: Any) -> Optional[str]:

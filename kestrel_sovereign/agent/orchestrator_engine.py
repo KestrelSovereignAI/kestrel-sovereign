@@ -4774,7 +4774,7 @@ class OrchestratorEngineMixin:
             yield response
             return
         if isinstance(response, str):
-            yield TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response
+            yield ToolInputSuspensionResponse.from_current_turn(self) if tool_effect_input_waiting(self) else response
             return
 
         messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
@@ -4812,7 +4812,7 @@ class OrchestratorEngineMixin:
                     yield response
                     return
             if not response.has_tool_calls:
-                yield TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response.content or ""
+                yield ToolInputSuspensionResponse.from_current_turn(self) if tool_effect_input_waiting(self) else response.content or ""
                 return
 
         messages.append(self._build_assistant_tool_history_msg(response))
@@ -4844,7 +4844,7 @@ class OrchestratorEngineMixin:
                 return
 
             if tool_effect_input_waiting(self):
-                yield TOOL_INPUT_REQUIRED_MESSAGE
+                yield ToolInputSuspensionResponse.from_current_turn(self)
                 return
 
             # Stream tool starts for user visibility as typed in-band
@@ -4945,7 +4945,7 @@ class OrchestratorEngineMixin:
                 return
 
             if tool_effect_input_waiting(self):
-                yield TOOL_INPUT_REQUIRED_MESSAGE
+                yield ToolInputSuspensionResponse.from_current_turn(self)
                 return
 
             all_tools = self._build_all_tools()

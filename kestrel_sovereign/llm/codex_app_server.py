@@ -57,6 +57,7 @@ from kestrel_sovereign.execution_custody import (
     execution_observation_error,
     execution_error_with_cause,
     is_execution_control_error,
+    is_host_control_error,
     is_scope_local_execution_control,
     owned_native_http_client,
 )
@@ -1409,12 +1410,14 @@ class CodexAppServerClient:
                 # to the captured journal and handler, outside the reader context.
                 raise execution_error_with_cause(
                     CodexToolReplyDeliveryError("codex tool reply delivery unconfirmed"), e)
-            if is_execution_control_error(e):
+            if is_host_control_error(e):
                 sink = self._turn_sinks.get(tid)
                 if sink is not None:
                     sink.put_nowait({"__bridge_error__": e})
                 self._retain_request_failure(e, caller_scopes=getattr(handler, "_codex_caller_scopes", ()))
-                self._send({"id": mid, "error": {"message": "execution requires authority/commit reconciliation"}})
+                message = ('execution requires authority/commit reconciliation' if is_execution_control_error(e)
+                    else 'tool execution suspended for operator input')
+                self._send({"id": mid, "error": {"message": message}})
                 return
             logger.warning("codex server-request %s failed: %s", method, e)
             try:

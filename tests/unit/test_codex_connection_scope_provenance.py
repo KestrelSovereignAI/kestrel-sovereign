@@ -11,6 +11,7 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCommitOutcomeError,
     ExecutionCustody, ProcessRuntimeExecutionFence,
     bind_execution_custody_snapshot, execution_denial_scopes,
+    is_execution_control_error,
     require_execution_work,
 )
 from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
@@ -18,8 +19,11 @@ from kestrel_sovereign.turn_scope import capture_turn_scope
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("receipt", ["scoped", "unscoped", "committed", "unknown"])
+@pytest.mark.parametrize("receipt", ["scoped", "unscoped", "committed", "unknown", "input"])
 async def test_native_codex_tool_refusal_keeps_original_turn_and_connection_boundaries(receipt):
+    from kestrel_sovereign.tools.effect_journal import ToolInputSuspended
+
+    input_signal = ToolInputSuspended(None, [], None)
     # A real owned stdio peer; no Codex binary, auth file or provider is used.
     process = await asyncio.create_subprocess_exec(sys.executable, "-u", "-c",
         "import sys\nfor line in sys.stdin:\n sys.stdout.write(line); sys.stdout.flush()",
@@ -38,6 +42,8 @@ async def test_native_codex_tool_refusal_keeps_original_turn_and_connection_boun
         with captured.bind():
             entered.set()
             await release.wait()
+            if receipt == 'input':
+                raise input_signal
             if receipt == "scoped":
                 require_execution_work()
             if receipt in {"committed", "unknown"}:
@@ -54,16 +60,23 @@ async def test_native_codex_tool_refusal_keeps_original_turn_and_connection_boun
     tasks = tuple(client._server_request_tasks)
     try:
         await asyncio.wait_for(entered.wait(), 2)
-        original.revoke("only original tool occurrence retired while awaiting approval")
+        if receipt != 'input':
+            original.revoke("only original tool occurrence retired while awaiting approval")
         release.set()
         for task in tasks:
             await await_owned_task(task)
         reply = json.loads(await asyncio.wait_for(process.stdout.readline(), 2))
         assert reply["id"] == 67 and "error" in reply
         denied = await queues["original"].get()
+        assert '__bridge_error__' in denied, 'Original native input control did not reach its owning Codex turn'
         failure = denied["__bridge_error__"]
-        if receipt == "scoped":
-            assert execution_denial_scopes(failure) == (original,)
+        if receipt in {"scoped", "input"}:
+            assert execution_denial_scopes(failure) == ((original,) if receipt == 'scoped' else None)
+            if receipt == 'input':
+                assert failure is input_signal
+                assert not is_execution_control_error(failure)
+                with captured.bind():
+                    require_execution_work()
             assert client._server_request_failure is None, "one turn's refusal poisoned the shared connection"
             assert client._closed_error is None and queues["other"].empty()
             await client.ensure_started()
@@ -83,6 +96,6 @@ async def test_native_codex_tool_refusal_keeps_original_turn_and_connection_boun
         for task in tuple(client._server_request_tasks):
             await await_owned_task(task)
         closed = await await_owned_task(create_owned_task(client.aclose()))
-        if receipt != "scoped":
+        if receipt not in {"scoped", "input"}:
             assert closed.error is client._server_request_failure
         assert process.returncode is not None
