@@ -481,6 +481,7 @@ jobs:
           tests/integration/test_mcp_permission_host_restart.py
           tests/integration/test_mcp_permission_unknown_restart.py
           tests/integration/test_tool_effect_host_boot.py
+          tests/integration/test_a2a_native_permission_cognition.py
           tests/unit/test_async_ownership.py::test_repeated_withdrawal_does_not_accumulate_completion_callbacks
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12

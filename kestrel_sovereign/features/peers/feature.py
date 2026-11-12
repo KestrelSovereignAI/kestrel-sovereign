@@ -26,6 +26,7 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
+    create_local_host_http_client,
     PeerAccessDeniedError,
     PeerDirectoryConfigurationError,
     PeerDirectoryError,
@@ -230,9 +231,8 @@ class PeersFeature(Feature):
             host_url,
             execution_custody=getattr(self.agent, "_execution_custody", None),
             transport_key=getattr(self, "_transport_key", ""),
-            client_factory=lambda *args, **kwargs: httpx.AsyncClient(
-                *args,
-                **kwargs,
+            client_factory=lambda *args, **kwargs: create_local_host_http_client(
+                *args, client_factory=httpx.AsyncClient, **kwargs,
             ),
             native_session_factory=getattr(self, "_native_session_factory", None),
         )
