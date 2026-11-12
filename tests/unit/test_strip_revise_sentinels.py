@@ -71,3 +71,23 @@ def test_chunk_that_is_only_a_sentinel():
     )
     out = strip_revise_sentinels(sentinel)
     assert out == ""
+
+
+def test_input_retraction_control_is_exact_and_never_spoken_or_persisted():
+    import json
+    from kestrel_sovereign.agent.streaming import (
+        RETRACT_SENTINEL_PREFIX, _build_retract_sentinel, _parse_stream_sentinels,
+    )
+    request_id = 'original-turn-"-\\'
+    frame = _build_retract_sentinel(request_id)
+    assert json.loads(frame[len(RETRACT_SENTINEL_PREFIX):-1]) == {'request_id': request_id}
+    assert strip_revise_sentinels(frame + 'Waiting.') == 'Waiting.'
+    assert _parse_stream_sentinels(frame + 'Waiting.') == ('Waiting.', [], [])
+
+
+def test_input_retraction_requires_original_request_id():
+    import pytest
+    from kestrel_sovereign.agent.streaming import _build_retract_sentinel
+    for value in (None, '', '   ', 17):
+        with pytest.raises(ValueError, match='original request ID'):
+            _build_retract_sentinel(value)

@@ -116,6 +116,8 @@ def resolve_turn_invocation_context(
 # ``pane.pendingRevise``; the other is a no-op.
 REVISE_SENTINEL_PREFIX = "\x1eKESTREL:REVISE:"
 REVISE_SENTINEL_SUFFIX = "\x1e"
+# Confirmed operator input invalidates only the original live turn prose.
+RETRACT_SENTINEL_PREFIX = "\x1eKESTREL:RETRACT:"
 
 # #1662 eager-vision read-path bounds (independent of the upload endpoint's
 # per-file/count caps, since a content-addressed read can name any stored
@@ -179,6 +181,7 @@ TOOL_SENTINEL_SUFFIX = "\x1e"
 # stream; this tuple drives every strip/extract loop.
 _ALL_SENTINEL_PREFIXES = (
     REVISE_SENTINEL_PREFIX,
+    RETRACT_SENTINEL_PREFIX,
     THINKING_SENTINEL_PREFIX,
     TOOL_SENTINEL_PREFIX,
     PART_SENTINEL_PREFIX,
@@ -498,6 +501,14 @@ def _build_revise_sentinel(marker: ToolCallStarted) -> str:
         "tool_name": marker.name,
     }, separators=(",", ":"))
     return f"{REVISE_SENTINEL_PREFIX}{payload}{REVISE_SENTINEL_SUFFIX}"
+
+
+def _build_retract_sentinel(request_id: str) -> str:
+    """Address a confirmed input checkpoint to its exact original turn."""
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError('Input checkpoint retraction requires the original request ID')
+    payload = json.dumps({'request_id': request_id}, separators=(',', ':'))
+    return f'{RETRACT_SENTINEL_PREFIX}{payload}{REVISE_SENTINEL_SUFFIX}'
 
 
 def _build_thinking_sentinel(delta: ThinkingDelta) -> str:
@@ -1757,11 +1768,9 @@ class StreamingMixin:
                     tool_response = item
                     pre_tool_prose_snapshot = None
                     if not buffer_audit:
-                        entry = item.executed_tool_calls[-1]
-                        marker = ToolCallStarted(index=len(item.executed_tool_calls)-1,
-                            id=entry['id'], name=entry['name'])
-                        await self._emit_revising_event(marker, session_id=session_id, request_id=request_id)
-                        yield _build_revise_sentinel(marker)
+                        for sentinel in _flush_part_list(pending_parts, full_response):
+                            yield sentinel
+                        yield _build_retract_sentinel(item.suspension.turn.invocation_id)
                         yield item.content
                     continue
                 if isinstance(item, str):
@@ -2025,12 +2034,7 @@ class StreamingMixin:
                                     yield sentinel
                             tool_response_chunks.append(chunk.content)
                             if not buffer_audit:
-                                entry = tool_results[-1]
-                                marker = ToolCallStarted(index=len(tool_results)-1,
-                                    id=entry['tool_call_id'], name=entry['name'])
-                                await self._emit_revising_event(marker,
-                                    session_id=session_id, request_id=request_id)
-                                yield _build_revise_sentinel(marker)
+                                yield _build_retract_sentinel(chunk.suspension.turn.invocation_id)
                                 yield chunk.content
                             continue
                         if isinstance(chunk, OwnedTaskHandoff):
