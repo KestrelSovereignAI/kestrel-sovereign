@@ -624,3 +624,110 @@ def test_compound_guard_handles_non_string():
     # anything else.
     assert command_contains_unquoted_shell_control(None) is False  # type: ignore[arg-type]
     assert command_contains_unquoted_shell_control(["ls", "-la"]) is False  # type: ignore[arg-type]
+
+
+# --- Subcommand policy: an allow-listed binary narrowed to named invocations ---
+
+from kestrel_sovereign.features.computer_use.policy import (  # noqa: E402
+    SubcommandPolicy,
+    SubcommandPolicyError,
+    subcommand_policies_from_config,
+)
+
+_GIT_READS = {
+    "allow": ["status", "log", "show", "diff", "rev-parse"],
+    "value_options": ["-C"],
+    "flag_options": ["--no-pager"],
+    "deny_options": ["--output"],
+}
+
+
+def _git_policy() -> BinaryPolicy:
+    return BinaryPolicy(
+        allow=["git", "ls"],
+        deny=[],
+        subcommands=subcommand_policies_from_config({"git": _GIT_READS}, auto_approved=["git", "ls"]),
+    )
+
+
+@pytest.mark.parametrize("argv, rule", [
+    (["git", "status"], "allow:git:status"),
+    (["git", "-C", "/repo", "status", "--short"], "allow:git:status"),
+    (["git", "--no-pager", "log", "-1", "--format=%H"], "allow:git:log"),
+    (["git", "-C", "/repo", "--no-pager", "diff", "--stat", "main...HEAD"], "allow:git:diff"),
+    (["git", "log", "--oneline"], "allow:git:log"),
+    ("git -C /repo status --short --branch", "allow:git:status"),
+])
+def test_a_listed_subcommand_is_pre_approved(argv, rule):
+    result = _git_policy().evaluate(argv)
+    assert (result.decision, result.rule) == (Decision.ALLOW, rule)
+
+
+@pytest.mark.parametrize("argv, rule", [
+    # Writes are not listed, so they queue like an unlisted binary.
+    (["git", "reset", "--hard"], "subcommand:git:reset"),
+    (["git", "-C", "/repo", "clean", "-fdx"], "subcommand:git:clean"),
+    (["git", "push", "--force"], "subcommand:git:push"),
+    # ``-c core.fsmonitor=<cmd>`` runs <cmd>: an unlisted leading option queues.
+    (["git", "-c", "core.fsmonitor=touch /tmp/x", "status"], "subcommand_option:git:-c"),
+    (["git", "--git-dir=/elsewhere/.git", "status"], "subcommand_option:git:--git-dir=/elsewhere/.git"),
+    # A value inside a flag token escapes path vetting, so it is never accepted.
+    (["git", "-C=/repo", "status"], "subcommand_option:git:-C=/repo"),
+    (["git", "-C/repo", "status"], "subcommand_option:git:-C/repo"),
+    # A value option with no value, or no subcommand at all.
+    (["git", "-C"], "no_subcommand:git"),
+    (["git"], "no_subcommand:git"),
+    (["git", "--no-pager"], "no_subcommand:git"),
+    # ``--output`` writes a file; git takes unambiguous prefixes of long options.
+    (["git", "diff", "--output=/tmp/x"], "subcommand_deny_option:git:diff:--output"),
+    (["git", "diff", "--output", "/tmp/x"], "subcommand_deny_option:git:diff:--output"),
+    (["git", "log", "-p", "--outp=/tmp/x"], "subcommand_deny_option:git:log:--output"),
+])
+def test_anything_else_queues(argv, rule):
+    result = _git_policy().evaluate(argv)
+    assert (result.decision, result.rule) == (Decision.REQUIRE_APPROVAL, rule)
+
+
+def test_a_binary_without_a_policy_is_allowed_whole():
+    assert _git_policy().evaluate(["ls", "-la", "/x"]).rule == "allow:ls"
+
+
+def test_the_deny_list_still_wins_over_a_subcommand_policy():
+    policy = _git_policy()
+    policy.deny.append("git")
+    assert policy.evaluate(["git", "status"]).decision is Decision.DENY
+
+
+def test_the_compound_guard_runs_before_the_subcommand_policy():
+    result = _git_policy().evaluate("git status; rm -rf /")
+    assert (result.decision, result.rule) == (Decision.REQUIRE_APPROVAL, "compound_command:allow:git")
+
+
+def test_a_short_deny_option_matches_exactly():
+    policy = SubcommandPolicy(allow=frozenset({"grep"}), deny_options=frozenset({"-O"}))
+    assert policy.evaluate("git", ["grep", "-O", "x"]).decision is Decision.REQUIRE_APPROVAL
+    assert policy.evaluate("git", ["grep", "-n", "x"]).decision is Decision.ALLOW
+
+
+def test_no_config_means_no_policies():
+    assert subcommand_policies_from_config(None, auto_approved=["git"]) == {}
+
+
+@pytest.mark.parametrize("raw, message", [
+    (["git"], "must be a table of binary"),
+    ({"git": ["status"]}, "auto_approved_subcommands.git must be a table"),
+    ({"gh": {"allow": ["pr"]}}, "not in auto_approved_binaries"),
+    ({"git": {"allow": ["status"], "allowed": ["log"]}}, "unknown keys ['allowed']"),
+    ({"git": {"allow": []}}, "must name at least one subcommand"),
+    ({"git": {}}, "must name at least one subcommand"),
+    ({"git": {"allow": "status"}}, "git.allow must be a list of non-empty strings"),
+    ({"git": {"allow": ["status", ""]}}, "git.allow must be a list of non-empty strings"),
+    ({"git": {"allow": [" status"]}}, "git.allow must be a list of non-empty strings"),
+    ({"git": {"allow": ["-C"]}}, "git.allow must list subcommands, not options"),
+    ({"git": {"allow": ["status"], "value_options": ["C"]}}, "git.value_options must list options"),
+    ({"git": {"allow": ["status"], "deny_options": [1]}}, "git.deny_options must be a list"),
+])
+def test_a_malformed_policy_is_refused_not_dropped(raw, message):
+    with pytest.raises(SubcommandPolicyError) as raised:
+        subcommand_policies_from_config(raw, auto_approved=["git"])
+    assert message in str(raised.value)
