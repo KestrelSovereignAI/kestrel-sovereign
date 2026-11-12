@@ -97,6 +97,30 @@ A host with no PID record is stopped through its port, under the same
 deadline: uvicorn frees the port before its shutdown has run, so the wait is
 for the process, not the port. A host or agent the stop signal could not
 reach is reported at once rather than waited for.
+
+`SERVER_TERMINATE_TIMEOUT_SECONDS` is the host's one shutdown budget,
+`HOST_SHUTDOWN_BUDGET_SECONDS` (#4028). The lifespan shutdown takes its own
+deadline from the same value: `HOST_SHUTDOWN_REMOTE_WORK_SECONDS`, the budget
+less `HOST_SHUTDOWN_RESERVE_SECONDS` (the graceful window and the time to
+finish after it). Agent shutdown starts no remote snapshot upload. When the
+database changed since the last snapshot that reached every target, it records
+the snapshot as owed, and the next scheduled `backup_snapshot` (seeded every
+four hours) sends it, even if the database looks unchanged by then. A
+snapshot no backup has sent within `KESTREL_OWED_SNAPSHOT_DEADLINE_S` of the
+record (default five hours) is sent by the agent's sync service itself, at its
+next start if the agent was stopped by then, so an agent that schedules no
+backup still sends it. If a stopping agent is still waiting on an upload some
+other task started, such as a scheduled backup in progress, the shutdown
+cancels it at that deadline and logs `snapshot to <target> cancelled at
+shutdown budget`. This is the fleet's terminal drain on a multi-agent host, or
+the server's own join for a single agent, including a join of cleanup an
+earlier teardown left running. A GCS upload runs on a thread of its own; the
+cancellation shuts down the sockets it is using and joins the thread, so the
+upload does not keep the process alive after the lifespan returns. The agent's
+local cleanup is then joined as before, so the lifespan
+returns before SIGKILL whenever that cleanup and the later phases fit in the
+reserve. SIGKILL is left for a process whose local cleanup is wedged.
+
 The direct `python -m kestrel_sovereign.server` command uses the same graceful
 window. Each launch first moves a log of `LOG_ROTATION_MAX_BYTES` or more aside
 (`host.log` becomes `host.log.1`, keeping `LOG_ROTATION_BACKUPS` generations).

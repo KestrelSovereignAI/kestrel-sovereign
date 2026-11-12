@@ -1931,7 +1931,9 @@ class SchedulerFeature(Feature):
 
         Uses ``snapshot_if_changed`` (#1674 P3) so a scheduled backup on an
         idle agent skips re-dumping an unchanged DB (notably the full S3
-        upload). Explicit ``!backup`` / shutdown still call ``force_snapshot``."""
+        upload), and sends a snapshot a shutdown recorded as owed even when
+        the database looks unchanged (#4028). Explicit requests still call
+        ``force_snapshot``; shutdown uploads nothing."""
         sync = getattr(self.agent, "_sync_service", None)
         if sync:
             snap = getattr(sync, "snapshot_if_changed", None) or sync.force_snapshot

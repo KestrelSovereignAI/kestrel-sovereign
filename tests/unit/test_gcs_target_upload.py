@@ -17,13 +17,16 @@ import hashlib
 import inspect
 import sqlite3
 import tempfile
+import threading
 from contextlib import closing
 
 import pytest
+import requests
 from google.api_core.exceptions import RetryError
 from google.cloud import storage
 from google.cloud.storage.retry import DEFAULT_RETRY
 
+from kestrel_sovereign.storage.sync import gcs_transfer
 from kestrel_sovereign.storage.sync.gcs_target import (
     GCS_REQUEST_TIMEOUT_SECONDS,
     GCS_RETRY_DEADLINE_SECONDS,
@@ -83,6 +86,7 @@ class _FakeBucket:
         self.rewrite_tokens: list[str | None] = [None]
         self.upload_error: Exception | None = None
         self.rewrite_error: Exception | None = None
+        self.transports: list[requests.Session] = []
 
     def blob(self, blob_name, **kwargs):
         inspect.signature(storage.Bucket.blob).bind(self, blob_name, **kwargs)
@@ -97,6 +101,9 @@ def bucket(monkeypatch):
     class Client:
         def __init__(self, **kwargs):
             clients.append(kwargs)
+            # The real client's transport is a ``requests`` session.
+            self._http = requests.Session()
+            fake.transports.append(self._http)
 
         def bucket(self, name):
             assert name == _BUCKET
@@ -216,3 +223,27 @@ async def test_a_retry_error_fails_the_sync_and_keeps_the_manifest(
     assert target._manifest_path.read_bytes() == manifest
     # A failed upload is never copied to latest.db.
     assert len(bucket.rewrites) == (1 if failing == "upload" else 2)
+
+
+async def test_the_client_transport_can_be_interrupted(bucket, target, agent_db):
+    """The upload's requests go through a transport its cancellation can
+    interrupt (#4028), and it runs on a thread of its own."""
+    threads: list[str] = []
+    original = _FakeBlob.upload_from_string
+
+    def record_thread(self, data, **kwargs):
+        threads.append(threading.current_thread().name)
+        original(self, data, **kwargs)
+
+    _FakeBlob.upload_from_string = record_thread
+    try:
+        result = await target.sync_snapshot(agent_db)
+    finally:
+        _FakeBlob.upload_from_string = original
+
+    assert result.success is True, result.error
+    (transport,) = bucket.transports
+    assert {type(adapter) for adapter in transport.adapters.values()} == {
+        gcs_transfer._AbortableHTTPAdapter
+    }
+    assert threads == [f"{gcs_transfer.GCS_TRANSFER_THREAD_PREFIX}{target.name}"]

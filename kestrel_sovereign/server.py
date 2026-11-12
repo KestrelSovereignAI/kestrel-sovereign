@@ -2088,15 +2088,65 @@ async def _supervise_phoenix_startup(app, supervisor) -> None:
         )
 
 
-async def _shutdown_single_agent(agent: KestrelAgent, *, finite_errors: list[BaseException] | None = None) -> bool | None:
-    """Bound user-visible shutdown while retaining ownership of its tail."""
+async def _cancel_remote_work_past_deadline(
+    agent: KestrelAgent, deadline: float, withdrawals: list[BaseException],
+) -> bool:
+    """Wait for the agent's retained cleanup until ``deadline``, then cancel
+    the remote work it still waits on (#4028); True if withdrawn meanwhile.
+
+    The single-agent counterpart of the fleet drain's budget: the caller
+    then joins the same cleanup, so its local work is never abandoned.
+    """
+    from kestrel_sovereign._async_ownership import wait_owned_tasks_until
+    from kestrel_sovereign.multi_agent.agent_manager import (
+        cancel_remote_work_at_shutdown_budget,
+    )
+
+    pending = {owner for owner in agent_shutdown_completion_owners(agent) if not owner.done()}
+    if not pending:
+        return False
+    observation = await wait_owned_tasks_until(pending, deadline=deadline)
+    withdrawal = observation.cancellation
+    if withdrawal is not None and all(withdrawal is not prior for prior in withdrawals):
+        withdrawals.append(withdrawal)
+    if any(not owner.done() for owner in pending):
+        cancel_remote_work = getattr(agent, "cancel_retained_remote_work", None)
+        cancelled = cancel_remote_work_at_shutdown_budget(
+            cancel_remote_work if callable(cancel_remote_work) else None,
+            "the agent",
+        )
+        logger.warning(
+            "Host shutdown budget spent while the agent's shutdown was still "
+            "running; cancelled its retained remote work (%s) and joining its "
+            "local cleanup",
+            "; ".join(cancelled) if cancelled else "none was running",
+        )
+    return withdrawal is not None
+
+
+async def _shutdown_single_agent(
+    agent: KestrelAgent, *, finite_errors: list[BaseException] | None = None,
+    remote_work_deadline: float | None = None,
+) -> bool | None:
+    """Bound user-visible shutdown while retaining ownership of its tail.
+
+    With ``remote_work_deadline`` every join of a retained tail, including
+    one an earlier teardown left, waits only until then before the remote
+    work it waits on is cancelled, as the fleet drain does.
+    """
     cancelled = False
     failures, withdrawals = [], []
     # Failed initialization may already have handed native cleanup to the
     # Agent. Join that exact owner before a fresh shutdown can touch providers.
     if agent_shutdown_completion_owners(agent):
+        if remote_work_deadline is not None:
+            cancelled = await _cancel_remote_work_past_deadline(
+                agent, remote_work_deadline, withdrawals,
+            )
         try:
-            cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures)
+            cancelled = await await_agent_shutdown_completion(
+                agent, withdrawals=withdrawals, finite_errors=failures,
+            ) or cancelled
         except BaseException as error:
             failures.append(error)
     try:
@@ -2114,6 +2164,10 @@ async def _shutdown_single_agent(agent: KestrelAgent, *, finite_errors: list[Bas
     except BaseException as error:
         failures.append(error)
         logger.warning("Error during agent shutdown (%s)", type(error).__name__)
+    if remote_work_deadline is not None:
+        cancelled = await _cancel_remote_work_past_deadline(
+            agent, remote_work_deadline, withdrawals,
+        ) or cancelled
     cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures) or cancelled
     if finite_errors is not None:
         finite_errors.extend(failures)
@@ -2978,8 +3032,16 @@ async def _shutdown_host_scheduler(app: FastAPI) -> None:
         raise terminal
 
 
-async def _shutdown_server_agents(app: FastAPI) -> None:
-    """Run the agent-owned shutdown phase for either server topology."""
+async def _shutdown_server_agents(
+    app: FastAPI, *, remote_work_deadline: float | None = None,
+) -> None:
+    """Run the agent-owned shutdown phase for either server topology.
+
+    ``remote_work_deadline`` is the loop time, taken from the host shutdown
+    budget, past which the remote work a stopping agent still waits on is
+    cancelled: by a fleet's terminal drain for a quarantined agent, and by
+    ``_shutdown_single_agent`` for a standalone one (#4028).
+    """
     manager = getattr(app.state, "agent_manager", None)
     cleanup_manager = getattr(app.state, "startup_cleanup_agent_manager", None)
     managers = []
@@ -2989,6 +3051,11 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
     failures = []
     for owned_manager in managers:
         try:
+            arm_remote_work_deadline = getattr(
+                owned_manager, "arm_shutdown_remote_work_deadline", None
+            )
+            if callable(arm_remote_work_deadline):
+                arm_remote_work_deadline(remote_work_deadline)
             await owned_manager.shutdown_all()
             if getattr(app.state, "agent_manager", None) is owned_manager:
                 app.state.agent_manager = None
@@ -3007,7 +3074,10 @@ async def _shutdown_server_agents(app: FastAPI) -> None:
         if agent is not None and all(agent is not known for known in owned_agents):
             owned_agents.append(agent)
             try:
-                completed = await _shutdown_single_agent(agent, finite_errors=failures)
+                completed = await _shutdown_single_agent(
+                    agent, finite_errors=failures,
+                    remote_work_deadline=remote_work_deadline,
+                )
             except BaseException as error:
                 failures.append(error)
             else:
@@ -3204,7 +3274,16 @@ async def _shutdown_server_resources(
 ) -> tuple[bool, BaseException | None]:
     """Drain every server-owned teardown phase before reporting an outcome."""
     from kestrel_sovereign.execution_custody import execution_finite_error
+    from kestrel_sovereign.multi_agent import process_manager
+
     logger.info("Server shutting down...")
+    # The host's one shutdown budget (#4028): ``kestrel terminate`` sends
+    # SIGKILL once it is spent, so remote work a stopping agent still waits
+    # on is cancelled early enough for this lifespan to return before then.
+    remote_work_deadline = (
+        asyncio.get_running_loop().time()
+        + process_manager.HOST_SHUTDOWN_REMOTE_WORK_SECONDS
+    )
     cancelled = False
     first_failure: BaseException | None = None
     failures = []
@@ -3234,7 +3313,9 @@ async def _shutdown_server_resources(
         ("unpublished-providers", lambda: drain_unpublished_llm_owners(
             getattr(app.state, "unpublished_llm_owners", {}),
         )),
-        ("agents", lambda: _shutdown_server_agents(app)),
+        ("agents", lambda: _shutdown_server_agents(
+            app, remote_work_deadline=remote_work_deadline,
+        )),
         # HostContext owns the fleet Hold store. Agent heartbeats, signals and
         # feature cleanup may still enter the universal turn seam until agent
         # shutdown is terminal, so that context must remain live through the

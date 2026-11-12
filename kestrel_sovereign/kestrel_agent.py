@@ -439,7 +439,7 @@ KESTREL_AGENT_SHUTDOWN_TIMEOUT_S = float(
 )
 
 # Headroom carved out of the sweep budget for the durable cleanup tail
-# (background tasks, memory, sync snapshot, storage close). The fallible
+# (background tasks, memory, owed-snapshot record, storage close). The fallible
 # prefix may only spend budget up to (deadline - this reserve), so the
 # durable tail always has time to run *within* the outer deadline instead of
 # relying on the outer wait_for cancellation to trigger it.
@@ -449,7 +449,7 @@ KESTREL_SHUTDOWN_DURABLE_RESERVE_S = float(
 
 # Per-feature *cap* for the whole-agent shutdown sweep (#2409). A single
 # feature that hangs in shutdown() must not stall the sweep or starve the
-# durable cleanup tail (background tasks, memory, sync snapshot, storage
+# durable cleanup tail (background tasks, memory, owed-snapshot record, storage
 # close); once this elapses the feature is abandoned and the sweep moves on.
 # The effective bound is min(this cap, fair share of the remaining sweep
 # budget) — see shutdown() — so this cap never lets one feature exceed its
@@ -460,7 +460,7 @@ KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S = float(
 
 # Minimum per-step guard (seconds) for the durable cleanup tail. Even when the
 # budget is nearly exhausted, each durable step (background-task cleanup,
-# memory, final snapshot, storage close) gets at least this nonzero attempt so
+# memory, owed-snapshot record, storage close) gets at least this nonzero attempt so
 # data is never silently dropped for lack of a sliver of time. The tail is
 # still bounded overall: a step that exceeds its guard is ABANDONED (not
 # awaited — so a coroutine that suppresses cancellation cannot hang the tail
@@ -3611,7 +3611,8 @@ class KestrelAgent(
 
         # Sync service — event-driven snapshots to all configured targets.
         # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
-        # Snapshots fire on shutdown, scheduled backup, or explicit !backup command.
+        # Snapshots fire on the scheduled backup or an explicit request. Shutdown
+        # only records the remote snapshot as owed (#4028).
         self._sync_service = None
         if self._db_backend.lower() != "postgres" and self._sync_enabled and not self.maintenance_boot:
             try:
@@ -10107,6 +10108,21 @@ Expected Duration: {expected_duration}
             reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"
         )
 
+    def cancel_retained_remote_work(self, reason: str) -> list[str]:
+        """Cancel the remote work this agent's shutdown still waits on.
+
+        The host calls this once its shutdown budget is spent (#4028). Its
+        sync service's ``stop()`` waits for a snapshot pass another task
+        started; that upload can take many minutes, so the host cancels it
+        rather than letting SIGKILL cut it off. Returns one description per
+        cancelled pass, naming its target. Local cleanup (storage close) is
+        not touched.
+        """
+        sync_service = getattr(self, "_sync_service", None)
+        if sync_service is None:
+            return []
+        return sync_service.cancel_inflight_snapshots(reason)
+
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
     # - _maybe_evict_direct_tools, _build_features_prompt_section
@@ -10307,7 +10323,7 @@ Expected Duration: {expected_duration}
         The whole method is a *fallible prefix* wrapped in one try/finally.
         The prefix stops every agent-owned worker and every feature; the
         ``finally`` runs the safety-critical durable tail (background-task
-        cleanup, memory shutdown, final sync snapshot, storage close).
+        cleanup, memory shutdown, owed-snapshot record, storage close).
 
         Cancellation contract (#2409): agent.shutdown() is wrapped in
         ``asyncio.wait_for(..., timeout=SHUTDOWN_TIMEOUT)`` by the CLI /
@@ -10995,7 +11011,7 @@ Expected Duration: {expected_duration}
         """Run the safety-critical durable shutdown steps.
 
         These persist data and prevent leaks (agent-owned background-task
-        cleanup, memory shutdown, the final sync snapshot, and storage
+        cleanup, memory shutdown, the owed-snapshot record, and storage
         close) and MUST complete even when a feature/MCP/LLM/TaskManager
         shutdown above was cancelled by the outer ``asyncio.wait_for``
         timeout. Each step guards its own errors so one failure never skips
@@ -11076,7 +11092,7 @@ Expected Duration: {expected_duration}
         # requirement, because that would silently discard the outer-budget
         # clamp when a configuration cannot fit.
         tail_deadline = loop.time() + max(0.0, tail_reserve)
-        # The sync path makes TWO guarded steps (snapshot + stop), so it must
+        # The sync path makes TWO guarded steps (owed record + stop), so it must
         # count as two in the fair-division denominator — otherwise sync-stop
         # runs at pending_steps==1 and claims the entire remaining budget,
         # starving the data-critical storage-close of its fair share.
@@ -11217,7 +11233,7 @@ Expected Duration: {expected_duration}
             their original Task and eventual physical-close evidence instead.
             When ``shielded`` the underlying task keeps running if the
             tail's own await is cancelled externally (used for
-            ``force_snapshot`` so cancellation neither aborts it nor skips the
+            the owed-snapshot record so cancellation neither aborts it nor skips the
             following ``stop()``); it is still bounded by ``guard``. An explicit
             retirement resource retains the Task past that observation bound;
             completion remains owned and a later completion waiter joins it.
@@ -11383,36 +11399,43 @@ Expected Duration: {expected_duration}
                 "memory-system",
             )
 
-        # Final snapshot to all sync targets before closing storage. The
-        # snapshot is SHIELDED so cancellation neither aborts it nor skips the
-        # ``stop()`` that releases the sync worker.
+        # Shutdown uploads no snapshot (#4028). An agent database is gigabytes
+        # and its upload takes many minutes, far past any stop the host can
+        # wait for, so a final upload was always cut off by SIGKILL. Record
+        # the remote snapshot as owed instead: the next scheduled backup sends
+        # it. Storage close below keeps the local work. The record is SHIELDED
+        # so cancellation neither aborts it nor skips the ``stop()``.
         if run_sync:
             status = await _bounded(
-                sync_service.force_snapshot(),
+                sync_service.record_remote_snapshot_owed(),
                 _step_guard(),
-                "sync-snapshot",
+                "sync-snapshot-owed",
                 shielded=True,
                 retirement_resource=sync_service,
             )
-            # Always attempt stop() — even if the snapshot was abandoned or
+            # Always attempt stop() — even if the record was abandoned or
             # cancellation was observed — so the sync worker is released.
+            # stop() waits for a pass some other task started, which is
+            # remote work the host's shutdown budget bounds
+            # (``cancel_retained_remote_work``).
 
             async def release_sync() -> ReleaseOutcome:
                 stopped = reported_outcome(await sync_service.stop())
                 if status in {"abandoned", "cancelled"}:
-                    # Work the unfinished snapshot started may still be
-                    # running against the sync targets (#3522).
+                    # The unfinished record may still be writing the sync
+                    # state file (#3522).
                     return ReleaseOutcome.RETAINED
                 return stopped
 
+            # SHIELDED, as the final snapshot it replaced was: a pass it
+            # waits for keeps its grace when the tail itself is cancelled.
             await _bounded(
                 custody.release("sync_service", release_sync),
                 _step_guard(),
                 "sync-stop",
+                shielded=True,
                 retirement_resource=sync_service,
             )
-            if status == "ok":
-                logging.info("Sync service: final snapshot flushed")
 
         # Another lifecycle caller may already have spent the dispatcher guard
         # and installed the unique continuation while this tail was stopping
