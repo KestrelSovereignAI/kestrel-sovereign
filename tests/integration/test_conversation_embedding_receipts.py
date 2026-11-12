@@ -226,6 +226,32 @@ async def test_actual_provider_failure_keeps_the_native_receipt(native_memory_ow
 
 
 @pytest.mark.asyncio
+async def test_actual_lookup_failure_keeps_the_canonical_receipt(native_memory_owners, provider_receipt_store):
+    n, store = native_memory_owners, provider_receipt_store
+    provider = n.service.providers[0]
+    adapter = provider.pop("adapter")
+    before = len(n.requests)
+    try:
+        # An incomplete real provider registration fails while constructing
+        # its service, before any embedding dispatch or SDK HTTP request.
+        with pytest.raises(KeyError, match="adapter"):
+            n.service.get_embedding_service()
+        resolved, lookup_failure = None, None
+        try:
+            resolved = store.embedding_service
+        except Exception as error:
+            lookup_failure = error
+        assert lookup_failure is None and resolved is None, (
+            "Lookup availability failure must preserve canonical conversation writes")
+        receipt = await store.add_conversation("user", "owned lookup availability failure", session_id=str(uuid4()))
+        assert type(receipt) is int and receipt > 0
+        assert await _stored_vector(store, receipt) is None
+        assert len(n.requests) == before, "Lookup failure must not dispatch an embedding request"
+    finally:
+        provider["adapter"] = adapter
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("column", ["embedding_vec", "embedding_profile_id"])
 async def test_embedding_migrations_inspect_the_original_resolved_relation(native_pg, column):
     backend, _, schema = native_pg
@@ -419,3 +445,55 @@ async def test_lost_fence_commit_ack_keeps_the_committed_rows_lexical_tokens(
         (raw.agent_id, row[1]),
     )
     assert tokens is not None and tokens[0] > 0, "Lost commit acknowledgement must not delete a committed row's lexical tokens"
+
+
+@pytest.mark.asyncio
+async def test_lost_original_savepoint_release_ack_cannot_replay_the_insert(
+    native_fenced_receipt_storage, monkeypatch,
+):
+    raw, observer, _ = native_fenced_receipt_storage
+    original_fetch = raw.db.fetchone
+    original_exit = asyncpg.transaction.Transaction.__aexit__
+    armed, attempts, fired = [], [], []
+
+    async def observe_original_insert(sql, params=()):
+        result = await original_fetch(sql, params)
+        if "INSERT INTO conversation_history" in sql:
+            attempts.append(result[0])
+            owner = raw.db.backend._current_txn_conn()
+            native = owner._con if isinstance(owner, asyncpg.pool.PoolConnectionProxy) else owner
+            assert isinstance(native, asyncpg.Connection)
+            if not armed:
+                armed.append(native)
+        return result
+
+    async def lose_original_release_ack(transaction, *args):
+        result = await original_exit(transaction, *args)
+        if (armed and not fired and transaction._connection is armed[0]
+                and transaction._nested and args[0] is None):
+            fired.append(True)
+            raise TimeoutError("owned acknowledgement lost after original RELEASE SAVEPOINT")
+        return result
+
+    monkeypatch.setattr(raw.db, "fetchone", observe_original_insert)
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "__aexit__", lose_original_release_ack)
+    observed = None
+    try:
+        async with raw.db.transaction():
+            await raw.conversation._insert_message(
+                role="assistant", content="owned original savepoint release witness",
+                rendered_content=None, metadata=None, embedding=[1.0, 0.0, 0.0],
+                embedding_profile_id="owned-release-profile", session_id=str(uuid4()),
+            )
+    except BaseException as error:
+        observed = error
+    rows = await observer.fetch_all(
+        "SELECT id, embedding_profile_id FROM conversation_history WHERE agent_id = ? ORDER BY id",
+        (raw.agent_id,),
+    )
+    assert len(fired) == 1
+    assert observed is not None and is_execution_control_error(observed), (
+        "Unacknowledged native savepoint release must not authorize an INSERT retry; "
+        f"actual rows={rows}, original INSERT ids={attempts}")
+    assert len(attempts) == 1, "Native savepoint uncertainty must not replay the original INSERT"
+    assert rows == [], "The outer native rollback must remove the unacknowledged exchange"

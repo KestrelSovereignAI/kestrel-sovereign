@@ -461,7 +461,7 @@ async def test_asyncpg_internal_reset_task_refusal_keeps_actual_debt(
                 connection.terminate()
 
 
-@pytest.mark.parametrize("surface", ["legacy", "callback", "cleanup"])
+@pytest.mark.parametrize("surface", ["plain", "callback", "cleanup"])
 async def test_unfenced_aborted_transaction_never_mints_known_commit(
     native_pg, surface
 ):
@@ -490,7 +490,7 @@ async def test_unfenced_aborted_transaction_never_mints_known_commit(
                     await backend.fetch_val("SELECT 1 / 0")
 
         outcome = await await_owned_task(create_owned_task(write()))
-        assert (outcome.error is None) == (surface == "legacy")
+        assert outcome.error is not None
         assert execution_commit_outcome(outcome.error) is None
     assert callbacks == []
     assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects') == 0

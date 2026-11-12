@@ -1844,12 +1844,18 @@ class PostgresBackend(DatabaseBackend):
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
             _require_native_observation_for_connection(existing)
-            require_execution_backend("postgres", self._remember_transaction_custody())
+            scopes = self._remember_transaction_custody()
+            require_execution_backend("postgres", scopes)
             after_commit = self._current_after_commit()
             after_commit.open_savepoint()
             body_failure: BaseException | None = None
             try:
-                async with existing.transaction():
+                # A savepoint RELEASE/ROLLBACK is an original native exit too.
+                # Join it and retain uncertain acknowledgement as control;
+                # it cannot mint a durable top-level COMMIT receipt.
+                async with self._tracked_native_transaction(
+                    existing, scopes, requires_commit_proof=False, admit_work=True,
+                ):
                     try:
                         await self._lock_transaction_custody(existing)
                         yield
