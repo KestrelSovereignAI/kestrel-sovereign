@@ -49,3 +49,64 @@ async def collect_native_stream(agent, operation, *, chunks=None):
         return observed
 
     return await drive_native(agent, collect)
+
+
+def install_input_checkpoint_provider(agent, registered, monkeypatch, *, followup=False, dispatch='inline',
+                                      before_tools=None, tool_markers=False):
+    """Script only model I/O; all governed tools and their receipts remain real."""
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall, ToolCallStarted
+    from kestrel_sovereign.tools.effect_journal import ToolInputSuspended
+    from kestrel_sovereign.agent.streaming import _build_tool_sentinel
+
+    first = registered['record_marker']
+    suspended = []
+    provider_calls = []
+    async def stream(**kwargs):
+        provider_calls.append(True)
+        executed = []
+        yield 'UNFINISHED-PRE-INPUT-PROSE'
+        if before_tools is not None:
+            await before_tools()
+        if followup and len(provider_calls) == 1:
+            yield LLMResponse(content='', stop_reason='tool_calls', tool_calls=[ToolCall(
+                id='owned-first-batch', name=first.binding.name,
+                arguments={'marker': 'completed-before-input'})])
+            return
+        names = ('open_marker',) if followup else ('record_marker', 'open_marker')
+        if dispatch == 'batch':
+            yield LLMResponse(content='', stop_reason='tool_calls', tool_calls=[ToolCall(
+                id='owned-batch-' + str(index), name=registered[name].binding.name,
+                arguments={'marker': 'completed-before-input' if name == 'record_marker' else 'must-wait'})
+                for index, name in enumerate(names)])
+            return
+        for index, name in enumerate(names):
+            registered_tool = registered[name]
+            if tool_markers:
+                yield ToolCallStarted(index=index, id='owned-inline-' + str(index), name=registered_tool.binding.name)
+            try:
+                outcome = await kwargs['tool_executor'](registered_tool.binding.name,
+                    {'marker': 'completed-before-input' if name == 'record_marker' else 'must-wait'})
+            except ToolInputSuspended as signal:
+                suspended.append(signal)
+                raise
+            if tool_markers:
+                yield _build_tool_sentinel('done', registered_tool.binding.name)
+            executed.append(dict(id='owned-inline-' + str(index), name=registered_tool.binding.name,
+                arguments=outcome[0], result=outcome[1], dispatch_id=outcome.dispatch_id))
+        final = LLMResponse(content='UNFINISHED-POST-INPUT-PROSE', stop_reason='completed')
+        final.executed_tool_calls = executed
+        yield final
+
+    monkeypatch.setattr(agent.llm_service, 'stream_with_tool_detection', stream)
+
+    async def generate(**kwargs):
+        final = None
+        async for item in stream(**kwargs):
+            if isinstance(item, LLMResponse):
+                final = item
+        assert final is not None, 'Scripted provider did not finish or suspend'
+        return final
+
+    monkeypatch.setattr(agent.llm_service, 'generate_with_messages', generate)
+
+    return provider_calls, suspended

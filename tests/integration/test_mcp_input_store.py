@@ -96,6 +96,25 @@ async def test_expiry_release_and_original_response_admission_share_one_capacity
 
 
 @pytest.mark.asyncio
+async def test_lower_pending_limit_does_not_strand_existing_reservations(custody):
+    original, reopen, _ = custody
+    first = await create(original)
+    await create(original, operation_id='second-existing-reservation')
+    lowered = await reopen(max_pending=1)
+    outcome, = await asyncio.gather(lowered.claim_response(first, {}, now=101), return_exceptions=True)
+    assert isinstance(outcome, MCPInputClaim), 'Reducing pending capacity stranded an already reserved operator response'
+
+
+@pytest.mark.asyncio
+async def test_newer_admission_cannot_reanimate_expiry_with_an_earlier_request_timestamp(custody):
+    original, _, _ = custody
+    first = await create(original)
+    await original.create(binding(operation_id='after-original-expiry'), checkpoint(), now=1001, expires_at=3000)
+    outcome, = await asyncio.gather(original.claim_response(first, {}, now=999), return_exceptions=True)
+    assert isinstance(outcome, MCPInputConflict), 'A stale admission revived a checkpoint after its expiry was already observed'
+
+
+@pytest.mark.asyncio
 async def test_continuation_chain_reuses_one_reservation_and_keeps_uncertain_claims_counted(custody):
     _, reopen, _ = custody
     store = await reopen(max_pending=1)

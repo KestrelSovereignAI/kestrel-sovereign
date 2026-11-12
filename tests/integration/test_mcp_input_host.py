@@ -578,8 +578,7 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
         apps_boundary, monkeypatch, followup, streaming, audit, dispatch):
     from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
-    from kestrel_sovereign.tools.effect_journal import ToolInputSuspended, ToolEffectJournalUnavailable
+    from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
     from tests.utils.native_streaming import prepare_streaming_agent
 
     b = apps_boundary
@@ -608,48 +607,9 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
 
     monkeypatch.setattr(b.agent.hooks_manager, 'execute_hooks_parallel', observe_stop)
 
-    provider_calls = []
-    async def stream(**kwargs):
-        provider_calls.append(True)
-        executed = []
-        yield 'UNFINISHED-PRE-INPUT-PROSE'
-        if followup and len(provider_calls) == 1:
-            yield LLMResponse(content='', stop_reason='tool_calls', tool_calls=[ToolCall(
-                id='owned-first-batch', name=first.binding.name,
-                arguments={'marker': 'completed-before-input'})])
-            return
-        names = ('open_marker',) if followup else ('record_marker', 'open_marker')
-        if dispatch == 'batch':
-            yield LLMResponse(content='', stop_reason='tool_calls', tool_calls=[ToolCall(
-                id='owned-batch-' + str(index), name=registered[name].binding.name,
-                arguments={'marker': 'completed-before-input' if name == 'record_marker' else 'must-wait'})
-                for index, name in enumerate(names)])
-            return
-        for index, name in enumerate(names):
-            registered_tool = registered[name]
-            try:
-                outcome = await kwargs['tool_executor'](registered_tool.binding.name,
-                    {'marker': 'completed-before-input' if name == 'record_marker' else 'must-wait'})
-            except ToolInputSuspended as signal:
-                suspended.append(signal)
-                raise
-            executed.append(dict(id='owned-inline-' + str(index), name=registered_tool.binding.name,
-                arguments=outcome[0], result=outcome[1], dispatch_id=outcome.dispatch_id))
-        final = LLMResponse(content='UNFINISHED-POST-INPUT-PROSE', stop_reason='completed')
-        final.executed_tool_calls = executed
-        yield final
-
-    monkeypatch.setattr(b.agent.llm_service, 'stream_with_tool_detection', stream)
-
-    async def generate(**kwargs):
-        final = None
-        async for item in stream(**kwargs):
-            if isinstance(item, LLMResponse):
-                final = item
-        assert final is not None, 'Scripted provider did not finish or suspend'
-        return final
-
-    monkeypatch.setattr(b.agent.llm_service, 'generate_with_messages', generate)
+    from tests.utils.native_streaming import install_input_checkpoint_provider
+    provider_calls, suspended = install_input_checkpoint_provider(b.agent, registered, monkeypatch,
+        followup=followup, dispatch=dispatch)
 
     @b.app.post('/api/owned-first-stream-input')
     async def first_stream(request: Request):
@@ -659,7 +619,8 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
                     session_id='original-chat', caller=request.state.caller)
                 return {'text': value}
             return {'chunks': [chunk async for chunk in b.agent.process_input_streaming(
-                'Run the owned tools once', session_id='original-chat', caller=request.state.caller)]}
+                'Run the owned tools once', session_id='original-chat', caller=request.state.caller,
+                request_id='owned-native-input-first-turn')]}
 
     response = await b.client.post('/api/owned-first-stream-input', headers=b.headers())
     assert response.status_code == 200, response.text
@@ -691,6 +652,12 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
     if streaming and audit is None:
         from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
 
+        from kestrel_sovereign.agent.streaming import RETRACT_SENTINEL_PREFIX
+        chunks = response.json()['chunks']
+        retractions = [chunk for chunk in chunks if chunk.startswith(RETRACT_SENTINEL_PREFIX)]
+        assert len(retractions) == 1, 'A confirmed input checkpoint must retract its live turn exactly once'
+        assert json.loads(retractions[0][len(RETRACT_SENTINEL_PREFIX):-1]) == {
+            'request_id': 'owned-native-input-first-turn'}
         live_parts = [part for part in _parse_stream_sentinels(''.join(response.json()['chunks']))[2]
             if part['type'] == 'mcp_input']
         assert len(live_parts) == 1, 'Input suspension retransmitted a form part already delivered in the live stream'
