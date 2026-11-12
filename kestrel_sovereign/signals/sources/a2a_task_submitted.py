@@ -37,7 +37,6 @@ from kestrel_sovereign.a2a.extensions import (
 from kestrel_sovereign.a2a.projections import message_text
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.task_store import (
-    UNDELIVERED_WAKE_SETTLEMENT_KIND,
     NativeTaskSnapshot,
     require_native_task_snapshot,
 )
@@ -232,35 +231,9 @@ def build_signal_for_submitted_task(
     )
 
 
-def admitted_input_signal(
-    task_id: str, input_revision: int, *, target_agent: str
-) -> Signal:
-    """The identity of the submission wake for one admitted input.
-
-    Bound as the current signal, it fences recipient task writes to exactly
-    that input, as the wake's own turn is fenced: a newer input the creator
-    added meanwhile is left alone. Its kind further fences them to a task
-    still ``submitted`` or ``working``, so one that asked for input meanwhile
-    is left alone too. It carries no request content and is never
-    dispatched; it settles a wake that ended without running (#4001).
-    """
-    identity = submitted_input_identity(task_id, input_revision)
-    return Signal(
-        source=SOURCE_NAME,
-        kind=UNDELIVERED_WAKE_SETTLEMENT_KIND,
-        mode=SignalMode.COGNITION,
-        payload={"task_id": task_id, "input_revision": input_revision},
-        target_agent=target_agent,
-        visibility=Visibility.INTERNAL,
-        origin_trust=Trust.TRUSTED,
-        dedupe_key=identity,
-    )
-
-
 __all__ = [
     "PROMPT_TEMPLATE",
     "SOURCE_NAME",
-    "admitted_input_signal",
     "build_a2a_task_submitted_registration",
     "build_signal_for_submitted_task",
     "parse_submitted_input_identity",

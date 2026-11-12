@@ -340,18 +340,18 @@ async def test_a_stopped_wake_whose_task_cannot_be_cancelled_is_settled_by_the_h
             await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
             task = await _submit_task(agent)
             await _wait_until_queued(agent)
-            manager = agent.task_manager
-            real_cancel = manager.cancel_task
+            store = agent.task_manager.task_store
+            real_apply = store.apply_undelivered_wake_transition
             faulted = {"on": True}
             attempts = []
 
-            async def cancel_task(*args, **kwargs):
-                attempts.append(args[0])
+            async def apply(transition):
+                attempts.append(transition.task_id)
                 if faulted["on"]:
                     raise OSError("database is locked")
-                return await real_cancel(*args, **kwargs)
+                return await real_apply(transition)
 
-            monkeypatch.setattr(manager, "cancel_task", cancel_task)
+            monkeypatch.setattr(store, "apply_undelivered_wake_transition", apply)
 
             assert await _stop_agent(agent, receipts) == [StopDisposition.STOPPED]
             await _settle(agent, (first,), "the stopped turn")
@@ -523,13 +523,13 @@ async def test_a_failed_wake_whose_task_write_failed_is_settled_without_a_restar
     )
     fault.commit()
     settlements = []
-    settle = KestrelAgent.settle_undelivered_cognition_wake
+    build = KestrelAgent.undelivered_cognition_wake_settlement
 
-    async def counted(self, **identity):
+    def counted(self, **identity):
         settlements.append(identity["source_event_id"])
-        return await settle(self, **identity)
+        return build(self, **identity)
 
-    monkeypatch.setattr(KestrelAgent, "settle_undelivered_cognition_wake", counted)
+    monkeypatch.setattr(KestrelAgent, "undelivered_cognition_wake_settlement", counted)
     # The owner heartbeat is the recovery worker; run its cadence at test speed.
     monkeypatch.setitem(
         SignalDispatcher.__init__.__kwdefaults__,
@@ -606,12 +606,16 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
 
     # The restart refuses the wake's retry and commits its failed row; the
     # process then stops before it settles the task.
-    async def stopped_before_settling(self, **identity):
-        return False
+    class _StoppedBeforeSettling:
+        async def apply(self):
+            return "owed", None
+
+    def stopped_before_settling(self, **identity):
+        return _StoppedBeforeSettling()
 
     with monkeypatch.context() as stopped:
         stopped.setattr(
-            KestrelAgent, "settle_undelivered_cognition_wake", stopped_before_settling
+            KestrelAgent, "undelivered_cognition_wake_settlement", stopped_before_settling
         )
         async with booted_agent(
             home, name="Recipient", provenance=provenance, features=set(), identity=did
@@ -634,11 +638,11 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
     )
     fault.commit()
     settlements = []
-    settle = KestrelAgent.settle_undelivered_cognition_wake
+    build = KestrelAgent.undelivered_cognition_wake_settlement
 
-    async def counted(self, **identity):
+    def counted(self, **identity):
         settlements.append(identity["source_event_id"])
-        return await settle(self, **identity)
+        return build(self, **identity)
 
     failed_row_writes = []
     write_row = DurableSignalStore.release_managed_delivery_after_task
@@ -647,7 +651,7 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
         failed_row_writes.append(kwargs["delivery_id"])
         return await write_row(self, **kwargs)
 
-    monkeypatch.setattr(KestrelAgent, "settle_undelivered_cognition_wake", counted)
+    monkeypatch.setattr(KestrelAgent, "undelivered_cognition_wake_settlement", counted)
     monkeypatch.setattr(
         DurableSignalStore, "release_managed_delivery_after_task", counted_row_write
     )
@@ -693,24 +697,22 @@ async def test_a_wake_already_failed_at_boot_is_settled_without_another_restart(
         fault.close()
 
 
-async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_by_the_heartbeat(
+async def test_a_failed_wake_whose_task_moved_on_meanwhile_is_settled_by_the_heartbeat(
     tmp_path, monkeypatch
 ):
     """Self-review of wo-4001-4: after a restart the wake's retry is refused
-    and its row fails. Between the settlement's read of the task and its
-    write, another recipient writer moves the task SUBMITTED -> WORKING, so
-    the settlement's lifecycle compare-and-set loses and raises. Before the
-    fix the dispatcher kept its in-process debt only for a storage error, so
-    this one was dropped: the delivery stayed failed, the sender saw
-    ``working``, and the owner heartbeat had nothing to retry. What is owed is
-    now read from durable state on every pass, so the running heartbeat
-    settles the task, writing neither cognition nor the committed row
-    again."""
+    and its row fails. Another recipient writer then moves the task
+    SUBMITTED -> WORKING on the same input. Before the fix the settlement
+    read the task, lost its lifecycle compare-and-set to that writer, and
+    dropped its debt, so the sender saw ``working`` forever. The settlement
+    now locks the task in the transaction that settles the row, so a writer
+    either finishes first, and the task is ended from WORKING, or waits for
+    it. The running heartbeat ends the task, writing neither cognition nor
+    the committed row again (#4001)."""
     from datetime import timedelta
 
-    from kestrel_sdk.native_a2a.types import Task, TaskState
+    from kestrel_sdk.native_a2a.types import TaskState
 
-    from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
     from kestrel_sovereign.signals.dispatcher import SignalDispatcher
     from kestrel_sovereign.signals.durable import DurableSignalStore
 
@@ -725,26 +727,17 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
         await asyncio.wait_for(parked.wait(), SETTLE_SECONDS)
         did = agent.did
 
-    native_save = TaskStore.save_recipient_lifecycle
-    raced = []
+    native_settle = DurableSignalStore.settle_terminal_delivery
+    moved = []
+    managers = []
 
-    async def concurrent_working_writer(self, value, **kwargs):
-        if not raced and value.id == task.id and (
-            value.status.state == TaskState.TASK_STATE_FAILED
-        ):
-            raced.append(value.id)
-            baseline = kwargs["baseline"]
-            working = Task.FromString(baseline.SerializeToString())
-            working.status.state = TaskState.TASK_STATE_WORKING
-            # The other writer wins the real store CAS for the same input.
-            assert await native_save(
-                self,
-                working,
-                baseline=baseline,
-                recipient_agent_id=kwargs["recipient_agent_id"],
-                expected_state=baseline.status.state,
-            ) is not None
-        return await native_save(self, value, **kwargs)
+    async def another_writer_first(self, **kwargs):
+        if not moved and managers:
+            moved.append(kwargs["delivery_id"])
+            await managers[0].update_status(
+                task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=did
+            )
+        return await native_settle(self, **kwargs)
 
     failed_row_writes = []
     write_row = DurableSignalStore.release_managed_delivery_after_task
@@ -753,7 +746,7 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
         failed_row_writes.append(kwargs["delivery_id"])
         return await write_row(self, **kwargs)
 
-    monkeypatch.setattr(TaskStore, "save_recipient_lifecycle", concurrent_working_writer)
+    monkeypatch.setattr(DurableSignalStore, "settle_terminal_delivery", another_writer_first)
     monkeypatch.setattr(
         DurableSignalStore, "release_managed_delivery_after_task", counted_row_write
     )
@@ -768,14 +761,8 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
     async with booted_agent(
         home, name="Recipient", provenance=provenance, features=set(), identity=did
     ) as agent:
+        managers.append(agent.task_manager)
         _script_replies(agent, monkeypatch, _woken_by(woken_by))
-
-        async def lost_the_race():
-            return bool(raced) and [d.status for d in await _submission_deliveries(agent)] == [
-                "failed"
-            ]
-
-        await _until(agent, lost_the_race, "the refused retry never failed its row")
 
         async def ended():
             return await _sender_state(agent, task) == TaskState.TASK_STATE_FAILED
@@ -783,13 +770,13 @@ async def test_a_failed_wake_whose_settlement_loses_a_lifecycle_race_is_settled_
         await _until(
             agent,
             ended,
-            "the owner heartbeat left the task live after its settlement lost a "
-            "lifecycle race",
+            "the owner heartbeat left the task live after another writer moved it",
         )
+        assert moved
         assert [d.status for d in await _submission_deliveries(agent)] == ["failed"]
         assert await agent.dispatcher.owed_cognition_wake_settlements() == []
         # The row was written once, by the refused retry; the heartbeat wrote
-        # only the task.
+        # only the task and the row's settlement.
         assert len(failed_row_writes) == 1
         await _until_completion_wake_settled(agent)
         assert set(woken_by) <= {COMPLETION_WAKE}
@@ -849,15 +836,15 @@ async def test_a_cycle_refused_wake_whose_settlement_fails_is_settled_by_the_hea
     )
     attempts = []
     fault = {"armed": True}
-    settle = KestrelAgent.settle_undelivered_cognition_wake
+    build = KestrelAgent.undelivered_cognition_wake_settlement
 
-    async def unavailable(self, **identity):
+    def unavailable(self, **identity):
         attempts.append(identity["source_event_id"])
         if fault["armed"]:
             raise OSError("database is locked")
-        return await settle(self, **identity)
+        return build(self, **identity)
 
-    monkeypatch.setattr(KestrelAgent, "settle_undelivered_cognition_wake", unavailable)
+    monkeypatch.setattr(KestrelAgent, "undelivered_cognition_wake_settlement", unavailable)
     async with booted_agent(
         tmp_path / "agent",
         name="Recipient",

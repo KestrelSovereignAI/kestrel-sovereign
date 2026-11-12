@@ -89,10 +89,9 @@ class _Agent(EventManagerMixin):
         self.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
             return_value=None
         )
-        # Boot reconciliation keys every unacknowledged wake, then runs the
+        # Boot reconciliation keys every unkeyed wake, then runs the
         # dispatcher's settlement pass; there is none unless a test says
         # otherwise.
-        self.dispatcher.unacknowledged_durable_deliveries = AsyncMock(return_value=[])
         self.dispatcher.assign_durable_wake_exclusive_keys = AsyncMock(return_value=0)
         self.dispatcher.settle_owed_cognition_sources = AsyncMock()
         self.task_manager = MagicMock()
@@ -267,38 +266,31 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
     ] == ['["missing-outbox",0]', "behind-it"]
 
 
-def _wake_row(source_event_id, *, terminal=False):
-    return SimpleNamespace(
-        event=SimpleNamespace(source="a2a.task_submitted", source_event_id=source_event_id),
-        is_terminal=terminal,
-    )
-
-
 @pytest.mark.asyncio
-async def test_boot_reconciliation_keys_every_unacknowledged_wake_then_lets_admission_decide():
+async def test_boot_reconciliation_keys_every_unkeyed_wake_then_lets_admission_decide():
     """Boot used to decide from its own ledger read whether a WORKING task's
     input got a recovery wake. That read was stale by the time boot minted,
-    and each review found it stale one more way. Boot now gives every
-    unacknowledged wake its exclusive key, so a wake admitted before keys
-    existed is visible to admission, before the settlement pass or any
-    mint. It then mints, and admission in the store refuses a wake while
-    another wake of its input has not run (DUPLICATE). The store-backed races
-    are in ``test_admission_refuses_a_wake_for_an_input_another_wake_carries``
+    and each review found it stale one more way. Boot now asks the store to
+    key every unkeyed wake, in one transaction that reads them again, before
+    the settlement pass, the candidate read or any mint; boot passes it
+    nothing it read. It then mints, and admission in the store refuses a wake while another wake of
+    its input holds its key (DUPLICATE). The store-backed races are in
+    ``test_admission_refuses_a_wake_for_an_input_another_wake_carries`` and
+    the legacy shapes in ``test_legacy_duplicate_wakes_are_held_not_co_keyed``
     (#4001)."""
 
     from kestrel_sovereign.signals import DurableAdmissionDisposition
 
     agent = _Agent()
     order = []
-    rows = [_wake_row('["mid-turn",0]'), _wake_row('["mid-turn",0,0]', terminal=True)]
-    agent.task_manager.list_cognition_wake_candidates = AsyncMock(
-        return_value=[
-            replace(_task('mid-turn', state=TaskState.TASK_STATE_WORKING), lifecycle_revision=1)
-        ]
+    candidate = replace(
+        _task('mid-turn', state=TaskState.TASK_STATE_WORKING), lifecycle_revision=1
     )
-    agent.dispatcher.unacknowledged_durable_deliveries = AsyncMock(return_value=rows)
+    agent.task_manager.list_cognition_wake_candidates = AsyncMock(
+        side_effect=lambda **_: order.append("candidates") or [candidate]
+    )
     agent.dispatcher.assign_durable_wake_exclusive_keys = AsyncMock(
-        side_effect=lambda deliveries: order.append("keys") or 0
+        side_effect=lambda: order.append("keys") or 0
     )
     agent.dispatcher.settle_owed_cognition_sources = AsyncMock(
         side_effect=lambda: order.append("settle")
@@ -312,11 +304,10 @@ async def test_boot_reconciliation_keys_every_unacknowledged_wake_then_lets_admi
 
     await agent.reconcile_a2a_cognition_wakes()
 
-    agent.dispatcher.unacknowledged_durable_deliveries.assert_awaited_once_with(
-        consumer_id="core.a2a-task-submitted-cognition-v1"
-    )
-    agent.dispatcher.assign_durable_wake_exclusive_keys.assert_awaited_once_with(rows)
-    assert order == ["keys", "settle", "mint"]
+    agent.dispatcher.assign_durable_wake_exclusive_keys.assert_awaited_once_with()
+    # Candidates are read only after the pass has settled what it can, so a
+    # task it ended is seen ended.
+    assert order == ["keys", "settle", "candidates", "mint"]
     assert [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list

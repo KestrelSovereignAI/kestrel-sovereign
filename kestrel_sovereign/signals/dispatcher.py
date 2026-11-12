@@ -150,6 +150,9 @@ from kestrel_sovereign.signals.durable import (
     LEASED,
     PENDING,
     RETRY,
+    SETTLEMENT_ENDED,
+    SETTLEMENT_OWED,
+    SETTLEMENT_RELEASED,
     TERMINAL_ACKABLE,
     DurableConsumerRegistration,
     DurableDelivery,
@@ -157,6 +160,7 @@ from kestrel_sovereign.signals.durable import (
     DurableIngressAttestation,
     DurableSignalStore,
     DurableSourceBoundary,
+    TerminalDeliverySettlement,
 )
 from kestrel_sovereign.signals.in_flight_control import (
     InFlightControlActionRegistration,
@@ -299,6 +303,41 @@ _OWED_SETTLEMENT_PROMPT_SECONDS = 0.05
 # Unsettled terminal wake rows read per statement by the settlement pass; a
 # pass reads every page, so this bounds each statement, not the pass.
 _UNDELIVERED_WAKE_PAGE_SIZE = 100
+
+
+@dataclass(frozen=True)
+class _DeliverySettlementControl:
+    """Control one delivery's settlement met, returned and never raised (#4001).
+
+    ``original`` is what is retained for that delivery. It stops the pass
+    that met it and surfaces at shutdown; it never refuses durable admission
+    as a whole.
+    """
+
+    delivery_id: str
+    original: BaseException
+
+
+def _is_settlement_control(error: BaseException) -> bool:
+    """Whether a settlement failure says something beyond "try again" (#4001)."""
+    return (
+        is_tool_execution_terminal_error(error)
+        or execution_commit_outcome(error) is not None
+    )
+
+
+async def _release_foreign_work() -> tuple[str, None]:
+    """The transition of a row whose work no settlement here owns (#4001)."""
+    return SETTLEMENT_RELEASED, None
+
+
+def _derived_exclusive_key(
+    declared, source_event_id, *, source: str, consumer_id: str,
+) -> str | None:
+    """The key admission derives for one wake of ``source`` (#4001)."""
+    if source_event_id is None:
+        return None
+    return declared(source=source, consumer_id=consumer_id, source_event_id=source_event_id)
 
 
 
@@ -1970,7 +2009,8 @@ class SignalDispatcher:
         Claiming it here could only spend an attempt on a caller-recovery
         failure, once per retry delay, for as long as no redelivery came
         (#3392). The ledger query leaves such rows out, so they neither crowd
-        executable rows out of the window nor re-arm the drain.
+        executable rows out of the window nor re-arm the drain. Rows held for
+        an operator, which no claim takes, are left out the same way (#4001).
         """
 
         return await self.list_durable_deliveries(
@@ -1979,6 +2019,7 @@ class SignalDispatcher:
             limit=limit,
             rebuildable_sources=self._durable_rebuildable_sources(),
             claim_executor_id=self._durable_delivery_owner,
+            include_held=False,
         )
 
     def _durable_rebuildable_sources(self) -> frozenset[str]:
@@ -2001,6 +2042,7 @@ class SignalDispatcher:
             pending = await self.list_durable_deliveries(
                 consumer_id=consumer_id, statuses=[PENDING, RETRY], limit=1,
                 rebuildable_sources=self._durable_rebuildable_sources(),
+                include_held=False,
             )
             if not pending:
                 return
@@ -2930,6 +2972,7 @@ class SignalDispatcher:
         limit: int = 100,
         rebuildable_sources: Optional[frozenset[str]] = None,
         claim_executor_id: Optional[str] = None,
+        include_held: bool = True,
     ) -> List[DurableDelivery]:
         """Observe durable delivery state for this agent only."""
         async with self._admit_durable_operation():
@@ -2941,6 +2984,7 @@ class SignalDispatcher:
                 limit=limit,
                 rebuildable_sources=rebuildable_sources,
                 claim_executor_id=claim_executor_id,
+                include_held=include_held,
                 runtime_owner_stale_before=(
                     datetime.now(timezone.utc) - self._runtime_owner_stale_after
                     if claim_executor_id is not None else None
@@ -3573,14 +3617,43 @@ class SignalDispatcher:
             raise error
 
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
-        """Retain original terminal delivery evidence from native writers."""
-        if error is not None and is_tool_execution_terminal_error(error):
-            from kestrel_sovereign.execution_custody import (
-                execution_native_source_error,
+        """Retain original terminal delivery evidence from native writers.
+
+        A delivery's settlement control is never this: it stays with its
+        delivery (:meth:`_settle_owed_wake_row`). An error carrying one is
+        logged and refused here rather than refusing all durable admission
+        (#4001).
+        """
+        if error is None or not is_tool_execution_terminal_error(error):
+            return
+        if self._carries_settlement_control(error):
+            logger.error(
+                "Refusing to retain a delivery's settlement control as "
+                "dispatcher-wide writer control (%s); it stays with its "
+                "delivery: deliveries=%s",
+                type(error).__name__,
+                ", ".join(sorted(self._source_settlement_control)),
             )
-            self._outcome_log_control_error = execution_native_source_error(
-                self._outcome_log_control_error, error, include_tool_terminal=True,
-            )
+            return
+        from kestrel_sovereign.execution_custody import (
+            execution_native_source_error,
+        )
+        self._outcome_log_control_error = execution_native_source_error(
+            self._outcome_log_control_error, error, include_tool_terminal=True,
+        )
+
+    def _carries_settlement_control(self, error: BaseException) -> bool:
+        """Whether ``error`` carries control retained for one delivery (#4001)."""
+        retained = getattr(self, "_source_settlement_control", {})
+        if not retained:
+            return False
+        from kestrel_sovereign.execution_custody import execution_evidence_carriers
+        carriers = {id(carrier) for carrier in execution_evidence_carriers(error)}
+        return any(
+            id(carrier) in carriers
+            for _, original in retained.values()
+            for carrier in execution_evidence_carriers(original)
+        )
 
     @property
     def unresolved_cognition_control(self) -> tuple[str, ...]:
@@ -3856,9 +3929,10 @@ class SignalDispatcher:
         if control is not None:
             logger.error(
                 "Settling the work of an undelivered cognition wake met "
-                "unresolved native control (%s); readiness fails and owner "
-                "retirement refuses until a settlement returns: deliveries=%s",
-                type(control).__name__,
+                "unresolved control (%s) for delivery %s; readiness fails and "
+                "owner retirement refuses until a settlement returns: deliveries=%s",
+                type(control.original).__name__,
+                control.delivery_id,
                 ", ".join(self.unresolved_cognition_control),
             )
 
@@ -6561,28 +6635,6 @@ class SignalDispatcher:
         )
         return result
 
-    async def _settle_undelivered_wake(
-        self, *, source: str, target_agent: str, source_event_id: str | None,
-        stopped: bool, cause: str,
-    ) -> bool:
-        """Write the one settlement of the work a terminal wake carried (#4001).
-
-        The agent's ``settle_undelivered_cognition_wake`` ends that work, an
-        inbound A2A task, fenced to the wake's own input. It returns, saying
-        whether it ended the work, once nothing is owed, and raises while the
-        work still waits on the wake.
-        """
-        settle = getattr(self._agent, "settle_undelivered_cognition_wake", None)
-        if not callable(settle):
-            return False
-        settled = settle(
-            source=source, target_agent=target_agent,
-            source_event_id=source_event_id, stopped=stopped, cause=cause,
-        )
-        if inspect.isawaitable(settled):
-            settled = await settled
-        return settled is True
-
     @staticmethod
     def _refusal_error(result: SignalResult) -> str:
         """What a refused wake's row records: the status that refused it.
@@ -6689,7 +6741,7 @@ class SignalDispatcher:
         """
         control = await self._settle_owed_cognition_sources()
         if control is not None:
-            raise control
+            raise control.original
 
     def _durable_exclusive_wake(
         self, source: str, source_event_id: str | None,
@@ -6714,36 +6766,63 @@ class SignalDispatcher:
                 return DurableExclusiveWake(consumer_id=consumer_id, key=key)
         return None
 
-    async def assign_durable_wake_exclusive_keys(
-        self, deliveries: list[DurableDelivery],
-    ) -> int:
-        """Give wakes admitted before exclusive keys existed their key (#4001).
+    async def assign_durable_wake_exclusive_keys(self) -> int:
+        """Key every wake admitted before exclusive keys existed (#4001).
 
-        Each key is derived from that wake's own source identity, as
-        admission derives it, so an admission check sees the wake. A wake
-        that already holds a key keeps it.
+        For each settling consumer and the source its wakes come from, the
+        store re-reads every unacknowledged, unsettled row in one transaction
+        under that source's handoff lock, and keys or holds each group of
+        rows sharing one piece of work (:meth:`DurableSignalStore.assign_exclusive_keys`).
+        The key is derived from each wake's own source identity, as admission
+        derives it. Nothing read before that transaction decides anything.
         """
-        keys: dict[tuple[str, str], dict[str, str]] = {}
-        for delivery in deliveries:
-            exclusive = self._durable_exclusive_wake(
-                delivery.event.source, delivery.event.source_event_id
-            )
-            if exclusive is None or exclusive.consumer_id != delivery.consumer_id:
-                continue
-            keys.setdefault((delivery.event.source, delivery.consumer_id), {})[
-                delivery.delivery_id
-            ] = exclusive.key
-        if not keys:
+        declared = getattr(self._agent, "durable_wake_exclusive_key", None)
+        sources = getattr(self._agent, "undelivered_cognition_wake_sources", None)
+        if not callable(declared) or not callable(sources):
+            return 0
+        scopes = sorted(
+            (source, consumer_id)
+            for consumer_id in self._undelivered_wake_consumers()
+            for source in sources(consumer_id=consumer_id)
+        )
+        if not scopes:
             return 0
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
-            assigned = 0
-            for (source, consumer_id), by_delivery in sorted(keys.items()):
-                assigned += await self._durable_store.assign_exclusive_keys(
-                    agent_id=self._agent.did, source=source,
-                    consumer_id=consumer_id, keys=by_delivery,
+            changed = 0
+            for source, consumer_id in scopes:
+                changed += await self._durable_store.assign_exclusive_keys(
+                    agent_id=self._agent.did,
+                    source=source,
+                    consumer_id=consumer_id,
+                    derive_key=functools.partial(
+                        _derived_exclusive_key, declared,
+                        source=source, consumer_id=consumer_id,
+                    ),
                 )
-            return assigned
+            held = await self._held_cognition_wake_groups()
+        if held:
+            logger.warning(
+                "%d piece(s) of work are held for operator reconciliation: their "
+                "legacy wakes share one input in a shape no rule resolves, so no "
+                "automatic path keys or settles them (#4001)",
+                held,
+            )
+        return changed
+
+    async def held_cognition_wake_groups(self) -> int:
+        """How many pieces of work hold legacy wakes for an operator (#4001)."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            return await self._held_cognition_wake_groups()
+
+    async def _held_cognition_wake_groups(self) -> int:
+        held = 0
+        for consumer_id in self._undelivered_wake_consumers():
+            held += await self._durable_store.held_exclusive_group_count(
+                agent_id=self._agent.did, consumer_id=consumer_id,
+            )
+        return held
 
     def _undelivered_wake_consumers(self) -> tuple[str, ...]:
         """Consumers whose terminal rows can carry work owed a settlement."""
@@ -6760,10 +6839,10 @@ class SignalDispatcher:
 
         ``consumers`` defaults to the settling consumers. The caller holds
         durable admission. Rows are read per status in delivery-ID keyset
-        pages on the unsettled-terminal index, so each statement reads only
-        the rows it returns. A row leaves once its settlement is recorded, so
-        what is read is what may still be owed, never the settled history
-        (#4001).
+        pages on the settlement-scan index, so each statement reads only the
+        rows it returns. A row leaves once its settlement is recorded, and a
+        row held for an operator is never in it, so what is read is what may
+        still be owed, never the settled history (#4001).
         """
         if consumers is None:
             consumers = self._undelivered_wake_consumers()
@@ -6787,35 +6866,14 @@ class SignalDispatcher:
     async def _undelivered_wake_owed(self, delivery: DurableDelivery) -> bool:
         """Whether the work this terminal row's wake carried still waits on it.
 
-        Not while a live wake holds the row's exclusive key: that wake
-        carries the work (#4001).
+        No live wake shares an unsettled terminal row's key: the unique holder
+        index and key backfill leave at most one unsettled row per piece of
+        work (#4001).
         """
         owed = getattr(self._agent, "undelivered_cognition_wake_owed", None)
         if not callable(owed):
             return False
-        if await self._durable_store.delivery_carried_by_live_wake(
-            agent_id=self._agent.did,
-            consumer_id=delivery.consumer_id,
-            delivery_id=delivery.delivery_id,
-        ):
-            return False
         return await owed(
-            source=delivery.event.source,
-            target_agent=delivery.event.target_agent,
-            source_event_id=delivery.event.source_event_id,
-        ) is True
-
-    async def _undelivered_wake_released(self, delivery: DurableDelivery) -> bool:
-        """Whether no later state can make this row's work owed again (#4001).
-
-        The agent's ``undelivered_cognition_wake_released`` proves it for good:
-        the task ended, moved past the input, or is gone. Not owed is not
-        enough, since a task that asked for input can work on it again.
-        """
-        release = getattr(self._agent, "undelivered_cognition_wake_released", None)
-        if not callable(release):
-            return False
-        return await release(
             source=delivery.event.source,
             target_agent=delivery.event.target_agent,
             source_event_id=delivery.event.source_event_id,
@@ -6831,42 +6889,6 @@ class SignalDispatcher:
             await self.initialize_durable_delivery()
             async with aclosing(self._unsettled_undelivered_wakes()) as rows:
                 return [delivery async for delivery in rows]
-
-    async def unacknowledged_durable_deliveries(
-        self, *, consumer_id: str
-    ) -> list[DurableDelivery]:
-        """Every delivery of one consumer that is not acknowledged (#4001).
-
-        Its live rows, then its unsettled terminal rows, each read in bounded
-        delivery-ID keyset pages from the ledger alone. A live row leaves
-        live only by becoming terminal or acknowledged, and a terminal row
-        leaves the unsettled set only once durable state shows its work can
-        never be owed again. Read in that order, every row that existed
-        before this read and is absent from it was acknowledged, or its work
-        released: neither can come to run, or come to be owed, later. Boot
-        gives each of them its exclusive key from what this returns; the
-        admission check, not this read, decides recovery (#4001).
-        """
-        async with self._admit_durable_operation():
-            await self.initialize_durable_delivery()
-            rows: list[DurableDelivery] = []
-            after = ""
-            while True:
-                page = await self._durable_store.list_live_deliveries_page(
-                    agent_id=self._agent.did,
-                    consumer_id=consumer_id,
-                    after_delivery_id=after,
-                    limit=_UNDELIVERED_WAKE_PAGE_SIZE,
-                )
-                rows.extend(page)
-                if len(page) < _UNDELIVERED_WAKE_PAGE_SIZE:
-                    break
-                after = page[-1].delivery_id
-            async with aclosing(
-                self._unsettled_undelivered_wakes((consumer_id,))
-            ) as terminal:
-                rows.extend([delivery async for delivery in terminal])
-            return rows
 
     async def owed_cognition_wake_settlements(self) -> list[DurableDelivery]:
         """Every terminal wake whose work still waits on it, read from storage.
@@ -6888,35 +6910,33 @@ class SignalDispatcher:
                     if await self._undelivered_wake_owed(delivery)
                 ]
 
-    async def _settle_owed_cognition_sources(self) -> BaseException | None:
+    async def _settle_owed_cognition_sources(self) -> "_DeliverySettlementControl | None":
         """The one settlement point for work a terminal wake carried (#4001).
 
         A durable wake that becomes terminal without running its turn is
         never claimed again, however it got there: a Stop, a refusal, a
         failed terminalizer, exhausted attempts, a deactivated consumer.
         What is owed is read from durable state on every pass: every
-        unsettled terminal row of a settling consumer. Nothing in this
-        process records what is owed, so no path can lose it, and a stale
-        owner whose terminal CAS lost leaves no terminal row for a pass to
-        find. Once durable state shows a row's work can never be owed again,
-        its settlement is recorded on the row, which then leaves the pass:
-        each pass reads what may still be owed, not the terminal history.
+        unsettled terminal row of a settling consumer that is not held for an
+        operator. Each row is settled by one store transaction that records
+        the row settled together with the task change it makes
+        (:meth:`DurableSignalStore.settle_terminal_delivery`), so a stale
+        owner whose terminal CAS lost leaves no terminal row to find, and a
+        retry of a settlement that committed returns its stored disposition.
 
-        A row whose work cannot be read or settled now, for any ordinary
-        reason, stays owed; the pass goes on to the next row, and the next
-        pass finds it again. A settlement whose commit outcome is unknown,
-        or whose execution authority is gone, is native control: it is
-        retained as that delivery's settlement control and returned, and the
-        pass stops. That control guards no lease, so the owner keeps
-        heartbeating while it stands; readiness fails and owner retirement
-        refuses until a pass, or the retirement drain, finds nothing owed.
+        A row whose work cannot be settled now, for any ordinary reason,
+        stays owed; the pass goes on to the next row, and the next pass
+        finds it again. Anything else a row's settlement meets is that
+        delivery's control (:meth:`_settle_owed_wake_row`): it is retained
+        for that delivery, the pass stops and returns it, and it never
+        refuses durable admission as a whole. Readiness fails and owner
+        retirement refuses while it stands; it guards no lease, so the owner
+        keeps renewing.
 
         Retained control is reconciled whether or not the scan still returns
-        its row. A peer that settled the same work records the row settled,
-        and retention may then remove it; either takes the row out of the
-        scan, but not the control this process holds. Each such control is
-        therefore settled from the work's own durable state too, which ends
-        it once nothing is owed.
+        its row. A peer that settled the same row, or retention that then
+        removed it, takes the row out of the scan, but not the control this
+        process holds; settling it again reads the row's stored outcome.
 
         Once shutdown closes admission the pass stops before its next row,
         so shutdown waits for one row's settlement, not a whole backlog.
@@ -6934,9 +6954,7 @@ class SignalDispatcher:
                     control = await self._settle_owed_wake_row(delivery)
                     if control is not None:
                         return control
-            for delivery, _ in tuple(
-                getattr(self, "_source_settlement_control", {}).values()
-            ):
+            for delivery, _ in tuple(self._source_settlement_control.values()):
                 if self._durable_shutdown:
                     return None
                 if delivery.delivery_id in scanned:
@@ -6946,132 +6964,103 @@ class SignalDispatcher:
                     return control
         return None
 
-    async def _settle_owed_wake_row(self, delivery: DurableDelivery) -> BaseException | None:
-        """Settle one row for the settlement pass; return native control met.
+    async def _settle_owed_wake_row(
+        self, delivery: DurableDelivery,
+    ) -> "_DeliverySettlementControl | None":
+        """Settle one row for the pass; the one boundary of its control (#4001).
 
         An ordinary failure leaves the row owed, and any control it holds
-        retained, for the next pass. Native control is retained as the row's
-        settlement control and returned, so the pass stops (#4001). That
-        includes the record that takes a settled row out of the pass: a
-        record whose commit is unknown is retried like the settlement.
-        """
-        try:
-            if await self._settle_undelivered_wake_row(delivery):
-                await self._record_undelivered_wake_settled(delivery)
-        except BaseException as error:
-            if (
-                is_tool_execution_terminal_error(error)
-                or execution_commit_outcome(error) is not None
-            ):
-                retained = self._retain_source_settlement_control(delivery, error)
-                if not isinstance(error, Exception):
-                    raise
-                return retained
-            if not isinstance(error, Exception):
-                raise
-            logger.warning(
-                "Could not settle the work an undelivered wake carried; it "
-                "stays owed to the next settlement pass: delivery=%s",
-                delivery.delivery_id,
-                exc_info=True,
-            )
-        return None
-
-    async def _settle_undelivered_wake_row(self, delivery: DurableDelivery) -> bool:
-        """Settle the work one terminal wake row carried, if it is still owed.
-
-        Returns whether durable state shows that work can never be owed
-        again, so the row's settlement may be recorded. Returning at all means
-        nothing is owed now, which also ends any settlement control this
-        delivery holds: a retry of the fenced write returns at once when an
-        earlier one committed. Raises while the work may still wait on the
-        wake (#4001).
-
-        A row whose exclusive key a live wake also holds owes nothing: that
-        wake carries its work. Wakes admitted before keys existed can share
-        one input, and boot keys each of them, so the row is released to the
-        live wake, by a write that reads it again, and its work is never
-        touched. The release is already recorded, so this returns False.
-        """
-        if await self._release_to_live_wake(delivery):
-            getattr(self, "_source_settlement_control", {}).pop(delivery.delivery_id, None)
-            return False
-        released = await self._undelivered_wake_released(delivery)
-        if not released:
-            stopped, cause = self._undelivered_wake_disposition(delivery)
-            if await self._settle_undelivered_wake(
-                source=delivery.event.source,
-                target_agent=delivery.event.target_agent,
-                source_event_id=delivery.event.source_event_id,
-                stopped=stopped,
-                cause=cause,
-            ):
-                released = await self._undelivered_wake_released(delivery)
-        getattr(self, "_source_settlement_control", {}).pop(delivery.delivery_id, None)
-        return released
-
-    async def _release_to_live_wake(self, delivery: DurableDelivery) -> bool:
-        """Release a terminal row to the live wake holding its key (#4001).
-
-        A read first, so a row no live wake shares, as every row admitted
-        under exclusive keys is, costs no write. The write reads the live
-        wake again in its own statement and records nothing once it is gone.
-        """
-        scope = {
-            "agent_id": self._agent.did,
-            "consumer_id": delivery.consumer_id,
-            "delivery_id": delivery.delivery_id,
-        }
-        if not await self._durable_store.delivery_carried_by_live_wake(**scope):
-            return False
-        return await self._durable_store.record_delivery_settled(
-            **scope, carried_by_live_wake=True,
-        )
-
-    async def _record_undelivered_wake_settled(self, delivery: DurableDelivery) -> None:
-        """Take a row whose work can never be owed again out of the pass.
-
-        The record only saves later passes a read: a row left unrecorded is
-        read and recorded by the next one. An ordinary failure is therefore
-        logged; native control propagates to the row's settlement control,
-        and a retry records it again only if it is still unrecorded.
-        """
-        try:
-            await self._durable_store.record_delivery_settled(
-                agent_id=self._agent.did,
-                consumer_id=delivery.consumer_id,
-                delivery_id=delivery.delivery_id,
-            )
-        except Exception as error:
-            if (
-                is_tool_execution_terminal_error(error)
-                or execution_commit_outcome(error) is not None
-            ):
-                raise
-            logger.warning(
-                "Could not record an undelivered wake settled; the next "
-                "settlement pass reads it again: delivery=%s",
-                delivery.delivery_id,
-                exc_info=True,
-            )
-
-    async def _settle_retained_source_control(self, delivery: DurableDelivery) -> None:
-        """End a settlement's retained native control only once nothing is owed.
-
-        Retrying the fenced write is safe whatever the earlier write did: it
-        returns at once when durable state shows nothing owed. Any failure,
-        ordinary or not, keeps the control, so owner retirement refuses; an
-        ordinary failure proves nothing about the earlier write (#4001).
+        retained, for the next pass. Anything else (native control, an
+        unknown commit, a bare cancellation, any other ``BaseException``) is
+        this delivery's control: it is retained for this delivery and
+        returned, never raised, so it cannot widen into the dispatcher's
+        writer latch and refuse all durable admission. It is re-raised only
+        when the pass itself is being cancelled, after it is retained; a
+        cancellation that cannot be told apart is this delivery's.
         """
         try:
             await self._settle_undelivered_wake_row(delivery)
         except BaseException as error:
-            if (
-                is_tool_execution_terminal_error(error)
-                or execution_commit_outcome(error) is not None
+            if isinstance(error, Exception) and not _is_settlement_control(error):
+                logger.warning(
+                    "Could not settle the work an undelivered wake carried; it "
+                    "stays owed to the next settlement pass: delivery=%s",
+                    delivery.delivery_id,
+                    exc_info=True,
+                )
+                return None
+            retained = self._retain_source_settlement_control(delivery, error)
+            current = asyncio.current_task()
+            if isinstance(error, (KeyboardInterrupt, SystemExit)) or (
+                current is not None and current.cancelling() > 0
             ):
+                raise
+            return _DeliverySettlementControl(delivery.delivery_id, retained)
+        self._source_settlement_control.pop(delivery.delivery_id, None)
+        return None
+
+    async def _settle_undelivered_wake_row(
+        self, delivery: DurableDelivery,
+    ) -> TerminalDeliverySettlement:
+        """Settle the work one terminal wake row carried (#4001).
+
+        Builds the row's task transition, hands it to the store's one
+        settlement transaction, and projects a settlement this call ended.
+        Returning at all means the row's outcome is durable and known: a
+        recorded or earlier settlement, or a row that owes nothing now, so
+        any control an earlier attempt left for this delivery is resolved.
+        """
+        stopped, cause = self._undelivered_wake_disposition(delivery)
+        build = getattr(self._agent, "undelivered_cognition_wake_settlement", None)
+        if not callable(build):
+            # No one here can settle this work; it stays owed.
+            return TerminalDeliverySettlement(SETTLEMENT_OWED, False)
+        settlement = build(
+            source=delivery.event.source,
+            target_agent=delivery.event.target_agent,
+            source_event_id=delivery.event.source_event_id,
+            stopped=stopped,
+            cause=cause,
+        )
+        outcome = await self._durable_store.settle_terminal_delivery(
+            agent_id=self._agent.did,
+            consumer_id=delivery.consumer_id,
+            delivery_id=delivery.delivery_id,
+            task_transition=(
+                _release_foreign_work if settlement is None else settlement.apply
+            ),
+        )
+        if outcome.recorded and outcome.disposition == SETTLEMENT_ENDED:
+            try:
+                await settlement.project(outcome.detail)
+            except Exception as error:
+                if _is_settlement_control(error):
+                    raise
+                # The settlement committed; only its best-effort projections
+                # failed, and a retry would not repeat them.
+                logger.warning(
+                    "An undelivered wake's settlement committed but its task "
+                    "projections failed: delivery=%s",
+                    delivery.delivery_id,
+                    exc_info=True,
+                )
+        return outcome
+
+    async def _settle_retained_source_control(self, delivery: DurableDelivery) -> None:
+        """End a settlement's retained control only once its outcome is known.
+
+        The store's settlement reads the row's stored outcome first, so a
+        retry never decides twice. Any failure keeps the control, so owner
+        retirement refuses; an ordinary failure proves nothing about the
+        earlier attempt (#4001).
+        """
+        try:
+            await self._settle_undelivered_wake_row(delivery)
+        except BaseException as error:
+            if not isinstance(error, Exception) or _is_settlement_control(error):
                 self._retain_source_settlement_control(delivery, error)
             raise
+        self._source_settlement_control.pop(delivery.delivery_id, None)
 
     def _retain_source_settlement_control(
         self, delivery: DurableDelivery, error: BaseException,

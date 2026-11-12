@@ -53,9 +53,7 @@ from kestrel_sovereign._async_ownership import (
 )
 from kestrel_sovereign.a2a.extensions import (
     causation_metadata,
-    correlated_answer_metadata,
     parse_message_metadata,
-    parse_question_correlation,
 )
 from kestrel_sovereign.a2a.lifecycle import (
     STREAM_STOP_STATES,
@@ -89,9 +87,13 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
 from kestrel_sovereign.a2a.stores.unified.outbound_store import OutboundStore
 from kestrel_sovereign.a2a.stores.unified.question_store import NativeQuestionStore
 from kestrel_sovereign.a2a.stores.unified.task_store import (
+    UNDELIVERED_WAKE_ENDED,
     NativeTaskSnapshot,
     TaskCancellationSnapshot,
     TaskMutationAuthorizationError,
+    UndeliveredWakeTaskOutcome,
+    UndeliveredWakeTaskTransition,
+    terminal_status_message,
     without_reserved_cancellation_receipt,
 )
 from kestrel_sovereign.execution_custody import (
@@ -1851,20 +1853,7 @@ class TaskManager:
         # Update status
         baseline = Task.FromString(task.SerializeToString())
         if new_state in TERMINAL_STATES and message is not None:
-            reply_metadata = MessageToDict(message.metadata)
-            answer_metadata = correlated_answer_metadata(
-                MessageToDict(task.metadata), reply_metadata
-            )
-            if (
-                parse_question_correlation(answer_metadata) is not None
-                and message.role != Role.ROLE_AGENT
-            ):
-                raise InvalidParamsError(
-                    message="A question answer must have the agent role"
-                )
-            if answer_metadata != reply_metadata:
-                message = Message.FromString(message.SerializeToString())
-                message.metadata.update(answer_metadata)
+            message = terminal_status_message(task, message)
         task.status.CopyFrom(new_task_status(new_state, at=self.task_store.now_utc(), message=message))
 
         # Add message to history if provided
@@ -2257,24 +2246,10 @@ class TaskManager:
         try:
             receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}
             previous_state = receipt.get("status_before")
-            if self._on_task_cancelled is not None:
-                try:
-                    self._on_task_cancelled(task)
-                except Exception as exc:
-                    if is_execution_control_error(exc):
-                        raise
-                    logger.warning(
-                        "on_task_cancelled callback failed for %s: %s",
-                        task.id,
-                        exc,
-                        exc_info=True,
-                    )
-            await self._finish_status_projection(
+            await self._project_cancellation(
                 task,
-                old_state=str(previous_state or "unspecified"),
-                new_state=TaskState.TASK_STATE_CANCELED,
+                previous_state=previous_state,
                 agent_name=agent_name,
-                is_final=True,
                 reason=reason,
             )
         except BaseException as projection_failure:  # noqa: BLE001 - preserve the original commit receipt before re-raising
@@ -2295,6 +2270,69 @@ class TaskManager:
         if store_failure is not None:
             raise store_failure
         return task
+
+    async def _project_cancellation(
+        self,
+        task: Task,
+        *,
+        previous_state: str | None,
+        agent_name: str | None,
+        reason: str | None,
+    ) -> None:
+        """Every projection of a committed cancellation, once."""
+        if self._on_task_cancelled is not None:
+            try:
+                self._on_task_cancelled(task)
+            except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
+                logger.warning(
+                    "on_task_cancelled callback failed for %s: %s",
+                    task.id,
+                    exc,
+                    exc_info=True,
+                )
+        await self._finish_status_projection(
+            task,
+            old_state=str(previous_state or "unspecified"),
+            new_state=TaskState.TASK_STATE_CANCELED,
+            agent_name=agent_name,
+            is_final=True,
+            reason=reason,
+        )
+
+    async def project_undelivered_wake_settlement(
+        self,
+        transition: UndeliveredWakeTaskTransition,
+        outcome: UndeliveredWakeTaskOutcome,
+    ) -> None:
+        """Project a committed settlement of an undelivered wake's task (#4001).
+
+        The task write committed in the delivery store's transaction, beside
+        the wake row it settled (:meth:`TaskStore.apply_undelivered_wake_transition`).
+        These are the same best-effort projections a cancellation or failure
+        has: subscribers, session history, completion, observability.
+        """
+        if outcome.kind != UNDELIVERED_WAKE_ENDED or outcome.task is None:
+            raise ValueError("Only an ended settlement has projections")
+        task = outcome.task
+        agent_name = transition.recipient_agent_id
+        if transition.cancel:
+            await self._project_cancellation(
+                task,
+                previous_state=outcome.previous_state,
+                agent_name=agent_name,
+                reason=transition.reason,
+            )
+            return
+        await self._finish_status_projection(
+            task,
+            old_state=str(outcome.previous_state or "unspecified"),
+            new_state=TaskState.TASK_STATE_FAILED,
+            agent_name=agent_name,
+            is_final=True,
+        )
+        await self._log_task_failure(task, transition.reason, agent_name=agent_name)
 
     async def _finish_status_projection(
         self,
@@ -2357,25 +2395,31 @@ class TaskManager:
         # Failure telemetry is a projection of the recipient-authorized durable
         # transition.  Emitting it before update_status would let a rejected
         # caller write attacker-authored data tied to another task's session.
-        if agent_name:
-            try:
-                await self.observability_store.log_error(
-                    agent_name=self.did,
-                    error_type="task_failure",
-                    error_message=error,
-                    session_id=self.session_id_for_context(task.context_id),
-                    metadata={"task_id": task_id, "reported_by": agent_name},
-                )
-            except Exception as execution_error:
-                if is_execution_control_error(execution_error):
-                    raise
-                logger.warning(
-                    "Task %s failed durably but failure observability logging failed",
-                    task_id,
-                    exc_info=True,
-                )
-
+        await self._log_task_failure(task, error, agent_name=agent_name)
         return task
+
+    async def _log_task_failure(
+        self, task: Task, error: str, *, agent_name: str | None,
+    ) -> None:
+        """Record a committed task failure in observability, best-effort."""
+        if not agent_name:
+            return
+        try:
+            await self.observability_store.log_error(
+                agent_name=self.did,
+                error_type="task_failure",
+                error_message=error,
+                session_id=self.session_id_for_context(task.context_id),
+                metadata={"task_id": task.id, "reported_by": agent_name},
+            )
+        except Exception as execution_error:
+            if is_execution_control_error(execution_error):
+                raise
+            logger.warning(
+                "Task %s failed durably but failure observability logging failed",
+                task.id,
+                exc_info=True,
+            )
 
     async def complete_task(
         self,

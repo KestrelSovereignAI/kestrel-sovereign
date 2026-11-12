@@ -504,69 +504,118 @@ dispatcher refused the wake as a cycle.
 
 What is owed is a query, not process state. Settlement is owed exactly while a
 delivery of a settling consumer is failed or terminal-ACKable in durable
-storage, its settlement is not recorded on it (`settled_at`), and the work it
-carried still waits on it. The agent names its settling
-consumers (`undelivered_cognition_wake_consumers`: the `a2a.task_submitted`
-consumer) and judges one row (`undelivered_cognition_wake_owed`). The row's
-source-event identity records the exact task and input its wake carried, so the
-judgement reads only that task at that input revision: `submitted` or
-`working`, with both wake-eligibility flags set. Neither the task's age nor its
-live lifecycle since decides it: a `working` recovery wake still owes its input
-after another writer moves the task back to `submitted`. The pass reads those
-consumers' unsettled terminal rows one status at a time, in bounded delivery-ID
-keyset pages on a partial index of unsettled terminal rows
-(`idx_durable_signal_deliveries_unsettled_terminal`), so a page reads only the
-rows it returns. Once durable state shows a row's work can never be owed again
-(`undelivered_cognition_wake_released`: its task ended, moved past that input,
-or is gone), the pass records the row settled (`record_delivery_settled`) and
-never reads it again. Each pass therefore reads what may still be owed, not the
-terminal history. Not owed is not enough to record it, since a task that asked
-for input can be working on the same input again. The `settled_at` column and
-the index are additive DDL the store ensures at every startup.
+storage, its settlement is not recorded on it (`settled_at`), it is not held
+for an operator (below), and the work it carried still waits on it. The agent
+names its settling consumers (`undelivered_cognition_wake_consumers`: the
+`a2a.task_submitted` consumer) and judges one row
+(`undelivered_cognition_wake_owed`). The row's source-event identity records
+the exact task and input its wake carried, so the judgement reads only that
+task at that input revision: `submitted` or `working`, with both
+wake-eligibility flags set. Neither the task's age nor its live lifecycle since
+decides it: a `working` recovery wake still owes its input after another writer
+moves the task back to `submitted`. The pass reads those consumers' unsettled
+terminal rows one status at a time, in bounded delivery-ID keyset pages on a
+partial index of exactly those rows
+(`idx_durable_signal_deliveries_settlement_scan`), so a page reads only the
+rows it returns. A row leaves the pass once its settlement is recorded, so each
+pass reads what may still be owed, not the terminal history.
+
+Each row is settled by one store transaction,
+`DurableSignalStore.settle_terminal_delivery`. It takes the source's handoff
+lock, then the delivery row, then the task row, in the order an ACK takes
+them, and the row's settlement, its key and the task change commit together or
+not at all:
+
+1. A row whose settlement is already recorded returns its stored
+   `settlement_disposition` and writes nothing. A retry after a lost ACK or
+   an unknown commit never decides again.
+2. A row that is not an unsettled terminal row, is held for an operator, or
+   holds no key yet writes nothing.
+3. The agent's transition (`undelivered_cognition_wake_settlement`) runs on
+   that same transaction, and opens none of its own
+   (`TaskStore.apply_undelivered_wake_transition`). A task still `submitted`
+   or `working` at the wake's input, with wakes enabled, is ended: canceled
+   when a Stop's row (`stop_acknowledged`) consumed the wake, failed otherwise,
+   naming a code its sender may read (the reconciliation failure, or the
+   status that refused the wake, such as `dropped_cycle`). That is `ended`. A
+   task that is gone, terminal, at another input, or never woken for this one
+   is `released`. One that holds the input in another live state, such as
+   input-required, is `owed`: nothing is written, and it stays for a later pass.
+4. `ended` and `released` are recorded on the row, in the same transaction.
+
+The transition names the wake by its durable identity (`source`,
+`target_agent`, `source_event_id`), never its payload, which a privacy mode may
+elide. Because the task row is locked and its state, input revision and flags
+are checked again in the write itself, a newer input the creator added stays
+live for its own wake, and a worker that asked for input wins. Once the
+transaction commits, the task's projections (subscribers, session history,
+completion, observability) run as a cancellation's or failure's do
+(`TaskManager.project_undelivered_wake_settlement`). A stale owner whose
+terminal CAS lost leaves no terminal row, so it never touches the task its
+successor runs. A failure anywhere in the transaction rolls all of it back,
+and the row stays owed.
 
 Admission, not boot, decides whether a wake may be minted for an input. For
-one consumer, at most one wake of an exact task input may be unacknowledged,
-whatever identity it was admitted under: the original submission wake, or a
+one consumer, at most one row may hold an exact task input's key, whatever
+identity its wake was admitted under: the original submission wake, or a
 recovery wake boot minted at a later lifecycle revision. Every submission wake
 carries its input as its delivery's exclusive key (`exclusive_key`, named by
-the agent's `durable_wake_exclusive_key`). `persist_signal` checks it in the
-transaction that admits the wake, under the source handoff lock every
-admission of that source takes. An unacknowledged delivery holding the key
+the agent's `durable_wake_exclusive_key`). A partial unique index
+(`idx_durable_signal_deliveries_exclusive_holder`, on keyed rows that are not
+acknowledged) makes a second holder unrepresentable, and `persist_signal`
+checks the key in the transaction that admits the wake, under the source
+handoff lock every admission of that source takes. A row holding the key
 refuses the wake: nothing is committed, and the producer sees `DUPLICATE`
 (`DurableEventPersistence.exclusive_holder`). A live holder resumes the work on
 its own retry, and a second wake would run it twice. A terminal holder keeps
-its key for good: the settlement pass ends the work it carried, and once that
-is settled nothing can make it owed again. Only a wake that ran (acknowledged)
-releases its key, so boot may then mint a recovery wake for a WORKING task. (A
-terminal row admitted before keys existed may also hand its key to a live wake
-that holds it too; see below.) Rows only leave the holding set, and a key
-never leaves it while a live wake holds it, so a check cannot go stale in the
-unsafe direction. That is why no read boot makes before it mints decides anything.
+its key for as long as it is retained, settled or not: until it is settled its
+work belongs to the settlement pass, and once it is settled that work can never
+be owed again, so no wake admitted after the settlement commits can carry it.
+Only a wake that ran (acknowledged) releases its key, so boot may then mint a
+recovery wake for a WORKING task. Schema bootstrap creates the index and
+refuses to start (`DurableExclusiveKeyIndexError`) if it cannot.
 
-A ledger read was the decision before, and each review found it stale one way
-more: it checked only the original identity; an earlier recovery wake failed
-after the read; a peer admitted the original after the read. Boot still reads
-every unacknowledged submission wake (`unacknowledged_durable_deliveries`), but
-only to give a wake admitted before exclusive keys existed its key
-(`assign_durable_wake_exclusive_keys`). It does so before reading candidates,
-running the settlement pass or minting anything. The column and its index
-(`idx_durable_signal_deliveries_exclusive_key`) are additive DDL the store
-ensures at every startup.
+Wakes admitted before exclusive keys existed hold none, so boot first keys
+them (`assign_durable_wake_exclusive_keys`), before it runs the settlement
+pass, reads candidates or mints anything. The store
+(`DurableSignalStore.assign_exclusive_keys`) reads every unacknowledged,
+unsettled row of the consumer and source again, in one transaction under that
+source's handoff lock, groups them by the key each derives, and resolves each
+group; nothing boot read earlier decides anything:
 
-Wakes admitted before exclusive keys existed may share one input: earlier
-boots minted a recovery wake beside one that was still live, and a retry of
-either could then fail. Each receives the input's key, so for those inputs
-admission's rule holds only from the upgrade on. The settlement pass therefore
-reads, for each terminal row, whether a live delivery of its consumer holds
-the same key (`delivery_carried_by_live_wake`). That wake carries the work: it
-runs it, or ends undelivered and owes it itself. The terminal row is then
-released to it without its work being read or touched
-(`record_delivery_settled(carried_by_live_wake=True)`), in a write that reads
-the live wake again and records nothing once it is gone. The row also gives up
-its key, so once the live wake has run, nothing holds the input, and boot may
-mint a recovery wake for a WORKING task as it does for any input whose wake
-ran. A row admitted under exclusive keys never shares its key with a live
-wake, so for it the check is one read that finds nothing.
+- a terminal row admitted at or before an acknowledgement (`acknowledged_at`)
+  of another wake of the same input is recorded `carried` first. Under
+  exclusive keys no wake can be admitted beside an unacknowledged one, so a
+  legacy wake acknowledged after the row existed ran the work the row carried.
+  The acknowledged rows are read in the same transaction and grouped by the
+  key derived from their own identities, since they hold none. A row admitted
+  after the last acknowledgement is the ordinary failed recovery wake, and the
+  rules below decide it;
+- one row is keyed;
+- one live wake beside terminal ones is keyed, and the terminal rows are
+  recorded `carried`: the live wake carries the work, so they owe nothing and
+  no task is touched; that wake ends the work by running, or owes it itself;
+- a group whose work a settled row already ended or released keeps that row's
+  key, and its other terminal rows are recorded `released`;
+- any other shape, such as two failed wakes for one input, is held: no row
+  holds the key, each holds it as a conflict (`exclusive_conflict_key`,
+  `settlement_disposition = 'held'`), admission refuses new wakes of that
+  input, and no automatic path settles or keys them. No claim, exact-event
+  claim, initial transfer or activation takes a held row
+  (`_unheld_predicate`), and neither the drainer's window nor the due-consumer
+  hint lists one, so a held live wake neither runs nor re-arms its drainer.
+  Boot logs each group and `held_cognition_wake_groups` counts them for an
+  operator to reconcile.
+
+A row whose identity names no work is recorded `released`. Before the first
+boot keys them, the pass leaves unkeyed rows alone (`unkeyed`), since whether a
+live wake carries their work is not yet known. The columns, the scan index and
+the holder index are additive DDL the store ensures at every startup; a
+database an earlier build of this branch keyed has its duplicate holders
+resolved by the same rule before the holder index is created. An ACK also
+refuses (`_require_sole_exclusive_holder_locked`) if another unsettled
+terminal row shares its key, which the index and the backfill make
+unreachable.
 
 A terminal row is that debt's only record, so retention keeps it. The durable
 retention sweep (`purge_expired_durable_deliveries`) holds every failed or
@@ -591,30 +640,32 @@ prompt heartbeat once their row stands. A row of any other consumer asks for
 nothing. A stale owner whose CAS lost therefore leaves no terminal row, and
 never touches the task its successor now runs.
 
-No failure type decides a retry. A storage error, a lifecycle compare-and-set
-lost to a concurrent task writer, a task that cannot be read, or anything else
-leaves the row owed; the pass goes on to the next row, boot is not refused, and
-the next pass finds it again. A row stops being owed only when durable state
-shows the task settled or its input superseded. A settlement whose commit outcome is
-unknown, or whose execution authority is gone, is native control: the pass
-retains it as that delivery's settlement control and stops, and boot refuses.
+No failure type decides a retry. A storage error, a task that cannot be read,
+or anything else ordinary leaves the row owed; the pass goes on to the next
+row, boot is not refused, and the next pass finds it again. A row stops being
+owed only when its settlement transaction commits. Anything else a row's
+settlement meets (a commit whose outcome is unknown, lost execution authority,
+a bare cancellation, any other `BaseException`) is that delivery's control,
+and `_settle_owed_wake_row` is its one boundary: it is retained for that
+delivery and returned as `_DeliverySettlementControl`, never raised, and the
+pass stops. It is re-raised only when the pass itself is being cancelled, after
+it is retained. It never reaches the dispatcher's writer latch
+(`_outcome_log_control_error`), which refuses all durable admission: the
+latch also refuses, and logs, any error carrying control a delivery retains.
 It is kept in its own ledger, apart from the debt of the delivery's own
 terminal write, so a late terminalizer or retained cleanup of that row clears
-only the row's debt and never the settlement's. The heartbeat logs it. While it
-stands owner retirement refuses and the host is not ready: `/health` fails and
-`/health/detailed` names the deliveries in a `durable_cognition_control` check
+only the row's debt. Boot refuses while it stands, and the heartbeat logs it.
+While it stands owner retirement refuses and the host is not ready: `/health`
+fails and `/health/detailed` names the deliveries in a
+`durable_cognition_control` check
 (`SignalDispatcher.unresolved_cognition_control`). It guards no lease, so the
-heartbeat keeps its ordinary maintenance. The record that takes a settled row
-out of the pass is treated the same way: its unknown commit is kept as that
-row's settlement control, never as control that refuses all durable
-admission. Each pass, like the retirement drain, retries only the fenced
-write, which returns at once when the earlier write committed. Each pass retries it whether
-or not its row is still unsettled: a peer that settled the same work records
-the row settled, and retention may then remove it, which takes the row out of
-the pass but leaves this process's control standing. The retry reads the work's
-own state, so it returns once nothing is owed. The control ends when a retry
-returns; any failure keeps it, so shutdown never reports a deferred settlement
-as done. The row's CAS is never written again.
+heartbeat keeps its ordinary maintenance. Each pass, like the retirement drain,
+settles the control's row again whether or not the scan still returns it: a
+peer that settled the same row, or retention that then removed it, takes the
+row out of the scan but not this process's control. Since settlement is one
+transaction, the retry reads the row's stored outcome, and returns once it is
+known; any failure keeps the control, so shutdown never reports a deferred
+settlement as done. The row's CAS is never written again.
 
 An owner that is not durably retired is renewed on every heartbeat tick, and
 nothing else decides that. Whatever keeps it unretired does not matter: a
@@ -643,19 +694,6 @@ admission and in the owner's own execution scope, so its failures, including
 retained control, stay its own. While debt that guards a lease stands
 (`_runtime_owner_cleanup_required`), or once shutdown has closed admission, a
 heartbeat only renews and admits no cognition.
-
-The write itself is the agent's `settle_undelivered_cognition_wake`, named by
-the wake's durable identity (`source`, `target_agent`, `source_event_id`) and
-never its payload, which a privacy mode may elide. A Stop's row
-(`stop_acknowledged`) cancels the task, as the Stop asked; any other row fails
-it, naming a code its sender may read: the reconciliation failure, or the
-status that refused the wake (`dropped_cycle`, `dropped_validation`), which a
-refused wake's row records. The write is bound to the wake's own
-admitted input, so it is fenced as that wake's turn is: a newer input the
-creator added meanwhile stays live. The identity's kind,
-`UNDELIVERED_WAKE_SETTLEMENT_KIND`, also fences the write to a task still
-`submitted` or `working`, in the same statement: a worker that asks the creator
-for input after the settler read the task wins.
 
 A wake refused by validation or cycle detection before it is persisted would
 leave no row for the query to find, and its producer stops on TERMINAL. So

@@ -3515,6 +3515,7 @@ class _ReconcilingA2AAgent(_Agent):
     # Admission, not boot's read, refuses a second wake of one input (#4001).
     durable_wake_exclusive_key = _Mixin.durable_wake_exclusive_key
     undelivered_cognition_wake_consumers = _Mixin.undelivered_cognition_wake_consumers
+    undelivered_cognition_wake_sources = _Mixin.undelivered_cognition_wake_sources
 
     def __init__(self, did: str, task, lifecycle_revision: int):
         from kestrel_sovereign.signals.sources.a2a import (

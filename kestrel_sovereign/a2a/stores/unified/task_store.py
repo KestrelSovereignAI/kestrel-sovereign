@@ -12,6 +12,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from google.protobuf.json_format import MessageToDict, MessageToJson, ParseDict
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -21,6 +22,7 @@ from kestrel_sdk.native_a2a.types import (
     Artifact,
     ListTasksRequest,
     ListTasksResponse,
+    Message,
     Role,
     SendMessageRequest,
     Task,
@@ -43,6 +45,10 @@ from kestrel_sdk.native_a2a.utils.task import (
     validate_page_size,
 )
 
+from kestrel_sovereign.a2a.extensions import (
+    correlated_answer_metadata,
+    parse_question_correlation,
+)
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, new_task_status
 from kestrel_sovereign.a2a.lifecycle import task_state_from_label as _native_state
 from kestrel_sovereign.a2a.lifecycle import task_state_label as _stored_state
@@ -84,11 +90,15 @@ _TASK_COLUMNS = (
 
 _TASK_SCOPE = "recipient_agent_id = ? AND tenant = ?"
 
-# The kind of a submission-wake identity that settles a wake which ended
-# without running (#4001). Bound as the current signal, it fences a write to
-# a task still waiting on that wake: the admitted input AND a live state that
-# only the wake would advance. A task that asked for input meanwhile is left.
-UNDELIVERED_WAKE_SETTLEMENT_KIND = "undelivered_wake_settlement"
+# What settling one undelivered submission wake did to its task (#4001).
+# ``ended``: the task was still waiting on that wake's input, and was canceled
+# or failed. ``released``: the task can never wait on that input again (gone,
+# terminal, past that input, or never woken for it). ``owed``: it still holds
+# that input but is in a live state the wake would not advance, such as
+# input-required, so nothing is written now.
+UNDELIVERED_WAKE_ENDED = "ended"
+UNDELIVERED_WAKE_RELEASED = "released"
+UNDELIVERED_WAKE_OWED = "owed"
 _SNAPSHOT_COLUMNS = (
     _TASK_COLUMNS + ", (SELECT request_json FROM a2a_task_inputs AS native_input "
     "WHERE native_input.task_id = a2a_tasks.id AND native_input.input_revision = a2a_tasks.input_revision), "
@@ -128,6 +138,64 @@ class TaskCancellationSnapshot:
     input_revision: int = 0
     cognition_wake_eligible: bool = True
     input_wake_eligible: bool = True
+
+
+@dataclass(frozen=True)
+class UndeliveredWakeTaskTransition:
+    """The settlement of a task whose submission wake ended undelivered (#4001).
+
+    It names the exact input the wake carried. ``cancel`` is set for a wake a
+    Stop consumed; any other wake fails the task with ``failure`` as the
+    reason its sender reads.
+    """
+
+    task_id: str
+    input_revision: int
+    recipient_agent_id: str
+    cancel: bool
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task_id, str) or not self.task_id:
+            raise ValueError("Settlement requires a concrete task ID")
+        if type(self.input_revision) is not int or self.input_revision < 0:
+            raise ValueError("Settlement requires the wake's admitted input revision")
+        if not isinstance(self.recipient_agent_id, str) or not self.recipient_agent_id:
+            raise ValueError("Settlement requires the task's recipient identity")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("Settlement requires a reason its sender can read")
+
+
+@dataclass(frozen=True)
+class UndeliveredWakeTaskOutcome:
+    """What :meth:`TaskStore.apply_undelivered_wake_transition` did (#4001).
+
+    ``task`` and ``previous_state`` are set when it ended the task: the
+    committed task and the stored state it ended from.
+    """
+
+    kind: str
+    task: Task | None = None
+    previous_state: str | None = None
+
+
+def terminal_status_message(task: Task, message: Message) -> Message:
+    """The reply that ends ``task``, carrying its question correlation.
+
+    A question's answer must name the question it answers and come from the
+    agent, whatever ended the task.
+    """
+    reply_metadata = MessageToDict(message.metadata)
+    answer_metadata = correlated_answer_metadata(MessageToDict(task.metadata), reply_metadata)
+    if (
+        parse_question_correlation(answer_metadata) is not None
+        and message.role != Role.ROLE_AGENT
+    ):
+        raise InvalidParamsError(message="A question answer must have the agent role")
+    if answer_metadata != reply_metadata:
+        message = Message.FromString(message.SerializeToString())
+        message.metadata.update(answer_metadata)
+    return message
 
 
 @dataclass(frozen=True)
@@ -710,14 +778,10 @@ class TaskStore(UnifiedStoreBase):
         revision = payload.get("input_revision")
         if type(revision) is not int or revision < 0:
             raise ValueError("Task mutation requires its admitted input revision")
-        predicate = (
-            " AND input_revision = ? AND cognition_wake_eligible = 1 AND input_wake_eligible = 1"
+        return (
+            " AND input_revision = ? AND cognition_wake_eligible = 1 AND input_wake_eligible = 1",
+            (revision,),
         )
-        if signal.kind == UNDELIVERED_WAKE_SETTLEMENT_KIND:
-            # Checked in the same statement as the write: a worker that moves
-            # the task to input-required after the settler read it wins.
-            predicate += " AND status IN ('submitted', 'working')"
-        return predicate, (revision,)
 
     async def save_recipient_lifecycle(
         self,
@@ -848,11 +912,40 @@ class TaskStore(UnifiedStoreBase):
                     # transaction. Keep a protocol conflict distinct from SQL.
                     conflict = error
                 else:
-                    message_json, artifacts_json, history_json, metadata_json = (
-                        _task_payload(merged)
+                    committed = await self._write_lifecycle_locked(
+                        row,
+                        merged,
+                        state=task.status.state,
+                        status_timestamp=(timestamp_seconds, timestamp_nanos),
+                        terminal_operation_id=terminal_operation_id,
+                        predicate=predicate,
+                        authority_values=authority_values,
                     )
-                    rows_affected = await self._backend.execute(
-                        f"""
+        if conflict is not None:
+            raise conflict
+        return committed
+
+    async def _write_lifecycle_locked(
+        self,
+        row: tuple,
+        merged: Task,
+        *,
+        state: TaskState,
+        status_timestamp: tuple[int | None, int | None],
+        terminal_operation_id: str | None,
+        predicate: str,
+        authority_values: tuple,
+    ) -> Task | None:
+        """Write one lifecycle transition of a row the caller has locked.
+
+        ``predicate`` repeats the caller's authority in the write itself.
+        Returns the committed task, or ``None`` when the predicate matched
+        nothing.
+        """
+        timestamp_seconds, timestamp_nanos = status_timestamp
+        message_json, artifacts_json, history_json, metadata_json = _task_payload(merged)
+        rows_affected = await self._backend.execute(
+            f"""
             UPDATE a2a_tasks SET
                 status = ?,
                 status_timestamp_seconds = ?,
@@ -867,32 +960,118 @@ class TaskStore(UnifiedStoreBase):
                 updated_at = {self.now_sql()}
             WHERE {predicate}
             """,
-                        (
-                            _stored_state(task.status.state),
-                            timestamp_seconds,
-                            timestamp_nanos,
-                            message_json,
-                            artifacts_json,
-                            history_json,
-                            metadata_json,
-                            terminal_operation_id,
-                            *authority_values,
-                        ),
-                    )
-                    if rows_affected == 1:
-                        committed_row = list(row)
-                        committed_row[4:9] = [
-                            _stored_state(task.status.state),
-                            message_json,
-                            artifacts_json,
-                            history_json,
-                            metadata_json,
-                        ]
-                        committed_row[20:22] = [timestamp_seconds, timestamp_nanos]
-                        committed = self._row_to_task(tuple(committed_row))
-        if conflict is not None:
-            raise conflict
-        return committed
+            (
+                _stored_state(state),
+                timestamp_seconds,
+                timestamp_nanos,
+                message_json,
+                artifacts_json,
+                history_json,
+                metadata_json,
+                terminal_operation_id,
+                *authority_values,
+            ),
+        )
+        if rows_affected != 1:
+            return None
+        committed_row = list(row)
+        committed_row[4:9] = [
+            _stored_state(state),
+            message_json,
+            artifacts_json,
+            history_json,
+            metadata_json,
+        ]
+        committed_row[20:22] = [timestamp_seconds, timestamp_nanos]
+        return self._row_to_task(tuple(committed_row))
+
+    async def apply_undelivered_wake_transition(
+        self, transition: UndeliveredWakeTaskTransition,
+    ) -> UndeliveredWakeTaskOutcome:
+        """Settle a task whose submission wake ended undelivered (#4001).
+
+        Runs on its caller's transaction and opens none of its own: the
+        durable delivery store calls it inside the transaction that records
+        the wake row settled, so the task and the row commit together. The
+        task row is locked, then classified. A task still ``submitted`` or
+        ``working`` at the wake's input, with wakes enabled, is ended:
+        canceled when a Stop consumed the wake, failed otherwise. A task that
+        is gone, terminal, at another input, or never woken for this one is
+        released. One that holds the input in another live state is owed and
+        left untouched. The write repeats its authority in its own predicate.
+        """
+        if not isinstance(transition, UndeliveredWakeTaskTransition):
+            raise TypeError("Settlement requires an UndeliveredWakeTaskTransition")
+        if not self._backend.owns_open_transaction:
+            raise RuntimeError(
+                "An undelivered wake's task settlement runs on its caller's "
+                "transaction, beside the delivery it settles"
+            )
+        scope = (transition.task_id, *self._scope_parameters, transition.recipient_agent_id)
+        lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+        row = await self._backend.fetch_one(
+            f"SELECT {_TASK_COLUMNS} FROM a2a_tasks "
+            f"WHERE id = ? AND {_TASK_SCOPE} AND recipient_agent_id = ?{lock_suffix}",
+            scope,
+        )
+        if row is None:
+            return UndeliveredWakeTaskOutcome(UNDELIVERED_WAKE_RELEASED)
+        state = str(row[4])
+        if (
+            _native_state(state) in TERMINAL_STATES
+            or row[23] != transition.input_revision
+            or not row[24]
+            or not row[25]
+        ):
+            return UndeliveredWakeTaskOutcome(UNDELIVERED_WAKE_RELEASED)
+        if state not in ("submitted", "working"):
+            return UndeliveredWakeTaskOutcome(UNDELIVERED_WAKE_OWED)
+        predicate = (
+            f"id = ? AND {_TASK_SCOPE} AND recipient_agent_id = ? "
+            "AND status IN ('submitted', 'working') AND input_revision = ? "
+            "AND cognition_wake_eligible = 1 AND input_wake_eligible = 1"
+        )
+        authority_values = (*scope, transition.input_revision)
+        current = self._row_to_task(row)
+        if transition.cancel:
+            timestamp = Timestamp()
+            timestamp.FromDatetime(datetime.now(UTC))
+            committed = await self._write_cancellation_locked(
+                row,
+                current,
+                actor_agent_id=transition.recipient_agent_id,
+                reason=transition.reason,
+                operation_id=uuid4().hex,
+                timestamp=timestamp,
+                predicate=predicate,
+                authority_values=authority_values,
+            )
+        else:
+            failed = Task.FromString(current.SerializeToString())
+            message = terminal_status_message(
+                failed, new_text_message(f"Task failed: {transition.reason}")
+            )
+            failed.status.CopyFrom(
+                new_task_status(TaskState.TASK_STATE_FAILED, at=self.now_utc(), message=message)
+            )
+            failed.history.append(message)
+            committed = await self._write_lifecycle_locked(
+                row,
+                failed,
+                state=TaskState.TASK_STATE_FAILED,
+                status_timestamp=_status_timestamp(failed.status),
+                terminal_operation_id=None,
+                predicate=predicate,
+                authority_values=authority_values,
+            )
+        if committed is None:
+            raise RuntimeError(
+                "A locked task changed under its settlement; the settlement is "
+                "rolled back and the wake's work stays owed"
+            )
+        return UndeliveredWakeTaskOutcome(
+            UNDELIVERED_WAKE_ENDED, task=committed, previous_state=state,
+        )
 
     async def create(
         self,
@@ -1538,76 +1717,105 @@ class TaskStore(UnifiedStoreBase):
             except TaskOutcomeConflictError as error:
                 conflict = error
             else:
-                message = new_text_message(
-                    f"Task canceled by {actor_agent_id}: {reason}"
-                    if reason
-                    else f"Task canceled by {actor_agent_id}",
-                    task_id=task_id,
-                    context_id=merged.context_id,
+                committed = await self._write_cancellation_locked(
+                    current,
+                    merged,
+                    actor_agent_id=actor_agent_id,
+                    reason=reason,
+                    operation_id=operation_id,
+                    timestamp=timestamp,
+                    predicate=live_authority_predicate,
+                    authority_values=authority_values,
                 )
-                merged.status.CopyFrom(
-                    new_task_status(
-                        TaskState.TASK_STATE_CANCELED, at=timestamp, message=message,
-                    )
-                )
-                merged.history.append(message)
-                message_json, artifacts_json, history_json, metadata_json = (
-                    _task_payload(merged)
-                )
-                rows_affected = await self._backend.execute(
-                    f"""
-                    UPDATE a2a_tasks
-                    SET cancel_previous_status = status,
-                        status = 'canceled',
-                        status_timestamp_seconds = ?,
-                        status_timestamp_nanos = ?,
-                        message = ?,
-                        artifacts = ?,
-                        history = ?,
-                        metadata = ?,
-                        canceled_by = ?,
-                        cancel_reason = ?,
-                        cancel_operation_id = ?,
-                        lifecycle_revision = lifecycle_revision + 1,
-                        lifecycle_updated_at = {self.now_sql()},
-                        updated_at = {self.now_sql()}
-                    WHERE {live_authority_predicate}
-                    """,
-                    (
-                        timestamp.seconds,
-                        timestamp.nanos,
-                        message_json,
-                        artifacts_json,
-                        history_json,
-                        metadata_json,
-                        actor_agent_id,
-                        reason,
-                        operation_id,
-                        *authority_values,
-                    ),
-                )
-                if rows_affected != 1:
-                    return None
-                # Materialize the exact committed payload from the locked row and
-                # the values written above.  A second read after commit can fail or
-                # be canceled after authority has already changed, which would
-                # wrongly roll back local intent and abandon every projection.
-                canceled_row = list(current)
-                canceled_row[4] = _stored_state(TaskState.TASK_STATE_CANCELED)
-                canceled_row[5] = message_json
-                canceled_row[6] = artifacts_json
-                canceled_row[7] = history_json
-                canceled_row[8] = metadata_json
-                canceled_row[13] = actor_agent_id
-                canceled_row[14] = reason
-                canceled_row[15] = current[4]
-                canceled_row[16] = operation_id
-                canceled_row[20] = timestamp.seconds
-                canceled_row[21] = timestamp.nanos
-                committed = self._row_to_task(tuple(canceled_row))
         if conflict is not None:
             raise conflict
         return committed
+
+    async def _write_cancellation_locked(
+        self,
+        current: tuple,
+        merged: Task,
+        *,
+        actor_agent_id: str,
+        reason: str | None,
+        operation_id: str | None,
+        timestamp: Timestamp,
+        predicate: str,
+        authority_values: tuple,
+    ) -> Task | None:
+        """Cancel one task row the caller has locked, by ``actor_agent_id``.
+
+        ``predicate`` repeats the caller's authority in the write itself.
+        Returns the committed task, or ``None`` when the predicate matched
+        nothing.
+        """
+        message = new_text_message(
+            f"Task canceled by {actor_agent_id}: {reason}"
+            if reason
+            else f"Task canceled by {actor_agent_id}",
+            task_id=merged.id,
+            context_id=merged.context_id,
+        )
+        merged.status.CopyFrom(
+            new_task_status(
+                TaskState.TASK_STATE_CANCELED, at=timestamp, message=message,
+            )
+        )
+        merged.history.append(message)
+        message_json, artifacts_json, history_json, metadata_json = (
+            _task_payload(merged)
+        )
+        rows_affected = await self._backend.execute(
+            f"""
+            UPDATE a2a_tasks
+            SET cancel_previous_status = status,
+                status = 'canceled',
+                status_timestamp_seconds = ?,
+                status_timestamp_nanos = ?,
+                message = ?,
+                artifacts = ?,
+                history = ?,
+                metadata = ?,
+                canceled_by = ?,
+                cancel_reason = ?,
+                cancel_operation_id = ?,
+                lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
+                updated_at = {self.now_sql()}
+            WHERE {predicate}
+            """,
+            (
+                timestamp.seconds,
+                timestamp.nanos,
+                message_json,
+                artifacts_json,
+                history_json,
+                metadata_json,
+                actor_agent_id,
+                reason,
+                operation_id,
+                *authority_values,
+            ),
+        )
+        if rows_affected != 1:
+            return None
+        # Materialize the exact committed payload from the locked row and
+        # the values written above. A second read after commit can fail or
+        # be canceled after authority has already changed, which would
+        # wrongly roll back local intent and abandon every projection.
+        canceled_row = list(current)
+        canceled_row[4] = _stored_state(TaskState.TASK_STATE_CANCELED)
+        canceled_row[5] = message_json
+        canceled_row[6] = artifacts_json
+        canceled_row[7] = history_json
+        canceled_row[8] = metadata_json
+        canceled_row[13] = actor_agent_id
+        canceled_row[14] = reason
+        canceled_row[15] = current[4]
+        canceled_row[16] = operation_id
+        canceled_row[20] = timestamp.seconds
+        canceled_row[21] = timestamp.nanos
+        return self._row_to_task(tuple(canceled_row))
 
     async def add_artifact(
         self,

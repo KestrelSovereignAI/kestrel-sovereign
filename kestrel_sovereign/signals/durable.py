@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from typing import (
     Any,
     AsyncContextManager,
     AsyncIterator,
+    Awaitable,
     Callable,
     Iterable,
     Mapping,
@@ -40,6 +42,8 @@ from kestrel_sdk.signals import Signal
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.signals.store import _json_default, _serialize_chain
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
+
+logger = logging.getLogger(__name__)
 
 PENDING = "pending"
 INITIAL_RESERVED = "initial_reserved"
@@ -56,14 +60,38 @@ _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED, TERMINAL_ACKABLE})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
 
 
-def _unsettled_terminal_predicate(alias: str = "") -> str:
-    """The rows a settlement pass reads: terminal, unacknowledged, unsettled.
+_LIVE_STATUSES = (PENDING, INITIAL_RESERVED, LEASED, RETRY)
 
-    A failed or terminal-ACKable row stays here until the settlement of the
-    work its wake carried is recorded on it (``settled_at``), so the pass
-    reads only what may still be owed (#4001). The index, its page query and
-    the retention hold share this predicate; SQLite uses a partial index only
-    when the query repeats the index's own terms.
+# How the work a terminal wake row carried was settled (#4001), recorded on
+# the row as ``settlement_disposition``. ``ended``: the settlement ended that
+# work. ``released``: durable state showed the work could never be owed again.
+# ``carried``: a live wake for the same work carries it, or a legacy wake for
+# it was acknowledged after this row was admitted. ``held``: legacy rows
+# that share one piece of work in a shape no rule resolves; an operator
+# reconciles them, and no automatic path settles or keys them.
+SETTLEMENT_ENDED = "ended"
+SETTLEMENT_RELEASED = "released"
+SETTLEMENT_CARRIED = "carried"
+SETTLEMENT_HELD = "held"
+# Outcomes of :meth:`DurableSignalStore.settle_terminal_delivery` that record
+# nothing. ``owed``: the work still waits on the wake but cannot be settled
+# now. ``not_owed``: the row is not an unsettled terminal row (it is live,
+# acknowledged or gone). ``unkeyed``: the row predates exclusive keys and has
+# not been keyed yet, so whether a live wake carries its work is unknown.
+SETTLEMENT_OWED = "owed"
+SETTLEMENT_NOT_OWED = "not_owed"
+SETTLEMENT_UNKEYED = "unkeyed"
+_RECORDED_SETTLEMENTS = frozenset(
+    {SETTLEMENT_ENDED, SETTLEMENT_RELEASED, SETTLEMENT_CARRIED}
+)
+
+
+def _unsettled_terminal_predicate(alias: str = "") -> str:
+    """Terminal, unacknowledged rows whose settlement is not recorded.
+
+    A failed or terminal-ACKable row of a settling consumer can be the only
+    record that the work its wake carried is still owed a settlement, so the
+    retention sweep keeps every such row until ``settled_at`` is set (#4001).
     """
     return (
         f"{alias}status IN ('{FAILED}', '{TERMINAL_ACKABLE}') "
@@ -71,25 +99,50 @@ def _unsettled_terminal_predicate(alias: str = "") -> str:
     )
 
 
-def _carried_by_live_wake_predicate(table: str) -> str:
-    """A row whose exclusive key a live delivery of its consumer also holds.
+def _settlement_scan_predicate(alias: str = "") -> str:
+    """The rows a settlement pass reads: unsettled terminal rows not held.
 
-    Admission keeps one unacknowledged wake per key, but wakes admitted
-    before keys existed are keyed at boot from their own identities, and an
-    earlier release could leave a failed wake and a live one for the same
-    input. The live one carries that work, so the terminal row owes nothing
-    (#4001). ``table`` names the outer row; the live row is read in the same
-    statement.
+    A row leaves once its settlement is recorded, and a held row is operator
+    work, so the pass reads only what it may settle (#4001). The index and its
+    page query share this predicate; SQLite uses a partial index only when
+    the query repeats the index's own terms.
     """
     return (
-        f"{table}.exclusive_key IS NOT NULL AND EXISTS ("
-        f"SELECT 1 FROM {table} AS live "
-        f"WHERE live.agent_id = {table}.agent_id "
-        f"AND live.consumer_id = {table}.consumer_id "
-        f"AND live.exclusive_key = {table}.exclusive_key "
-        f"AND live.delivery_id <> {table}.delivery_id "
-        f"AND live.status IN ('{PENDING}', '{INITIAL_RESERVED}', '{LEASED}', '{RETRY}'))"
+        f"{_unsettled_terminal_predicate(alias)} "
+        f"AND {alias}exclusive_conflict_key IS NULL"
     )
+
+
+def _exclusive_holding_predicate(alias: str = "") -> str:
+    """A row holding its exclusive key: keyed and not acknowledged (#4001).
+
+    The partial unique index enforces at most one such row per consumer and
+    key, and admission refuses a wake while one exists. A live row holds its
+    key until it is acknowledged. A terminal one holds it for as long as it
+    is retained, settled or not: once its work is settled nothing can make
+    that work owed again, so no later wake may carry it either. Only a row
+    recorded ``carried`` gives its key to the live wake that carries its work.
+    """
+    return f"{alias}exclusive_key IS NOT NULL AND {alias}status <> '{ACKNOWLEDGED}'"
+
+
+def _unheld_predicate(alias: str = "") -> str:
+    """A row that no conflict holds for an operator (#4001).
+
+    Held rows share one piece of work in a shape no rule resolves. Running
+    one would decide that work without the operator, so no claim, exact-event
+    claim, initial transfer or activation takes a held row, and neither the
+    drainer's window nor the due-consumer hint lists one.
+    """
+    return f"{alias}exclusive_conflict_key IS NULL"
+
+
+class DurableExclusiveKeyIndexError(RuntimeError):
+    """The store could not enforce one holder per exclusive key (#4001).
+
+    Raised at schema bootstrap when the partial unique index cannot be
+    created, so the dispatcher never runs without it.
+    """
 
 
 _DEACTIVATED_CONSUMER_ERROR = "durable consumer deactivated"
@@ -999,16 +1052,40 @@ class DurableExclusiveWake:
     """One consumer admits at most one wake that has not run per ``key`` (#4001).
 
     ``key`` names the exact work a wake carries, whatever source identity it
-    is admitted under. While a delivery of ``consumer_id`` holding ``key`` is
-    not acknowledged, another signal carrying the same key commits nothing: a
-    live wake's own lease and terminal CAS decide the work. A terminal one
-    holds its key for good: the settlement pass ends the work it carried, and
-    once that is settled nothing can make that work owed again, so no later
-    wake may carry it either. Only a wake that ran releases its key.
+    is admitted under. While a delivery of ``consumer_id`` holds ``key``
+    (:func:`_exclusive_holding_predicate`), another signal carrying the same
+    key commits nothing: a live wake's own lease and terminal CAS decide the
+    work, a terminal one's work belongs to the settlement pass, and once
+    that is settled the work can never be owed again. A partial unique index
+    makes a second holder unrepresentable. Legacy rows that cannot be keyed
+    hold the key as a conflict (``exclusive_conflict_key``), which refuses
+    admission too.
     """
 
     consumer_id: str
     key: str
+
+
+@dataclass(frozen=True)
+class TerminalDeliverySettlement:
+    """What :meth:`DurableSignalStore.settle_terminal_delivery` found (#4001).
+
+    ``disposition`` is a recorded settlement (``ended``, ``released``,
+    ``carried``), ``held``, or one of the outcomes that record nothing
+    (``owed``, ``not_owed``, ``unkeyed``). ``recorded`` is whether this call
+    wrote it; a retry of a committed settlement returns the stored
+    disposition with ``recorded`` false. ``detail`` is what the task
+    transition returned when this call recorded ``ended``.
+    """
+
+    disposition: str
+    recorded: bool
+    detail: Any = None
+
+    @property
+    def settled(self) -> bool:
+        """Whether the row's settlement is recorded, by this call or before."""
+        return self.disposition in _RECORDED_SETTLEMENTS
 
 
 @dataclass(frozen=True)
@@ -1211,6 +1288,23 @@ def _owns_retry_release_receipt(method):
             else:
                 self._pending_retry_release_receipts.pop(key)
     return owned
+
+
+@dataclass(frozen=True)
+class _ExclusiveGroupRow:
+    """One unacknowledged row of a group sharing one key (#4001)."""
+
+    delivery_id: str
+    status: str
+    exclusive_key: Optional[str]
+    exclusive_conflict_key: Optional[str]
+    settlement_disposition: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    @property
+    def settled(self) -> bool:
+        """Whether this row settled the group's work: it ended or released it."""
+        return self.settlement_disposition in (SETTLEMENT_ENDED, SETTLEMENT_RELEASED)
 
 
 class DurableSignalStore(UnifiedStoreBase):
@@ -1465,6 +1559,8 @@ class DurableSignalStore(UnifiedStoreBase):
                 updated_at {ts_type} {ts_default},
                 settled_at {ts_type},
                 exclusive_key TEXT,
+                exclusive_conflict_key TEXT,
+                settlement_disposition TEXT,
                 UNIQUE (agent_id, consumer_id, event_id),
                 FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
                     ON DELETE CASCADE,
@@ -1540,6 +1636,10 @@ class DurableSignalStore(UnifiedStoreBase):
             # The exact work a delivery's wake carries, when its consumer
             # admits at most one wake that has not run for it (#4001).
             await self._ensure_column(self.DELIVERIES, "exclusive_key", "TEXT")
+            # The key a legacy row shares with others in a shape no rule
+            # resolves, and how a terminal row's work was settled (#4001).
+            await self._ensure_column(self.DELIVERIES, "exclusive_conflict_key", "TEXT")
+            await self._ensure_column(self.DELIVERIES, "settlement_disposition", "TEXT")
             source_state = await self._source_sequence_schema_state()
             await self._ensure_source_sequence_state()
             if self.is_postgres:
@@ -1739,6 +1839,24 @@ class DurableSignalStore(UnifiedStoreBase):
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type = 'table' AND name = ?",
                     (table,),
+                )
+            )
+        raise RuntimeError(
+            "Durable signal schema inspection supports only sqlite or postgres"
+        )
+
+    async def _index_exists(self, index: str) -> bool:
+        """Return whether one owned index exists in the current schema."""
+
+        if self.is_postgres:
+            return bool(
+                await self._backend.fetch_val("SELECT to_regclass(?) IS NOT NULL", (index,))
+            )
+        if self.is_sqlite:
+            return bool(
+                await self._backend.fetch_val(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    (index,),
                 )
             )
         raise RuntimeError(
@@ -3497,23 +3615,85 @@ class DurableSignalStore(UnifiedStoreBase):
             f"ON {self.DELIVERIES}(event_id, status)"
         )
         # Unsettled terminal rows a settlement pass pages through in
-        # delivery-ID order (#4001). Partial, so neither live claim traffic
-        # nor settled history is in it.
+        # delivery-ID order (#4001). Partial, so neither live claim traffic,
+        # settled history nor held rows are in it.
         await self._backend.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_unsettled_terminal "
+            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_settlement_scan "
             f"ON {self.DELIVERIES}(agent_id, consumer_id, status, delivery_id) "
-            f"WHERE {_unsettled_terminal_predicate()}"
+            f"WHERE {_settlement_scan_predicate()}"
         )
-        # The wakes holding one consumer's exclusive key (#4001).
+        await self._ensure_exclusive_holder_index()
+        # The legacy rows held under one key, which also refuse admission.
         await self._backend.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_exclusive_key "
-            f"ON {self.DELIVERIES}(agent_id, consumer_id, exclusive_key) "
-            "WHERE exclusive_key IS NOT NULL"
+            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_exclusive_conflict "
+            f"ON {self.DELIVERIES}(agent_id, consumer_id, exclusive_conflict_key) "
+            "WHERE exclusive_conflict_key IS NOT NULL"
         )
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
             f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
         )
+
+    async def _ensure_exclusive_holder_index(self) -> None:
+        """Make a second holder of one exclusive key unrepresentable (#4001).
+
+        Runs inside the schema bootstrap transaction. Any duplicate holders an
+        earlier build left behind are first resolved by the same rule key
+        backfill applies (:meth:`_resolve_exclusive_group_locked`). Then the
+        partial unique index is created. A failure refuses boot: the dispatcher never runs
+        with exclusivity unenforced.
+        """
+        index = f"idx_{self.DELIVERIES}_exclusive_holder"
+        if await self._index_exists(index):
+            # Every holder written since the index existed passed it.
+            return
+        duplicates = await self._backend.fetch_all(
+            f"""
+            SELECT agent_id, consumer_id, exclusive_key FROM {self.DELIVERIES}
+            WHERE {_exclusive_holding_predicate()}
+            GROUP BY agent_id, consumer_id, exclusive_key
+            HAVING COUNT(*) > 1
+            ORDER BY agent_id, consumer_id, exclusive_key
+            """
+        )
+        for agent_id, consumer_id, key in duplicates:
+            rows = await self._backend.fetch_all(
+                f"""
+                SELECT delivery_id, status, exclusive_key, exclusive_conflict_key,
+                       CASE WHEN settled_at IS NULL THEN NULL
+                            ELSE settlement_disposition END,
+                       created_at
+                FROM {self.DELIVERIES}
+                WHERE agent_id = ? AND consumer_id = ? AND exclusive_key = ?
+                  AND status <> ?
+                ORDER BY delivery_id
+                """,
+                (agent_id, consumer_id, key, ACKNOWLEDGED),
+            )
+            acknowledged = await self._backend.fetch_all(
+                f"""
+                SELECT acknowledged_at FROM {self.DELIVERIES}
+                WHERE agent_id = ? AND consumer_id = ? AND exclusive_key = ?
+                  AND status = ?
+                """,
+                (agent_id, consumer_id, key, ACKNOWLEDGED),
+            )
+            await self._resolve_exclusive_group_locked(
+                agent_id=str(agent_id), consumer_id=str(consumer_id), key=str(key),
+                rows=[self._exclusive_group_row(*row) for row in rows],
+                acknowledged_at=self._acknowledged_times(row[0] for row in acknowledged),
+            )
+        try:
+            await self._backend.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {index} "
+                f"ON {self.DELIVERIES}(agent_id, consumer_id, exclusive_key) "
+                f"WHERE {_exclusive_holding_predicate()}"
+            )
+        except Exception as error:
+            raise DurableExclusiveKeyIndexError(
+                "Durable signal delivery refuses to start without its unique "
+                "exclusive-key index: at most one wake may hold each key (#4001)"
+            ) from error
 
     # ------------------------------------------------------------------
     # Subscription registration and event persistence
@@ -3772,13 +3952,15 @@ class DurableSignalStore(UnifiedStoreBase):
 
         ``exclusive_wake`` decides admission across source identities (#4001).
         In this transaction, under the same handoff lock every admission of
-        this source takes, an unacknowledged delivery of its consumer holding
-        its key refuses this signal: nothing is committed, and the result
+        this source takes, a delivery of its consumer holding its key
+        (:func:`_exclusive_holding_predicate`) or held under it as a legacy
+        conflict refuses this signal: nothing is committed, and the result
         names that holder (``exclusive_holder``). Otherwise this signal's
-        delivery for that consumer is stored holding the key. A row stops
-        holding its key only by being acknowledged, or by handing it to a
-        live wake that holds it too (:meth:`record_delivery_settled`), never
-        the reverse, so the check cannot go stale in the unsafe direction.
+        delivery for that consumer is stored holding the key, and the partial
+        unique index refuses a second holder outright. A live row stops
+        holding its key only by being acknowledged; a terminal row holds it
+        while it is retained, so a settlement that ended the work can never
+        be followed by a wake that carries it again.
         """
         if exclusive_wake is not None:
             if not isinstance(exclusive_wake, DurableExclusiveWake):
@@ -4209,7 +4391,8 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND (
                     (d.status IN ('{PENDING}', '{RETRY}')
                       AND (d.max_attempts = 0 OR d.attempts < d.max_attempts)
-                      AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?))
+                      AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
+                      AND {_unheld_predicate('d.')})
                     OR (d.status = '{LEASED}' AND d.lease_expires_at <= ?)
                   )
             )
@@ -4320,6 +4503,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND {_unheld_predicate()}
                   AND {self._managed_retry_claim_sql()}
                 """,
                 (
@@ -4418,6 +4602,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND status IN ('{PENDING}', '{RETRY}')
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND {_unheld_predicate()}
                   AND {self._managed_retry_claim_sql()}
                 """,
                 (
@@ -4470,6 +4655,7 @@ class DurableSignalStore(UnifiedStoreBase):
             f"status IN ('{PENDING}', '{RETRY}')",
             "(max_attempts = 0 OR attempts < max_attempts)",
             "(next_attempt_at IS NULL OR next_attempt_at <= ?)",
+            _unheld_predicate(),
         ]
         params: list[Any] = [agent_id, consumer_id, self.to_timestamp_param(now)]
         if event_id is not None:
@@ -4684,6 +4870,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
                   AND status = ? AND lease_owner = ? AND lease_token = ?
                   AND lease_expires_at > ?
+                  AND {_unheld_predicate()}
                   AND EXISTS (
                       SELECT 1 FROM {self.CONSUMERS} consumer
                       WHERE consumer.agent_id = {self.DELIVERIES}.agent_id
@@ -4768,6 +4955,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
                   AND status = ? AND lease_owner = ? AND lease_token = ?
                   AND lease_expires_at IS NULL
+                  AND {_unheld_predicate()}
                   AND EXISTS (
                       SELECT 1 FROM {self.CONSUMERS} consumer
                       WHERE consumer.agent_id = {self.DELIVERIES}.agent_id
@@ -5268,6 +5456,9 @@ class DurableSignalStore(UnifiedStoreBase):
             )
             if now is None:
                 return False
+            await self._require_sole_exclusive_holder_locked(
+                agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id,
+            )
             updated = await self._backend.execute(
                 f"""
                 UPDATE {self.DELIVERIES}
@@ -5680,6 +5871,7 @@ class DurableSignalStore(UnifiedStoreBase):
         rebuildable_sources: Optional[Iterable[str]] = None,
         claim_executor_id: Optional[str] = None,
         runtime_owner_stale_before: Optional[datetime] = None,
+        include_held: bool = True,
     ) -> list[DurableDelivery]:
         """List observable delivery state within one agent/tenant only.
 
@@ -5689,12 +5881,19 @@ class DurableSignalStore(UnifiedStoreBase):
         row of any other source stores no caller and can run only from its
         provider's redelivery (#3392). A claimable window must use the same
         runtime-owner staleness cutoff as its subsequent native claim.
+        ``include_held=False`` leaves out rows held for an operator, which no
+        claim takes (:func:`_unheld_predicate`), so they neither crowd
+        executable rows out of a window nor re-arm a drain (#4001).
         """
         self._require_nonempty("agent_id", agent_id)
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
+        if type(include_held) is not bool:
+            raise ValueError("include_held must be an explicit bool")
         where = ["d.agent_id = ?"]
         params: list[Any] = [agent_id]
+        if not include_held:
+            where.append(_unheld_predicate("d."))
         if consumer_id is not None:
             where.append("d.consumer_id = ?")
             params.append(consumer_id)
@@ -5751,10 +5950,11 @@ class DurableSignalStore(UnifiedStoreBase):
 
         The rows after ``after_delivery_id`` (``""`` for the first page), in
         delivery-ID order, whose settlement is not yet recorded
-        (:meth:`record_delivery_settled`). The status is a literal in the
-        statement, so the unsettled-terminal index serves both the range and
-        the order: a page reads only the rows it returns, and settled history
-        is never read again (#4001).
+        (:meth:`settle_terminal_delivery`) and that are not held for an
+        operator. The status is a literal in the statement, so the
+        settlement-scan index serves both the range and the order: a page
+        reads only the rows it returns, and settled history is never read
+        again (#4001).
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("consumer_id", consumer_id)
@@ -5766,7 +5966,7 @@ class DurableSignalStore(UnifiedStoreBase):
             raise ValueError("limit must be between 1 and 1000")
         where = (
             "d.agent_id = ? AND d.consumer_id = ? "
-            f"AND d.status = '{status}' AND {_unsettled_terminal_predicate('d.')} "
+            f"AND d.status = '{status}' AND {_settlement_scan_predicate('d.')} "
             "AND d.delivery_id > ?"
         )
         rows = await self._backend.fetch_all(
@@ -5775,103 +5975,109 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return [self._row_to_delivery(row) for row in rows]
 
-    async def list_live_deliveries_page(
-        self,
-        *,
-        agent_id: str,
-        consumer_id: str,
-        after_delivery_id: str,
-        limit: int,
-    ) -> list[DurableDelivery]:
-        """One keyset page of a consumer's live rows, in delivery-ID order.
-
-        Live is pending, initially reserved, leased or awaiting retry: a row
-        that can still run, or still end without running. What this reads is
-        bounded by the consumer's in-flight work, never its history (#4001).
-        """
-        self._require_nonempty("agent_id", agent_id)
-        self._require_nonempty("consumer_id", consumer_id)
-        if not isinstance(after_delivery_id, str):
-            raise ValueError("after_delivery_id must be a delivery ID string")
-        if limit < 1 or limit > 1000:
-            raise ValueError("limit must be between 1 and 1000")
-        rows = await self._backend.fetch_all(
-            self._delivery_select_sql(
-                "d.agent_id = ? AND d.consumer_id = ? "
-                "AND d.status IN (?, ?, ?, ?) AND d.delivery_id > ?"
-            )
-            + " ORDER BY d.delivery_id LIMIT ?",
-            (
-                agent_id, consumer_id, PENDING, INITIAL_RESERVED, LEASED, RETRY,
-                after_delivery_id, limit,
-            ),
-        )
-        return [self._row_to_delivery(row) for row in rows]
-
-    async def record_delivery_settled(
+    async def settle_terminal_delivery(
         self,
         *,
         agent_id: str,
         consumer_id: str,
         delivery_id: str,
-        carried_by_live_wake: bool = False,
+        task_transition: Callable[[], Awaitable[tuple[str, Any]]],
         now: Optional[datetime] = None,
-    ) -> bool:
-        """Record that the work a terminal row's wake carried is settled.
+    ) -> TerminalDeliverySettlement:
+        """Settle the work one terminal row's wake carried, atomically (#4001).
 
-        The caller has read from durable state that the work can never be
-        owed again. The row keeps its terminal status and error; it only
-        leaves the settlement pass and the retention hold (#4001). Returns
-        whether this call recorded it.
+        One transaction locks the source's handoff, then the delivery row,
+        then runs ``task_transition`` on this same transaction, then records
+        the settlement on the row. The row's settlement, its key and the work
+        it carried therefore commit together or not at all:
 
-        ``carried_by_live_wake`` records it only while a live delivery of the
-        consumer holds the row's exclusive key, read in the same statement:
-        that wake carries the work, and ends it by running or, ending
-        undelivered, owes it itself. The row then hands the key to that wake,
-        so once it is acknowledged nothing holds the input and recovery may
-        wake it again (#4001).
+        1. A row whose settlement is already recorded returns its stored
+           disposition and writes nothing, so a retry after a lost ACK or an
+           unknown commit never decides again.
+        2. A row that is not an unsettled terminal row, is held for an
+           operator, or holds no key yet writes nothing.
+        3. ``task_transition`` returns ``(disposition, detail)``: ``ended``
+           when it ended the work, ``released`` when durable state shows the
+           work can never be owed again, or ``owed`` when the work still
+           waits but cannot be settled now. Only the first two may write; an
+           ``owed`` transition writes nothing. It must not open a transaction
+           of its own.
+        4. ``ended`` and ``released`` are recorded on the row
+           (``settled_at``, ``settlement_disposition``) in the same
+           transaction; exactly one row must change. The row keeps its key,
+           so no later wake can be admitted for work this settled.
+
+        A failure anywhere rolls the whole settlement back, so the row stays
+        owed. ``now`` is a SQLite clock seam.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("consumer_id", consumer_id)
         self._require_nonempty("delivery_id", delivery_id)
-        now = _as_utc(now or self.now_utc())
-        carried = (
-            ", exclusive_key = NULL WHERE "
-            f"{_carried_by_live_wake_predicate(self.DELIVERIES)} AND "
-            if carried_by_live_wake
-            else " WHERE "
-        )
-        updated = await self._backend.execute(
-            f"UPDATE {self.DELIVERIES} SET settled_at = ?, updated_at = ?{carried}"
-            "agent_id = ? AND consumer_id = ? AND delivery_id = ? "
-            f"AND {_unsettled_terminal_predicate()}",
-            (
-                self.to_timestamp_param(now),
-                self.to_timestamp_param(now),
-                agent_id,
-                consumer_id,
-                delivery_id,
-            ),
-        )
-        return updated == 1
-
-    async def delivery_carried_by_live_wake(
-        self, *, agent_id: str, consumer_id: str, delivery_id: str
-    ) -> bool:
-        """Whether a live delivery of the consumer holds this row's key (#4001).
-
-        The read :meth:`record_delivery_settled` makes before releasing a row
-        to the live wake that carries its work.
-        """
-        self._require_nonempty("agent_id", agent_id)
-        self._require_nonempty("consumer_id", consumer_id)
-        self._require_nonempty("delivery_id", delivery_id)
+        if not callable(task_transition):
+            raise ValueError("task_transition must be callable")
+        requested_now = _as_utc(now) if now is not None else None
         row = await self._backend.fetch_one(
-            f"SELECT 1 FROM {self.DELIVERIES} WHERE agent_id = ? AND consumer_id = ? "
-            f"AND delivery_id = ? AND {_carried_by_live_wake_predicate(self.DELIVERIES)}",
+            f"SELECT e.source FROM {self.DELIVERIES} d "
+            f"JOIN {self.EVENTS} e ON e.event_id = d.event_id "
+            "WHERE d.agent_id = ? AND d.consumer_id = ? AND d.delivery_id = ?",
             (agent_id, consumer_id, delivery_id),
         )
-        return row is not None
+        if row is None:
+            return TerminalDeliverySettlement(SETTLEMENT_NOT_OWED, False)
+        transaction = (
+            self._sqlite_immediate_transaction()
+            if self.is_sqlite
+            else self._backend.transaction()
+        )
+        async with transaction:
+            await self._lock_scope_handoff(agent_id=agent_id, source=str(row[0]))
+            lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+            locked = await self._backend.fetch_one(
+                f"""
+                SELECT status, settled_at, settlement_disposition, exclusive_key,
+                       exclusive_conflict_key
+                FROM {self.DELIVERIES}
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                {lock_suffix}
+                """,
+                (agent_id, consumer_id, delivery_id),
+            )
+            if locked is None:
+                return TerminalDeliverySettlement(SETTLEMENT_NOT_OWED, False)
+            status, settled_at, disposition, key, conflict = locked
+            if settled_at is not None:
+                return TerminalDeliverySettlement(
+                    str(disposition or SETTLEMENT_RELEASED), False
+                )
+            if status not in (FAILED, TERMINAL_ACKABLE):
+                return TerminalDeliverySettlement(SETTLEMENT_NOT_OWED, False)
+            if conflict is not None:
+                return TerminalDeliverySettlement(SETTLEMENT_HELD, False)
+            if key is None:
+                return TerminalDeliverySettlement(SETTLEMENT_UNKEYED, False)
+            outcome, detail = await task_transition()
+            if outcome == SETTLEMENT_OWED:
+                return TerminalDeliverySettlement(SETTLEMENT_OWED, False)
+            if outcome not in (SETTLEMENT_ENDED, SETTLEMENT_RELEASED):
+                raise ValueError(f"Unknown settlement transition outcome {outcome!r}")
+            stamp = self.to_timestamp_param(requested_now or self.now_utc())
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET settled_at = ?, settlement_disposition = ?, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                  AND {_unsettled_terminal_predicate()}
+                """,
+                (stamp, outcome, stamp, agent_id, consumer_id, delivery_id),
+            )
+            if updated != 1:
+                raise RuntimeError(
+                    "A terminal delivery changed under its settlement lock; the "
+                    "settlement is rolled back and its work stays owed"
+                )
+        return TerminalDeliverySettlement(
+            outcome, True, detail if outcome == SETTLEMENT_ENDED else None,
+        )
 
     async def source_history_is_drained(
         self, boundary: DurableSourceBoundary
@@ -5945,7 +6151,7 @@ class DurableSignalStore(UnifiedStoreBase):
 
         A failed or terminal-ACKable row of one of ``held_consumers`` keeps
         its event past retention until its settlement is recorded
-        (:meth:`record_delivery_settled`): such a row can be the only record
+        (:meth:`settle_terminal_delivery`): such a row can be the only record
         that work its wake carried is still owed a settlement (#4001).
         """
         self._require_nonempty("agent_id", agent_id)
@@ -6053,65 +6259,353 @@ class DurableSignalStore(UnifiedStoreBase):
     ) -> Optional[tuple[str, str]]:
         """The delivery holding an exclusive key, if any (#4001).
 
-        Every delivery that is not acknowledged holds its key: a live wake,
-        or a terminal one, whose work the settlement pass owns. Returns its
-        ``(delivery_id, event_id)``.
+        A row holding the key (:func:`_exclusive_holding_predicate`): a live
+        wake, or a terminal one whose settlement is not recorded. Legacy rows
+        held under the key hold it too, so admission cannot add to a group an
+        operator must reconcile. Returns its ``(delivery_id, event_id)``.
         """
         row = await self._backend.fetch_one(
             f"""
             SELECT delivery_id, event_id FROM {self.DELIVERIES}
-            WHERE agent_id = ? AND consumer_id = ? AND exclusive_key = ?
-              AND status <> ?
+            WHERE agent_id = ? AND consumer_id = ?
+              AND ((exclusive_key = ? AND {_exclusive_holding_predicate()})
+                OR (exclusive_conflict_key = ? AND status <> ?))
             ORDER BY delivery_id
             LIMIT 1
             """,
-            (agent_id, exclusive_wake.consumer_id, exclusive_wake.key, ACKNOWLEDGED),
+            (
+                agent_id, exclusive_wake.consumer_id, exclusive_wake.key,
+                exclusive_wake.key, ACKNOWLEDGED,
+            ),
         )
         return None if row is None else (str(row[0]), str(row[1]))
 
     async def assign_exclusive_keys(
-        self, *, agent_id: str, source: str, consumer_id: str, keys: Mapping[str, str],
+        self,
+        *,
+        agent_id: str,
+        source: str,
+        consumer_id: str,
+        derive_key: Callable[[Optional[str]], Optional[str]],
     ) -> int:
-        """Give keyless deliveries the exclusive key their wake carries (#4001).
+        """Key every unkeyed wake of one consumer and source (#4001).
 
         Deliveries admitted before exclusive keys existed hold none, so an
-        admission check cannot see them. ``keys`` maps each such delivery ID
-        to the key its caller derived from that wake's own source identity.
-        A delivery that already holds a key keeps it. Runs under the source's
-        handoff lock, so an admission of that source either precedes this
-        assignment or sees it. Returns how many deliveries were assigned.
-
-        The rules those wakes were admitted under could leave more than one
-        unacknowledged wake for one input, a failed one beside a live one;
-        each receives the key. The settlement pass then releases a terminal
-        one whose key a live wake holds to that wake, rather than ending work
-        it still runs (:meth:`record_delivery_settled`).
+        admission check cannot see them. ``derive_key`` maps a wake's source
+        event ID to the key admission derives for it. In one transaction,
+        under the source's handoff lock, every unacknowledged, unsettled row
+        of the consumer and source is read again, grouped by its key, and
+        each group resolved (:meth:`_resolve_exclusive_group_locked`): a
+        terminal row admitted at or before an acknowledgement of a wake of
+        the same work is recorded ``carried``, since that wake ran the work;
+        of the rest, a group of one is keyed; one live wake beside terminal
+        ones is keyed and the terminal ones recorded ``carried``; any other
+        shape is held for an operator and keyed by no one. A terminal row
+        whose identity names no work is recorded ``released``. Nothing read
+        before this transaction decides a group. Returns how many rows or
+        groups changed.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("source", source)
         self._require_nonempty("consumer_id", consumer_id)
-        for delivery_id, key in keys.items():
-            self._require_nonempty("delivery_id", delivery_id)
-            self._require_nonempty("key", key)
-        if not keys:
-            return 0
-        assigned = 0
+        if not callable(derive_key):
+            raise ValueError("derive_key must be callable")
+        changed = 0
         async with self._backend.transaction():
             await self._lock_scope_handoff(agent_id=agent_id, source=source)
-            for delivery_id, key in sorted(keys.items()):
-                assigned += await self._backend.execute(
-                    f"""
-                    UPDATE {self.DELIVERIES} SET exclusive_key = ?
-                    WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
-                      AND exclusive_key IS NULL
-                      AND event_id IN (
-                          SELECT event_id FROM {self.EVENTS}
-                          WHERE agent_id = ? AND source = ?
-                      )
-                    """,
-                    (key, agent_id, consumer_id, delivery_id, agent_id, source),
+            unkeyed = await self._backend.fetch_val(
+                f"""
+                SELECT 1 FROM {self.DELIVERIES} d
+                JOIN {self.EVENTS} e ON e.event_id = d.event_id
+                WHERE d.agent_id = ? AND d.consumer_id = ? AND e.source = ?
+                  AND d.status <> ? AND d.settled_at IS NULL
+                  AND d.exclusive_key IS NULL AND d.exclusive_conflict_key IS NULL
+                LIMIT 1
+                """,
+                (agent_id, consumer_id, source, ACKNOWLEDGED),
+            )
+            if not unkeyed:
+                return 0
+            rows = await self._backend.fetch_all(
+                f"""
+                SELECT d.delivery_id, d.status, d.exclusive_key,
+                       d.exclusive_conflict_key, e.source_event_id, d.created_at
+                FROM {self.DELIVERIES} d
+                JOIN {self.EVENTS} e ON e.event_id = d.event_id
+                WHERE d.agent_id = ? AND d.consumer_id = ? AND e.source = ?
+                  AND d.status <> ? AND d.settled_at IS NULL
+                ORDER BY d.delivery_id
+                """,
+                (agent_id, consumer_id, source, ACKNOWLEDGED),
+            )
+            groups: dict[str, list[_ExclusiveGroupRow]] = {}
+            unnamed: list[str] = []
+            for delivery_id, status, key, conflict, source_event_id, created in rows:
+                group = key or conflict or derive_key(source_event_id)
+                if group is None:
+                    unnamed.append(str(delivery_id))
+                    continue
+                groups.setdefault(str(group), []).append(
+                    self._exclusive_group_row(
+                        delivery_id, status, key, conflict, None, created
+                    )
                 )
-        return assigned
+            # A legacy wake for the same work that was acknowledged after a
+            # terminal row was admitted ran that work: the row owes nothing.
+            # Read in this transaction, as the rows are; an ACK cannot land
+            # between them on SQLite, and on PostgreSQL either order of an
+            # ACK and this read resolves the group the same way.
+            acknowledged = await self._acknowledged_wakes_locked(
+                agent_id=agent_id, source=source, consumer_id=consumer_id,
+                derive_key=derive_key,
+                keys={
+                    key for key, members in groups.items()
+                    if any(member.status in (FAILED, TERMINAL_ACKABLE) for member in members)
+                    and any(
+                        member.exclusive_key is None and member.exclusive_conflict_key is None
+                        for member in members
+                    )
+                },
+            )
+            now = self.to_timestamp_param(self.now_utc())
+            for delivery_id in unnamed:
+                # Every settling wake is minted under a canonical identity; a
+                # row without one names no work, so nothing can be owed by it.
+                changed += await self._backend.execute(
+                    f"""
+                    UPDATE {self.DELIVERIES}
+                    SET settled_at = ?, settlement_disposition = ?, updated_at = ?
+                    WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                      AND {_unsettled_terminal_predicate()}
+                    """,
+                    (now, SETTLEMENT_RELEASED, now, agent_id, consumer_id, delivery_id),
+                )
+            for key, members in sorted(groups.items()):
+                if not any(
+                    member.exclusive_key is None and member.exclusive_conflict_key is None
+                    for member in members
+                ):
+                    continue
+                settled = await self._backend.fetch_all(
+                    f"""
+                    SELECT delivery_id, status, exclusive_key, exclusive_conflict_key,
+                           settlement_disposition
+                    FROM {self.DELIVERIES}
+                    WHERE agent_id = ? AND consumer_id = ? AND exclusive_key = ?
+                      AND status <> ? AND settled_at IS NOT NULL
+                    ORDER BY delivery_id
+                    """,
+                    (agent_id, consumer_id, key, ACKNOWLEDGED),
+                )
+                await self._resolve_exclusive_group_locked(
+                    agent_id=agent_id, consumer_id=consumer_id, key=key,
+                    rows=[*members, *(_ExclusiveGroupRow(*row) for row in settled)],
+                    acknowledged_at=acknowledged.get(key, ()),
+                )
+                changed += 1
+        return changed
+
+    def _exclusive_group_row(
+        self,
+        delivery_id: Any,
+        status: Any,
+        exclusive_key: Any,
+        exclusive_conflict_key: Any,
+        settlement_disposition: Any,
+        created_at: Any,
+    ) -> _ExclusiveGroupRow:
+        stamp = self.from_timestamp_field(created_at)
+        return _ExclusiveGroupRow(
+            str(delivery_id), str(status), exclusive_key, exclusive_conflict_key,
+            settlement_disposition, None if stamp is None else _as_utc(stamp),
+        )
+
+    def _acknowledged_times(self, values: Iterable[Any]) -> tuple[datetime, ...]:
+        stamps = (self.from_timestamp_field(value) for value in values)
+        return tuple(_as_utc(stamp) for stamp in stamps if stamp is not None)
+
+    async def _acknowledged_wakes_locked(
+        self,
+        *,
+        agent_id: str,
+        source: str,
+        consumer_id: str,
+        derive_key: Callable[[Optional[str]], Optional[str]],
+        keys: set[str],
+    ) -> dict[str, tuple[datetime, ...]]:
+        """When each acknowledged wake of ``keys`` was acknowledged (#4001).
+
+        Legacy acknowledged rows hold no key, so each is grouped by the key
+        derived from its own identity, as an unacknowledged one is. Nothing
+        is read when no group has a terminal row, and this runs only while
+        some row of the scope is unkeyed, which after the first boot of a
+        release with exclusive keys no admitted wake is.
+        """
+        if not keys:
+            return {}
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT d.exclusive_key, e.source_event_id, d.acknowledged_at
+            FROM {self.DELIVERIES} d
+            JOIN {self.EVENTS} e ON e.event_id = d.event_id
+            WHERE d.agent_id = ? AND d.consumer_id = ? AND e.source = ?
+              AND d.status = ?
+            """,
+            (agent_id, consumer_id, source, ACKNOWLEDGED),
+        )
+        acknowledged: dict[str, list[Any]] = {}
+        for key, source_event_id, acknowledged_at in rows:
+            group = key or derive_key(source_event_id)
+            if group in keys:
+                acknowledged.setdefault(str(group), []).append(acknowledged_at)
+        return {
+            key: self._acknowledged_times(values) for key, values in acknowledged.items()
+        }
+
+    async def _resolve_exclusive_group_locked(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        key: str,
+        rows: list[_ExclusiveGroupRow],
+        acknowledged_at: tuple[datetime, ...] = (),
+    ) -> str:
+        """Resolve the unacknowledged rows sharing one key (#4001).
+
+        The caller has just read ``rows`` in this transaction under the
+        source's handoff lock (or the schema bootstrap lock), and
+        ``acknowledged_at``: when each acknowledged wake of the same key was
+        acknowledged. A row whose settlement already ended or released the
+        work keeps the key, and the others owe nothing: an unsettled terminal
+        one is recorded ``released``, a live one is left unkeyed, and no task
+        is touched. A terminal row admitted at or before some acknowledgement
+        of the same work is recorded ``carried``: under exclusive keys no
+        wake can be admitted beside it, so a legacy one that ran after it
+        existed delivered the work it carried, and no task is touched. Of
+        the rest, one row is keyed. Exactly one live row beside terminal ones
+        is keyed, and the terminal rows are recorded ``carried``: the live
+        wake carries the work, so they owe nothing and no task is touched.
+        Any other shape, or a group already held, is held: no row holds the
+        key, each holds it as a conflict, and only an operator reconciles
+        them. Rows are demoted before one is keyed, so the unique holder
+        index never sees two holders. Returns the resolution.
+        """
+        now = self.to_timestamp_param(self.now_utc())
+        scope = (agent_id, consumer_id)
+        settled = [row for row in rows if row.settled]
+        if settled:
+            holder = next(
+                (row for row in settled if row.exclusive_key is not None), settled[0]
+            )
+            for row in rows:
+                if row is holder:
+                    continue
+                await self._backend.execute(
+                    f"""
+                    UPDATE {self.DELIVERIES}
+                    SET exclusive_key = NULL, updated_at = ?,
+                        settlement_disposition = CASE
+                            WHEN {_unsettled_terminal_predicate()} THEN ?
+                            ELSE settlement_disposition END,
+                        settled_at = CASE
+                            WHEN {_unsettled_terminal_predicate()} THEN ?
+                            ELSE settled_at END
+                    WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                    """,
+                    (now, SETTLEMENT_RELEASED, now, *scope, row.delivery_id),
+                )
+            if holder.exclusive_key is None:
+                await self._backend.execute(
+                    f"UPDATE {self.DELIVERIES} SET exclusive_key = ?, updated_at = ? "
+                    "WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?",
+                    (key, now, *scope, holder.delivery_id),
+                )
+            return SETTLEMENT_RELEASED
+        held = any(row.exclusive_conflict_key is not None for row in rows)
+        terminal = [row for row in rows if row.status in (FAILED, TERMINAL_ACKABLE)]
+        if acknowledged_at and any(row.created_at is None for row in terminal):
+            # Whether a later wake ran this row's work cannot be read.
+            held = True
+        if not held and acknowledged_at:
+            delivered = {
+                row.delivery_id for row in terminal
+                if any(acked >= row.created_at for acked in acknowledged_at)
+            }
+            for delivery_id in sorted(delivered):
+                await self._backend.execute(
+                    f"""
+                    UPDATE {self.DELIVERIES}
+                    SET settled_at = ?, settlement_disposition = ?,
+                        exclusive_key = NULL, updated_at = ?
+                    WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                      AND {_unsettled_terminal_predicate()}
+                    """,
+                    (now, SETTLEMENT_CARRIED, now, *scope, delivery_id),
+                )
+            rows = [row for row in rows if row.delivery_id not in delivered]
+            terminal = [row for row in terminal if row.delivery_id not in delivered]
+            if not rows:
+                # The work ran: nothing holds its key, as after any wake that
+                # ran, so recovery may wake a WORKING task again.
+                return SETTLEMENT_CARRIED
+        live = [row for row in rows if row.status in _LIVE_STATUSES]
+        resolvable = not held and len(live) + len(terminal) == len(rows)
+        if resolvable and (len(rows) == 1 or len(live) == 1):
+            for row in terminal if len(rows) > 1 else ():
+                await self._backend.execute(
+                    f"""
+                    UPDATE {self.DELIVERIES}
+                    SET settled_at = ?, settlement_disposition = ?,
+                        exclusive_key = NULL, updated_at = ?
+                    WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                      AND {_unsettled_terminal_predicate()}
+                    """,
+                    (now, SETTLEMENT_CARRIED, now, *scope, row.delivery_id),
+                )
+            holder = live[0] if live else rows[0]
+            if holder.exclusive_key is None:
+                await self._backend.execute(
+                    f"""
+                    UPDATE {self.DELIVERIES} SET exclusive_key = ?, updated_at = ?
+                    WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                      AND exclusive_key IS NULL AND exclusive_conflict_key IS NULL
+                    """,
+                    (key, now, *scope, holder.delivery_id),
+                )
+            return SETTLEMENT_CARRIED if len(rows) > 1 else "keyed"
+        for row in rows:
+            await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET exclusive_key = NULL, exclusive_conflict_key = ?,
+                    settlement_disposition = ?, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                """,
+                (key, SETTLEMENT_HELD, now, *scope, row.delivery_id),
+            )
+        logger.warning(
+            "Durable wakes share one piece of work in a shape no rule resolves; "
+            "they are held, keyed by none and settled by no automatic path, "
+            "until an operator reconciles them: consumer=%s deliveries=%s",
+            consumer_id,
+            ",".join(row.delivery_id for row in rows),
+        )
+        return SETTLEMENT_HELD
+
+    async def held_exclusive_group_count(self, *, agent_id: str, consumer_id: str) -> int:
+        """How many keys of one consumer hold legacy rows for an operator (#4001)."""
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        count = await self._backend.fetch_val(
+            f"""
+            SELECT COUNT(DISTINCT exclusive_conflict_key) FROM {self.DELIVERIES}
+            WHERE agent_id = ? AND consumer_id = ?
+              AND exclusive_conflict_key IS NOT NULL AND status <> ?
+            """,
+            (agent_id, consumer_id, ACKNOWLEDGED),
+        )
+        return int(count or 0)
 
     async def _existing_event_id_locked(
         self, agent_id: str, signal: Signal, source_event_id: Optional[str]
@@ -6470,6 +6964,39 @@ class DurableSignalStore(UnifiedStoreBase):
             f"{self._backend.backend_type!r}"
         )
 
+    async def _require_sole_exclusive_holder_locked(
+        self, *, agent_id: str, consumer_id: str, delivery_id: str,
+    ) -> None:
+        """Refuse an ACK while another unsettled row shares its key (#4001).
+
+        The unique holder index and key backfill already make this
+        unreachable: a live wake that holds its key is the only unsettled
+        row for that work. Checked again where the ACK commits, so an ACK can
+        never leave a terminal row owing work its own wake just delivered.
+        """
+        clash = await self._backend.fetch_val(
+            f"""
+            SELECT 1 FROM {self.DELIVERIES} AS live
+            JOIN {self.DELIVERIES} AS other
+              ON other.agent_id = live.agent_id
+             AND other.consumer_id = live.consumer_id
+             AND other.delivery_id <> live.delivery_id
+             AND (other.exclusive_key = live.exclusive_key
+                  OR other.exclusive_conflict_key = live.exclusive_key)
+            WHERE live.agent_id = ? AND live.consumer_id = ? AND live.delivery_id = ?
+              AND live.exclusive_key IS NOT NULL
+              AND other.status IN ('{FAILED}', '{TERMINAL_ACKABLE}')
+              AND other.settled_at IS NULL
+            LIMIT 1
+            """,
+            (agent_id, consumer_id, delivery_id),
+        )
+        if clash:
+            raise RuntimeError(
+                "A live wake's exclusive key is also held by an unsettled terminal "
+                "row; refusing its acknowledgement (#4001)"
+            )
+
     async def _lock_live_delivery_lease(
         self, *, agent_id: str, consumer_id: str, delivery_id: str,
         lease_token: str, now: Optional[datetime] = None,
@@ -6789,6 +7316,21 @@ class DurableSignalStore(UnifiedStoreBase):
                 exclusive_key,
             ),
         )
+        if inserted != 1 and exclusive_key is not None:
+            # ``OR IGNORE`` exists for the (agent, consumer, event) identity.
+            # A keyed insert that matched nothing must not vanish silently:
+            # admission checked the holder under the handoff lock, so a
+            # conflict here is a second holder the unique index refused.
+            existing = await self._backend.fetch_val(
+                f"SELECT 1 FROM {self.DELIVERIES} "
+                "WHERE agent_id = ? AND consumer_id = ? AND event_id = ?",
+                (agent_id, consumer_id, event_id),
+            )
+            if not existing:
+                raise RuntimeError(
+                    "A durable wake's exclusive key is already held; the unique "
+                    "holder index refused a second holder (#4001)"
+                )
         return delivery_id if inserted == 1 else None
 
     def _event_from_signal(
