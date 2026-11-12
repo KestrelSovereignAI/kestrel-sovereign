@@ -24,6 +24,7 @@ from kestrel_sdk.native_a2a.types import (
     SendMessageRequest,
     TaskState,
 )
+from kestrel_sdk.signals import Status
 
 from kestrel_sovereign.a2a.native_card import (
     REQUIRED_NATIVE_EXTENSIONS,
@@ -101,6 +102,24 @@ async def test_signed_native_http_cognition_obeys_the_real_remote_tool_permissio
                     }:
                         await asyncio.sleep(0.1)
                         task = await client.get_task(GetTaskRequest(id=task.id, tenant=scope.tenant))
+                    assert task.status.state == TaskState.TASK_STATE_COMPLETED, str(task)
+                    # Terminal task persistence precedes the independent completion
+                    # cognition. Observe that real turn inside this SAME deadline;
+                    # starting host shutdown is not a way to skip its outcome.
+                    while True:
+                        with closing(sqlite3.connect(
+                            (c.home / 'agent/kestrel_prime.db').as_uri() + '?mode=ro',
+                            uri=True,
+                        )) as database:
+                            completion = database.execute(
+                                'SELECT status, completed_at, error FROM signal_log '
+                                'WHERE source = ? AND dedupe_key = ?',
+                                ('a2a.task_complete', f'{task.id}:completed'),
+                            ).fetchone()
+                        if completion is not None and completion[1] is not None:
+                            assert completion[0] == Status.OK.value, completion
+                            break
+                        await asyncio.sleep(0.01)
                 return task
 
             task = await complete_request()
@@ -110,7 +129,6 @@ async def test_signed_native_http_cognition_obeys_the_real_remote_tool_permissio
                 assert pending.json()['pending'] == [], (
                     'A signed peer without an interactive approver manufactured a private approval'
                 )
-            assert task.status.state == TaskState.TASK_STATE_COMPLETED, str(task)
             assert task.status.message.parts[0].text == 'Owned permission evaluation complete'
         audit = await operator.get('/api/agents/permission-host/api/security/audit')
         assert audit.status_code == 200, audit.text

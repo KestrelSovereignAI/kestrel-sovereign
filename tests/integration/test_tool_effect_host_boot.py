@@ -17,6 +17,14 @@ pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120),
     pytest.mark.skipif(sys.platform == 'win32', reason='Requires native graceful SIGTERM')]
 
 
+def assert_database_closed(database: sqlite3.Connection) -> None:
+    try:
+        with pytest.raises(sqlite3.ProgrammingError, match='closed database'):
+            database.execute('SELECT 1')
+    finally:
+        database.close()
+
+
 @pytest.mark.asyncio
 async def test_normal_host_opens_journal_on_its_original_primary_database(host_campaign):
     c = host_campaign
@@ -25,9 +33,10 @@ async def test_normal_host_opens_journal_on_its_original_primary_database(host_c
         database = Path(host.state['agent_database']).resolve()
         assert database.is_relative_to(c.home.resolve())
     assert host.process.returncode is not None
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         assert db.execute('SELECT COUNT(*) FROM tool_effect_keys').fetchone() == (1,)
         assert db.execute('SELECT COUNT(*) FROM tool_effect_operations').fetchone() == (0,)
+    assert_database_closed(db)
 
 
 @pytest.mark.asyncio
@@ -36,13 +45,15 @@ async def test_corrupt_journal_cannot_be_ignored_during_normal_host_boot(host_ca
     async with native_host(c.home, c.descriptor, c.environment, c.peer, 'journal-original') as original:
         database = Path(original.state['agent_database']).resolve()
         assert database.is_relative_to(c.home.resolve())
-    with sqlite3.connect(database) as db:
+    with closing(sqlite3.connect(database)) as db, db:
         db.execute('UPDATE tool_effect_keys SET wrapped_key = ?', (b'owned-corrupt-envelope',))
+    assert_database_closed(db)
     with pytest.raises(AssertionError, match='tool effect envelope cannot be opened'):
         async with native_host(c.home, c.descriptor, c.environment, c.peer, 'journal-corrupt'):
             pytest.fail('A configured persistent journal was silently ignored')
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         assert db.execute('SELECT wrapped_key FROM tool_effect_keys').fetchone() == (b'owned-corrupt-envelope',)
+    assert_database_closed(db)
     assert c.peer.witness_file is not None
     assert not c.peer.witness_file.exists() or not c.peer.witness_file.read_text().splitlines()
 

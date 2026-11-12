@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import signal
 import threading
+from typing import Any
 
 from mcp import types
 from mcp.server import MCPServer
@@ -56,6 +57,35 @@ class DropFirstToolReply:
         await self.app(scope, replay_receive, lose_reply)
 
 
+def active_user_turn(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """Read the current request, not auxiliary context or historical signals.
+
+    This external finite peer understands Core's text wire envelopes without
+    importing Core policy or executing any of its tools.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError("The owned provider requires a text user request")
+        content = content.strip()
+        if content.startswith("<operator_notice>"):
+            continue
+        if content.startswith("<retrieved_context>"):
+            _context, separator, content = content.partition("</retrieved_context>")
+            if not separator:
+                raise ValueError("The owned provider received an incomplete context envelope")
+            content = content.strip()
+            if not content:
+                continue
+        if content.startswith("<user_input>\n") and content.endswith("\n</user_input>"):
+            content = content[len("<user_input>\n"):-len("\n</user_input>")]
+        return content, messages[index:]
+    raise ValueError("The owned provider requires an active user request")
+
+
 def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: str | None = None):
     """Serve finite native provider responses beside the owned MCP witness."""
     calls = 0
@@ -70,34 +100,35 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
     async def completion(request):
         nonlocal calls
         body = await request.json()
+        prompt, current_turn = active_user_turn(body["messages"])
         with request_witness.open("a") as stream:
             stream.write(json.dumps({"path": request.url.path, "model": body.get("model"),
                 "tools": [tool["function"]["name"] for tool in body.get("tools", [])],
                 "last_role": body["messages"][-1]["role"],
+                "active_user_prefix": prompt[:200],
                 "has_response_format": bool(body.get("response_format"))}) + "\n")
         if body.get("model") != model:
             return JSONResponse({"error": "Owned provider requires its configured model"}, status_code=400)
         calls += 1
         tools = [tool["function"] for tool in body.get("tools", [])]
         candidates = [tool for tool in tools if tool["name"].endswith("record_marker")]
-        finished = body["messages"][-1]["role"] == "tool"
         message = {"role": "assistant", "content": "Owned provider response complete"}
         reason = "stop"
-        selected = candidates[0] if len(candidates) == 1 and not finished else None
+        called = {call['function']['name'] for message in current_turn
+            for call in message.get('tool_calls', [])}
+        selected = candidates[0] if len(candidates) == 1 and candidates[0]['name'] not in called else None
         arguments = {"marker": "owned-provider-effect"}
         if candidates and len(candidates) != 1:
             return JSONResponse({"error": "Owned provider requires one marker tool"}, status_code=400)
         # A finite model script consumes the actual cognition prompt and tool
         # schemas. Task completion still runs through the real governed tool.
-        prompt = "\n".join(m['content'] for m in body['messages']
-            if isinstance(m.get('content'), str))
-        incoming = re.search(r"\[A2A_TASK_SUBMITTED\] Peer `[^`]+` submitted native A2A task `([^`]+)`", prompt)
-        if incoming:
+        incoming = re.match(r"\[A2A_TASK_SUBMITTED\] Peer `[^`]+` submitted native A2A task `([^`]+)`", prompt)
+        if prompt.startswith('[A2A_COMPLETE]'):
+            selected = None
+        elif incoming:
             replies = [tool for tool in tools if tool['name'].endswith('respond_to_a2a_task')]
             if len(candidates) != 1 or len(replies) != 1:
                 return JSONResponse({"error": "Owned A2A model requires the original marker and task response tools"}, status_code=400)
-            called = {call['function']['name'] for m in body['messages']
-                for call in m.get('tool_calls', [])}
             if candidates[0]['name'] not in called:
                 selected = candidates[0]
             elif replies[0]['name'] not in called:
@@ -116,7 +147,7 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
         response = {
             "id": f"owned-provider-response-{calls}", "object": "chat.completion",
             "created": 0, "model": model,
-            "choices": [{"index": 1 if fault == "wrong_choice" and candidates and not finished else 0,
+            "choices": [{"index": 1 if fault == "wrong_choice" and selected is not None else 0,
                          "finish_reason": reason, "message": message}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
