@@ -6,7 +6,7 @@ The enabled local executor runs only a fixed script against a test-owned file.
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -29,6 +29,8 @@ class NativePermissionCase:
     agent: object
     witness: Path
     http: httpx2.AsyncClient
+    approval_timeout_seconds: float = 10
+    _calls: list[asyncio.Task] = field(default_factory=list, repr=False)
 
     @property
     def compute(self):
@@ -77,8 +79,27 @@ class NativePermissionCase:
         return [row for row in await self.security.permission_store.get_audit_log()
                 if row["feature"] in owners and row["tool"] == "run_script"]
 
+    def start(self, entrypoint, script):
+        call = asyncio.create_task(self.invoke(entrypoint, script))
+        self._calls.append(call)
+        return call
+
+    async def retire_calls(self):
+        calls = tuple(self._calls)
+        try:
+            for call in calls:
+                if not call.done():
+                    call.cancel()
+            if calls:
+                done, pending = await asyncio.wait(calls, timeout=10)
+                assert not pending, "Native permission case retained invocation tasks after bounded cleanup"
+                await asyncio.gather(*done, return_exceptions=True)
+                self._calls.clear()
+        finally:
+            self.security.approval_queue.cancel_all()
+
     async def next_approval(self, call):
-        async with asyncio.timeout(10):
+        async with asyncio.timeout(self.approval_timeout_seconds):
             while not self.security.approval_queue.pending_requests:
                 if call.done():
                     await call
@@ -103,6 +124,7 @@ async def native_permission_case(
     monkeypatch.setenv("KESTREL_COMPUTE_ALLOW_DOCKER", "false")
     monkeypatch.setenv("KESTREL_ALLOW_LOCAL_COMPUTE", "true")
     monkeypatch.setenv("KESTREL_COMPUTE_AUTO_APPROVE_RISK", "101")
+    monkeypatch.setenv("KESTREL_COMPUTE_MAX_TIMEOUT", "30")
     monkeypatch.setenv("KESTREL_TEST_AUTO_APPROVE", "false")
     monkeypatch.setenv("KESTREL_TEST_INSTANCE_AUTO_APPROVE", "false")
     (tmp_path / "kestrel.toml").write_text('[llm]\nroute_priority=[]\n')
@@ -123,16 +145,19 @@ async def native_permission_case(
                 transport=httpx2.ASGITransport(app=app), base_url="https://owned-console.invalid",
                 headers={"X-API-Key": credential},
             ) as http:
-                yield NativePermissionCase(agent, tmp_path / "owned-process-effects", http)
+                case = NativePermissionCase(agent, tmp_path / "owned-process-effects", http)
+                try:
+                    yield case
+                finally:
+                    await case.retire_calls()
 
     yield create
 
 
 @pytest.fixture
 def native_permission_inherited_environment(request, monkeypatch):
-    setting = getattr(request, "param", None)
-    if setting is not None:
-        monkeypatch.setenv(setting, "true")
+    for key, value in (getattr(request, "param", None) or {}).items():
+        monkeypatch.setenv(key, value)
 
 
 @pytest.mark.asyncio
@@ -158,10 +183,11 @@ async def test_native_approval_rate_budget_rejects_excess_unknown_decisions(nati
     (PermissionLevel.DENY, "auto_denied", None),
     (PermissionLevel.ALLOW, "auto_allowed", None),
     (PermissionLevel.ASK, "no_approver", None),
-    (PermissionLevel.ASK, "no_approver", "KESTREL_TEST_AUTO_APPROVE"),
-    (PermissionLevel.ASK, "no_approver", "KESTREL_TEST_INSTANCE_AUTO_APPROVE"),
+    (PermissionLevel.ASK, "no_approver", {"KESTREL_TEST_AUTO_APPROVE": "true"}),
+    (PermissionLevel.ASK, "no_approver", {"KESTREL_TEST_INSTANCE_AUTO_APPROVE": "true"}),
+    (PermissionLevel.ALLOW, "auto_allowed", {"KESTREL_COMPUTE_MAX_TIMEOUT": "20"}),
 ], indirect=["native_permission_inherited_environment"],
-    ids=["deny", "allow", "headless-ask", "inherited-auto", "inherited-instance-auto"])
+    ids=["deny", "allow", "headless-ask", "inherited-auto", "inherited-instance-auto", "inherited-ceiling"])
 async def test_native_entrypoints_share_permission_before_actual_process_effect(
     native_permission_case, entrypoint, permission, decision,
 ):
@@ -190,13 +216,10 @@ async def test_native_one_shot_approval_cannot_authorize_another_process_effect(
     native_permission_case, entrypoint,
 ):
     async with native_permission_case(is_test_instance=False) as case:
-        queue = case.security.approval_queue
         await case.security.permission_store.set_permission("ComputeFeature", "run_script", PermissionLevel.ASK)
         first = await case.stage_script()
-        calls = []
         try:
-            call = asyncio.create_task(case.invoke(entrypoint, first))
-            calls.append(call)
+            call = case.start(entrypoint, first)
             request = await case.next_approval(call)
             case.assert_effect_count(0)
             accepted = await asyncio.gather(
@@ -216,8 +239,7 @@ async def test_native_one_shot_approval_cannot_authorize_another_process_effect(
             assert replay.status_code == 404
 
             second = await case.stage_script()
-            following = asyncio.create_task(case.invoke(entrypoint, second))
-            calls.append(following)
+            following = case.start(entrypoint, second)
             new_request = await case.next_approval(following)
             assert new_request.id != request.id
             replay = await case.http.post("/api/security/approve", json={
@@ -233,8 +255,7 @@ async def test_native_one_shot_approval_cannot_authorize_another_process_effect(
             assert await case.compute.script_store.get_executions_for_script(second.id) == []
             assert sorted(row["decision"] for row in await case.audit()) == ["user_approved", "user_denied"]
         finally:
-            queue.cancel_all()
-            await asyncio.gather(*calls, return_exceptions=True)
+            await case.retire_calls()
 
 
 @pytest.mark.asyncio
@@ -247,7 +268,7 @@ async def test_native_http_rejects_wrong_credential_and_malformed_approval_scope
         queue = case.security.approval_queue
         await case.security.permission_store.set_permission("ComputeFeature", "run_script", PermissionLevel.ASK)
         script = await case.stage_script()
-        call = asyncio.create_task(case.invoke(entrypoint, script))
+        call = case.start(entrypoint, script)
         try:
             request = await case.next_approval(call)
             payload = {"approval_id": request.id, "approved": True, "scope": "once"}
@@ -267,8 +288,7 @@ async def test_native_http_rejects_wrong_credential_and_malformed_approval_scope
             assert await case.compute.script_store.get_executions_for_script(script.id) == []
             assert [row["decision"] for row in await case.audit()] == ["user_denied"]
         finally:
-            queue.cancel_all()
-            await asyncio.gather(call, return_exceptions=True)
+            await case.retire_calls()
 
 
 @pytest.mark.asyncio
@@ -278,13 +298,10 @@ async def test_native_approval_cannot_execute_a_replaced_feature_registration(
     native_permission_case, entrypoint,
 ):
     async with native_permission_case(is_test_instance=False) as case:
-        queue = case.security.approval_queue
         await case.security.permission_store.set_permission("ComputeFeature", "run_script", PermissionLevel.ASK)
         script = await case.stage_script()
-        calls = []
         try:
-            call = asyncio.create_task(case.invoke(entrypoint, script))
-            calls.append(call)
+            call = case.start(entrypoint, script)
             request = await case.next_approval(call)
             original = case.compute
             await case.agent._unregister_feature_runtime(original, unload=False)
@@ -302,8 +319,7 @@ async def test_native_approval_cannot_execute_a_replaced_feature_registration(
             case.assert_effect_count(0)
             assert await case.compute.script_store.get_executions_for_script(script.id) == []
 
-            fresh = asyncio.create_task(case.invoke(entrypoint, script))
-            calls.append(fresh)
+            fresh = case.start(entrypoint, script)
             new_request = await case.next_approval(fresh)
             assert new_request.id != request.id
             approved = await case.http.post("/api/security/approve", json={
@@ -315,5 +331,67 @@ async def test_native_approval_cannot_execute_a_replaced_feature_registration(
             assert len(records) == 1 and records[0].succeeded and not records[0].dry_run
             assert [row["decision"] for row in await case.audit()] == ["user_approved"] * 2
         finally:
-            queue.cancel_all()
-            await asyncio.gather(*calls, return_exceptions=True)
+            await case.retire_calls()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("entrypoint", ["command", "named-tool", "task-skill"])
+@pytest.mark.parametrize("driver", [
+    test_native_one_shot_approval_cannot_authorize_another_process_effect,
+    test_native_http_rejects_wrong_credential_and_malformed_approval_scope,
+    test_native_approval_cannot_execute_a_replaced_feature_registration,
+], ids=["one-shot", "invalid-scope", "stale-registration"])
+async def test_native_case_cleanup_joins_late_invocations_before_clearing_approvals(
+    native_permission_case, driver, entrypoint,
+):
+    # Delay only the test-owned invocation helper, never its production body.
+    entered, release, cleanup_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    owned = {}
+
+    @asynccontextmanager
+    async def gated_factory(**kwargs):
+        async with native_permission_case(**kwargs) as case:
+            case.approval_timeout_seconds = 0.05
+            original_invoke = case.invoke
+            original_cancel = case.security.approval_queue.cancel_all
+
+            async def held(selected_entrypoint, script):
+                owned["invocation"] = asyncio.current_task()
+                entered.set()
+                await release.wait()
+                return await original_invoke(selected_entrypoint, script)
+
+            def observe_cancel():
+                cleanup_started.set()
+                return original_cancel()
+
+            case.invoke = held
+            case.security.approval_queue.cancel_all = observe_cancel
+            owned["case"] = case
+            yield case
+
+    owner = asyncio.create_task(driver(gated_factory, entrypoint))
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await asyncio.wait_for(cleanup_started.wait(), 10)
+        release.set()
+        async with asyncio.timeout(30):
+            while not owner.done() and not owned["case"].security.approval_queue.pending_requests:
+                await asyncio.sleep(0.01)
+        assert owner.done(), "Native test cleanup retained an unfinished invocation which queued ASK after cleanup"
+        result, = await asyncio.gather(owner, return_exceptions=True)
+        assert isinstance(result, TimeoutError), "Retirement must preserve the original approval observation failure"
+        assert owned["invocation"].done()
+        assert not owned["case"].security.approval_queue.pending_requests
+        owned["case"].assert_effect_count(0)
+    finally:
+        release.set()
+        invocation = owned.get("invocation")
+        if invocation is not None:
+            if not invocation.done():
+                invocation.cancel()
+            await asyncio.gather(invocation, return_exceptions=True)
+        if "case" in owned:
+            owned["case"].security.approval_queue.cancel_all()
+        await asyncio.gather(owner, return_exceptions=True)
