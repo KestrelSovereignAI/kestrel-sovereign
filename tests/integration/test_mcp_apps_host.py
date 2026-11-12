@@ -9,7 +9,7 @@ from uuid import uuid4
 import asyncio
 import json
 import os
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import socket
@@ -37,6 +37,41 @@ from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as nativ
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security import private_delivery
+
+
+@asynccontextmanager
+async def privacy_transition_probe(agent, monkeypatch):
+    """Observe a real transition's first blocked mutex/gate acquisition."""
+    attempted = asyncio.Event()
+    original_lock = agent._get_privacy_transition_lock
+    gate = agent._get_durable_persistence_gate()
+    transition = None
+
+    def observed_lock():
+        actual = original_lock()
+        if asyncio.current_task() is transition:
+            attempted.set()
+        return actual
+
+    async def change_privacy():
+        async with agent.privacy_transition():
+            pass
+
+    with monkeypatch.context() as patch:
+        patch.setattr(agent, '_get_privacy_transition_lock', observed_lock)
+        transition = asyncio.create_task(change_privacy())
+        try:
+            await asyncio.wait_for(attempted.wait(), 5)
+            inversion = gate._lock._waiting_writers != 0
+            if inversion:
+                transition.cancel()
+                await asyncio.gather(transition, return_exceptions=True)
+            yield transition, inversion
+        finally:
+            if not transition.done():
+                transition.cancel()
+            await asyncio.gather(transition, return_exceptions=True)
+
 from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware,
     RequestAuthenticationService,
@@ -481,3 +516,41 @@ async def test_host_configuration_preflight_requires_the_actual_audited_publicat
     with pytest.raises(TypeError, match="audited deferred results"):
         b.agent.validate_mcp_apps_host_configuration({"sandbox_url": "https://sandbox.apps.test/"})
     assert b.agent._mcp_apps_hosts == [b.host] and not b.host.retired
+
+
+async def test_app_call_takes_privacy_mutex_before_persistence_lease(apps_boundary, monkeypatch):
+    b = apps_boundary
+    reference = await b.publish(marker='opened-once')
+    opened = await b.open(reference)
+    assert opened.status_code == 200, opened.text
+    view_id = opened.json()['view_id']
+    tool = next(item for item in b.tools if item.tool.native_tool.name == 'mutate_marker')
+    await b.permissions.set_permission('mcp:owned-apps', tool.binding.name, PermissionLevel.ALLOW)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = b.host.authority.operation
+
+    @asynccontextmanager
+    async def held_operation(*args, **kwargs):
+        async with original(*args, **kwargs) as check:
+            entered.set()
+            await release.wait()
+            yield check
+
+    monkeypatch.setattr(b.host.authority, 'operation', held_operation)
+    call = asyncio.create_task(b.client.post('/api/mcp/apps/views/' + view_id + '/tools/call',
+        params={'session_id': 'original-chat'}, headers=b.headers(),
+        json={'name': 'mutate_marker', 'arguments': {'marker': 'continued-once'},
+            'operation_id': uuid4().hex}))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        async with privacy_transition_probe(b.agent, monkeypatch) as (transition, inversion):
+            release.set()
+            result = await asyncio.wait_for(call, 5)
+            if not inversion:
+                await asyncio.wait_for(transition, 5)
+            assert not inversion, 'MCP App call took the shared persistence lease before the privacy mutex'
+            assert result.status_code == 200, result.text
+            assert b.markers == ['opened-once', 'continued-once']
+    finally:
+        release.set()
+        await asyncio.gather(call, return_exceptions=True)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -111,6 +111,7 @@ class _Reader:
     caller: CallerContext
     session_id: str
     authentication: object
+    borrowed: AsyncExitStack = field(default_factory=AsyncExitStack, repr=False)
     active: bool = True
     baseline_check: Callable[[], None] | None = None
     physical: _PhysicalView | None = None
@@ -280,7 +281,8 @@ class MCPAppsHost:
                     check_current=check_current, authority_gate=self._gate):
                 token = self._reader.set(reader)
                 try:
-                    yield context
+                    async with reader.borrowed:
+                        yield context
                 finally:
                     try:
                         if reader.opened_id is not None and not reader.delivered:
@@ -295,6 +297,8 @@ class MCPAppsHost:
     @asynccontextmanager
     async def _operation(self, context, action):
         reader = self._reader.get()
+        if action is _Action.CALL:
+            await reader.borrowed.enter_async_context(self.agent._get_privacy_transition_lock())
         async with self.authority.operation(context, action, self._agent_id) as baseline:
             reader.baseline_check = baseline
             def check():

@@ -1,6 +1,7 @@
 """Actual Core credentials, native MCP wire, approvals, SQL and external effects."""
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +16,7 @@ from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation
 from kestrel_sovereign._async_ownership import raise_owned_outcome
 
 from kestrel_sovereign.features.security.permissions import PermissionLevel
-from tests.integration.test_mcp_apps_host import ALICE, BOB, apps_boundary
+from tests.integration.test_mcp_apps_host import ALICE, BOB, apps_boundary, privacy_transition_probe
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(30)]
 
@@ -62,6 +63,49 @@ async def open_input_app(b):
     return view_id
 
 
+@pytest.mark.parametrize(('apps_boundary', 'app_input'), [
+    ({'operator_input': 'form'}, False),
+    ({'operator_input': 'form', 'input_tool': 'mutate_marker'}, True),
+], indirect=['apps_boundary'])
+async def test_input_response_takes_privacy_mutex_before_persistence_lease(
+        apps_boundary, app_input, monkeypatch):
+    b = apps_boundary
+    # Select the actual paused form through the same native routes as the UI.
+    if app_input:
+        row, _ = await pause_app(b)
+    else:
+        await pause(b)
+        row, = (await pending(b)).json()['inputs']
+    host = b.feature._input_host
+    read, release = asyncio.Event(), asyncio.Event()
+    original_read = host.store.read_for
+
+    async def held_read(*args, **kwargs):
+        result = await original_read(*args, **kwargs)
+        read.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(host.store, 'read_for', held_read)
+    response = asyncio.create_task(answer(b, row))
+    try:
+        await asyncio.wait_for(read.wait(), 5)
+        async with privacy_transition_probe(b.agent, monkeypatch) as (transition, inversion):
+            release.set()
+            continued = await asyncio.wait_for(response, 5)
+            if not inversion:
+                await asyncio.wait_for(transition, 5)
+            assert not inversion, (
+                'MCP input response retained a shared persistence lease before its privacy mutex, '
+                'letting a real privacy transition form the opposite lock order')
+            assert continued.status_code == 200, continued.text
+            assert continued.json()['state'] == 'RESOLVED'
+            assert len(wire(b)) == 2
+    finally:
+        release.set()
+        await asyncio.gather(response, return_exceptions=True)
+
+
 async def pause_app(b):
     view_id = await open_input_app(b)
     called = await b.client.post('/api/mcp/apps/views/' + view_id + '/tools/call',
@@ -77,7 +121,7 @@ async def pause_app(b):
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form', 'input_tool': 'mutate_marker',
     'hold_first_input': True}], indirect=True)
-async def test_parallel_app_calls_recheck_pending_input_before_second_native_dispatch(apps_boundary):
+async def test_parallel_app_calls_recheck_pending_input_before_second_native_dispatch(apps_boundary, monkeypatch):
     b = apps_boundary
     view_id = await open_input_app(b)
     original_view = b.host._views[view_id].view
@@ -89,22 +133,27 @@ async def test_parallel_app_calls_recheck_pending_input_before_second_native_dis
     second = None
     try:
         await asyncio.wait_for(b.input_barrier[0].wait(), 5)
+        attempted = asyncio.Event()
+        original_operation = b.host._operation
+
+        @asynccontextmanager
+        async def observed_operation(*args, **kwargs):
+            attempted.set()
+            async with original_operation(*args, **kwargs) as check:
+                yield check
+
+        monkeypatch.setattr(b.host, '_operation', observed_operation)
         second = asyncio.create_task(call('must-not-start'))
-        async with asyncio.timeout(5):
-            while len(original_view._calls) != 2:
-                assert not second.done(), 'The parallel request did not enter the original View'
-                await asyncio.sleep(.01)
-        # Core serializes effects through its original privacy mutex. The
-        # second call is admitted to the View before the first checkpoint,
-        # then must revalidate pending input after that real mutex wait.
+        await asyncio.wait_for(attempted.wait(), 5)
+        assert not second.done() and len(original_view._calls) == 1
+        # The second real HTTP request now waits at the host mutex, before
+        # entering its View child. It must observe the first input checkpoint
+        # when that original mutex admission resumes.
         b.input_barrier[1].set()
         response = await asyncio.wait_for(second, 5)
-        assert response.status_code == 200, response.text
-        assert response.json() == {
-            'content': [{'type': 'text', 'text':
-                'The host refused this MCP App invocation before a native result was confirmed'}],
-            'isError': True, 'resultType': 'complete',
-        }, 'A concurrent App call created a second operator wait before the first checkpoint'
+        assert response.status_code == 404, response.text
+        assert response.json() == {'error': {'code': 'mcp_app_unavailable'}}, (
+            'A concurrent App call passed the original pending-input View fence')
         assert len(wire(b)) == 1
         initial = await asyncio.wait_for(first, 5)
         assert initial.status_code == 202, initial.text
