@@ -124,7 +124,6 @@ async def test_parent_retires_original_gateway_after_forced_host_exit(
     reader_scope = ExitStack()
     try:
         if before_readiness:
-            ready = str(c.home / 'host-2-ready.json')
             async with asyncio.timeout(30):
                 while original is None:
                     assert not task.done(), 'Host failed before actual Gateway admission'
@@ -183,7 +182,8 @@ async def test_parent_retires_original_gateway_after_forced_host_exit(
             reader_scope.close()
         error, = await asyncio.gather(task, return_exceptions=True)
         assert isinstance(error, AssertionError), repr(error)
-        assert not original.is_running(), 'Host fixture abandoned its original admitted native Gateway'
+        assert not original.is_running(), (
+            'Host fixture abandoned its original admitted native Gateway', repr(error))
         if deferred_reader and configuration.exists():
             assert str(error) == 'Retain native profile until its owned peers retire', repr(error)
             assert reader.done() and await asyncio.to_thread(finished_reader.wait, 10)

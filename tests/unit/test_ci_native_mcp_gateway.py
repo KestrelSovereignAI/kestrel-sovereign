@@ -34,7 +34,9 @@ def test_native_gateway_permission_campaign_cannot_drop_its_cli_or_real_cases():
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform == 'win32', reason='Original POSIX process retirement requires process groups')
-@pytest.mark.parametrize('exit_phase', ['zombie', 'group-lookup', 'birth-lookup'])
+@pytest.mark.parametrize('exit_phase', [
+    'zombie', 'group-lookup', 'birth-lookup', 'command-line-withdrawn', 'executable-withdrawn',
+])
 async def test_original_admitted_gateway_zombie_is_joined_before_receipt_release(tmp_path, monkeypatch, exit_phase):
     """A real exited-but-unreaped process still has an original waiter."""
     import asyncio
@@ -88,6 +90,22 @@ async def test_original_admitted_gateway_zombie_is_joined_before_receipt_release
                     boundary.setattr(os, 'getpgid', after_original_exit)
                     assert peer.admitted_processes(record) == [original], (
                         'Native group lookup lost the birth-verified original receipt')
+            elif exit_phase in ('command-line-withdrawn', 'executable-withdrawn'):
+                # Linux reads an exiting process's command line and executable
+                # as empty once it has released its memory, before /proc calls
+                # it a zombie. No portable exit stops in that window, so the
+                # original reads here exactly what /proc reports during it.
+                name, withdrawn = (
+                    ('cmdline', []) if exit_phase == 'command-line-withdrawn' else ('exe', ''))
+                native_read = getattr(psutil.Process, name)
+
+                def exiting(process):
+                    return withdrawn if process.pid == child.pid else native_read(process)
+
+                with monkeypatch.context() as boundary:
+                    boundary.setattr(psutil.Process, name, exiting)
+                    assert peer.admitted_processes(record) == [original], (
+                        'An exiting original lost its receipt to withdrawn metadata')
             else:
                 native_birth = psutil.Process.create_time
 

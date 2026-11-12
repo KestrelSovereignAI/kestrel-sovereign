@@ -125,8 +125,16 @@ async def test_sqlite_worker_retirement_is_owned_until_the_worker_exits(tmp_path
     from kestrel_sovereign.storage.db import SQLiteBackend
     from kestrel_sovereign.storage.db import sqlite as sqlite_backend
     from tests.utils.aiosqlite_workers import (
+        CloseStage,
         aiosqlite_worker,
         delay_aiosqlite_worker_exit,
+        observe_bounded_close_stages,
+    )
+    from tests.utils.virtual_clock import (
+        HANG_GUARD_SECONDS,
+        advanceable_loop_clock,
+        await_within_hang_guard,
+        wait_for_thread_event,
     )
 
     release = threading.Event()
@@ -134,24 +142,52 @@ async def test_sqlite_worker_retirement_is_owned_until_the_worker_exits(tmp_path
     selected = []
     with delay_aiosqlite_worker_exit(
         release, delayed, should_delay=lambda worker: worker in selected
-    ) as workers:
+    ) as workers, observe_bounded_close_stages() as stages:
         backend = SQLiteBackend(str(tmp_path / "retirement.db"))
         await backend.connect()
         instance = TaskManager.from_backend(
             backend, scope=NativeRecipientScope("did:test:recipient"), owns_backend=True,
         )
         await instance.initialize()
-        worker = aiosqlite_worker(backend._connection)
+        connection = backend._connection
+        worker = aiosqlite_worker(connection)
         selected.append(worker)
-        monkeypatch.setattr(sqlite_backend, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", 0.01)
-        try:
-            with pytest.raises(BackendError):
+        # No real close comes near this budget. The deadline expires only when
+        # the clock is moved past it, once the close waits on the held worker:
+        # on a loaded host a real 10 ms deadline expired before the worker
+        # had even acknowledged Connection.close().
+        monkeypatch.setattr(
+            sqlite_backend, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", 2 * HANG_GUARD_SECONDS
+        )
+        closing = None
+        with advanceable_loop_clock() as clock:
+            try:
+                closing = asyncio.create_task(instance.close())
+                await stages.reached(connection, CloseStage.WORKER_EXIT)
+                assert not closing.done()
+                clock.advance(sqlite_backend._minimum_close_timeout_s())
+                with pytest.raises(BackendError):
+                    await await_within_hang_guard(
+                        closing, step="the close after its deadline passed"
+                    )
+                await wait_for_thread_event(
+                    delayed, step="the worker holding at its final return"
+                )
+                assert workers == [worker] and backend.connection_retirement_pending
+                with pytest.raises(BackendError, match="still retiring"):
+                    await instance.close()
+            finally:
+                release.set()
+                # Settle every task the skipped clock armed before leaving it.
+                await asyncio.gather(
+                    *(
+                        retained.retirement_task
+                        for retained in backend._retired_connection_closes.values()
+                        if retained.retirement_task is not None
+                    ),
+                    *([closing] if closing is not None else []),
+                    return_exceptions=True,
+                )
+                await asyncio.to_thread(worker.join, HANG_GUARD_SECONDS)
                 await instance.close()
-            assert workers == [worker] and backend.connection_retirement_pending
-            with pytest.raises(BackendError, match="still retiring"):
-                await instance.close()
-        finally:
-            release.set()
-            worker.join(timeout=5)
-            await instance.close()
     assert not worker.is_alive() and not backend.connection_retirement_pending
