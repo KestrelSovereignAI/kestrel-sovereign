@@ -155,10 +155,14 @@ def _native(value):
 
 
 def _error(error, prepared):
-    from kestrel_sovereign.api_errors import api_error_response, tool_effect_api_error
+    from kestrel_sovereign.api_errors import (
+        api_error_response, execution_control_api_error, tool_effect_api_error,
+    )
 
-    failure = tool_effect_api_error(error)
-    if failure is not None and not prepared:
+    failure = execution_control_api_error(error)
+    if failure is None and not prepared:
+        failure = tool_effect_api_error(error)
+    if failure is not None:
         return api_error_response(status_code=failure.status_code, code=failure.code,
             message=failure.message, details=failure.details)
     if prepared or isinstance(error, (ResourceOutcomeUnknown, TimeoutError)):
