@@ -190,7 +190,7 @@ async def test_native_live_console_retracts_only_original_turn_prose(
 
     @b.app.post('/api/owned-console-bootstrap')
     async def bootstrap():
-        return {'parts': [{'type': 'notice', 'data': {'body': 'PRIOR-CONVERSATION-MUST-REMAIN'}}]}
+        return {'parts': [{'type': 'notice', 'data': 'PRIOR-CONVERSATION-MUST-REMAIN'}]}
 
     @b.app.post('/api/owned-release-stream')
     async def release(request: Request):
@@ -243,6 +243,8 @@ const transport=[]; page.on('response',r=>transport.push([r.status(),r.url()]));
 try {await page.goto(process.argv[1]);
  await page.waitForFunction(()=>window.ownedConsoleReady || window.ownedConsoleFailure);
  if (await page.evaluate(()=>window.ownedConsoleFailure)) throw new Error(await page.evaluate(()=>window.ownedConsoleFailure));
+ await page.getByText('PRIOR-CONVERSATION-MUST-REMAIN',{exact:true}).waitFor({state:'visible'});
+ await page.getByText('OTHER-PANE-MUST-REMAIN',{exact:true}).waitFor({state:'visible'});
  await page.evaluate(()=>window.startOwnedStream());
  await page.waitForFunction(()=>document.body.textContent.includes('UNFINISHED-PRE-INPUT-PROSE'));
  await page.evaluate(()=>window.releaseOwnedStream());
@@ -264,7 +266,7 @@ try {await page.goto(process.argv[1]);
         assert child.returncode == 0, errors.decode()
         receipt = json.loads(output)
         assert receipt['unfinishedRemoved'], 'Live Console retained unfinished provider prose after the input checkpoint'
-        assert receipt['waiting'] and receipt['prior'] and receipt['other']
+        assert receipt['waiting'] and receipt['prior'] and receipt['other'], receipt
         assert receipt['forms'] == 1, 'Live Console duplicated its original pending form card'
         assert receipt['toolCards'] > 0 and receipt['errors'] == []
         assert b.markers == ['completed-before-input'] and len(wire(b)) == 1

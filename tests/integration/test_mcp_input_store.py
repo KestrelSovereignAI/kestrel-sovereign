@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 import pytest_asyncio
+from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.mcp_input_store import (
     MCPInputBinding, MCPInputClaim, MCPInputConflict, MCPInputIntegrityError, MCPInputStore,
@@ -93,6 +94,27 @@ async def test_expiry_release_and_original_response_admission_share_one_capacity
     finally:
         release.set()
         await asyncio.gather(claiming, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_missing_admission_scope_fails_before_checkpoint_write(custody):
+    original, _, _ = custody
+    await original.database.execute('DELETE FROM mcp_input_scopes WHERE scope=?', (original.scope,))
+    with pytest.raises(TransactionError, match='admission scope is missing') as caught:
+        await create(original)
+    assert isinstance(caught.value.__cause__, MCPInputIntegrityError)
+    assert await original.database.fetchone('SELECT COUNT(*) FROM mcp_inputs') == (0,)
+
+
+@pytest.mark.asyncio
+async def test_invalid_admission_time_fails_before_checkpoint_write(custody):
+    original, _, _ = custody
+    await original.database.execute('UPDATE mcp_input_scopes SET observed_at=? WHERE scope=?',
+        (float('inf'), original.scope))
+    with pytest.raises(TransactionError, match='admission time is invalid') as caught:
+        await create(original)
+    assert isinstance(caught.value.__cause__, MCPInputIntegrityError)
+    assert await original.database.fetchone('SELECT COUNT(*) FROM mcp_inputs') == (0,)
 
 
 @pytest.mark.asyncio
