@@ -16,7 +16,9 @@ from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation
 from kestrel_sovereign._async_ownership import raise_owned_outcome
 
 from kestrel_sovereign.features.security.permissions import PermissionLevel
-from tests.integration.test_mcp_apps_host import ALICE, BOB, apps_boundary, privacy_transition_probe
+from tests.integration.test_mcp_apps_host import (
+    ALICE, BOB, apps_boundary as apps_boundary, privacy_transition_probe,
+)
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(30)]
 
@@ -687,6 +689,11 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
     assert all('UNFINISHED' not in str(value.response_text) for value in stopped)
     current, = (await pending(b)).json()['inputs']
     if streaming and audit is None:
+        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+
+        live_parts = [part for part in _parse_stream_sentinels(''.join(response.json()['chunks']))[2]
+            if part['type'] == 'mcp_input']
+        assert len(live_parts) == 1, 'Input suspension retransmitted a form part already delivered in the live stream'
         cards = [part for part in saved['metadata'].get('parts', []) if part['type'] == 'mcp_input']
         assert len(cards) == 1 and cards[0]['data']['reference'] == current['request_id'], (
             'Input suspension lost or duplicated its actual pending form part in durable history')

@@ -2,7 +2,7 @@
 
 import asyncio
 import base64
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 
 import pytest
@@ -62,6 +62,37 @@ def checkpoint():
 
 async def create(store, **changes):
     return await store.create(binding(**changes), checkpoint(), expires_at=1000, now=100)
+
+
+@pytest.mark.asyncio
+async def test_expiry_release_and_original_response_admission_share_one_capacity_fence(custody, monkeypatch):
+    _, reopen, _ = custody
+    original, fresh = await reopen(max_pending=1), await reopen(max_pending=1)
+    first = await create(original)
+    entered, release = asyncio.Event(), asyncio.Event()
+    transaction = original.write_transaction
+
+    @asynccontextmanager
+    async def held_admission():
+        entered.set()
+        await release.wait()
+        async with transaction():
+            yield
+
+    monkeypatch.setattr(original, 'write_transaction', held_admission)
+    claiming = asyncio.create_task(original.claim_response(first, {}, now=999))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        replacement = await fresh.create(binding(operation_id='after-original-expiry'), checkpoint(),
+            now=1001, expires_at=3000)
+        release.set()
+        outcome, = await asyncio.gather(claiming, return_exceptions=True)
+        assert isinstance(outcome, MCPInputConflict), (
+            'An expired reservation was reclaimed after another native writer consumed its released capacity')
+        assert await fresh.list_for(first.binding.principal_id, first.binding.session_id, now=1002) == (replacement,)
+    finally:
+        release.set()
+        await asyncio.gather(claiming, return_exceptions=True)
 
 
 @pytest.mark.asyncio

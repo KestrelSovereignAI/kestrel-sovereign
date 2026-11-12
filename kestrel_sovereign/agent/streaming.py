@@ -2006,16 +2006,24 @@ class StreamingMixin:
                                 tool_results, session_id=session_id)
                             kept = _parse_stream_sentinels(''.join(full_response))[2]
                             kept.extend(_parse_stream_sentinels(''.join(tool_response_chunks))[2])
-                            parts = [{key: value for key, value in part.items() if key not in {'pos', 'seq'}}
+                            kept = [{key: value for key, value in part.items() if key not in {'pos', 'seq'}}
                                 for part in kept]
-                            parts.extend(drain_parts())
-                            tool_response_chunks = [chunk.content]
+                            fresh_parts = drain_parts()
+                            tool_response_chunks = []
                             input_followup = True
                             pre_tool_text = ''
                             pre_tool_prose_snapshot = ''
                             pre_parts = []
                             pending_visible_boundary = False
                             join_separator = ''
+                            # Rebase previously delivered parts for history;
+                            # only newly drained parts belong on the live wire.
+                            for _sentinel in _flush_part_list(kept, tool_response_chunks):
+                                pass
+                            for sentinel in _flush_part_list(fresh_parts, tool_response_chunks):
+                                if not buffer_audit:
+                                    yield sentinel
+                            tool_response_chunks.append(chunk.content)
                             if not buffer_audit:
                                 entry = tool_results[-1]
                                 marker = ToolCallStarted(index=len(tool_results)-1,
@@ -2024,9 +2032,6 @@ class StreamingMixin:
                                     session_id=session_id, request_id=request_id)
                                 yield _build_revise_sentinel(marker)
                                 yield chunk.content
-                            for sentinel in _flush_part_list(parts, tool_response_chunks):
-                                if not buffer_audit:
-                                    yield sentinel
                             continue
                         if isinstance(chunk, OwnedTaskHandoff):
                             deferred_tool_batch_cancellation = chunk
