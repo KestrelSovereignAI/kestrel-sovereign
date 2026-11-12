@@ -118,17 +118,23 @@ class _Reader:
     delivered: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class _OwnedAppCall:
     task: asyncio.Task
-    active: bool = True
+    cancel: Callable[[asyncio.Task], object] = field(repr=False)
+    active: bool = field(default=True, init=False)
+
+    def _cancel(self, task):
+        from kestrel_sovereign.callbacks import require_callback_result
+
+        require_callback_result(self.cancel(task))
 
     async def wait(self):
         from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 
         if not self.active:
             raise ResourceConflict('Original MCP App call ownership ended')
-        outcome = await await_owned_task(self.task, cancel_on_caller_cancellation=True)
+        outcome = await await_owned_task(self.task, cancel_on_caller_cancellation=self._cancel)
         return raise_owned_outcome(outcome, operation='MCP App call', retain_originals=True)
 
 
@@ -427,7 +433,7 @@ class MCPAppsHostMixin:
     supports_owned_mcp_app_calls = True
 
     @asynccontextmanager
-    async def mcp_app_call_scope(self, operation, *, name):
+    async def mcp_app_call_scope(self, operation, *, name, cancel):
         """Own one View child through its native execution and physical join."""
         from kestrel_sovereign._async_ownership import (
             OwnedCallbackScope, await_owned_task, bind_owned_coordinator,
@@ -435,9 +441,11 @@ class MCPAppsHostMixin:
         from kestrel_sovereign.callbacks import invoke_host_callback
         from kestrel_sovereign.execution_custody import execution_observation_error
 
+        if not callable(cancel):
+            raise TypeError('MCP App calls require their original cancellation policy')
         with bind_owned_coordinator(self._get_privacy_transition_lock()):
             scope = OwnedCallbackScope()
-            owner = _OwnedAppCall(scope.start(lambda: invoke_host_callback(operation), name=name))
+            owner = _OwnedAppCall(scope.start(lambda: invoke_host_callback(operation), name=name), cancel)
             pending = None
             try:
                 yield owner
@@ -445,7 +453,7 @@ class MCPAppsHostMixin:
                 pending = error
                 raise
             finally:
-                owner.active = False
+                object.__setattr__(owner, 'active', False)
                 scope.close()
                 outcome = await await_owned_task(owner.task)
                 terminal = execution_observation_error(pending, outcome.error, outcome.cancellation)
