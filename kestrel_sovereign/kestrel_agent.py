@@ -9411,7 +9411,13 @@ Expected Duration: {expected_duration}
         conv_store = getattr(self._raw_storage, "conversation", None)
         if conv_store is None:
             return
-        messages = await conv_store.get_messages_by_ids([user_message_id, assistant_message_id])
+        try:
+            messages = await conv_store.get_messages_by_ids([user_message_id, assistant_message_id])
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logging.getLogger(__name__).exception("Post-response receipt lookup failed")
+            return
         rows = {message["id"]: message for message in messages}
         if (
             set(rows) != {user_message_id, assistant_message_id}

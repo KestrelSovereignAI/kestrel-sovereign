@@ -160,7 +160,9 @@ async def test_memory_tagging_retains_the_original_native_metadata_lease_control
         finally:
             tasks = tuple(owner._background_tasks)
             if tasks:
-                await asyncio.gather(*tasks)
+                await asyncio.gather(*tasks, return_exceptions=True)
+                for task in tasks:
+                    owner._finish_background_task(task)
     if kind == "ordinary-constraint":
         assert observed and caught is None and not failed_connections
         assert all(not is_execution_control_error(error) for error in observed)
@@ -456,3 +458,53 @@ async def test_memory_graph_routing_retains_original_native_schema_control(nativ
     assert caught is not None and is_execution_control_error(caught) and fault.error in tuple(_explicit_control_chain(caught)), (
         "Memory graph routing discarded its original native schema control"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["ordinary-query", "native-reset"])
+async def test_memory_receipt_lookup_preserves_controls_but_keeps_query_errors_advisory(
+    native_pipeline_owner, monkeypatch, kind,
+):
+    context = native_pipeline_owner
+    owner, n = context.owner, context.n
+    ordinary = kind == "ordinary-query"
+    if ordinary:
+        await n.pg_storage.db.execute(
+            "ALTER TABLE conversation_history RENAME COLUMN content TO owned_unreadable_content"
+        )
+    fault = observe_original_pg_release(monkeypatch, n.pg_storage.conversation,
+        "get_messages_by_ids", fail_reset=not ordinary)
+    owner._execution_custody = ExecutionCustody(ProcessRuntimeExecutionFence(n.did))
+    caught = None
+    try:
+        with bind_execution_runtime(owner):
+            try:
+                await owner._post_response_pipeline(user_message_id=context.user_id,
+                    assistant_message_id=context.assistant_id)
+            except (DatabaseError, ExecutionAuthorityError, BaseExceptionGroup, asyncio.CancelledError) as error:
+                caught = error
+            finally:
+                tasks = tuple(owner._background_tasks)
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    for task in tasks:
+                        owner._finish_background_task(task)
+    finally:
+        if ordinary:
+            await n.pg_storage.db.execute(
+                "ALTER TABLE conversation_history RENAME COLUMN owned_unreadable_content TO content"
+            )
+    assert fault.sources, "Receipt lookup did not reach the original native failure producer"
+    if ordinary:
+        assert not is_execution_control_error(fault.sources[0])
+        assert any(isinstance(source, asyncpg.UndefinedColumnError)
+            for source in _explicit_control_chain(fault.sources[0]))
+        assert caught is None and not owner._background_tasks, (
+            "An ordinary native receipt lookup failure escaped advisory enrichment"
+        )
+    else:
+        assert len(fault.failed_connections) == 1 and fault.failed_connections[0].is_closed()
+        assert is_execution_control_error(fault.sources[0]) and fault.error in tuple(_explicit_control_chain(fault.sources[0]))
+        assert caught is not None and is_execution_control_error(caught) and fault.error in tuple(_explicit_control_chain(caught)), (
+            "Receipt lookup discarded its original native lease control"
+        )
