@@ -329,6 +329,11 @@ class MCPInputHost:
     @asynccontextmanager
     async def _operation(self, context, action):
         reader = self._reader.get()
+        if action is _Action.RESPOND:
+            # Dispatch takes this mutex before the persistence gate. Retain
+            # its original span outside later App borrows, so they settle
+            # before closing the span joins their native owners.
+            await reader.borrowed.enter_async_context(self.agent._get_privacy_transition_lock())
         async with self.authority.operation(context, action, self._agent_id) as check:
             reader.check = check
             try:
