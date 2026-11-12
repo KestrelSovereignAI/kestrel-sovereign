@@ -554,3 +554,36 @@ async def test_app_call_takes_privacy_mutex_before_persistence_lease(apps_bounda
     finally:
         release.set()
         await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize('commit_outcome', ['committed', 'unknown'])
+async def test_native_app_audit_commit_preserves_reconciliation(apps_boundary, monkeypatch, commit_outcome):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    b = apps_boundary
+    reference = await b.publish()
+    opened = await b.open(reference)
+    assert opened.status_code == 200, opened.text
+    view_id = opened.json()['view_id']
+    tool = next(item for item in b.tools if item.tool.native_tool.name == 'mutate_marker')
+    await b.permissions.set_permission('mcp:owned-apps', tool.binding.name, PermissionLevel.ALLOW)
+    store = b.agent.observability_store
+    original = store.log_tool_dispatch
+
+    async def lost_acknowledgement(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise ExecutionCommitOutcomeError(commit_outcome)
+
+    monkeypatch.setattr(store, 'log_tool_dispatch', lost_acknowledgement)
+    response = await b.client.post('/api/mcp/apps/views/' + view_id + '/tools/call',
+        params={'session_id': 'original-chat'}, headers=b.headers(),
+        json={'name': 'mutate_marker', 'arguments': {'marker': 'native-effect-once'},
+              'operation_id': uuid4().hex})
+    assert b.markers == ['once', 'native-effect-once']
+    rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+    assert rows == [('success',), ('success',)]
+    assert response.status_code == 500, response.text
+    assert response.json()['error']['code'] == 'execution_control', (
+        'Native MCP App audit commit uncertainty lost its execution-control classification')
+    assert response.json()['error']['details'] == [{'commit_outcome': commit_outcome}]
+    assert 'Reconcile' in response.json()['error']['message']
