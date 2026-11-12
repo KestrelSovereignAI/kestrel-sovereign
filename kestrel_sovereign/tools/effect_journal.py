@@ -46,11 +46,11 @@ class ToolEffectInputRequired(ResourceConflict):
 
 
 class ToolInputSuspended(ToolEffectInputRequired):
-    """An original inline executor stopped at a confirmed human checkpoint.
+    """An original executor stopped at a confirmed human checkpoint.
 
     This is host control, not a provider answer or loss of execution authority.
-    Completed callbacks remain attached to their original live turn until the
-    provider's owned work has settled and its history consumer takes custody.
+    Inline callbacks remain attached to their original live turn until the
+    provider's owned work settles. Batch callers already own their receipts.
     """
 
     def __init__(self, turn, completed, scope):
@@ -64,7 +64,7 @@ class ToolInputSuspended(ToolEffectInputRequired):
         # ContextVars. Re-present the original revocable scope; never create
         # a replacement turn or treat its description as authorization.
         with self.scope.bind():
-            if current_tool_effect_turn(owner) is not self.turn or not self.turn.operator_input_refs:
+            if self.turn is None or current_tool_effect_turn(owner) is not self.turn or not self.turn.operator_input_refs:
                 raise ToolEffectJournalUnavailable('Original input suspension turn is unavailable')
             self.turn.require_live(owner)
             self.turn.require_confirmed()

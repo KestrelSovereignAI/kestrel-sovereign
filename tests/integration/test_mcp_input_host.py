@@ -571,8 +571,9 @@ async def test_followup_inline_input_stops_continuation_and_repair(
 @pytest.mark.parametrize('followup', [False, True])
 @pytest.mark.parametrize('streaming', [False, True])
 @pytest.mark.parametrize('audit', [None, 'allow', 'deny'])
+@pytest.mark.parametrize('dispatch', ['inline', 'batch'])
 async def test_first_stream_input_preserves_completed_receipts_without_accepting_unfinished_prose(
-        apps_boundary, monkeypatch, followup, streaming, audit):
+        apps_boundary, monkeypatch, followup, streaming, audit, dispatch):
     from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
@@ -616,6 +617,12 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
                 arguments={'marker': 'completed-before-input'})])
             return
         names = ('open_marker',) if followup else ('record_marker', 'open_marker')
+        if dispatch == 'batch':
+            yield LLMResponse(content='', stop_reason='tool_calls', tool_calls=[ToolCall(
+                id='owned-batch-' + str(index), name=registered[name].binding.name,
+                arguments={'marker': 'completed-before-input' if name == 'record_marker' else 'must-wait'})
+                for index, name in enumerate(names)])
+            return
         for index, name in enumerate(names):
             registered_tool = registered[name]
             try:
@@ -655,6 +662,7 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
     response = await b.client.post('/api/owned-first-stream-input', headers=b.headers())
     assert response.status_code == 200, response.text
     assert b.markers == ['completed-before-input'] and len(wire(b)) == 1
+    assert len(provider_calls) == (2 if followup else 1), 'An input suspension allowed an additional model call'
     assistants = [row for row in persisted if row['role'] == 'assistant']
     assert len(assistants) == 1
     saved = assistants[0]
@@ -671,15 +679,23 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
             for name in ('record_marker', 'open_marker')], 'Input suspension discarded completed inline tool receipts'
         assert len(stopped[0].tool_results) == 2
     else:
-        assert 'tool_results' not in (saved.get('metadata') or {})
+        assert not {'tool_results', 'parts', 'tool_events', 'pre_tool_reasoning'} & (saved.get('metadata') or {}).keys()
         assert stopped[0].tool_results is None and stopped[0].tool_calls is None
         assert len(audited) == 1 and 'waiting for operator input' in audited[0].response_text
+        assert 'UNFINISHED' not in audited[0].response_text, 'Unfinished batch prose entered the waiting checkpoint audit'
         assert 'UNFINISHED' not in json.dumps(response.json()), 'Buffered input suspension leaked unfinished prose'
     assert all('UNFINISHED' not in str(value.response_text) for value in stopped)
-    assert len((await pending(b)).json()['inputs']) == 1
-    assert len(suspended) == 1 and not suspended[0].turn.live
-    with pytest.raises((ToolEffectJournalUnavailable, ExecutionAuthorityError)):
-        suspended[0].require_current(b.agent)
+    current, = (await pending(b)).json()['inputs']
+    if streaming and audit is None:
+        cards = [part for part in saved['metadata'].get('parts', []) if part['type'] == 'mcp_input']
+        assert len(cards) == 1 and cards[0]['data']['reference'] == current['request_id'], (
+            'Input suspension lost or duplicated its actual pending form part in durable history')
+    if dispatch == 'inline':
+        assert len(suspended) == 1 and not suspended[0].turn.live
+        with pytest.raises((ToolEffectJournalUnavailable, ExecutionAuthorityError)):
+            suspended[0].require_current(b.agent)
+    else:
+        assert suspended == []
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)

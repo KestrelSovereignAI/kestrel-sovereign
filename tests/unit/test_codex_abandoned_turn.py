@@ -148,6 +148,67 @@ async def _stream(adapter: CodexAdapter, **kwargs: Any) -> List[Any]:
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('streamed', [False, True])
+@pytest.mark.parametrize('interruption', ['acknowledged', 'missing-turn-id', 'failed', 'malformed-ack'])
+async def test_input_suspension_retires_the_still_running_thread_before_next_turn(
+        streamed, interruption, monkeypatch, tmp_path):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_journal import ToolInputSuspended, tool_input_suspension
+
+    signal = ToolInputSuspended(None, [], None)
+
+    class SuspendingApp(FakeCodexAppServer):
+        async def request(self, method, params=None, *, timeout=120):
+            if method == 'turn/interrupt':
+                self.interrupts.append(params)
+                assert self._running[params['threadId']] == 'input'
+                if interruption == 'failed':
+                    raise CodexAppServerError('owned interruption acknowledgement unavailable')
+                del self._running[params['threadId']]
+                return False if interruption == 'malformed-ack' else {}
+            result = await super().request(method, params, timeout=timeout)
+            if method == 'turn/start' and interruption != 'missing-turn-id':
+                return {'turn': {'id': 'owned-turn-' + str(len(self.turns))}}
+            return result
+
+        def register_server_request_handler(self, method, handler, *, thread_id=None):
+            if method == 'item/tool/call':
+                self.tool_handler = handler
+            return lambda: None
+
+        async def iter_turn_events(self, sink, *, thread_id=None, cancel_token=None):
+            if self._running[thread_id] == 'input':
+                await self.tool_handler(dict(threadId=thread_id, tool='owned_tool', arguments={}))
+                raise AssertionError('A suspended input callback returned as ordinary provider output')
+            async for event in super().iter_turn_events(sink, thread_id=thread_id, cancel_token=cancel_token):
+                yield event
+
+    app = SuspendingApp('input', 'answer')
+    app.interrupts = []
+    adapter = _adapter(app, monkeypatch, tmp_path)
+
+    async def execute(name, arguments):
+        raise signal
+
+    with pytest.raises(Exception) as raised:
+        await (_stream if streamed else _ask)(adapter, tool_executor=execute,
+            tools=[{'type': 'function', 'function': {'name': 'owned_tool', 'description': 'owned tool',
+                'parameters': {'type': 'object'}}}])
+    assert signal in tuple(execution_evidence_carriers(raised.value))
+    if interruption == 'acknowledged':
+        assert app.interrupts == [{'threadId': app.threads[0], 'turnId': 'owned-turn-1'}], (
+            'Input suspension left remote Codex inference running without requesting interruption')
+        assert app.threads[0] not in app._running
+        assert tool_input_suspension(raised.value) is signal
+    else:
+        assert tool_input_suspension(raised.value) is None, 'Unconfirmed Codex interruption was accepted as a clean suspension'
+    assert SESSION not in adapter._session_threads, 'Input suspension left its unfinished Codex thread reusable'
+    response = await _ask(adapter)
+    assert response.content == app.answer and app.rejected == []
+    assert len(app.threads) == 2 and app.turns == app.threads
+
+
 async def _watchdog_non_streaming(adapter: CodexAdapter, app) -> None:
     with pytest.raises(LLMCallInactivityTimeout):
         await LLMCallWatchdog(BOUND).call(_ask(adapter))

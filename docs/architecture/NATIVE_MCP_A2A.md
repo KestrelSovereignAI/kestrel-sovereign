@@ -528,6 +528,12 @@ and completed tool receipts. It is not an accepted model completion: unfinished
 provider prose is retracted and excluded from saved history. Both transports
 retain actual tool receipts in history and STOP hooks unless an enforcing
 response audit withholds those unreviewed side channels.
+Ordinary tool batches use the same typed checkpoint. Codex forwards its
+original control to the owning turn's event sink, settles accepted callbacks,
+and requests native `turn/interrupt` with the original thread and turn IDs.
+Missing IDs or a failed/malformed acknowledgement fail the turn; the unfinished
+thread is retired before another call can reuse it. Unrelated turns keep their
+connection and authority. The checkpoint never claims provider completion.
 
 Submitting `/api/mcp/inputs/{reference}/responses` independently authenticates
 the principal and chat, validates the original form schema, invokes the current
