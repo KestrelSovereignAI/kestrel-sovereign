@@ -38,10 +38,9 @@ import inspect
 from unittest.mock import AsyncMock
 
 import pytest
-
 from kestrel_sdk.signals import ResourceLock
 
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.kestrel_agent import KestrelAgent, _BootstrapReply
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import optional_transition_lock
 
@@ -337,7 +336,7 @@ async def test_bootstrap_transition_lock_writers_run_inside_the_span(native_tool
             "bootstrap must run inside the turn's privacy span"
         )
         await bootstrap_write()
-        return "welcome"
+        return _BootstrapReply("welcome", None, None)
 
     agent._handle_bootstrap = handle_bootstrap
     agent._post_response_pipeline = AsyncMock()
@@ -345,6 +344,7 @@ async def test_bootstrap_transition_lock_writers_run_inside_the_span(native_tool
     response = await asyncio.wait_for(agent.process_input("hello"), timeout=5)
 
     assert response == "welcome"
+    agent._post_response_pipeline.assert_awaited_once_with(user_message_id=None, assistant_message_id=None)
     assert writes == ["discovery_history", "agent_description"], (
         "a bootstrap durable write deadlocked on the lock its own turn holds"
     )
