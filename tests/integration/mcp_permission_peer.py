@@ -17,8 +17,6 @@ import uvicorn
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
-
 
 class DropFirstToolReply:
     """Lose one real native reply after the external witness was written."""
@@ -60,6 +58,8 @@ class DropFirstToolReply:
 
 def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: str | None = None):
     """Serve finite native provider responses beside the owned MCP witness."""
+    from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
+
     calls = 0
 
     async def models(request):

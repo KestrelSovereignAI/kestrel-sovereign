@@ -4,8 +4,8 @@ import httpx
 import pytest
 from starlette.applications import Starlette
 
-from tests.integration.mcp_permission_peer import add_owned_provider_routes
 from kestrel_sovereign.agent.operator_signals import _fallback_user_notice
+from tests.integration.mcp_permission_peer import add_owned_provider_routes
 
 
 @pytest.mark.asyncio
