@@ -440,6 +440,66 @@ If a flagged task cannot be recorded, or another writer's terminal state wins,
 `execute_skill` raises `ResourceOutcomeUnknown` instead, caused by any storage
 failure.
 
+### Tool invocation outcome
+
+One tool invocation's outcome has one immutable type,
+`kestrel_sovereign.tools.invocation_outcome.ToolInvocationOutcome` (#3977). It
+is the contract the host tool executor and the normalized tool-execution
+envelope consume. No dispatch path uses it yet; each still shapes its own
+result, and migrating them is separate work. The variants are closed:
+
+| Variant | Carries |
+|---|---|
+| `Success` | the returned result, which may be a host-private dict |
+| `ControlDeny` | an execution-control exception or a blocking `BlockedDecision`, with its `error_class` |
+| `Cancelled` | a cancellation or process-control carrier, as its cause |
+| `Deferred` | the `DeferredToolResult` itself |
+| `Error` | an ordinary exception, with its `error_class` |
+
+The variant says how the invocation ended, never what its result reports: a
+returned failed or partial envelope is a `Success`, and its status stays
+whatever `infer_tool_result_status` reads from it. `outcome_unknown` is a fact
+set on any variant, never a variant of its own, so retry depends only on
+whether execution met a `ResourceOutcomeUnknown`, as in #3946.
+
+`classify_tool_invocation` is the one total map from what a path produces:
+exactly one of the value it returned, the exception it raised or the
+blocking decision its PRE hook chain produced. A tool's own return value is
+never read as a host refusal. Anything that is not an `Exception` is
+`Cancelled`. An exception `is_execution_control_error` reads as control is
+`ControlDeny`, never an `Error`, and an `Error` refuses to hold one. Every
+other exception is an `Error`. `outcome_unknown` is set when the raised
+exception, or an error the path reports it met and flattened into its result,
+carries a `ResourceOutcomeUnknown` by `observed_outcome_unknown` (the error,
+an explicit cause or an exception-group member; implicit context never
+counts), or when the path returned the host's unconfirmed-outcome marker.
+
+`project_public` reproduces what the model sees on main, and the match over
+the type ends in `assert_never`, which pyright checks:
+
+- `Success` is its result; a host-private result becomes the plain dict a
+  copy of it already is. Copying or pickling a `Success` keeps only that
+  public result, so a dispatch receipt or failure marker never leaves the host.
+- `Deferred` is its public dictionary, a plain copy. The original keeps its
+  one-shot factory unconsumed for the existing completion boundary; the
+  completed result is a `Success`. A `Deferred` cannot be deep-copied or
+  pickled.
+- `ControlDeny` holding a `BlockedDecision` is that decision's envelope, as
+  the chat, named and bound paths return it. A feature subagent's
+  own tool loop words its refusal differently today; the type keeps the
+  decision itself and leaves that wording to the migration.
+- Execution control, a cancellation and an `Error` that requires
+  reconciliation (`is_tool_execution_terminal_error`) are never a result: the
+  projection raises the original object, unchanged, as every path does.
+- Any other `Error` is `{"success": False, "error": str(error)}`, the envelope
+  each `@tool` wrapper builds its own on (they add `tool` and buffered parts).
+
+The classifier reads what a path hands on after its own shaping. A wrapper
+that turned an exception into a failure envelope produced a `Success`, and an
+error it reports flattening is passed as observed evidence. Where the named
+inline executor recovers an uncertain failure as the host's unconfirmed
+marker, that is a `Success` with `outcome_unknown`.
+
 ### Tasks and operator input
 
 An MCP task is identified by agent, connection and remote task ID. Its durable
