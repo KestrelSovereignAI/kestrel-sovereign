@@ -609,7 +609,7 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
 
     from tests.utils.native_streaming import install_input_checkpoint_provider
     provider_calls, suspended = install_input_checkpoint_provider(b.agent, registered, monkeypatch,
-        followup=followup, dispatch=dispatch)
+        followup=followup, dispatch=dispatch, tool_markers=True, interleaved_parts=True)
 
     @b.app.post('/api/owned-first-stream-input')
     async def first_stream(request: Request):
@@ -641,6 +641,24 @@ async def test_first_stream_input_preserves_completed_receipts_without_accepting
         assert [row['name'] for row in results] == [registered[name].binding.name
             for name in ('record_marker', 'open_marker')], 'Input suspension discarded completed inline tool receipts'
         assert len(stopped[0].tool_results) == 2
+        if streaming:
+            events = saved['metadata'].get('tool_events', [])
+            assert {event['tool'] for event in events if event['type'] == 'complete'} == {
+                registered[name].binding.name for name in ('record_marker', 'open_marker')}, (
+                'Input checkpoint history dropped completed callback tool cards')
+            notices = [part for part in saved['metadata'].get('parts', []) if part['type'] == 'notice']
+            assert len(notices) == (2 if followup else 1)
+            first_start = next(event for event in events if event['type'] == 'start'
+                and event['tool'] == registered['record_marker'].binding.name)
+            assert notices[0]['seq'] < first_start['seq'], (
+                'Input checkpoint moved a tool card before its earlier component')
+            if followup:
+                first_done = next(event for event in events if event['type'] == 'complete'
+                    and event['tool'] == registered['record_marker'].binding.name)
+                next_start = next(event for event in events if event['type'] == 'start'
+                    and event['tool'] == registered['open_marker'].binding.name)
+                assert first_done['seq'] < notices[1]['seq'] < next_start['seq'], (
+                    'Input checkpoint discarded the original TOOL/PART order')
     else:
         assert not {'tool_results', 'parts', 'tool_events', 'pre_tool_reasoning'} & (saved.get('metadata') or {}).keys()
         assert stopped[0].tool_results is None and stopped[0].tool_calls is None

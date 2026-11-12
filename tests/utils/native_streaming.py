@@ -52,11 +52,12 @@ async def collect_native_stream(agent, operation, *, chunks=None):
 
 
 def install_input_checkpoint_provider(agent, registered, monkeypatch, *, followup=False, dispatch='inline',
-                                      before_tools=None, tool_markers=False):
+                                      before_tools=None, tool_markers=False, interleaved_parts=False):
     """Script only model I/O; all governed tools and their receipts remain real."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall, ToolCallStarted
     from kestrel_sovereign.tools.effect_journal import ToolInputSuspended
     from kestrel_sovereign.agent.streaming import _build_tool_sentinel
+    from kestrel_sovereign.agent.parts import build_part_sentinel
 
     first = registered['record_marker']
     suspended = []
@@ -65,6 +66,8 @@ def install_input_checkpoint_provider(agent, registered, monkeypatch, *, followu
         provider_calls.append(True)
         executed = []
         yield 'UNFINISHED-PRE-INPUT-PROSE'
+        if interleaved_parts:
+            yield build_part_sentinel({'type': 'notice', 'data': 'BEFORE-BATCH-' + str(len(provider_calls))})
         if before_tools is not None:
             await before_tools()
         if followup and len(provider_calls) == 1:

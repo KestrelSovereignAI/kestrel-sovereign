@@ -202,14 +202,17 @@ def _build_tool_sentinel(
     shell-command preview (start) or error text (error); ``ms`` the
     dispatch duration (done).
     """
-    payload = json.dumps({
+    return _encode_tool_sentinel({
         "phase": phase,
         "name": name,
         "index": index,
         "ms": ms,
         "detail": detail,
-    }, separators=(",", ":"))
-    return f"{TOOL_SENTINEL_PREFIX}{payload}{TOOL_SENTINEL_SUFFIX}"
+    })
+
+
+def _encode_tool_sentinel(payload: dict) -> str:
+    return f'{TOOL_SENTINEL_PREFIX}{json.dumps(payload, separators=(",", ":"))}{TOOL_SENTINEL_SUFFIX}'
 
 
 def is_only_sentinels(text: str) -> bool:
@@ -449,6 +452,61 @@ def _flush_part_list(pending: list, full_response: list):
 _TOOL_EVENT_PHASE = {"start": "start", "complete": "done", "error": "error"}
 
 
+def _matching_tool_part(event: dict, parts: list, consumed: list) -> int | None:
+    phase = _TOOL_EVENT_PHASE.get(event.get('type'))
+    name = event.get('tool', '')
+    return next((index for index, part in enumerate(parts) if not consumed[index]
+        and part.get('phase') == phase and part.get('name', '') == name), None)
+
+
+def _inline_tool_events(executed: list) -> list:
+    """The existing card contract for actual completed inline callbacks."""
+    return [event for entry in executed for event in (
+        {'type': 'start', 'tool': entry['name']},
+        {'type': 'complete', 'tool': entry['name'], 'ms': 0})]
+
+
+def _input_checkpoint_metadata(text: str, events: list) -> list[str]:
+    """Rebase the observed TOOL/PART timeline without replaying it to clients.
+
+    Confirmed callbacks can lack adapter wire markers. Add their missing card
+    events before the next observed matching event, or after the observed
+    timeline when no later anchor exists. Observed frames never change order.
+    Fresh collector parts are appended by the caller after these receipts.
+    """
+    _, tools, components = _parse_stream_sentinels(text)
+    consumed = [False] * len(tools)
+    matches = []
+    for event in events:
+        matched = _matching_tool_part(event, tools, consumed)
+        matches.append(matched)
+        if matched is not None:
+            consumed[matched] = True
+    insertions: dict[int | None, list[str]] = {}
+    previous_seq = -1
+    for index, (event, matched) in enumerate(zip(events, matches, strict=True)):
+        if matched is not None:
+            previous_seq = max(previous_seq, tools[matched]['seq'])
+            continue
+        next_seq = next((tools[item]['seq'] for item in matches[index + 1:]
+            if item is not None and tools[item]['seq'] > previous_seq), None)
+        phase = _TOOL_EVENT_PHASE[event['type']]
+        insertions.setdefault(next_seq, []).append(_build_tool_sentinel(phase,
+            event['tool'], ms=event.get('ms'), detail=event.get('error')))
+    timeline = [(part['seq'], True, part) for part in tools]
+    timeline.extend((part['seq'], False, part) for part in components)
+    result = []
+    for seq, is_tool, part in sorted(timeline, key=lambda item: item[0]):
+        result.extend(insertions.pop(seq, []))
+        payload = {key: value for key, value in part.items() if key not in {'pos', 'seq'}}
+        encoded = _encode_tool_sentinel(payload) if is_tool else build_part_sentinel(payload)
+        if encoded is None:
+            raise ValueError('Input checkpoint contains invalid component metadata')
+        result.append(encoded)
+    result.extend(insertions.pop(None, []))
+    return result
+
+
 def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
     """Assign each ``tool_events`` entry a ``pos`` (clean-text offset) by
     matching it to the TOOL sentinel part that produced it.
@@ -469,15 +527,7 @@ def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
     for ev in tool_events:
         if not isinstance(ev, dict):
             continue
-        want_phase = _TOOL_EVENT_PHASE.get(ev.get("type"))
-        name = ev.get("tool", "")
-        matched = None
-        for i, p in enumerate(parts):
-            if consumed[i]:
-                continue
-            if p.get("phase") == want_phase and p.get("name", "") == name:
-                matched = i
-                break
+        matched = _matching_tool_part(ev, parts, consumed)
         if matched is not None:
             consumed[matched] = True
             pos = parts[matched].get("pos")
@@ -1767,9 +1817,12 @@ class StreamingMixin:
                     item.suspension.require_current(self)
                     tool_response = item
                     pre_tool_prose_snapshot = None
-                    if not buffer_audit:
-                        for sentinel in _flush_part_list(pending_parts, full_response):
+                    full_response = _input_checkpoint_metadata(''.join(full_response),
+                        _inline_tool_events(item.executed_tool_calls))
+                    for sentinel in _flush_part_list(pending_parts, full_response):
+                        if not buffer_audit:
                             yield sentinel
+                    if not buffer_audit:
                         yield _build_retract_sentinel(item.suspension.turn.invocation_id)
                         yield item.content
                     continue
@@ -2013,22 +2066,19 @@ class StreamingMixin:
                             chunk.suspension.require_current(self)
                             await self._append_executed_tool_breadcrumbs([], chunk.executed_tool_calls,
                                 tool_results, session_id=session_id)
-                            kept = _parse_stream_sentinels(''.join(full_response))[2]
-                            kept.extend(_parse_stream_sentinels(''.join(tool_response_chunks))[2])
-                            kept = [{key: value for key, value in part.items() if key not in {'pos', 'seq'}}
-                                for part in kept]
+                            tool_events.extend(_inline_tool_events(chunk.executed_tool_calls))
+                            retained_metadata = _input_checkpoint_metadata(
+                                ''.join(full_response + tool_response_chunks), tool_events)
                             fresh_parts = drain_parts()
-                            tool_response_chunks = []
+                            tool_response_chunks = retained_metadata
                             input_followup = True
                             pre_tool_text = ''
                             pre_tool_prose_snapshot = ''
                             pre_parts = []
                             pending_visible_boundary = False
                             join_separator = ''
-                            # Rebase previously delivered parts for history;
-                            # only newly drained parts belong on the live wire.
-                            for _sentinel in _flush_part_list(kept, tool_response_chunks):
-                                pass
+                            # Retain the original TOOL/PART timeline for history;
+                            # only fresh collector parts belong on the live wire.
                             for sentinel in _flush_part_list(fresh_parts, tool_response_chunks):
                                 if not buffer_audit:
                                     yield sentinel
@@ -2343,15 +2393,13 @@ class StreamingMixin:
             from kestrel_sovereign.security.narration_check import (
                 summarize_tool_result_for_audit,
             )
-            synth_tool_events = []
+            synth_tool_events = _inline_tool_events(inline_executed)
             tool_results: list = []
             features_by_tool_name = (
                 self._visible_features_by_tool_name()
                 if hasattr(self, "_visible_features_by_tool_name") else {}
             )
             for e in inline_executed:
-                synth_tool_events.append({"type": "start", "tool": e["name"]})
-                synth_tool_events.append({"type": "complete", "tool": e["name"], "ms": 0})
                 serialized = _serialize_tool_result(e["result"])
                 tool_results.append({
                     "tool_call_id": e["id"],
