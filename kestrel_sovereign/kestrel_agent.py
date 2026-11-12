@@ -8570,12 +8570,12 @@ Expected Duration: {expected_duration}
         provider: Optional[str] = None,
         use_last_identity: bool = False,
         wake_reply: Optional[WakeReplyReceipt] = None,
-    ) -> None:
-        """Persist an assistant row with resolved model/provider columns.
+    ) -> Optional[int]:
+        """Persist an assistant row and return its exact storage receipt.
 
         With ``wake_reply`` the row is a signal wake's reply: it is stamped
         with the wake's signal id, and the receipt records the stored row's
-        id (#3655).
+        id without a correlation readback (#3655).
         """
         identity = self._conversation_response_identity(
             response,
@@ -8592,42 +8592,17 @@ Expected Duration: {expected_duration}
             kwargs["model"] = resolved_model
         if resolved_provider is not None:
             kwargs["provider"] = resolved_provider
-        await self.privacy_agent.add_conversation(
+        message_id = await self.privacy_agent.add_conversation(
             "assistant",
             content,
             **kwargs,
         )
         mark_current_invocation_effect_checkpointed()
         if wake_reply is not None:
-            wake_reply.message_id = await self._stored_wake_reply_id(
-                wake_reply.signal_id
+            wake_reply.message_id = (
+                message_id if self.privacy_agent.can_store("conversation") else None
             )
-
-    async def _stored_wake_reply_id(self, signal_id: str) -> Optional[int]:
-        """The id of the row just stored as ``signal_id``'s reply, if any.
-
-        Asked only when the privacy agent stored the row durably. Otherwise a
-        row an earlier delivery of the same wake stored would answer for a
-        reply this turn kept only in memory.
-
-        The reply is already stored, and the id only tells the chat console
-        where to load it from. A read that fails leaves no id: the console
-        then shows its truncated-preview notice rather than presenting the
-        event's capped summary as the reply. It must not fail the turn, which
-        the dispatcher would record as an undelivered wake.
-        """
-        if not self.privacy_agent.can_store("conversation"):
-            return None
-        try:
-            return await self.storage.find_signal_wake_reply_id(signal_id)
-        except DatabaseError as error:
-            if is_execution_control_error(error):
-                raise
-            logging.warning(
-                "Could not read back the stored reply to signal %s", signal_id,
-                exc_info=True,
-            )
-            return None
+        return message_id
 
     async def _maybe_compact_codex_thread(
         self, session_id: Optional[str],
