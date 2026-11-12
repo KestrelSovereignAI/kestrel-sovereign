@@ -45,7 +45,7 @@ async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, mo
                 models = await provider.adapter.list_models(provider.client)
                 assert [model.id for model in models] == ["owned-permission-model"]
                 response = await provider.adapter.get_response(provider.client, provider.model,
-                    [{"role": "user", "content": "Record the owned marker"}], tools=[{
+                    [{"role": "user", "content": "Record the owned marker using the connected MCP tool."}], tools=[{
                         "type": "function", "function": {"name": "record_marker", "parameters": {
                             "type": "object", "properties": {"marker": {"type": "string"}},
                             "required": ["marker"],

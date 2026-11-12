@@ -36,6 +36,7 @@ from tests.integration.test_mcp_permission_host_restart import (
     configure_mcp,
     host_client,
     native_host,
+    observe_registry,
     set_permission,
 )
 from tests.integration.test_mcp_permission_host_restart import (
@@ -47,6 +48,29 @@ host_campaign = _host_campaign
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120),
     pytest.mark.skipif(sys.platform == 'win32', reason='This test requires native graceful SIGTERM')]
+
+
+async def await_original_cognition_retirement(campaign, operator, state, task_id):
+    """Observe both original durable turns and their memory tail before shutdown."""
+    async with asyncio.timeout(30):
+        while True:
+            with closing(sqlite3.connect((campaign.home / 'agent/kestrel_prime.db').as_uri()
+                    + '?mode=ro', uri=True)) as database:
+                rows = database.execute('SELECT source, status, error FROM signal_log '
+                    'WHERE dedupe_key LIKE ? AND source IN (?, ?)',
+                    ('%' + task_id + '%', 'a2a.task_submitted', 'a2a.task_complete')).fetchall()
+            assert all(status == 'ok' for _source, status, _error in rows), rows
+            nonce = uuid4().hex
+            audit = await operator.get('/api/agents/permission-host/api/security/audit',
+                headers={'X-Owned-Registry-Observation': nonce})
+            assert audit.status_code == 200, audit.text
+            observed = await observe_registry(campaign, state, nonce)
+            if ({source for source, _status, _error in rows}
+                    == {'a2a.task_submitted', 'a2a.task_complete'}
+                    and observed['live_turn_id'] is None
+                    and observed['pending_memory_tasks'] == 0):
+                return audit
+            await asyncio.sleep(0.05)
 
 
 @pytest.mark.parametrize('host_campaign', [{'native_a2a': True}], indirect=True)
@@ -112,7 +136,7 @@ async def test_signed_native_http_cognition_obeys_the_real_remote_tool_permissio
                 )
             assert task.status.state == TaskState.TASK_STATE_COMPLETED, str(task)
             assert task.status.message.parts[0].text == 'Owned permission evaluation complete'
-        audit = await operator.get('/api/agents/permission-host/api/security/audit')
+        audit = await await_original_cognition_retirement(c, operator, host.state, task.id)
         assert audit.status_code == 200, audit.text
         decisions = [entry['decision'] for entry in audit.json()['logs']
             if entry['feature'] == owner and entry['tool'] == handle]

@@ -17,6 +17,8 @@ import uvicorn
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
+
 
 class DropFirstToolReply:
     """Lose one real native reply after the external witness was written."""
@@ -74,6 +76,11 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
             stream.write(json.dumps({"path": request.url.path, "model": body.get("model"),
                 "tools": [tool["function"]["name"] for tool in body.get("tools", [])],
                 "last_role": body["messages"][-1]["role"],
+                "message_shapes": [{"role": row['role'],
+                    "content_type": type(row.get('content')).__name__,
+                    "markers": [marker for marker in ['A2A_TASK_SUBMITTED', 'A2A_COMPLETE',
+                        'Record the owned marker'] if marker in str(row.get('content'))]}
+                    for row in body['messages']],
                 "has_response_format": bool(body.get("response_format"))}) + "\n")
         if body.get("model") != model:
             return JSONResponse({"error": "Owned provider requires its configured model"}, status_code=400)
@@ -83,14 +90,16 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
         finished = body["messages"][-1]["role"] == "tool"
         message = {"role": "assistant", "content": "Owned provider response complete"}
         reason = "stop"
-        selected = candidates[0] if len(candidates) == 1 and not finished else None
+        selected = None
         arguments = {"marker": "owned-provider-effect"}
         if candidates and len(candidates) != 1:
             return JSONResponse({"error": "Owned provider requires one marker tool"}, status_code=400)
         # A finite model script consumes the actual cognition prompt and tool
         # schemas. Task completion still runs through the real governed tool.
-        prompt = "\n".join(m['content'] for m in body['messages']
-            if isinstance(m.get('content'), str))
+        prompt = extract_raw_user_content(next((m['content'] for m in reversed(body['messages'])
+            if m['role'] == 'user' and isinstance(m.get('content'), str)
+            and not (m['content'].startswith('<operator_notice>\n')
+                and m['content'].endswith('\n</operator_notice>'))), ''))
         incoming = re.search(r"\[A2A_TASK_SUBMITTED\] Peer `[^`]+` submitted native A2A task `([^`]+)`", prompt)
         if incoming:
             replies = [tool for tool in tools if tool['name'].endswith('respond_to_a2a_task')]
@@ -106,6 +115,9 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
                     "content": "Owned permission evaluation complete", "state": "completed"}
             else:
                 selected = None
+        elif (prompt.strip() == 'Record the owned marker using the connected MCP tool.'
+                and len(candidates) == 1 and not finished):
+            selected = candidates[0]
         if selected is not None:
             message = {"role": "assistant", "content": None, "tool_calls": [{
                 "id": f"owned-provider-call-{calls}", "type": "function", "function": {
