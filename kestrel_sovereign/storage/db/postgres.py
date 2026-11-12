@@ -2651,56 +2651,25 @@ class PostgresBackend(DatabaseBackend):
             wrapper._session_file_metadata = {}
         return report
 
-    async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
-        """Retain an existing live owner with leased or receipt-pending cognition.
-
-        This cleanup-only metadata operation cannot insert/revive an owner,
-        grant a lease, acknowledge ingress, or reopen ordinary native work.
-        It serializes with canonical owner recovery using its exact key.
-        """
-        return await self._retain_live_runtime_owner(
-            agent_id=agent_id, owner_id=owner_id, cognition_lease_required=True,
-        )
-
     async def retain_unretired_runtime_owner(self, *, agent_id: str, owner_id: str) -> bool:
-        """Retain an existing live owner whose retirement has not completed.
+        """Renew one existing, unstopped managed owner on fixed SQL (#4001).
 
-        A shutdown that refused or failed leaves its owner unretired, and a
-        peer must not reclaim what it still leases (#4001). Like cognition
-        cleanup this cannot insert/revive an owner, grant a lease, or reopen
-        ordinary native work; it needs no leased cognition, since what an
-        unretired owner still guards need not be cognition.
+        This is the only write that renews a dispatcher's owner. An owner
+        that is not retired is renewed whatever else it holds or owes: a
+        shutdown that refused or failed, retained cleanup debt, or denied
+        ordinary work. It cannot insert or revive an owner, grant a lease,
+        acknowledge ingress, or reopen ordinary native work, and it
+        serializes with canonical owner recovery using its exact key.
         """
-        return await self._retain_live_runtime_owner(
-            agent_id=agent_id, owner_id=owner_id, cognition_lease_required=False,
-        )
-
-    async def _retain_live_runtime_owner(
-        self, *, agent_id: str, owner_id: str, cognition_lease_required: bool,
-    ) -> bool:
-        """Refresh one existing, unstopped managed owner on fixed cleanup SQL."""
         from kestrel_sovereign.signals.durable import DurableSignalStore
-        from kestrel_sovereign.signals.sources import core_cognition_consumers
 
         if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
-            raise ValueError("cognition cleanup requires exact owner identities")
+            raise ValueError("owner renewal requires exact owner identities")
         if not owner_id.startswith("dispatcher:"):
-            raise ValueError("cognition cleanup requires its managed owner")
+            raise ValueError("owner renewal requires its managed owner")
         pool = self._pool
         if pool is None:
-            raise ConnectionError("cognition cleanup requires the original backend")
-        lease_guard = ""
-        parameters: tuple = (agent_id, owner_id)
-        if cognition_lease_required:
-            lease_guard = (
-                " AND EXISTS ("
-                f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
-                "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
-                "AND delivery.consumer_id = ANY($3::text[]) "
-                "AND delivery.status IN ('leased', 'retry') "
-                "AND delivery.lease_token IS NOT NULL)"
-            )
-            parameters += (list(dict(core_cognition_consumers())),)
+            raise ConnectionError("owner renewal requires the original backend")
         async with asyncio.timeout(5):
             async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
                 async with self._tracked_native_transaction(connection, state.scopes, state):
@@ -2713,8 +2682,8 @@ class PostgresBackend(DatabaseBackend):
                         "SET heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()), "
                         "updated_at = clock_timestamp() "
                         "WHERE owner.agent_id = $1 AND owner.owner_id = $2 "
-                        "AND owner.stopped_at IS NULL" + lease_guard,
-                        *parameters,
+                        "AND owner.stopped_at IS NULL",
+                        agent_id, owner_id,
                     )
                     return result == "UPDATE 1"
 

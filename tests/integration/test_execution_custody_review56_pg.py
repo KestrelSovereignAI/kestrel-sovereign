@@ -74,7 +74,7 @@ async def test_retired_fixed_cleanup_native_ack_never_reports_success(native_pg,
             elif route == "cognition":
                 await backend.fail_cognition_delivery(agent_id="original", consumer_id=DURABLE_COGNITION_CONSUMER_ID, delivery_id="delivery1", owner_id="dispatcher:original", lease_token="token1", error="original terminal control")
             else:
-                await backend.retain_cognition_cleanup_owner(agent_id="original", owner_id="dispatcher:original")
+                await backend.retain_unretired_runtime_owner(agent_id="original", owner_id="dispatcher:original")
         assert receipts == [True]
         assert execution_commit_outcome(caught.value) == ("unknown" if boundary == "commit" else "committed")
         assert carries(caught.value, original)

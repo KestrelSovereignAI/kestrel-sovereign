@@ -71,6 +71,27 @@ def _unsettled_terminal_predicate(alias: str = "") -> str:
     )
 
 
+def _carried_by_live_wake_predicate(table: str) -> str:
+    """A row whose exclusive key a live delivery of its consumer also holds.
+
+    Admission keeps one unacknowledged wake per key, but wakes admitted
+    before keys existed are keyed at boot from their own identities, and an
+    earlier release could leave a failed wake and a live one for the same
+    input. The live one carries that work, so the terminal row owes nothing
+    (#4001). ``table`` names the outer row; the live row is read in the same
+    statement.
+    """
+    return (
+        f"{table}.exclusive_key IS NOT NULL AND EXISTS ("
+        f"SELECT 1 FROM {table} AS live "
+        f"WHERE live.agent_id = {table}.agent_id "
+        f"AND live.consumer_id = {table}.consumer_id "
+        f"AND live.exclusive_key = {table}.exclusive_key "
+        f"AND live.delivery_id <> {table}.delivery_id "
+        f"AND live.status IN ('{PENDING}', '{INITIAL_RESERVED}', '{LEASED}', '{RETRY}'))"
+    )
+
+
 _DEACTIVATED_CONSUMER_ERROR = "durable consumer deactivated"
 # The emitting dispatcher's first lease on a payload-elided delivery expired
 # (or its transfer failed) before any worker claimed it. The row is released
@@ -967,6 +988,27 @@ class DurableEventPersistence:
     retention_until: Optional[datetime] = None
     initial_reservations: tuple["DurableInitialDeliveryReservation", ...] = ()
     source_sequence: Optional[int] = None
+    # Set when nothing was committed because another wake that has not run
+    # holds this signal's exclusive key: that wake's delivery ID. ``event_id``
+    # is then that wake's event, which this signal must not be routed as.
+    exclusive_holder: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DurableExclusiveWake:
+    """One consumer admits at most one wake that has not run per ``key`` (#4001).
+
+    ``key`` names the exact work a wake carries, whatever source identity it
+    is admitted under. While a delivery of ``consumer_id`` holding ``key`` is
+    not acknowledged, another signal carrying the same key commits nothing: a
+    live wake's own lease and terminal CAS decide the work. A terminal one
+    holds its key for good: the settlement pass ends the work it carried, and
+    once that is settled nothing can make that work owed again, so no later
+    wake may carry it either. Only a wake that ran releases its key.
+    """
+
+    consumer_id: str
+    key: str
 
 
 @dataclass(frozen=True)
@@ -1422,6 +1464,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 created_at {ts_type} {ts_default},
                 updated_at {ts_type} {ts_default},
                 settled_at {ts_type},
+                exclusive_key TEXT,
                 UNIQUE (agent_id, consumer_id, event_id),
                 FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
                     ON DELETE CASCADE,
@@ -1494,6 +1537,9 @@ class DurableSignalStore(UnifiedStoreBase):
             # When the settlement of the work a terminal wake carried was
             # recorded, so the row leaves the settlement pass (#4001).
             await self._ensure_column(self.DELIVERIES, "settled_at", ts_type)
+            # The exact work a delivery's wake carries, when its consumer
+            # admits at most one wake that has not run for it (#4001).
+            await self._ensure_column(self.DELIVERIES, "exclusive_key", "TEXT")
             source_state = await self._source_sequence_schema_state()
             await self._ensure_source_sequence_state()
             if self.is_postgres:
@@ -3458,6 +3504,12 @@ class DurableSignalStore(UnifiedStoreBase):
             f"ON {self.DELIVERIES}(agent_id, consumer_id, status, delivery_id) "
             f"WHERE {_unsettled_terminal_predicate()}"
         )
+        # The wakes holding one consumer's exclusive key (#4001).
+        await self._backend.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_exclusive_key "
+            f"ON {self.DELIVERIES}(agent_id, consumer_id, exclusive_key) "
+            "WHERE exclusive_key IS NOT NULL"
+        )
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
             f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
@@ -3669,6 +3721,7 @@ class DurableSignalStore(UnifiedStoreBase):
         admission_fence: Any = None,
         refused_consumer_id: Optional[str] = None,
         refusal_error: Optional[str] = None,
+        exclusive_wake: Optional[DurableExclusiveWake] = None,
     ) -> DurableEventPersistence:
         """Commit a persisted signal and all matching initial deliveries.
 
@@ -3716,7 +3769,22 @@ class DurableSignalStore(UnifiedStoreBase):
         but a durable record that its work was never delivered. A duplicate
         source event commits nothing, so a refusal never overrides an
         identity whose earlier attempt was already admitted.
+
+        ``exclusive_wake`` decides admission across source identities (#4001).
+        In this transaction, under the same handoff lock every admission of
+        this source takes, an unacknowledged delivery of its consumer holding
+        its key refuses this signal: nothing is committed, and the result
+        names that holder (``exclusive_holder``). Otherwise this signal's
+        delivery for that consumer is stored holding the key. A row stops
+        holding its key only by being acknowledged, or by handing it to a
+        live wake that holds it too (:meth:`record_delivery_settled`), never
+        the reverse, so the check cannot go stale in the unsafe direction.
         """
+        if exclusive_wake is not None:
+            if not isinstance(exclusive_wake, DurableExclusiveWake):
+                raise ValueError("exclusive_wake must be a DurableExclusiveWake")
+            self._require_nonempty("exclusive_wake.consumer_id", exclusive_wake.consumer_id)
+            self._require_nonempty("exclusive_wake.key", exclusive_wake.key)
         if (refused_consumer_id is None) != (refusal_error is None):
             raise ValueError(
                 "refused_consumer_id and refusal_error must be set together"
@@ -3772,6 +3840,16 @@ class DurableSignalStore(UnifiedStoreBase):
                         created=False,
                         source_sequence=existing_sequence,
                     )
+                if exclusive_wake is not None:
+                    holder = await self._exclusive_holder_locked(
+                        agent_id=agent_id, exclusive_wake=exclusive_wake
+                    )
+                    if holder is not None:
+                        return DurableEventPersistence(
+                            event_id=holder[1],
+                            created=False,
+                            exclusive_holder=holder[0],
+                        )
                 # The transaction may have waited behind the cross-instance
                 # handoff lock. Start persisted event timing only after that
                 # contention has cleared, never from method entry.
@@ -3910,6 +3988,12 @@ class DurableSignalStore(UnifiedStoreBase):
                             "registration for its source"
                         )
                 for consumer_id, selector, max_attempts, lease_seconds in consumer_rows:
+                    exclusive_key = (
+                        exclusive_wake.key
+                        if exclusive_wake is not None
+                        and exclusive_wake.consumer_id == consumer_id
+                        else None
+                    )
                     if refused_consumer_id is not None:
                         delivery_id = await self._insert_delivery_locked(
                             agent_id=agent_id,
@@ -3918,6 +4002,7 @@ class DurableSignalStore(UnifiedStoreBase):
                             max_attempts=int(max_attempts),
                             now=now,
                             failed_error=refusal_error,
+                            exclusive_key=exclusive_key,
                         )
                         if delivery_id is not None:
                             delivery_ids.append(delivery_id)
@@ -3935,6 +4020,7 @@ class DurableSignalStore(UnifiedStoreBase):
                         now=now,
                         initial_reservation_owner=initial_lease_owner,
                         initial_reservation_token=reservation_token,
+                        exclusive_key=exclusive_key,
                     )
                     if delivery_id is not None:
                         delivery_ids.append(delivery_id)
@@ -4755,24 +4841,32 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id=agent_id, owner_id=owner_id, now=touch_now
             )
 
-    async def retain_unretired_runtime_owner(self, *, agent_id: str, owner_id: str) -> bool:
+    async def retain_unretired_runtime_owner(
+        self, *, agent_id: str, owner_id: str, now: Optional[datetime] = None,
+    ) -> bool:
         """Refresh an existing owner that is not yet stopped; never revive one.
 
-        A dispatcher whose shutdown refused or failed keeps this owner
-        unretired and must stay live for peers until it retires (#4001). Unlike
-        :meth:`heartbeat_runtime_owner` this inserts nothing and never clears
-        ``stopped_at``, so a heartbeat that runs late cannot undo a retirement.
-        Returns whether the owner was refreshed.
+        The only write that renews a dispatcher's owner: an owner that is not
+        retired stays live for peers, whatever else it holds or owes, until it
+        retires (#4001). Unlike :meth:`heartbeat_runtime_owner` this inserts
+        nothing and never clears ``stopped_at``, so a renewal that runs late
+        cannot undo a retirement. Returns whether the owner was refreshed.
+        ``now`` is a SQLite clock seam; PostgreSQL renews on its own clock.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
         if self.is_postgres:
+            if now is not None:
+                raise ValueError("PostgreSQL owner renewal uses the database clock")
             return await self._backend.retain_unretired_runtime_owner(
                 agent_id=agent_id, owner_id=owner_id,
             )
+        requested_now = _as_utc(now) if now is not None else None
         async with self._backend.transaction():
             await self._lock_runtime_owner_scope(agent_id=agent_id)
-            now = self.to_timestamp_param(self.now_utc())
+            # Sampled after the lock, as a heartbeat taken before waiting on
+            # it is not trustworthy liveness evidence.
+            now = self.to_timestamp_param(requested_now or self.now_utc())
             updated = await self._backend.execute(
                 f"""
                 UPDATE {self.RUNTIME_OWNERS}
@@ -5720,6 +5814,7 @@ class DurableSignalStore(UnifiedStoreBase):
         agent_id: str,
         consumer_id: str,
         delivery_id: str,
+        carried_by_live_wake: bool = False,
         now: Optional[datetime] = None,
     ) -> bool:
         """Record that the work a terminal row's wake carried is settled.
@@ -5728,14 +5823,27 @@ class DurableSignalStore(UnifiedStoreBase):
         owed again. The row keeps its terminal status and error; it only
         leaves the settlement pass and the retention hold (#4001). Returns
         whether this call recorded it.
+
+        ``carried_by_live_wake`` records it only while a live delivery of the
+        consumer holds the row's exclusive key, read in the same statement:
+        that wake carries the work, and ends it by running or, ending
+        undelivered, owes it itself. The row then hands the key to that wake,
+        so once it is acknowledged nothing holds the input and recovery may
+        wake it again (#4001).
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("consumer_id", consumer_id)
         self._require_nonempty("delivery_id", delivery_id)
         now = _as_utc(now or self.now_utc())
+        carried = (
+            ", exclusive_key = NULL WHERE "
+            f"{_carried_by_live_wake_predicate(self.DELIVERIES)} AND "
+            if carried_by_live_wake
+            else " WHERE "
+        )
         updated = await self._backend.execute(
-            f"UPDATE {self.DELIVERIES} SET settled_at = ?, updated_at = ? "
-            "WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ? "
+            f"UPDATE {self.DELIVERIES} SET settled_at = ?, updated_at = ?{carried}"
+            "agent_id = ? AND consumer_id = ? AND delivery_id = ? "
             f"AND {_unsettled_terminal_predicate()}",
             (
                 self.to_timestamp_param(now),
@@ -5746,6 +5854,24 @@ class DurableSignalStore(UnifiedStoreBase):
             ),
         )
         return updated == 1
+
+    async def delivery_carried_by_live_wake(
+        self, *, agent_id: str, consumer_id: str, delivery_id: str
+    ) -> bool:
+        """Whether a live delivery of the consumer holds this row's key (#4001).
+
+        The read :meth:`record_delivery_settled` makes before releasing a row
+        to the live wake that carries its work.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        row = await self._backend.fetch_one(
+            f"SELECT 1 FROM {self.DELIVERIES} WHERE agent_id = ? AND consumer_id = ? "
+            f"AND delivery_id = ? AND {_carried_by_live_wake_predicate(self.DELIVERIES)}",
+            (agent_id, consumer_id, delivery_id),
+        )
+        return row is not None
 
     async def source_history_is_drained(
         self, boundary: DurableSourceBoundary
@@ -5921,6 +6047,71 @@ class DurableSignalStore(UnifiedStoreBase):
         if existing is None:
             raise RuntimeError("durable event insert conflicted without an existing event")
         return existing
+
+    async def _exclusive_holder_locked(
+        self, *, agent_id: str, exclusive_wake: DurableExclusiveWake
+    ) -> Optional[tuple[str, str]]:
+        """The delivery holding an exclusive key, if any (#4001).
+
+        Every delivery that is not acknowledged holds its key: a live wake,
+        or a terminal one, whose work the settlement pass owns. Returns its
+        ``(delivery_id, event_id)``.
+        """
+        row = await self._backend.fetch_one(
+            f"""
+            SELECT delivery_id, event_id FROM {self.DELIVERIES}
+            WHERE agent_id = ? AND consumer_id = ? AND exclusive_key = ?
+              AND status <> ?
+            ORDER BY delivery_id
+            LIMIT 1
+            """,
+            (agent_id, exclusive_wake.consumer_id, exclusive_wake.key, ACKNOWLEDGED),
+        )
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    async def assign_exclusive_keys(
+        self, *, agent_id: str, source: str, consumer_id: str, keys: Mapping[str, str],
+    ) -> int:
+        """Give keyless deliveries the exclusive key their wake carries (#4001).
+
+        Deliveries admitted before exclusive keys existed hold none, so an
+        admission check cannot see them. ``keys`` maps each such delivery ID
+        to the key its caller derived from that wake's own source identity.
+        A delivery that already holds a key keeps it. Runs under the source's
+        handoff lock, so an admission of that source either precedes this
+        assignment or sees it. Returns how many deliveries were assigned.
+
+        The rules those wakes were admitted under could leave more than one
+        unacknowledged wake for one input, a failed one beside a live one;
+        each receives the key. The settlement pass then releases a terminal
+        one whose key a live wake holds to that wake, rather than ending work
+        it still runs (:meth:`record_delivery_settled`).
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("source", source)
+        self._require_nonempty("consumer_id", consumer_id)
+        for delivery_id, key in keys.items():
+            self._require_nonempty("delivery_id", delivery_id)
+            self._require_nonempty("key", key)
+        if not keys:
+            return 0
+        assigned = 0
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(agent_id=agent_id, source=source)
+            for delivery_id, key in sorted(keys.items()):
+                assigned += await self._backend.execute(
+                    f"""
+                    UPDATE {self.DELIVERIES} SET exclusive_key = ?
+                    WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                      AND exclusive_key IS NULL
+                      AND event_id IN (
+                          SELECT event_id FROM {self.EVENTS}
+                          WHERE agent_id = ? AND source = ?
+                      )
+                    """,
+                    (key, agent_id, consumer_id, delivery_id, agent_id, source),
+                )
+        return assigned
 
     async def _existing_event_id_locked(
         self, agent_id: str, signal: Signal, source_event_id: Optional[str]
@@ -6556,6 +6747,7 @@ class DurableSignalStore(UnifiedStoreBase):
         initial_reservation_owner: Optional[str] = None,
         initial_reservation_token: Optional[str] = None,
         failed_error: Optional[str] = None,
+        exclusive_key: Optional[str] = None,
     ) -> Optional[str]:
         initial_reservation = initial_reservation_owner is not None
         if initial_reservation != (initial_reservation_token is not None):
@@ -6576,8 +6768,9 @@ class DurableSignalStore(UnifiedStoreBase):
             INSERT OR IGNORE INTO {self.DELIVERIES} (
                 delivery_id, agent_id, consumer_id, event_id, status,
                 attempts, max_attempts, lease_owner, lease_token,
-                lease_expires_at, last_error, terminal_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                lease_expires_at, last_error, terminal_at, created_at, updated_at,
+                exclusive_key
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 delivery_id,
@@ -6593,6 +6786,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 None if terminal_at is None else self.to_timestamp_param(terminal_at),
                 self.to_timestamp_param(now),
                 self.to_timestamp_param(now),
+                exclusive_key,
             ),
         )
         return delivery_id if inserted == 1 else None

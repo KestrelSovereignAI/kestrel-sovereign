@@ -44,12 +44,15 @@ async def test_native_lost_terminal_and_liveness_cas_keep_cleanup_debt_and_succe
         with pytest.raises(ExecutionCommitOutcomeError) as caught:
             await dispatcher._release_retained_durable_cognition_task(delivery, error)
         assert caught.value is error
-        # The same zero-row CAS is retried by heartbeat supervision. Receipt
-        # identity must survive without retaining every completed reader frame.
+        # Renewal does not depend on the lease the debt was about: the
+        # unretired owner is renewed on every heartbeat, admitting nothing,
+        # and the debt stays retained (#4001). Receipt identity must survive
+        # without retaining every completed reader frame.
+        renewed = await controller.fetchval("SELECT heartbeat_at FROM durable_signal_runtime_owners WHERE owner_id='dispatcher:original'")
         for _ in range(100):
-            with pytest.raises(ExecutionCommitOutcomeError) as heartbeat:
-                await dispatcher._heartbeat_runtime_owner()
-            assert heartbeat.value is error
+            await dispatcher._heartbeat_runtime_owner()
+        assert await controller.fetchval("SELECT heartbeat_at FROM durable_signal_runtime_owners WHERE owner_id='dispatcher:original'") > renewed
+        assert dispatcher._retained_cognition_control_debt == {"delivery1": (delivery, error)}
         from tests.unit.test_execution_custody_review35_native import traceback_size
         assert traceback_size(error) <= 12, "native lost-CAS retry retained unbounded traceback frames"
         with pytest.raises(ExecutionCommitOutcomeError):

@@ -89,10 +89,11 @@ class _Agent(EventManagerMixin):
         self.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
             return_value=None
         )
-        # Boot reconciliation reads every unacknowledged wake, then opens with
-        # the dispatcher's settlement pass; there is none unless a test says
+        # Boot reconciliation keys every unacknowledged wake, then runs the
+        # dispatcher's settlement pass; there is none unless a test says
         # otherwise.
         self.dispatcher.unacknowledged_durable_deliveries = AsyncMock(return_value=[])
+        self.dispatcher.assign_durable_wake_exclusive_keys = AsyncMock(return_value=0)
         self.dispatcher.settle_owed_cognition_sources = AsyncMock()
         self.task_manager = MagicMock()
         self.task_manager.get_task_snapshot = AsyncMock(
@@ -274,60 +275,52 @@ def _wake_row(source_event_id, *, terminal=False):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "unacknowledged,mints",
-    [
-        ([], True),
-        ([_wake_row('["mid-turn",0]')], False),
-        ([_wake_row('["mid-turn",0]', terminal=True)], False),
-        ([_wake_row('["mid-turn",0,0]')], False),
-        ([_wake_row('["mid-turn",0,0]', terminal=True)], False),
-        ([_wake_row('["mid-turn",0,1]')], True),
-        ([_wake_row('["mid-turn",1]', terminal=True)], True),
-    ],
-    ids=[
-        "none-or-acknowledged",
-        "original-still-live",
-        "original-ended-undelivered",
-        "earlier-recovery-still-live",
-        "earlier-recovery-ended-undelivered",
-        "same-identity-live",
-        "another-input-ended",
-    ],
-)
-async def test_boot_reconciliation_mints_working_only_when_no_other_wake_holds_the_input(
-    unacknowledged, mints
-):
-    """A live wake of the input, the original or an earlier recovery wake,
-    resumes its own work, and a second identity would duplicate it. One that
-    ended without running is settled instead; see
-    ``test_boot_reconcile_ends_a_task_whose_wake_already_failed``. Only the
-    ledger read decides: acknowledged rows are absent from it (#4001)."""
+async def test_boot_reconciliation_keys_every_unacknowledged_wake_then_lets_admission_decide():
+    """Boot used to decide from its own ledger read whether a WORKING task's
+    input got a recovery wake. That read was stale by the time boot minted,
+    and each review found it stale one more way. Boot now gives every
+    unacknowledged wake its exclusive key, so a wake admitted before keys
+    existed is visible to admission, before the settlement pass or any
+    mint. It then mints, and admission in the store refuses a wake while
+    another wake of its input has not run (DUPLICATE). The store-backed races
+    are in ``test_admission_refuses_a_wake_for_an_input_another_wake_carries``
+    (#4001)."""
+
+    from kestrel_sovereign.signals import DurableAdmissionDisposition
 
     agent = _Agent()
+    order = []
+    rows = [_wake_row('["mid-turn",0]'), _wake_row('["mid-turn",0,0]', terminal=True)]
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
         return_value=[
             replace(_task('mid-turn', state=TaskState.TASK_STATE_WORKING), lifecycle_revision=1)
         ]
     )
-    agent.dispatcher.unacknowledged_durable_deliveries = AsyncMock(return_value=unacknowledged)
-    agent.dispatcher.enqueue_durable_cognition = AsyncMock(
-        side_effect=lambda *args, **kwargs: _durable_signal_handle(
-            DurableAdmissionDisposition.COMMITTED
-        )
+    agent.dispatcher.unacknowledged_durable_deliveries = AsyncMock(return_value=rows)
+    agent.dispatcher.assign_durable_wake_exclusive_keys = AsyncMock(
+        side_effect=lambda deliveries: order.append("keys") or 0
     )
+    agent.dispatcher.settle_owed_cognition_sources = AsyncMock(
+        side_effect=lambda: order.append("settle")
+    )
+
+    def refused(*args, **kwargs):
+        order.append("mint")
+        return _durable_signal_handle(DurableAdmissionDisposition.DUPLICATE)
+
+    agent.dispatcher.enqueue_durable_cognition = AsyncMock(side_effect=refused)
 
     await agent.reconcile_a2a_cognition_wakes()
 
     agent.dispatcher.unacknowledged_durable_deliveries.assert_awaited_once_with(
         consumer_id="core.a2a-task-submitted-cognition-v1"
     )
-    agent.dispatcher.get_durable_delivery_for_source_event.assert_not_awaited()
-    minted = [
+    agent.dispatcher.assign_durable_wake_exclusive_keys.assert_awaited_once_with(rows)
+    assert order == ["keys", "settle", "mint"]
+    assert [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
-    ]
-    assert minted == (['["mid-turn",0,1]'] if mints else [])
+    ] == ['["mid-turn",0,1]']
 
 
 @pytest.mark.asyncio

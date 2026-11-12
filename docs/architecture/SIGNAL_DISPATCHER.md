@@ -524,21 +524,49 @@ terminal history. Not owed is not enough to record it, since a task that asked
 for input can be working on the same input again. The `settled_at` column and
 the index are additive DDL the store ensures at every startup.
 
-Boot decides each input's recovery from every wake of it that is not
-acknowledged, under any identity: the original submission wake and each
-earlier recovery wake (`unacknowledged_durable_deliveries`, which reads only the
-ledger: live rows, then unsettled terminal rows, in bounded keyset pages). It
-mints no wake for an input one of them names unless that one is live under the
-very identity boot would mint, which deduplicates. A terminal one owns its
-input for the settlement pass: a replacement would be refused as its wake was,
-and a live wake beside the terminal row would leave the next pass ending work
-that wake still runs. A live one under another identity resumes the work on
-its own retry, and a second identity would run it twice. The read comes before
-the candidate tasks and the settlement pass. A row it found live may end
-undelivered since, here or on a peer, and boot has already left its input to
-it; a row it did not find was acknowledged, or its work released, and neither
-can come to run or be owed. So no write after the read can make boot's
-decision wrong.
+Admission, not boot, decides whether a wake may be minted for an input. For
+one consumer, at most one wake of an exact task input may be unacknowledged,
+whatever identity it was admitted under: the original submission wake, or a
+recovery wake boot minted at a later lifecycle revision. Every submission wake
+carries its input as its delivery's exclusive key (`exclusive_key`, named by
+the agent's `durable_wake_exclusive_key`). `persist_signal` checks it in the
+transaction that admits the wake, under the source handoff lock every
+admission of that source takes. An unacknowledged delivery holding the key
+refuses the wake: nothing is committed, and the producer sees `DUPLICATE`
+(`DurableEventPersistence.exclusive_holder`). A live holder resumes the work on
+its own retry, and a second wake would run it twice. A terminal holder keeps
+its key for good: the settlement pass ends the work it carried, and once that
+is settled nothing can make it owed again. Only a wake that ran (acknowledged)
+releases its key, so boot may then mint a recovery wake for a WORKING task. (A
+terminal row admitted before keys existed may also hand its key to a live wake
+that holds it too; see below.) Rows only leave the holding set, and a key
+never leaves it while a live wake holds it, so a check cannot go stale in the
+unsafe direction. That is why no read boot makes before it mints decides anything.
+
+A ledger read was the decision before, and each review found it stale one way
+more: it checked only the original identity; an earlier recovery wake failed
+after the read; a peer admitted the original after the read. Boot still reads
+every unacknowledged submission wake (`unacknowledged_durable_deliveries`), but
+only to give a wake admitted before exclusive keys existed its key
+(`assign_durable_wake_exclusive_keys`). It does so before reading candidates,
+running the settlement pass or minting anything. The column and its index
+(`idx_durable_signal_deliveries_exclusive_key`) are additive DDL the store
+ensures at every startup.
+
+Wakes admitted before exclusive keys existed may share one input: earlier
+boots minted a recovery wake beside one that was still live, and a retry of
+either could then fail. Each receives the input's key, so for those inputs
+admission's rule holds only from the upgrade on. The settlement pass therefore
+reads, for each terminal row, whether a live delivery of its consumer holds
+the same key (`delivery_carried_by_live_wake`). That wake carries the work: it
+runs it, or ends undelivered and owes it itself. The terminal row is then
+released to it without its work being read or touched
+(`record_delivery_settled(carried_by_live_wake=True)`), in a write that reads
+the live wake again and records nothing once it is gone. The row also gives up
+its key, so once the live wake has run, nothing holds the input, and boot may
+mint a recovery wake for a WORKING task as it does for any input whose wake
+ran. A row admitted under exclusive keys never shares its key with a live
+wake, so for it the check is one read that finds nothing.
 
 A terminal row is that debt's only record, so retention keeps it. The durable
 retention sweep (`purge_expired_durable_deliveries`) holds every failed or
@@ -575,12 +603,12 @@ terminal write, so a late terminalizer or retained cleanup of that row clears
 only the row's debt and never the settlement's. The heartbeat logs it. While it
 stands owner retirement refuses and the host is not ready: `/health` fails and
 `/health/detailed` names the deliveries in a `durable_cognition_control` check
-(`SignalDispatcher.unresolved_cognition_control`). It guards no lease, so it
-never puts the owner heartbeat into its cleanup branch: on PostgreSQL that
-branch refreshes an owner only while it leases cognition, and a peer would
-reclaim this live owner's other leases. The heartbeat keeps its ordinary work,
-and each pass, like the retirement drain, retries only the fenced write, which
-returns at once when the earlier write committed. Each pass retries it whether
+(`SignalDispatcher.unresolved_cognition_control`). It guards no lease, so the
+heartbeat keeps its ordinary maintenance. The record that takes a settled row
+out of the pass is treated the same way: its unknown commit is kept as that
+row's settlement control, never as control that refuses all durable
+admission. Each pass, like the retirement drain, retries only the fenced
+write, which returns at once when the earlier write committed. Each pass retries it whether
 or not its row is still unsettled: a peer that settled the same work records
 the row settled, and retention may then remove it, which takes the row out of
 the pass but leaves this process's control standing. The retry reads the work's
@@ -588,20 +616,33 @@ own state, so it returns once nothing is owed. The control ends when a retry
 returns; any failure keeps it, so shutdown never reports a deferred settlement
 as done. The row's CAS is never written again.
 
-Whether the owner heartbeat runs and which branch it runs are separate
-decisions. An owner that is not durably retired keeps heartbeating, whatever
-keeps it unretired: a shutdown that refused or failed (settlement control that
-stands, an ordinary error in its retry, or a stop mark that did not commit),
-retained row debt, or a retained cognition task
-(`_runtime_owner_liveness_required`). The heartbeat stops only while shutdown
-stops it and marks the owner stopped, and after that mark commits; if either
-step fails it resumes for the retry. Only debt that guards a lease routes it
-to the cleanup branch (`_runtime_owner_cleanup_required`). Once shutdown has
-closed admission, any other unretired owner's heartbeat runs no settlement
-pass, recovery or claim: it renews only this owner's own row
-(`retain_unretired_runtime_owner`), which never inserts a row or renews one
-already stopped, so a stop mark whose acknowledgement was lost stays a
-retirement.
+An owner that is not durably retired is renewed on every heartbeat tick, and
+nothing else decides that. Whatever keeps it unretired does not matter: a
+shutdown that refused or failed, retained row debt, a retained cognition task,
+settlement control, or a refused admission (`_runtime_owner_liveness_required`).
+Renewal is one fixed write, `retain_unretired_runtime_owner`, the only path
+that renews an owner. It refreshes this owner's own existing, unstopped row,
+and never inserts a row, revives a stopped one, grants a lease or admits work.
+On PostgreSQL it runs on the fixed cleanup connection, which needs no work
+admission (`admit_work=False`). On both backends each tick starts it in a task
+of its own (`_start_runtime_owner_renewal`), in an empty context. It therefore
+runs outside durable admission and on no execution scope the agent's own work
+holds, so a fenced original scope cannot refuse it. It never waits for other
+work. The tick starts it before the heartbeat's maintenance and schedules the
+next tick without waiting for that maintenance, so a maintenance pass that
+stalls or fails never holds renewal back. Renewal stops only while shutdown
+marks the owner stopped, and after that mark commits. If either step fails,
+it resumes for the retry, and a stop mark whose acknowledgement was lost stays
+a retirement. A renewal that finds the owner stopped or gone renews nothing,
+and while debt that guards a lease stands it raises that debt as lost
+protection.
+
+The maintenance after it (`_heartbeat_runtime_owner`) recovers reservations,
+handoffs and leases and starts the settlement pass. It runs under durable
+admission and in the owner's own execution scope, so its failures, including
+retained control, stay its own. While debt that guards a lease stands
+(`_runtime_owner_cleanup_required`), or once shutdown has closed admission, a
+heartbeat only renews and admits no cognition.
 
 The write itself is the agent's `settle_undelivered_cognition_wake`, named by
 the wake's durable identity (`source`, `target_agent`, `source_event_id`) and

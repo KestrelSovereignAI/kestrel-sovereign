@@ -3512,6 +3512,9 @@ class _ReconcilingA2AAgent(_Agent):
 
     reconcile_a2a_cognition_wakes = _Mixin.reconcile_a2a_cognition_wakes
     _a2a_wake_replay_horizon = _Mixin._a2a_wake_replay_horizon
+    # Admission, not boot's read, refuses a second wake of one input (#4001).
+    durable_wake_exclusive_key = _Mixin.durable_wake_exclusive_key
+    undelivered_cognition_wake_consumers = _Mixin.undelivered_cognition_wake_consumers
 
     def __init__(self, did: str, task, lifecycle_revision: int):
         from kestrel_sovereign.signals.sources.a2a import (
@@ -4862,7 +4865,7 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
     async def reject_renewal(**_kwargs):
         return None
 
-    original_owner_heartbeat = dispatcher_a._durable_store.heartbeat_runtime_owner
+    original_owner_heartbeat = dispatcher_a._durable_store.retain_unretired_runtime_owner
     original_owner_schedule = dispatcher_a._schedule_runtime_owner_heartbeat
     fenced_heartbeat_times: list[datetime] = []
     fenced_heartbeat_delays: list[float | None] = []
@@ -4890,18 +4893,18 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
                 fenced_heartbeat_times[-1] + dispatcher_a._runtime_owner_stale_after
                 if fenced_heartbeat_times else datetime.now(timezone.utc)
             )
-            await original_owner_heartbeat(**{**kwargs, "now": committed_at})
+            renewed = await original_owner_heartbeat(**{**kwargs, "now": committed_at})
             fenced_heartbeat_times.append(committed_at)
             if committed_at - fenced_heartbeat_times[0] >= (
                 2 * dispatcher_a._runtime_owner_stale_after
             ):
                 repeated_fenced_heartbeat.set()
-        else:
-            await original_owner_heartbeat(**kwargs)
+            return renewed
+        return await original_owner_heartbeat(**kwargs)
 
     agent_a.process_input = hostile_turn
     dispatcher_a.renew_durable_delivery_lease = reject_renewal  # type: ignore[method-assign]
-    dispatcher_a._durable_store.heartbeat_runtime_owner = observe_owner_heartbeat
+    dispatcher_a._durable_store.retain_unretired_runtime_owner = observe_owner_heartbeat
     dispatcher_a._schedule_runtime_owner_heartbeat = observe_owner_schedule
     try:
         await dispatcher_a.register_durable_consumer(consumer)
@@ -4992,7 +4995,7 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         ) is not None
     finally:
         allow_exit.set()
-        dispatcher_a._durable_store.heartbeat_runtime_owner = original_owner_heartbeat
+        dispatcher_a._durable_store.retain_unretired_runtime_owner = original_owner_heartbeat
         dispatcher_a._schedule_runtime_owner_heartbeat = original_owner_schedule
         try:
             await dispatcher_a.shutdown_durable_delivery()
@@ -6445,7 +6448,7 @@ async def test_runtime_owner_heartbeat_failure_keeps_a_bounded_future_retry(tmp_
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "owner-heartbeat-retry.db", "did:agent:one"
     )
-    original = dispatcher._durable_store.heartbeat_runtime_owner
+    original = dispatcher._durable_store.retain_unretired_runtime_owner
     attempts = 0
 
     async def fail_once(*args, **kwargs):
@@ -6455,7 +6458,7 @@ async def test_runtime_owner_heartbeat_failure_keeps_a_bounded_future_retry(tmp_
             raise RuntimeError("temporary durable store outage")
         return await original(*args, **kwargs)
 
-    dispatcher._durable_store.heartbeat_runtime_owner = fail_once
+    dispatcher._durable_store.retain_unretired_runtime_owner = fail_once
     try:
         dispatcher._start_runtime_owner_heartbeat()
         task = dispatcher._runtime_owner_heartbeat_task
@@ -6473,7 +6476,7 @@ async def test_runtime_owner_heartbeat_failure_keeps_a_bounded_future_retry(tmp_
             dispatcher._runtime_owner_stale_after.total_seconds() / 3
         )
     finally:
-        dispatcher._durable_store.heartbeat_runtime_owner = original
+        dispatcher._durable_store.retain_unretired_runtime_owner = original
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
@@ -9020,7 +9023,7 @@ async def test_shutdown_drains_an_admitted_owner_heartbeat_before_release(tmp_pa
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "shutdown-owner-heartbeat.db", "did:agent:one"
     )
-    original_heartbeat = dispatcher._durable_store.heartbeat_runtime_owner
+    original_heartbeat = dispatcher._durable_store.retain_unretired_runtime_owner
     heartbeat_entered = asyncio.Event()
     allow_heartbeat = asyncio.Event()
     heartbeat_task = None
@@ -9031,7 +9034,7 @@ async def test_shutdown_drains_an_admitted_owner_heartbeat_before_release(tmp_pa
         await allow_heartbeat.wait()
         return await original_heartbeat(*args, **kwargs)
 
-    dispatcher._durable_store.heartbeat_runtime_owner = heartbeat_after_shutdown_admission
+    dispatcher._durable_store.retain_unretired_runtime_owner = heartbeat_after_shutdown_admission
     try:
         heartbeat_task = asyncio.create_task(dispatcher._heartbeat_runtime_owner())
         await asyncio.wait_for(heartbeat_entered.wait(), timeout=1.0)
@@ -9057,7 +9060,7 @@ async def test_shutdown_drains_an_admitted_owner_heartbeat_before_release(tmp_pa
             await dispatcher._heartbeat_runtime_owner()
     finally:
         allow_heartbeat.set()
-        dispatcher._durable_store.heartbeat_runtime_owner = original_heartbeat
+        dispatcher._durable_store.retain_unretired_runtime_owner = original_heartbeat
         if heartbeat_task is not None and not heartbeat_task.done():
             await heartbeat_task
         if shutdown_task is not None and not shutdown_task.done():

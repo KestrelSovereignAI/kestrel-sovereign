@@ -760,26 +760,33 @@ async def test_boot_reconcile_ends_a_task_whose_wake_already_failed(manager, sta
     the task live, with no wake left to run it. Boot reconciliation opens
     with the settlement pass, which ends it, rather than leaving it for its
     sender to wait on or minting another wake for the same refused input.
-    Boot dispatches nothing for that input, not even a duplicate of the
-    ended wake: its row owns the input."""
+    Boot admits nothing for that input, not even a duplicate of the ended
+    wake: its row holds the input, so admission refuses every wake of it."""
+    from kestrel_sovereign.signals import DurableAdmissionDisposition
+
     task = await manager.create_task(request(), creator_agent_id="did:creator")
     agent, dispatcher, consumer = await input_dispatcher(manager)
     try:
         await failed_submission_wake(manager, dispatcher, consumer, task)
         if state == TaskState.TASK_STATE_WORKING:
             await manager.update_status(task.id, state, recipient_agent_id=manager.did)
-        enqueued = []
+        admissions = []
         enqueue = dispatcher.enqueue_durable_cognition
 
-        async def counted_enqueue(signal, **kwargs):
-            enqueued.append(kwargs["source_event_id"])
-            return await enqueue(signal, **kwargs)
+        async def recorded_enqueue(signal, **kwargs):
+            handle = await enqueue(signal, **kwargs)
+            receipt = await handle.wait_for_durable_admission()
+            admissions.append(receipt.disposition)
+            return handle
 
-        dispatcher.enqueue_durable_cognition = counted_enqueue
+        dispatcher.enqueue_durable_cognition = recorded_enqueue
 
         await agent.reconcile_a2a_cognition_wakes()
 
-        assert enqueued == []
+        assert admissions and set(admissions) <= {
+            DurableAdmissionDisposition.DUPLICATE,
+            DurableAdmissionDisposition.DELIVERY_FAILED,
+        }, admissions
 
         settled = await snapshot(manager, task)
         assert settled.task.status.state == TaskState.TASK_STATE_FAILED
@@ -796,7 +803,7 @@ async def test_boot_reconcile_ends_a_task_whose_wake_already_failed(manager, sta
 @pytest.mark.parametrize("when", ["after_read", "after_pass"])
 @pytest.mark.parametrize("ending", ["failed", "stopped", "acknowledged", "still_live"])
 @pytest.mark.parametrize("held_by", ["original", "earlier_recovery"])
-async def test_boot_mints_no_wake_for_an_input_a_live_wake_held_at_its_read(
+async def test_boot_mints_a_wake_only_for_an_input_no_wake_still_carries(
     manager, held_by, ending, when
 ):
     """Self-review of wo-4001-8 and of wo-4001-9: a WORKING task's input is
@@ -809,9 +816,11 @@ async def test_boot_mints_no_wake_for_an_input_a_live_wake_held_at_its_read(
     original wake alone: it minted a second wake beside a live earlier
     recovery wake, so one input ran twice, and beside one a peer had just
     failed, so the next settlement pass ended work the new wake still ran.
-    Boot now mints nothing for an input a live wake held when it read. A wake
-    that ended undelivered is settled by the next pass; one that ran, or
-    still runs, is left to itself (#4001)."""
+    Admission now decides as boot mints: it refuses a wake while another one
+    that has not run carries the input. A wake that ended undelivered is
+    settled by the next pass, and one that still runs is left to itself. One
+    that ran leaves its input to recovery, so boot mints exactly one wake
+    for it, as it does for any input whose wake ran (#4001)."""
     import copy
 
     from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
@@ -898,10 +907,17 @@ async def test_boot_mints_no_wake_for_an_input_a_live_wake_held_at_its_read(
         assert ended == [held.delivery_id]
 
         rows = await dispatcher.list_durable_deliveries(consumer_id=consumer)
-        assert {d.delivery_id for d in rows} == rows_before, (
-            "boot minted a second wake for an input a live wake held",
-            [(d.event.source_event_id, d.status) for d in rows],
-        )
+        minted = [d for d in rows if d.delivery_id not in rows_before]
+        summary = [(d.event.source_event_id, d.status) for d in rows]
+        if ending == "acknowledged":
+            assert len(minted) == 1 and not minted[0].is_terminal, summary
+        else:
+            assert minted == [], (
+                "boot minted a second wake for an input another wake carries",
+                summary,
+            )
+        # Never two wakes that have not run for one input.
+        assert sum(d.status != "acknowledged" for d in rows) <= 1, summary
         await heartbeat(dispatcher)
         assert (await snapshot(manager, task)).task.status.state == {
             "failed": TaskState.TASK_STATE_FAILED,
@@ -912,7 +928,7 @@ async def test_boot_mints_no_wake_for_an_input_a_live_wake_held_at_its_read(
         assert {
             d.delivery_id
             for d in await dispatcher.list_durable_deliveries(consumer_id=consumer)
-        } == rows_before
+        } == rows_before | {d.delivery_id for d in minted}
     finally:
         await close_input_dispatcher(agent, dispatcher)
 
@@ -1616,6 +1632,438 @@ async def test_a_row_that_ends_during_a_pass_gets_a_prompt_pass_of_its_own(
     finally:
         release.set()
         await close_input_dispatcher(agent, dispatcher)
+
+
+_RENEWAL_OBSTACLES = (
+    "refused_shutdown",
+    "failed_shutdown",
+    "stalled_settlement",
+    "stalled_maintenance",
+    "native_denial",
+    "lost_settled_ack",
+    "retained_control",
+)
+
+
+@pytest.mark.parametrize("obstacle", _RENEWAL_OBSTACLES)
+async def test_an_unretired_owner_is_renewed_whatever_else_stands(
+    manager, monkeypatch, obstacle
+):
+    """Self-review of wo-4001-8 and of both wo-4001-9 attempts: each round
+    found another way the owner's renewal stopped while the owner still
+    leased work. A shutdown that refused (an unknown settlement commit), one
+    that failed (an ordinary error on its retry), a settlement pass or a
+    maintenance sweep that stalled, native denial of the agent's own
+    execution scope, a lost acknowledgement of the record that takes a
+    settled row out of the pass, and a plain retained control error all held
+    renewal back, because renewal shared a path with work that can fail or
+    wait. Renewal is now one fixed write, in a task of its own every tick,
+    outside durable admission and on no execution scope the agent's work can
+    fence. Whatever stands, the real timer renews the unretired owner past
+    the stale threshold and a peer's recovery reclaims nothing it holds
+    (#4001)."""
+    from kestrel_sdk.storage.database.interface import QueryError
+
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        ExecutionCustody,
+        ProcessRuntimeExecutionFence,
+    )
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.signals import SignalDispatcher
+
+    stale_after = timedelta(seconds=1.2)
+    monkeypatch.setitem(
+        SignalDispatcher.__init__.__kwdefaults__, "runtime_owner_stale_after", stale_after
+    )
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    released = asyncio.Event()
+    fault = {"error": None}
+    closed = False
+    try:
+        if obstacle in ("native_denial", "lost_settled_ack"):
+            # The agent's own execution scope, which a booted agent binds on
+            # every resident timer and so on every heartbeat it starts.
+            agent._execution_custody = ExecutionCustody(ProcessRuntimeExecutionFence(agent.did))
+            monkeypatch.setattr(
+                type(agent), "_runtime_owner_context",
+                KestrelAgent._runtime_owner_context, raising=False,
+            )
+            if dispatcher._runtime_owner_heartbeat_timer is not None:
+                dispatcher._runtime_owner_heartbeat_timer.cancel()
+                dispatcher._runtime_owner_heartbeat_timer = None
+            dispatcher._schedule_runtime_owner_heartbeat()
+
+        save = manager.task_store.save_recipient_lifecycle
+
+        async def faulted_save(*args, **kwargs):
+            if fault["error"] is not None:
+                raise fault["error"]
+            return await save(*args, **kwargs)
+
+        monkeypatch.setattr(manager.task_store, "save_recipient_lifecycle", faulted_save)
+        failed, held = await _held_workflow_lease(manager, dispatcher, consumer, task)
+
+        if obstacle in ("refused_shutdown", "failed_shutdown"):
+            fault["error"] = ExecutionCommitOutcomeError("unknown")
+            await heartbeat(dispatcher)
+            assert dispatcher.unresolved_cognition_control == (failed.delivery_id,)
+            if obstacle == "failed_shutdown":
+                fault["error"] = QueryError("database is locked")
+            with pytest.raises(BaseException):
+                await close_input_dispatcher(agent, dispatcher)
+            assert dispatcher._durable_shutdown
+            assert dispatcher._durable_runtime_owner_registered
+        elif obstacle == "stalled_settlement":
+            entered, released = stall_settlement_reads(agent, monkeypatch)
+            dispatcher._request_owed_settlement_pass(consumer_id=consumer, status="failed")
+            await asyncio.wait_for(entered.wait(), 5)
+        elif obstacle == "stalled_maintenance":
+            entered = asyncio.Event()
+
+            async def stalled_sweep():
+                entered.set()
+                await released.wait()
+                return 0
+
+            monkeypatch.setattr(dispatcher, "_recover_abandoned_leases", stalled_sweep)
+            await asyncio.wait_for(entered.wait(), 5)
+        elif obstacle == "native_denial":
+            # What either backend does to every original scope when a COMMIT
+            # acknowledgement is lost.
+            agent._execution_custody.preserve_commit_uncertainty("unknown")
+        elif obstacle == "lost_settled_ack":
+            store = dispatcher._durable_store
+            record = store.record_delivery_settled
+
+            async def lost_ack(**kwargs):
+                await record(**kwargs)
+                agent._execution_custody.preserve_commit_uncertainty("unknown")
+                raise ExecutionCommitOutcomeError("unknown")
+
+            monkeypatch.setattr(store, "record_delivery_settled", lost_ack)
+            await heartbeat(dispatcher)
+            # The record's own control, retained for its row, never the pass's.
+            assert dispatcher.unresolved_cognition_control == (failed.delivery_id,)
+            assert dispatcher._outcome_log_control_error is None
+        else:
+            dispatcher._outcome_log_control_error = ExecutionCommitOutcomeError("unknown")
+
+        await _assert_unretired_owner_stays_live(dispatcher, held, stale_after)
+
+        # The obstacle still stands: renewal went on beside it.
+        if obstacle in ("refused_shutdown", "failed_shutdown"):
+            assert dispatcher._durable_runtime_owner_registered
+        elif obstacle == "stalled_settlement":
+            assert not dispatcher._owed_settlement_task.done()
+        elif obstacle == "stalled_maintenance":
+            assert not dispatcher._runtime_owner_heartbeat_task.done()
+        elif obstacle in ("native_denial", "lost_settled_ack"):
+            with pytest.raises(ExecutionCommitOutcomeError):
+                agent._execution_custody.require_work()
+        else:
+            assert dispatcher._outcome_log_control_error is not None
+    finally:
+        released.set()
+        fault["error"] = None
+        dispatcher._outcome_log_control_error = None
+        if not closed:
+            await close_input_dispatcher(agent, dispatcher)
+
+
+@pytest.mark.parametrize(
+    "race",
+    ["earlier_identity_live", "earlier_identity_fails", "original_admitted_meanwhile"],
+)
+async def test_admission_refuses_a_wake_for_an_input_another_wake_carries(manager, race):
+    """Self-review of wo-4001-8 and of both wo-4001-9 attempts: boot decided
+    from a snapshot whether to mint a recovery wake for a WORKING task's
+    input, and each round found the snapshot stale one way more. It checked
+    only the original identity, while an earlier recovery wake still ran
+    (``earlier_identity_live``). An earlier recovery wake a peer failed after
+    boot read the ledger, and boot minted a replacement the next settlement
+    pass then ended (``earlier_identity_fails``). A peer admitted the original
+    wake after boot read, and boot minted a second leased wake for the same
+    input (``original_admitted_meanwhile``). Admission now decides, in the
+    store, in the transaction that admits the wake: it refuses a wake while
+    another wake of the same input has not run, whatever its identity. Here
+    two dispatchers share one store, and the peer acts while boot is between
+    its reads and its admission (#4001)."""
+    import copy
+
+    from kestrel_sovereign.signals import DurableAdmissionDisposition
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    peer_agent, peer, consumer = await input_dispatcher(manager)
+    agent, dispatcher, _ = await input_dispatcher(manager)
+    held = None
+    try:
+        if race != "original_admitted_meanwhile":
+            ran = await claimed_submission_wake(manager, peer, consumer, task)
+            assert await peer.ack_durable_delivery(
+                consumer_id=consumer, delivery_id=ran.delivery_id,
+                lease_token=ran.lease_token,
+            )
+            await manager.update_status(
+                task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+            )
+            earlier = await snapshot(manager, task)
+            identity = submitted_input_identity(
+                task.id, 0, working_revision=earlier.lifecycle_revision
+            )
+            await peer.dispatch_signal(
+                copy.deepcopy(wake(earlier, manager)), source_event_id=identity
+            )
+            held = await peer.get_durable_delivery_for_source_event(
+                consumer_id=consumer, source=SOURCE_NAME, source_event_id=identity
+            )
+            held = await peer.claim_durable_delivery_for_event(
+                consumer_id=consumer, event_id=held.event_id,
+                executor_id=peer._durable_delivery_owner,
+            )
+            # The same input, now at a later lifecycle revision.
+            await manager.update_status(
+                task.id, TaskState.TASK_STATE_SUBMITTED, recipient_agent_id=manager.did
+            )
+            await manager.update_status(
+                task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+            )
+        read = manager.list_cognition_wake_candidates
+        read_revisions = []
+
+        async def peer_acts_as_boot_reads(**kwargs):
+            nonlocal held
+            if race == "original_admitted_meanwhile":
+                held = await claimed_submission_wake(manager, peer, consumer, task)
+                await manager.update_status(
+                    task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+                )
+            candidates = await read(**kwargs)
+            read_revisions.extend(
+                c.lifecycle_revision for c in candidates if c.task.id == task.id
+            )
+            if race == "earlier_identity_fails":
+                await earlier_terminal_row(
+                    peer, consumer, held,
+                    error="execution_control_unresolved: tool_effect_reconciliation_required",
+                )
+            return candidates
+
+        manager.list_cognition_wake_candidates = peer_acts_as_boot_reads
+        admissions = []
+        enqueue = dispatcher.enqueue_durable_cognition
+
+        async def recorded_enqueue(signal, **kwargs):
+            handle = await enqueue(signal, **kwargs)
+            admissions.append(
+                (kwargs["source_event_id"], (await handle.wait_for_durable_admission()).disposition)
+            )
+            return handle
+
+        dispatcher.enqueue_durable_cognition = recorded_enqueue
+        await agent.reconcile_a2a_cognition_wakes()
+        manager.list_cognition_wake_candidates = read
+
+        rows = await dispatcher.list_durable_deliveries(consumer_id=consumer)
+        summary = [(d.event.source_event_id, d.status, d.lease_owner) for d in rows]
+        assert [d.delivery_id for d in rows if d.status != "acknowledged"] == [
+            held.delivery_id
+        ], summary
+        (revision,) = read_revisions
+        assert admissions == [
+            (
+                submitted_input_identity(task.id, 0, working_revision=revision),
+                DurableAdmissionDisposition.DUPLICATE,
+            )
+        ], admissions
+
+        await heartbeat(dispatcher)
+        # A live wake keeps its work; a failed one, the only wake of its
+        # input, leaves it to the settlement pass, which ends it.
+        assert (await snapshot(manager, task)).task.status.state == (
+            TaskState.TASK_STATE_FAILED if race == "earlier_identity_fails"
+            else TaskState.TASK_STATE_WORKING
+        ), summary
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+        await close_input_dispatcher(peer_agent, peer)
+
+
+async def _claimed_legacy_wake(manager, dispatcher, consumer, task, *, recovery):
+    """Admit and claim a submission wake as a release before exclusive keys did.
+
+    Its delivery holds no key, and nothing checked whether another wake of
+    the same input was live: an earlier boot minted a recovery wake at the
+    task's current lifecycle revision beside one that had not run.
+    """
+    import copy
+
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import SOURCE_NAME
+
+    current = await snapshot(manager, task)
+    identity_key = (
+        submitted_input_identity(
+            task.id, current.input_revision, working_revision=current.lifecycle_revision
+        )
+        if recovery
+        else submitted_input_identity(task.id, current.input_revision)
+    )
+    dispatcher._agent.durable_wake_exclusive_key = lambda **_: None
+    try:
+        await dispatcher.dispatch_signal(
+            copy.deepcopy(wake(current, manager)), source_event_id=identity_key
+        )
+    finally:
+        del dispatcher._agent.durable_wake_exclusive_key
+    admitted = await dispatcher.get_durable_delivery_for_source_event(
+        consumer_id=consumer, source=SOURCE_NAME, source_event_id=identity_key
+    )
+    return await dispatcher.claim_durable_delivery_for_event(
+        consumer_id=consumer,
+        event_id=admitted.event_id,
+        executor_id=dispatcher._durable_delivery_owner,
+    )
+
+
+async def _next_working_revision(manager, task):
+    """Move a WORKING task to a later lifecycle revision of the same input."""
+    await manager.update_status(
+        task.id, TaskState.TASK_STATE_SUBMITTED, recipient_agent_id=manager.did
+    )
+    await manager.update_status(
+        task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+    )
+
+
+@pytest.mark.parametrize("earlier", ["failed_at_upgrade", "fails_after_upgrade"])
+async def test_an_upgraded_wake_beside_a_live_one_leaves_its_work_to_that_wake(
+    manager, earlier
+):
+    """Self-review of wo-4001-10: boot gives every wake admitted before
+    exclusive keys existed its key, and the rules those wakes were admitted
+    under could leave two unacknowledged wakes for one input. Here the
+    original submission wake ran, a recovery wake for its WORKING task then
+    failed (or is still leased and fails after the upgrade), and a later
+    recovery wake for the same input is leased to an earlier process. Boot
+    gave both recovery wakes the same key, and the settlement pass then
+    failed the task while the leased wake still carried its input. A
+    terminal row whose key a live wake also holds now owes nothing: the pass
+    releases it to that wake, which hands it the key, and once that wake has
+    run, boot may wake the WORKING task's input again, as it does for any
+    input whose wake ran (#4001)."""
+    from kestrel_sovereign.signals import DurableAdmissionDisposition
+
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    peer_agent, peer, consumer = await input_dispatcher(manager)
+    agent, dispatcher, _ = await input_dispatcher(manager)
+    reconciliation = "execution_control_unresolved: tool_effect_reconciliation_required"
+    try:
+        original = await _claimed_legacy_wake(manager, peer, consumer, task, recovery=False)
+        assert await peer.ack_durable_delivery(
+            consumer_id=consumer, delivery_id=original.delivery_id,
+            lease_token=original.lease_token,
+        )
+        await manager.update_status(
+            task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+        )
+        older = await _claimed_legacy_wake(manager, peer, consumer, task, recovery=True)
+        if earlier == "failed_at_upgrade":
+            await earlier_terminal_row(peer, consumer, older, error=reconciliation)
+        await _next_working_revision(manager, task)
+        live = await _claimed_legacy_wake(manager, peer, consumer, task, recovery=True)
+        # A later lifecycle revision again: boot's recovery identity is new,
+        # so only the input's key can refuse it.
+        await _next_working_revision(manager, task)
+        backend = dispatcher._durable_store._backend
+        assert await backend.fetch_all(
+            "SELECT exclusive_key FROM durable_signal_deliveries "
+            "WHERE exclusive_key IS NOT NULL"
+        ) == []
+
+        admissions = []
+        enqueue = dispatcher.enqueue_durable_cognition
+
+        async def recorded_enqueue(signal, **kwargs):
+            handle = await enqueue(signal, **kwargs)
+            admissions.append((await handle.wait_for_durable_admission()).disposition)
+            return handle
+
+        dispatcher.enqueue_durable_cognition = recorded_enqueue
+        await agent.reconcile_a2a_cognition_wakes()
+
+        rows = {
+            d.delivery_id: d
+            for d in await dispatcher.list_durable_deliveries(consumer_id=consumer)
+        }
+        summary = [(d.event.source_event_id, d.status) for d in rows.values()]
+        assert set(rows) == {original.delivery_id, older.delivery_id, live.delivery_id}, summary
+        assert rows[live.delivery_id].status == "leased", summary
+        assert admissions == [DurableAdmissionDisposition.DUPLICATE], admissions
+        assert (await snapshot(manager, task)).task.status.state == TaskState.TASK_STATE_WORKING
+
+        if earlier == "fails_after_upgrade":
+            await earlier_terminal_row(peer, consumer, older, error=reconciliation)
+            # Carried by the live wake, so owed to no one.
+            assert await dispatcher.owed_cognition_wake_settlements() == []
+        await heartbeat(dispatcher)
+        assert (await snapshot(manager, task)).task.status.state == TaskState.TASK_STATE_WORKING
+        assert await dispatcher.unsettled_cognition_wakes() == [], summary
+
+        # The live wake runs. Its input was delivered, so the released row
+        # never comes back owed, and the input's key is held by nothing.
+        assert await peer.ack_durable_delivery(
+            consumer_id=consumer, delivery_id=live.delivery_id, lease_token=live.lease_token,
+        )
+        await heartbeat(dispatcher)
+        assert (await snapshot(manager, task)).task.status.state == TaskState.TASK_STATE_WORKING
+
+        admissions.clear()
+        await agent.reconcile_a2a_cognition_wakes()
+        assert admissions == [DurableAdmissionDisposition.COMMITTED], admissions
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+        await close_input_dispatcher(peer_agent, peer)
+
+
+async def test_an_upgraded_wake_left_alone_still_owes_its_work_once_none_is_live(manager):
+    """Self-review of wo-4001-10: releasing a terminal upgraded wake to a
+    live one must not release one whose sibling has ended too. Two recovery
+    wakes of one input, admitted before exclusive keys existed, both end
+    undelivered: no live wake carries the input, so the pass ends it, and the
+    sender sees it fail rather than wait (#4001)."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    peer_agent, peer, consumer = await input_dispatcher(manager)
+    agent, dispatcher, _ = await input_dispatcher(manager)
+    reconciliation = "execution_control_unresolved: tool_effect_reconciliation_required"
+    try:
+        original = await _claimed_legacy_wake(manager, peer, consumer, task, recovery=False)
+        assert await peer.ack_durable_delivery(
+            consumer_id=consumer, delivery_id=original.delivery_id,
+            lease_token=original.lease_token,
+        )
+        await manager.update_status(
+            task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+        )
+        older = await _claimed_legacy_wake(manager, peer, consumer, task, recovery=True)
+        await _next_working_revision(manager, task)
+        later = await _claimed_legacy_wake(manager, peer, consumer, task, recovery=True)
+        await agent.reconcile_a2a_cognition_wakes()
+
+        await earlier_terminal_row(peer, consumer, older, error=reconciliation)
+        await heartbeat(dispatcher)
+        assert (await snapshot(manager, task)).task.status.state == TaskState.TASK_STATE_WORKING
+
+        await earlier_terminal_row(peer, consumer, later, error=reconciliation)
+        await heartbeat(dispatcher)
+        seen = (await snapshot(manager, task)).task
+        assert seen.status.state == TaskState.TASK_STATE_FAILED
+        assert "tool_effect_reconciliation_required" in seen.status.message.parts[0].text
+        assert await dispatcher.unsettled_cognition_wakes() == []
+    finally:
+        await close_input_dispatcher(agent, dispatcher)
+        await close_input_dispatcher(peer_agent, peer)
 
 
 async def failed_recovery_wake(manager, dispatcher, consumer, task):

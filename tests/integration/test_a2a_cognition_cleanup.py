@@ -66,7 +66,7 @@ async def cognition_lease(native_pg, cognition_source, cognition_registration):
 
 async def test_core_cognition_native_cleanup_supports_original_registered_source(cognition_lease):
     backend, _observer, _schema, _agent, _dispatcher, delivery = cognition_lease
-    assert await backend.retain_cognition_cleanup_owner(
+    assert await backend.retain_unretired_runtime_owner(
         agent_id="original", owner_id="dispatcher:original",
     ), "the original A2A cognition owner lost its cleanup heartbeat"
     assert await backend.fail_cognition_delivery(
@@ -166,7 +166,7 @@ async def test_original_retry_commit_lost_ack_excludes_fresh_runtime_and_settles
             "SELECT status,lease_owner,lease_token FROM durable_signal_deliveries"
         )) == ("retry", "dispatcher:original", delivery.lease_token)
         assert dispatcher._retained_cognition_control_debt
-        assert await backend.retain_cognition_cleanup_owner(agent_id=agent.did, owner_id="dispatcher:original")
+        assert await backend.retain_unretired_runtime_owner(agent_id=agent.did, owner_id="dispatcher:original")
         assert await fresh.claim_delivery(agent_id=agent.did, consumer_id=delivery.consumer_id,
                                           executor_id="dispatcher:successor") is None
         release_terminal.set()
@@ -228,7 +228,7 @@ async def test_retained_core_cognition_keeps_owner_until_original_body_and_termi
         source.assert_retained(dispatcher._retained_cognition_control_debt[delivery.delivery_id][1])
         assert await dispatcher.shutdown_durable_delivery() is False
         assert dispatcher.durable_shutdown_owner_fenced
-        await dispatcher._retain_runtime_owner_cleanup_liveness()
+        await dispatcher._renew_runtime_owner_row()
         assert await observer.fetchval("SELECT stopped_at FROM durable_signal_runtime_owners") is None
         assert await observer.fetchval("SELECT status FROM durable_signal_deliveries") == "leased"
         release_body.set()

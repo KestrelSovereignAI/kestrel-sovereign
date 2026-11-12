@@ -744,30 +744,22 @@ class EventManagerMixin:
         )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_signal_for_submitted_task,
-            parse_submitted_input_identity,
             submitted_input_identity,
         )
 
-        # Every wake of an input that is not acknowledged decides whether
-        # boot may mint one for it (#4001). Read before the candidates and the
-        # settlement pass, so a task the pass ends here is skipped below, and
-        # from the ledger alone, so no task's read can refuse this boot. Each
-        # row read live may since have ended undelivered, and settlement then
-        # owns its input; a row not read was acknowledged, or its work was
-        # released, and neither can change. So the decision below stands
-        # whatever such a row has done since, here or on a peer.
-        wakes_of_input: dict[tuple[str, int], list] = {}
-        for delivery in await self.dispatcher.unacknowledged_durable_deliveries(
-            consumer_id=SUBMITTED_CONSUMER
-        ):
-            if delivery.event.source != SUBMITTED_SOURCE:
-                continue
-            try:
-                named = parse_submitted_input_identity(delivery.event.source_event_id)
-            except ValueError:
-                # A row without a canonical identity names no input.
-                continue
-            wakes_of_input.setdefault(named, []).append(delivery)
+        # Admission decides whether a wake may be minted for an input: the
+        # store refuses one while another wake that has not run carries the
+        # same input, whatever identity either is under (#4001). Wakes
+        # admitted before that rule existed carry no key it can see, so each
+        # is given its key first. Those rules could leave a failed wake and a
+        # live one for one input, and both get its key: the settlement pass
+        # below releases the failed one to the live one, which carries the
+        # work, rather than ending work the live one still runs.
+        await self.dispatcher.assign_durable_wake_exclusive_keys(
+            await self.dispatcher.unacknowledged_durable_deliveries(
+                consumer_id=SUBMITTED_CONSUMER
+            )
+        )
 
         now = datetime.now(UTC)
         horizons = {
@@ -780,12 +772,13 @@ class EventManagerMixin:
             terminal_changed_since=horizons[COMPLETE_SOURCE],
         )
         # The settlement pass's first run: end the work of every wake that
-        # ended undelivered, before anything is minted. A task it ends here
-        # is still a live candidate above, and is skipped below; the
-        # completion it causes wakes the agent as any other does. A task it
-        # cannot read or settle now stays owed to the owner heartbeat's next
-        # pass, so it neither refuses this boot nor waits for another. Native
-        # control it meets refuses the boot.
+        # ended undelivered, before anything is minted. A task it ends is
+        # still a live candidate above; its terminal wake holds its input, so
+        # admission refuses a wake for it below, and the completion it causes
+        # wakes the agent as any other does. A task it cannot read or settle
+        # now stays owed to the owner heartbeat's next pass, so it neither
+        # refuses this boot nor waits for another. Native control it meets
+        # refuses the boot.
         await self.dispatcher.settle_owed_cognition_sources()
 
         unadmitted: list[str] = []
@@ -806,20 +799,11 @@ class EventManagerMixin:
                         working_revision=candidate.lifecycle_revision,
                     )
                 )
-                if any(
-                    # Ended undelivered: its work belongs to the settlement
-                    # pass. A replacement would be refused as it was, or run
-                    # beside a row the next pass settles by ending its work.
-                    wake.is_terminal
-                    # Live under another identity, whether the original or an
-                    # earlier recovery wake: its own retry resumes this work,
-                    # and a second identity would run it twice.
-                    or wake.event.source_event_id != source_event_id
-                    for wake in wakes_of_input.get(
-                        (task.id, candidate.input_revision), ()
-                    )
-                ):
-                    continue
+                # Admission refuses this wake (DUPLICATE) while another wake
+                # that has not run carries the input: a live one resumes the
+                # work on its own retry, and a terminal one's work belongs to
+                # the settlement pass. A second would run the work twice, or
+                # run beside a row the next pass settles by ending it.
                 signal = build_signal_for_submitted_task(
                     candidate, target_agent=self.did
                 )
@@ -979,6 +963,31 @@ class EventManagerMixin:
                 "registration to bound its replay window"
             )
         return now - timedelta(days=registration.retention_days)
+
+    def durable_wake_exclusive_key(
+        self, *, source: str, consumer_id: str, source_event_id: str | None,
+    ) -> str | None:
+        """The input a submission wake carries, whatever identity it is under.
+
+        The original wake of an input and each recovery wake boot mints for
+        it name the same task input. Admission refuses a wake of it while
+        another such wake has not run, that is, is not acknowledged (#4001).
+        """
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID,
+            SOURCE_NAME,
+            parse_submitted_input_identity,
+            submitted_input_identity,
+        )
+
+        if source != SOURCE_NAME or consumer_id != DURABLE_COGNITION_CONSUMER_ID:
+            return None
+        try:
+            task_id, input_revision = parse_submitted_input_identity(source_event_id)
+        except ValueError:
+            # A row without a canonical identity names no input.
+            return None
+        return submitted_input_identity(task_id, input_revision)
 
     def undelivered_cognition_wake_consumers(self) -> frozenset[str]:
         """Consumers whose terminal wake rows can carry work owed a settlement.
