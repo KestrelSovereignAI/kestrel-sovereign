@@ -7,6 +7,11 @@ from kestrel_sovereign.agent.context_manager import ContextResult
 
 async def streaming_agent(native_tool_effect_agent, *, persisted=None, connected_backend=None):
     agent = await native_tool_effect_agent(did="did:test:streaming-component", connected_backend=connected_backend)
+    return prepare_streaming_agent(agent, persisted=persisted)
+
+
+def prepare_streaming_agent(agent, *, persisted=None, tools=None):
+    """Script context/model collaborators while retaining an existing native host."""
     context = ContextResult(system_prompt="system", messages=[], total_tokens=0,
                             budget_summary={}, dynamic_user_context="ctx")
     agent.context_manager = SimpleNamespace(build_context=AsyncMock(return_value=context))
@@ -18,7 +23,7 @@ async def streaming_agent(native_tool_effect_agent, *, persisted=None, connected
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent._get_governing_constitution = AsyncMock(return_value="constitution")
     agent.check_solvency = AsyncMock(return_value="test-model")
-    agent._build_all_tools = MagicMock(return_value=[])
+    agent._build_all_tools = MagicMock(return_value=[] if tools is None else tools)
     agent._post_response_pipeline = AsyncMock(return_value=None)
     write = agent.privacy_agent.add_conversation
 

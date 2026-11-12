@@ -1134,6 +1134,39 @@ async def _call(service, entry: str, executor) -> Any:
     return text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry', ['generate_with_messages', 'stream_with_tool_detection'])
+@pytest.mark.parametrize('codex_callback', [False, True])
+async def test_input_suspension_is_original_control_across_adapter_and_service(
+        two_route_service, entry, codex_callback):
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.tools.effect_journal import ToolInputSuspended
+
+    service, install = two_route_service
+    first = _InlineToolAdapter(act=True, ending='answers')
+    spare = install(first)
+    signal = ToolInputSuspended(None, [], None)
+
+    async def execute(name, arguments):
+        assert (name, arguments) == INLINE_TOOL
+        raise signal
+
+    executor = execute
+    if codex_callback:
+        handler = CodexAdapter()._make_tool_call_handler(execute, 'owned-input-thread',
+            frozenset({INLINE_TOOL[0]}))
+
+        async def executor(name, arguments):
+            return await handler(dict(threadId='owned-input-thread', callId='owned-input-call',
+                tool=name, arguments=arguments))
+
+    with pytest.raises(ToolInputSuspended) as raised:
+        await _call(service, entry, executor)
+    assert raised.value is signal, 'An original input suspension was converted into provider output'
+    assert first.calls == 1 and spare.calls == 0, 'An input suspension triggered another provider'
+    assert first.tool_results == [], 'An input suspension was accepted as a successful tool response'
+
+
 #: Both route walks a turn's answer comes from, x every way the gate rejects
 #: a response.
 _REJECTED_AFTER_A_TOOL = [

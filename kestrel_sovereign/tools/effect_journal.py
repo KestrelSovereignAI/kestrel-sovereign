@@ -45,6 +45,60 @@ class ToolEffectInputRequired(ResourceConflict):
     """A confirmed checkpoint fences further effects in its originating turn."""
 
 
+class ToolInputSuspended(ToolEffectInputRequired):
+    """An original inline executor stopped at a confirmed human checkpoint.
+
+    This is host control, not a provider answer or loss of execution authority.
+    Completed callbacks remain attached to their original live turn until the
+    provider's owned work has settled and its history consumer takes custody.
+    """
+
+    def __init__(self, turn, completed, scope):
+        super().__init__('tool_input_required')
+        self.turn = turn
+        self.completed = completed
+        self.scope = scope
+
+    def require_current(self, owner):
+        # Provider source tasks, like reader tasks, can predate the turn's
+        # ContextVars. Re-present the original revocable scope; never create
+        # a replacement turn or treat its description as authorization.
+        with self.scope.bind():
+            if current_tool_effect_turn(owner) is not self.turn or not self.turn.operator_input_refs:
+                raise ToolEffectJournalUnavailable('Original input suspension turn is unavailable')
+            self.turn.require_live(owner)
+            self.turn.require_confirmed()
+            require_execution_work(owner)
+
+
+def tool_input_suspension(error: BaseException | None) -> ToolInputSuspended | None:
+    """Read original input control without overriding native terminal failures."""
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    if is_execution_control_error(error) or requires_tool_effect_reconciliation(error):
+        return None
+    nodes = tuple(execution_evidence_carriers(error))
+    found = [node for node in nodes if issubclass(type(node), ToolInputSuspended)]
+    if not found:
+        return None
+    for node in nodes:
+        if issubclass(type(node), (ToolInputSuspended, BaseExceptionGroup)):
+            continue
+        # An independent cancellation/failure is not a successful suspension.
+        # Read the native descriptor, never an application exception hook.
+        if (not issubclass(type(node), Exception)
+                or BaseException.__cause__.__get__(node) is None):
+            return None
+    original = found[0]
+    if any(node.turn is not original.turn or node.completed is not original.completed for node in found):
+        raise ToolEffectJournalUnavailable('Input suspensions belong to different original providers')
+    return original
+
+
+def _is_tool_input_control(error: BaseException) -> bool:
+    return any(issubclass(type(node), ToolInputSuspended) for node in execution_evidence_carriers(error))
+
+
 def requires_tool_effect_reconciliation(error: BaseException | None) -> bool:
     """Native ACK/retirement uncertainty also fences pre-body journal work."""
     return bool(observed_outcome_unknown(error)

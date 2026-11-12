@@ -36,7 +36,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
-from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta, ToolInputSuspensionResponse
 from kestrel_sovereign.llm.generation_gate import judge_generation
 from kestrel_sovereign.llm.provider_policy import caller_call_override_scope
 from kestrel_sovereign.llm.invocation_context import (
@@ -1752,6 +1752,18 @@ class StreamingMixin:
                 # VISIBLE text below — AFTER this item if it's a tool sentinel — so a
                 # component lands after its producing tool's card, not before it.
                 pending_parts.extend(drain_parts())
+                if isinstance(item, ToolInputSuspensionResponse):
+                    item.suspension.require_current(self)
+                    tool_response = item
+                    pre_tool_prose_snapshot = None
+                    if not buffer_audit:
+                        entry = item.executed_tool_calls[-1]
+                        marker = ToolCallStarted(index=len(item.executed_tool_calls)-1,
+                            id=entry['id'], name=entry['name'])
+                        await self._emit_revising_event(marker, session_id=session_id, request_id=request_id)
+                        yield _build_revise_sentinel(marker)
+                        yield item.content
+                    continue
                 if isinstance(item, str):
                     # #1914: a component emitted by the tool that produced THIS
                     # visible text flushes here — after any tool done/error sentinel
@@ -1907,6 +1919,7 @@ class StreamingMixin:
             # response hook can run the narration check (#1042 layer 3)
             # over the same envelopes the LLM saw.
             tool_response_chunks = []
+            input_followup = False
             tool_events = []
             tool_results: list = []
             deferred_tool_batch_cancellation: Optional[
@@ -1987,6 +2000,34 @@ class StreamingMixin:
                     continuation_user_content=prompt + lazy_hint,
                 )) as _owned_forwarder_1870:
                     async for chunk in _owned_forwarder_1870:
+                        if isinstance(chunk, ToolInputSuspensionResponse):
+                            chunk.suspension.require_current(self)
+                            await self._append_executed_tool_breadcrumbs([], chunk.executed_tool_calls,
+                                tool_results, session_id=session_id)
+                            kept = _parse_stream_sentinels(''.join(full_response))[2]
+                            kept.extend(_parse_stream_sentinels(''.join(tool_response_chunks))[2])
+                            parts = [{key: value for key, value in part.items() if key not in {'pos', 'seq'}}
+                                for part in kept]
+                            parts.extend(drain_parts())
+                            tool_response_chunks = [chunk.content]
+                            input_followup = True
+                            pre_tool_text = ''
+                            pre_tool_prose_snapshot = ''
+                            pre_parts = []
+                            pending_visible_boundary = False
+                            join_separator = ''
+                            if not buffer_audit:
+                                entry = chunk.executed_tool_calls[-1]
+                                marker = ToolCallStarted(index=len(chunk.executed_tool_calls)-1,
+                                    id=entry['id'], name=entry['name'])
+                                await self._emit_revising_event(marker,
+                                    session_id=session_id, request_id=request_id)
+                                yield _build_revise_sentinel(marker)
+                                yield chunk.content
+                            for sentinel in _flush_part_list(parts, tool_response_chunks):
+                                if not buffer_audit:
+                                    yield sentinel
+                            continue
                         if isinstance(chunk, OwnedTaskHandoff):
                             deferred_tool_batch_cancellation = chunk
                             # Resume once so the inner async generator reaches its return
@@ -2094,6 +2135,9 @@ class StreamingMixin:
                     }
                     for tc in tool_response.tool_calls
                 ]
+                if input_followup:
+                    tool_calls_payload = [dict(id=row['tool_call_id'], name=row['name'],
+                        arguments=row['arguments']) for row in tool_results]
                 tool_final_text = await self._fire_post_response_hook(
                     post_tool_text, session_id,
                     pre_tool_prose=pre_tool_for_audit,
@@ -2318,6 +2362,13 @@ class StreamingMixin:
             context_replay_text, inline_parts, inline_components = _parse_stream_sentinels(
                 "".join(full_response)
             )
+            if isinstance(tool_response, ToolInputSuspensionResponse):
+                # A host checkpoint carries actual callbacks, never acceptance
+                # of the provider prose emitted before its input suspension.
+                context_replay_text = tool_response.content
+                pre_tool_prose_snapshot = None
+                inline_components = [{**part, 'pos': 0} for part in inline_components]
+                inline_parts = [{**part, 'pos': 0} for part in inline_parts]
             _stamp_tool_event_positions(synth_tool_events, inline_parts)
             tool_calls_payload = [
                 {"id": e["id"], "name": e["name"], "arguments": e["arguments"]}

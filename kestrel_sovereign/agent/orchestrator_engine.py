@@ -62,6 +62,7 @@ from kestrel_sovereign.agent.direct_tool_arguments import (
 )
 from kestrel_sovereign.llm.adapter import (
     InlineToolOutcome,
+    ToolInputSuspensionResponse,
     LLMResponse,
     ThinkingDelta,
     tool_call_history_entry,
@@ -1440,6 +1441,8 @@ class OrchestratorEngineMixin:
             ),
             invocation_context=invocation_context,
         )
+        if isinstance(repaired, ToolInputSuspensionResponse):
+            return repaired
         return OrchestratorEngineMixin._settle_repaired_turn(
             content, repaired, original_delivered=original_delivered,
         )
@@ -1606,10 +1609,7 @@ class OrchestratorEngineMixin:
         lock indefinitely. The call's inline tool executor, built for
         ``executor_session_id``, suspends the bound while a tool runs.
         """
-        from kestrel_sovereign.tools.effect_journal import TOOL_INPUT_REQUIRED_MESSAGE, tool_effect_input_waiting
-
-        if tool_effect_input_waiting(self):
-            return TOOL_INPUT_REQUIRED_MESSAGE
+        from kestrel_sovereign.tools.effect_journal import tool_input_suspension
         watchdog = LLMCallWatchdog.for_call(
             self.llm_service,
             model_override=call_kwargs.get("model_override"),
@@ -1617,16 +1617,16 @@ class OrchestratorEngineMixin:
             streaming=False,
         )
         try:
-            response = await watchdog.call(self.llm_service.generate_with_messages(
+            return await watchdog.call(self.llm_service.generate_with_messages(
                 tool_executor=self._make_inline_tool_executor(
                     executor_session_id, watchdog=watchdog,
                 ),
                 **call_kwargs,
             ))
-            # Inline adapters may have suspended a tool inside this provider
-            # call. Fence every caller, including premature-yield repair.
-            return TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response
         except Exception as exc:
+            suspension = tool_input_suspension(exc)
+            if suspension is not None:
+                return ToolInputSuspensionResponse(suspension, self)
             await OrchestratorEngineMixin._settle_failed_generation(
                 self, exc, session_id=call_kwargs.get("session_id"),
             )
@@ -1645,25 +1645,18 @@ class OrchestratorEngineMixin:
         raises is settled by :meth:`_settle_failed_generation` before the
         error reaches the turn.
         """
-        from kestrel_sovereign.tools.effect_journal import TOOL_INPUT_REQUIRED_MESSAGE, tool_effect_input_waiting
-
-        if tool_effect_input_waiting(self):
-            yield TOOL_INPUT_REQUIRED_MESSAGE
-            return
+        from kestrel_sovereign.tools.effect_journal import tool_input_suspension
         try:
             async with aclosing(watchdog.watch(
                 self.llm_service.stream_with_tool_detection(**call_kwargs)
             )) as stream:
                 async for item in stream:
-                    if tool_effect_input_waiting(self):
-                        yield TOOL_INPUT_REQUIRED_MESSAGE
-                        return
                     yield item
-                # An inline tool can suspend even if its adapter ends without
-                # another chunk or final response object.
-                if tool_effect_input_waiting(self):
-                    yield TOOL_INPUT_REQUIRED_MESSAGE
         except Exception as exc:
+            suspension = tool_input_suspension(exc)
+            if suspension is not None:
+                yield ToolInputSuspensionResponse(suspension, self)
+                return
             await OrchestratorEngineMixin._settle_failed_generation(
                 self, exc, session_id=call_kwargs.get("session_id"),
             )
@@ -1739,7 +1732,12 @@ class OrchestratorEngineMixin:
         # turn-scoped value is carried without touching this executor. Capture
         # per closure (per turn) keeps concurrent turns multiplexed over one
         # app-server routing to their own state.
+        from kestrel_sovereign.tools.effect_journal import (
+            ToolInputSuspended, current_tool_effect_turn, tool_effect_input_waiting,
+        )
         turn_scope = capture_turn_scope(self)
+        original_turn = current_tool_effect_turn(self)
+        completed = []
         request_id = current_invocation_id()
         effect_checkpoint = current_invocation_effect_checkpoint()
 
@@ -1751,11 +1749,20 @@ class OrchestratorEngineMixin:
             capture: Dict[str, Any] = {}
             paused = watchdog.tool_running() if watchdog is not None else nullcontext()
             with paused, turn_scope.bind():
+                if tool_effect_input_waiting(self):
+                    raise ToolInputSuspended(original_turn, completed, turn_scope)
+                callback_id = uuid.uuid4().hex
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
                 )
                 require_execution_work(self)
+                outcome = InlineToolOutcome(capture.get("effective_args", args), result,
+                    capture.get("dispatch_id"))
+                completed.append(dict(id=callback_id, name=name,
+                    arguments=deepcopy(outcome[0]), result=result, dispatch_id=outcome.dispatch_id))
+                suspension = (ToolInputSuspended(original_turn, completed, turn_scope)
+                    if tool_effect_input_waiting(self) else None)
             # The Codex reader owns this callback on an old task context.  Pass
             # the turn's captured mutable state explicitly: a ContextVar lookup
             # here would see the reader's stale pre-turn snapshot.
@@ -1763,10 +1770,9 @@ class OrchestratorEngineMixin:
                 session_id,
                 checkpoint=effect_checkpoint,
             )
-            return InlineToolOutcome(
-                capture.get("effective_args", args), result,
-                capture.get("dispatch_id"),
-            )
+            if suspension is not None:
+                raise suspension
+            return outcome
 
         async def _persist_completed_effects(executed: list[dict]) -> None:
             """Checkpoint an inline effect before transport cancellation wins."""
@@ -4269,6 +4275,10 @@ class OrchestratorEngineMixin:
         if max_iterations is None:
             max_iterations = MAX_TOOL_ITERATIONS
 
+        if isinstance(response, ToolInputSuspensionResponse):
+            await self._append_executed_tool_breadcrumbs([], response.executed_tool_calls,
+                tool_results, session_id=session_id)
+            return TOOL_INPUT_REQUIRED_MESSAGE
         if isinstance(response, str):
             return TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response
 
@@ -4301,6 +4311,10 @@ class OrchestratorEngineMixin:
                     effective_model=effective_model,
                     session_id=session_id,
                 )
+                if isinstance(response, ToolInputSuspensionResponse):
+                    await self._append_executed_tool_breadcrumbs([], response.executed_tool_calls,
+                        tool_results, session_id=session_id)
+                    return TOOL_INPUT_REQUIRED_MESSAGE
                 if isinstance(response, str):
                     return response
             if not response.has_tool_calls:
@@ -4379,6 +4393,10 @@ class OrchestratorEngineMixin:
                 invocation_context=invocation_context,
             )
 
+            if isinstance(response, ToolInputSuspensionResponse):
+                await self._append_executed_tool_breadcrumbs([], response.executed_tool_calls,
+                    tool_results, session_id=session_id)
+                return TOOL_INPUT_REQUIRED_MESSAGE
             if isinstance(response, str):
                 logging.debug(
                     "[ORCHESTRATOR] Final response (string): chars=%d",
@@ -4397,6 +4415,10 @@ class OrchestratorEngineMixin:
                         effective_model=effective_model,
                         session_id=session_id,
                     )
+                    if isinstance(response, ToolInputSuspensionResponse):
+                        await self._append_executed_tool_breadcrumbs([], response.executed_tool_calls,
+                            tool_results, session_id=session_id)
+                        return TOOL_INPUT_REQUIRED_MESSAGE
                     if isinstance(response, str):
                         logging.debug(
                             "[ORCHESTRATOR] Final response after repair: chars=%d",
@@ -4748,6 +4770,9 @@ class OrchestratorEngineMixin:
         if max_iterations is None:
             max_iterations = MAX_TOOL_ITERATIONS
 
+        if isinstance(response, ToolInputSuspensionResponse):
+            yield response
+            return
         if isinstance(response, str):
             yield TOOL_INPUT_REQUIRED_MESSAGE if tool_effect_input_waiting(self) else response
             return
@@ -4780,6 +4805,9 @@ class OrchestratorEngineMixin:
                     request_id=request_id,
                     invocation_context=invocation_context,
                 )
+                if isinstance(response, ToolInputSuspensionResponse):
+                    yield response
+                    return
                 if isinstance(response, str):
                     yield response
                     return
@@ -5001,6 +5029,9 @@ class OrchestratorEngineMixin:
                     )
                 ) as followup_stream:
                     async for item in followup_stream:
+                        if isinstance(item, ToolInputSuspensionResponse):
+                            yield item
+                            return
                         if _cancelled():
                             break
                         if isinstance(item, str):
@@ -5080,6 +5111,9 @@ class OrchestratorEngineMixin:
                 # user); nothing further to do for this turn.
                 return
 
+            if isinstance(response, ToolInputSuspensionResponse):
+                yield response
+                return
             if isinstance(response, str):
                 yield response
                 return
@@ -5117,6 +5151,9 @@ class OrchestratorEngineMixin:
                                 'error', 'llm', detail=failure_summary(exc),
                             )
                         raise
+                    if isinstance(response, ToolInputSuspensionResponse):
+                        yield response
+                        return
                     if isinstance(response, str):
                         yield response
                         return

@@ -1,6 +1,7 @@
 """Every transport shares typed, content-free effect failure semantics."""
 
 import pytest
+import asyncio
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign.api_errors import tool_effect_api_error
@@ -11,8 +12,36 @@ from kestrel_sovereign.tool_effect_store import (
 )
 from kestrel_sovereign.tools.effect_failures import tool_effect_failure
 from kestrel_sovereign.tools.effect_journal import (
-    ToolEffectJournalUnavailable, ToolEffectPrivacyRefused,
+    ToolEffectJournalUnavailable, ToolEffectPrivacyRefused, ToolInputSuspended, tool_input_suspension,
 )
+
+
+@pytest.mark.parametrize('shape', ['direct', 'cause', 'group'])
+def test_input_control_propagates_without_becoming_authority_loss(shape):
+    from kestrel_sdk.features.host_errors import is_host_control_error
+
+    signal = ToolInputSuspended(None, [], None)
+    if shape == 'cause':
+        error = RuntimeError('opaque provider wrapper')
+        error.__cause__ = signal
+    elif shape == 'group':
+        error = ExceptionGroup('original provider control', [signal])
+    else:
+        error = signal
+    assert is_host_control_error(error)
+    assert is_tool_execution_terminal_error(error)
+    assert not is_execution_control_error(error)
+    assert tool_input_suspension(error) is signal
+
+
+@pytest.mark.parametrize('secondary', [
+    ValueError('independent provider failure'), asyncio.CancelledError('caller withdrawal'),
+    ResourceOutcomeUnknown('independent native uncertainty'), ExecutionAuthorityError('original admission lost'),
+])
+def test_input_control_never_overrides_an_independent_terminal(secondary):
+    signal = ToolInputSuspended(None, [], None)
+    error = BaseExceptionGroup('original independent outcomes', [signal, secondary])
+    assert tool_input_suspension(error) is None
 
 
 @pytest.mark.parametrize('error,code,status,reconcile', [

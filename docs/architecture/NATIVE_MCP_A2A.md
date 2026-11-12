@@ -523,6 +523,11 @@ its reference and original chat selector. Neither is an authorization grant.
 The original effect turn records the pending input through its existing nested
 turn state and refuses another admission before approvals or network I/O.
 Both orchestrator modes return a waiting message without another model call.
+Inline providers propagate a typed host suspension with the original live turn
+and completed tool receipts. It is not an accepted model completion: unfinished
+provider prose is retracted and excluded from saved history. Both transports
+retain actual tool receipts in history and STOP hooks unless an enforcing
+response audit withholds those unreviewed side channels.
 
 Submitting `/api/mcp/inputs/{reference}/responses` independently authenticates
 the principal and chat, validates the original form schema, invokes the current
@@ -533,6 +538,11 @@ projections and next-form references remain encrypted so a reloaded card can
 recover them without replay. The response deadline does not delete historical
 encrypted reconciliation records. SQLite and PostgreSQL share the same custody
 contract on the primary database.
+The pending limit counts unresolved operation chains rather than individual
+rounds. A successor reuses its predecessor's reservation only through the
+original live response claim and an atomic, single-successor transition.
+Unsettled response claims keep their reservation; restart does not free quota
+or permit replay. Readers display the current checkpoint once per chain.
 
 App continuations additionally retain the original physical View and its fresh
 private reader through the actual outer HTTP send. A closed or lost View cannot

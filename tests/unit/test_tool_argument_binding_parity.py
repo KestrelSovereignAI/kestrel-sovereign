@@ -758,7 +758,8 @@ def test_core_registers_its_control_error_predicate_with_the_sdk():
     assert is_host_control_error(ExecutionAuthorityError("retired")) is True
     assert is_host_control_error(LookupError("ordinary")) is False
     # Registering the same function again is the documented no-op.
-    register_control_error_predicate(is_execution_control_error)
+    from kestrel_sovereign.execution_custody import is_host_control_error as core_host_control
+    register_control_error_predicate(core_host_control)
     assert is_host_control_error(ExecutionAuthorityError("retired")) is True
 
 
