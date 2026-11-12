@@ -4687,6 +4687,43 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id=agent_id, owner_id=owner_id, now=touch_now
             )
 
+    async def retain_unretired_runtime_owner(
+        self, *, agent_id: str, owner_id: str, now: Optional[datetime] = None,
+    ) -> bool:
+        """Refresh an existing owner that is not yet stopped; never revive one.
+
+        The only write that renews a dispatcher's owner: an owner that is not
+        retired stays live for peers, whatever else it holds or owes, until it
+        retires (#4001). Unlike :meth:`heartbeat_runtime_owner` this inserts
+        nothing and never clears ``stopped_at``, so a renewal that runs late
+        cannot undo a retirement. Returns whether the owner was refreshed.
+        ``now`` is a SQLite clock seam; PostgreSQL renews on its own clock.
+
+        Both backends renew through a fixed backend operation that the shared
+        work connection's fences cannot hold back: PostgreSQL on a pool
+        checkout that admits no work, SQLite on a connection of its own.
+        Serialization with recovery is the database's writer lock on SQLite
+        and the owner-scope advisory key on PostgreSQL.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        if self.is_postgres:
+            if now is not None:
+                raise ValueError("PostgreSQL owner renewal uses the database clock")
+            return await self._backend.retain_unretired_runtime_owner(
+                agent_id=agent_id, owner_id=owner_id,
+            )
+        if self._backend.backend_type != "sqlite":
+            raise RuntimeError(
+                "Durable runtime-owner renewal does not support backend "
+                f"{self._backend.backend_type!r}"
+            )
+        requested_now = _as_utc(now) if now is not None else None
+        return await self._backend.retain_unretired_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id,
+            timestamp=lambda: self.to_timestamp_param(requested_now or self.now_utc()),
+        )
+
     async def release_initial_reservations(
         self,
         *,

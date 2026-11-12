@@ -28,15 +28,19 @@ async def test_native_cleanup_heartbeat_cannot_insert_revive_or_touch_successor(
         "('original','dispatcher:stopped',NOW()-INTERVAL '1 hour',NOW()), "
         "('other','dispatcher:successor',NOW()-INTERVAL '1 hour',NULL)"
     )
-    # An existing managed owner without a matching leased cognition is not
-    # eligible for this cleanup metadata path (nor can stopped owners revive).
+    # Under revoked custody an unretired managed owner is still renewed,
+    # whatever it leases (#4001); a missing owner is never inserted and a
+    # stopped one never revives.
     scope = ExecutionCustody(GenerationFence())
     backend._execution_custody = scope
     scope.revoke("original generation uncertain")
-    assert not await backend.retain_cognition_cleanup_owner(agent_id="original", owner_id="dispatcher:original")
-    assert not await backend.retain_cognition_cleanup_owner(agent_id="original", owner_id="dispatcher:missing")
+    assert await backend.retain_unretired_runtime_owner(agent_id="original", owner_id="dispatcher:original")
+    assert not await backend.retain_unretired_runtime_owner(agent_id="original", owner_id="dispatcher:missing")
     # Use controller-only fixture setup for a real, FK-valid managed delivery.
     await controller.execute(f'SET search_path TO "{schema}", public')
+    assert not await controller.fetchval(
+        "SELECT COUNT(*) FROM durable_signal_runtime_owners WHERE owner_id='dispatcher:missing'"
+    )
     await controller.execute(
         "INSERT INTO durable_signal_consumers "
         "(agent_id,consumer_id,source,max_attempts,lease_seconds,active) "
@@ -55,11 +59,11 @@ async def test_native_cleanup_heartbeat_cannot_insert_revive_or_touch_successor(
         "VALUES ('delivery','event','original',$1,'leased',0,'dispatcher:original','original-token')",
         DURABLE_COGNITION_CONSUMER_ID,
     )
-    assert await backend.retain_cognition_cleanup_owner(agent_id="original", owner_id="dispatcher:original")
-    assert not await backend.retain_cognition_cleanup_owner(agent_id="original", owner_id="dispatcher:stopped")
+    assert await backend.retain_unretired_runtime_owner(agent_id="original", owner_id="dispatcher:original")
+    assert not await backend.retain_unretired_runtime_owner(agent_id="original", owner_id="dispatcher:stopped")
     assert await controller.fetchval("SELECT heartbeat_at > NOW()-INTERVAL '1 minute' FROM durable_signal_runtime_owners WHERE agent_id='original' AND owner_id='dispatcher:original'")
     await controller.execute("UPDATE durable_signal_deliveries SET lease_owner='dispatcher:stopped' WHERE delivery_id='delivery'")
-    assert not await backend.retain_cognition_cleanup_owner(agent_id="original", owner_id="dispatcher:stopped")
+    assert not await backend.retain_unretired_runtime_owner(agent_id="original", owner_id="dispatcher:stopped")
     assert await controller.fetchval("SELECT stopped_at IS NOT NULL FROM durable_signal_runtime_owners WHERE owner_id='dispatcher:stopped'")
     assert await controller.fetchval("SELECT heartbeat_at < NOW()-INTERVAL '30 minutes' FROM durable_signal_runtime_owners WHERE owner_id='dispatcher:successor'")
     with pytest.raises(ExecutionAuthorityError):

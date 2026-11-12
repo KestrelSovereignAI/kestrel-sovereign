@@ -83,6 +83,12 @@ _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 # return control to SQLite.
 _SQLITE_BUSY_TIMEOUT_S = 30.0
 _CANCELLED_OPERATION_DRAIN_TIMEOUT_S = _SQLITE_BUSY_TIMEOUT_S
+# How long a runtime-owner renewal waits for SQLite's writer slot before it
+# fails and a heartbeat retries it: the bound PostgreSQL's renewal puts on
+# its whole transaction (#4001), so a renewal waiting behind another writer
+# is retried within a heartbeat interval rather than holding its slot for
+# the shared busy timeout.
+_SQLITE_OWNER_RENEWAL_BUSY_TIMEOUT_S = 5.0
 
 # Backoff between attempts of a cancellation-drain rollback that the drain's
 # own interrupt aborted. Attempts stop at the drain deadline above.
@@ -1594,19 +1600,32 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
+        return await self._open_sibling_connection(
+            busy_timeout_s=_SQLITE_BUSY_TIMEOUT_S, query_only=True,
+        )
+
+    async def _open_sibling_connection(
+        self, *, busy_timeout_s: float, query_only: bool,
+    ) -> aiosqlite.Connection:
+        """Open a one-shot connection of its own to the connected file.
+
+        It shares nothing with the shared connection: not its operation lock,
+        its open transaction or its cancellation-cleanup fence. Only SQLite's
+        writer slot on the file is shared. The file is the one this backend
+        connected to; a replaced pathname is refused.
+        """
         self.assert_connected_file_still_valid()
         conn = await aiosqlite.connect(
             self._resolved_path.as_uri() + "?mode=rw",
             uri=True,
-            timeout=_SQLITE_BUSY_TIMEOUT_S,
+            timeout=busy_timeout_s,
         )
         try:
             self.assert_connected_file_still_valid()
-            await conn.execute(
-                f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
-            )
+            await conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_s * 1000)}")
             await conn.execute("PRAGMA foreign_keys=ON")
-            await conn.execute("PRAGMA query_only=ON")
+            if query_only:
+                await conn.execute("PRAGMA query_only=ON")
             conn.row_factory = aiosqlite.Row
             return conn
         except BaseException as error:
@@ -1619,6 +1638,92 @@ class SQLiteBackend(DatabaseBackend):
             except BaseException as cleanup_error:
                 raise execution_terminal_error(error, cleanup_error)
             raise
+
+    async def retain_unretired_runtime_owner(
+        self, *, agent_id: str, owner_id: str, timestamp: Callable[[], str],
+    ) -> bool:
+        """Renew one existing, unstopped managed owner on fixed SQL (#4001).
+
+        The SQLite counterpart of ``PostgresBackend``'s method of this name:
+        the only write that renews a dispatcher's owner. It cannot insert or
+        revive an owner, grant a lease or admit work. ``timestamp`` is sampled
+        once this write holds SQLite's writer slot, as a heartbeat taken
+        before waiting for it is not trustworthy liveness evidence. Returns
+        whether the owner was renewed.
+
+        A file database is renewed on a connection of its own, never the
+        shared one. That connection's cancellation-cleanup fence keeps later
+        writers off work a cancelled caller abandoned on it. This write leaves
+        the fence, and the error it retains, as they are: a write on another
+        connection cannot commit that work. Were
+        renewal held back by that fence, a peer reaching the file through its
+        own connection would find the owner stale and reclaim leases it still
+        holds. Only SQLite's writer slot is shared: while the abandoned
+        transaction still holds it this waits for it, bounded by
+        ``_SQLITE_OWNER_RENEWAL_BUSY_TIMEOUT_S``, then fails and is retried.
+        An in-memory database has no second connection, and none for a peer
+        either: every writer to it, a peer's recovery included, passes the
+        same fence, so it is renewed on the shared connection.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+
+        if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
+            raise ValueError("owner renewal requires exact owner identities")
+        if not owner_id.startswith("dispatcher:"):
+            raise ValueError("owner renewal requires its managed owner")
+        sql = (
+            f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} "
+            "SET heartbeat_at = CASE WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END, "
+            "updated_at = CASE WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END "
+            "WHERE agent_id = ? AND owner_id = ? AND stopped_at IS NULL"
+        )
+        if self._resolved_path is None:
+            async with self.transaction():
+                now = timestamp()
+                updated = await self.execute(
+                    sql, (now, now, now, now, agent_id, owner_id)
+                )
+            return updated == 1
+        self._require_execution_backend()
+        conn = await self._open_sibling_connection(
+            busy_timeout_s=_SQLITE_OWNER_RENEWAL_BUSY_TIMEOUT_S, query_only=False,
+        )
+        body_error = None
+        try:
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                now = timestamp()
+                cursor = await conn.execute(
+                    sql, (now, now, now, now, agent_id, owner_id)
+                )
+                updated = cursor.rowcount
+                await cursor.close()
+                await conn.commit()
+            except sqlite3.Error as error:
+                raise QueryError(f"SQLite owner renewal failed: {error}") from error
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            # Closing also rolls back a transaction this write left open.
+            try:
+                await _close_aiosqlite_connection(
+                    conn,
+                    retained_closes=self._retired_connection_closes,
+                    diagnostics=self._close_diagnostics(),
+                )
+            except BaseException as cleanup_error:
+                if body_error is not None or not self._is_retained_close_overrun(
+                    conn, cleanup_error
+                ):
+                    raise execution_terminal_error(body_error, cleanup_error)
+                # The renewal committed; a slow close does not undo it. The
+                # backend keeps the close until its worker exits.
+                logger.warning(
+                    "SQLite owner renewal committed; its connection close is "
+                    "still running and stays retained"
+                )
+        return updated == 1
 
     @asynccontextmanager
     async def _read_connection(

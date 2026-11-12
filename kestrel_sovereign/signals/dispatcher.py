@@ -971,8 +971,11 @@ class SignalDispatcher:
         # effects from the original task are still running.
         self._durable_shutdown_owner_fenced = False
         self._durable_control_cleanup_fenced = False
+        # Set only while shutdown stops the owner heartbeat and marks the
+        # owner stopped: the one span in which an unretired owner may go
+        # unrenewed, because it is being retired (#4001).
+        self._runtime_owner_retiring = False
         self._fenced_durable_shutdown_completion: Optional[asyncio.Task[None]] = None
-        self._runtime_owner_fence_lock = asyncio.Lock()
         # What the UI side-channel emit actually did, per signal (#2922).
         # Deliberately in-memory and bounded: it is diagnostic provenance for
         # the wait reconciler's next harvest, not a second audit trail, and an
@@ -999,6 +1002,9 @@ class SignalDispatcher:
         self._runtime_owner_stale_after = runtime_owner_stale_after
         self._runtime_owner_heartbeat_timer: Optional[asyncio.TimerHandle] = None
         self._runtime_owner_heartbeat_task: Optional[asyncio.Task] = None
+        # The one write that renews this owner, in a task of its own so that
+        # nothing else a heartbeat does can hold it back (#4001).
+        self._runtime_owner_renewal_task: Optional[asyncio.Task] = None
         # A transient ledger outage must not silently orphan this runtime's
         # ownership heartbeat.  Backoff is capped so repeated errors retain a
         # bounded future retry rather than either hot-looping or giving up.
@@ -1066,9 +1072,11 @@ class SignalDispatcher:
         """Metadata owners excluded from the general sweep only after close."""
         if not self._durable_shutdown:
             return frozenset()
-        heartbeat = self._runtime_owner_heartbeat_task
-        return frozenset(self._durable_owned_tasks) | (
-            frozenset({heartbeat}) if heartbeat is not None else frozenset()
+        return frozenset(self._durable_owned_tasks) | frozenset(
+            task for task in (
+                self._runtime_owner_heartbeat_task,
+                getattr(self, "_runtime_owner_renewal_task", None),
+            ) if task is not None
         )
 
     def _cognition_stop_notice(self) -> asyncio.Future[None]:
@@ -3053,8 +3061,27 @@ class SignalDispatcher:
             self._schedule_runtime_owner_heartbeat()
         await self._drain_retained_durable_cognition_cleanup_tasks()
         self._durable_control_cleanup_fenced = False
-        await self._stop_runtime_owner_heartbeat()
-        await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
+        await self._retire_runtime_owner()
+
+    async def _retire_runtime_owner(self) -> None:
+        """Stop the owner heartbeat, then mark the owner stopped (#4001).
+
+        The heartbeat stops first, so a delayed one cannot revive the owner
+        it retires. Until that mark commits the owner is not retired: when
+        either step fails it keeps heartbeating for the retry, rather than
+        looking dead to a peer while it still holds leases. Every caller runs
+        after durable admission has drained and closed, so no maintenance can
+        still be running: the span without renewal lasts one renewal write.
+        """
+        self._runtime_owner_retiring = True
+        try:
+            await self._stop_runtime_owner_heartbeat()
+            await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
+        except BaseException:
+            self._runtime_owner_retiring = False
+            self._schedule_runtime_owner_heartbeat(retry=True)
+            raise
+        self._runtime_owner_retiring = False
 
     async def _wait_for_retained_durable_cognition_cancellation(self) -> bool:
         """Request a bounded stop and report whether retained work remains."""
@@ -3073,11 +3100,11 @@ class SignalDispatcher:
     async def _activate_retained_durable_shutdown_fence(self) -> None:
         """Keep the managed owner live until cancellation-resistant work settles."""
         self._durable_shutdown_owner_fenced = True
-        # Refresh liveness after closing admission. This is deliberately not a
-        # public durable operation: public work is closed, but the retained
-        # task's exact owner must remain non-reclaimable while it can act.
-        async with self._runtime_owner_fence_lock:
-            await self._retain_runtime_owner_cleanup_liveness()
+        # Refresh liveness after closing admission. Renewal is deliberately
+        # not a public durable operation: public work is closed, but the
+        # retained task's exact owner must remain non-reclaimable while it
+        # can act.
+        await self._renew_runtime_owner()
         self._schedule_runtime_owner_heartbeat()
         await self._release_runtime_owner_after_shutdown(mark_owner_stopped=False)
         if (
@@ -3115,10 +3142,7 @@ class SignalDispatcher:
         await self._drain_retained_durable_cognition_cleanup_tasks()
         self._durable_control_cleanup_fenced = False
         self._durable_shutdown_owner_fenced = False
-        await self._stop_runtime_owner_heartbeat()
-        async with self._runtime_owner_fence_lock:
-            pass
-        await self._release_runtime_owner_after_shutdown(mark_owner_stopped=True)
+        await self._retire_runtime_owner()
 
     async def _release_runtime_owner_after_shutdown(
         self, *, mark_owner_stopped: bool
@@ -3489,8 +3513,32 @@ class SignalDispatcher:
                 self._outcome_log_control_error, error, include_tool_terminal=True,
             )
 
+    def _runtime_owner_liveness_required(self) -> bool:
+        """Whether this owner is renewed on every heartbeat tick (#4001).
+
+        An owner that is not durably retired is renewed, whatever keeps it
+        unretired: a shutdown that refused or failed, retained row debt, or
+        retained writer control. Otherwise a peer treats it as dead and
+        reclaims leases it still holds. Renewal stops only while shutdown is
+        retiring the owner, and once it has. Whether a heartbeat also runs
+        its ordinary maintenance is a separate question
+        (:meth:`_runtime_owner_cleanup_required`).
+        """
+        if getattr(self, "_runtime_owner_retiring", False):
+            return False
+        return (
+            not self._durable_shutdown
+            or self._runtime_owner_cleanup_required()
+            or self._durable_runtime_owner_registration_started
+        )
+
     def _runtime_owner_cleanup_required(self) -> bool:
-        """Keep exact owner protection until retained cognition has joined."""
+        """Whether debt that guards a lease stands: the heartbeat only renews.
+
+        While it does, a heartbeat runs no ordinary maintenance and admits no
+        work; renewal goes on regardless (#4001). This never decides whether
+        the owner is renewed (:meth:`_runtime_owner_liveness_required`).
+        """
         return (
             bool(self._retained_cognition_control_debt)
             or self.durable_shutdown_owner_fenced
@@ -3529,11 +3577,12 @@ class SignalDispatcher:
         ``retry`` uses an exponential-but-capped delay after a storage error.
         Crucially it still creates a future timer: an exception is observable,
         but never changes into a silent end to runtime ownership heartbeats.
+        No call postpones a tick already due sooner, so whatever finishes
+        between two ticks never pushes the next renewal back (#4001).
         """
-        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
+        if not self._runtime_owner_liveness_required():
             return
-        if self._runtime_owner_heartbeat_timer is not None:
-            self._runtime_owner_heartbeat_timer.cancel()
+        loop = asyncio.get_running_loop()
         interval = max(0.01, self._runtime_owner_stale_after.total_seconds() / 3)
         if retry:
             # Cap retries at the normal interval. This gives a failing backend
@@ -3544,7 +3593,16 @@ class SignalDispatcher:
                 max(0.01, interval / 8)
                 * (2 ** min(self._runtime_owner_heartbeat_failures, 3)),
             )
-        self._runtime_owner_heartbeat_timer = asyncio.get_running_loop().call_later(
+        timer = self._runtime_owner_heartbeat_timer
+        if (
+            timer is not None
+            and not timer.cancelled()
+            and timer.when() <= loop.time() + interval
+        ):
+            return
+        if timer is not None:
+            timer.cancel()
+        self._runtime_owner_heartbeat_timer = loop.call_later(
             interval, self._start_runtime_owner_heartbeat,
             context=self._resident_timer_context(),
         )
@@ -3555,14 +3613,40 @@ class SignalDispatcher:
         A timer may already have spawned its agent-owned task when boot starts
         rolling back.  Merely cancelling the next ``TimerHandle`` leaves that
         in-flight task free to touch storage after the rollback has closed it.
+        The renewal a heartbeat tick started is joined too, after the
+        heartbeat, which joins it as it runs (#4001).
         """
         if self._runtime_owner_heartbeat_timer is not None:
             self._runtime_owner_heartbeat_timer.cancel()
             self._runtime_owner_heartbeat_timer = None
+        errors: list[BaseException] = []
+        # Each is joined whatever another raised: neither may touch the store
+        # after its owner closes it.
+        for join in (
+            self._join_runtime_owner_heartbeat,
+            self._join_runtime_owner_renewal,
+        ):
+            try:
+                await join()
+            except BaseException as error:
+                errors.append(error)
+            # A completion callback may have rearmed while we were joining.
+            # Cancel it before the next join, or it could fire meanwhile and
+            # start a heartbeat that nothing joins.
+            if self._runtime_owner_heartbeat_timer is not None:
+                self._runtime_owner_heartbeat_timer.cancel()
+                self._runtime_owner_heartbeat_timer = None
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise execution_finite_error(*errors)
+
+    async def _join_runtime_owner_heartbeat(self) -> None:
+        """Join the running heartbeat, without cancelling it."""
         task = self._runtime_owner_heartbeat_task
         try:
             if task is not None:
-                # The heartbeat can already be committing cleanup-owner CAS.
+                # The heartbeat can already be committing a maintenance write.
                 # Cancelling it manufactures an UNKNOWN acknowledgement during
                 # otherwise successful teardown. Join the original bounded SQL
                 # operation; caller cancellation cannot close its store early.
@@ -3575,19 +3659,55 @@ class SignalDispatcher:
                 # harvester was installed. Stop owns the same terminal receipt
                 # as the retry path, before its finally clears the slot.
                 self._finish_runtime_owner_heartbeat(task)
+                if outcome.cancellation is None and isinstance(
+                    outcome.error, _DurableDeliveryShuttingDownError
+                ):
+                    # A tick that lost the race to retirement renewed
+                    # nothing and ran no maintenance; it ended normally.
+                    return
                 raise_owned_outcome(outcome, operation="runtime-owner heartbeat retirement")
         finally:
             if self._runtime_owner_heartbeat_task is task:
                 self._runtime_owner_heartbeat_task = None
-            # Its completion callback may have rearmed while we were joining.
-            if self._runtime_owner_heartbeat_timer is not None:
-                self._runtime_owner_heartbeat_timer.cancel()
-                self._runtime_owner_heartbeat_timer = None
+
+    async def _join_runtime_owner_renewal(self) -> None:
+        """Join the running renewal, without cancelling it (#4001).
+
+        Cancelling it mid-write would turn a renewal already committing into
+        an unknown outcome. Retirement joins it before marking the owner
+        stopped; a renewal never revives a stopped owner in any case.
+        """
+        task = getattr(self, "_runtime_owner_renewal_task", None)
+        if task is None:
+            return
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            raise_owned_outcome,
+        )
+        try:
+            outcome = await await_owned_task(task)
+            self._finish_runtime_owner_renewal(task)
+            if outcome.cancellation is None and isinstance(
+                outcome.error, _DurableDeliveryShuttingDownError
+            ):
+                return
+            raise_owned_outcome(outcome, operation="runtime-owner renewal retirement")
+        finally:
+            if getattr(self, "_runtime_owner_renewal_task", None) is task:
+                self._runtime_owner_renewal_task = None
 
     def _start_runtime_owner_heartbeat(self) -> None:
+        """One heartbeat tick: renew this owner, then start its maintenance.
+
+        Every tick starts the owner's renewal in a task of its own first, so
+        a maintenance pass that runs long or fails never holds the next
+        renewal back. The maintenance (:meth:`_heartbeat_runtime_owner`)
+        starts unless the previous one is still running (#4001).
+        """
         self._runtime_owner_heartbeat_timer = None
-        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
+        if not self._runtime_owner_liveness_required():
             return
+        renewal = self._start_runtime_owner_renewal()
         task = self._runtime_owner_heartbeat_task
         if task is not None:
             # Publication can fail after this exact monitor was accepted.
@@ -3596,13 +3716,13 @@ class SignalDispatcher:
             if task.done():
                 self._finish_runtime_owner_heartbeat(task)
             else:
-                self._schedule_runtime_owner_heartbeat(retry=True)
+                self._schedule_runtime_owner_heartbeat()
             return
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         admission = OwnedTaskAdmission()
         try:
             task = self._agent._track_background_task(
-                self._heartbeat_runtime_owner(),
+                self._heartbeat_runtime_owner(renewal),
                 name=f"durable_signal_owner_heartbeat:{self._agent.did}",
                 admission=admission,
             )
@@ -3617,63 +3737,142 @@ class SignalDispatcher:
             self._runtime_owner_heartbeat_failures += 1
             self._schedule_runtime_owner_heartbeat(retry=True)
             raise
+        # The next tick does not wait for this maintenance to end: one that
+        # never ends must not end renewal with it.
+        self._schedule_runtime_owner_heartbeat()
 
-    async def _retain_runtime_owner_cleanup_liveness(self) -> None:
-        """Refresh only the already-owned shutdown/terminalization metadata."""
-        if self._durable_store.backend.backend_type == "postgres":
-            # False means the original live owner no longer has a leased or
-            # receipt-pending retry
-            # cognition. Never insert or revive it to manufacture protection.
-            retained = await self._durable_store.backend.retain_cognition_cleanup_owner(
-                agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+    def _start_runtime_owner_renewal(self) -> Optional[asyncio.Task]:
+        """Start this owner's renewal unless one is running; return it (#4001).
+
+        Returns None once the owner is retired or being retired: no write may
+        follow. The renewal runs in an empty context, on no execution scope
+        the agent's own work holds, so a scope that work fenced cannot refuse
+        it. It is one fixed write that admits nothing.
+        """
+        task = getattr(self, "_runtime_owner_renewal_task", None)
+        if task is not None:
+            if not task.done():
+                return task
+            # Its completion callback was never published; harvest it here.
+            self._finish_runtime_owner_renewal(task)
+        if not self._runtime_owner_liveness_required():
+            return None
+        from contextvars import Context
+
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission,
+            create_owned_task,
+        )
+        admission = OwnedTaskAdmission()
+        try:
+            task = create_owned_task(
+                self._renew_runtime_owner_row(),
+                name=f"durable_signal_owner_renewal:{self._agent.did}",
+                context=Context(),
+                admission=admission,
             )
-            if not retained and self._retained_cognition_control_debt:
-                # A zero-row CAS is lost protection, not a healthy heartbeat.
-                # Keep the original debt and expose its terminal evidence; a
-                # timer retry cannot manufacture another owner's authority.
-                from kestrel_sovereign.execution_custody import execution_finite_error
-                raise execution_finite_error(*(
-                    error for _, error in self._retained_cognition_control_debt.values()
-                ))
-            if not retained and any(
-                not task.done() for task in self._retained_durable_cognition_tasks
-            ):
-                from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-                raise ExecutionAuthorityError("original retained cognition cleanup owner was lost")
-        else:
-            await self._durable_store.heartbeat_runtime_owner(
-                agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+            self._runtime_owner_renewal_task = task
+            task.add_done_callback(self._finish_runtime_owner_renewal)
+        except BaseException as error:
+            # An accepted renewal keeps its slot, so none runs beside it; the
+            # next tick harvests it once it ends.
+            self._runtime_owner_renewal_task = admission.task
+            self._retain_durable_writer_control(error)
+            self._runtime_owner_heartbeat_failures += 1
+            self._rearm_cleanup_runtime_owner_heartbeat()
+            raise
+        return task
+
+    def _finish_runtime_owner_renewal(self, task: asyncio.Task) -> None:
+        if getattr(self, "_runtime_owner_renewal_task", None) is not task:
+            return
+        self._runtime_owner_renewal_task = None
+        from kestrel_sovereign._async_ownership import owned_task_error
+        error = owned_task_error(task)
+        if error is None or isinstance(error, _DurableDeliveryShuttingDownError):
+            return
+        self._retain_durable_writer_control(error)
+        logger.error(
+            "Durable signal runtime-owner renewal failed (%s); retrying",
+            type(error).__name__,
+        )
+        if self._runtime_owner_liveness_required():
+            # A heartbeat that joined this renewal counts the failure; this
+            # only brings the next tick forward.
+            self._rearm_cleanup_runtime_owner_heartbeat()
+
+    async def _renew_runtime_owner(self, task: Optional[asyncio.Task] = None) -> None:
+        """Renew this owner, joining ``task`` or a renewal already running.
+
+        A heartbeat joins the renewal its own tick started, even one that has
+        already ended, so a tick writes once (#4001).
+        """
+        if task is None:
+            task = self._start_runtime_owner_renewal()
+        if task is None:
+            raise _DurableDeliveryShuttingDownError(
+                "Durable signal delivery is shutting down"
             )
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task,
+            raise_owned_outcome,
+        )
+        outcome = await await_owned_task(task)
+        self._finish_runtime_owner_renewal(task)
+        raise_owned_outcome(outcome, operation="runtime-owner renewal")
 
-    async def _heartbeat_runtime_owner(self) -> None:
-        if self._runtime_owner_cleanup_required():
-            # Irreversible runtime denial also denies ordinary metadata SQL.
-            # Keep only the existing managed owner's cleanup liveness; this
-            # fixed path cannot revive a stopped owner or admit cognition.
-            async with self._runtime_owner_fence_lock:
-                if self._runtime_owner_cleanup_required():
-                    await self._retain_runtime_owner_cleanup_liveness()
-            return
-        # The timer can have queued this coroutine immediately before
-        # shutdown flips the lifecycle state.  Take the same admission as
-        # public APIs so it either completes before teardown or performs no
-        # post-close storage work at all.
-        if self._durable_shutdown:
-            if not self.durable_shutdown_owner_fenced:
-                raise _DurableDeliveryShuttingDownError(
-                    "Durable signal delivery is shutting down"
-                )
-            async with self._runtime_owner_fence_lock:
-                if not self.durable_shutdown_owner_fenced:
-                    return
-                await self._retain_runtime_owner_cleanup_liveness()
-            return
+    async def _renew_runtime_owner_row(self) -> None:
+        """The one write that renews this owner (#4001).
 
+        It refreshes this owner's own existing, unstopped row and nothing
+        else: it never inserts an owner, revives a stopped one, grants a
+        lease or admits work, on either backend. It runs outside durable
+        admission, so a closed or refused admission and retained control
+        cannot stop it; only retirement does. A renewal that finds the owner
+        stopped or gone renews nothing; while debt that guards a lease
+        stands, that is lost protection, and it raises.
+        """
+        if not self._runtime_owner_liveness_required():
+            raise _DurableDeliveryShuttingDownError(
+                "Durable signal delivery is shutting down"
+            )
+        if await self._durable_store.retain_unretired_runtime_owner(
+            agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
+        ):
+            return
+        if self._retained_cognition_control_debt:
+            # A zero-row write is lost protection, not a healthy heartbeat.
+            # Keep the original debt and expose its terminal evidence; a
+            # retry cannot manufacture another owner's authority.
+            raise execution_finite_error(*(
+                error for _, error in self._retained_cognition_control_debt.values()
+            ))
+        if any(not task.done() for task in self._retained_durable_cognition_tasks):
+            from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+            raise ExecutionAuthorityError("original retained cognition cleanup owner was lost")
+        logger.warning(
+            "Durable signal runtime owner is stopped or gone while it is not "
+            "retired; it is not renewed: agent=%s",
+            self._agent.did,
+        )
+
+    async def _heartbeat_runtime_owner(
+        self, renewal: Optional[asyncio.Task] = None,
+    ) -> None:
+        """One heartbeat: renew this owner, then run its ordinary maintenance.
+
+        Renewal comes first, and nothing after it can undo or hold it back
+        (#4001). Maintenance (reservation, handoff and lease recovery) runs
+        under durable admission, in the owner's own execution scope: a
+        refused admission or a fenced scope fails it alone. While debt that
+        guards a lease stands, or once shutdown has closed admission, the
+        heartbeat only renews, and admits no cognition. ``renewal`` is the
+        renewal the tick started for it.
+        """
+        await self._renew_runtime_owner(renewal)
+        if self._runtime_owner_cleanup_required() or self._durable_shutdown:
+            return
         async with self._admit_durable_operation():
-            await self._durable_store.heartbeat_runtime_owner(
-                agent_id=self._agent.did,
-                owner_id=self._durable_delivery_owner,
-            )
             # Startup cannot know whether a recently crashed runtime will cross
             # the stale threshold moments later.  Sweep on every owner heartbeat
             # so such unactivated reservations eventually become marker-only
@@ -3736,7 +3935,7 @@ class SignalDispatcher:
         error = owned_task_error(task)
         self._retain_durable_writer_control(error)
         if isinstance(error, asyncio.CancelledError):
-            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
+            if self._runtime_owner_liveness_required():
                 self._runtime_owner_heartbeat_failures += 1
                 logger.warning(
                     "Durable signal runtime-owner heartbeat was cancelled; "
@@ -3747,15 +3946,17 @@ class SignalDispatcher:
         if isinstance(error, _DurableDeliveryShuttingDownError):
             # A queued timer callback can lose the lifecycle race after
             # shutdown closes admission.  That rejection is normal, but its
-            # exception must still be retrieved before returning.
+            # exception must still be retrieved, and an owner that is not
+            # retired keeps its heartbeat (#4001).
+            self._schedule_runtime_owner_heartbeat()
             return
         if error is not None:
             logger.error("Durable signal runtime-owner heartbeat failed (%s)", type(error).__name__)
-            if not self._durable_shutdown or self._runtime_owner_cleanup_required():
+            if self._runtime_owner_liveness_required():
                 self._runtime_owner_heartbeat_failures += 1
                 self._schedule_runtime_owner_heartbeat(retry=True)
             return
-        if self._durable_shutdown and not self._runtime_owner_cleanup_required():
+        if not self._runtime_owner_liveness_required():
             return
         self._runtime_owner_heartbeat_failures = 0
         self._schedule_runtime_owner_heartbeat()

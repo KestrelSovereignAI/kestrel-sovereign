@@ -119,14 +119,14 @@ async def test_outer_consumers_keep_independent_native_sources_immutable(
                     "second-stale-source": (delivery, independent.error),
                 }
                 dispatcher._durable_delivery_owner = "dispatcher:unregistered-native-cleanup-owner"
-                actual = dispatcher._durable_store.backend.retain_cognition_cleanup_owner
+                actual = dispatcher._durable_store.backend.retain_unretired_runtime_owner
                 async def zero(**kwargs):
                     result = await actual(**kwargs)
                     assert result is False
                     calls.append("zero-original-cas")
                     return result
-                monkeypatch.setattr(dispatcher._durable_store.backend, "retain_cognition_cleanup_owner", zero)
-                operation = dispatcher._retain_runtime_owner_cleanup_liveness()
+                monkeypatch.setattr(dispatcher._durable_store.backend, "retain_unretired_runtime_owner", zero)
+                operation = dispatcher._renew_runtime_owner_row()
         result = await await_owned_task(create_owned_task(operation, retain_originals=True))
         source.assert_retained(result.error)
         independent.assert_retained(result.error)
