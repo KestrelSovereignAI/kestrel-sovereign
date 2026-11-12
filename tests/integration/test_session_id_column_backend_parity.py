@@ -2555,7 +2555,6 @@ async def test_the_watermark_is_comparable_on_both_backends(db_backend, monkeypa
     from kestrel_sovereign.storage.conversation_sessions import (
         CURRENT,
         REBUILT,
-        SessionWatermark,
     )
 
     _without_embeddings(monkeypatch)

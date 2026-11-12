@@ -497,3 +497,65 @@ async def test_lost_original_savepoint_release_ack_cannot_replay_the_insert(
         f"actual rows={rows}, original INSERT ids={attempts}")
     assert len(attempts) == 1, "Native savepoint uncertainty must not replay the original INSERT"
     assert rows == [], "The outer native rollback must remove the unacknowledged exchange"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("migration", ["create", "parity"])
+@pytest.mark.parametrize("decoy_visible", [False, True])
+async def test_native_embedding_registry_migrations_ignore_foreign_schema(
+    native_pg, migration, decoy_visible,
+):
+    """A foreign registry cannot satisfy or receive this schema's migration."""
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.sqla.migrations import (
+        migrate_create_embedding_profiles,
+        migrate_embedding_profiles_add_parity,
+    )
+
+    _, control, schema = native_pg
+    decoy = "registry_decoy_" + uuid4().hex
+    pool = backend = None
+    await control.execute(f'CREATE SCHEMA "{decoy}"')
+    try:
+        search_path = f'"{schema}","{decoy}"' if decoy_visible else f'"{schema}"'
+        pool = await asyncpg.create_pool(os.environ["TEST_POSTGRES_URL"],
+            min_size=0, max_size=2, server_settings={"search_path": search_path})
+        backend = PostgresBackend.from_pool(pool)
+        db = AsyncDatabase(backend)
+        if migration == "parity":
+            await migrate_create_embedding_profiles(db)
+        await control.execute(f'CREATE TABLE "{decoy}".embedding_profiles '
+            '(id TEXT PRIMARY KEY, parity_cosine DOUBLE PRECISION)')
+        await control.execute(f'INSERT INTO "{decoy}".embedding_profiles VALUES ($1, $2)',
+            "foreign-original", 0.25)
+        operation = (migrate_create_embedding_profiles if migration == "create"
+            else migrate_embedding_profiles_add_parity)
+        await operation(db)
+        await operation(db)
+        target = f'"{schema}".embedding_profiles'
+        assert await control.fetchval("SELECT to_regclass($1)", target) is not None, (
+            "the registry creation migration accepted a foreign schema's table"
+        )
+        if migration == "create":
+            await migrate_embedding_profiles_add_parity(db)
+        assert await control.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+            "WHERE attrelid=to_regclass($1) AND attname='parity_cosine' "
+            "AND NOT attisdropped)", target,
+        ), "the registry parity migration accepted a foreign schema's column"
+        await db.execute("INSERT INTO embedding_profiles "
+            "(id, provider, model, dim, space_id, normalized, parity_cosine) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("local-original", "owned", "native", 3, "owned-space", False, 0.75))
+        assert await control.fetchval(f'SELECT count(*) FROM "{schema}".embedding_profiles') == 1
+        assert await control.fetch(f'SELECT id, parity_cosine FROM "{decoy}".embedding_profiles') == [
+            ("foreign-original", 0.25)
+        ], "migration or subsequent native write modified another schema's registry"
+    finally:
+        try:
+            if backend is not None:
+                await backend.close()
+            if pool is not None:
+                await pool.close()
+        finally:
+            await control.execute(f'DROP SCHEMA "{decoy}" CASCADE')
