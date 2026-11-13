@@ -29,14 +29,14 @@ from kestrel_sdk.resources import ResourceUnsupported
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody, bind_execution_custody_snapshot,
-    is_execution_control_error,
+    execution_terminal_error, is_execution_control_error,
 )
 from kestrel_sovereign.execution_sync_http import (
     await_native_sync_http, bind_native_sync_http_execution_admission,
 )
 from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
 from kestrel_sovereign.security.capability_authority import HostCapabilityAuthority
-from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate, _SharedGateHold, _SharedGateLease
 from kestrel_sovereign.visual_computer.repository import CustodyRecord
 from kestrel_sovereign.visual_computer.runpod_acquisition import prepare_runpod_acquisition_producer
 from kestrel_sovereign.visual_computer.runtime import VisualAccessDenied, VisualAction
@@ -258,6 +258,46 @@ async def test_native_original_producer_minimal_ack_precedes_optional_cost(custo
     assert peer.requests[0][2]['Accept-Encoding'] == 'identity' and peer.requests[0][3] == 'TLSv1.3'
 
 
+def _withdraw_original_hold_marker(root, restore):
+    """Retire only the original frame marker while retaining its read lease."""
+    descriptor = root._native_backing
+    hold, gate, lease = descriptor.privacy_holds[0]
+    assert type(hold) is _SharedGateHold and type(gate) is DurablePersistenceGate
+    assert type(lease) is _SharedGateLease
+    assert hold.gate is gate and hold.lease is lease
+    assert hold.task is descriptor.owner_task is root._owner_task
+    frames, holds = frozenset(gate._shared_frames), lease.holds
+    assert hold in frames and hold.live is True and type(holds) is int and holds > 0
+
+    def reset():
+        assert hold.gate is gate and hold.lease is lease
+        assert hold.task is descriptor.owner_task is root._owner_task
+        assert lease.holds == holds and hold not in gate._shared_frames
+        gate._shared_frames.add(hold)
+        assert hold.live is True and gate._shared_frames == frames
+
+    restore.append(reset)
+    gate._shared_frames.remove(hold)
+    assert hold.live is False and lease.holds == holds
+    assert gate._shared_frames == frames-{hold}
+
+
+def _inject_after_tls(start_tls, inject):
+    """Own the exact TLS return until the controlled injection hands it back."""
+    def after_tls(stream, *args, **kwargs):
+        actual = start_tls(stream, *args, **kwargs)
+        try:
+            inject(actual)
+            return actual
+        except BaseException as error:
+            try:
+                actual.close()
+            except BaseException as cleanup:
+                raise execution_terminal_error(error, cleanup, retain_originals=True)
+            raise
+    return after_tls
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('fault', ['copy', 'generation', 'backing', 'hold-marker', 'global-stop'])
 async def test_original_worker_refuses_changed_captured_lifetime_after_tls(custody, vendor, peer, monkeypatch, fault):
@@ -267,8 +307,7 @@ async def test_original_worker_refuses_changed_captured_lifetime_after_tls(custo
         start_tls = SyncStream.start_tls
         restore = []
         entered = []
-        def after_tls(stream, *args, **kwargs):
-            actual = start_tls(stream, *args, **kwargs)
+        def inject(actual):
             entered.append(threading.current_thread())
             if fault == 'copy':
                 value = root._native_backing
@@ -287,15 +326,10 @@ async def test_original_worker_refuses_changed_captured_lifetime_after_tls(custo
                 restore.append(lambda: setattr(target, name, value))
                 setattr(target, name, object())
             elif fault == 'hold-marker':
-                # Controlled retirement marker, exactly as shared-frame exit
-                # sets it; restore before unwinding the still-owned test lease.
-                hold = root._native_backing.privacy_holds[0][0]
-                restore.append(lambda: setattr(hold, 'live', True))
-                hold.live = False
+                _withdraw_original_hold_marker(root, restore)
             else:
                 original.turn.revoke('global Stop after genuine TLS and before application write')
-            return actual
-        monkeypatch.setattr(SyncStream, 'start_tls', after_tls)
+        monkeypatch.setattr(SyncStream, 'start_tls', _inject_after_tls(start_tls, inject))
         try:
             with pytest.raises(BaseException) as denied:
                 await invoke(original, check=lambda: None)
@@ -318,6 +352,59 @@ async def test_original_worker_refuses_changed_captured_lifetime_after_tls(custo
             with pytest.raises(Exception) as ordinary:
                 await original.store.db.fetchone('SELECT 1')
             assert is_execution_control_error(ordinary.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lose_close_ack', [False, True])
+async def test_failed_tls_injection_retires_exact_return_and_retains_errors(
+    custody, vendor, peer, monkeypatch, lose_close_ack,
+):
+    async with original_acquisition(custody, vendor, peer, monkeypatch) as original:
+        await original.attempt.begin_dispatch()
+        start_tls, close = SyncStream.start_tls, SyncStream.close
+        primary = RuntimeError('owned after-TLS injection failure')
+        cleanup = OSError('owned after-TLS close acknowledgement loss')
+        returns, closes = [], []
+
+        def inject(actual):
+            returns.append(actual)
+            raise primary
+
+        def close_original(stream):
+            close(stream)
+            if returns and stream is returns[0]:
+                closes.append(stream)
+                if lose_close_ack:
+                    raise cleanup
+
+        monkeypatch.setattr(SyncStream, 'close', close_original)
+        monkeypatch.setattr(SyncStream, 'start_tls', _inject_after_tls(start_tls, inject))
+        try:
+            with pytest.raises(BaseException) as failure:
+                await invoke(original)
+            pending, found = [failure.value], set()
+            while pending:
+                error = pending.pop()
+                if id(error) in found:
+                    continue
+                found.add(id(error))
+                pending.extend(value for value in (error.__cause__, error.__context__) if value is not None)
+                pending.extend(getattr(error, 'exceptions', ()))
+            assert id(primary) in found
+            assert (id(cleanup) in found) is lose_close_ack
+            if lose_close_ack:
+                assert failure.value is not cleanup, 'TLS close failure replaced the injection failure'
+            actual, = returns
+            assert closes == [actual] and actual._sock.fileno() == -1
+            assert original.native.is_closed and len(original.closes) == 1
+            assert not peer.requests and original.handle._receipt.phase is None
+            checkpoint = await original.handle.persist_minimal()
+            assert checkpoint.state == 'unknown' and checkpoint.lease is None
+        finally:
+            # Guard mutations must fail before this cleanup, while the same
+            # real TLS peer still gets its original socket/thread retirement.
+            for actual in returns:
+                close(actual)
 
 
 @pytest.mark.asyncio
@@ -499,6 +586,7 @@ async def test_joined_native_fact_refuses_changed_original_custody(custody, vend
         await original.attempt.begin_dispatch()
         await invoke(original)
         root, handle = original.attempt._result, original.handle
+        restore = []
         if fault == 'receipt':
             target, name, changed = handle, '_receipt', copy.copy(handle._receipt)
         elif fault == 'row':
@@ -506,19 +594,22 @@ async def test_joined_native_fact_refuses_changed_original_custody(custody, vend
         elif fault == 'key':
             target, name, changed = original.store, '_key', b'X'*32
         elif fault == 'hold-marker':
-            target, name, changed = root._native_backing.privacy_holds[0][0], 'live', False
+            _withdraw_original_hold_marker(root, restore)
         else:
             target = root._backend if root._generation is not None else root._native_backing.postgres_pool.pool
             name = '_connection_generation' if root._generation is not None else '_generation'
             value = getattr(target, name)
             changed = 'changed' if type(value) is str else value+1
-        value = getattr(target, name)
-        setattr(target, name, changed)
+        if fault != 'hold-marker':
+            value = getattr(target, name)
+            restore.append(lambda: setattr(target, name, value))
+            setattr(target, name, changed)
         try:
             with pytest.raises(ExecutionAuthorityError):
                 await handle.persist_minimal()
         finally:
-            setattr(target, name, value)  # Exact owned fixture cleanup only.
+            for reset in reversed(restore):
+                reset()  # Exact owned fixture cleanup only.
         assert original.attempt.checkpoint.state == 'dispatching'
         assert len(peer.requests) == 1
 
