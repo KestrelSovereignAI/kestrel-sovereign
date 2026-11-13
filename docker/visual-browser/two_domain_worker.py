@@ -287,17 +287,14 @@ async def _main(lifecycle):
     incarnation = secrets.token_hex(32)
     (directory/"incarnation").write_text(incarnation)
     source = directory/"bootstrap.json"
-    async with asyncio.timeout(30):
-        while not source.exists() and not retirement.is_set():
-            await asyncio.sleep(.05)
-        if retirement.is_set():
-            return
-        with source.open("rb") as stream:
-            raw = stream.read(MAX_REQUEST+1)
-        source.unlink()
-        settings = configuration(decode(raw))
-        if not hmac.compare_digest(settings["incarnation"], incarnation):
-            raise Refused("worker_incarnation_mismatch")
+    if not await ProcessLifetime.wait_for_bootstrap(lifecycle, source, retirement):
+        return
+    with source.open("rb") as stream:
+        raw = stream.read(MAX_REQUEST+1)
+    source.unlink()
+    settings = configuration(decode(raw))
+    if not hmac.compare_digest(settings["incarnation"], incarnation):
+        raise Refused("worker_incarnation_mismatch")
     shared = Path(IPC)
     for name, value in (("incarnation", incarnation), ("profile", settings["profile_sha256"])):
         with open(shared/name, "x", opener=lambda p, flags: os.open(p, flags, 0o640)) as stream:

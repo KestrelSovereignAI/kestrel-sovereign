@@ -61,6 +61,26 @@ class ProcessLifetime:
         if self.requested:
             loop.call_soon_threadsafe(self._notify)
 
+    async def wait_for_bootstrap(self, path, retirement):
+        """Retire a worker whose bootstrap was never admitted.
+
+        This deadline covers waiting only. Reading or validating bootstrap,
+        native startup and their errors remain the caller's responsibility.
+        Caller cancellation must still pass through the original lifetime.
+        """
+        import asyncio
+
+        deadline = asyncio.timeout(30)
+        try:
+            async with deadline:
+                while not path.exists() and not self.requested and not retirement.is_set():
+                    await asyncio.sleep(.05)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            return False
+        return not self.requested and not retirement.is_set()
+
     def detach(self):
         # Python finalization resets caught dispositions before native exit.
         # After the original main joins, keep withdrawal blocked across that

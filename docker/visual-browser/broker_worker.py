@@ -59,16 +59,13 @@ async def _main(lifecycle):
         PRIVATE.mkdir(mode=0o700, exist_ok=False)
         (PRIVATE/"incarnation").write_text(secrets.token_hex(32))
         path = PRIVATE/"bootstrap.json"
-        async with asyncio.timeout(30):
-            while not path.exists() and not retirement.is_set():
-                await asyncio.sleep(.05)
-            if retirement.is_set():
-                return
-            with path.open("rb") as stream:
-                raw = stream.read(MAX_REQUEST+1)
-            path.unlink()
-            if len(raw) > MAX_REQUEST:
-                raise ValueError("bounded_original_broker_bootstrap_required")
+        if not await ProcessLifetime.wait_for_bootstrap(lifecycle, path, retirement):
+            return
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_REQUEST+1)
+        path.unlink()
+        if len(raw) > MAX_REQUEST:
+            raise ValueError("bounded_original_broker_bootstrap_required")
         value = decode(raw)
         validate_configuration(value)
         if not hmac.compare_digest(value["broker_incarnation"], (PRIVATE/"incarnation").read_text()):
