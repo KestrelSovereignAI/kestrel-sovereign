@@ -1,5 +1,6 @@
 """Explicit remote-server identity, registered clients and finite OAuth budgets."""
 
+import hmac
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Literal, Self
 from urllib.parse import urlsplit
@@ -70,6 +71,15 @@ class MCPServerClient(BaseModel):
         if tuple(str(uri) for uri in self.oauth_information().redirect_uris) != self.redirect_uris:
             raise ValueError("The native SDK must preserve the registered redirect identity")
         return self
+
+    def check_client_secret(self, secret: str) -> bool:
+        """Authenticate a confidential client through Authlib's standard methods."""
+        return self.client_secret is not None and hmac.compare_digest(
+            self.client_secret.get_secret_value().encode(), secret.encode())
+
+    def check_endpoint_auth_method(self, method: str, endpoint: str) -> bool:
+        """The registered method is the sole authority for token and revoke."""
+        return endpoint in {"token", "revocation"} and method == self.token_endpoint_auth_method
 
     def oauth_information(self) -> "OAuthClientInformationFull":
         """Give the official authorization handler its registered client record."""

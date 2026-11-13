@@ -1611,6 +1611,42 @@ effect, terminal receipt, owner-release ordering and restart recovery. This
 does not eliminate the existing at-least-once crash window between a business
 effect and its durable terminal record.
 
+## Inbound MCP server
+
+The server direction in #1990 has one standard OAuth authorization server and
+uses the published MCP SDK for its authenticated Streamable HTTP resource
+server. `mcp_server.transport.NativeMCPServer` composes the official server,
+its original authentication middleware and lifespan, exact protected-resource
+metadata route, and RFC 8414 discovery for the pathful per-agent issuer.
+It does not introduce a second MCP wire protocol. The routes remain private
+implementation work until the host publication and governed tools are wired.
+
+`mcp_server.oauth.NativeMCPOAuthProvider` uses Authlib's registered client
+authentication methods and native MCP token models. The optional MCP SDK 2.3
+OAuth token/revocation handlers are unsuitable for this authorization server:
+actual SQLite/PostgreSQL HTTP tests reproduce refusal of Basic authentication
+without a redundant body client ID, and refusal of public-client revocation
+without a nonexistent client secret. Kestrel implements these standard OAuth
+endpoints directly. It neither rewrites the client's HTTP request nor patches
+or vendors MCP. Authlib's dependency floor covers the tested request-payload
+contract; the published official MCP SDK remains unchanged.
+
+Only explicit registered clients may authorize. Code exchange requires S256
+PKCE, the exact original redirect and resource, and the client's registered
+authentication method. Repeated parameters and multiple client authentication
+methods fail before token consumption. Opaque credentials remain encrypted,
+agent-bound SQL records; consumption, rotation and family revocation belong to
+the original top-level transaction. An authenticated revocation proves stored
+ownership even while current grant use is denied by a temporary key change.
+Token verification always checks current grant authority and audience.
+
+The first-party consent authority still requires its original live sovereign
+HTTP request. An authorization redirect only creates pending consent; it does
+not mint a grant. This foundation does not yet establish the Console consent
+UI, Core route publication, governed memory tools, atomic external `log_turn`,
+actual Claude/ChatGPT installation, or subsequent reflection/consolidation.
+Those remain acceptance gates of #1990 and the original epic.
+
 ## Review, verification and release order
 
 1. Review this design in its worktree; complete dependency/import and three
