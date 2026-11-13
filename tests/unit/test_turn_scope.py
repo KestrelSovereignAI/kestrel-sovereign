@@ -670,18 +670,57 @@ async def test_lifecycle_binding_inherited_by_a_child_is_not_a_lock_grant():
 _ALLOWED_DIRECT_BINDS = {
     # The invocation boundary publishes the endpoint's own caller lifetime on
     # each ``anext`` of an isolated invocation — it precedes any turn.
-    ("agent/invocation.py", "caller_context_binding_scope"),
+    ("agent/invocation.py", "bind_async_invocation.decorate.wrapped", "caller_context_binding_scope"),
+    ("agent/invocation.py", "bind_async_generator_invocation.decorate.wrapped", "caller_context_binding_scope"),
+    # Native MCP publishes its verified endpoint caller before governed turn
+    # admission. This exact ingress is not a closure carrying a prior turn.
+    ("mcp_server/tool_caller.py", "MCPToolCaller.bind", "caller_context_binding_scope"),
     # A subagent binds its LOCAL parts sink, not a captured turn collector.
-    ("features/base.py", "bind_part_collector"),
+    ("features/base.py", "Feature._execute_subagent_tool.operation", "bind_part_collector"),
     # A deferred publication runs its synchronous factory, on the same task,
     # under the collector of its chosen destination, or none when headless.
-    ("agent/orchestrator_engine.py", "bind_part_collector"),
+    ("agent/orchestrator_engine.py", "_publication_scope", "bind_part_collector"),
 }
 
 
 def _declaring_file(func) -> str:
     module = getattr(func, "__module__", "")
     return module.replace("kestrel_sovereign.", "").replace(".", "/") + ".py"
+
+
+def _manual_bind_offenders(source, relative_path, bind_owners):
+    offenders = []
+
+    def visit(node, scope=()):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = (*scope, node.name)
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = (func.id if isinstance(func, ast.Name)
+                else func.attr if isinstance(func, ast.Attribute) else None)
+            owner = bind_owners.get(name)
+            if (owner is not None and owner != relative_path
+                    and (relative_path, ".".join(scope), name) not in _ALLOWED_DIRECT_BINDS):
+                offenders.append(f"{relative_path}:{node.lineno} {name} ({'.'.join(scope)})")
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(ast.parse(source))
+    return offenders
+
+
+@pytest.mark.parametrize("scope", ["dispatch", "bind.later"])
+def test_turn_scope_scan_does_not_exempt_other_mcp_methods_or_nested_handoffs(scope):
+    source = "class MCPToolCaller:\n    async def bind(self):\n        with caller_context_binding_scope(binding):\n            pass\n"
+    owners = {"caller_context_binding_scope": "auth.py"}
+    assert _manual_bind_offenders(source, "mcp_server/tool_caller.py", owners) == []
+    if scope == "dispatch":
+        source = source.replace("async def bind", "async def dispatch")
+    else:
+        source = "class MCPToolCaller:\n    async def bind(self):\n        async def later():\n            with caller_context_binding_scope(binding):\n                pass\n"
+    offenders = _manual_bind_offenders(source, "mcp_server/tool_caller.py", owners)
+    assert len(offenders) == 1 and f"MCPToolCaller.{scope}" in offenders[0], (
+        "An ingress exception exempted another method or a nested turn handoff")
 
 
 def test_no_closure_re_presents_turn_scoped_state_by_hand():
@@ -714,22 +753,7 @@ def test_no_closure_re_presents_turn_scoped_state_by_hand():
     offenders = []
     for path in root.rglob("*.py"):
         rel = path.relative_to(root).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = (
-                func.id if isinstance(func, ast.Name)
-                else func.attr if isinstance(func, ast.Attribute)
-                else None
-            )
-            owner = bind_owners.get(name)
-            if owner is None or owner == rel:
-                continue
-            if (rel, name) in _ALLOWED_DIRECT_BINDS:
-                continue
-            offenders.append(f"{rel}:{node.lineno} {name}")
+        offenders.extend(_manual_bind_offenders(path.read_text(encoding="utf-8"), rel, bind_owners))
 
     assert not offenders, (
         "These re-present one turn-scoped value by hand; a closure crossing a "

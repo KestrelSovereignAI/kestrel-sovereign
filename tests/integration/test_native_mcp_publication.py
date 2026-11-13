@@ -52,7 +52,7 @@ KEY = "owned-publication-durable-key"
 
 
 @pytest.fixture
-async def publication(assistant_agent, monkeypatch):
+async def publication(assistant_agent, monkeypatch, request):
     monkeypatch.setenv("KESTREL_API_KEY", KEY)
     agent = assistant_agent
     assert agent._runtime_publication_ready.is_set()
@@ -68,9 +68,11 @@ async def publication(assistant_agent, monkeypatch):
     for middleware in reversed(server.app.user_middleware):
         if middleware.cls in boundaries:
             app.add_middleware(middleware.cls, *middleware.args, **middleware.kwargs)
-    policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
+    configuration = {"console_origin": "https://kestrel.example",
         "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
-            "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}))
+            "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}
+    configuration.update(getattr(request, "param", {}))
+    policy = MCPServerPolicy.model_validate_json(json.dumps(configuration))
     p = await NativeMCPPublication.prepare(app, agent, "OwnedNativeMCP", policy, sovereign_key=lambda: KEY)
     async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
             base_url=policy.console_origin, follow_redirects=False) as client:

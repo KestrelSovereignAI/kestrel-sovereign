@@ -63,6 +63,7 @@ class NativeMCPPublication:
         self._resident_operation = self._close_operation = None
         self._stop = asyncio.Event()
         self._requests = AsyncReaderWriterLock()
+        self._tool_callers = set()
         self.runtime = self.controller = self.binding = None
         self.resource = policy.console_origin + "/api/agent-routes/" + encode_agent_route_name(routing_key) + "/mcp"
 
@@ -124,6 +125,9 @@ class NativeMCPPublication:
             await grants.initialize()
             publication.runtime = NativeMCPServer(grants, name=agent.agent_name,
                 consent_url=publication.resource + "/consent")
+            from .memory_tools import NativeMCPMemoryTools
+
+            NativeMCPMemoryTools(publication).register()
             publication.controller = MCPConsentController(agent, publication.runtime.authorization,
                 require_current=publication.require_current)
             prefix = "" if manager is None else "/api/agent-routes/" + encode_agent_route_name(routing_key)
@@ -189,11 +193,17 @@ class NativeMCPPublication:
             self.registry.withdraw(self.binding)
 
     @asynccontextmanager
-    async def request_lifetime(self):
+    async def request_lifetime(self, scope=None):
         self.require_current()
         async with self._requests.read():
             self.require_current()
-            yield self.require_current
+            if scope is not None:
+                from .tool_caller import MCPToolCaller
+
+                async with MCPToolCaller(self, scope) as request:
+                    yield request
+            else:
+                yield self.require_current
 
     async def close(self):
         failure = None

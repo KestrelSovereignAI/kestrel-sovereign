@@ -32,6 +32,7 @@ class AuthMethod(str, Enum):
     OAUTH_SESSION = "oauth_session"
     A2A_TRANSPORT = "a2a_transport"
     MCP_TRANSPORT = "mcp_transport"
+    MCP_OAUTH = "mcp_oauth"
     INTERNAL = "internal"  # Agent-to-agent or system calls
 
 

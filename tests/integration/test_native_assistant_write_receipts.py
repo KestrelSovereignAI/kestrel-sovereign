@@ -31,14 +31,14 @@ async def assistant_agent(tmp_path, monkeypatch, request):
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-credentials"))
     (tmp_path / "kestrel.toml").write_text('[llm]\nroute_priority=[]\n')
     settings = getattr(request, "param", {})
-    assert type(settings) is dict and set(settings) <= {"is_test_instance", "owned_local_generation"}
+    assert type(settings) is dict and set(settings) <= {"is_test_instance", "owned_local_generation", "features"}
     policy = PayerPolicy.host_env_default()
     if not settings.get("owned_local_generation", False):
         policy = PayerPolicy.model_validate({
             **policy.model_dump(), "llm": PayerSpec(vendor="local", kind=PayerKind.NONE),
         })
     async with booted_agent(tmp_path, name="OwnedAssistantReceipts",
-            provenance="test:1990-original-assistant-receipt", features=set(),
+            provenance="test:1990-original-assistant-receipt", features=set(settings.get("features", ())),
             payer_policy=policy, is_test_instance=settings.get("is_test_instance", True)) as agent:
         if settings.get("owned_local_generation", False):
             assert not agent.llm_service.disabled

@@ -23,9 +23,9 @@ class NativeMCPHostMiddleware:
             return
         if not callable(binding.request_lifetime):
             raise TypeError("Original native MCP host request lifetime required")
-        async with binding.request_lifetime() as current:
+        async with binding.request_lifetime(scope) as current:
             async def guarded_send(message):
                 current()
-                await send(message)
+                await current.send(message, send)
                 current()
             await self.app(scope, receive, guarded_send)

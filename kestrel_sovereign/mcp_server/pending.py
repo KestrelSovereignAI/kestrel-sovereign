@@ -52,12 +52,12 @@ class PendingMCPAuthorizations:
         self.backend, self.agent_id = backend, agent_id
         self.resource_url, self.policy, self.clock = resource_url, policy, clock
 
-    def now(self) -> int:
-        """Read the shared finite authorization clock after the last native wait."""
+    def now(self, *, fractional: bool = False) -> int | float:
+        """Read validated time; records use seconds, deadlines retain fractions."""
         value = self.clock()
         if not math.isfinite(value) or value < 0:
             raise ValueError("MCP authorization clock must supply a finite Unix time")
-        return math.floor(value)
+        return value if fractional else math.floor(value)
 
     async def initialize(self) -> None:
         async with self.backend.transaction():
