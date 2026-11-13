@@ -435,7 +435,9 @@ class VisualComputerRuntime:
         provider = self.providers.get(record.request.provider_id)
         if type(provider) is not LocalTwoDomainProvider:
             return None
-        # Callers hold the existing session lock and fresh current authority.
+        # Callers hold the existing session lock. Foreground operations retain
+        # current authority; maintenance passes no new grant after rechecking
+        # the already admitted fixed lease's cleanup eligibility under that lock.
         # A stale in-memory lease assignment is never a durable lease receipt.
         record = await self.repository.get(scope, session_id=record.session_id, guard=check)
         host = provider._setup_host
@@ -473,15 +475,16 @@ class VisualComputerRuntime:
                 record = await self.repository.get(scope, request_id=request_id, guard=check)
                 async with self._lock(record.session_id):
                     settled = await self._settle_failed_local_setup(scope, record, check)
-                    if settled is None:
-                        record = await self.repository.get(scope, session_id=record.session_id, guard=check)
-                if settled is not None:
-                    return self._retirement(settled) if settled.phase == "retired" else {"session_id": settled.session_id, "released": True}
+                    if settled is not None:
+                        return self._retirement(settled) if settled.phase == "retired" else {"session_id": settled.session_id, "released": True}
+                    record = await self.repository.get(scope, session_id=record.session_id, guard=check)
+                    if record.phase == "released":
+                        # The original join and same-entry removal serialize
+                        # with foreground release on this existing session lock.
+                        await self._discard_released_local_connection(record, check)
+                        return {"session_id": record.session_id, "released": True}
                 if record.phase == "retired":
                     return self._retirement(record)
-                if record.phase == "released":
-                    await self._discard_released_local_connection(record, check)
-                    return {"session_id": record.session_id, "released": True}
                 if record.phase in {"admitted", "quoted"}:
                     record = await self.repository.retire_unacquired(scope, record, at=self._now(), guard=check)
                     return self._retirement(record)
@@ -1027,6 +1030,12 @@ class VisualComputerRuntime:
                     last = record.last_activity_at or record.request.requested_at
                     if (record.phase != "releasing" and self._now() < record.lease.expires_at
                             and (self._now()-last).total_seconds() < record.request.idle_ttl_seconds):
+                        continue
+                    # A failed setup may already have joined its physical
+                    # closer while its durable settlement was unavailable.
+                    # Reuse that same original join/ACK/discard boundary before
+                    # the generic lease release path drops connection custody.
+                    if await self._settle_failed_local_setup(scope, record, None) is not None:
                         continue
                     await self._begin_release(scope, record)
                     async with asyncio.timeout(self.policy.operation_seconds):
