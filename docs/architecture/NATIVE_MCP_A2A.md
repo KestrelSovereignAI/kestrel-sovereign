@@ -1621,14 +1621,19 @@ metadata route, and RFC 8414 discovery for the pathful per-agent issuer.
 It does not introduce a second MCP wire protocol. The routes remain private
 implementation work until the host publication and governed tools are wired.
 
-`mcp_server.oauth.NativeMCPOAuthProvider` uses Authlib's registered client
+`mcp_server.oauth.NativeMCPAuthorizationServer` uses Authlib's registered client
 authentication methods and native MCP token models. The optional MCP SDK 2.3
-OAuth token/revocation handlers are unsuitable for this authorization server:
-actual SQLite/PostgreSQL HTTP tests reproduce refusal of Basic authentication
-without a redundant body client ID, and refusal of public-client revocation
-without a nonexistent client secret. Kestrel implements these standard OAuth
-endpoints directly. It neither rewrites the client's HTTP request nor patches
-or vendors MCP. Authlib's dependency floor covers the tested request-payload
+OAuth server handlers are unsuitable for this authorization server. Actual
+SQLite/PostgreSQL HTTP tests reproduce refusal of Basic authentication without
+a redundant body client ID, refusal of public-client revocation without a
+nonexistent secret, and acceptance of normalized redirect identities and
+repeated authorization parameters. Error redirects also discarded an empty
+registered query parameter. The common boundary is the optional OAuth server
+implementation, so Kestrel implements all three standard OAuth endpoints with
+Authlib authentication and native grant storage. It preserves the original
+registered callback string, including its query, and returns the original state
+and issuer. Request values are never rewritten to satisfy SDK handlers. The MCP
+SDK is neither patched nor vendored. Authlib's dependency floor covers the tested request-payload
 contract; the published official MCP SDK remains unchanged.
 
 Only explicit registered clients may authorize. Code exchange requires S256

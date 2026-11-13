@@ -74,7 +74,7 @@ class PendingMCPAuthorizations:
         client = self._registered_client(client_id)
         return (client is not None and isinstance(parameters, AuthorizationParams)
             and parameters.resource == self.resource_url
-            and str(parameters.redirect_uri) in client.redirect_uris
+            and client.native_redirect_uri(str(parameters.redirect_uri)) is not None
             and bool(parameters.scopes) and set(parameters.scopes) <= set(client.scopes))
 
     def _registered_client(self, client_id: str) -> MCPServerClient | None:
@@ -132,8 +132,7 @@ class PendingMCPAuthorizations:
         # AuthorizationParams reparses a serialized string with a slash.
         # Re-present the exact registered native URL object, as the official
         # authorization handler does when selecting a client's sole callback.
-        redirect = next((uri for uri in client.oauth_information().redirect_uris
-            if str(uri) == value["parameters"]["redirect_uri"]), None)
+        redirect = client.native_redirect_uri(value["parameters"]["redirect_uri"])
         if redirect is None:
             return None
         parameters = AuthorizationParams.model_validate({**value["parameters"], "redirect_uri": redirect})

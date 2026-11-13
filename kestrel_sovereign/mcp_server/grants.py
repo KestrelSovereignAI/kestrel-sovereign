@@ -212,8 +212,9 @@ class MCPAuthorizationGrants:
         value = {key: value for key, value in stored.items() if key != "grant_hash"}
         if kind is MCPRecordKind.CODE:
             client = self.policy.registered_client(value["client_id"])
-            redirect = next(uri for uri in client.oauth_information().redirect_uris
-                if str(uri) == value["redirect_uri"])
+            redirect = client.native_redirect_uri(value["redirect_uri"])
+            if redirect is None:
+                raise ValueError("The stored MCP redirect is no longer registered")
             return AuthorizationCode.model_validate({**value, "code": secret, "redirect_uri": redirect})
         model = AccessToken if kind is MCPRecordKind.ACCESS else RefreshToken
         return model.model_validate({**value, "token": secret})

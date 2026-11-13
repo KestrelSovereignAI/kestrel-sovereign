@@ -44,6 +44,7 @@ async def test_native_resource_challenge_and_pathful_issuer_discovery(consent_ht
         assert value["token_endpoint"] == RESOURCE + "/oauth/token"
         assert value["authorization_endpoint"] == RESOURCE + "/oauth/authorize"
         assert value["code_challenge_methods_supported"] == ["S256"]
+        assert value["authorization_response_iss_parameter_supported"] is True
         assert "registration_endpoint" not in value
         assert urlsplit(value["revocation_endpoint"]).path == "/mcp/owned/oauth/revoke"
 

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import (
+    AnyUrl,
     BaseModel,
     ConfigDict,
     Field,
@@ -71,6 +72,13 @@ class MCPServerClient(BaseModel):
         if tuple(str(uri) for uri in self.oauth_information().redirect_uris) != self.redirect_uris:
             raise ValueError("The native SDK must preserve the registered redirect identity")
         return self
+
+    def native_redirect_uri(self, value: str) -> AnyUrl | None:
+        """Select the exact registered native URI before request normalization."""
+        for configured, native in zip(self.redirect_uris, self.oauth_information().redirect_uris, strict=True):
+            if value == configured:
+                return native
+        return None
 
     def check_client_secret(self, secret: str) -> bool:
         """Authenticate a confidential client through Authlib's standard methods."""

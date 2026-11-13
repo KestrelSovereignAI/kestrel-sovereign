@@ -23,7 +23,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Route, request_response
 
 from .grants import MCPAuthorizationGrants
-from .oauth import NativeMCPOAuthProvider
+from .oauth import NativeMCPAuthorizationServer
 from .policy import MemoryScope
 
 
@@ -31,7 +31,7 @@ class NativeMCPServer:
     """One agent's native MCP runtime; the host owns its complete lifespan."""
 
     def __init__(self, grants: MCPAuthorizationGrants, *, name: str, consent_url: str):
-        self.authorization = NativeMCPOAuthProvider(grants, consent_url)
+        self.authorization = NativeMCPAuthorizationServer(grants, consent_url)
         resource = grants.pending.resource_url
         issuer = grants.issuer
         settings = AuthSettings(issuer_url=issuer, resource_server_url=resource,
@@ -59,7 +59,8 @@ class NativeMCPServer:
             revocation_endpoint=AnyHttpUrl(issuer + "/revoke"),
             response_types_supported=["code"], grant_types_supported=["authorization_code", "refresh_token"],
             scopes_supported=list(get_args(MemoryScope)), code_challenge_methods_supported=["S256"],
-            token_endpoint_auth_methods_supported=methods, revocation_endpoint_auth_methods_supported=methods)
+            token_endpoint_auth_methods_supported=methods, revocation_endpoint_auth_methods_supported=methods,
+            authorization_response_iss_parameter_supported=True)
         metadata_handler = MetadataHandler(metadata)
         routes = [Route(issuer_metadata_path,
             cors_middleware(metadata_handler.handle, ["GET", "OPTIONS"]), methods=["GET", "OPTIONS"])]

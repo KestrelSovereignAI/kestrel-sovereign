@@ -2,7 +2,7 @@
 
 import base64
 import hashlib
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx2
 import pytest
@@ -10,7 +10,7 @@ from mcp.server.auth.provider import AuthorizationParams
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-from kestrel_sovereign.mcp_server.oauth import NativeMCPOAuthProvider
+from kestrel_sovereign.mcp_server.oauth import NativeMCPAuthorizationServer
 from tests.integration.test_native_mcp_consent import API_KEY, RESOURCE
 from tests.integration.test_native_mcp_consent import consent_http as _consent_http
 from tests.integration.test_native_mcp_consent import native_pg as _native_pg
@@ -24,7 +24,7 @@ CALLBACK = "https://provider.example/callback"
 
 
 def provider(boundary):
-    return NativeMCPOAuthProvider(boundary[6], "https://kestrel.example/console/mcp/consent")
+    return NativeMCPAuthorizationServer(boundary[6], "https://kestrel.example/console/mcp/consent")
 
 
 def oauth_app(native):
@@ -39,11 +39,18 @@ async def approved_code(boundary):
     client, pending = boundary[:2]
     handle = await pending.create("owned-provider", AuthorizationParams(
         state="owned-http-state", scopes=["memory:read"], code_challenge=CHALLENGE,
-        redirect_uri=CALLBACK, redirect_uri_provided_explicitly=True, resource=RESOURCE))
+        redirect_uri=pending.policy.clients[0].oauth_information().redirect_uris[0],
+        redirect_uri_provided_explicitly=True, resource=RESOURCE))
     response = await client.post("/api/owned-mcp-consent", params={"mode": "issue-code", "handle": handle},
         headers={"x-api-key": API_KEY})
     assert response.status_code == 200, response.text
     return response.json()["code"]
+
+
+def authorization_request():
+    return {"response_type": "code", "client_id": "owned-provider", "redirect_uri": CALLBACK,
+        "scope": "memory:read", "state": "original-http-state", "code_challenge": CHALLENGE,
+        "code_challenge_method": "S256", "resource": RESOURCE}
 
 
 def code_request(code):
@@ -54,9 +61,7 @@ def code_request(code):
 async def test_authorization_redirect_only_creates_original_pending_consent(consent_http):
     native = provider(consent_http)
     async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native)), base_url="https://kestrel.example") as client:
-        response = await client.get("/authorize", params={"response_type": "code", "client_id": "owned-provider",
-            "redirect_uri": CALLBACK, "scope": "memory:read", "state": "original-http-state",
-            "code_challenge": CHALLENGE, "code_challenge_method": "S256", "resource": RESOURCE})
+        response = await client.get("/authorize", params=authorization_request())
     assert response.status_code == 302, response.text
     location = urlsplit(response.headers["location"])
     assert location.scheme == "https" and location.netloc == "kestrel.example"
@@ -200,8 +205,6 @@ async def test_revocation_survives_a_temporary_sovereign_key_change(consent_http
 
 @pytest.mark.parametrize("field", ["resource", "code", "code_verifier", "client_id"])
 async def test_duplicate_token_parameters_do_not_consume_original_code(consent_http, field):
-    from urllib.parse import urlencode
-
     native = provider(consent_http)
     code = await approved_code(consent_http)
     request = code_request(code)
@@ -236,7 +239,7 @@ async def test_authorization_preserves_original_host_lease_control_after_body_re
     authority = MCPConsentAuthority(pending.agent_id, RESOURCE, pending.policy,
         require_current=require_current, sovereign_key=lambda: API_KEY, clock=pending.clock)
     grants = MCPAuthorizationGrants(pending, consent_http[6].issuer, consent_authority=authority)
-    native = NativeMCPOAuthProvider(grants, "https://kestrel.example/console/mcp/consent")
+    native = NativeMCPAuthorizationServer(grants, "https://kestrel.example/console/mcp/consent")
     app = oauth_app(native)
 
     async def retire_during_body(scope, receive, send):
@@ -250,7 +253,68 @@ async def test_authorization_preserves_original_host_lease_control_after_body_re
     async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=retire_during_body),
             base_url="https://kestrel.example") as client:
         with pytest.raises(ExecutionAuthorityError) as escaped:
-            await client.post("/authorize", data={"response_type": "code", "client_id": "owned-provider",
-                "redirect_uri": CALLBACK, "scope": "memory:read", "state": "original-http-state",
-                "code_challenge": CHALLENGE, "code_challenge_method": "S256", "resource": RESOURCE})
+            await client.post("/authorize", data=authorization_request())
     assert originals and escaped.value is originals[0], "The original host callback control was replaced"
+
+
+@pytest.mark.parametrize("redirect", ["HTTPS://provider.example/callback", "https://provider.example/a/../callback"])
+async def test_authorization_compares_the_original_redirect_bytes(consent_http, redirect):
+    native = provider(consent_http)
+    request = authorization_request()
+    request["redirect_uri"] = redirect
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native)),
+            base_url="https://kestrel.example") as client:
+        response = await client.get("/authorize", params=request)
+    assert response.status_code == 400, "A normalized redirect replaced the exact registered identity"
+    assert "location" not in response.headers
+
+
+@pytest.mark.parametrize("field", ["client_id", "redirect_uri", "code_challenge"])
+async def test_authorization_refuses_repeated_parameters_before_consent(consent_http, field):
+    native = provider(consent_http)
+    request = authorization_request()
+    body = urlencode([*request.items(), (field, request[field])])
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native)),
+            base_url="https://kestrel.example") as client:
+        response = await client.post("/authorize", content=body,
+            headers={"content-type": "application/x-www-form-urlencoded"})
+    assert response.status_code == 400, "Repeated OAuth parameters created consent"
+    assert "location" not in response.headers
+
+
+
+@pytest.mark.parametrize("consent_http", [
+    {"backend": backend, "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
+        "redirect_uris": ["https://provider.example/callback?keep=&tag=one&tag=two"],
+        "scopes": ["memory:read", "memory:write"], "client_secret": "owned-secret"}]}
+    for backend in ("sqlite", "postgres")], indirect=True)
+async def test_authorization_error_preserves_registered_query_and_state(consent_http):
+    native = provider(consent_http)
+    callback = consent_http[1].policy.clients[0].redirect_uris[0]
+    request = authorization_request()
+    request.update(redirect_uri=callback, scope="unregistered-scope", state="original + state & value")
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native)),
+            base_url="https://kestrel.example") as client:
+        response = await client.get("/authorize", params=request)
+    assert response.status_code == 302, response.text
+    location = response.headers["location"]
+    assert location.startswith(callback + "&"), "The original registered callback query was rewritten"
+    values = parse_qs(urlsplit(location).query, keep_blank_values=True)
+    assert values["keep"] == [""] and values["tag"] == ["one", "two"]
+    assert values["state"] == [request["state"]]
+    assert values["iss"] == [consent_http[6].issuer]
+    assert values["error"] == ["invalid_scope"]
+
+
+
+@pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
+async def test_token_endpoint_requires_the_standard_form_media_type(consent_http, content_type):
+    native = provider(consent_http)
+    code = await approved_code(consent_http)
+    request = code_request(code)
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native)),
+            base_url="https://kestrel.example") as client:
+        response = await client.post("/token", content=urlencode(request), headers={"content-type": content_type})
+        assert response.status_code == 400 and response.json()["error"] == "invalid_request"
+        response = await client.post("/token", data=request)
+    assert response.status_code == 200, response.text

@@ -1,11 +1,11 @@
-"""Compose official MCP OAuth handlers with the host's native authority and resource."""
+"""Standard OAuth endpoints backed by native SQL grants and Authlib authentication."""
 
 import asyncio
 import hmac
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlencode
 
@@ -15,34 +15,27 @@ from authlib.oauth2.rfc6749.errors import (
     InvalidClientError,
     InvalidGrantError,
     InvalidRequestError,
+    InvalidScopeError,
     UnsupportedGrantTypeError,
+    UnsupportedResponseTypeError,
 )
 from authlib.oauth2.rfc6749.requests import BasicOAuth2Payload
 from authlib.oauth2.rfc7636.challenge import (
+    CODE_CHALLENGE_PATTERN,
     CODE_VERIFIER_PATTERN,
     create_s256_code_challenge,
 )
-from mcp.server.auth.handlers.authorize import AuthorizationHandler
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
     AuthorizationParams,
-    AuthorizeError,
-    IdentityAssertionParams,
     RefreshToken,
-    RegistrationError,
     TokenError,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from starlette.datastructures import FormData, QueryParams
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-
-from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError,
-    execution_observation_error,
-    is_execution_control_error,
-)
-from kestrel_sovereign.storage.db.interface import TransactionError
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from .grants import MCPAuthorizationGrants
 from .pending import PendingMCPQuotaExceeded
@@ -69,10 +62,9 @@ class _OAuthRequest:
     purpose: Literal["authorize", "token", "revoke"]
     resource: str
     active: bool = True
-    control: BaseException | None = field(default=None, repr=False)
 
 
-class NativeMCPOAuthProvider:
+class NativeMCPAuthorizationServer:
     """Native OAuth authorization server and official MCP token verifier."""
 
     def __init__(self, grants: MCPAuthorizationGrants, consent_url: str):
@@ -81,25 +73,10 @@ class NativeMCPOAuthProvider:
             raise ValueError("MCP consent must use the configured first-party Console")
         self.grants, self.pending, self.consent_url = grants, grants.pending, consent_url
         self._request: ContextVar[_OAuthRequest | None] = ContextVar("mcp_oauth_request", default=None)
-        self._authorization = AuthorizationHandler(self)
         self._authenticate_client = ClientAuthentication(self.pending.policy.registered_client)
 
-    def _retain_original_control(self, error: BaseException) -> None:
-        owner = self._request.get()
-        if (owner is not None and owner.active and owner.task is asyncio.current_task()
-                and is_execution_control_error(error)):
-            owner.control = execution_observation_error(owner.control, error)
-
     def _require_current(self) -> None:
-        owner = self._request.get()
-        if (owner is not None and owner.active and owner.task is asyncio.current_task()
-                and owner.control is not None):
-            raise owner.control
-        try:
-            self.grants.consent_authority.require_current_host()
-        except (ExecutionAuthorityError, TransactionError, BaseExceptionGroup) as error:
-            self._retain_original_control(error)
-            raise
+        self.grants.consent_authority.require_current_host()
 
     @contextmanager
     def _own_request(self, request: Request, purpose: Literal["authorize", "token", "revoke"]) -> Iterator[_OAuthRequest]:
@@ -123,28 +100,15 @@ class NativeMCPOAuthProvider:
             raise RuntimeError("The original native OAuth HTTP operation is required")
         return owner
 
-    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        self._require_current()
-        client = self.pending.policy.registered_client(client_id)
-        return client.oauth_information() if client is not None else None
-
-    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        raise RegistrationError("invalid_client_metadata", "Explicit client registration is required")
-
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         owner = self._owner("authorize")
         if params.resource != owner.resource:
-            raise AuthorizeError("invalid_target", "The exact MCP resource is required")
+            raise TokenError("invalid_target", "The exact MCP resource is required")
         try:
             handle = await self.pending.create(client.client_id, params)
         except PendingMCPQuotaExceeded as error:
-            raise AuthorizeError("temporarily_unavailable", "Pending MCP consent capacity is full") from error
-        except (ExecutionAuthorityError, TransactionError, BaseExceptionGroup) as error:
-            # The official authorization handler catches Exception. Retain a
-            # classified native receipt so the original HTTP owner can raise
-            # it before publishing the handler's ordinary error response.
-            self._retain_original_control(error)
-            raise
+            raise OAuth2Error(error="temporarily_unavailable",
+                description="Pending MCP consent capacity is full") from error
         return self.consent_url + "?" + urlencode({"request": handle})
 
     async def load_authorization_code(self, client: OAuthClientInformationFull, authorization_code: str) -> AuthorizationCode | None:
@@ -158,10 +122,8 @@ class NativeMCPOAuthProvider:
             resource=self._owner("token").resource)
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
-        owner = self._owner("token", "revoke")
-        loader = self.grants.load_for_revocation if owner.purpose == "revoke" else self.grants.load
-        return await loader(MCPRecordKind.REFRESH, refresh_token,
-            resource=owner.resource, client_id=client.client_id)
+        return await self.grants.load(MCPRecordKind.REFRESH, refresh_token,
+            resource=self._owner("token").resource, client_id=client.client_id)
 
     async def exchange_refresh_token(self, client: OAuthClientInformationFull, refresh_token: RefreshToken,
                                      scopes: list[str]) -> OAuthToken:
@@ -169,11 +131,6 @@ class NativeMCPOAuthProvider:
             raise TokenError("invalid_grant", "The original OAuth client is required")
         return await self.grants.exchange(MCPRecordKind.REFRESH, refresh_token,
             resource=self._owner("token").resource, scopes=scopes)
-
-    async def load_access_token(self, token: str) -> AccessToken | None:
-        self._owner("revoke")
-        return await self.grants.load_for_revocation(MCPRecordKind.ACCESS, token,
-            resource=self.pending.resource_url, client_id=None)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         self._require_current()
@@ -184,23 +141,80 @@ class NativeMCPOAuthProvider:
         await self.grants.revoke(kind, token.token, resource=self._owner("revoke").resource,
             client_id=token.client_id)
 
-    async def exchange_identity_assertion(self, client: OAuthClientInformationFull,
-                                          params: IdentityAssertionParams) -> OAuthToken:
-        raise TokenError("unsupported_grant_type", "Identity assertion grants are not enabled")
+    @staticmethod
+    def _scopes(value: str | None, defaults: list[str]) -> list[str]:
+        selected = list(defaults) if value is None else value.split(" ")
+        if not selected or len(set(selected)) != len(selected) or not set(selected) <= set(defaults):
+            raise InvalidScopeError(description="Only the original registered scopes may be requested")
+        return selected
+
+    def authorization_response(self, redirect_uri: str, values: dict[str, str]) -> Response:
+        """Append response parameters without rewriting the registered URI query."""
+        encoded = urlencode({**values, "iss": self.grants.issuer})
+        separator = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(redirect_uri + separator + encoded, status_code=302,
+            headers=self._response_headers())
 
     async def authorization_endpoint(self, request: Request) -> Response:
-        with self._own_request(request, "authorize") as owner:
-            response = await self._authorization.handle(request)
-            if owner.control is not None:
-                raise owner.control
-            self._require_current()
-            return response
+        with self._own_request(request, "authorize"):
+            redirect, state = None, None
+            try:
+                parameters = self._parameters(request.query_params) if request.method == "GET" else await self._form(request)
+                self._require_current()
+                client = self.pending.policy.registered_client(parameters.get("client_id", ""))
+                if client is None:
+                    raise InvalidRequestError(description="Explicit OAuth client registration is required")
+                supplied_redirect = parameters.get("redirect_uri")
+                if supplied_redirect is None:
+                    if len(client.redirect_uris) != 1:
+                        raise InvalidRequestError(description="The redirect_uri is required")
+                    supplied_redirect = client.redirect_uris[0]
+                native_redirect = client.native_redirect_uri(supplied_redirect)
+                if native_redirect is None:
+                    raise InvalidRequestError(description="The exact registered redirect URI is required")
+                redirect, state = str(native_redirect), parameters.get("state")
+                response_type = parameters.get("response_type")
+                if not response_type:
+                    raise InvalidRequestError(description="The response_type is required")
+                if response_type != "code":
+                    raise UnsupportedResponseTypeError()
+                if parameters.get("resource") != self.pending.resource_url:
+                    raise TokenError("invalid_target", "The exact MCP resource is required")
+                challenge = parameters.get("code_challenge", "")
+                if (parameters.get("code_challenge_method") != "S256" or len(challenge) != 43
+                        or not CODE_CHALLENGE_PATTERN.fullmatch(challenge)):
+                    raise InvalidRequestError(description="An S256 PKCE challenge is required")
+                scopes = self._scopes(parameters.get("scope"), list(client.scopes))
+                params = AuthorizationParams(state=state, scopes=scopes, code_challenge=challenge,
+                    redirect_uri=native_redirect, redirect_uri_provided_explicitly="redirect_uri" in parameters,
+                    resource=self.pending.resource_url)
+                location = await self.authorize(client.oauth_information(), params)
+                self._require_current()
+                return RedirectResponse(location, status_code=302, headers=self._response_headers())
+            except (OAuth2Error, TokenError) as error:
+                self._require_current()
+                if redirect is None:
+                    return self._oauth_error(error)
+                values = self._error_values(error)
+                if state is not None:
+                    values["state"] = state
+                return self.authorization_response(redirect, values)
+
+    @staticmethod
+    def _parameters(parameters: FormData | QueryParams) -> dict[str, str]:
+        result = {}
+        for key in parameters:
+            values = parameters.getlist(key)
+            if len(values) != 1 or not isinstance(values[0], str):
+                raise InvalidRequestError(description="OAuth parameters must occur once and contain text")
+            result[key] = values[0]
+        return result
 
     async def _form(self, request: Request) -> dict[str, str]:
-        form = await request.form()
-        if any(len(form.getlist(key)) != 1 or not isinstance(value, str) for key, value in form.items()):
-            raise InvalidRequestError(description="OAuth parameters must occur once and contain text")
-        return dict(form)
+        media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type != "application/x-www-form-urlencoded":
+            raise InvalidRequestError(description="OAuth requests require application/x-www-form-urlencoded")
+        return self._parameters(await request.form())
 
     def _client(self, request: Request, form: dict[str, str], endpoint: str) -> OAuthClientInformationFull:
         if len(request.headers.getlist("authorization")) > 1:
@@ -219,15 +233,26 @@ class NativeMCPOAuthProvider:
         return client.oauth_information()
 
     @staticmethod
-    def _response(value: dict, status: int = 200, headers: Mapping[str, str] | None = None) -> Response:
-        return JSONResponse(value, status_code=status, headers={
-            "Cache-Control": "no-store", "Pragma": "no-cache", **(headers or {})})
+    def _response_headers() -> dict[str, str]:
+        return {"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer"}
+
+    @classmethod
+    def _response(cls, value: dict, status: int = 200, headers: Mapping[str, str] | None = None) -> Response:
+        return JSONResponse(value, status_code=status, headers={**cls._response_headers(), **(headers or {})})
+
+    @staticmethod
+    def _error_values(error: OAuth2Error | TokenError) -> dict[str, str]:
+        if isinstance(error, OAuth2Error):
+            return dict(error.get_body())
+        result = {"error": error.error}
+        if error.error_description is not None:
+            result["error_description"] = error.error_description
+        return result
 
     @classmethod
     def _oauth_error(cls, error: OAuth2Error | TokenError) -> Response:
-        if isinstance(error, OAuth2Error):
-            return cls._response(dict(error.get_body()), error.status_code, dict(error.get_headers()))
-        return cls._response({"error": error.error, "error_description": error.error_description}, 400)
+        status, headers = (error.status_code, dict(error.get_headers())) if isinstance(error, OAuth2Error) else (400, {})
+        return cls._response(cls._error_values(error), status, headers)
 
     async def token_endpoint(self, request: Request) -> Response:
         with self._own_request(request, "token"):
@@ -260,7 +285,7 @@ class NativeMCPOAuthProvider:
                     credential = await self.load_refresh_token(client, secret)
                     if credential is None:
                         raise InvalidGrantError(description="The refresh token is unavailable")
-                    scopes = form["scope"].split() if "scope" in form else credential.scopes
+                    scopes = self._scopes(form.get("scope"), credential.scopes)
                     tokens = await self.exchange_refresh_token(client, credential, scopes)
                 else:
                     raise UnsupportedGrantTypeError()
@@ -287,6 +312,6 @@ class NativeMCPOAuthProvider:
                         await self.revoke_token(token)
                         break
                 self._require_current()
-                return Response(status_code=200, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+                return Response(status_code=200, headers=self._response_headers())
             except (OAuth2Error, TokenError) as error:
                 return self._oauth_error(error)

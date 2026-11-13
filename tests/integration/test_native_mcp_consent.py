@@ -59,7 +59,7 @@ async def consent_http(request, native_pg, tmp_path, monkeypatch):
         await pending.initialize()
         handle = await pending.create("owned-provider", AuthorizationParams(
             state="owned-original-state", scopes=["memory:read"], code_challenge="a" * 43,
-            redirect_uri="https://provider.example/callback", redirect_uri_provided_explicitly=True,
+            redirect_uri=policy.clients[0].oauth_information().redirect_uris[0], redirect_uri_provided_explicitly=True,
             resource=RESOURCE))
         app = FastAPI()
         app.state.request_authentication = RequestAuthenticationService(api_key=lambda: keys[0])
