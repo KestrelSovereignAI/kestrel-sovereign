@@ -26,6 +26,14 @@ class MCPAuthorizationCommitRequired(RuntimeError):
     """A credential operation cannot publish from an enclosing transaction."""
 
 
+class MCPAuthorizationDecisionUnavailable(ValueError):
+    """The original pending request cannot produce a publishable decision."""
+
+
+class MCPAuthorizationGrantQuotaExceeded(ValueError):
+    """The agent already has its configured durable grant quota."""
+
+
 class MCPAuthorizationGrants:
     """Borrow SQL and host authority; the original host owns both lifetimes.
 
@@ -202,12 +210,12 @@ class MCPAuthorizationGrants:
             self.consent_authority.require_approval(approval)
             self._require_current()
         if full:
-            raise ValueError("The agent's MCP authorization grant quota is full")
+            raise MCPAuthorizationGrantQuotaExceeded("The agent's MCP authorization grant quota is full")
         if pending is None:
-            raise ValueError("The original pending MCP request is unavailable")
+            raise MCPAuthorizationDecisionUnavailable("The original pending MCP request is unavailable")
         self.consent_authority.require_approval(approval)
         if code.expires_at <= self.pending.now():
-            raise ValueError("The MCP authorization code expired before publication")
+            raise MCPAuthorizationDecisionUnavailable("The MCP authorization code expired before publication")
         return code
 
     async def _insert(self, kind: MCPRecordKind, secret: str, grant_hash: str,

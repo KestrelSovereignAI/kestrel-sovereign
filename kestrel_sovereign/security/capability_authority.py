@@ -35,6 +35,7 @@ __all__ = [
     "HostCapabilityAuthority",
     "require_raw_capability_disclosure",
     "require_current_feature_host",
+    "require_current_http_agent",
 ]
 
 
@@ -185,8 +186,12 @@ def require_current_feature_host(agent, feature, agent_id: str, *,
             or runtime is None or runtime.is_active(feature) is not True
             or getattr(feature, "enabled", True) is not True or is_current() is not True):
         raise HostCapabilityAccessDenied(f"original {label} feature is unavailable")
-    if request is None:
-        return
+    if request is not None:
+        require_current_http_agent(agent, request, label=label)
+
+
+def require_current_http_agent(agent, request, *, label: str) -> None:
+    """Check actual host membership and the original routed agent identity."""
     routed = getattr(request.state, "agent", None)
     if routed is not None and routed is not agent:
         raise HostCapabilityAccessDenied(f"original {label} agent does not match route")

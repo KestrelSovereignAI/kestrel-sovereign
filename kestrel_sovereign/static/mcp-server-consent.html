@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Connect to Kestrel</title>
+  <link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+  <main id="mcp-consent" class="settings-panel" data-api-prefix="__KESTREL_MCP_API_PREFIX__">
+    <h1>Connect to Kestrel</h1>
+    <p><strong id="consent-client"></strong> requests access to <strong id="consent-agent"></strong>.</p>
+    <p>Agent endpoint: <code id="consent-resource"></code></p>
+    <form id="consent-form">
+      <fieldset id="consent-scopes"><legend>Requested permissions</legend></fieldset>
+      <p>Only exchanges this connector sends to Kestrel are saved.</p>
+      <p id="consent-status" role="status" aria-live="polite">Loading authorization request…</p>
+      <button id="consent-allow" type="submit" disabled>Allow selected permissions</button>
+      <button id="consent-deny" type="button" disabled>Don’t allow</button>
+    </form>
+    <p><a id="consent-return" href="/">Return to Console</a></p>
+  </main>
+  <script type="module" src="/js/mcp-server-consent.mjs"></script>
+</body>
+</html>
