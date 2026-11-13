@@ -15,18 +15,26 @@ turn's privacy lifetime; those regressions are in
 reaching a parked turn or a parked scheduled tool, and the locks a failed
 required audit leaves behind.
 
-Every agent here is real, on real storage; only the model is scripted.
+Every agent here is real, on real storage; only the model is scripted. Each
+scenario runs on SQLite and on PostgreSQL. The PostgreSQL leg owns a schema
+of its own and is a ``native_pg`` consumer, so a run with
+``KESTREL_REQUIRE_POSTGRES_TESTS=1`` fails it rather than skipping it
+(tests/shared/postgres_requirement.py).
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
+from contextlib import asynccontextmanager
 
+import asyncpg
 import pytest
 from kestrel_sdk.signals import (
     ResourceLock,
 )
+from kestrel_sdk.storage.database.interface import QueryError
 
 from kestrel_sovereign.agent.invocation import InvocationCancelledError
 from kestrel_sovereign.await_chain import format_await_chain
@@ -41,13 +49,65 @@ from kestrel_sovereign.stop.types import (
     StopRequest,
     StopScope,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db.postgres import PostgresBackend
 from tests.shared.booted_agent import booted_agent
+from tests.utils.postgres_schema import (
+    disposable_postgres_schema,
+    pgvector_schema,
+    quoted_search_path,
+    with_search_path,
+)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(60)]
 
 REPLY = "Noted."
 #: Each phase of a scenario must settle well inside this. A deadlock does not.
 SETTLE_SECONDS = 10.0
+
+
+async def _no_schema_ddl(database):
+    """The admin connection boots no schema of its own on the shared database."""
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def agent_backend(request):
+    """The engine this case's agent keeps all of its state on."""
+    return request.param
+
+
+@pytest.fixture
+async def native_pg(agent_backend):
+    """The URL of this case's own PostgreSQL schema, or ``None`` on SQLite.
+
+    Every scenario requests this fixture by name. That name marks the case
+    ``native_postgres``, the selection of the required native PostgreSQL CI
+    lane, and makes a skipped PostgreSQL leg a failure under
+    ``KESTREL_REQUIRE_POSTGRES_TESTS=1`` (tests/shared/postgres_requirement.py).
+    In CI these cases run in the unit tier, which provides PostgreSQL and sets
+    that variable; the native lane collects only ``tests/integration/``.
+    pytest resolves fixtures per function, so the SQLite leg carries the name
+    too; it never skips, so the mark cannot turn it into a failure.
+
+    The schema is dropped at teardown, so the case changes no row it did not
+    create. pgvector's schema is on the path, as the agent's stores need it
+    (#3401).
+    """
+    if agent_backend == "sqlite":
+        yield None
+        return
+    url = os.environ.get("TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("TEST_POSTGRES_URL required for the PostgreSQL leg")
+    admin = await AsyncDatabase.postgres(
+        url, min_pool_size=1, max_pool_size=2, schema_initializer=_no_schema_ddl
+    )
+    try:
+        vector = await pgvector_schema(admin)
+        async with disposable_postgres_schema(admin, "parked_turn") as schema:
+            yield with_search_path(url, quoted_search_path(schema, vector))
+    finally:
+        await admin.close()
 
 
 def _script_replies(agent, monkeypatch, generate=None):
@@ -121,23 +181,81 @@ def _authority(agent, receipts) -> CancellationAuthority:
     )
 
 
-async def _receipt_store(tmp_path):
-    from kestrel_sovereign.storage.async_database import AsyncDatabase
+@asynccontextmanager
+async def _receipt_store(tmp_path, database_url):
+    """The Stop receipt store, on the engine the agent uses.
 
-    database = await AsyncDatabase.sqlite(str(tmp_path / "stop-receipts.db"))
-    store = StopReceiptStore(database)
-    await store.ensure_schema()
-    return database, store
+    On PostgreSQL it is the agent's database, as the host keeps it there.
+    """
+    if database_url is None:
+        database = await AsyncDatabase.sqlite(str(tmp_path / "stop-receipts.db"))
+    else:
+        database = await AsyncDatabase.postgres(
+            database_url, min_pool_size=1, max_pool_size=2
+        )
+    try:
+        await _assert_on_engine(database.backend, database_url)
+        store = StopReceiptStore(database)
+        await store.ensure_schema()
+        yield store
+    finally:
+        await database.close()
+
+
+async def _assert_on_engine(backend, database_url):
+    """*backend* is on the engine this leg names, and on PostgreSQL in the
+    case's own schema: a leg that silently fell back to SQLite, or to the
+    shared schema, would otherwise pass as the PostgreSQL case."""
+    expected = "sqlite" if database_url is None else "postgres"
+    assert backend.backend_type == expected, (
+        f"{backend!r} is on {backend.backend_type}, not {expected}"
+    )
+    if database_url is not None:
+        schema = await backend.fetch_val("SELECT current_schema()")
+        assert schema.startswith("parked_turn_"), schema
+
+
+async def _assert_agent_on_engine(agent, database_url):
+    """The agent's storage, effect journal and dispatch audit are all on it."""
+    for backend in (
+        agent._raw_storage.db.backend,
+        agent.tool_effect_store.database.backend,
+        agent.observability_store.backend,
+    ):
+        await _assert_on_engine(backend, database_url)
+
+
+def _dispatch_audit_write_failure(database_url) -> QueryError:
+    """What the backend raises when the dispatch row's column is missing.
+
+    The 11-09 shape (#4002): the row names a column the table does not have.
+    Each backend raises ``QueryError`` caused by its own driver's error.
+    """
+    if database_url is None:
+        cause = sqlite3.OperationalError(
+            "table a2a_tool_dispatches has no column named dispatch_id"
+        )
+    else:
+        cause = asyncpg.exceptions.UndefinedColumnError(
+            'column "dispatch_id" of relation "a2a_tool_dispatches" does not exist'
+        )
+    error = QueryError(f"Query failed: {cause}")
+    error.__cause__ = cause
+    return error
 
 
 async def test_a_turn_parked_after_begin_is_stopped_and_the_queued_turn_runs(
-    tmp_path, monkeypatch
+    native_pg, tmp_path, monkeypatch
 ):
-    database, receipts = await _receipt_store(tmp_path)
-    try:
+    async with _receipt_store(tmp_path, native_pg) as receipts:
         async with booted_agent(
-            tmp_path / "agent", name="Parked", provenance="test:4001-turn", features=set()
+            tmp_path / "agent",
+            name="Parked",
+            provenance="test:4001-turn",
+            features=set(),
+            database_url=native_pg,
         ) as agent:
+            await _assert_agent_on_engine(agent, native_pg)
             _script_replies(agent, monkeypatch)
             parked = await _park_after_begin(agent, monkeypatch)
             first = asyncio.create_task(agent.process_input("one", session_id="s"))
@@ -172,19 +290,21 @@ async def test_a_turn_parked_after_begin_is_stopped_and_the_queued_turn_runs(
             assert [outcome.disposition for outcome in receipt.outcomes] == [
                 StopDisposition.STOPPED
             ]
-    finally:
-        await database.close()
 
 
 async def test_agent_stop_of_a_turn_parked_after_begin_is_receipted_stopped(
-    tmp_path, monkeypatch
+    native_pg, tmp_path, monkeypatch
 ):
     """``kestrel stop <agent>``: every current unit stops, and says so."""
-    database, receipts = await _receipt_store(tmp_path)
-    try:
+    async with _receipt_store(tmp_path, native_pg) as receipts:
         async with booted_agent(
-            tmp_path / "agent", name="Parked", provenance="test:4001-agent", features=set()
+            tmp_path / "agent",
+            name="Parked",
+            provenance="test:4001-agent",
+            features=set(),
+            database_url=native_pg,
         ) as agent:
+            await _assert_agent_on_engine(agent, native_pg)
             _script_replies(agent, monkeypatch)
             parked = await _park_after_begin(agent, monkeypatch)
             first = asyncio.create_task(agent.process_input("one", session_id="s"))
@@ -215,12 +335,10 @@ async def test_agent_stop_of_a_turn_parked_after_begin_is_receipted_stopped(
             assert await asyncio.wait_for(
                 agent.process_input("three", session_id="s"), SETTLE_SECONDS
             ) == REPLY
-    finally:
-        await database.close()
 
 
 async def test_a_failed_required_audit_leaves_the_next_turn_runnable(
-    tmp_path, monkeypatch
+    native_pg, tmp_path, monkeypatch
 ):
     """The 11-09 trigger shape (#4002): a required dispatch audit write raises
     during a tool batch. The next turn still takes both locks and finishes."""
@@ -228,7 +346,11 @@ async def test_a_failed_required_audit_leaves_the_next_turn_runnable(
 
     monkeypatch.setenv("KESTREL_TEST_AUTO_APPROVE", "1")
     async with booted_agent(
-        tmp_path / "agent", name="Audited", provenance="test:4001-audit", features=set()
+        tmp_path / "agent",
+        name="Audited",
+        provenance="test:4001-audit",
+        features=set(),
+        database_url=native_pg,
     ) as agent:
 
         async def generate(kwargs):
@@ -244,24 +366,25 @@ async def test_a_failed_required_audit_leaves_the_next_turn_runnable(
             return LLMResponse(content=REPLY)
 
         _script_replies(agent, monkeypatch, generate)
+        await _assert_agent_on_engine(agent, native_pg)
         store = agent.observability_store
         real_log = store.log_tool_dispatch
+        failure = _dispatch_audit_write_failure(native_pg)
         failures = {"left": 1}
 
         async def log_tool_dispatch(entry, **kwargs):
             if failures["left"]:
                 failures["left"] -= 1
-                raise sqlite3.OperationalError(
-                    "table a2a_tool_dispatches has no column named dispatch_id"
-                )
+                raise failure
             return await real_log(entry, **kwargs)
 
         monkeypatch.setattr(store, "log_tool_dispatch", log_tool_dispatch)
-        with pytest.raises(ToolAuditUnconfirmedError):
+        with pytest.raises(ToolAuditUnconfirmedError) as unconfirmed:
             await asyncio.wait_for(
                 agent.process_input("check waits", session_id="s"), SETTLE_SECONDS
             )
         assert failures["left"] == 0
+        assert unconfirmed.value.__cause__ is failure
         assert not agent._get_lock_manager().is_held(ResourceLock.CONVERSATION)
         assert not agent._get_privacy_transition_lock().locked()
 
@@ -271,7 +394,7 @@ async def test_a_failed_required_audit_leaves_the_next_turn_runnable(
 
 
 async def test_a_scheduled_tool_holding_the_memory_lock_before_its_body_is_stopped(
-    native_tool_effect_agent, monkeypatch
+    native_pg, native_tool_effect_agent, monkeypatch
 ):
     """The 03:00Z ``training_cycle`` shape: a cron dispatch holds the memory
     lock and its tool parks before the body runs. Stop cancels it, the memory
@@ -287,8 +410,16 @@ async def test_a_scheduled_tool_holding_the_memory_lock_before_its_body_is_stopp
     )
     from tests.utils.scheduler_ticks import tick_and_settle
 
-    owner = await native_tool_effect_agent(did="did:test:4001-scheduled")
+    owner = await native_tool_effect_agent(
+        did="did:test:4001-scheduled",
+        connected_backend=(
+            None
+            if native_pg is None
+            else PostgresBackend(native_pg, min_pool_size=1, max_pool_size=4)
+        ),
+    )
     database = owner.tool_effect_store.database
+    await _assert_on_engine(database.backend, native_pg)
     bodies = []
 
     class TrainingFeature(Feature):
