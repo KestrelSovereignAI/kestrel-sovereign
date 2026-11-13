@@ -29,7 +29,7 @@ from kestrel_sdk.resources import ResourceUnsupported
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody, bind_execution_custody_snapshot,
-    execution_terminal_error, is_execution_control_error,
+    execution_evidence_carriers, execution_terminal_error, is_execution_control_error,
 )
 from kestrel_sovereign.execution_sync_http import (
     await_native_sync_http, bind_native_sync_http_execution_admission,
@@ -408,15 +408,22 @@ async def test_failed_tls_injection_retires_exact_return_and_retains_errors(
 
 
 @pytest.mark.asyncio
-async def test_running_original_worker_lifetime_cannot_be_borrowed_by_foreign_thread_or_stage(custody, vendor, peer, monkeypatch):
+@pytest.mark.parametrize('inject_failure', [False, True], ids=['foreign-thread', 'injection-failure'])
+async def test_running_original_worker_lifetime_cannot_be_borrowed_by_foreign_thread_or_stage(
+    custody, vendor, peer, monkeypatch, inject_failure,
+):
     async with original_acquisition(custody, vendor, peer, monkeypatch) as original:
         root, handle = original.attempt._result, original.handle
         with pytest.raises(ExecutionAuthorityError):
             root._require_native_producer_lifetime(handle)
         await original.attempt.begin_dispatch()
-        start_tls, refused = SyncStream.start_tls, queue.Queue()
-        def after_tls(stream, *args, **kwargs):
-            actual = start_tls(stream, *args, **kwargs)
+        start_tls, close, refused = SyncStream.start_tls, SyncStream.close, queue.Queue()
+        primary = RuntimeError('owned foreign-thread test injection failure')
+        returns = []
+        def inject(actual):
+            returns.append(actual)
+            if inject_failure:
+                raise primary
             root._require_native_producer_lifetime(handle)  # THIS genuine worker.
             def other():
                 try:
@@ -427,13 +434,29 @@ async def test_running_original_worker_lifetime_cannot_be_borrowed_by_foreign_th
             foreign.start()
             foreign.join(2)
             assert not foreign.is_alive()
-            return actual
-        monkeypatch.setattr(SyncStream, 'start_tls', after_tls)
-        await invoke(original)
-        assert type(refused.get_nowait()) is ExecutionAuthorityError
-        with pytest.raises(ExecutionAuthorityError):
-            root._require_native_producer_lifetime(handle)
-        assert (await handle.persist_minimal()).lease.provider_resource_id == 'owned-native-pod'
+        monkeypatch.setattr(SyncStream, 'start_tls', _inject_after_tls(start_tls, inject))
+        try:
+            if inject_failure:
+                with pytest.raises(BaseException) as failure:
+                    await invoke(original)
+                assert any(error is primary for error in execution_evidence_carriers(failure.value))
+                actual, = returns
+                assert original.native.is_closed and len(original.closes) == 1
+                assert not peer.requests and original.handle._receipt.phase is None
+                assert actual._sock.fileno() == -1, 'after-TLS injection lost its exact original stream'
+                checkpoint = await handle.persist_minimal()
+                assert checkpoint.state == 'unknown' and checkpoint.lease is None
+                return
+            await invoke(original)
+            assert type(refused.get_nowait()) is ExecutionAuthorityError
+            with pytest.raises(ExecutionAuthorityError):
+                root._require_native_producer_lifetime(handle)
+            assert (await handle.persist_minimal()).lease.provider_resource_id == 'owned-native-pod'
+        finally:
+            # A wiring inverse must fail before this cleanup; the exact real
+            # peer socket still retires before its original fixture joins.
+            for actual in returns:
+                close(actual)
     assert len(peer.requests) == 1
 
 
