@@ -29,7 +29,7 @@ from kestrel_sdk.resources import ResourceUnsupported
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody, bind_execution_custody_snapshot,
-    execution_evidence_carriers, execution_terminal_error, is_execution_control_error,
+    execution_evidence_carriers, is_execution_control_error,
 )
 from kestrel_sovereign.execution_sync_http import (
     await_native_sync_http, bind_native_sync_http_execution_admission,
@@ -270,10 +270,10 @@ def _withdraw_original_hold_marker(root, restore):
     assert hold in frames and hold.live is True and type(holds) is int and holds > 0
 
     def reset():
+        gate._shared_frames.add(hold)
         assert hold.gate is gate and hold.lease is lease
         assert hold.task is descriptor.owner_task is root._owner_task
-        assert lease.holds == holds and hold not in gate._shared_frames
-        gate._shared_frames.add(hold)
+        assert lease.holds == holds
         assert hold.live is True and gate._shared_frames == frames
 
     restore.append(reset)
@@ -293,7 +293,9 @@ def _inject_after_tls(start_tls, inject):
             try:
                 actual.close()
             except BaseException as cleanup:
-                raise execution_terminal_error(error, cleanup, retain_originals=True)
+                # httpcore may clear a cause with `raise exc from None`;
+                # explicit members retain both original test-owned failures.
+                raise BaseExceptionGroup('owned TLS injection and original close failed', [error, cleanup])
             raise
     return after_tls
 
@@ -382,21 +384,17 @@ async def test_failed_tls_injection_retires_exact_return_and_retains_errors(
         try:
             with pytest.raises(BaseException) as failure:
                 await invoke(original)
-            pending, found = [failure.value], set()
-            while pending:
-                error = pending.pop()
-                if id(error) in found:
-                    continue
-                found.add(id(error))
-                pending.extend(value for value in (error.__cause__, error.__context__) if value is not None)
-                pending.extend(getattr(error, 'exceptions', ()))
-            assert id(primary) in found
-            assert (id(cleanup) in found) is lose_close_ack
+            carriers = execution_evidence_carriers(failure.value)
+            assert any(error is primary for error in carriers)
+            assert any(error is cleanup for error in carriers) is lose_close_ack, (
+                'original TLS cleanup missing from explicit execution evidence'
+            )
             if lose_close_ack:
                 assert failure.value is not cleanup, 'TLS close failure replaced the injection failure'
             actual, = returns
             assert closes == [actual] and actual._sock.fileno() == -1
             assert original.native.is_closed and len(original.closes) == 1
+            assert not original.handle._thread.sent
             assert not peer.requests and original.handle._receipt.phase is None
             checkpoint = await original.handle.persist_minimal()
             assert checkpoint.state == 'unknown' and checkpoint.lease is None
@@ -442,6 +440,7 @@ async def test_running_original_worker_lifetime_cannot_be_borrowed_by_foreign_th
                 assert any(error is primary for error in execution_evidence_carriers(failure.value))
                 actual, = returns
                 assert original.native.is_closed and len(original.closes) == 1
+                assert not original.handle._thread.sent
                 assert not peer.requests and original.handle._receipt.phase is None
                 assert actual._sock.fileno() == -1, 'after-TLS injection lost its exact original stream'
                 checkpoint = await handle.persist_minimal()
@@ -610,24 +609,24 @@ async def test_joined_native_fact_refuses_changed_original_custody(custody, vend
         await invoke(original)
         root, handle = original.attempt._result, original.handle
         restore = []
-        if fault == 'receipt':
-            target, name, changed = handle, '_receipt', copy.copy(handle._receipt)
-        elif fault == 'row':
-            target, name, changed = root, '_identity', ('foreign',)+root._identity[1:]
-        elif fault == 'key':
-            target, name, changed = original.store, '_key', b'X'*32
-        elif fault == 'hold-marker':
-            _withdraw_original_hold_marker(root, restore)
-        else:
-            target = root._backend if root._generation is not None else root._native_backing.postgres_pool.pool
-            name = '_connection_generation' if root._generation is not None else '_generation'
-            value = getattr(target, name)
-            changed = 'changed' if type(value) is str else value+1
-        if fault != 'hold-marker':
-            value = getattr(target, name)
-            restore.append(lambda: setattr(target, name, value))
-            setattr(target, name, changed)
         try:
+            if fault == 'receipt':
+                target, name, changed = handle, '_receipt', copy.copy(handle._receipt)
+            elif fault == 'row':
+                target, name, changed = root, '_identity', ('foreign',)+root._identity[1:]
+            elif fault == 'key':
+                target, name, changed = original.store, '_key', b'X'*32
+            elif fault == 'hold-marker':
+                _withdraw_original_hold_marker(root, restore)
+            else:
+                target = root._backend if root._generation is not None else root._native_backing.postgres_pool.pool
+                name = '_connection_generation' if root._generation is not None else '_generation'
+                value = getattr(target, name)
+                changed = 'changed' if type(value) is str else value+1
+            if fault != 'hold-marker':
+                value = getattr(target, name)
+                restore.append(lambda: setattr(target, name, value))
+                setattr(target, name, changed)
             with pytest.raises(ExecutionAuthorityError):
                 await handle.persist_minimal()
         finally:
@@ -635,6 +634,43 @@ async def test_joined_native_fact_refuses_changed_original_custody(custody, vend
                 reset()  # Exact owned fixture cleanup only.
         assert original.attempt.checkpoint.state == 'dispatching'
         assert len(peer.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_hold_restore_diagnostic_restores_original_frame(custody, vendor, peer, monkeypatch):
+    async with original_acquisition(custody, vendor, peer, monkeypatch) as original:
+        await original.attempt.begin_dispatch()
+        await invoke(original)
+        root, handle = original.attempt._result, original.handle
+        hold, gate, lease = root._native_backing.privacy_holds[0]
+        frames, holds = frozenset(gate._shared_frames), lease.holds
+        assert hold in frames and hold.live is True and holds > 0
+        restore = []
+        try:
+            # This is the same real gate/lease, acquired and retired by its
+            # canonical nested context; no lease counter is manufactured.
+            async with gate.shared_lock():
+                assert lease.holds == holds + 1
+                _withdraw_original_hold_marker(root, restore)
+                assert hold.live is False and lease.holds == holds + 1
+            assert lease.holds == holds
+            with pytest.raises(AssertionError):
+                restore[0]()
+            assert hold.live is True and gate._shared_frames == frames, (
+                'strict restore diagnostics left the original hold withdrawn'
+            )
+            assert lease.holds == holds
+            checkpoint = await handle.persist_minimal()
+            assert checkpoint.state == 'unknown'
+            assert checkpoint.lease.provider_resource_id == 'owned-native-pod'
+            assert checkpoint.lease.actual_cost_usd is None
+            assert original.native.is_closed and len(original.closes) == len(peer.requests) == 1
+        finally:
+            # A genuine BEFORE failure still returns only this same original
+            # marker before its owning frame runs normal lease retirement.
+            gate._shared_frames.add(hold)
+            assert hold.live is True and gate._shared_frames == frames
+            assert lease.holds == holds
 
 
 @pytest.mark.asyncio

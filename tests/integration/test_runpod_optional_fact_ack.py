@@ -26,7 +26,7 @@ from tests.integration.test_visual_runpod_acquisition import (
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repair_payload", [False, True], ids=["original", "late-repair"])
 @pytest.mark.parametrize("optional_fact", [
-    "env_integer", "malformed_created_at", "empty_status",
+    "env_integer", "env_nested_list", "malformed_created_at", "empty_status",
     "optional_text_over64k", "optional_nodes_over4096", "optional_depth_over16",
 ])
 async def test_successful_original_create_persists_known_id_before_rejecting_optional_facts(
@@ -37,6 +37,8 @@ async def test_successful_original_create_persists_known_id_before_rejecting_opt
     async with original_acquisition(custody, vendor, peer, monkeypatch) as original:
         if optional_fact == "env_integer":
             peer.reply["env"] = {"OPTIONAL_FACT": 7}
+        elif optional_fact == "env_nested_list":
+            peer.reply["env"] = {"OPTIONAL_FACT": ["ok", 7]}
         elif optional_fact == "malformed_created_at":
             peer.reply["createdAt"] = "not-a-provider-timestamp"
         elif optional_fact == "empty_status":
@@ -114,6 +116,15 @@ async def test_successful_original_create_persists_known_id_before_rejecting_opt
                 original_env = payload["env"]
                 original_env["OPTIONAL_FACT"] = "valid"
                 assert payload["env"] is original_env
+            elif optional_fact == "env_nested_list":
+                original_env = payload["env"]
+                original_list = original_env["OPTIONAL_FACT"]
+                original_list[1] = "valid"
+                assert payload["env"] is original_env and original_env["OPTIONAL_FACT"] is original_list
+                assert json.loads(json.dumps(phase.facts)) == frozen_facts_snapshot
+                # Only after measuring the nested in-place change, make the
+                # continuation env valid; refusal must retain original facts.
+                original_env["OPTIONAL_FACT"] = "valid"
             elif optional_fact == "malformed_created_at":
                 payload["createdAt"] = "2026-11-13T00:00:00Z"
             elif optional_fact == "empty_status":
