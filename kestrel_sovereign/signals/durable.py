@@ -4497,10 +4497,11 @@ class DurableSignalStore(UnifiedStoreBase):
         requested_now = _as_utc(now) if now is not None else None
         async with self._backend.transaction():
             # Acquire the delivery's write/row serialization point before
-            # observing time.  SQLite transactions begin deferred, so the
-            # targeted no-op update reserves the actual writer slot; PostgreSQL
-            # locks this row with ``FOR UPDATE``.  Sampling first can publish a
-            # worker lease that has already expired while waiting here.
+            # observing time.  A SQLite transaction already holds the writer
+            # slot from ``BEGIN IMMEDIATE`` (#4040), and the targeted no-op
+            # update reserves it explicitly too; PostgreSQL locks this row
+            # with ``FOR UPDATE``.  Sampling first can publish a worker lease
+            # that has already expired while waiting here.
             initial = await self._lock_delivery_lease_row(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
@@ -4653,6 +4654,10 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
         requested_now = _as_utc(now) if now is not None else None
+        if self.is_postgres:
+            # No owner is registered without a connection of its own to be
+            # renewed on (#4001): see retain_unretired_runtime_owner.
+            await self._backend.reserve_runtime_owner_renewal()
         async with self._backend.transaction():
             await self._lock_runtime_owner_scope(agent_id=agent_id)
             # Entering this transaction may wait behind a real writer.  A
@@ -4686,6 +4691,44 @@ class DurableSignalStore(UnifiedStoreBase):
             await self._touch_runtime_owner_locked(
                 agent_id=agent_id, owner_id=owner_id, now=touch_now
             )
+
+    async def retain_unretired_runtime_owner(
+        self, *, agent_id: str, owner_id: str, now: Optional[datetime] = None,
+    ) -> bool:
+        """Refresh an existing owner that is not yet stopped; never revive one.
+
+        The only write that renews a dispatcher's owner: an owner that is not
+        retired stays live for peers, whatever else it holds or owes, until it
+        retires (#4001). Unlike :meth:`heartbeat_runtime_owner` this inserts
+        nothing and never clears ``stopped_at``, so a renewal that runs late
+        cannot undo a retirement. Returns whether the owner was refreshed.
+        ``now`` is a SQLite clock seam; PostgreSQL renews on its own clock.
+
+        Both backends renew through a fixed backend operation that ordinary
+        work cannot hold back: PostgreSQL on a one-connection pool nothing
+        else checks out from, reserved when the owner registers, and SQLite
+        on a connection of its own. Serialization with recovery is the
+        database's writer lock on SQLite and the owner-scope advisory key on
+        PostgreSQL.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        if self.is_postgres:
+            if now is not None:
+                raise ValueError("PostgreSQL owner renewal uses the database clock")
+            return await self._backend.retain_unretired_runtime_owner(
+                agent_id=agent_id, owner_id=owner_id,
+            )
+        if self._backend.backend_type != "sqlite":
+            raise RuntimeError(
+                "Durable runtime-owner renewal does not support backend "
+                f"{self._backend.backend_type!r}"
+            )
+        requested_now = _as_utc(now) if now is not None else None
+        return await self._backend.retain_unretired_runtime_owner(
+            agent_id=agent_id, owner_id=owner_id,
+            timestamp=lambda: self.to_timestamp_param(requested_now or self.now_utc()),
+        )
 
     async def release_initial_reservations(
         self,
@@ -5776,11 +5819,11 @@ class DurableSignalStore(UnifiedStoreBase):
         registration could backfill before a concurrent event commits, while
         that event's consumer query runs before the registration commits.
         ``pg_advisory_xact_lock`` keeps those two atomic handoff paths in one
-        order and releases automatically on commit or rollback.  SQLite
-        transactions begin deferred, so a no-op write reserves its one writer
-        slot before either handoff path can read stale state.  This matters
-        across backend instances: each instance's in-memory write lock is
-        local to that instance.
+        order and releases automatically on commit or rollback.  On SQLite a
+        no-op write reserves its one writer slot before either handoff path
+        can read stale state, which ``BEGIN IMMEDIATE`` already holds since
+        #4040.  This matters across backend instances: each instance's
+        in-memory write lock is local to that instance.
         """
         if self.is_postgres:
             await self._backend.fetch_val(
@@ -6106,9 +6149,10 @@ class DurableSignalStore(UnifiedStoreBase):
                 params,
             )
         if self._backend.backend_type == "sqlite":
-            # ``BEGIN`` is deferred in SQLite. Updating the exact delivery to
-            # its current value claims the writer slot before the following
-            # read/time sample, while preserving every persisted field.
+            # Updating the exact delivery to its current value claims SQLite's
+            # writer slot before the following read/time sample, while
+            # preserving every persisted field. ``BEGIN IMMEDIATE`` already
+            # holds it since #4040.
             await self._backend.execute(
                 f"""
                 UPDATE {self.DELIVERIES}

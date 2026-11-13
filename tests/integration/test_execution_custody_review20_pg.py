@@ -55,7 +55,7 @@ async def test_native_retry_retains_original_capability_and_excludes_live_siblin
         assert await release(store, agent, delivery, kind)
         row = await controller.fetchrow("SELECT status, lease_owner, lease_token, lease_expires_at FROM durable_signal_deliveries WHERE delivery_id='delivery1'")
         assert tuple(row) == ("retry", "dispatcher:original", delivery.lease_token, None)
-        assert await backend.retain_cognition_cleanup_owner(agent_id=agent.did, owner_id="dispatcher:original")
+        assert await backend.retain_unretired_runtime_owner(agent_id=agent.did, owner_id="dispatcher:original")
         assert await claim(store, agent, delivery, "dispatcher:sibling", exact) is None
         original_retry = await claim(store, agent, delivery, "dispatcher:original", exact)
         assert original_retry is not None
@@ -197,7 +197,7 @@ async def test_actual_committed_release_lost_ack_cannot_be_reclaimed_by_fresh_ru
             held = dispatcher._retained_cognition_control_debt[delivery.delivery_id][1]
             for source in OriginalFailure.capture_sources(caught.value):
                 source.assert_retained(held)
-            assert await backend.retain_cognition_cleanup_owner(agent_id=agent.did, owner_id="dispatcher:original")
+            assert await backend.retain_unretired_runtime_owner(agent_id=agent.did, owner_id="dispatcher:original")
             backend.fail_cognition_delivery = original_cleanup
             await dispatcher._drain_retained_durable_cognition_cleanup_tasks()
         assert await controller.fetchval("SELECT status FROM durable_signal_deliveries WHERE delivery_id='delivery1'") == "failed"

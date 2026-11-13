@@ -376,3 +376,120 @@ async def test_empty_acquire_is_a_noop(fast_thresholds):
     async with mgr.acquire(set(), label="none"):
         pass
     assert mgr.holder(ResourceLock.CONVERSATION) is None
+
+
+async def _parked_in_a_named_frame(gate: asyncio.Event) -> None:
+    await gate.wait()
+
+
+def _hold_reports(caplog, resource: str) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if f"has held the {resource} lock" in record.getMessage()
+    ]
+
+
+async def _until(predicate, *, within: float = 10.0) -> None:
+    """Poll the condition rather than guess how long a loaded host takes."""
+    deadline = asyncio.get_running_loop().time() + within
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, "condition never held"
+        await asyncio.sleep(0.01)
+
+
+async def test_a_long_hold_reports_where_the_holder_is_parked_once(
+    fast_thresholds, monkeypatch, caplog
+):
+    """#4001: the report names the frame the holder waits in, past the task
+    it awaits, once per hold rather than on every report."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.signals.lock_manager.HOLD_AWAIT_CHAIN_SECONDS", 0.0
+    )
+    mgr = OrderedLockManager()
+    released = asyncio.Event()
+
+    async def holder():
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="Emma turn_parked"):
+            await asyncio.create_task(
+                _parked_in_a_named_frame(released), name="invocation-turn:child"
+            )
+
+    with caplog.at_level(logging.INFO):
+        holding = asyncio.create_task(holder(), name="turn-holder")
+        await _until(lambda: len(_hold_reports(caplog, "conversation")) >= 3)
+        released.set()
+        await holding
+
+    reports = [record.getMessage() for record in _hold_reports(caplog, "conversation")]
+    with_chain = [report for report in reports if "parked at" in report]
+    assert len(with_chain) == 1, reports
+    assert reports[0] is with_chain[0]
+    assert "Emma turn_parked" in with_chain[0]
+    assert "task 'invocation-turn:child':" in with_chain[0]
+    assert "_parked_in_a_named_frame" in with_chain[0]
+
+
+async def test_a_hold_below_the_threshold_reports_no_await_chain(
+    fast_thresholds, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        "kestrel_sovereign.signals.lock_manager.HOLD_AWAIT_CHAIN_SECONDS", 3600.0
+    )
+    mgr = OrderedLockManager()
+    released = asyncio.Event()
+
+    async def holder():
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label="slow turn"):
+            await _parked_in_a_named_frame(released)
+
+    with caplog.at_level(logging.INFO):
+        holding = asyncio.create_task(holder())
+        await _until(lambda: len(_hold_reports(caplog, "conversation")) >= 2)
+        released.set()
+        await holding
+
+    assert not [
+        record for record in _hold_reports(caplog, "conversation")
+        if "parked at" in record.getMessage()
+    ]
+
+
+async def test_the_escalation_carries_the_await_chain_in_its_one_error(
+    monkeypatch, caplog
+):
+    for name, value in (
+        ("SLOW_WAIT_WARN_SECONDS", 0.01),
+        ("SLOW_HOLD_WARN_SECONDS", 0.01),
+        ("HOLD_AWAIT_CHAIN_SECONDS", 0.0),
+        ("BLOCKED_HOLD_ERROR_SECONDS", 0.05),
+    ):
+        monkeypatch.setattr(f"kestrel_sovereign.signals.lock_manager.{name}", value)
+    mgr = OrderedLockManager()
+    released = asyncio.Event()
+
+    async def holder():
+        async with mgr.acquire({ResourceLock.MEMORY}, label="cron training_cycle"):
+            await _parked_in_a_named_frame(released)
+
+    async def waiter():
+        async with mgr.acquire({ResourceLock.MEMORY}, label="cron sleep"):
+            pass
+
+    def errors():
+        return [record for record in caplog.records if record.levelno == logging.ERROR]
+
+    with caplog.at_level(logging.WARNING):
+        holding = asyncio.create_task(holder())
+        await _until(lambda: mgr.is_held(ResourceLock.MEMORY))
+        blocked = asyncio.create_task(waiter())
+        await _until(lambda: bool(errors()))
+        # Two more reports after the escalation: none may repeat it.
+        reported = len(_hold_reports(caplog, "memory"))
+        await _until(lambda: len(_hold_reports(caplog, "memory")) >= reported + 2)
+        released.set()
+        await asyncio.gather(holding, blocked)
+
+    assert len(errors()) == 1
+    assert "degrading readiness" in errors()[0].getMessage()
+    assert "_parked_in_a_named_frame" in errors()[0].getMessage()

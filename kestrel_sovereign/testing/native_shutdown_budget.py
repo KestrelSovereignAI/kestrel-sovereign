@@ -1,5 +1,7 @@
 """Compose fixture lifecycle guards with real backend close reservations."""
 
+import math
+
 import pytest
 
 
@@ -27,6 +29,10 @@ def reserve_native_shutdown_budget(
         if tail < available_prefix + reserved:
             return
     total = tail + prefix
+    # ``total - tail`` can round one ulp below ``prefix`` (4.11 + 5.0, say);
+    # the smallest larger total keeps the whole prefix window.
+    while total - tail < prefix:
+        total = math.nextafter(total, math.inf)
     assert 0 < total <= 30, "native lifecycle fixture requires a finite coherent budget"
     monkeypatch.setattr(agent_module, "SHUTDOWN_TIMEOUT", total)
     monkeypatch.setattr(agent_module, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", total)

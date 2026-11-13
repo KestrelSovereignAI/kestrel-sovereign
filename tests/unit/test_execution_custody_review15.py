@@ -89,12 +89,16 @@ def dispatcher_fixture(error):
     dispatcher._discard_transient_durable_handoff = Mock()
     dispatcher._retained_cognition_control_debt = {}
     dispatcher._retained_durable_cognition_tasks = set()
-    dispatcher._runtime_owner_fence_lock = asyncio.Lock()
     dispatcher._durable_shutdown_owner_fenced = False
-    dispatcher._durable_store = SimpleNamespace(_failed_retry_release_receipts=set(), backend=SimpleNamespace(
-        backend_type="postgres", fail_cognition_delivery=AsyncMock(return_value=False),
-        retain_cognition_cleanup_owner=AsyncMock(return_value=False),
-    ))
+    dispatcher._durable_shutdown = False
+    dispatcher._durable_runtime_owner_registration_started = True
+    dispatcher._durable_store = SimpleNamespace(
+        _failed_retry_release_receipts=set(),
+        retain_unretired_runtime_owner=AsyncMock(return_value=False),
+        backend=SimpleNamespace(
+            backend_type="postgres", fail_cognition_delivery=AsyncMock(return_value=False),
+        ),
+    )
     delivery = ReceiptDelivery(delivery_id="delivery", consumer_id="consumer", lease_token="original-token")
     return dispatcher, delivery
 

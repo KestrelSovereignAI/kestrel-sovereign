@@ -398,15 +398,20 @@ async def test_cleanup_heartbeat_never_reopens_ordinary_denied_work():
     owner.did = "did:test:cleanup"
     dispatcher._durable_delivery_owner = "dispatcher:original"
     dispatcher._retained_cognition_control_debt = {"original": object()}
-    dispatcher._runtime_owner_fence_lock = asyncio.Lock()
-    native = SimpleNamespace(backend_type="postgres", retain_cognition_cleanup_owner=AsyncMock(return_value=True))
-    dispatcher._durable_store = SimpleNamespace(backend=native, heartbeat_runtime_owner=AsyncMock())
+    dispatcher._durable_shutdown = False
+    dispatcher._durable_runtime_owner_registration_started = True
+    native = SimpleNamespace(backend_type="postgres")
+    dispatcher._durable_store = SimpleNamespace(
+        backend=native, heartbeat_runtime_owner=AsyncMock(),
+        retain_unretired_runtime_owner=AsyncMock(return_value=True),
+    )
     # Capturing cleanup metadata context cannot grant a new resident admission.
     context = dispatcher._resident_timer_context()
     with pytest.raises(ExecutionAuthorityError):
         context.run(require_execution_work, owner)
     await dispatcher._heartbeat_runtime_owner()
-    native.retain_cognition_cleanup_owner.assert_awaited_once_with(
+    # Only the fixed renewal write runs, never the reviving ordinary one.
+    dispatcher._durable_store.retain_unretired_runtime_owner.assert_awaited_once_with(
         agent_id=owner.did, owner_id="dispatcher:original",
     )
     dispatcher._durable_store.heartbeat_runtime_owner.assert_not_awaited()

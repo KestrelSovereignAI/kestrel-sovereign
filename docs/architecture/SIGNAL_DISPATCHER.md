@@ -491,6 +491,73 @@ unadmitted attempts; each caller separately receives its actual allocation error
 with the original native receipt. A later admitted cleanup must settle the same
 delivery/token through its real CAS, without reviving ordinary runtime work.
 
+#### Runtime-owner renewal
+
+An owner that is not durably retired is renewed on every heartbeat tick, and
+nothing else decides that (#4001). What keeps it unretired does not matter: a
+shutdown that refused or failed, retained row debt, a retained cognition task,
+retained writer control, or a refused admission
+(`_runtime_owner_liveness_required`). Otherwise a peer judges it dead and
+reclaims leases it still holds, so the same work runs twice.
+
+Renewal is one fixed write, `retain_unretired_runtime_owner`, and it is the
+only path that renews an owner. It refreshes this owner's own existing,
+unstopped row. It never inserts a row, revives a stopped one, grants a lease or
+admits work, and on PostgreSQL it no longer depends on the owner leasing core
+cognition. On PostgreSQL it runs on a one-connection pool of its own, opened
+when the owner registers and checked out by nothing else, so ordinary work
+holding every connection of the operational or advisory pool cannot hold it
+back; it shares only the owner-scope advisory key, the transaction lock that
+serializes it with recovery. It never falls back to another pool, and closing
+the backend waits for a renewal in flight before closing that pool. A close
+cancelled during that wait keeps the cancellation, closes every pool, then
+raises it. This costs
+one PostgreSQL connection per backend that hosts an owner. On a SQLite file it runs on a
+connection of its own, kept between renewals and retired by the backend's
+close, never the shared work connection. Each renewal checks that the
+database's path still names the file the backend connected to, before it
+waits for the writer slot and again before it commits, and refuses otherwise.
+After a cancelled
+write's rollback cannot be confirmed, that connection's cleanup fence refuses
+every later write on it until it is replaced; renewal is not one of them, and
+it leaves the fence and the error it retains as they are. Only SQLite's writer
+slot is shared. Renewal tries for it in attempts of 0.1 s for at most 5 s
+before a retry, and between attempts ends, having written nothing, once the
+backend's close has begun. Close therefore waits only for a renewal that
+already holds the slot, and its reservation covers that one attempt. Because
+renewal commits from a second connection, every SQLite `transaction()` begins
+`BEGIN IMMEDIATE`: a deferred transaction that read before such a commit could
+not then write. An
+in-memory SQLite database has one connection for every writer, a peer's
+recovery included, so it renews there. On both backends each tick starts it
+in a task of its own (`_start_runtime_owner_renewal`), in an empty context.
+It therefore runs outside durable admission (`_admit_durable_operation`) and
+on no execution scope the agent's own work holds, so neither retained control
+nor a fenced original scope can refuse it. It never waits for other work: the
+tick starts it before the heartbeat's maintenance, and schedules the next tick
+without waiting for that maintenance, so a maintenance pass that stalls or
+fails never holds renewal back. No scheduling call postpones a tick that is
+already due sooner.
+
+Renewal stops only while shutdown marks the owner stopped
+(`_retire_runtime_owner`), and once that mark commits. Retirement runs after
+durable admission has drained, so that span lasts one renewal write. Stopping
+the heartbeat joins the heartbeat, then the renewal, and cancels the next tick
+after each join, so no heartbeat starts unjoined; a tick that lost the race to
+retirement renews nothing and is not a failure. If stopping the heartbeat or
+the mark fails, renewal resumes for the retry; a stop mark whose
+acknowledgement was lost is still a retirement, and the resumed renewal finds
+the owner stopped and renews nothing. A renewal that finds the owner stopped
+or gone renews nothing, and while debt that guards a lease stands it raises
+that debt as lost protection.
+
+The maintenance after it (`_heartbeat_runtime_owner`) recovers reservations,
+handoffs and leases. It runs under durable admission and in the owner's own
+execution scope, so its failures, including retained control, stay its own.
+While debt that guards a lease stands (`_runtime_owner_cleanup_required`), or
+once shutdown has closed admission, a heartbeat only renews and admits no
+cognition.
+
 #### Resuming on a wait handle instead of holding a turn
 
 A held wait (`wait("<kind>:<handle>")`, or any `run_wait_loop` caller) is

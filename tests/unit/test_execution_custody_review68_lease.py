@@ -1,4 +1,4 @@
-"""SQLite's deferred transaction must lock before sampling renewal time."""
+"""SQLite's transaction must hold the writer slot before sampling renewal time."""
 
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -40,14 +40,17 @@ async def test_native_sqlite_delivery_renewal_cannot_revive_expired_token(tmp_pa
         )
         locked.execute("BEGIN IMMEDIATE")
         entered = asyncio.Event()
-        execute = backend.execute
+        connection = backend._connection
+        execute = connection.execute
 
-        async def native_execute(query, params=()):
-            if "UPDATE durable_signal_deliveries" in query:
+        def native_execute(query, *args, **kwargs):
+            # The renewal's transaction asks for the writer slot here, and
+            # waits for it, before it reads the lease or samples time (#4040).
+            if query == "BEGIN IMMEDIATE":
                 entered.set()
-            return await execute(query, params)
+            return execute(query, *args, **kwargs)
 
-        monkeypatch.setattr(backend, "execute", native_execute)
+        monkeypatch.setattr(connection, "execute", native_execute)
         renewing = create_owned_task(store.renew_delivery_lease(
             agent_id="original", consumer_id="consumer", delivery_id="delivery", lease_token="token",
         ))

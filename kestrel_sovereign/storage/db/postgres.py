@@ -34,6 +34,7 @@ from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskAdmission,
+    acquire_lock_keeping_cancellation,
     await_owned_task,
     create_owned_task,
 )
@@ -480,7 +481,10 @@ class PostgresBackend(DatabaseBackend):
         self._advisory_pool: Optional[asyncpg.Pool] = None
         self._advisory_pool_lock = asyncio.Lock()
         self._advisory_backend: Optional["PostgresBackend"] = None
-        
+        # Runtime-owner renewal's own connection (#4001); see
+        # _runtime_owner_renewal_pool_locked.
+        self._runtime_owner_renewal_pool: Optional[asyncpg.Pool] = None
+
         self._pool: Optional[asyncpg.Pool] = None
         self._original_result_holds = {}
         self._original_results_closing = False
@@ -612,6 +616,7 @@ class PostgresBackend(DatabaseBackend):
         instance._advisory_pool = None
         instance._advisory_pool_lock = asyncio.Lock()
         instance._advisory_backend = advisory_backend
+        instance._runtime_owner_renewal_pool = None
         instance._pool = pool
         instance._original_result_holds = {}
         instance._original_results_closing = False
@@ -872,6 +877,7 @@ class PostgresBackend(DatabaseBackend):
                 )
             
             self._original_results_closing = False
+            self._runtime_owner_renewal_retired = False
             logger.debug("Connected to PostgreSQL pool (initial: %s, maximum: %s)",
                          self._min_pool_size, self._max_pool_size)
             
@@ -888,7 +894,7 @@ class PostgresBackend(DatabaseBackend):
         """
         from .original_result_custody import _drain_original_results
         await _drain_original_results(self)
-        errors: list[BaseException] = []
+        errors: list[BaseException | None] = [await self._retire_runtime_owner_renewal_pool()]
         for attribute in ("_advisory_pool", "_pool"):
             pool = getattr(self, attribute)
             if pool is None:
@@ -904,6 +910,90 @@ class PostgresBackend(DatabaseBackend):
         )
         if terminal is not None:
             raise terminal
+
+    def _runtime_owner_renewal_lock(self) -> asyncio.Lock:
+        """Held by each renewal across its write, and by close (#4001).
+
+        Created on first use, as ``PoolBackendAdapter`` and hand-built test
+        backends never run ``__init__``.
+        """
+        return vars(self).setdefault("_runtime_owner_renewal_mutex", asyncio.Lock())
+
+    async def _runtime_owner_renewal_pool_locked(self) -> "asyncpg.Pool":
+        """The pool only runtime-owner renewal checks out from (#4001).
+
+        Call with :meth:`_runtime_owner_renewal_lock` held. Renewal must not
+        wait behind ordinary work, and ``admit_work=False`` skips admission
+        but reserves no connection: on the operational pool a renewal queues
+        behind every checkout ordinary work holds, and on the advisory pool
+        behind every session-scoped lock holder. Held long enough, a peer
+        finds the live owner stale and reclaims leases it still holds. This
+        pool's one connection opens when the pool is created, is never closed
+        for idleness, and nothing else checks out from it. It is built from
+        the advisory pool's recipe, so it reaches the same database and
+        schema. A lost connection is reopened by the next renewal's checkout;
+        renewal never falls back to another pool.
+        """
+        pool = getattr(self, "_runtime_owner_renewal_pool", None)
+        if pool is not None:
+            return pool
+        if getattr(self, "_runtime_owner_renewal_retired", False):
+            # Close retired this pool: a renewal racing it gets none back.
+            raise ConnectionError("owner renewal requires the original backend")
+        try:
+            args, kwargs = self.independent_connection_recipe()
+            pool = await asyncpg.create_pool(
+                *args,
+                init_size=1,
+                min_size=0,
+                max_size=1,
+                max_inactive_connection_lifetime=0,
+                **kwargs,
+            )
+        except ConnectionError:
+            raise
+        except Exception as exc:
+            raise execution_error_with_cause(ConnectionError(
+                f"Failed to create the PostgreSQL runtime-owner renewal pool: {exc}"
+            ), exc)
+        self._runtime_owner_renewal_pool = pool
+        return pool
+
+    async def reserve_runtime_owner_renewal(self) -> None:
+        """Open renewal's own connection before an owner registers (#4001).
+
+        An owner is never registered that has no connection to renew it on.
+        Idempotent: one pool serves every owner on this backend.
+        """
+        self._ensure_connected()
+        async with self._runtime_owner_renewal_lock():
+            await self._runtime_owner_renewal_pool_locked()
+
+    async def _retire_runtime_owner_renewal_pool(self) -> BaseException | None:
+        """Close renewal's pool once the renewal using it has finished (#4001).
+
+        Taking the renewal lock joins a renewal in flight, whose write is
+        bounded; closing the pool under it would end that renewal, and
+        retirement is the only thing that may. A cancellation of the caller
+        while it joins is kept rather than raised, so this pool still closes
+        and :meth:`close` still retires the others, and is returned with this
+        pool's close failure for close to raise after them (#4040).
+        """
+        lock = self._runtime_owner_renewal_lock()
+        cancellation = await acquire_lock_keeping_cancellation(lock)
+        try:
+            self._runtime_owner_renewal_retired = True
+            pool = getattr(self, "_runtime_owner_renewal_pool", None)
+            failure = (
+                None if pool is None
+                else await self._retire_owned_pool("_runtime_owner_renewal_pool", pool)
+            )
+        finally:
+            lock.release()
+        return execution_terminal_error(
+            failure, cancellation, retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
+        )
 
     async def _retire_owned_pool(self, attribute: str, pool: Any) -> BaseException | None:
         """One exact pool closer for backend exit and refused new allocation."""
@@ -2658,44 +2748,48 @@ class PostgresBackend(DatabaseBackend):
             wrapper._session_file_metadata = {}
         return report
 
-    async def retain_cognition_cleanup_owner(self, *, agent_id: str, owner_id: str) -> bool:
-        """Retain an existing live owner with leased or receipt-pending cognition.
+    async def retain_unretired_runtime_owner(self, *, agent_id: str, owner_id: str) -> bool:
+        """Renew one existing, unstopped managed owner on fixed SQL (#4001).
 
-        This cleanup-only metadata operation cannot insert/revive an owner,
-        grant a lease, acknowledge ingress, or reopen ordinary native work.
-        It serializes with canonical owner recovery using its exact key.
+        This is the only write that renews a dispatcher's owner. An owner
+        that is not retired is renewed whatever else it holds or owes: a
+        shutdown that refused or failed, retained cleanup debt, or denied
+        ordinary work. It cannot insert or revive an owner, grant a lease,
+        acknowledge ingress, or reopen ordinary native work, and it
+        serializes with canonical owner recovery using its exact key.
+
+        It checks out from renewal's own one-connection pool, never the
+        operational or advisory pool, so ordinary work holding every
+        connection it can reach cannot hold renewal back. The only resource
+        it shares with that work is the owner-scope advisory key, which is
+        transaction-scoped and is how it serializes with recovery.
         """
         from kestrel_sovereign.signals.durable import DurableSignalStore
-        from kestrel_sovereign.signals.sources import core_cognition_consumers
 
         if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
-            raise ValueError("cognition cleanup requires exact owner identities")
+            raise ValueError("owner renewal requires exact owner identities")
         if not owner_id.startswith("dispatcher:"):
-            raise ValueError("cognition cleanup requires its managed owner")
-        pool = self._pool
-        if pool is None:
-            raise ConnectionError("cognition cleanup requires the original backend")
+            raise ValueError("owner renewal requires its managed owner")
+        if self._pool is None:
+            raise ConnectionError("owner renewal requires the original backend")
         async with asyncio.timeout(5):
-            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
-                async with self._tracked_native_transaction(connection, state.scopes, state):
-                    await connection.fetchval(
-                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                        DurableSignalStore.runtime_owner_lock_key(agent_id),
-                    )
-                    result = await connection.execute(
-                        f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} owner "
-                        "SET heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()), "
-                        "updated_at = clock_timestamp() "
-                        "WHERE owner.agent_id = $1 AND owner.owner_id = $2 "
-                        "AND owner.stopped_at IS NULL AND EXISTS ("
-                        f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
-                        "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
-                        "AND delivery.consumer_id = ANY($3::text[]) "
-                        "AND delivery.status IN ('leased', 'retry') "
-                        "AND delivery.lease_token IS NOT NULL)",
-                        agent_id, owner_id, list(dict(core_cognition_consumers())),
-                    )
-                    return result == "UPDATE 1"
+            async with self._runtime_owner_renewal_lock():
+                pool = await self._runtime_owner_renewal_pool_locked()
+                async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, state):
+                    async with self._tracked_native_transaction(connection, state.scopes, state):
+                        await connection.fetchval(
+                            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                            DurableSignalStore.runtime_owner_lock_key(agent_id),
+                        )
+                        result = await connection.execute(
+                            f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} owner "
+                            "SET heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()), "
+                            "updated_at = clock_timestamp() "
+                            "WHERE owner.agent_id = $1 AND owner.owner_id = $2 "
+                            "AND owner.stopped_at IS NULL",
+                            agent_id, owner_id,
+                        )
+                        return result == "UPDATE 1"
 
     async def fail_cognition_delivery(
         self, *, agent_id: str, consumer_id: str, delivery_id: str,

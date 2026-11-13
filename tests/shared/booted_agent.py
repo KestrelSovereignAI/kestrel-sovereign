@@ -28,6 +28,7 @@ async def booted_agent(
     features: AbstractSet[str],
     genesis: bool = True,
     released_schema: Path | None = None,
+    database_url: str | None = None,
     is_test_instance: bool = True,
     payer_policy: PayerPolicy | None = None,
 ):
@@ -40,6 +41,11 @@ async def booted_agent(
     ``released_schema`` names a snapshot from ``tests.shared.agent_store_schema``.
     The agent's database then starts as that release's fresh database, and the
     agent boots across whatever upgrade its stores need (#4002).
+
+    ``database_url`` boots the agent on that PostgreSQL database instead of
+    SQLite. Inception still writes the local birth record, which boot
+    replicates into PostgreSQL as it does in production (#2871). The database
+    must be the caller's own, empty and disposable.
 
     ``is_test_instance=False`` creates a separate test-owned identity with
     interactive approvals enabled; the default identity is tagged headless.
@@ -54,6 +60,8 @@ async def booted_agent(
     from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
     from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
+    if released_schema is not None and database_url is not None:
+        raise ValueError("a released SQLite schema cannot boot on PostgreSQL")
     db_path = Path(tmp_path) / "kestrel_prime.db"
     if released_schema is None:
         credentials = await create_kestrel_identity_async(
@@ -76,12 +84,18 @@ async def booted_agent(
         finally:
             await database.close()
     llm_service = LLMService()
+    backend = (
+        {}
+        if database_url is None
+        else {"db_backend": "postgres", "database_url": database_url}
+    )
     agent = KestrelAgent(
         did=credentials.agent_did,
         storage_path=str(db_path),
         llm_service=llm_service,
         allowed_features=set(features),
         payer_policy=payer_policy,
+        **backend,
     )
     try:
         await agent.initialize()
