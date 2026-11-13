@@ -4924,16 +4924,40 @@ class KestrelAgent(
             custody.settle("llm_service", llm_outcome)
             if llm_outcome is not ReleaseOutcome.RELEASED:
                 return ReleaseOutcome.RETAINED
-        raw = self._raw_storage
-        if raw is not None and hasattr(raw, "close"):
-            outcome = reported_outcome(await raw.close())
-            if outcome is not ReleaseOutcome.RELEASED:
-                return outcome
-        await self._retire_tool_effect_store()
+        outcome = await self._close_primary_storage(self._raw_storage)
+        if outcome is not ReleaseOutcome.RELEASED:
+            return outcome
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
         return ReleaseOutcome.RELEASED
+
+    async def _join_primary_storage_borrowers(self) -> None:
+        """Original native borrower retirement precedes every storage phase."""
+        custody = self._resource_custody()
+        if custody.is_held("native_mcp_server"):
+            # close() observes its ONE retained operation, including unknown
+            # admission debt. Never treat a missing Task as a fresh attempt or
+            # replace the original control receipt with a generic refusal.
+            await custody.release("native_mcp_server", self._close_native_mcp_publication)
+        if custody.is_held("native_mcp_server") or custody.is_held("task_manager"):
+            self._raise_shutdown_control(control_only=True)
+            raise RuntimeError("Original native storage borrower retirement is incomplete")
+
+    async def _preclose_primary_storage(self, preclose) -> ReleaseOutcome:
+        """Dispose cached storage resources only after original native borrowers."""
+        await self._join_primary_storage_borrowers()
+        return reported_outcome(await preclose())
+
+    async def _close_primary_storage(self, storage) -> ReleaseOutcome:
+        """One physical primary-close boundary for rollback and both shutdowns."""
+        await self._join_primary_storage_borrowers()
+        closed = ReleaseOutcome.RELEASED
+        if storage is not None and hasattr(storage, "close"):
+            closed = reported_outcome(await storage.close())
+        if closed is ReleaseOutcome.RELEASED:
+            await self._retire_tool_effect_store()
+        return closed
 
     async def _retire_tool_effect_store(self) -> None:
         """Drop the borrower only after the primary storage owner retires."""
@@ -4961,6 +4985,30 @@ class KestrelAgent(
                 )
                 return ReleaseOutcome.RETAINED
         return ReleaseOutcome.RELEASED
+
+    def _native_mcp_publication_owner(self):
+        """Resolve one original server owner without manufacturing retirement ACKs."""
+        publication = vars(self).get("_native_mcp_publication")
+        if publication is None:
+            if self._resource_custody().is_held("native_mcp_server"):
+                raise RuntimeError("Original native MCP retirement owner is unavailable")
+            return None
+        from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+
+        if not isinstance(publication, NativeMCPPublication) or publication.agent is not self:
+            raise TypeError("Original native MCP publication owner required")
+        return publication
+
+    def _withdraw_native_mcp_publication(self):
+        """The guarded shutdown step resolves and fences its original owner."""
+        publication = self._native_mcp_publication_owner()
+        if publication is not None:
+            publication.withdraw()
+
+    async def _close_native_mcp_publication(self):
+        """Join the host's original SDK lifetime before releasing borrowed SQL."""
+        publication = self._native_mcp_publication_owner()
+        return (await publication.close()) if publication is not None else ReleaseOutcome.RELEASED
 
     async def _close_native_task_manager(self, manager):
         """Join standalone publication readers before releasing their primary store."""
@@ -9790,12 +9838,8 @@ Expected Duration: {expected_duration}
         async def close_storage() -> ReleaseOutcome:
             precloses = ReleaseOutcome.RELEASED
             if storage_preclose is not None:
-                precloses = reported_outcome(await storage_preclose())
-            closed = ReleaseOutcome.RELEASED
-            if storage is not None and hasattr(storage, "close"):
-                closed = reported_outcome(await storage.close())
-            if closed is ReleaseOutcome.RELEASED:
-                await self._retire_tool_effect_store()
+                precloses = await self._preclose_primary_storage(storage_preclose)
+            closed = await self._close_primary_storage(storage)
             return closed if precloses is ReleaseOutcome.RELEASED else precloses
 
         if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
@@ -9805,6 +9849,13 @@ Expected Duration: {expected_duration}
         # an empty writer set is not proof of provider retirement. Both native
         # LLM settlement and close precede every borrowed storage release.
         await custody.release("llm_service", release_llm)
+        # The finite prefix may also have exhausted its TaskManager slice.
+        # Complete its canonical retryable store close before the common
+        # primary-storage gate; retaining a name alone cannot finish cleanup.
+        if custody.is_held("task_manager"):
+            if self.task_manager is None or not callable(getattr(self.task_manager, "close", None)):
+                raise RuntimeError("Original native task-manager owner is unavailable")
+            await custody.release("task_manager", self._boot_teardown_task_manager)
         if vars(self).get("_resolved_local_host_db") is not None:
             async def release_host_db() -> ReleaseOutcome:
                 await self._close_local_host_db()
@@ -10437,6 +10488,8 @@ Expected Duration: {expected_duration}
         has_llm = bool(self.llm_service and hasattr(self.llm_service, "close"))
         has_task_mgr = bool(self.task_manager and hasattr(self.task_manager, "close"))
         has_host_db = vars(self).get("_resolved_local_host_db") is not None
+        native_mcp = vars(self).get("_native_mcp_publication")
+        has_native_mcp = native_mcp is not None or self._resource_custody().is_held("native_mcp_server")
 
         pending_ops = (
             int(has_ephemeral)
@@ -10449,6 +10502,7 @@ Expected Duration: {expected_duration}
             + int(has_llm)
             + int(has_task_mgr)
             + int(has_host_db)
+            + int(has_native_mcp)
         )
 
         def _step_budget() -> float:
@@ -10698,6 +10752,11 @@ Expected Duration: {expected_duration}
             return worker.request_stop if callable(request) else None
 
         try:
+            if has_native_mcp:
+                await _release_within("native_mcp_server", "Native MCP server",
+                    self._close_native_mcp_publication, _step_budget(),
+                    request=self._withdraw_native_mcp_publication)
+
             # EPHEMERAL hard-purge defense-in-depth (#767 / #2673). If the agent
             # process is exiting while still in EPHEMERAL, the session is
             # closing — fire the hard-purge so any leak doesn't survive the
@@ -10854,7 +10913,8 @@ Expected Duration: {expected_duration}
             getattr(dispatcher, "durable_shutdown_owner_fenced", False)
         )
         llm_owner_fenced = self._has_pending_llm_storage_dependents()
-        if not shutdown_cancelled and not dispatcher_owner_fenced and not llm_owner_fenced:
+        mcp_owner_fenced = custody.is_held("native_mcp_server")
+        if not shutdown_cancelled and not dispatcher_owner_fenced and not llm_owner_fenced and not mcp_owner_fenced:
             try:
                 await self.wait_for_shutdown_completion(defer_cancellation=False)
             except asyncio.CancelledError as cancellation:
@@ -10863,7 +10923,7 @@ Expected Duration: {expected_duration}
             except (Exception, BaseExceptionGroup) as failure:
                 remember_finite(failure, retain_ordinary=True)
                 tail_degraded = True
-        elif dispatcher_owner_fenced or llm_owner_fenced:
+        elif dispatcher_owner_fenced or llm_owner_fenced or mcp_owner_fenced:
             # The continuation owns storage close after the hostile cognition
             # task settles. Returning degraded keeps shutdown bounded without
             # making that live task peer-reclaimable in this process.
@@ -11449,6 +11509,13 @@ Expected Duration: {expected_duration}
             return tail_result(True)
         await self._join_llm_storage_dependents()
 
+        if custody.is_held("native_mcp_server"):
+            # The finite prefix withdrew only its observation. This explicit
+            # agent-owned continuation joins the original SDK/request drain
+            # and then enters the shared primary-storage retirement boundary.
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            return tail_result(True)
+
         if custody.is_held("task_manager"):
             # The finite prefix could not join the native manager. Keep its
             # primary backend and SQLAlchemy owners available for a retry.
@@ -11464,7 +11531,7 @@ Expected Duration: {expected_duration}
 
             async def run_preclose() -> None:
                 nonlocal preclose_reported
-                preclose_reported = reported_outcome(await storage_preclose())
+                preclose_reported = await self._preclose_primary_storage(storage_preclose)
 
             storage_preclose_status = await _bounded(
                 run_preclose(),
@@ -11489,9 +11556,7 @@ Expected Duration: {expected_duration}
             storage = self.storage
 
             async def close_storage() -> ReleaseOutcome:
-                closed = reported_outcome(await storage.close())
-                if closed is ReleaseOutcome.RELEASED:
-                    await self._retire_tool_effect_store()
+                closed = await self._close_primary_storage(storage)
                 if storage_preclose_status in {"error", "abandoned", "cancelled"}:
                     # The cached SQLAlchemy engine may still hold the store.
                     return ReleaseOutcome.RETAINED

@@ -31,6 +31,7 @@ class AuthMethod(str, Enum):
     JWT = "jwt"
     OAUTH_SESSION = "oauth_session"
     A2A_TRANSPORT = "a2a_transport"
+    MCP_TRANSPORT = "mcp_transport"
     INTERNAL = "internal"  # Agent-to-agent or system calls
 
 
@@ -86,6 +87,12 @@ class CallerContext:
             auth_method=AuthMethod.A2A_TRANSPORT,
             identity="a2a_transport",
         )
+
+    @staticmethod
+    def mcp_transport() -> "CallerContext":
+        """Native SDK authentication lane; no operator or OAuth grant authority."""
+        return CallerContext(role=CallerRole.AUTHENTICATED,
+            auth_method=AuthMethod.MCP_TRANSPORT, identity="mcp_transport")
 
     @staticmethod
     def anonymous() -> "CallerContext":

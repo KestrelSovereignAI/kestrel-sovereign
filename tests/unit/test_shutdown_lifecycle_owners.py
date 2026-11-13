@@ -1929,7 +1929,7 @@ async def test_terminal_drain_sanitizes_cancelled_worker_with_prior_failure(
 async def test_manager_shutdown_all_continues_after_terminal_agent_failure(
     monkeypatch,
 ) -> None:
-    """A failed agent stays published, but cannot abandon later fleet cleanup."""
+    """Retain failed cleanup ownership with public routes fenced; finish the fleet."""
     monkeypatch.setattr(
         "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT", 0.01
     )
@@ -1947,7 +1947,10 @@ async def test_manager_shutdown_all_continues_after_terminal_agent_failure(
     with pytest.raises(ExceptionGroup, match="fleet agents failed"):
         await manager.shutdown_all()
 
-    assert manager.get_agent("failed") is failed
+    assert manager.get_agent("failed") is None, "Failed fleet shutdown left its public agent route available"
+    assert failed not in manager.list_agents().values()
+    assert manager._agents["failed"] is failed, "Failed fleet shutdown lost its original cleanup owner"
+    assert manager._fenced_agent_routes["failed"] is failed
     assert manager.get_agent("healthy") is None
     assert healthy.storage_closed.is_set()
     assert manager.get_children("did:test:parent") == ["failed"]
@@ -1990,13 +1993,17 @@ async def test_manager_shutdown_all_retries_retained_agent_and_hold_after_failur
         await manager.shutdown_all()
 
     assert agent.shutdown_calls == 1
-    assert manager.get_agent("retry") is agent
+    assert manager.get_agent("retry") is None, "Retryable fleet shutdown left its public agent route available"
+    assert agent not in manager.list_agents().values()
+    assert manager._agents["retry"] is agent, "Retryable fleet shutdown lost its original cleanup owner"
+    assert manager._fenced_agent_routes["retry"] is agent
     assert "retry" in manager._child_budgets
     assert manager._quarantined_shutdown_handoffs_sealed is False
 
     await manager.shutdown_all()
 
     assert agent.shutdown_calls == 2
+    assert "retry" not in manager._fenced_agent_routes, "Successful fleet retry retained its completed routing fence"
     assert released == ["retry"]
     assert manager.get_agent("retry") is None
     assert "retry" not in manager._child_budgets

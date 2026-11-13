@@ -38,11 +38,19 @@ _LEGACY_WORKFLOW_ARTIFACT_TARGET = (
     + re.escape(_LEGACY_WORKFLOW_ARTIFACT_MARKER) + r"(?:/|$))"
 )
 _PRIVATE_LEGACY_WORKFLOW_TARGET = re.compile(_LEGACY_WORKFLOW_ARTIFACT_TARGET)
+_NATIVE_MCP_PRIVATE_TARGETS = tuple(
+    (marker, "(?i:" + _url_path_literal(marker) + r"(?:/|%(?:2f|3f|23)|[?#]|$))")
+    for marker in ("/api/mcp/server/consent", "/mcp/oauth", "/mcp/consent")
+)
+_NATIVE_MCP_PRIVATE_MATCHERS = tuple(
+    (marker, re.compile(pattern)) for marker, pattern in _NATIVE_MCP_PRIVATE_TARGETS
+)
 # Also used before optional auto-instrumentation creates a URL-bearing span.
 PRIVATE_CAPABILITY_URL_PATTERN = (
     r"/api/(?:artifacts|visual-computer|mcp/oauth)(?:[/?#]|$)|"
     r"/oauth/mcp/callback(?:[/?#]|$)|"
-    + _LEGACY_WORKFLOW_ARTIFACT_TARGET
+    + _LEGACY_WORKFLOW_ARTIFACT_TARGET + "|"
+    + "|".join(pattern for _marker, pattern in _NATIVE_MCP_PRIVATE_TARGETS)
 )
 _PRIVATE_TARGET = re.compile(r"/api/(artifacts|visual-computer|mcp/oauth)(?:/|$)")
 _PRIVATE_TOOL = re.compile(r"(?:^|__|:)(?:artifact_|visual_)")
@@ -53,6 +61,8 @@ _SENSITIVE_QUERY_NAMES = frozenset(
         "clientsecret",
         "password",
         "secret",
+        "request",
+        "state",
     }
 )
 
@@ -73,7 +83,12 @@ def private_capability_path(path: str) -> str | None:
     if _PRIVATE_LEGACY_WORKFLOW_TARGET.search(path):
         return _LEGACY_WORKFLOW_ARTIFACT_MARKER
     match = _PRIVATE_TARGET.search(path)
-    return f"/api/{match[1]}" if match else None
+    if match:
+        return f"/api/{match[1]}"
+    for marker, matcher in _NATIVE_MCP_PRIVATE_MATCHERS:
+        if matcher.search(path):
+            return marker
+    return None
 
 
 def private_capability_tool_name(name: str | None) -> bool:

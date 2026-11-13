@@ -37,6 +37,54 @@ LEGACY_PRIVATE_PATHS = (
     "/api/workflows/runs/private-run/artifacts%23private-artifact",
 )
 
+NATIVE_MCP_PRIVATE_PATHS = (
+    ("/api/mcp/server/consent/requests/opaque-pending-handle", "/api/mcp/server/consent"),
+    ("/api/agent-routes/b3duZWQ/api/mcp/server/consent/requests/opaque-pending-handle/decision", "/api/mcp/server/consent"),
+    ("/api/agent-routes/b3duZWQ/mcp/consent", "/mcp/consent"),
+    ("/api/agent-routes/b3duZWQ/mcp/oauth/authorize", "/mcp/oauth"),
+    ("/api/mcp/ser%76er/consent/requests/opaque-pending-handle", "/api/mcp/server/consent"),
+    ("/api/agent-routes/b3duZWQ/%6dcp/%6fauth/authorize", "/mcp/oauth"),
+)
+
+
+@pytest.mark.parametrize("path,marker", NATIVE_MCP_PRIVATE_PATHS)
+def test_native_mcp_private_urls_share_the_diagnostic_classifier(path, marker):
+    for representation in (path, unquote(path)):
+        assert private_capability_path(representation) == marker, "Native MCP capability URL was not classified as private"
+
+
+@pytest.mark.parametrize("path,_marker", NATIVE_MCP_PRIVATE_PATHS)
+def test_native_mcp_private_urls_are_excluded_before_trace_creation(path, _marker):
+    assert re.search(PRIVATE_CAPABILITY_URL_PATTERN, "https://kestrel.example" + path), (
+        "Native MCP capability URL could create a URL-bearing diagnostic span"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,marker", NATIVE_MCP_PRIVATE_PATHS)
+async def test_native_mcp_access_log_hides_original_pending_and_state(path, marker):
+    query = b"request=opaque-pending-handle&state=private-authorization-state"
+    scope = {"type": "http", "path": path, "raw_path": path.encode(), "query_string": query}
+    observed = []
+
+    async def inner(actual, receive, send):
+        assert actual["path"] == path and actual["query_string"] == query
+        await send({"type": "http.response.start", "status": 403, "headers": []})
+        assert actual["path"] == path and actual["query_string"] == query
+
+    async def send(_message):
+        observed.append(get_path_with_query_string(scope))
+
+    await SensitiveQueryStringRedactionMiddleware(inner)(scope, None, send)
+    assert observed == [marker], "Native MCP access logging retained a pending capability or authorization state"
+
+
+def test_oauth_request_and_state_query_fields_are_not_diagnostic_values():
+    query = b"request=opaque-pending-handle&state=private-state&page=2"
+    assert parse_qs(redact_sensitive_query_string(query).decode()) == {
+        "request": ["redacted"], "state": ["redacted"], "page": ["2"],
+    }, "Generic diagnostic query redaction retained OAuth request or state"
+
 
 @pytest.mark.parametrize("path", LEGACY_PRIVATE_PATHS)
 @pytest.mark.parametrize("prefix", ["", "/api/agents/private-agent", "/api/agent-routes/cHJpdmF0ZQ"])
