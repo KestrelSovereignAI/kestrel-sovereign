@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.multi_agent.agent_manager import (
@@ -684,11 +685,20 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
     manager = AgentManager(base_data_dir=tmp_path)
     lifecycle = SpawnedAgentLifecycle(manager)
     manager._lifecycle = lifecycle
-    monkeypatch.setattr(
-        lifecycle,
-        "_remaining_ttl_seconds",
-        lambda _created_at, _ttl_seconds: 0.01,
-    )
+    parent_expiry_waiting = asyncio.Event()
+    release_parent_expiry = asyncio.Event()
+    native_monitor = lifecycle._run_ttl_monitor
+
+    async def monitor_at_original_expiry(child_name, child_did, remaining):
+        if child_name == parent_name:
+            parent_expiry_waiting.set()
+            await release_parent_expiry.wait()
+            remaining = 0
+        await native_monitor(child_name, child_did, remaining)
+
+    # Select the parent's expiry phase without shortening the child's signed
+    # hour-long lifetime. The original timer task and retirement body still run.
+    monkeypatch.setattr(lifecycle, "_run_ttl_monitor", monitor_at_original_expiry)
     parent = _make_durable_spawn_agent(
         parent_did,
         parent_mandate,
@@ -710,16 +720,28 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
     lifecycle.restore_persisted_child(parent_name, parent_mandate)
     expiry_owner = lifecycle._tracked[parent_name].ttl_task
 
-    assert await manager.remove_agent(parent_name) is True
-    assert manager.get_agent(child_name) is child
+    try:
+        await asyncio.wait_for(parent_expiry_waiting.wait(), timeout=0.5)
+        assert await manager.remove_agent(parent_name) is True
+        assert manager.get_agent(child_name) is child
+        assert lifecycle.cleanup_authority_children(parent_did=parent_did) == ()
+        assert lifecycle._cold_ttl_tasks[(parent_name.casefold(), parent_did)] is expiry_owner
 
-    assert expiry_owner is not None
-    await asyncio.wait_for(asyncio.shield(expiry_owner), timeout=0.5)
-    child.shutdown.assert_awaited_once()
-    assert manager.get_agent(child_name) is None
-    assert registry.get(parent_did).retired
-    assert registry.get(child_did).retired
-    assert manager._spawn_cap_slots_in_use() == 0
+        assert expiry_owner is not None
+        release_parent_expiry.set()
+        await asyncio.wait_for(asyncio.shield(expiry_owner), timeout=0.5)
+        child.shutdown.assert_awaited_once()
+        assert manager.get_agent(child_name) is None
+        assert registry.get(parent_did).retired
+        assert registry.get(child_did).retired
+        assert manager._spawn_cap_slots_in_use() == 0
+        assert lifecycle.cleanup_authority_children(parent_did=parent_did) == ()
+    finally:
+        release_parent_expiry.set()
+        if expiry_owner is not None:
+            outcome = await await_owned_task(expiry_owner)
+            raise_owned_outcome(outcome, operation="owned parent expiry test retirement")
+        await lifecycle.shutdown()
 
 
 @pytest.mark.asyncio
