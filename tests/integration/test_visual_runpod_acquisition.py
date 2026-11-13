@@ -243,7 +243,12 @@ async def test_native_original_producer_minimal_ack_precedes_optional_cost(custo
                 original.producer.finish_optional_cost(phase)
         else:
             public = original.producer.finish_optional_cost(phase)
-            assert public.id == 'owned-native-pod' and public.cost_per_hr == (None if cost == 'missing' else 0.16)
+            assert public.id == 'owned-native-pod'
+            if cost == 'missing':
+                assert public.cost_per_hr is None
+            else:
+                assert type(public.cost_per_hr) is Decimal
+                assert public.cost_per_hr == Decimal('0.16')
             accepted = await original.attempt.record_accepted(checkpoint.lease.model_copy(update={'state': 'pending'}))
             assert accepted.state == 'accepted' and accepted.lease.actual_cost_usd is None
         assert original.current['checks'] > 1

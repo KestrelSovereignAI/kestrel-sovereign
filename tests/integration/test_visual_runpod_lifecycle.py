@@ -467,16 +467,38 @@ async def test_readback_error_never_means_gone_or_delete_retry(custody, vendor, 
 
 
 @pytest.mark.asyncio
-async def test_malformed_optional_cost_does_not_supply_teardown_identity(custody, vendor, quote_peer, monkeypatch):
-    from kestrel_cloud_runpod.models import RunPodManagerError
+async def test_malformed_optional_cost_retains_known_identity_and_release_ack(custody, vendor, quote_peer, monkeypatch):
+    from kestrel_cloud_runpod.models import PodResource, ResourceFieldState
+
     async with lifecycle(custody, vendor, quote_peer, monkeypatch, release=True) as h:
         quote_peer.reply["cost"] = "PRIVATE-MALFORMED-COST"
-        with pytest.raises(RunPodManagerError):
-            await h.lifecycle.run_original()
-        assert len(quote_peer.requests) == 1
+        readbacks = []
+
+        def retain_original_readback():
+            if len(quote_peer.requests) == 1:
+                readbacks.append(h.lifecycle._stage)
+
+        quote_peer.before_reply = retain_original_readback
+        lease = await h.lifecycle.run_original()
+        stage, = readbacks
+        pod = stage._native_result
+        assert type(pod) is PodResource
+        assert pod.id == "owned-native-pod" and pod.cost_per_hr is None
+        assert pod.field_evidence.invalid_fields == ("cost",)
+        assert pod.field_evidence.state("cost") is ResourceFieldState.INVALID
+        assert stage._client_closed and stage._worker_exited and not stage._thread.sockets
+        assert h.lifecycle._stage._client_closed and h.lifecycle._stage._worker_exited
+        assert not h.lifecycle._stage._thread.sockets
+        assert len(quote_peer.requests) == 2
+        assert all(request[0] == "/v2/pods/owned-native-pod" for request in quote_peer.requests)
+        assert lease.state == "unknown" and lease.actual_cost_usd is None and lease.released_at is None
         row = await h.store.get(SCOPE, session_id=h.row.session_id, guard=h.check)
-        assert row.lease.provider_resource_id == "owned-native-pod" and row.lease.released_at is None
-        assert row.remote_environment.release.state == "intent"
+        assert row.lease == lease and row.lease.provider_resource_id == "owned-native-pod"
+        assert row.phase == "fenced" and row.remote_environment.release.state == "acknowledged"
+        fact = row.remote_environment.release
+        assert fact.provider_resource_id == "owned-native-pod" and fact.native_status == 204
+        assert fact.acknowledged_at >= fact.requested_at
+        assert (await h.store.db.fetchone("SELECT released FROM visual_computer_requests"))[0] == 0
 
 
 def install_provider(h):
