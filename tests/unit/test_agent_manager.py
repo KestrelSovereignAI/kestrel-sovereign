@@ -1408,7 +1408,11 @@ async def test_refused_child_offboarding_restores_spawn_startup_row(tmp_path):
 
     persisted = MultiAgentConfig.from_file(config_path)
     assert persisted.agents[child_name] == child_config
-    assert manager.get_agent(child_name) is child
+    # Compensation preserves desired startup state and private cleanup owner,
+    # but a retirement that entered shutdown cannot resume serving requests.
+    assert manager.get_agent(child_name) is None
+    assert manager._get_agent_for_lifecycle(child_name) is child
+    assert child not in manager.list_agents().values()
 
 
 @pytest.mark.asyncio
@@ -17131,7 +17135,9 @@ class TestSpawnAgent:
         assert witness.state == (
             "retiring" if preexisting_retirement else "active"
         )
-        assert manager.get_agent(child_name) is child
+        assert manager.get_agent(child_name) is None
+        assert manager._get_agent_for_lifecycle(child_name) is child
+        assert child not in manager.list_agents().values()
 
     def test_host_spawn_witness_preserves_operator_config_edits(self, tmp_path):
         config_path = tmp_path / "multi_agent.toml"

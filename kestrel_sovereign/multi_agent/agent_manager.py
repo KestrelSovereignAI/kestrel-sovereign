@@ -3628,9 +3628,7 @@ class AgentManager:
             agent._agent_manager_authority_prepared = None
         if vars(agent).get("_agent_manager") is self:
             agent._agent_manager = None
-        canonical_name = self._canonical_agent_name(name)
-        if self._fenced_agent_routes.get(canonical_name) is agent:
-            self._fenced_agent_routes.pop(canonical_name, None)
+        self._clear_withdrawn_agent_route_fence(name, agent)
         disarm_host_authority_deadline(agent)
 
     async def _discard_unpublished_initialized_agent(
@@ -5249,6 +5247,14 @@ class AgentManager:
             or (admission is not None and admission.child is agent)
         ):
             self._fenced_agent_routes[canonical_name] = agent
+
+    def _clear_withdrawn_agent_route_fence(self, name: str, agent: KestrelAgent) -> None:
+        """Drop only the removed routing owner's fence, never cleanup custody."""
+        if self._published_agent_binding(name)[1] is agent:
+            raise RuntimeError("Withdraw original public routing before clearing its fence")
+        canonical_name = self._canonical_agent_name(name)
+        if self._fenced_agent_routes.get(canonical_name) is agent:
+            self._fenced_agent_routes.pop(canonical_name, None)
 
     def fence_expired_spawn_routes(
         self,
@@ -10614,6 +10620,7 @@ class AgentManager:
                 # republishing a process whose shutdown already completed.
                 self._agents.pop(name, None)
                 self._agent_names.pop(agent.agent_id, None)
+                self._clear_withdrawn_agent_route_fence(name, agent)
                 self._non_governing_spawn_lineage.difference_update(
                     _loaded_agent_bound_dids(agent)
                 )

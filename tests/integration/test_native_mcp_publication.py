@@ -229,6 +229,9 @@ async def test_actual_manager_commit_and_withdrawal_own_the_same_mcp_generation(
         with pytest.raises(HostCapabilityAccessDenied):
             prepared.require_current()
         assert manager.get_agent("OwnedNativeMCP") is None
+        assert all(owner is not p.agent for owner in manager._fenced_agent_routes.values()), (
+            "Committed private withdrawal retained its original agent route fence"
+        )
         assert not prepared.registry.is_current(prepared.binding)
     finally:
         await prepared.close()
@@ -610,3 +613,44 @@ async def test_public_manager_removal_fences_routes_before_failed_protocol_clean
     assert manager.get_agent("OwnedNativeMCP") is None, "Public remove left a retiring agent routable after closer admission failed"
     assert agent not in manager.list_agents().values(), "Public remove left a retiring agent discoverable"
     assert manager._get_agent_for_lifecycle("OwnedNativeMCP") is agent, "Public fencing discarded private cleanup ownership"
+
+
+async def test_successful_public_removal_releases_original_route_fence(native_tool_effect_agent, tmp_path):
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    manager = AgentManager(base_data_dir=tmp_path, startup_runtime_env={}, startup_roster_enabled=False)
+    agent = await native_tool_effect_agent(did="did:owned:mcp-successful-removal")
+    assert not agent._runtime_publication_ready.is_set()
+    assert vars(agent).get("_native_mcp_publication") is None
+    async with manager.a2a_lifecycle_lease():
+        manager._register_agent("OwnedRetirement", agent)
+    assert await manager.remove_agent("OwnedRetirement") is True
+    assert manager.get_agent("OwnedRetirement") is None
+    assert manager._get_agent_for_lifecycle("OwnedRetirement") is None
+    assert all(value is not agent for value in manager._fenced_agent_routes.values()), (
+        "Successful public removal permanently retained its retired agent in the routing fence"
+    )
+
+
+async def test_route_fence_release_requires_withdrawal_and_keeps_replacement_owner(native_tool_effect_agent, tmp_path):
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    manager = AgentManager(base_data_dir=tmp_path, startup_runtime_env={}, startup_roster_enabled=False)
+    original = await native_tool_effect_agent(did="did:owned:mcp-original-fence")
+    replacement = await native_tool_effect_agent(did="did:owned:mcp-replacement-fence")
+    async with manager.a2a_lifecycle_lease():
+        manager._register_agent("OwnedFence", original)
+    manager._fence_agent_route("OwnedFence", original)
+    with pytest.raises(RuntimeError, match="Withdraw original public routing"):
+        manager._clear_withdrawn_agent_route_fence("OwnedFence", original)
+    assert manager.get_agent("OwnedFence") is None
+    assert manager._get_agent_for_lifecycle("OwnedFence") is original
+    assert await manager.remove_agent("OwnedFence") is True
+    async with manager.a2a_lifecycle_lease():
+        manager._register_agent("OwnedFence", replacement)
+    manager._fence_agent_route("OwnedFence", replacement)
+    manager._clear_withdrawn_agent_route_fence("OwnedFence", original)
+    assert manager.get_agent("OwnedFence") is None, "An old owner cleared the replacement's live route fence"
+    assert manager._get_agent_for_lifecycle("OwnedFence") is replacement
+    assert await manager.remove_agent("OwnedFence") is True
+    assert not manager._fenced_agent_routes
