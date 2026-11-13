@@ -1,20 +1,15 @@
 """Bounded, encrypted pending OAuth requests; none of these records grants access."""
 
-import hashlib
-import json
 import math
-import re
-import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from kestrel_sdk.security.aead import AEADCipher
-from kestrel_sdk.security.encryption import get_agent_key
 from kestrel_sdk.storage.database import DatabaseBackend
 from mcp.server.auth.provider import AuthorizationParams
 
 from .policy import MCPServerClient, MCPServerPolicy
+from .records import MCPAuthorizationRecords, MCPRecordKind, hash_mcp_secret, new_mcp_secret
 
 
 class PendingMCPQuotaExceeded(ValueError):
@@ -40,9 +35,7 @@ class PendingMCPAuthorizations:
 
     def __init__(self, backend: DatabaseBackend, agent_id: str, resource_url: str,
                  policy: MCPServerPolicy, *, clock: Callable[[], float] = time.time):
-        if (not isinstance(agent_id, str) or not agent_id
-                or any(ord(char) < 32 or ord(char) == 127 for char in agent_id)):
-            raise ValueError("Pending MCP authorization requires the original agent identity")
+        self._records = MCPAuthorizationRecords(agent_id, policy.max_request_bytes)
         if (not isinstance(resource_url, str) or "#" in resource_url
                 or not resource_url.startswith(policy.console_origin + "/")):
             raise ValueError("MCP resource must belong to the configured host origin")
@@ -54,18 +47,6 @@ class PendingMCPAuthorizations:
         if not math.isfinite(value) or value < 0:
             raise ValueError("MCP authorization clock must supply a finite Unix time")
         return math.floor(value)
-
-    def _handle_hash(self, handle: str) -> str:
-        if not isinstance(handle, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", handle) is None:
-            raise ValueError("Invalid pending MCP authorization handle")
-        return hashlib.sha256(handle.encode("utf-8")).hexdigest()
-
-    def _aad(self, handle_hash: str, expires_at: int) -> bytes:
-        return json.dumps(["kestrel-mcp-server-pending-v1", self.agent_id,
-            handle_hash, expires_at], separators=(",", ":")).encode()
-
-    def _cipher(self) -> AEADCipher:
-        return AEADCipher(get_agent_key(self.agent_id, "service-keys"))
 
     async def initialize(self) -> None:
         async with self.backend.transaction():
@@ -101,15 +82,12 @@ class PendingMCPAuthorizations:
     async def create(self, client_id: str, parameters: AuthorizationParams) -> str:
         if not self._currently_registered(client_id, parameters):
             raise ValueError("Pending MCP authorization requires a registered client, redirect, scopes and resource")
-        handle = secrets.token_urlsafe(32)
-        handle_hash = self._handle_hash(handle)
+        handle = new_mcp_secret()
+        handle_hash = hash_mcp_secret(handle)
         now = self._now()
         expires = now + math.ceil(self.policy.authorization_seconds)
-        raw = json.dumps({"client_id": client_id, "parameters": parameters.model_dump(mode="json")},
-            sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        if len(raw) > self.policy.max_request_bytes:
-            raise ValueError("Pending MCP authorization exceeds its storage budget")
-        ciphertext = self._cipher().encrypt(raw, aad=self._aad(handle_hash, expires)).decode("ascii")
+        ciphertext = self._records.seal(MCPRecordKind.PENDING, handle_hash, expires,
+            {"client_id": client_id, "parameters": parameters.model_dump(mode="json")})
         async with self.backend.transaction():
             # UPDATE takes the original native row lock until this transaction
             # exits; a COUNT followed by INSERT alone races on PostgreSQL.
@@ -135,8 +113,7 @@ class PendingMCPAuthorizations:
 
     def _decode(self, handle_hash: str, row) -> PendingMCPAuthorization | None:
         ciphertext, expires = row
-        raw = self._cipher().decrypt(ciphertext.encode("ascii"), aad=self._aad(handle_hash, expires))
-        value = json.loads(raw)
+        value = self._records.open(MCPRecordKind.PENDING, handle_hash, expires, ciphertext)
         client = self._registered_client(value["client_id"])
         if client is None:
             return None
@@ -154,7 +131,7 @@ class PendingMCPAuthorizations:
         return PendingMCPAuthorization(value["client_id"], expires, parameters)
 
     async def read(self, handle: str) -> PendingMCPAuthorization | None:
-        handle_hash = self._handle_hash(handle)
+        handle_hash = hash_mcp_secret(handle)
         row = await self.backend.fetch_one("""SELECT ciphertext, expires_at FROM mcp_server_oauth_pending
             WHERE agent_id = ? AND handle_hash = ? AND consumed = 0 AND expires_at > ?""",
             (self.agent_id, handle_hash, self._now()))
@@ -162,7 +139,7 @@ class PendingMCPAuthorizations:
 
     async def claim(self, handle: str) -> PendingMCPAuthorization | None:
         """Consume once inside the consent owner's transaction; this mints no grant."""
-        handle_hash = self._handle_hash(handle)
+        handle_hash = hash_mcp_secret(handle)
         async with self.backend.transaction():
             await self._lock_capacity()
             row = await self.backend.fetch_one("""SELECT ciphertext, expires_at FROM mcp_server_oauth_pending
