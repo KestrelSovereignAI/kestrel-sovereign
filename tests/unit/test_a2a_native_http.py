@@ -32,6 +32,7 @@ from kestrel_sdk.native_a2a.types import (
     TaskState,
 )
 from kestrel_sdk.native_a2a.utils.errors import (
+    ContentTypeNotSupportedError,
     InternalError,
     InvalidParamsError,
     PushNotificationNotSupportedError,
@@ -181,42 +182,52 @@ async def submit(wire):
     return events[0].task
 
 
-@pytest.mark.parametrize('headers,query,accepted', [
-    ([], ['1.0.9'], True),
-    ([], ['0.3'], False),
-    (['1.0'], ['0.3'], False),
-    (['0.3'], ['1.0'], False),
-    (['1.0', '0.3'], ['1.0'], False),
-    ([], ['1.0', '0.3'], False),
-    (['1.0'], ['1.0.9'], True),
-    ([], [], False),
-])
-async def test_signed_http_version_carriers_are_validated_before_task_admission(wire, headers, query, accepted):
+@pytest.mark.parametrize(
+    "headers,query,accepted",
+    [
+        ([], ["1.0.9"], True),
+        ([], ["0.3"], False),
+        (["1.0"], ["0.3"], False),
+        (["0.3"], ["1.0"], False),
+        (["1.0", "0.3"], ["1.0"], False),
+        ([], ["1.0", "0.3"], False),
+        (["1.0"], ["1.0.9"], True),
+        ([], [], False),
+    ],
+)
+async def test_signed_http_version_carriers_are_validated_before_task_admission(
+    wire, headers, query, accepted
+):
     from kestrel_sdk.native_a2a.utils.errors import VersionNotSupportedError
 
     async def carry_version(outgoing):
         # Leave the actual SDK request and DID proof intact. Choose only the
         # standard HTTP version carriers at the real transport boundary.
-        outgoing.headers.pop('A2A-Version', None)
-        outgoing.headers = httpx.Headers([
-            *outgoing.headers.multi_items(),
-            *(('A2A-Version', value) for value in headers),
-        ])
+        outgoing.headers.pop("A2A-Version", None)
+        outgoing.headers = httpx.Headers(
+            [
+                *outgoing.headers.multi_items(),
+                *(("A2A-Version", value) for value in headers),
+            ]
+        )
         url = outgoing.url
         for value in query:
-            url = url.copy_add_param('A2A-Version', value)
+            url = url.copy_add_param("A2A-Version", value)
         outgoing.url = url
 
-    wire.http.event_hooks['request'].append(carry_version)
+    wire.http.event_hooks["request"].append(carry_version)
     if accepted:
         task = await submit(wire)
-        assert task.id and task.status.HasField('timestamp')
+        assert task.id and task.status.HasField("timestamp")
         assert len(wire.submissions) == 1
     else:
         with pytest.raises(VersionNotSupportedError):
             await submit(wire)
         assert wire.submissions == []
-        assert await wire.manager.task_store.backend.fetch_all('SELECT id FROM a2a_tasks') == []
+        assert (
+            await wire.manager.task_store.backend.fetch_all("SELECT id FROM a2a_tasks")
+            == []
+        )
 
 
 async def test_inline_callback_requires_the_advertised_push_capability(wire):
@@ -233,8 +244,16 @@ async def test_empty_text_returns_native_invalid_params_before_admission(wire):
     with pytest.raises(InvalidParamsError):
         _ = [event async for event in wire.client().send_message(params)]
     assert not wire.submissions
-    assert await wire.manager.task_store.backend.fetch_all("SELECT id FROM a2a_tasks") == []
-    assert await wire.manager.task_store.backend.fetch_all("SELECT context_id FROM a2a_contexts") == []
+    assert (
+        await wire.manager.task_store.backend.fetch_all("SELECT id FROM a2a_tasks")
+        == []
+    )
+    assert (
+        await wire.manager.task_store.backend.fetch_all(
+            "SELECT context_id FROM a2a_contexts"
+        )
+        == []
+    )
 
 
 async def test_sdk_send_get_list_and_cancel_share_native_durable_authority(wire):
@@ -628,7 +647,18 @@ async def test_revocation_before_the_first_stream_event_exposes_no_snapshot(wire
         await events.aclose()
 
 
-async def test_terminal_cancel_and_subscribe_return_standard_lifecycle_errors(wire):
+async def test_terminal_cancel_and_subscribe_return_standard_lifecycle_errors(
+    wire, monkeypatch
+):
+    sources = []
+    subscribe = wire.manager.subscribe
+
+    def observe_original(*args, **kwargs):
+        source = subscribe(*args, **kwargs)
+        sources.append(source)
+        return source
+
+    monkeypatch.setattr(wire.manager, "subscribe", observe_original)
     task = await submit(wire)
     await wire.manager.complete_task(
         task.id, "done", recipient_agent_id=wire.admission.scope.recipient_id
@@ -642,6 +672,183 @@ async def test_terminal_cancel_and_subscribe_return_standard_lifecycle_errors(wi
             SubscribeToTaskRequest(id=task.id, tenant=wire.admission.scope.tenant)
         ):
             pytest.fail("A terminal task started a new subscription")
+    assert len(sources) == 1 and sources[0].ag_frame is None
+    assert not wire.manager._subscribers
+
+
+@pytest.mark.parametrize("operation", ["send", "subscribe"])
+async def test_streaming_capability_refusal_keeps_standard_error_after_authority_exit(
+    wire, operation
+):
+    # The real caller card remains streaming-capable to exercise the server's
+    # independently held configuration rather than a client-side refusal.
+    wire.handler._card.capabilities.streaming = False
+    client = wire.client(streaming=True)
+    with pytest.raises(UnsupportedOperationError):
+        if operation == "send":
+            async for _ in client.send_message(send(wire.admission)):
+                pytest.fail("Unadvertised streaming dispatched task work")
+        else:
+            async for _ in client.subscribe(
+                SubscribeToTaskRequest(id="missing", tenant=wire.admission.scope.tenant)
+            ):
+                pytest.fail("Unadvertised streaming opened a subscription")
+    assert wire.admission.state.authorizations == [SENDER]
+    assert not wire.admission.lock.locked()
+    assert not wire.manager._subscribers
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+
+
+async def test_missing_subscription_keeps_standard_error_after_original_source_close(
+    wire,
+):
+    with pytest.raises(TaskNotFoundError):
+        async for _ in wire.client(streaming=True).subscribe(
+            SubscribeToTaskRequest(id="missing", tenant=wire.admission.scope.tenant)
+        ):
+            pytest.fail("A missing task exposed a subscription snapshot")
+    assert not wire.admission.lock.locked()
+    assert not wire.manager._subscribers
+
+
+@pytest.mark.parametrize(
+    "refusal,error_type",
+    [
+        ("history", InvalidParamsError),
+        ("output-mode", ContentTypeNotSupportedError),
+        ("input-mode", ContentTypeNotSupportedError),
+        ("missing-continuation", TaskNotFoundError),
+    ],
+)
+async def test_stream_send_validation_refusals_keep_protocol_errors(
+    wire, refusal, error_type
+):
+    params = send(wire.admission)
+    if refusal == "history":
+        params.configuration.history_length = -1
+    elif refusal == "output-mode":
+        params.configuration.accepted_output_modes.append("image/png")
+    elif refusal == "input-mode":
+        params.message.parts[0].media_type = "image/png"
+    else:
+        params.message.task_id = "missing"
+    with pytest.raises(error_type):
+        async for _ in wire.client(streaming=True).send_message(params):
+            pytest.fail("Invalid streaming input dispatched business work")
+    assert not wire.admission.lock.locked()
+    assert not wire.manager._subscribers
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+
+
+async def test_domain_typed_actual_authority_exit_failure_is_not_protocol_refusal(
+    wire, monkeypatch
+):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.a2a.stores.unified.task_store import TaskInputConflictError
+    from kestrel_sovereign.execution_custody import (
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
+
+    guard_type = type(wire.admission.guard)
+    hold = guard_type.hold_authority
+    reserve = wire.manager.context_store.reserve
+    original = TaskInputConflictError(
+        "Actual native authority exit acknowledgement failed"
+    )
+    armed = False
+    witnesses = []
+
+    async def arm_after_original_reservation(*args, **kwargs):
+        nonlocal armed
+        result = await reserve(*args, **kwargs)
+        armed = True
+        return result
+
+    @asynccontextmanager
+    async def lose_original_authority_ack(guard, admitted):
+        nonlocal armed
+        async with hold(guard, admitted):
+            yield
+        if guard is wire.admission.guard and armed:
+            armed = False
+            assert not wire.admission.lock.locked()
+            witnesses.append(asyncio.current_task())
+            raise original
+
+    monkeypatch.setattr(
+        wire.manager.context_store, "reserve", arm_after_original_reservation
+    )
+    monkeypatch.setattr(guard_type, "hold_authority", lose_original_authority_ack)
+    with pytest.raises(BaseException) as failed:
+        async for _ in wire.client(streaming=True).send_message(send(wire.admission)):
+            pytest.fail("An actual failed authority exit became protocol data")
+    assert len(witnesses) == 1
+    assert is_execution_control_error(failed.value)
+    assert any(error is original for error in execution_evidence_carriers(failed.value))
+
+
+@pytest.mark.parametrize(
+    "domain", ["input-conflict", "input-unsupported", "push-unavailable"]
+)
+async def test_domain_typed_actual_postgres_release_failure_is_not_protocol_refusal(
+    wire, monkeypatch, domain
+):
+    """Physical error origin, not its domain class, decides source failure."""
+    if wire.admission.backend.backend_type != "postgres":
+        pytest.skip("The release witness is the actual PostgreSQL pool context")
+    import asyncpg
+    from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
+    from kestrel_sovereign.a2a.stores.unified.task_store import (
+        TaskInputConflictError,
+        TaskInputUnsupportedError,
+    )
+    from kestrel_sovereign.execution_custody import (
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
+
+    error_type = {
+        "input-conflict": TaskInputConflictError,
+        "input-unsupported": TaskInputUnsupportedError,
+        "push-unavailable": PushServiceUnavailable,
+    }[domain]
+    original = error_type("Actual PostgreSQL release acknowledgement failed")
+    reserve = wire.manager.context_store.reserve
+    exit_pool = asyncpg.pool.PoolAcquireContext.__aexit__
+    armed = False
+    witnesses = []
+
+    async def arm_after_original_reservation(*args, **kwargs):
+        nonlocal armed
+        result = await reserve(*args, **kwargs)
+        armed = True
+        return result
+
+    async def lose_original_release_ack(checkout, typ, error, traceback):
+        nonlocal armed
+        result = await exit_pool(checkout, typ, error, traceback)
+        if armed and typ is None:
+            armed = False
+            witnesses.append(asyncio.current_task())
+            raise original
+        return result
+
+    monkeypatch.setattr(
+        wire.manager.context_store, "reserve", arm_after_original_reservation
+    )
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            asyncpg.pool.PoolAcquireContext, "__aexit__", lose_original_release_ack
+        )
+        with pytest.raises(BaseException) as failed:
+            async for _ in wire.client(streaming=True).send_message(
+                send(wire.admission)
+            ):
+                pytest.fail("An actual failed database release became protocol data")
+    assert len(witnesses) == 1
+    assert is_execution_control_error(failed.value)
+    assert any(error is original for error in execution_evidence_carriers(failed.value))
 
 
 @pytest.mark.parametrize(
@@ -805,7 +1012,8 @@ async def test_native_http_stream_uses_actual_admitted_core_source_owner(wire):
     async def complete_original():
         await wire.submitted.wait()
         await wire.manager.complete_task(
-            wire.submissions[0].task.id, "original native snapshot",
+            wire.submissions[0].task.id,
+            "original native snapshot",
             recipient_agent_id=wire.admission.scope.recipient_id,
         )
 
@@ -821,7 +1029,10 @@ async def test_native_http_stream_uses_actual_admitted_core_source_owner(wire):
 
             with bind_native_execution_admission(require_original_membership):
                 events = [
-                    event async for event in wire.client(streaming=True).send_message(send(wire.admission))
+                    event
+                    async for event in wire.client(streaming=True).send_message(
+                        send(wire.admission)
+                    )
                 ]
             assert events and events[0].task.id == wire.submissions[0].task.id
             originals = set(observed) - {root}
@@ -895,7 +1106,10 @@ async def test_native_server_refuses_unsupported_or_malformed_input_before_task_
     wire, mime
 ):
     from kestrel_sdk.native_a2a.types import Part
-    from kestrel_sdk.native_a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+    from kestrel_sdk.native_a2a.utils.errors import (
+        ContentTypeNotSupportedError,
+        InvalidParamsError,
+    )
 
     params = send(wire.admission)
     params.message.parts.append(Part(raw=b"not fetched or admitted", media_type=mime))
