@@ -71,7 +71,7 @@ class PendingMCPAuthorizations:
             and bool(parameters.scopes) and set(parameters.scopes) <= set(client.scopes))
 
     def _registered_client(self, client_id: str) -> MCPServerClient | None:
-        return next((row for row in self.policy.clients if row.client_id == client_id), None)
+        return self.policy.registered_client(client_id)
 
     async def _lock_capacity(self) -> None:
         capacity = await self.backend.fetch_one("UPDATE mcp_server_oauth_capacity SET revision = revision + 1 WHERE agent_id = ? RETURNING revision",

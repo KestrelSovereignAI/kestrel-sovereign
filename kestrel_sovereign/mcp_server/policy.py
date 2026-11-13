@@ -117,3 +117,7 @@ class MCPServerPolicy(BaseModel):
     def from_environment(cls, environ: Mapping[str, str]) -> Self | None:
         raw = environ.get("KESTREL_MCP_SERVER")
         return None if raw is None else cls.model_validate_json(raw)
+
+    def registered_client(self, client_id: str) -> MCPServerClient | None:
+        """Resolve the current explicit registration without fetching client metadata."""
+        return next((client for client in self.clients if client.client_id == client_id), None)
