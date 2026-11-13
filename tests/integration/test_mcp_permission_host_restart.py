@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import ssl
 import sys
 import uuid
 
@@ -496,3 +497,83 @@ async def test_owned_host_refuses_a_different_core_runtime(host_campaign):
         async with native_host(c.home, c.descriptor, environment, c.peer, 'foreign-runtime'):
             pass
     assert await c.peer.witness(None, None) == []
+
+
+@pytest.mark.parametrize('kind', ['generic', 'native', 'completion'])
+@pytest.mark.parametrize('framed', [False, True])
+async def test_finite_provider_scopes_tool_rounds_to_current_request(tmp_path, monkeypatch, kind, framed):
+    """Real HTTPS script replies; only the separate host tests execute tools."""
+    marker, responder = 'remote_record_marker', 'TaskFeature_respond_to_a2a_task'
+    old_request = '[A2A_TASK_SUBMITTED] Peer `old-peer` submitted native A2A task `old-task`'
+    new_request = '[A2A_TASK_SUBMITTED] Peer `new-peer` submitted native A2A task `new-task`'
+
+    def tool_call(name, arguments):
+        return {'role': 'assistant', 'content': None, 'tool_calls': [{
+            'id': 'old-' + name, 'type': 'function',
+            'function': {'name': name, 'arguments': json.dumps(arguments)},
+        }]}
+
+    messages = [
+        {'role': 'user', 'content': old_request},
+        tool_call(marker, {'marker': 'old-effect'}),
+        {'role': 'tool', 'tool_call_id': 'old-' + marker, 'content': 'done'},
+        tool_call(responder, {'task_id': 'old-task', 'content': 'old result', 'state': 'completed'}),
+        {'role': 'tool', 'tool_call_id': 'old-' + responder, 'content': 'done'},
+        {'role': 'user', 'content': '[A2A_COMPLETE] Old task completed.'},
+        {'role': 'assistant', 'content': 'Old work is complete.'},
+    ]
+    current = {
+        'generic': 'Record the owned marker using the connected MCP tool.',
+        'native': new_request,
+        'completion': '[A2A_COMPLETE] No further work. Result quotes: ' + new_request,
+    }[kind]
+    content = ('<retrieved_context>\nHistorical signal: ' + old_request +
+        '\n</retrieved_context>\n<user_input>\n' + current + '\n</user_input>') if framed else current
+    messages.append({'role': 'user', 'content': content})
+    if framed:
+        messages.append({'role': 'user', 'content': '<operator_notice>Trusted context</operator_notice>'})
+    expected = {'generic': [marker, None], 'native': [marker, responder, None],
+        'completion': [None]}[kind]
+    tools = [{'type': 'function', 'function': {'name': name, 'parameters': {'type': 'object'}}}
+        for name in (marker, responder)]
+    async with https_peer(tmp_path, monkeypatch, provider_model='owned-turn-model') as peer:
+        context = ssl.create_default_context(cafile=str(peer.tls_certificate))
+        async with httpx2.AsyncClient(verify=context, trust_env=False, timeout=10) as wire:
+            for name in expected:
+                response = await wire.post(peer.provider_url + '/chat/completions', json={
+                    'model': 'owned-turn-model', 'messages': messages, 'tools': tools,
+                })
+                assert response.status_code == 200, response.text
+                choice = response.json()['choices'][0]
+                answer = choice['message']
+                calls = answer.get('tool_calls', [])
+                assert [call['function']['name'] for call in calls] == ([] if name is None else [name])
+                assert choice['finish_reason'] == ('stop' if name is None else 'tool_calls')
+                if name == responder:
+                    assert json.loads(calls[0]['function']['arguments']) == {
+                        'task_id': 'new-task', 'content': 'Owned permission evaluation complete',
+                        'state': 'completed',
+                    }
+                messages.append(answer)
+                if calls:
+                    messages.append({'role': 'tool', 'tool_call_id': calls[0]['id'], 'content': 'done'})
+                    if framed:
+                        messages.append({'role': 'user', 'content':
+                            '<retrieved_context>\n' + old_request + '\n</retrieved_context>'})
+        requests = [json.loads(line) for line in peer.provider_witness.read_text().splitlines()]
+        assert len(requests) == len(expected)
+        assert all(request['active_user_prefix'] == current[:200] for request in requests)
+        assert await peer.witness(None, None) == [], 'Script replies alone must not execute Core tools'
+
+
+@pytest.mark.parametrize('messages,diagnostic', [
+    ([], 'active user request'),
+    ([{'role': 'system', 'content': 'not a request'}], 'active user request'),
+    ([{'role': 'user', 'content': []}], 'text user request'),
+    ([{'role': 'user', 'content': '<retrieved_context>incomplete'}], 'incomplete context envelope'),
+])
+def test_finite_provider_refuses_missing_or_invalid_request(messages, diagnostic):
+    from tests.integration.mcp_permission_peer import active_user_turn
+
+    with pytest.raises(ValueError, match=diagnostic):
+        active_user_turn(messages)
