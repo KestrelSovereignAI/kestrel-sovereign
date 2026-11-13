@@ -4,7 +4,11 @@ import hashlib
 from dataclasses import dataclass, field
 
 import rfc8785
-from kestrel_sdk.native_a2a.types import SendMessageRequest, TaskPushNotificationConfig
+from kestrel_sdk.native_a2a.types import (
+    Role,
+    SendMessageRequest,
+    TaskPushNotificationConfig,
+)
 from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict, MessageToJson
@@ -73,6 +77,8 @@ def prepare_native_task_input(request: SendMessageRequest) -> NativeTaskInput:
     """
     if not isinstance(request, SendMessageRequest):
         raise TypeError("Task input requires an official SendMessageRequest")
+    if request.message.role != Role.ROLE_USER:
+        raise InvalidParamsError(message="Task admission requires a user message")
     execution = SendMessageRequest.FromString(request.SerializeToString())
     wire_digest = native_request_digest(execution, "SendMessage")
     # The executor requires nonempty text. Apply that business constraint to

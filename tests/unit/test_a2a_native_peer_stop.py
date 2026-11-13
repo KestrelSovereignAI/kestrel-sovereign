@@ -10,7 +10,10 @@ import pytest_asyncio
 from kestrel_sdk.native_a2a.client.errors import A2AClientError
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
 from kestrel_sdk.native_a2a.types import Message, Role, SendMessageRequest
-from kestrel_sdk.native_a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+from kestrel_sdk.native_a2a.utils.errors import (
+    ContentTypeNotSupportedError,
+    InvalidParamsError,
+)
 from starlette.applications import Starlette
 
 from kestrel_sovereign.a2a.extensions import (
@@ -217,16 +220,17 @@ async def test_peer_stop_cannot_attach_a_callback_to_its_taskless_message(
 
 
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("reason", ["Please stop", None])
 async def test_native_stop_returns_receipted_control_without_task_or_cognition(
-    control, streaming
+    control, streaming, reason
 ):
     agent = control.rail.agent
     agent._active_request_ids.add("turn-1")
-    result = await receipt(control, streaming=streaming)
+    result = await receipt(control, request(reason=reason), streaming=streaming)
     assert result["recorded"] is True and result["receipt_kind"] == "operation"
     assert result["stop_outcomes"][0]["disposition"] == "stopped"
     assert agent.cancelled == ["turn-1"]
-    replay = await receipt(control, streaming=streaming)
+    replay = await receipt(control, request(reason=reason), streaming=streaming)
     assert replay["stop_outcomes"] == result["stop_outcomes"]
     assert agent.cancelled == ["turn-1"]
     page = await control.rail.receipts.list_receipts(limit=10)

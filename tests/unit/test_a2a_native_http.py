@@ -307,7 +307,10 @@ async def test_unknown_or_foreign_task_has_the_same_native_not_found_result(wire
     assert not listing.tasks and listing.total_size == 0
 
 
-async def test_foreign_context_is_denied_without_a_task_or_submission_wake(wire):
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_foreign_context_is_denied_without_a_task_or_submission_wake(
+    wire, streaming
+):
     other = await wire.manager.create_task(
         send(wire.admission), creator_agent_id="did:kestrel:other-principal"
     )
@@ -315,7 +318,7 @@ async def test_foreign_context_is_denied_without_a_task_or_submission_wake(wire)
     params = send(wire.admission)
     params.message.context_id = other.context_id
     with pytest.raises(A2AClientError, match="403"):
-        async for _ in wire.client().send_message(params):
+        async for _ in wire.client(streaming=streaming).send_message(params):
             pytest.fail("A foreign context admitted a task")
     rows = await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks")
     assert rows == [(other.id,)]
@@ -789,7 +792,8 @@ async def test_domain_typed_actual_authority_exit_failure_is_not_protocol_refusa
 
 
 @pytest.mark.parametrize(
-    "domain", ["input-conflict", "input-unsupported", "push-unavailable"]
+    "domain",
+    ["input-conflict", "input-unsupported", "push-unavailable", "context-conflict"],
 )
 async def test_domain_typed_actual_postgres_release_failure_is_not_protocol_refusal(
     wire, monkeypatch, domain
@@ -798,6 +802,7 @@ async def test_domain_typed_actual_postgres_release_failure_is_not_protocol_refu
     if wire.admission.backend.backend_type != "postgres":
         pytest.skip("The release witness is the actual PostgreSQL pool context")
     import asyncpg
+    from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnershipError
     from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
     from kestrel_sovereign.a2a.stores.unified.task_store import (
         TaskInputConflictError,
@@ -812,6 +817,7 @@ async def test_domain_typed_actual_postgres_release_failure_is_not_protocol_refu
         "input-conflict": TaskInputConflictError,
         "input-unsupported": TaskInputUnsupportedError,
         "push-unavailable": PushServiceUnavailable,
+        "context-conflict": ContextOwnershipError,
     }[domain]
     original = error_type("Actual PostgreSQL release acknowledgement failed")
     reserve = wire.manager.context_store.reserve
@@ -1140,3 +1146,182 @@ async def test_native_metadata_cannot_activate_its_own_optional_extension(wire):
         async for _ in wire.client(polling=False).send_message(params):
             pytest.fail("URI metadata is not extension negotiation")
     assert not wire.submissions
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("invalid", ["agent-role", "empty-text"])
+async def test_canonical_input_refusals_remain_standard_before_any_admission(
+    wire, streaming, invalid
+):
+    from kestrel_sdk.native_a2a.types import Role
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    params = send(wire.admission)
+    if invalid == "agent-role":
+        params.message.role = Role.ROLE_AGENT
+    else:
+        params.message.parts[0].text = ""
+    with pytest.raises(InvalidParamsError) as refused:
+        async for _ in wire.client(streaming=streaming).send_message(params):
+            pytest.fail("Invalid input must not admit or return a task")
+    assert not is_execution_control_error(refused.value)
+    assert not wire.submissions
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not wire.manager._subscribers
+    assert not wire.admission.lock.locked()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_raw_http_invalid_tenant_is_protocol_data_not_source_failure(
+    wire, streaming
+):
+    from google.protobuf.json_format import MessageToDict
+
+    params = send(wire.admission)
+    params.tenant = "foreign"
+    body = MessageToDict(params)
+    if wire.protocol == "JSONRPC":
+        path = wire.binding.prefix + "/rpc"
+        body = {
+            "jsonrpc": "2.0",
+            "id": "tenant-refusal",
+            "method": "SendStreamingMessage" if streaming else "SendMessage",
+            "params": body,
+        }
+    else:
+        path = (
+            wire.binding.prefix
+            + "/tenant-alpha/"
+            + ("message:stream" if streaming else "message:send")
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            Starlette(routes=[wire.binding.route]), raise_app_exceptions=False
+        ),
+        base_url="http://native-core.test",
+        headers=dict(wire.http.headers),
+    ) as actual:
+        response = await actual.post(path, json=body)
+    assert response.status_code == (200 if wire.protocol == "JSONRPC" else 400)
+    assert "tenant" in response.text.lower()
+    assert not wire.submissions
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not wire.admission.lock.locked()
+
+
+@pytest.mark.parametrize("operation", ["send", "subscribe"])
+@pytest.mark.parametrize("refusal", ["missing-proof", "policy-denial"])
+@pytest.mark.parametrize("fail_original_exit", [False, True])
+async def test_stream_admission_http_refusal_retires_before_status_and_challenge(
+    wire, operation, refusal, fail_original_exit, monkeypatch
+):
+    from contextlib import asynccontextmanager
+    from google.protobuf.json_format import MessageToDict
+    from kestrel_sovereign.execution_custody import (
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
+
+    statuses = []
+    failures = []
+    physical = HTTPException(401, detail="actual original lease exit failed")
+    if fail_original_exit:
+        original_lease = wire.handler.guard.lifecycle_lease
+
+        @asynccontextmanager
+        async def failed_original_exit():
+            async with original_lease():
+                yield
+            raise physical
+
+        monkeypatch.setattr(
+            wire.handler,
+            "guard",
+            replace(wire.handler.guard, lifecycle_lease=failed_original_exit),
+        )
+    original_app = Starlette(routes=[wire.binding.route])
+
+    async def checked_app(scope, receive, send_response):
+        async def checked_send(message):
+            if message["type"] == "http.response.start":
+                assert not wire.admission.lock.locked()
+                statuses.append(message["status"])
+            await send_response(message)
+
+        try:
+            await original_app(scope, receive, checked_send)
+        except BaseException as error:
+            failures.append(error)
+            raise
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(checked_app, raise_app_exceptions=False),
+        base_url="http://native-core.test",
+        headers=dict(wire.http.headers),
+    ) as actual:
+        if refusal == "missing-proof":
+            params = (
+                send(wire.admission)
+                if operation == "send"
+                else SubscribeToTaskRequest(
+                    id="unknown", tenant=wire.admission.scope.tenant
+                )
+            )
+            if wire.protocol == "JSONRPC":
+                path = wire.binding.prefix + "/rpc"
+                body = {
+                    "jsonrpc": "2.0",
+                    "id": "refusal",
+                    "method": "SendStreamingMessage"
+                    if operation == "send"
+                    else "SubscribeToTask",
+                    "params": MessageToDict(params),
+                }
+            else:
+                path = (
+                    wire.binding.prefix
+                    + "/tenant-alpha/"
+                    + (
+                        "message:stream"
+                        if operation == "send"
+                        else "tasks/unknown:subscribe"
+                    )
+                )
+                body = MessageToDict(params) if operation == "send" else {}
+            response = await actual.post(path, json=body)
+            assert response.status_code == (500 if fail_original_exit else 401)
+            if not fail_original_exit:
+                assert response.headers["www-authenticate"].startswith(
+                    "Kestrel-A2A-Sender-Proof"
+                )
+        else:
+            await wire.admission.backend.execute("DELETE FROM native_test_principals")
+            client = wire.client(streaming=True, http_client=actual)
+            stream = (
+                client.send_message(send(wire.admission))
+                if operation == "send"
+                else client.subscribe(
+                    SubscribeToTaskRequest(
+                        id="unknown", tenant=wire.admission.scope.tenant
+                    )
+                )
+            )
+            with pytest.raises(
+                A2AClientError, match="500" if fail_original_exit else "403"
+            ):
+                async for _ in stream:
+                    pytest.fail("A denied sender must not receive a native event")
+    assert statuses == [
+        500 if fail_original_exit else 401 if refusal == "missing-proof" else 403
+    ]
+    if fail_original_exit:
+        assert len(failures) == 1 and is_execution_control_error(failures[0])
+        assert any(
+            error is physical for error in execution_evidence_carriers(failures[0])
+        )
+    else:
+        assert not failures
+    assert not wire.submissions
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not wire.manager._subscribers
+    assert not wire.admission.lock.locked()

@@ -32,7 +32,10 @@ from kestrel_sdk.native_a2a.types import (
     TaskState,
     TaskStatus,
 )
-from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError, UnsupportedOperationError
+from kestrel_sdk.native_a2a.utils.errors import (
+    InvalidParamsError,
+    UnsupportedOperationError,
+)
 from google.protobuf.json_format import MessageToDict
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -452,3 +455,45 @@ def test_missing_identity_or_unsupported_binding_fails_at_registration(field, va
     values[field] = value
     with pytest.raises(ValueError):
         NativeRecipientBinding(**values)
+
+
+@pytest.mark.parametrize("refusal_values", [False, True])
+@pytest.mark.parametrize("protocol_error", [False, True])
+async def test_original_http_body_failure_is_never_pure_validation_data(
+    refusal_values, protocol_error
+):
+    import os
+
+    descriptor = os.open(os.devnull, os.O_WRONLY)
+    originals = []
+
+    async def failed_receive():
+        try:
+            os.read(descriptor, 1)
+        except OSError as physical:
+            if protocol_error:
+                error = InvalidParamsError(
+                    message="actual original body-reader failure"
+                )
+                originals.append(error)
+                raise error from physical
+            originals.append(physical)
+            raise
+        pytest.fail("Reading the original write-only descriptor must fail")
+
+    try:
+        context = _direct_context(failed_receive)
+        with pytest.raises(InvalidParamsError if protocol_error else OSError) as caught:
+            await bind_native_request(
+                GetTaskRequest(id="known-task"),
+                context,
+                routing_key="registered-agent",
+                scope=NativeRecipientScope("did:test:recipient"),
+                refusal_values=refusal_values,
+            )
+        assert caught.value is originals[0]
+        if protocol_error:
+            assert isinstance(caught.value.__cause__, OSError)
+        os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
