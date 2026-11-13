@@ -359,7 +359,9 @@ async def test_held_a2a_wake_is_drained_automatically_after_release(
 
     handle = await c.dispatcher.enqueue_durable_cognition(
         build_signal_for_submitted_task(snapshot, target_agent=c.agent.did),
-        source_event_id=submitted_input_identity(task.id, snapshot.input_revision),
+        source_event_id=(
+            await manager.get_wake_obligation(task.id, snapshot.input_revision)
+        ).identity,
         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
     )
     admission = await handle.wait_for_durable_admission()

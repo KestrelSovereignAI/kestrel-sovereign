@@ -45,7 +45,8 @@ async def retry_pair(
     signal = (a2a.build_signal_for_completed_task(candidate, manager.did) if completed
               else a2a_task_submitted.build_signal_for_submitted_task(candidate, manager.did))
     consumer_id = source.DURABLE_COGNITION_CONSUMER_ID
-    identity = task.id if completed else a2a_task_submitted.submitted_input_identity(task.id, 0)
+    # A submission wake is admitted at its input's owed obligation (#4041).
+    identity = task.id if completed else (await manager.get_wake_obligation(task.id, 0)).identity
     agent_a, dispatcher_a, _ = await input_dispatcher(manager, private=private)
     backend_b = native_a2a_backend_factory()
     await backend_b.connect()

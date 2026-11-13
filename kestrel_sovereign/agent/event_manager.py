@@ -237,20 +237,17 @@ class EventManagerMixin:
         retry in-process, while boot reconciliation covers process loss.
         """
 
+        from kestrel_sovereign.a2a.wake_obligations import OWED
         from kestrel_sovereign.signals import DurableAdmissionDisposition
         from kestrel_sovereign.signals.delivery import (
             ACCEPTED_STATUSES,
             await_terminal_delivery,
         )
-        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-            submitted_input_identity,
-        )
 
-        source_event_id = (
-            submitted_input_identity(task_id, input_revision)
-            if cancellation_aware
-            else task_id
-        )
+        # A submission wake is admitted for its input's owed obligation, at
+        # that obligation's generation (#4041); a completion wake keys on its
+        # task.
+        source_event_id = task_id
         delay = A2A_WAKE_RETRY_INITIAL_SECONDS
         pending = vars(self).setdefault("_a2a_submitted_signal_handles", {})
         # A retry loop must terminate on a condition retrying cannot change.
@@ -323,6 +320,26 @@ class EventManagerMixin:
                     or snapshot.input_revision != input_revision
                 ):
                     return
+                try:
+                    obligation = await self.task_manager.get_wake_obligation(
+                        task_id, input_revision
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logging.warning(
+                        "%s: wake-obligation read failed; retrying durable wake: %s",
+                        label,
+                        exc,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
+                    continue
+                if obligation is None or obligation.state != OWED:
+                    # Its wake was admitted, ran or was settled: nothing owed.
+                    return
+                source_event_id = obligation.identity
             try:
                 # Dispatch mutates normalization and causation state in-place.
                 # A persistence retry must therefore start from a fresh source
@@ -412,11 +429,11 @@ class EventManagerMixin:
                         label,
                         outcome.describe(),
                     )
-                retry = (
-                    admission is not None
-                    and admission.disposition
-                    is DurableAdmissionDisposition.NOT_ADMITTED
-                )
+                retry = admission is not None and admission.disposition in {
+                    DurableAdmissionDisposition.NOT_ADMITTED,
+                    # The obligation moved on; the next pass re-reads it.
+                    DurableAdmissionDisposition.REFUSED,
+                }
             finally:
                 if cancellation_aware and pending.get(task_id) is handle:
                     pending.pop(task_id, None)
@@ -710,22 +727,22 @@ class EventManagerMixin:
         )
 
     async def reconcile_a2a_cognition_wakes(self) -> None:
-        """Recreate any A2A wake lost after its authoritative task commit.
+        """Settle, then admit every owed input's wake, then replay completions.
 
-        Task callbacks cannot be atomic with the asynchronous signal ledger.
-        Boot therefore treats TaskStore as the outbox authority and idempotently
-        replays candidates before durable drainers are allowed to consume
-        privacy-elided marker rows.
+        Task callbacks cannot be atomic with the asynchronous signal ledger,
+        so boot reconciles from durable truth before the drainers start. For
+        submission wakes that truth is the input's wake obligation (#4041):
+        the first settlement pass runs here, then every ``owed`` obligation is
+        admitted at its own generation. Its identity names that generation, so
+        it never deduplicates against an earlier wake of the same input. An
+        owed obligation whose task no longer holds that input is released.
 
-        Deduplication is the durable event row, which retention deletes. A
-        wake is admitted no earlier than the lifecycle change that minted it,
-        so its row outlives that change by at least the source's retention.
-        Each candidate is therefore bounded by its own source's retention,
-        measured from the lifecycle change -- live and terminal alike. Past
-        that, a missing row is not evidence of a lost wake, and replaying it
-        would recreate the wake once every retention period.
+        Completion wakes still replay from TaskStore within their source's
+        retention: deduplication is their durable event row, and past its
+        retention a missing row is not evidence of a lost wake.
         """
 
+        from kestrel_sovereign.a2a.wake_obligations import OWED
         from kestrel_sovereign.signals import DurableAdmissionDisposition
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
@@ -737,14 +754,7 @@ class EventManagerMixin:
             build_signal_for_completed_task,
         )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-            DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
-        )
-        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             SOURCE_NAME as SUBMITTED_SOURCE,
-        )
-        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-            build_signal_for_submitted_task,
-            submitted_input_identity,
         )
 
         now = datetime.now(UTC)
@@ -757,60 +767,50 @@ class EventManagerMixin:
                     "registration to bound its replay window"
                 )
             horizons[source] = now - timedelta(days=registration.retention_days)
+
+        await self.dispatcher.run_wake_settlement_pass()
+        unadmitted: list[str] = []
+        obligations = self.task_manager.task_store.obligations
+        after = None
+        while True:
+            page = await obligations.list_by_state(
+                agent_id=self.did, state=OWED, after=after
+            )
+            for obligation in page:
+                disposition = await self._admit_owed_wake(obligation)
+                if disposition is DurableAdmissionDisposition.NOT_ADMITTED:
+                    unadmitted.append(obligation.task_id)
+                elif disposition is DurableAdmissionDisposition.DELIVERY_FAILED:
+                    logging.warning(
+                        "A2A cognition wake for task %s already failed "
+                        "terminally; its settlement owns it",
+                        obligation.task_id,
+                    )
+            if not page:
+                break
+            after = (page[-1].task_id, page[-1].input_revision)
+
         tasks = await self.task_manager.list_cognition_wake_candidates(
             recipient_agent_id=self.did,
             live_changed_since=horizons[SUBMITTED_SOURCE],
             terminal_changed_since=horizons[COMPLETE_SOURCE],
         )
-        unadmitted: list[str] = []
         for candidate in tasks:
             task = candidate.task
-            state = task.status.state
-            if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}:
-                signal = build_signal_for_submitted_task(
-                    candidate, target_agent=self.did
-                )
-                consumer_id = SUBMITTED_CONSUMER
-                # SUBMITTED owns the callback's original source identity.
-                # WORKING is a later durable lifecycle revision: if the
-                # original wake already ACKed before a process died, reusing
-                # the task ID would deduplicate against that completed wake.
-                source_event_id = (
-                    submitted_input_identity(task.id, candidate.input_revision)
-                    if state == TaskState.TASK_STATE_SUBMITTED
-                    else submitted_input_identity(
-                        task.id,
-                        candidate.input_revision,
-                        working_revision=candidate.lifecycle_revision,
-                    )
-                )
-                if state == TaskState.TASK_STATE_WORKING:
-                    original = (
-                        await self.dispatcher.get_durable_delivery_for_source_event(
-                            consumer_id=SUBMITTED_CONSUMER,
-                            source=SUBMITTED_SOURCE,
-                            source_event_id=submitted_input_identity(
-                                task.id, candidate.input_revision
-                            ),
-                        )
-                    )
-                    if original is not None and not original.is_terminal:
-                        # A crash mid-turn leaves the submission wake live, and
-                        # its own retry resumes this work. A second identity
-                        # would run the same task twice at recovery.
-                        continue
-            else:
-                signal = build_signal_for_completed_task(
-                    candidate,
-                    target_agent=self.did,
-                )
-                consumer_id = COMPLETE_CONSUMER
-                source_event_id = str(task.id)
-
+            if task.status.state in {
+                TaskState.TASK_STATE_SUBMITTED,
+                TaskState.TASK_STATE_WORKING,
+            }:
+                # Submission wakes come only from obligations, above.
+                continue
+            signal = build_signal_for_completed_task(
+                candidate,
+                target_agent=self.did,
+            )
             handle = await self.dispatcher.enqueue_durable_cognition(
                 signal,
-                source_event_id=source_event_id,
-                consumer_id=consumer_id,
+                source_event_id=str(task.id),
+                consumer_id=COMPLETE_CONSUMER,
             )
             receipt = await handle.wait_for_durable_admission()
             if receipt.disposition is DurableAdmissionDisposition.DELIVERY_FAILED:
@@ -830,6 +830,48 @@ class EventManagerMixin:
                 "A2A cognition outbox reconciliation could not durably admit "
                 f"task(s) {', '.join(unadmitted)}"
             )
+
+    async def _admit_owed_wake(self, obligation):
+        """Admit one owed obligation's wake at its generation, or release it.
+
+        Returns the admission disposition, or None when the task no longer
+        holds the input and the obligation was released.
+        """
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        candidate = await self.task_manager.get_task_snapshot(
+            obligation.task_id, recipient_agent_id=self.did
+        )
+        if (
+            candidate is None
+            or candidate.task.status.state
+            not in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING}
+            or not candidate.cognition_wake_eligible
+            or not candidate.input_wake_eligible
+            or candidate.input_revision != obligation.input_revision
+        ):
+            await self.task_manager.task_store.release_unwakeable_obligation(obligation)
+            return None
+        handle = await self.dispatcher.enqueue_durable_cognition(
+            build_signal_for_submitted_task(candidate, target_agent=self.did),
+            source_event_id=obligation.identity,
+            consumer_id=SUBMITTED_CONSUMER,
+        )
+        receipt = await handle.wait_for_durable_admission()
+        return receipt.disposition
+
+    async def settle_wake_task(self, obligation, reason: str):
+        """The task half of a wake settlement, on the settlement transaction."""
+        return await self.task_manager.task_store.settle_wake_task(obligation, reason)
+
+    async def project_wake_settlement(self, outcome) -> None:
+        """Project an ended wake settlement to the task's subscribers."""
+        await self.task_manager.project_wake_settlement(outcome)
 
     async def validate_cognition_signal_execution(self, signal) -> str | None:
         """Fail closed when durable state withdraws an inbound A2A wake.

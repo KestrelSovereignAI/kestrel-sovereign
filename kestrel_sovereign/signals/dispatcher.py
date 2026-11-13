@@ -143,6 +143,11 @@ from kestrel_sovereign.signals.constitution_metrics import (
 )
 from kestrel_sovereign.signals.correlation import durable_correlation_values
 from kestrel_sovereign.signals.delivery import detached_from_enclosing_turn
+from kestrel_sovereign.a2a.wake_obligations import ENDED as WAKE_ENDED
+from kestrel_sovereign.a2a.wake_obligations import (
+    WakeObligationRefused,
+    WakeSettlement,
+)
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
     EXPIRED_INITIAL_HANDOFF_ERROR,
@@ -253,6 +258,10 @@ class DurableAdmissionDisposition(str, Enum):
     # event cannot change it, so it must not read as a retryable NOT_ADMITTED.
     DELIVERY_FAILED = "delivery_failed"
     NOT_ADMITTED = "not_admitted"
+    # The input's wake obligation was not owed at this wake's generation
+    # (#4041): it has a wake already, ran, was settled or was re-armed.
+    # Nothing was written; the producer re-reads the obligation.
+    REFUSED = "refused"
 
 
 @dataclass(frozen=True)
@@ -936,6 +945,12 @@ class SignalDispatcher:
         self._retained_cognition_control_debt: dict[str, tuple[DurableDelivery, BaseException]] = {}
         self._cognition_control_terminal_owners: dict[tuple[str, ...], asyncio.Task[None]] = {}
         self._cognition_control_terminal_receipts: dict[tuple[str, ...], weakref.ReferenceType] = {}
+        # Q3 (#4041): the one home of control a wake settlement retained,
+        # keyed by the settled input's live delivery. It may stop the current
+        # settlement pass and surfaces at shutdown; it never widens into
+        # dispatcher-wide admission.
+        self._source_settlement_control: dict[str, tuple[tuple[str, int], BaseException]] = {}
+        self._wake_settlement_task: Optional[asyncio.Task] = None
         # Channel ingress ACKs after its selected delivery is durable, not
         # after cognition completes.  These owners make that promise useful
         # after the provider has advanced its cursor: every restarted
@@ -1942,6 +1957,7 @@ class SignalDispatcher:
             limit=limit,
             rebuildable_sources=self._durable_rebuildable_sources(),
             claim_executor_id=self._durable_delivery_owner,
+            claimable_only=True,
         )
 
     def _durable_rebuildable_sources(self) -> frozenset[str]:
@@ -1964,6 +1980,7 @@ class SignalDispatcher:
             pending = await self.list_durable_deliveries(
                 consumer_id=consumer_id, statuses=[PENDING, RETRY], limit=1,
                 rebuildable_sources=self._durable_rebuildable_sources(),
+                claimable_only=True,
             )
             if not pending:
                 return
@@ -2885,6 +2902,7 @@ class SignalDispatcher:
         limit: int = 100,
         rebuildable_sources: Optional[frozenset[str]] = None,
         claim_executor_id: Optional[str] = None,
+        claimable_only: bool = False,
     ) -> List[DurableDelivery]:
         """Observe durable delivery state for this agent only."""
         async with self._admit_durable_operation():
@@ -2900,6 +2918,7 @@ class SignalDispatcher:
                     datetime.now(timezone.utc) - self._runtime_owner_stale_after
                     if claim_executor_id is not None else None
                 ),
+                claimable_only=claimable_only,
             )
 
     async def purge_expired_durable_deliveries(self) -> int:
@@ -3067,7 +3086,26 @@ class SignalDispatcher:
             self._schedule_runtime_owner_heartbeat()
         await self._drain_retained_durable_cognition_cleanup_tasks()
         self._durable_control_cleanup_fenced = False
+        await self._reconcile_settlement_control_for_shutdown()
         await self._retire_runtime_owner()
+
+    async def _reconcile_settlement_control_for_shutdown(self) -> None:
+        """Surface retained settlement control at shutdown (Q3, #4041).
+
+        One more pass re-reads each retained input; settlement is idempotent,
+        so a committed one clears its entry. Anything still retained fails
+        this shutdown with its original control, and the unretired owner
+        keeps renewing for the retry.
+        """
+        await self._join_wake_settlement_pass()
+        if not self._source_settlement_control:
+            return
+        await self.run_wake_settlement_pass()
+        if self._source_settlement_control:
+            raise execution_finite_error(
+                *(error for _, error in self._source_settlement_control.values()),
+                retain_originals=True, isolate_control_originals=True,
+            )
 
     async def _retire_runtime_owner(self) -> None:
         """Stop the owner heartbeat, then mark the owner stopped (#4001).
@@ -3509,8 +3547,26 @@ class SignalDispatcher:
         if error is not None:
             raise error
 
+    def is_settlement_control(self, error: BaseException | None) -> bool:
+        """Whether ``error`` carries control a wake settlement retained (Q3)."""
+        if error is None or not self._source_settlement_control:
+            return False
+        from kestrel_sovereign.execution_custody import _native_source_originals
+
+        entries = [entry for _, entry in self._source_settlement_control.values()]
+        sources = (error, *_native_source_originals(error, include_tool_terminal=True))
+        return any(source is entry for source in sources for entry in entries)
+
     def _retain_durable_writer_control(self, error: BaseException | None) -> None:
         """Retain original terminal delivery evidence from native writers."""
+        if self.is_settlement_control(error):
+            # Per-delivery settlement control has one home and never widens
+            # into dispatcher-wide admission (Q3, #4041).
+            logger.error(
+                "Refused to widen a wake settlement's retained control into "
+                "dispatcher admission (%s)", type(error).__name__,
+            )
+            return
         if error is not None and is_tool_execution_terminal_error(error):
             from kestrel_sovereign.execution_custody import (
                 execution_native_source_error,
@@ -3536,6 +3592,7 @@ class SignalDispatcher:
             not self._durable_shutdown
             or self._runtime_owner_cleanup_required()
             or self._durable_runtime_owner_registration_started
+            or bool(self._source_settlement_control)
         )
 
     def _runtime_owner_cleanup_required(self) -> bool:
@@ -3631,6 +3688,7 @@ class SignalDispatcher:
         for join in (
             self._join_runtime_owner_heartbeat,
             self._join_runtime_owner_renewal,
+            self._join_wake_settlement_pass,
         ):
             try:
                 await join()
@@ -3714,6 +3772,7 @@ class SignalDispatcher:
         if not self._runtime_owner_liveness_required():
             return
         renewal = self._start_runtime_owner_renewal()
+        self._start_wake_settlement_pass(renewal)
         task = self._runtime_owner_heartbeat_task
         if task is not None:
             # Publication can fail after this exact monitor was accepted.
@@ -3788,6 +3847,168 @@ class SignalDispatcher:
             self._rearm_cleanup_runtime_owner_heartbeat()
             raise
         return task
+
+    def _start_wake_settlement_pass(
+        self, renewal: Optional[asyncio.Task] = None
+    ) -> Optional[asyncio.Task]:
+        """Start the owed-settlement pass in the owner-tick lane (#4041).
+
+        It follows the tick's renewal and never waits for maintenance or
+        cognition. It runs in an empty context, outside durable admission and
+        every execution scope the agent's work holds, so a fenced scope or a
+        refused admission cannot keep owed settlements, or retained
+        settlement control, from being reconciled. At most one runs.
+        """
+        task = self._wake_settlement_task
+        if task is not None and not task.done():
+            return task
+        if task is not None:
+            self._finish_wake_settlement_pass(task)
+        if (
+            self._durable_shutdown
+            or getattr(self, "_runtime_owner_retiring", False)
+            or not callable(getattr(self._agent, "settle_wake_task", None))
+        ):
+            return None
+        from contextvars import Context
+
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        admission = OwnedTaskAdmission()
+        try:
+            task = Context().run(
+                self._agent._track_background_task,
+                self._run_wake_settlement_pass(renewal),
+                name=f"a2a_wake_settlement:{self._agent.did}",
+                admission=admission,
+            )
+        except Exception:
+            self._wake_settlement_task = admission.task
+            logger.exception("Could not start the wake settlement pass")
+            return admission.task
+        self._wake_settlement_task = task
+        task.add_done_callback(self._finish_wake_settlement_pass)
+        return task
+
+    def _finish_wake_settlement_pass(self, task: asyncio.Task) -> None:
+        if self._wake_settlement_task is not task:
+            return
+        self._wake_settlement_task = None
+        from kestrel_sovereign._async_ownership import owned_task_error
+        error = owned_task_error(task)
+        if error is not None and not isinstance(
+            error, (asyncio.CancelledError, _DurableDeliveryShuttingDownError)
+        ):
+            # Retained per-delivery control never reaches here: the pass keeps
+            # it in its one home. This is an ordinary failure of the pass's
+            # query, retried on the next tick.
+            logger.warning(
+                "Wake settlement pass failed (%s); retried on the next tick",
+                type(error).__name__,
+            )
+
+    async def _join_wake_settlement_pass(self) -> None:
+        """Join a running settlement pass, without cancelling it."""
+        task = self._wake_settlement_task
+        if task is None:
+            return
+        from kestrel_sovereign._async_ownership import await_owned_task
+        try:
+            await await_owned_task(task)
+            self._finish_wake_settlement_pass(task)
+        finally:
+            if self._wake_settlement_task is task:
+                self._wake_settlement_task = None
+
+    async def _run_wake_settlement_pass(
+        self, renewal: Optional[asyncio.Task] = None
+    ) -> None:
+        if renewal is not None:
+            # After renewal, whatever its outcome: settlement needs no lease.
+            await asyncio.wait({renewal})
+        await self.run_wake_settlement_pass()
+
+    async def run_wake_settlement_pass(self) -> int:
+        """Settle every owed input once, retained control first (#4041).
+
+        Owed is a query: a bound obligation whose live wake ended undelivered
+        or is gone. Each settlement is idempotent, so a retained entry is
+        simply settled again; one that already committed clears. An ordinary
+        failure leaves its input owed for the next pass. Control a settlement
+        raises, a commit whose outcome is unknown, or a cancellation that is
+        not this pass's own, is kept for that delivery alone (Q3). When the
+        pass itself is cancelled it stops with a bare ``CancelledError`` and
+        carries no settlement's control. Returns how many inputs settled.
+        """
+        if not callable(getattr(self._agent, "settle_wake_task", None)):
+            return 0
+        work: dict[tuple[str, int], str] = {}
+        for delivery_id, (key, _error) in tuple(self._source_settlement_control.items()):
+            work[key] = delivery_id
+        for obligation in await self._durable_store.list_settleable_wake_obligations(
+            agent_id=self._agent.did
+        ):
+            work.setdefault(
+                (obligation.task_id, obligation.input_revision),
+                obligation.live_delivery_id or "",
+            )
+        settled = 0
+        stop = False
+        for (task_id, input_revision), delivery_id in work.items():
+            try:
+                await self.settle_wake_obligation(
+                    task_id=task_id, input_revision=input_revision
+                )
+            except BaseException as error:
+                current = asyncio.current_task()
+                own_cancellation = current is not None and current.cancelling() > 0
+                control = (
+                    isinstance(error, asyncio.CancelledError)
+                    or not isinstance(error, Exception)
+                    or is_execution_control_error(error)
+                    or execution_commit_outcome(error) is not None
+                )
+                if control or own_cancellation:
+                    # Its outcome is unknown until a later pass re-reads it.
+                    self._source_settlement_control[delivery_id] = (
+                        (task_id, input_revision), error,
+                    )
+                else:
+                    logger.warning(
+                        "Wake settlement of task %s input %s failed; it stays "
+                        "owed: %s", task_id, input_revision, error,
+                    )
+                if own_cancellation:
+                    stop = True
+                    break
+            else:
+                settled += 1
+                self._source_settlement_control.pop(delivery_id, None)
+        if stop:
+            # Raised outside every handler, so it carries no settlement's
+            # control as its context.
+            raise asyncio.CancelledError()
+        return settled
+
+    async def settle_wake_obligation(
+        self, *, task_id: str, input_revision: int
+    ) -> WakeSettlement:
+        """Settle one owed input, then project what that settlement committed.
+
+        Projection follows the committed disposition, not whether this
+        attempt recorded it: a retry after an unknown commit that finds the
+        task already ended projects it (#4041, finding 4). The agent's
+        projection is idempotent per task, input and terminal state.
+        """
+        outcome = await self._durable_store.settle_wake_obligation(
+            agent_id=self._agent.did,
+            task_id=task_id,
+            input_revision=input_revision,
+            settle_task=self._agent.settle_wake_task,
+        )
+        project = getattr(self._agent, "project_wake_settlement", None)
+        if outcome.disposition == WAKE_ENDED and callable(project):
+            await project(outcome)
+        return outcome
 
     def _finish_runtime_owner_renewal(self, task: asyncio.Task) -> None:
         if getattr(self, "_runtime_owner_renewal_task", None) is not task:
@@ -5023,6 +5244,20 @@ class SignalDispatcher:
                         durable_projection.signal,
                         **persistence_kwargs,
                     )
+        except WakeObligationRefused as refused:
+            if durable_admission is not None and not durable_admission.done():
+                durable_admission.set_result(
+                    DurableAdmissionResult(
+                        DurableAdmissionDisposition.REFUSED, signal.id
+                    )
+                )
+            return self._fail(
+                signal,
+                start,
+                Status.COALESCED,
+                error=f"Wake obligation refused admission: {refused}",
+                registration=registration,
+            )
         except Exception as exc:
             if is_tool_execution_terminal_error(exc):
                 raise

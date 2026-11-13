@@ -40,12 +40,15 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     NativeTaskSnapshot,
     require_native_task_snapshot,
 )
+from kestrel_sovereign.a2a.wake_obligations import CONSUMER_ID as _OBLIGATION_CONSUMER_ID
+from kestrel_sovereign.a2a.wake_obligations import SOURCE as _OBLIGATION_SOURCE
+from kestrel_sovereign.a2a.wake_obligations import parse_wake_identity
 
 logger = logging.getLogger(__name__)
 
 
-SOURCE_NAME = "a2a.task_submitted"
-DURABLE_COGNITION_CONSUMER_ID = "core.a2a-task-submitted-cognition-v1"
+SOURCE_NAME = _OBLIGATION_SOURCE
+DURABLE_COGNITION_CONSUMER_ID = _OBLIGATION_CONSUMER_ID
 PROMPT_TEMPLATE = (
     # Inside the package (#1415); see a2a.py for the full rationale.
     Path(__file__).resolve().parents[2]
@@ -60,33 +63,41 @@ PROMPT_TEMPLATE = (
 # ---------------------------------------------------------------------------
 
 
-def submitted_input_identity(
-    task_id: str, input_revision: int, *, working_revision: int | None = None
-) -> str:
-    """Encode an unambiguous durable identity for exactly one admitted input."""
+def submitted_input_identity(task_id: str, input_revision: int) -> str:
+    """Encode an unambiguous identity for exactly one admitted input.
+
+    It names the input, not one of its wakes: tool effects and coalescing
+    key on it. A wake's durable source identity is
+    :func:`kestrel_sovereign.a2a.wake_obligations.wake_identity`, which also
+    names its obligation's generation (#4041).
+    """
     if not isinstance(task_id, str) or not task_id:
         raise ValueError("Input wake requires a concrete task ID")
     if type(input_revision) is not int or input_revision < 0:
         raise ValueError("Input wake requires a nonnegative input revision")
-    values = [task_id, input_revision]
-    if working_revision is not None:
-        if type(working_revision) is not int or working_revision < 0:
-            raise ValueError("Working wake requires a nonnegative lifecycle revision")
-        values.append(working_revision)
-    return json.dumps(values, separators=(",", ":"))
+    return json.dumps([task_id, input_revision], separators=(",", ":"))
 
 
 def parse_submitted_input_identity(value: str) -> tuple[str, int]:
-    """Read privacy-retained identity without ever substituting a newer input."""
+    """Read the input a wake identity names, never substituting a newer one.
+
+    Accepts a generation's wake identity and the two forms earlier releases
+    stored: the input itself, and ``[task, input, lifecycle revision]``.
+    """
+    wake = parse_wake_identity(value)
+    if wake is not None:
+        return wake[0], wake[1]
     try:
         parts = json.loads(value)
     except (TypeError, ValueError) as error:
         raise ValueError("Invalid task input wake identity") from error
     if not isinstance(parts, list) or len(parts) not in {2, 3}:
         raise ValueError("Invalid task input wake identity")
-    canonical = submitted_input_identity(
-        parts[0], parts[1], working_revision=parts[2] if len(parts) == 3 else None
-    )
+    canonical = submitted_input_identity(parts[0], parts[1])
+    if len(parts) == 3:
+        if type(parts[2]) is not int or parts[2] < 0:
+            raise ValueError("Invalid task input wake identity")
+        canonical = canonical[:-1] + f",{parts[2]}]"
     if canonical != value:
         raise ValueError("Noncanonical task input wake identity")
     return parts[0], parts[1]

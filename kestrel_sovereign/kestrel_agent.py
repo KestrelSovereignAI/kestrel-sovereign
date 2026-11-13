@@ -9588,8 +9588,27 @@ Expected Duration: {expected_duration}
         if done not in self._background_tasks:
             return
         from kestrel_sovereign._async_ownership import owned_task_error
-        self._remember_shutdown_control(owned_task_error(done), retain_originals=False)
+        error = owned_task_error(done)
+        if not self._is_wake_settlement_control(error):
+            self._remember_shutdown_control(error, retain_originals=False)
         self._background_tasks.discard(done)
+
+    def _is_wake_settlement_control(self, error: BaseException | None) -> bool:
+        """Whether ``error`` is control a wake settlement keeps (Q3, #4041).
+
+        That control has one home, the dispatcher's per-delivery inventory,
+        which reconciles it and surfaces it when the dispatcher closes. The
+        agent-wide inventory never takes a copy it could not clear.
+        """
+        dispatcher = vars(self).get("dispatcher")
+        check = getattr(dispatcher, "is_settlement_control", None)
+        if not callable(check) or not check(error):
+            return False
+        logging.error(
+            "Refused to retain a wake settlement's per-delivery control in the "
+            "agent-wide control inventory (%s)", type(error).__name__,
+        )
+        return True
 
     def _runtime_owner_context(self):
         """Original resident context; also used by lifecycle-owned timers.
@@ -9864,6 +9883,8 @@ Expected Duration: {expected_duration}
             not is_execution_control_error(error)
             and not (retain_cancellation and isinstance(error, asyncio.CancelledError))
         ):
+            return
+        if self._is_wake_settlement_control(error):
             return
         # A late, stronger background receipt must not replace original
         # finite native close/admission evidence. Conversely, aggregating

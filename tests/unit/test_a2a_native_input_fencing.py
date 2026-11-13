@@ -1,6 +1,7 @@
 """A later creator input must fence every old recipient execution and wake."""
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -13,6 +14,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskInputTerminalError,
     TaskMutationAuthorizationError,
 )
+from kestrel_sovereign.a2a.wake_obligations import wake_identity
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.signals.context import bind_current_signal
 from kestrel_sovereign.signals.durable import DurableSignalEvent
@@ -268,9 +270,11 @@ def test_input_identity_handles_arbitrary_task_identifiers():
         task_id,
         7,
     )
-    assert parse_submitted_input_identity(
-        submitted_input_identity(task_id, 7, working_revision=9)
-    ) == (task_id, 7)
+    # The working-revision form earlier releases stored still names its input.
+    legacy_working = json.dumps([task_id, 7, 9], separators=(",", ":"))
+    assert parse_submitted_input_identity(legacy_working) == (task_id, 7)
+    # A generation's wake identity names the same input (#4041).
+    assert parse_submitted_input_identity(wake_identity(task_id, 7, 2)) == (task_id, 7)
 
 
 async def input_dispatcher(manager, *, held=False, private=False):
@@ -353,8 +357,8 @@ async def test_restarted_private_recovery_delivers_only_current_input_once(manag
         deliveries = await dispatcher.list_durable_deliveries(consumer_id=consumer)
         assert len(deliveries) == 2
         assert {d.event.source_event_id for d in deliveries} == {
-            submitted_input_identity(task.id, 0),
-            submitted_input_identity(task.id, 1),
+            wake_identity(task.id, 0, 1),
+            wake_identity(task.id, 1, 1),
         }
         assert all(d.event.payload == {"_privacy_gated": "none"} for d in deliveries)
         await manager.update_status(
@@ -446,8 +450,8 @@ async def test_immediate_callback_admits_distinct_inputs_before_restart(manager)
         deliveries = await dispatcher.list_durable_deliveries(consumer_id=consumer)
         assert len(deliveries) == 2
         assert {d.event.source_event_id for d in deliveries} == {
-            submitted_input_identity(task.id, 0),
-            submitted_input_identity(task.id, 1),
+            wake_identity(task.id, 0, 1),
+            wake_identity(task.id, 1, 1),
         }
     finally:
         manager._on_task_submitted = None

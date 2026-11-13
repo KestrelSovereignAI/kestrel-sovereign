@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -38,8 +39,45 @@ from typing import (
 from kestrel_sdk.signals import Signal
 
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
+from kestrel_sovereign.a2a.wake_obligations import (
+    BOUND as OBLIGATION_BOUND,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    CONFLICT as OBLIGATION_CONFLICT,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    CONSUMER_ID as OBLIGATION_CONSUMER_ID,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    OWED as OBLIGATION_OWED,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    SETTLED as OBLIGATION_SETTLED,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    SOURCE as OBLIGATION_SOURCE,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    TABLE as OBLIGATIONS,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    NOT_OWED as OBLIGATION_NOT_OWED,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    BackfillReport,
+    WakeObligation,
+    WakeObligationRefused,
+    WakeObligationStore,
+    WakeSettlement,
+    WakeTaskSettlement,
+    claimable_predicate,
+    parse_wake_identity,
+)
+from kestrel_sovereign.storage.db.source_handoff import lock_source_handoff
 from kestrel_sovereign.signals.store import _json_default, _serialize_chain
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.db.interface import DatabaseBackend, TransactionError
+
+logger = logging.getLogger(__name__)
 
 PENDING = "pending"
 INITIAL_RESERVED = "initial_reserved"
@@ -1241,6 +1279,8 @@ class DurableSignalStore(UnifiedStoreBase):
         super().__init__(native_backend)
         self._pending_retry_release_receipts: dict[tuple[str, str, str], int] = {}
         self._failed_retry_release_receipts: set[tuple[str, str, str]] = set()
+        self._obligations = WakeObligationStore(native_backend)
+        self.wake_obligation_backfill = BackfillReport()
 
     async def initialize(self) -> None:
         """Serialize PostgreSQL's transactional and autocommit schema phases."""
@@ -1462,6 +1502,10 @@ class DurableSignalStore(UnifiedStoreBase):
             )
             for statement in statements:
                 await self._backend.execute(statement)
+            # Claims of A2A wakes read their obligation (#4041), so the table
+            # exists wherever this ledger does.
+            await self._obligations.ensure_schema()
+            self.wake_obligation_backfill = await self._backfill_wake_obligations()
             await self._ensure_source_sequence_backfill_marker_column()
             # ``CREATE TABLE IF NOT EXISTS`` cannot evolve an existing durable
             # ledger. Keep the caller representation additive: legacy rows
@@ -1656,6 +1700,111 @@ class DurableSignalStore(UnifiedStoreBase):
                 "SQLite durable signal delivery requires transaction(immediate=True) "
                 "for schema bootstrap"
             ) from exc
+
+    async def _backfill_wake_obligations(self) -> BackfillReport:
+        """Give every live wake-eligible A2A input without one an obligation.
+
+        Runs in the schema bootstrap transaction (#4041). It reads task state,
+        not delivery shape: for each ``submitted``/``working`` task whose
+        current input has no obligation, the input's live wakes are counted.
+        One live wake binds the obligation to it; none leaves it owed, and
+        boot admits a fresh-generation wake; more than one is a conflict no
+        wake may resolve, left for an operator. Never settles or fails a task,
+        and inserts only where the input has no obligation yet.
+        """
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            parse_submitted_input_identity,
+        )
+
+        required = {
+            "id", "status", "recipient_agent_id", "input_revision",
+            "cognition_wake_eligible", "input_wake_eligible",
+        }
+        if not await self._table_exists("a2a_tasks") or not required <= (
+            await self._column_names("a2a_tasks")
+        ):
+            return BackfillReport()
+        tasks = await self._backend.fetch_all(
+            f"""
+            SELECT t.recipient_agent_id, t.id, t.input_revision
+            FROM a2a_tasks t
+            WHERE t.status IN ('submitted', 'working')
+              AND t.cognition_wake_eligible = 1 AND t.input_wake_eligible = 1
+              AND t.recipient_agent_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {OBLIGATIONS} o
+                  WHERE o.agent_id = t.recipient_agent_id AND o.consumer_id = ?
+                    AND o.task_id = t.id AND o.input_revision = t.input_revision
+              )
+            ORDER BY t.recipient_agent_id, t.id
+            """,
+            (OBLIGATION_CONSUMER_ID,),
+        )
+        if not tasks:
+            return BackfillReport()
+        for agent_id in sorted({str(row[0]) for row in tasks}):
+            await self._lock_scope_handoff(agent_id=agent_id, source=OBLIGATION_SOURCE)
+        live: dict[tuple[str, str, int], list[str]] = {}
+        for agent_id, delivery_id, source_event_id in await self._backend.fetch_all(
+            f"""
+            SELECT d.agent_id, d.delivery_id, e.source_event_id
+            FROM {self.DELIVERIES} d
+            JOIN {self.EVENTS} e ON e.event_id = d.event_id
+            WHERE d.consumer_id = ? AND e.source = ?
+              AND d.status IN ('{PENDING}', '{RETRY}', '{LEASED}', '{INITIAL_RESERVED}')
+            ORDER BY d.delivery_id
+            """,
+            (OBLIGATION_CONSUMER_ID, OBLIGATION_SOURCE),
+        ):
+            try:
+                task_id, input_revision = parse_submitted_input_identity(source_event_id)
+            except ValueError:
+                continue
+            live.setdefault((str(agent_id), task_id, input_revision), []).append(
+                str(delivery_id)
+            )
+        counts = {OBLIGATION_OWED: 0, OBLIGATION_BOUND: 0, OBLIGATION_CONFLICT: 0}
+        conflicts = []
+        for agent_id, task_id, input_revision in tasks:
+            key = (str(agent_id), str(task_id), int(input_revision))
+            wakes = live.get(key, [])
+            state = (
+                OBLIGATION_BOUND if len(wakes) == 1
+                else OBLIGATION_CONFLICT if wakes
+                else OBLIGATION_OWED
+            )
+            if await self._obligations.insert_backfilled(
+                agent_id=key[0], task_id=key[1], input_revision=key[2],
+                state=state,
+                live_delivery_id=wakes[0] if state == OBLIGATION_BOUND else None,
+            ):
+                counts[state] += 1
+                if state == OBLIGATION_CONFLICT:
+                    conflicts.append(f"{key[1]}@{key[2]}: {','.join(wakes)}")
+        if conflicts:
+            logger.warning(
+                "A2A task inputs with more than one live wake are held as "
+                "wake-obligation conflicts; none of their wakes will run until an "
+                "operator reconciles them (#4041): %s",
+                "; ".join(conflicts),
+            )
+        return BackfillReport(
+            owed=counts[OBLIGATION_OWED],
+            bound=counts[OBLIGATION_BOUND],
+            conflict=counts[OBLIGATION_CONFLICT],
+        )
+
+    async def _column_names(self, table: str) -> set[str]:
+        """The column names of one owned table in the current schema."""
+        if self.is_postgres:
+            rows = await self._backend.fetch_all(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = ?",
+                (table,),
+            )
+            return {str(row[0]) for row in rows}
+        rows = await self._backend.fetch_all(f"PRAGMA table_info({table})")
+        return {str(row[1]) for row in rows}
 
     async def _table_exists(self, table: str) -> bool:
         """Return whether one owned table exists in the current schema."""
@@ -3725,6 +3874,13 @@ class DurableSignalStore(UnifiedStoreBase):
                         created=False,
                         source_sequence=existing_sequence,
                     )
+                # I4 (#4041): a generation's wake is admitted only while its
+                # input's obligation is owed at that generation. Locked here,
+                # after the handoff and before any delivery row, and bound
+                # below in this same transaction.
+                obligation = await self._owed_obligation_locked(
+                    signal, agent_id=agent_id, source_event_id=source_event_id
+                )
                 # The transaction may have waited behind the cross-instance
                 # handoff lock. Start persisted event timing only after that
                 # contention has cleared, never from method entry.
@@ -3868,6 +4024,21 @@ class DurableSignalStore(UnifiedStoreBase):
                         initial_reservation_owner=initial_lease_owner,
                         initial_reservation_token=reservation_token,
                     )
+                    if (
+                        delivery_id is not None
+                        and obligation is not None
+                        and consumer_id == OBLIGATION_CONSUMER_ID
+                        and not await self._obligations.bind(
+                            agent_id=agent_id,
+                            task_id=obligation.task_id,
+                            input_revision=obligation.input_revision,
+                            generation=obligation.generation,
+                            delivery_id=delivery_id,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "A locked owed wake obligation changed before binding"
+                        )
                     if delivery_id is not None:
                         delivery_ids.append(delivery_id)
                         if reservation_token is not None:
@@ -3889,12 +4060,53 @@ class DurableSignalStore(UnifiedStoreBase):
                 )
                 if before_commit is not None:
                     before_commit(persistence)
+        except TransactionError as error:
+            if persistence is not None and on_rollback is not None:
+                on_rollback(persistence)
+            if isinstance(error.__cause__, WakeObligationRefused):
+                # A refusal is a domain outcome, not a storage failure; it
+                # rolled back everything this admission wrote.
+                raise error.__cause__ from None
+            raise
         except BaseException:
             if persistence is not None and on_rollback is not None:
                 on_rollback(persistence)
             raise
         assert persistence is not None
         return persistence
+
+    async def _owed_obligation_locked(
+        self, signal: Signal, *, agent_id: str, source_event_id: Optional[str]
+    ) -> Optional[WakeObligation]:
+        """The owed obligation a generation's wake is admitted for, locked.
+
+        Only an ``a2a.task_submitted`` event whose source identity names a
+        generation binds an obligation. Any other identity binds none, and its
+        delivery can then never be claimed (I2). Refuses, rolling back the
+        admission, unless the obligation is owed at exactly that generation.
+        """
+        if signal.source != OBLIGATION_SOURCE or source_event_id is None:
+            return None
+        wake = parse_wake_identity(source_event_id)
+        if wake is None:
+            return None
+        task_id, input_revision, generation = wake
+        obligation = await self._obligations.get(
+            agent_id=agent_id, task_id=task_id, input_revision=input_revision,
+            for_update=True,
+        )
+        if (
+            obligation is None
+            or obligation.state != OBLIGATION_OWED
+            or obligation.generation != generation
+        ):
+            raise WakeObligationRefused(
+                f"Wake generation {generation} of task {task_id} input "
+                f"{input_revision} is not owed: "
+                f"{'no obligation' if obligation is None else obligation.state}"
+                f"{'' if obligation is None else f' at generation {obligation.generation}'}"
+            )
+        return obligation
 
     @_with_admission_fence
     async def upgrade_legacy_delivery_for_redelivery(
@@ -3942,6 +4154,9 @@ class DurableSignalStore(UnifiedStoreBase):
             now = self.now_utc()
             consumer = await self._get_consumer(agent_id, consumer_id)
             if consumer is None or not consumer[4] or consumer[0] != expected_signal.source:
+                return False
+            if consumer_id == OBLIGATION_CONSUMER_ID:
+                # A wake obligation binds only at admission (#4041).
                 return False
             row = await self._backend.fetch_one(
                 f"""
@@ -4167,6 +4382,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                   AND {self._managed_retry_claim_sql()}
+                  AND {claimable_predicate(self.DELIVERIES)}
                 """,
                 (
                     LEASED,
@@ -4265,6 +4481,7 @@ class DurableSignalStore(UnifiedStoreBase):
                   AND (max_attempts = 0 OR attempts < max_attempts)
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                   AND {self._managed_retry_claim_sql()}
+                  AND {claimable_predicate(self.DELIVERIES)}
                 """,
                 (
                     LEASED,
@@ -4316,6 +4533,7 @@ class DurableSignalStore(UnifiedStoreBase):
             f"status IN ('{PENDING}', '{RETRY}')",
             "(max_attempts = 0 OR attempts < max_attempts)",
             "(next_attempt_at IS NULL OR next_attempt_at <= ?)",
+            claimable_predicate(self.DELIVERIES),
         ]
         params: list[Any] = [agent_id, consumer_id, self.to_timestamp_param(now)]
         if event_id is not None:
@@ -4537,6 +4755,7 @@ class DurableSignalStore(UnifiedStoreBase):
                         AND consumer.consumer_id = {self.DELIVERIES}.consumer_id
                         AND consumer.active = ?
                   )
+                  AND {claimable_predicate(self.DELIVERIES)}
                 """,
                 (
                     executor_id,
@@ -4621,6 +4840,7 @@ class DurableSignalStore(UnifiedStoreBase):
                         AND consumer.consumer_id = {self.DELIVERIES}.consumer_id
                         AND consumer.active = ?
                   )
+                  AND {claimable_predicate(self.DELIVERIES)}
                 """,
                 (
                     LEASED,
@@ -5107,11 +5327,25 @@ class DurableSignalStore(UnifiedStoreBase):
         if type(complete_consumer) is not bool:
             raise ValueError("Consumer completion must be an explicit bool")
         async with self._backend.transaction():
+            handoff_source = None
             if complete_consumer:
                 consumer = await self._get_consumer(agent_id, consumer_id)
                 if consumer is None:
                     return False
-                await self._lock_scope_handoff(agent_id=agent_id, source=consumer[0])
+                handoff_source = consumer[0]
+            elif consumer_id == OBLIGATION_CONSUMER_ID:
+                handoff_source = OBLIGATION_SOURCE
+            if handoff_source is not None:
+                await self._lock_scope_handoff(agent_id=agent_id, source=handoff_source)
+            # I5 (#4041): handoff, then obligation, then delivery.
+            obligation = (
+                await self._obligations.get_bound_to(
+                    agent_id=agent_id, consumer_id=consumer_id,
+                    delivery_id=delivery_id, for_update=True,
+                )
+                if consumer_id == OBLIGATION_CONSUMER_ID
+                else None
+            )
             now = await self._lock_live_delivery_lease(
                 agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id,
                 lease_token=lease_token, now=now,
@@ -5140,6 +5374,18 @@ class DurableSignalStore(UnifiedStoreBase):
                     self.to_timestamp_param(now),
                 ),
             )
+            if (
+                updated == 1
+                and obligation is not None
+                and obligation.state == OBLIGATION_BOUND
+            ):
+                # Only the bound delivery records its input as run. An
+                # acknowledged wake its obligation no longer names decides
+                # nothing.
+                await self._obligations.mark_ran(
+                    agent_id=agent_id, consumer_id=consumer_id,
+                    delivery_id=delivery_id,
+                )
             if updated == 1 and complete_consumer and (
                 not await self.deactivate_consumer(
                     agent_id=agent_id, consumer_id=consumer_id
@@ -5147,6 +5393,98 @@ class DurableSignalStore(UnifiedStoreBase):
             ):
                 raise RuntimeError("Acknowledged delivery lost its original consumer")
             return updated == 1
+
+    async def settle_wake_obligation(
+        self,
+        *,
+        agent_id: str,
+        task_id: str,
+        input_revision: int,
+        settle_task: Callable[[WakeObligation, str], Any],
+    ) -> WakeSettlement:
+        """Q1 (#4041): settle one input whose bound wake ended undelivered.
+
+        One transaction, in the shared lock order: the wake handoff, the
+        obligation, its delivery, then the task, which ``settle_task`` writes
+        on this transaction and opens none of its own. A retry finds a
+        committed settlement and returns its disposition without deciding
+        again. Owed is only ``bound`` with its live delivery failed,
+        terminal-ackable or gone; any other obligation is not owed and nothing
+        is written. ``settle_task`` returns a :class:`WakeTaskSettlement`
+        whose disposition is ``ended`` or ``released``, or raises, rolling the
+        whole settlement back so the input stays owed.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("task_id", task_id)
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(agent_id=agent_id, source=OBLIGATION_SOURCE)
+            obligation = await self._obligations.get(
+                agent_id=agent_id, task_id=task_id, input_revision=input_revision,
+                for_update=True,
+            )
+            if obligation is not None and obligation.state in OBLIGATION_SETTLED:
+                return WakeSettlement(
+                    obligation.state, recorded=False, obligation=obligation
+                )
+            if (
+                obligation is None
+                or obligation.state != OBLIGATION_BOUND
+                or obligation.live_delivery_id is None
+            ):
+                return WakeSettlement(
+                    OBLIGATION_NOT_OWED, recorded=False, obligation=obligation
+                )
+            lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+            delivery = await self._backend.fetch_one(
+                f"SELECT status, last_error FROM {self.DELIVERIES} "
+                "WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?"
+                f"{lock_suffix}",
+                (agent_id, obligation.consumer_id, obligation.live_delivery_id),
+            )
+            if delivery is not None and delivery[0] not in (FAILED, TERMINAL_ACKABLE):
+                return WakeSettlement(
+                    OBLIGATION_NOT_OWED, recorded=False, obligation=obligation
+                )
+            reason = (
+                "its cognition wake was lost before it was delivered"
+                if delivery is None
+                else f"its cognition wake ended undelivered ({delivery[1] or delivery[0]})"
+            )
+            outcome = await settle_task(obligation, reason)
+            if not isinstance(outcome, WakeTaskSettlement) or (
+                outcome.disposition not in OBLIGATION_SETTLED
+            ):
+                raise RuntimeError("A wake task settlement returned no settled disposition")
+            await self._obligations.settle(obligation, disposition=outcome.disposition)
+            return WakeSettlement(
+                outcome.disposition, recorded=True, obligation=obligation,
+                task=outcome.task, previous_state=outcome.previous_state,
+            )
+
+    async def list_settleable_wake_obligations(
+        self, *, agent_id: str, limit: int = 100
+    ) -> list[WakeObligation]:
+        """Bound obligations whose live wake ended undelivered or is gone."""
+        self._require_nonempty("agent_id", agent_id)
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT o.agent_id, o.consumer_id, o.task_id, o.input_revision,
+                   o.generation, o.state, o.live_delivery_id
+            FROM {OBLIGATIONS} o
+            LEFT JOIN {self.DELIVERIES} d
+              ON d.agent_id = o.agent_id AND d.consumer_id = o.consumer_id
+             AND d.delivery_id = o.live_delivery_id
+            WHERE o.agent_id = ? AND o.consumer_id = ? AND o.state = ?
+              AND (d.delivery_id IS NULL OR d.status IN (?, ?))
+            ORDER BY o.task_id, o.input_revision
+            LIMIT ?
+            """,
+            (
+                agent_id, OBLIGATION_CONSUMER_ID, OBLIGATION_BOUND,
+                FAILED, TERMINAL_ACKABLE, limit,
+            ),
+        )
+        return [WakeObligationStore._row(row) for row in rows]
 
     @_owns_retry_release_receipt
     async def nack_delivery(
@@ -5530,6 +5868,7 @@ class DurableSignalStore(UnifiedStoreBase):
         rebuildable_sources: Optional[Iterable[str]] = None,
         claim_executor_id: Optional[str] = None,
         runtime_owner_stale_before: Optional[datetime] = None,
+        claimable_only: bool = False,
     ) -> list[DurableDelivery]:
         """List observable delivery state within one agent/tenant only.
 
@@ -5539,12 +5878,16 @@ class DurableSignalStore(UnifiedStoreBase):
         row of any other source stores no caller and can run only from its
         provider's redelivery (#3392). A claimable window must use the same
         runtime-owner staleness cutoff as its subsequent native claim.
+        ``claimable_only`` leaves out wakes their obligation does not let run
+        (#4041), so a drain window neither waits on nor re-arms for them.
         """
         self._require_nonempty("agent_id", agent_id)
         if limit < 1 or limit > 1000:
             raise ValueError("limit must be between 1 and 1000")
         where = ["d.agent_id = ?"]
         params: list[Any] = [agent_id]
+        if claimable_only:
+            where.append(claimable_predicate("d"))
         if consumer_id is not None:
             where.append("d.consumer_id = ?")
             params.append(consumer_id)
@@ -5825,18 +6168,9 @@ class DurableSignalStore(UnifiedStoreBase):
         #4040.  This matters across backend instances: each instance's
         in-memory write lock is local to that instance.
         """
-        if self.is_postgres:
-            await self._backend.fetch_val(
-                "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-                (f"durable-signal:{agent_id}:{source}",),
-            )
-            return
-        if self._backend.backend_type == "sqlite":
-            await self._backend.execute(f"DELETE FROM {self.CONSUMERS} WHERE 0")
-            return
-        raise RuntimeError(
-            "Durable signal handoff serialization does not support backend "
-            f"{self._backend.backend_type!r}"
+        await lock_source_handoff(
+            self._backend, agent_id=agent_id, source=source,
+            sqlite_reserve_table=self.CONSUMERS,
         )
 
     async def _source_sequence_locked(
@@ -6343,6 +6677,10 @@ class DurableSignalStore(UnifiedStoreBase):
         self, registration: DurableConsumerRegistration, *, now: datetime
     ) -> None:
         if not registration.replay_retained:
+            return
+        if registration.consumer_id == OBLIGATION_CONSUMER_ID:
+            # Its wakes come only from owed obligations (#4041); a retained
+            # event re-delivered here could never be claimed.
             return
         rows = await self._backend.fetch_all(
             f"""

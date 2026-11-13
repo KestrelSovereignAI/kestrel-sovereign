@@ -216,7 +216,9 @@ async def _held_elided_a2a_wake(tmp_path, name: str, rehydrate):
     await dispatcher.register_durable_consumer(consumer)
     handle = await dispatcher.enqueue_durable_cognition(
         build_signal_for_submitted_task(candidate, target_agent=did),
-        source_event_id=submitted_input_identity(task.id, candidate.input_revision),
+        source_event_id=(
+            await manager.get_wake_obligation(task.id, candidate.input_revision)
+        ).identity,
         consumer_id=A2A_CONSUMER,
     )
     assert (

@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
+from tests.utils.wake_obligations import arm_wake_obligation
 from kestrel_sdk.signals import (
     RateLimit,
     RedactionPolicy,
@@ -3115,9 +3117,10 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
     agent_a.process_input = AsyncMock(return_value="must not run")
     try:
         await dispatcher_a.register_durable_consumer(consumer)
+        identity = await arm_wake_obligation(backend_a, agent_id=did, task_id=task.id)
         handle = await dispatcher_a.enqueue_durable_cognition(
             build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
-            source_event_id=submitted_input_identity(task.id, 0),
+            source_event_id=identity,
             consumer_id=A2A_CONSUMER,
         )
         assert (
@@ -3198,9 +3201,10 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
     agent_a._hold_store = _HoldSnapshots(_held_state(did))
     try:
         await dispatcher_a.register_durable_consumer(consumer)
+        identity = await arm_wake_obligation(backend_a, agent_id=did, task_id=task.id)
         handle = await dispatcher_a.enqueue_durable_cognition(
             build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
-            source_event_id=submitted_input_identity(task.id, 0),
+            source_event_id=identity,
             consumer_id=A2A_CONSUMER,
         )
         assert (
@@ -3575,6 +3579,10 @@ async def _reconciling_a2a_dispatcher(path, did: str, task, lifecycle_revision: 
     store = SignalLogStore(backend)
     await store.initialize()
     agent = _ReconcilingA2AAgent(did, task, lifecycle_revision)
+    from kestrel_sovereign.a2a.wake_obligations import WakeObligationStore
+    agent.task_manager.task_store = SimpleNamespace(
+        obligations=WakeObligationStore(backend)
+    )
     dispatcher = SignalDispatcher(
         agent=agent,
         registry=agent.signal_registry,
@@ -3619,9 +3627,10 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     )
     agent_a.hang_turns = True
     await dispatcher_a.register_durable_consumer(consumer)
+    identity = await arm_wake_obligation(backend_a, agent_id=did, task_id=submitted.id)
     handle = await dispatcher_a.enqueue_durable_cognition(
         build_signal_for_submitted_task(_native_a2a_snapshot(submitted, did), target_agent=did),
-        source_event_id=submitted_input_identity(submitted.id, 0),
+        source_event_id=identity,
         consumer_id=SUBMITTED_CONSUMER,
     )
     await handle.wait_for_durable_admission()
@@ -3666,7 +3675,8 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
         [recovered] = await dispatcher_b.list_durable_deliveries(
             consumer_id=SUBMITTED_CONSUMER
         )
-        assert recovered.event.source_event_id == submitted_input_identity("peer-task", 0)
+        # The bound wake resumes under its own generation's identity (#4041).
+        assert recovered.event.source_event_id == identity
         assert recovered.status == ACKNOWLEDGED
         assert len(agent_b.prompts) == 1
     finally:

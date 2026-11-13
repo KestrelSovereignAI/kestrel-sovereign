@@ -63,7 +63,25 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextStore,
 )
 from kestrel_sovereign.a2a.stores.unified.task_change_store import TaskChangeStore
-from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
+from kestrel_sovereign.a2a.wake_obligations import (
+    ENDED as WAKE_ENDED,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    OWED as WAKE_OWED,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    RELEASED as WAKE_RELEASED,
+)
+from kestrel_sovereign.a2a.wake_obligations import (
+    WakeObligation,
+    WakeObligationStore,
+    WakeTaskSettlement,
+)
+from kestrel_sovereign.storage.db.interface import (
+    DatabaseBackend,
+    QueryError,
+    TransactionError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +309,7 @@ class TaskStore(UnifiedStoreBase):
         super().__init__(backend, owns_backend=owns_backend)
         self._scope = scope
         self.changes = TaskChangeStore(backend, scope=scope)
+        self.obligations = WakeObligationStore(backend)
 
     @property
     def scope(self) -> NativeRecipientScope:
@@ -377,6 +396,7 @@ class TaskStore(UnifiedStoreBase):
         else:
             await self._ensure_cancellation_schema_objects()
         await self.changes.initialize()
+        await self.obligations.ensure_schema()
 
     async def _postgres_cancellation_schema_ready(self) -> bool:
         """Re-probe every PostgreSQL object protected by the migration lock."""
@@ -824,7 +844,10 @@ class TaskStore(UnifiedStoreBase):
         transaction = self.write_transaction()
         conflict = None
         committed = None
+        rearms = task.status.state == TaskState.TASK_STATE_SUBMITTED
         async with transaction:
+            if rearms:
+                await self.obligations.lock_scope(agent_id=self.scope.recipient_id)
             lock_suffix = " FOR UPDATE" if self.is_postgres else ""
             row = await self._backend.fetch_one(
                 f"SELECT {_TASK_COLUMNS} FROM a2a_tasks WHERE {predicate}{lock_suffix}",
@@ -869,6 +892,8 @@ class TaskStore(UnifiedStoreBase):
                             *authority_values,
                         ),
                     )
+                    if rows_affected == 1 and rearms:
+                        await self._arm_current_input(task.id)
                     if rows_affected == 1:
                         committed_row = list(row)
                         committed_row[4:9] = [
@@ -883,6 +908,117 @@ class TaskStore(UnifiedStoreBase):
         if conflict is not None:
             raise conflict
         return committed
+
+    async def settle_wake_task(
+        self, obligation: WakeObligation, reason: str
+    ) -> WakeTaskSettlement:
+        """Settle the task of an input whose bound wake ended undelivered.
+
+        Runs on the caller's settlement transaction (#4041), after the wake
+        handoff, the obligation and its delivery, and opens none of its own.
+        A task still ``submitted`` or ``working`` at that input, taking wakes,
+        is failed: ``ended``. One that is gone, terminal, at another input,
+        waiting on its creator, or no longer taking wakes no longer holds the
+        input: ``released``, and it is not written.
+        """
+        if not self._backend.owns_open_transaction:
+            raise RuntimeError(
+                "A wake task settlement runs on its caller's transaction"
+            )
+        if obligation.agent_id != self.scope.recipient_id:
+            raise TaskMutationAuthorizationError(
+                "Wake settlement names another recipient"
+            )
+        lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+        scope = (obligation.task_id, *self._scope_parameters)
+        row = await self._backend.fetch_one(
+            f"SELECT {_TASK_COLUMNS} FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE}"
+            f"{lock_suffix}",
+            scope,
+        )
+        if row is None:
+            return WakeTaskSettlement(WAKE_RELEASED)
+        state = str(row[4])
+        if (
+            state not in ("submitted", "working")
+            or int(row[23]) != obligation.input_revision
+            or not row[24]
+            or not row[25]
+        ):
+            return WakeTaskSettlement(WAKE_RELEASED)
+        failed = self._row_to_task(row)
+        message = new_text_message(f"Task failed: {reason}")
+        failed.status.CopyFrom(
+            new_task_status(TaskState.TASK_STATE_FAILED, at=self.now_utc(), message=message)
+        )
+        failed.history.append(message)
+        message_json, artifacts_json, history_json, metadata_json = _task_payload(failed)
+        timestamp_seconds, timestamp_nanos = _status_timestamp(failed.status)
+        updated = await self._backend.execute(
+            f"""
+            UPDATE a2a_tasks SET
+                status = ?, message = ?, history = ?,
+                status_timestamp_seconds = ?, status_timestamp_nanos = ?,
+                lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
+                updated_at = {self.now_sql()}
+            WHERE id = ? AND {_TASK_SCOPE} AND status = ? AND input_revision = ?
+              AND cognition_wake_eligible = 1 AND input_wake_eligible = 1
+            """,
+            (
+                _stored_state(TaskState.TASK_STATE_FAILED),
+                message_json,
+                history_json,
+                timestamp_seconds,
+                timestamp_nanos,
+                *scope,
+                state,
+                obligation.input_revision,
+            ),
+        )
+        if updated != 1:
+            raise RuntimeError(
+                "A locked task changed under its wake settlement; the input stays owed"
+            )
+        return WakeTaskSettlement(WAKE_ENDED, task=failed, previous_state=state)
+
+    async def release_unwakeable_obligation(self, obligation: WakeObligation) -> bool:
+        """Release an owed obligation whose task no longer holds that input.
+
+        A task can leave ``submitted``/``working`` at an input before any wake
+        was admitted for it. Its obligation is then owed by nothing: released
+        here, decided from task state under the wake handoff, the obligation
+        and the task row. Returns whether it was released.
+        """
+        async with self.write_transaction():
+            await self.obligations.lock_scope(agent_id=self.scope.recipient_id)
+            current = await self.obligations.get(
+                agent_id=obligation.agent_id, task_id=obligation.task_id,
+                input_revision=obligation.input_revision, for_update=True,
+            )
+            if (
+                current is None
+                or current.state != WAKE_OWED
+                or current.generation != obligation.generation
+            ):
+                return False
+            lock_suffix = " FOR UPDATE" if self.is_postgres else ""
+            row = await self._backend.fetch_one(
+                "SELECT status, input_revision, cognition_wake_eligible, "
+                f"input_wake_eligible FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE}"
+                f"{lock_suffix}",
+                (obligation.task_id, *self._scope_parameters),
+            )
+            if (
+                row is not None
+                and str(row[0]) in ("submitted", "working")
+                and int(row[1]) == obligation.input_revision
+                and row[2]
+                and row[3]
+            ):
+                return False
+            await self.obligations.settle(current, disposition=WAKE_RELEASED)
+            return True
 
     async def create(
         self,
@@ -919,40 +1055,60 @@ class TaskStore(UnifiedStoreBase):
         metadata = MessageToDict(task.metadata)
         task_type = metadata.get("task_type", "generic")
         user_id = metadata.get("user_id")
+        insert_sql = f"""
+            INSERT INTO a2a_tasks
+            (id, session_id, user_id, task_type, status, message, artifacts,
+             history, metadata, updated_at, lifecycle_updated_at,
+             creator_agent_id, recipient_agent_id,
+             status_timestamp_seconds, status_timestamp_nanos, tenant,
+             cognition_wake_eligible, input_wake_eligible)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()},
+                    {self.now_sql()}, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO NOTHING
+        """
+        insert_values = (
+            task.id,
+            task.context_id,
+            user_id,
+            task_type,
+            _stored_state(task.status.state),
+            message_json,
+            artifacts_json,
+            history_json,
+            metadata_json,
+            creator_agent_id,
+            recipient_agent_id,
+            timestamp_seconds,
+            timestamp_nanos,
+            self.scope.tenant,
+            int(cognition_wake_eligible),
+            int(input_wake_eligible),
+        )
 
         try:
-            rows_affected = await self._backend.execute(
-                f"""
-                INSERT INTO a2a_tasks
-                (id, session_id, user_id, task_type, status, message, artifacts,
-                 history, metadata, updated_at, lifecycle_updated_at,
-                 creator_agent_id, recipient_agent_id,
-                 status_timestamp_seconds, status_timestamp_nanos, tenant,
-                 cognition_wake_eligible, input_wake_eligible)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()},
-                        {self.now_sql()}, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                (
-                    task.id,
-                    task.context_id,
-                    user_id,
-                    task_type,
-                    _stored_state(task.status.state),
-                    message_json,
-                    artifacts_json,
-                    history_json,
-                    metadata_json,
-                    creator_agent_id,
-                    recipient_agent_id,
-                    timestamp_seconds,
-                    timestamp_nanos,
-                    self.scope.tenant,
-                    int(cognition_wake_eligible),
-                    int(input_wake_eligible),
-                ),
-            )
-        except QueryError as insert_error:
+            if task.status.state == TaskState.TASK_STATE_SUBMITTED and (
+                cognition_wake_eligible and input_wake_eligible
+            ):
+                # I3 (#4041): the submitted input owes a wake from the moment
+                # its row commits, in the same transaction.
+                async with self.write_transaction():
+                    await self.obligations.lock_scope(agent_id=recipient_agent_id)
+                    rows_affected = await self._backend.execute(
+                        insert_sql, insert_values
+                    )
+                    if rows_affected == 1:
+                        await self.obligations.arm(
+                            agent_id=recipient_agent_id, task_id=task.id,
+                            input_revision=0,
+                        )
+            else:
+                rows_affected = await self._backend.execute(insert_sql, insert_values)
+        except (QueryError, TransactionError) as caught:
+            if isinstance(caught, TransactionError) and not isinstance(
+                caught.__cause__, QueryError
+            ):
+                raise
+            insert_error = caught
             # SQLite fires BEFORE INSERT triggers before applying this
             # statement's ON CONFLICT policy. The terminal canceled-row fence
             # must continue blocking legacy INSERT OR REPLACE writers, but an
@@ -1073,6 +1229,9 @@ class TaskStore(UnifiedStoreBase):
             )
         current, appended, conflict = None, False, None
         async with self.write_transaction():
+            # The wake handoff precedes the task row lock in every writer
+            # that may arm an obligation (#4041).
+            await self.obligations.lock_scope(agent_id=self.scope.recipient_id)
             suffix = " FOR UPDATE" if self.is_postgres else ""
             row = await self.backend.fetch_one(
                 f"SELECT {_SNAPSHOT_COLUMNS} FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE} AND creator_agent_id = ?{suffix}",
@@ -1168,6 +1327,12 @@ class TaskStore(UnifiedStoreBase):
                                     raise RuntimeError(
                                         "Locked native task input lost its revision"
                                     )
+                                # I3 (#4041): the new input owes its wake.
+                                await self.obligations.arm(
+                                    agent_id=self.scope.recipient_id,
+                                    task_id=task.id,
+                                    input_revision=revision,
+                                )
                                 await self._write_input(
                                     task.id,
                                     revision,
@@ -1394,8 +1559,7 @@ class TaskStore(UnifiedStoreBase):
         input_predicate, input_values = self._input_revision_predicate(
             task_id, recipient_agent_id
         )
-        rows_affected = await self._backend.execute(
-            f"""
+        update_sql = f"""
             UPDATE a2a_tasks
             SET status = ?, message = ?,
                 status_timestamp_seconds = ?, status_timestamp_nanos = ?,
@@ -1405,20 +1569,46 @@ class TaskStore(UnifiedStoreBase):
             WHERE id = ? AND {_TASK_SCOPE}
               AND recipient_agent_id = ?
               AND status = ? {input_predicate}
-            """,
-            (
-                _stored_state(status.state),
-                message_json,
-                timestamp_seconds,
-                timestamp_nanos,
-                task_id,
-                *self._scope_parameters,
-                recipient_agent_id,
-                _stored_state(expected_state),
-                *input_values,
-            ),
+        """
+        update_values = (
+            _stored_state(status.state),
+            message_json,
+            timestamp_seconds,
+            timestamp_nanos,
+            task_id,
+            *self._scope_parameters,
+            recipient_agent_id,
+            _stored_state(expected_state),
+            *input_values,
         )
+        if status.state != TaskState.TASK_STATE_SUBMITTED:
+            return await self._backend.execute(update_sql, update_values) == 1
+        async with self.write_transaction():
+            await self.obligations.lock_scope(agent_id=self.scope.recipient_id)
+            rows_affected = await self._backend.execute(update_sql, update_values)
+            if rows_affected == 1:
+                await self._arm_current_input(task_id)
         return rows_affected == 1
+
+    async def _arm_current_input(self, task_id: str) -> None:
+        """I3 (#4041): a transition into SUBMITTED re-arms its input's wake.
+
+        Runs in the transition's own transaction, after the wake handoff. A
+        task that takes no cognition wakes owes none.
+        """
+        row = await self._backend.fetch_one(
+            "SELECT input_revision, cognition_wake_eligible, input_wake_eligible "
+            f"FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE}",
+            (task_id, *self._scope_parameters),
+        )
+        if row is None:
+            raise RuntimeError("A task written into SUBMITTED was not readable")
+        if row[1] and row[2]:
+            await self.obligations.arm(
+                agent_id=self.scope.recipient_id,
+                task_id=task_id,
+                input_revision=int(row[0]),
+            )
 
     async def cancel_if_authorized(
         self,

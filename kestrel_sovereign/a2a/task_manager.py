@@ -12,6 +12,7 @@ This is the primary API for working with A2A tasks.
 
 import asyncio
 import logging
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from datetime import UTC, datetime
@@ -106,6 +107,9 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Ended wake settlements this manager has already projected (#4041).
+_PROJECTED_WAKE_SETTLEMENT_LIMIT = 4096
 
 
 class TaskCancellationAuthorizationError(PermissionError):
@@ -2324,6 +2328,41 @@ class TaskManager:
             outcome,
             operation="A2A task status projection",
         )
+
+    async def get_wake_obligation(self, task_id: str, input_revision: int):
+        """The wake obligation of one of this recipient's task inputs (#4041)."""
+        return await self.task_store.obligations.get(
+            agent_id=self.did, task_id=task_id, input_revision=input_revision
+        )
+
+    async def project_wake_settlement(self, outcome) -> None:
+        """Project an ended wake settlement once per task, input and state.
+
+        The task write committed in the settlement transaction (#4041). A
+        retry that found it committed carries no task, so the committed row
+        is read; the projection follows that disposition either way, so an
+        open subscriber always receives the terminal status.
+        """
+        obligation = outcome.obligation
+        task = outcome.task
+        if task is None:
+            task = await self.task_store.get_for_recipient(obligation.task_id, self.did)
+        if task is None or task.status.state not in TERMINAL_STATES:
+            return
+        key = (obligation.task_id, obligation.input_revision, int(task.status.state))
+        projected = vars(self).setdefault("_projected_wake_settlements", OrderedDict())
+        if key in projected:
+            return
+        await self._finish_status_projection(
+            task,
+            old_state=outcome.previous_state or "unspecified",
+            new_state=task.status.state,
+            agent_name=self.did,
+            is_final=True,
+        )
+        projected[key] = None
+        while len(projected) > _PROJECTED_WAKE_SETTLEMENT_LIMIT:
+            projected.popitem(last=False)
 
     async def fail_task(
         self,
