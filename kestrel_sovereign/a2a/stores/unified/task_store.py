@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -63,16 +63,16 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextStore,
 )
 from kestrel_sovereign.a2a.stores.unified.task_change_store import TaskChangeStore
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     ENDED as WAKE_ENDED,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     OWED as WAKE_OWED,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     RELEASED as WAKE_RELEASED,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     WakeObligation,
     WakeObligationStore,
     WakeTaskSettlement,
@@ -736,8 +736,16 @@ class TaskStore(UnifiedStoreBase):
         baseline: Task,
         recipient_agent_id: str,
         expected_state: TaskState,
+        on_rearmed: Callable[[NativeTaskSnapshot], None] | None = None,
     ) -> Task | None:
-        """CAS a worker result from one expected live recipient-owned state."""
+        """CAS a worker result from one expected live recipient-owned state.
+
+        A write into SUBMITTED re-arms its input's wake obligation (I3,
+        #4041). Once that write commits, ``on_rearmed`` receives the snapshot
+        the transaction armed, so the caller can hand the input to its live
+        submission producer; nothing else would admit the new generation's
+        wake before a restart.
+        """
 
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
             raise ValueError("Task lifecycle recipient must be a concrete identity")
@@ -759,6 +767,7 @@ class TaskStore(UnifiedStoreBase):
             baseline=baseline,
             recipient_agent_id=recipient_agent_id,
             expected_states=(expected_state,),
+            on_rearmed=on_rearmed,
         )
 
     async def save_recipient_terminal_outcome(
@@ -811,6 +820,7 @@ class TaskStore(UnifiedStoreBase):
         recipient_agent_id: str,
         expected_states: tuple[TaskState, ...],
         terminal_operation_id: str | None = None,
+        on_rearmed: Callable[[NativeTaskSnapshot], None] | None = None,
     ) -> Task | None:
         """Apply an owned delta under the row lock and return what committed."""
 
@@ -844,6 +854,7 @@ class TaskStore(UnifiedStoreBase):
         transaction = self.write_transaction()
         conflict = None
         committed = None
+        rearmed = None
         rearms = task.status.state == TaskState.TASK_STATE_SUBMITTED
         async with transaction:
             if rearms:
@@ -893,7 +904,7 @@ class TaskStore(UnifiedStoreBase):
                         ),
                     )
                     if rows_affected == 1 and rearms:
-                        await self._arm_current_input(task.id)
+                        rearmed = await self._arm_current_input(task.id)
                     if rows_affected == 1:
                         committed_row = list(row)
                         committed_row[4:9] = [
@@ -907,6 +918,8 @@ class TaskStore(UnifiedStoreBase):
                         committed = self._row_to_task(tuple(committed_row))
         if conflict is not None:
             raise conflict
+        if rearmed is not None and on_rearmed is not None:
+            on_rearmed(rearmed)
         return committed
 
     async def settle_wake_task(
@@ -1590,25 +1603,29 @@ class TaskStore(UnifiedStoreBase):
                 await self._arm_current_input(task_id)
         return rows_affected == 1
 
-    async def _arm_current_input(self, task_id: str) -> None:
+    async def _arm_current_input(self, task_id: str) -> NativeTaskSnapshot | None:
         """I3 (#4041): a transition into SUBMITTED re-arms its input's wake.
 
-        Runs in the transition's own transaction, after the wake handoff. A
-        task that takes no cognition wakes owes none.
+        Runs in the transition's own transaction, after the wake handoff, and
+        returns the snapshot of the input it armed, read in that transaction,
+        for the writer's owner to hand to the submission producer after
+        commit. A task that takes no cognition wakes owes none: None.
         """
         row = await self._backend.fetch_one(
-            "SELECT input_revision, cognition_wake_eligible, input_wake_eligible "
-            f"FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE}",
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE}",
             (task_id, *self._scope_parameters),
         )
         if row is None:
             raise RuntimeError("A task written into SUBMITTED was not readable")
-        if row[1] and row[2]:
-            await self.obligations.arm(
-                agent_id=self.scope.recipient_id,
-                task_id=task_id,
-                input_revision=int(row[0]),
-            )
+        candidate = self._row_to_snapshot(row)
+        if not (candidate.cognition_wake_eligible and candidate.input_wake_eligible):
+            return None
+        await self.obligations.arm(
+            agent_id=self.scope.recipient_id,
+            task_id=task_id,
+            input_revision=candidate.input_revision,
+        )
+        return candidate
 
     async def cancel_if_authorized(
         self,

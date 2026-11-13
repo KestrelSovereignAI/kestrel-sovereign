@@ -186,6 +186,10 @@ def _native_boot_task_manager_double(backend):
     manager.observability_store.backend = backend
     manager.observability_store.set_privacy_config_provider = MagicMock()
     manager.observability_store.purge_observability_since = AsyncMock(return_value={})
+    # Boot reconciliation pages the task store's wake obligations (#4041).
+    # An implicit child mock is a truthy, empty, endless page; this double
+    # owes nothing.
+    manager.task_store.obligations.list_by_state = AsyncMock(return_value=[])
     return manager
 
 

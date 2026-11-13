@@ -86,6 +86,12 @@ async def test_an_owner_heartbeat_tick_does_not_make_the_agent_busy(tmp_path):
         assert heartbeat is not None and not heartbeat.done()
         assert heartbeat in agent._background_tasks
         assert heartbeat.get_name().startswith("durable_signal_owner_heartbeat:")
+        # The tick also starts the A2A wake-settlement pass after its
+        # renewal (#4041); it is the same owner-lane bookkeeping.
+        settlement = agent.dispatcher._wake_settlement_task
+        assert settlement is not None and not settlement.done()
+        assert settlement in agent._background_tasks
+        assert settlement.get_name().startswith("a2a_wake_settlement:")
 
         state = RestartCoordinatorFeature(agent)._agent_appears_idle()
 

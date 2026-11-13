@@ -18,7 +18,7 @@ class NativeStoreSchema(Enum):
     payload encoding. A standalone TaskStore never proves the other stores.
     """
 
-    CORE = ("core", 6)
+    CORE = ("core", 7)
     MEMORY = ("memory", 1)
     FEEDBACK = ("feedback", 1)
     PUSH = ("push", 4)
@@ -35,7 +35,10 @@ class NativeStoreSchema(Enum):
 ADDITIVE_ONLINE_UPGRADES = MappingProxyType(
     {
         # 6: a2a_tool_dispatches.dispatch_id and parent_dispatch_id (#3995).
-        NativeStoreSchema.CORE.value[0]: frozenset({5}),
+        # 7: the a2a_wake_obligations table and its indexes (#4041). Its
+        # rows are backfilled from task state by the durable signal ledger's
+        # own schema bootstrap, never by this crossing.
+        NativeStoreSchema.CORE.value[0]: frozenset({5, 6}),
     }
 )
 

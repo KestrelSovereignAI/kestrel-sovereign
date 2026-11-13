@@ -3579,7 +3579,7 @@ async def _reconciling_a2a_dispatcher(path, did: str, task, lifecycle_revision: 
     store = SignalLogStore(backend)
     await store.initialize()
     agent = _ReconcilingA2AAgent(did, task, lifecycle_revision)
-    from kestrel_sovereign.a2a.wake_obligations import WakeObligationStore
+    from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import WakeObligationStore
     agent.task_manager.task_store = SimpleNamespace(
         obligations=WakeObligationStore(backend)
     )

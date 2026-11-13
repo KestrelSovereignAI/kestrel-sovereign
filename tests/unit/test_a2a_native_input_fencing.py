@@ -14,7 +14,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskInputTerminalError,
     TaskMutationAuthorizationError,
 )
-from kestrel_sovereign.a2a.wake_obligations import wake_identity
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import wake_identity
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.signals.context import bind_current_signal
 from kestrel_sovereign.signals.durable import DurableSignalEvent

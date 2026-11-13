@@ -431,6 +431,12 @@ def _boot_mocks(real_task_manager: bool = False, *, primary_backend=None):
             # coroutine.
             task_manager.unregister_provider = MagicMock()
             task_manager.close = AsyncMock()
+            # Boot reconciliation pages the task store's wake obligations
+            # (#4041). An implicit child mock is a truthy, empty, endless
+            # page; this double owes nothing.
+            task_manager.task_store.obligations.list_by_state = AsyncMock(
+                return_value=[]
+            )
             MockTaskManager.from_backend.return_value = task_manager
 
         mocks = SimpleNamespace(

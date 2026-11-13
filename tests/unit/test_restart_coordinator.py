@@ -6385,6 +6385,8 @@ def test_kinds_only_description_withholds_every_per_instance_tail():
         "wait_fallback_reconcile",
         # Durable dispatcher owner-liveness tick, a fresh task every ~40s.
         "durable_signal_owner_heartbeat:did:pkh:eip155:1:0xabc",
+        # The owner tick's A2A wake-settlement pass (#4041).
+        "a2a_wake_settlement:did:pkh:eip155:1:0xabc",
         "workflows:lease-recovery",
         "native_a2a_question_recovery",
     ],

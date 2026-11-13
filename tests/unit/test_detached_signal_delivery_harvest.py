@@ -40,6 +40,14 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     NativeTaskSnapshot,
     TaskCancellationSnapshot,
 )
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
+    CONSUMER_ID as SUBMITTED_CONSUMER,
+)
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
+    OWED,
+    WakeObligation,
+    wake_identity,
+)
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.signals import DurableAdmissionDisposition
 from kestrel_sovereign.signals.dispatcher import (
@@ -89,9 +97,23 @@ class _Agent(EventManagerMixin):
         self.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
             return_value=None
         )
+        self.dispatcher.run_wake_settlement_pass = AsyncMock(return_value=0)
         self.task_manager = MagicMock()
         self.task_manager.get_task_snapshot = AsyncMock(
-            side_effect=lambda task_id: _task(task_id, state=TaskState.TASK_STATE_SUBMITTED)
+            side_effect=lambda task_id, **_scope: _task(
+                task_id, state=TaskState.TASK_STATE_SUBMITTED
+            )
+        )
+        # Every submitted input owes its generation-1 wake (#4041), and boot
+        # finds nothing owed, unless a test says otherwise.
+        self.task_manager.get_wake_obligation = AsyncMock(
+            side_effect=lambda task_id, input_revision: _owed(task_id, input_revision)
+        )
+        self.task_manager.task_store.obligations.list_by_state = AsyncMock(
+            return_value=[]
+        )
+        self.task_manager.task_store.release_unwakeable_obligation = AsyncMock(
+            return_value=True
         )
         self.task_manager.get_task_cancellation_snapshot = AsyncMock(
             side_effect=lambda _task_id, *, recipient_agent_id: TaskCancellationSnapshot(
@@ -124,6 +146,19 @@ def _task(task_id: str = "task-1", *, state=TaskState.TASK_STATE_COMPLETED):
     )
 
 
+def _owed(task_id: str, input_revision: int = 0, generation: int = 1) -> WakeObligation:
+    return WakeObligation(
+        agent_id="did:test:agent", consumer_id=SUBMITTED_CONSUMER, task_id=task_id,
+        input_revision=input_revision, generation=generation, state=OWED,
+        live_delivery_id=None,
+    )
+
+
+def _owed_pages(*obligations: WakeObligation) -> AsyncMock:
+    """Boot's keyset reads of owed obligations: one page, then the end."""
+    return AsyncMock(side_effect=[list(obligations), []])
+
+
 async def _drain(agent) -> None:
     for task, _name in agent.tracked:
         await asyncio.wait_for(task, timeout=5)
@@ -146,7 +181,12 @@ def _durable_signal_handle(
 
 @pytest.mark.asyncio
 async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows():
-    """TaskStore, not the one-shot callback, is the crash-safe wake authority."""
+    """Durable truth, not the one-shot callback, is the crash-safe wake authority.
+
+    For a submitted input that truth is its owed obligation, admitted at its
+    own generation (#4041); for a completion it is TaskStore. Live candidates
+    in the TaskStore scan mint nothing of their own.
+    """
 
     agent = _Agent()
     submitted = _task("submitted-gap", state=TaskState.TASK_STATE_SUBMITTED)
@@ -159,6 +199,9 @@ async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows():
             replace(completed, lifecycle_revision=8),
         ]
     )
+    agent.task_manager.task_store.obligations.list_by_state = _owed_pages(
+        _owed("submitted-gap"), _owed("working-gap", generation=2),
+    )
     agent.dispatcher.enqueue_durable_cognition = AsyncMock(
         side_effect=lambda *args, **kwargs: _durable_signal_handle(
             DurableAdmissionDisposition.COMMITTED
@@ -169,10 +212,14 @@ async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows():
     await agent.reconcile_a2a_cognition_wakes()
     after = datetime.now(timezone.utc)
 
+    agent.dispatcher.run_wake_settlement_pass.assert_awaited_once_with()
+    reads = agent.task_manager.task_store.obligations.list_by_state.await_args_list
+    assert [call.kwargs["state"] for call in reads] == [OWED, OWED]
+    assert [call.kwargs["after"] for call in reads] == [None, ("working-gap", 0)]
     calls = agent.dispatcher.enqueue_durable_cognition.await_args_list
     assert [call.kwargs["source_event_id"] for call in calls] == [
-        '["submitted-gap",0]',
-        '["working-gap",0,7]',
+        wake_identity("submitted-gap", 0, 1),
+        wake_identity("working-gap", 0, 2),
         "completed-gap",
     ]
     assert [call.kwargs["consumer_id"] for call in calls] == [
@@ -240,6 +287,9 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
             replace(_task('behind-it', state=TaskState.TASK_STATE_COMPLETED), lifecycle_revision=4),
         ]
     )
+    agent.task_manager.task_store.obligations.list_by_state = _owed_pages(
+        _owed("missing-outbox")
+    )
     dispositions = iter(
         (
             DurableAdmissionDisposition.NOT_ADMITTED,
@@ -258,23 +308,18 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
     assert [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
-    ] == ['["missing-outbox",0]', "behind-it"]
+    ] == [wake_identity("missing-outbox", 0, 1), "behind-it"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "original,mints",
-    [
-        (None, True),
-        (SimpleNamespace(is_terminal=True), True),
-        (SimpleNamespace(is_terminal=False), False),
-    ],
-    ids=["no-original", "original-finished", "original-still-live"],
-)
-async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
-    original, mints
-):
-    """A live submission wake resumes its own work; a second would duplicate it."""
+@pytest.mark.parametrize("owed", [True, False], ids=["owed", "bound-or-ran"])
+async def test_boot_reconciliation_mints_working_only_while_its_input_is_owed(owed):
+    """A WORKING task is woken only when its input's obligation owes a wake.
+
+    A live wake resumes its own work and a wake that ran is done; both are
+    obligations no longer owed, so boot admits nothing for them. Delivery
+    rows decide nothing (#4041): boot never reads them.
+    """
 
     agent = _Agent()
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
@@ -282,8 +327,14 @@ async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
             replace(_task('mid-turn', state=TaskState.TASK_STATE_WORKING), lifecycle_revision=1)
         ]
     )
-    agent.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
-        return_value=original
+    agent.task_manager.get_task_snapshot = AsyncMock(
+        side_effect=lambda task_id, **_scope: _task(
+            task_id, state=TaskState.TASK_STATE_WORKING
+        )
+    )
+    agent.task_manager.task_store.obligations.list_by_state = (
+        _owed_pages(_owed("mid-turn", generation=3)) if owed
+        else AsyncMock(return_value=[])
     )
     agent.dispatcher.enqueue_durable_cognition = AsyncMock(
         side_effect=lambda *args, **kwargs: _durable_signal_handle(
@@ -293,16 +344,12 @@ async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
 
     await agent.reconcile_a2a_cognition_wakes()
 
-    agent.dispatcher.get_durable_delivery_for_source_event.assert_awaited_once_with(
-        consumer_id="core.a2a-task-submitted-cognition-v1",
-        source="a2a.task_submitted",
-        source_event_id='["mid-turn",0]',
-    )
+    agent.dispatcher.get_durable_delivery_for_source_event.assert_not_awaited()
     minted = [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
     ]
-    assert minted == (['["mid-turn",0,1]'] if mints else [])
+    assert minted == ([wake_identity("mid-turn", 0, 3)] if owed else [])
 
 
 @pytest.mark.asyncio
@@ -343,6 +390,9 @@ async def test_boot_reconciliation_leaves_a_terminally_failed_wake_failed(caplog
             replace(_task('behind-it', state=TaskState.TASK_STATE_COMPLETED), lifecycle_revision=4),
         ]
     )
+    agent.task_manager.task_store.obligations.list_by_state = _owed_pages(
+        _owed("exhausted")
+    )
     dispositions = iter(
         (
             DurableAdmissionDisposition.DELIVERY_FAILED,
@@ -362,7 +412,7 @@ async def test_boot_reconciliation_leaves_a_terminally_failed_wake_failed(caplog
     assert [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
-    ] == ['["exhausted",0]', "behind-it"]
+    ] == [wake_identity("exhausted", 0, 1), "behind-it"]
     assert "exhausted already failed terminally" in caplog.text
 
 
@@ -498,7 +548,8 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
         agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
         call = agent.dispatcher.enqueue_durable_cognition.await_args
         assert call.kwargs["source_event_id"] == (
-            '["task-1",0]' if state == TaskState.TASK_STATE_SUBMITTED else "task-1"
+            wake_identity("task-1", 0, 1)
+            if state == TaskState.TASK_STATE_SUBMITTED else "task-1"
         )
         assert call.kwargs["consumer_id"] in {
             "core.a2a-task-complete-cognition-v1",

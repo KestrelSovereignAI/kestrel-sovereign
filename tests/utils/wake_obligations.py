@@ -1,6 +1,6 @@
 """Arm A2A wake obligations in tests that run no TaskStore (#4041)."""
 
-from kestrel_sovereign.a2a.wake_obligations import WakeObligationStore, wake_identity
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import WakeObligationStore, wake_identity
 
 
 async def arm_wake_obligation(backend, *, agent_id, task_id, input_revision=0):

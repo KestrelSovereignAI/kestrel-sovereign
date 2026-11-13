@@ -40,9 +40,9 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     NativeTaskSnapshot,
     require_native_task_snapshot,
 )
-from kestrel_sovereign.a2a.wake_obligations import CONSUMER_ID as _OBLIGATION_CONSUMER_ID
-from kestrel_sovereign.a2a.wake_obligations import SOURCE as _OBLIGATION_SOURCE
-from kestrel_sovereign.a2a.wake_obligations import parse_wake_identity
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import CONSUMER_ID as _OBLIGATION_CONSUMER_ID
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import SOURCE as _OBLIGATION_SOURCE
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import parse_wake_identity
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ def submitted_input_identity(task_id: str, input_revision: int) -> str:
 
     It names the input, not one of its wakes: tool effects and coalescing
     key on it. A wake's durable source identity is
-    :func:`kestrel_sovereign.a2a.wake_obligations.wake_identity`, which also
+    :func:`kestrel_sovereign.a2a.stores.unified.wake_obligation_store.wake_identity`, which also
     names its obligation's generation (#4041).
     """
     if not isinstance(task_id, str) or not task_id:

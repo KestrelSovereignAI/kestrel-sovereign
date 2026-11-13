@@ -2,8 +2,10 @@
 
 Booted ``KestrelAgent`` on SQLite and PostgreSQL. A settlement pass is
 cancelled while its task write reports a commit whose outcome is unknown; the
-per-delivery entry is the only place that control lives. Once a later pass
-reconciles it, nothing in the agent-wide control inventory remains.
+per-delivery entry is the only place that control lives. Another background
+task that fails with an error derived from it is harvested without the agent
+keeping a copy. Once a later pass reconciles the entry, nothing in the
+agent-wide control inventory remains.
 """
 
 import asyncio
@@ -12,8 +14,11 @@ import pytest
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
 from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
 
-from kestrel_sovereign.a2a.wake_obligations import ENDED
-from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import ENDED
+from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    execution_finite_error,
+)
 from kestrel_sovereign.signals.sources.a2a_task_submitted import build_signal_for_submitted_task
 from tests.shared.booted_agent import booted_agent
 from tests.unit.test_turn_parked_before_first_llm_call import (  # noqa: F401
@@ -79,6 +84,27 @@ async def test_real_agent_harvester_does_not_retain_settlement_control(
             await asyncio.wait({running}, timeout=10)
             assert running.done()
             assert set(dispatcher._source_settlement_control) == {delivery_id}
+            agent._raise_shutdown_control()
+            # Another observer of the same lost commit fails in the agent's
+            # own background work: its error's native source is the entry.
+            # The harvester refuses it, so the agent keeps no copy it could
+            # never clear.
+            [(_, carrier)] = dispatcher._source_settlement_control.values()
+            observed = execution_finite_error(
+                carrier, asyncio.CancelledError(),
+                retain_originals=True, isolate_control_originals=True,
+            )
+            assert observed is not carrier
+            assert dispatcher.is_settlement_control(observed)
+
+            async def observes_the_lost_commit():
+                raise observed
+
+            observer = agent._track_background_task(
+                observes_the_lost_commit(), name="observes-settlement-commit"
+            )
+            await asyncio.wait({observer}, timeout=10)
+            assert observer.done() and observer not in agent._background_tasks
             agent._raise_shutdown_control()
         finally:
             agent.settle_wake_task = real

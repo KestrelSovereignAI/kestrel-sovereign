@@ -6,10 +6,11 @@ skips the CORE initializers for a database already at the runtime revision,
 so no existing database received the columns, and the required dispatch audit
 #3999 introduced failed every tool call.
 
-CORE is now revision 6, and revision 5 has an additive online upgrade: under
-the schema lease, ``TaskManager.initialize`` re-runs the idempotent CORE
-initializers and advances the stored row. No row is converted; every other
-stored revision still requires the offline migration.
+Revision 5 has an additive online upgrade, as revision 6 does since #4041
+added ``a2a_wake_obligations``: under the schema lease,
+``TaskManager.initialize`` re-runs the idempotent CORE initializers and
+advances the stored row. No row is converted; every other stored revision
+still requires the offline migration.
 """
 
 from __future__ import annotations
@@ -156,6 +157,43 @@ async def test_core_5_store_gains_the_dispatch_columns_at_initialization(
         ]
         health = manager.observability_store.tool_dispatch_audit_health
         assert health.failures == 0 and health.last_success_at is not None
+    finally:
+        await manager.close()
+        await backend.close()
+
+
+async def test_core_6_store_gains_the_wake_obligations_at_initialization(
+    native_a2a_backend_factory,
+):
+    """#4041: a CORE store left at revision 6 receives a2a_wake_obligations."""
+    from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import OWED, TABLE
+    from tests.unit.test_a2a_native_task_manager import request
+
+    scope = NativeRecipientScope("did:recipient", "tenant")
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = manager_for(backend, scope, owns_backend=False)
+    try:
+        await manager.initialize()
+    finally:
+        await manager.close()
+    # The bundle as revision 6 left it: everything but the obligation table.
+    await backend.execute(f"DROP TABLE {TABLE}")
+    await backend.execute(
+        "UPDATE a2a_native_store_schema SET revision = 6 WHERE component = 'core'"
+    )
+    manager = manager_for(backend, scope, owns_backend=False)
+    try:
+        assert not await backend.table_exists(TABLE)
+        await require_native_a2a_schema(backend)
+
+        await manager.initialize()
+
+        assert await backend.table_exists(TABLE)
+        assert await _revisions(backend) == {NativeStoreSchema.CORE.value}
+        task = await manager.create_task(request(), creator_agent_id="did:creator")
+        armed = await manager.get_wake_obligation(task.id, 0)
+        assert (armed.state, armed.generation) == (OWED, 1)
     finally:
         await manager.close()
         await backend.close()

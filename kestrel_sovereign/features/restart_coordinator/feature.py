@@ -386,6 +386,11 @@ def _tail(raw: Any) -> str:
 #     requeueing stale foreign leases, which a restart's own startup recovery
 #     repeats; any cognition it wakes runs as ``durable_cognition:*``, which
 #     still defers.
+#   - ``a2a_wake_settlement:`` — the A2A wake-settlement pass the owner tick
+#     starts after its renewal (#4041). It ends the task of an input whose
+#     bound wake ended undelivered, never awaits cognition, and is joined
+#     before the dispatcher closes; a restart's boot reconciliation runs the
+#     same pass first, and settlement is idempotent.
 # Runtime-owned periodic loops below are infrastructure, not perpetual user
 # work. Shutdown joins them. Actual scheduler occurrences are separately
 # tracked and still defer restart, as do active requests and signal dispatch.
@@ -402,6 +407,7 @@ _INFRA_TASK_PREFIXES = (
     "isolated-runtime-telemetry:",
     "wait_fallback_reconcile",
     "durable_signal_owner_heartbeat:",
+    "a2a_wake_settlement:",
     "health-worker:",
 )
 _INFRA_TASK_NAMES = frozenset({

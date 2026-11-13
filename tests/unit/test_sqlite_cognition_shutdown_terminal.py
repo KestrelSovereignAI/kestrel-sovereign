@@ -21,6 +21,7 @@ from tests.unit.test_durable_signal_delivery import (
     _close,
 )
 from tests.utils.original_failure import hold_original_sqlite_commit_ack
+from tests.utils.wake_obligations import arm_wake_obligation
 
 
 @pytest.fixture(params=[channels, a2a, a2a_task_submitted, a2a_question_answered],
@@ -68,9 +69,15 @@ async def owned_delivery(tmp_path, cognition_source):
             agent_id=agent.did, consumer_id=cognition_source.DURABLE_COGNITION_CONSUMER_ID,
             source=cognition_source.SOURCE_NAME, max_attempts=3,
         ))
+        # A submission wake is claimable only while its input's obligation
+        # binds it (#4041), so it is admitted under that generation's identity.
+        identity = (
+            await arm_wake_obligation(backend, agent_id=agent.did, task_id="task1")
+            if cognition_source is a2a_task_submitted else "original"
+        )
         await ledger.persist_signal(
             cognition_signal(cognition_source, agent.did), agent_id=agent.did,
-            source_event_id="original", retention_days=1,
+            source_event_id=identity, retention_days=1,
         )
         delivery = await ledger.claim_delivery(
             agent_id=agent.did, consumer_id=cognition_source.DURABLE_COGNITION_CONSUMER_ID,

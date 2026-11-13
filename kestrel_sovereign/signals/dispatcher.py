@@ -143,8 +143,8 @@ from kestrel_sovereign.signals.constitution_metrics import (
 )
 from kestrel_sovereign.signals.correlation import durable_correlation_values
 from kestrel_sovereign.signals.delivery import detached_from_enclosing_turn
-from kestrel_sovereign.a2a.wake_obligations import ENDED as WAKE_ENDED
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import ENDED as WAKE_ENDED
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     WakeObligationRefused,
     WakeSettlement,
 )
@@ -950,6 +950,10 @@ class SignalDispatcher:
         # settlement pass and surfaces at shutdown; it never widens into
         # dispatcher-wide admission.
         self._source_settlement_control: dict[str, tuple[tuple[str, int], BaseException]] = {}
+        # Committed settlements whose projection failed with an ordinary
+        # error, by input. Not control: the settlement stands, and the next
+        # pass retries only its projection.
+        self._wake_projection_debt: dict[tuple[str, int], str] = {}
         self._wake_settlement_task: Optional[asyncio.Task] = None
         # Channel ingress ACKs after its selected delivery is durable, not
         # after cognition completes.  These owners make that promise useful
@@ -3928,22 +3932,32 @@ class SignalDispatcher:
         await self.run_wake_settlement_pass()
 
     async def run_wake_settlement_pass(self) -> int:
-        """Settle every owed input once, retained control first (#4041).
+        """Settle every owed input once, then publish what settlement ended.
 
         Owed is a query: a bound obligation whose live wake ended undelivered
-        or is gone. Each settlement is idempotent, so a retained entry is
-        simply settled again; one that already committed clears. An ordinary
-        failure leaves its input owed for the next pass. Control a settlement
-        raises, a commit whose outcome is unknown, or a cancellation that is
-        not this pass's own, is kept for that delivery alone (Q3). When the
-        pass itself is cancelled it stops with a bare ``CancelledError`` and
-        carries no settlement's control. Returns how many inputs settled.
+        or is gone (#4041). Retained control and projection debt are worked
+        first; settlement is idempotent, so a retry that finds its settlement
+        committed returns that disposition and projects it. An ordinary
+        failure of a settlement leaves its input owed for the next pass. An
+        ordinary failure of its projection leaves the committed settlement as
+        it is and is retried, projection only, next pass. Control a
+        settlement or its projection raises, a commit whose outcome is
+        unknown, or a cancellation that is not this pass's own, is kept for
+        that delivery alone (Q3). When the pass itself is cancelled it stops
+        with a bare ``CancelledError`` and carries no settlement's control.
+
+        Last, every open local subscriber of a task whose obligation ended is
+        given its committed terminal status, whether the settlement committed
+        on a peer or its projection here failed. Returns how many
+        settlements this pass committed.
         """
         if not callable(getattr(self._agent, "settle_wake_task", None)):
             return 0
         work: dict[tuple[str, int], str] = {}
         for delivery_id, (key, _error) in tuple(self._source_settlement_control.items()):
             work[key] = delivery_id
+        for key, delivery_id in tuple(self._wake_projection_debt.items()):
+            work.setdefault(key, delivery_id)
         for obligation in await self._durable_store.list_settleable_wake_obligations(
             agent_id=self._agent.did
         ):
@@ -3953,11 +3967,14 @@ class SignalDispatcher:
             )
         settled = 0
         stop = False
-        for (task_id, input_revision), delivery_id in work.items():
+        for key, delivery_id in work.items():
+            committed = False
             try:
-                await self.settle_wake_obligation(
-                    task_id=task_id, input_revision=input_revision
-                )
+                outcome = await self._record_wake_settlement(*key)
+                committed = True
+                if outcome.recorded:
+                    settled += 1
+                await self._project_wake_settlement(outcome)
             except BaseException as error:
                 current = asyncio.current_task()
                 own_cancellation = current is not None and current.cancelling() > 0
@@ -3968,25 +3985,33 @@ class SignalDispatcher:
                     or execution_commit_outcome(error) is not None
                 )
                 if control or own_cancellation:
-                    # Its outcome is unknown until a later pass re-reads it.
-                    self._source_settlement_control[delivery_id] = (
-                        (task_id, input_revision), error,
+                    # Its outcome is unknown until a later pass re-reads it;
+                    # that pass settles again and projects what committed.
+                    self._source_settlement_control[delivery_id] = (key, error)
+                    self._wake_projection_debt.pop(key, None)
+                elif committed:
+                    self._wake_projection_debt[key] = delivery_id
+                    logger.warning(
+                        "Wake settlement of task %s input %s is committed, but "
+                        "projecting it failed; retried on the next pass: %s",
+                        key[0], key[1], error,
                     )
                 else:
                     logger.warning(
-                        "Wake settlement of task %s input %s failed; it stays "
-                        "owed: %s", task_id, input_revision, error,
+                        "Wake settlement of task %s input %s failed; retried on "
+                        "the next pass: %s", key[0], key[1], error,
                     )
                 if own_cancellation:
                     stop = True
                     break
             else:
-                settled += 1
                 self._source_settlement_control.pop(delivery_id, None)
+                self._wake_projection_debt.pop(key, None)
         if stop:
             # Raised outside every handler, so it carries no settlement's
             # control as its context.
             raise asyncio.CancelledError()
+        await self._publish_ended_wake_settlements()
         return settled
 
     async def settle_wake_obligation(
@@ -3999,16 +4024,46 @@ class SignalDispatcher:
         task already ended projects it (#4041, finding 4). The agent's
         projection is idempotent per task, input and terminal state.
         """
-        outcome = await self._durable_store.settle_wake_obligation(
+        outcome = await self._record_wake_settlement(task_id, input_revision)
+        await self._project_wake_settlement(outcome)
+        return outcome
+
+    async def _record_wake_settlement(
+        self, task_id: str, input_revision: int
+    ) -> WakeSettlement:
+        """The settlement transaction alone, or its committed disposition."""
+        return await self._durable_store.settle_wake_obligation(
             agent_id=self._agent.did,
             task_id=task_id,
             input_revision=input_revision,
             settle_task=self._agent.settle_wake_task,
         )
+
+    async def _project_wake_settlement(self, outcome: WakeSettlement) -> None:
+        """Project an ended settlement through the agent, once per manager."""
         project = getattr(self._agent, "project_wake_settlement", None)
         if outcome.disposition == WAKE_ENDED and callable(project):
             await project(outcome)
-        return outcome
+
+    async def _publish_ended_wake_settlements(self) -> None:
+        """Publish ended settlements to the agent's open local subscribers.
+
+        Best effort like every post-commit projection: an ordinary failure
+        is retried by the next pass and never fails this one, which shutdown
+        also runs. Control still propagates.
+        """
+        publish = getattr(self._agent, "publish_ended_wake_settlements", None)
+        if not callable(publish):
+            return
+        try:
+            await publish()
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logger.warning(
+                "Publishing ended wake settlements to open subscribers failed; "
+                "retried on the next pass: %s", error,
+            )
 
     def _finish_runtime_owner_renewal(self, task: asyncio.Task) -> None:
         if getattr(self, "_runtime_owner_renewal_task", None) is not task:

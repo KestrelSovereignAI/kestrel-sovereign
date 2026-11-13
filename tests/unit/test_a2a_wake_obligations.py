@@ -10,22 +10,27 @@ a skipped PostgreSQL leg is a failure (tests/shared/postgres_requirement.py).
 import asyncio
 import copy
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from kestrel_sdk.native_a2a.types import TaskState, TaskStatusUpdateEvent
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     BOUND,
     CONFLICT,
+    CONSUMER_ID,
     ENDED,
     OWED,
     RAN,
     RELEASED,
     TABLE,
+    WakeObligation,
     wake_identity,
 )
+from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 from kestrel_sovereign.signals import DurableAdmissionDisposition
 from kestrel_sovereign.signals.sources.a2a_task_submitted import (
@@ -352,6 +357,10 @@ async def test_settlement_retry_after_unknown_commit_projects_to_open_subscriber
 ):
     task = await manager.create_task(request(), creator_agent_id="did:creator")
     agent, dispatcher, consumer = await input_dispatcher(manager)
+    # The completion wake is a durable projection only the settlement's own
+    # projection raises; an open subscriber is also reached by publication.
+    completions = []
+    manager._on_task_complete = completions.append
     stream = manager.subscribe(task.id, recipient_agent_id=manager.did)
     try:
         assert (await anext(stream)).status.state == TaskState.TASK_STATE_SUBMITTED
@@ -377,26 +386,32 @@ async def test_settlement_retry_after_unknown_commit_projects_to_open_subscriber
             # delivery alone keeps the control, and nothing was projected.
             assert set(dispatcher._source_settlement_control) == {delivery}
             assert dispatcher._outcome_log_control_error is None
+            assert completions == []
             await dispatcher.run_wake_settlement_pass()
             assert calls[-1].disposition == ENDED and not calls[-1].recorded
         assert dispatcher._source_settlement_control == {}
+        # The committed disposition was projected exactly once.
+        assert len(completions) == 1
         async with asyncio.timeout(5):
             event = await anext(stream)
         assert isinstance(event, TaskStatusUpdateEvent)
         assert event.status.state == TaskState.TASK_STATE_FAILED
     finally:
+        manager._on_task_complete = None
         await stream.aclose()
         await close_input_dispatcher(agent, dispatcher)
 
 
-# ---------------------------------------------------------------------------
-# R7 (Q1 lock order): settlement and a peer's re-arm and admission serialize.
-# ---------------------------------------------------------------------------
+async def test_settlement_on_a_peer_reaches_this_managers_open_subscriber(
+    manager, native_pg
+):
+    """A settlement committed elsewhere still ends this manager's open stream.
 
-
-@pytest.mark.parametrize("round_", range(6))
-async def test_settlement_and_peer_release_serialize(manager, native_pg, round_):
-    """Never a task ended by settlement while a live wake holds its input."""
+    Subscribers are this manager's own queues, and the peer that settles
+    projects only to its own. This manager's pass has nothing left to settle,
+    yet it publishes the committed terminal status to its subscriber, and
+    re-runs none of the peer's durable projections.
+    """
     task = await manager.create_task(request(), creator_agent_id="did:creator")
     agent, dispatcher, consumer = await input_dispatcher(manager)
     peer_backend = native_pg()
@@ -404,48 +419,335 @@ async def test_settlement_and_peer_release_serialize(manager, native_pg, round_)
     peer_manager = manager_for(peer_backend, manager.task_store.scope)
     await peer_manager.initialize()
     peer_agent, peer, _ = await input_dispatcher(peer_manager)
+    completions, peer_completions = [], []
+    manager._on_task_complete = completions.append
+    peer_manager._on_task_complete = peer_completions.append
+    stream = manager.subscribe(task.id, recipient_agent_id=manager.did)
+    try:
+        assert (await anext(stream)).status.state == TaskState.TASK_STATE_SUBMITTED
+        delivery = await persisted_wake(
+            manager, dispatcher, task, (await obligation(manager, task)).identity
+        )
+        await fail_terminally(peer, consumer, await claim(peer, consumer, delivery))
+        assert await peer.run_wake_settlement_pass() == 1
+        assert (await obligation(manager, task)).state == ENDED
+        assert len(peer_completions) == 1
+        assert await dispatcher.run_wake_settlement_pass() == 0
+        await dispatcher.run_wake_settlement_pass()
+        # Published once, however many passes find it before it is read.
+        assert [queue.qsize() for queue in manager._subscribers[task.id]] == [1]
+        async with asyncio.timeout(5):
+            event = await anext(stream)
+        assert isinstance(event, TaskStatusUpdateEvent)
+        assert event.status.state == TaskState.TASK_STATE_FAILED
+        # Publication only: the peer's completion wake is not raised again.
+        await dispatcher.run_wake_settlement_pass()
+        assert completions == [] and len(peer_completions) == 1
+    finally:
+        await stream.aclose()
+        manager._on_task_complete = None
+        await close_input_dispatcher(peer_agent, peer)
+        await peer_manager.close()
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_settled_wake_projection_is_retried_after_an_ordinary_failure(manager):
+    """A committed settlement whose projection failed is projected next pass."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    completions = []
+    manager._on_task_complete = completions.append
     try:
         delivery = await persisted_wake(
             manager, dispatcher, task, (await obligation(manager, task)).identity
         )
-        await manager.update_status(
-            task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+        await fail_terminally(dispatcher, consumer, await claim(dispatcher, consumer, delivery))
+        real = manager.project_wake_settlement
+        attempts = []
+
+        async def fails_once(outcome):
+            attempts.append(outcome)
+            if len(attempts) == 1:
+                raise RuntimeError("projection read failed")
+            await real(outcome)
+
+        manager.project_wake_settlement = fails_once
+        # The settlement commits; its failed projection is not mistaken for
+        # an input that stays owed, nor kept as control.
+        assert await dispatcher.run_wake_settlement_pass() == 1
+        assert (await obligation(manager, task)).state == ENDED
+        assert await state_of(manager, task) == TaskState.TASK_STATE_FAILED
+        assert dispatcher._source_settlement_control == {}
+        assert completions == []
+        assert await dispatcher.run_wake_settlement_pass() == 0
+        assert [(a.disposition, a.recorded) for a in attempts] == [
+            (ENDED, True), (ENDED, False),
+        ]
+        assert len(completions) == 1
+        # Projected once: a later pass has nothing left to project.
+        await dispatcher.run_wake_settlement_pass()
+        assert len(attempts) == 2 and len(completions) == 1
+    finally:
+        manager.project_wake_settlement = real
+        manager._on_task_complete = None
+        await close_input_dispatcher(agent, dispatcher)
+
+
+async def test_settlement_projection_failure_still_ends_the_open_stream(manager):
+    """An open subscriber is not left waiting on a failing projection."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    stream = manager.subscribe(task.id, recipient_agent_id=manager.did)
+    real = manager.project_wake_settlement
+
+    async def always_fails(outcome):
+        raise RuntimeError("projection read failed")
+
+    try:
+        assert (await anext(stream)).status.state == TaskState.TASK_STATE_SUBMITTED
+        delivery = await persisted_wake(
+            manager, dispatcher, task, (await obligation(manager, task)).identity
         )
         await fail_terminally(dispatcher, consumer, await claim(dispatcher, consumer, delivery))
-
-        async def peer_rearms_and_admits():
-            await asyncio.sleep(0.001 * round_)
-            try:
-                await peer_manager.update_status(
-                    task.id, TaskState.TASK_STATE_SUBMITTED,
-                    recipient_agent_id=manager.did,
-                )
-            except ValueError:
-                return  # settlement ended the task first
-            await persisted_wake(
-                peer_manager, peer, task,
-                (await obligation(peer_manager, task)).identity,
-            )
-
-        async def settles():
-            await asyncio.sleep(0.001 * (5 - round_))
-            await dispatcher.run_wake_settlement_pass()
-
-        await asyncio.gather(peer_rearms_and_admits(), settles())
-        await dispatcher.run_wake_settlement_pass()
-        state = await state_of(manager, task)
-        current = await obligation(manager, task)
-        live = [
-            row for row in await dispatcher.list_durable_deliveries(consumer_id=consumer)
-            if row.status in LIVE
-        ]
-        if state == TaskState.TASK_STATE_FAILED:
-            assert current.state == ENDED and live == []
-        else:
-            assert state == TaskState.TASK_STATE_SUBMITTED
-            assert current.state == BOUND and current.generation == 2
-            assert [row.delivery_id for row in live] == [current.live_delivery_id]
+        manager.project_wake_settlement = always_fails
+        assert await dispatcher.run_wake_settlement_pass() == 1
+        async with asyncio.timeout(5):
+            event = await anext(stream)
+        assert event.status.state == TaskState.TASK_STATE_FAILED
     finally:
+        manager.project_wake_settlement = real
+        await stream.aclose()
+        await close_input_dispatcher(agent, dispatcher)
+
+
+# ---------------------------------------------------------------------------
+# R7 (Q1 lock order): two dispatchers on one database serialize every write
+# to one input. Each case holds one writer inside its transaction at a
+# barrier, then checks what the other dispatcher sees and does meanwhile.
+# The races are the three wo-4001-9 boot races in obligation terms, plus
+# settlement against a peer's re-arm in both orders.
+# ---------------------------------------------------------------------------
+
+# A peer that does not wait for the held writer's locks finishes well inside
+# this; one that waits stays blocked until the barrier is released.
+BLOCKED_WINDOW = 0.5
+
+
+class Barrier:
+    """Hold one writer at a point inside its transaction until released."""
+
+    def __init__(self):
+        self.reached, self.released = asyncio.Event(), asyncio.Event()
+
+    def before(self, target, name):
+        real = getattr(target, name)
+
+        async def held(*args, **kwargs):
+            self.reached.set()
+            await self.released.wait()
+            return await real(*args, **kwargs)
+
+        setattr(target, name, held)
+
+    def after(self, target, name):
+        real = getattr(target, name)
+
+        async def held(*args, **kwargs):
+            result = await real(*args, **kwargs)
+            self.reached.set()
+            await self.released.wait()
+            return result
+
+        setattr(target, name, held)
+
+    async def wait_reached(self, operation):
+        reached = asyncio.ensure_future(self.reached.wait())
+        try:
+            await asyncio.wait({reached, operation}, timeout=10,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            reached.cancel()
+        if operation.done():
+            operation.result()
+            raise AssertionError("the held writer finished without reaching its barrier")
+        assert self.reached.is_set(), "the held writer never reached its barrier"
+
+
+async def assert_blocked(operation, what):
+    await asyncio.wait({operation}, timeout=BLOCKED_WINDOW)
+    if operation.done():
+        operation.result()
+        raise AssertionError(f"{what} did not wait for the held writer")
+
+
+async def live_wakes(dispatcher, consumer):
+    return [
+        row for row in await dispatcher.list_durable_deliveries(consumer_id=consumer)
+        if row.status in LIVE
+    ]
+
+
+async def assert_serial_view(manager, dispatcher, consumer, task, revision=0):
+    """A reader sees one input in a state some serial order of writes left."""
+    state = await state_of(manager, task)
+    current = await obligation(manager, task, revision)
+    live = await live_wakes(dispatcher, consumer)
+    if state == TaskState.TASK_STATE_FAILED:
+        assert current.state == ENDED and live == [], (state, current, live)
+    else:
+        assert state in (TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING)
+        assert current.state in (OWED, BOUND, RAN), (state, current)
+    assert [row.delivery_id for row in live] in (
+        [], [current.live_delivery_id]
+    ), (current, live)
+
+
+async def bound_wake_failed_on_working_task(manager, dispatcher, consumer, task):
+    """Generation 1's bound wake ended undelivered while its task WORKS."""
+    delivery = await persisted_wake(
+        manager, dispatcher, task, (await obligation(manager, task)).identity
+    )
+    await manager.update_status(
+        task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+    )
+    await fail_terminally(dispatcher, consumer, await claim(dispatcher, consumer, delivery))
+    return delivery
+
+
+async def admit(dispatcher, manager, task, identity, consumer):
+    handle = await dispatcher.enqueue_durable_cognition(
+        wake(await snapshot(manager, task), manager),
+        source_event_id=identity, consumer_id=consumer,
+    )
+    receipt = await handle.wait_for_durable_admission()
+    await handle.wait()
+    return receipt.disposition
+
+
+async def rearm(manager, task):
+    await manager.update_status(
+        task.id, TaskState.TASK_STATE_SUBMITTED, recipient_agent_id=manager.did
+    )
+
+
+R7_RACES = [
+    # Settlement holds the input before its task write: a peer's re-arm
+    # waits, then finds the task ended.
+    "settlement_first_at_task_write",
+    # Settlement holds the input between its task write and its obligation
+    # record: no reader sees one without the other.
+    "settlement_first_at_obligation_record",
+    # A peer's re-arm holds the input: settlement waits, then finds nothing
+    # owed, and the re-armed generation's wake runs (wo-4001-9 attempt 1).
+    "rearm_first",
+    # Boot read an owed generation; a peer re-armed and admitted the next
+    # one before boot's admission (wo-4001-9 attempt 2).
+    "stale_scan_admits_after_peer",
+    # Two dispatchers admit the same owed generation (wo-4001-8).
+    "both_admit_the_owed_generation",
+]
+
+
+@pytest.mark.parametrize("race", R7_RACES)
+async def test_settlement_and_peer_release_serialize(manager, native_pg, race):
+    """Never a task ended while a live wake holds its input, nor two wakes."""
+    task = await manager.create_task(request(), creator_agent_id="did:creator")
+    agent, dispatcher, consumer = await input_dispatcher(manager)
+    peer_backend = native_pg()
+    await peer_backend.connect()
+    peer_manager = manager_for(peer_backend, manager.task_store.scope)
+    await peer_manager.initialize()
+    peer_agent, peer, _ = await input_dispatcher(peer_manager)
+    barrier = Barrier()
+    running = []
+
+    def start(coroutine):
+        running.append(asyncio.ensure_future(coroutine))
+        return running[-1]
+
+    try:
+        if race.startswith("settlement_first"):
+            await bound_wake_failed_on_working_task(manager, dispatcher, consumer, task)
+            if race == "settlement_first_at_task_write":
+                barrier.before(agent, "settle_wake_task")
+            else:
+                barrier.before(dispatcher._durable_store._obligations, "settle")
+            settling = start(dispatcher.settle_wake_obligation(
+                task_id=task.id, input_revision=0
+            ))
+            await barrier.wait_reached(settling)
+            await assert_serial_view(peer_manager, peer, consumer, task)
+            rearming = start(rearm(peer_manager, task))
+            await assert_blocked(rearming, "the peer's re-arm")
+            barrier.released.set()
+            outcome = await settling
+            assert (outcome.disposition, outcome.recorded) == (ENDED, True)
+            with pytest.raises(ValueError):
+                await rearming
+            assert await state_of(manager, task) == TaskState.TASK_STATE_FAILED
+        elif race == "rearm_first":
+            failed = await bound_wake_failed_on_working_task(
+                manager, dispatcher, consumer, task
+            )
+            barrier.after(peer_manager.task_store.obligations, "arm")
+            rearming = start(rearm(peer_manager, task))
+            await barrier.wait_reached(rearming)
+            await assert_serial_view(manager, dispatcher, consumer, task)
+            settling = start(dispatcher.settle_wake_obligation(
+                task_id=task.id, input_revision=0
+            ))
+            await assert_blocked(settling, "the settlement")
+            barrier.released.set()
+            await rearming
+            outcome = await settling
+            assert (outcome.disposition, outcome.recorded) == ("not_owed", False)
+            rearmed = await obligation(peer_manager, task)
+            assert (rearmed.state, rearmed.generation) == (OWED, 2)
+            assert await admit(peer, peer_manager, task, rearmed.identity, consumer) is (
+                DurableAdmissionDisposition.COMMITTED
+            )
+            # The re-armed generation's own wake was admitted and ran.
+            current = await obligation(manager, task)
+            assert (current.state, current.generation) == (RAN, 2)
+            assert current.live_delivery_id != failed
+            assert await state_of(manager, task) == TaskState.TASK_STATE_SUBMITTED
+        elif race == "stale_scan_admits_after_peer":
+            scanned = (await obligation(manager, task)).identity
+            await peer_manager.update_status(
+                task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+            )
+            await rearm(peer_manager, task)
+            rearmed = await obligation(peer_manager, task)
+            assert await admit(peer, peer_manager, task, rearmed.identity, consumer) is (
+                DurableAdmissionDisposition.COMMITTED
+            )
+            assert await admit(dispatcher, manager, task, scanned, consumer) is (
+                DurableAdmissionDisposition.REFUSED
+            )
+            # Only the peer's generation-2 wake was admitted, and it ran.
+            current = await obligation(manager, task)
+            assert (current.state, current.generation) == (RAN, 2)
+        else:
+            identity = (await obligation(manager, task)).identity
+            barrier.after(dispatcher._durable_store._obligations, "bind")
+            admitting = start(persisted_wake(manager, dispatcher, task, identity))
+            await barrier.wait_reached(admitting)
+            await assert_serial_view(peer_manager, peer, consumer, task)
+            peer_admitting = start(admit(peer, peer_manager, task, identity, consumer))
+            await assert_blocked(peer_admitting, "the peer's admission")
+            barrier.released.set()
+            first = await admitting
+            assert await peer_admitting is DurableAdmissionDisposition.DUPLICATE
+            assert (await obligation(manager, task)).live_delivery_id == first
+        await assert_serial_view(manager, dispatcher, consumer, task)
+        await assert_serial_view(peer_manager, peer, consumer, task)
+        await assert_not_stranded(manager, task)
+    finally:
+        barrier.released.set()
+        for operation in running:
+            if not operation.done():
+                operation.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
         await close_input_dispatcher(peer_agent, peer)
         await peer_manager.close()
         await close_input_dispatcher(agent, dispatcher)
@@ -647,6 +949,57 @@ async def test_live_submission_callback_admits_at_the_obligation_generation(mana
         await close_input_dispatcher(agent, dispatcher)
 
 
+async def test_rearmed_input_resumes_after_hold_release_without_restart(manager):
+    """A re-arm hands its input to the live producer; no reboot is needed.
+
+    The generation-1 wake is admitted under Hold. The task then goes WORKING
+    and back to SUBMITTED, which re-arms the input at generation 2 and makes
+    that wake unclaimable. The re-arm's own wake must be admitted at once, so
+    releasing Hold resumes the task in this process.
+    """
+    from kestrel_sovereign.hold import EffectiveHoldState
+    from tests.unit.test_durable_signal_delivery import _HoldSnapshots
+
+    agent, dispatcher, consumer = await input_dispatcher(manager, held=True)
+    manager._on_task_submitted = agent._on_task_submitted
+    prompts = []
+
+    async def process(prompt):
+        prompts.append(prompt)
+        return "Handled the re-armed input"
+
+    agent.process_input = process
+    try:
+        task = await manager.create_task(request(), creator_agent_id="did:creator")
+        await asyncio.gather(*agent.tasks)
+        first = await obligation(manager, task)
+        assert (first.state, first.generation) == (BOUND, 1)
+        await manager.update_status(
+            task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=manager.did
+        )
+        await manager.update_status(
+            task.id, TaskState.TASK_STATE_SUBMITTED, recipient_agent_id=manager.did
+        )
+        await asyncio.gather(*agent.tasks)
+        rearmed = await obligation(manager, task)
+        assert (rearmed.state, rearmed.generation) == (BOUND, 2)
+        assert rearmed.live_delivery_id != first.live_delivery_id
+        live = await dispatcher._durable_store.get_delivery(
+            agent_id=manager.did, consumer_id=consumer,
+            delivery_id=rearmed.live_delivery_id,
+        )
+        assert live.event.source_event_id == wake_identity(task.id, 0, 2)
+        assert prompts == []
+        agent._hold_store = _HoldSnapshots(EffectiveHoldState(host=None, agent=None))
+        await dispatcher._drain_durable_cognition_consumer(consumer)
+        assert len(prompts) == 1
+        ran = await obligation(manager, task)
+        assert (ran.state, ran.generation) == (RAN, 2)
+    finally:
+        manager._on_task_submitted = None
+        await close_input_dispatcher(agent, dispatcher)
+
+
 async def test_stale_generation_admission_is_refused(manager):
     task = await manager.create_task(request(), creator_agent_id="did:creator")
     agent, dispatcher, consumer = await input_dispatcher(manager)
@@ -670,3 +1023,84 @@ async def test_stale_generation_admission_is_refused(manager):
         assert (await obligation(manager, task)).state == OWED
     finally:
         await close_input_dispatcher(agent, dispatcher)
+
+
+# ---------------------------------------------------------------------------
+# Boot pages owed obligations by key, and refuses a cursor that stands still.
+# ---------------------------------------------------------------------------
+
+
+def owed(task_id, input_revision=0):
+    return WakeObligation(
+        agent_id="did:kestrel:recipient", consumer_id=CONSUMER_ID, task_id=task_id,
+        input_revision=input_revision, generation=1, state=OWED, live_delivery_id=None,
+    )
+
+
+class SamePageEveryTime:
+    """An obligation store whose keyset ignores its cursor.
+
+    It stops the test after ``bound`` pages, so a loop that never notices
+    fails here instead of running the host out of memory.
+    """
+
+    def __init__(self, page, bound=50):
+        self.page, self.bound, self.cursors = page, bound, []
+
+    async def list_by_state(self, *, agent_id, state, after=None, limit=500):
+        assert state == OWED
+        self.cursors.append(after)
+        if len(self.cursors) > self.bound:
+            raise AssertionError(f"boot paged {self.bound} times without stopping")
+        return list(self.page)
+
+
+class KeysetPages:
+    """An obligation store that honours its cursor, one obligation per page."""
+
+    def __init__(self, obligations):
+        self.obligations, self.cursors = obligations, []
+
+    async def list_by_state(self, *, agent_id, state, after=None, limit=500):
+        self.cursors.append(after)
+        return [
+            item for item in self.obligations
+            if after is None or (item.task_id, item.input_revision) > after
+        ][:1]
+
+
+def paging_agent(store, admitted):
+    async def admit(obligation_):
+        admitted.append((obligation_.task_id, obligation_.input_revision))
+        return None
+
+    return SimpleNamespace(
+        did="did:kestrel:recipient",
+        signal_registry=SimpleNamespace(get=lambda source: SimpleNamespace(retention_days=14)),
+        dispatcher=SimpleNamespace(run_wake_settlement_pass=AsyncMock(return_value=0)),
+        task_manager=SimpleNamespace(
+            task_store=SimpleNamespace(obligations=store),
+            list_cognition_wake_candidates=AsyncMock(return_value=[]),
+        ),
+        _admit_owed_wake=admit,
+    )
+
+
+async def test_boot_paging_refuses_a_cursor_that_does_not_advance():
+    store = SamePageEveryTime([owed("task-a"), owed("task-b", 2)])
+    admitted = []
+    with pytest.raises(RuntimeError, match="paging did not advance"):
+        await EventManagerMixin.reconcile_a2a_cognition_wakes(
+            paging_agent(store, admitted)
+        )
+    assert store.cursors == [None, ("task-b", 2)]
+    # The repeated page is refused before any of it is admitted again.
+    assert admitted == [("task-a", 0), ("task-b", 2)]
+
+
+async def test_boot_paging_admits_every_page_of_an_advancing_cursor():
+    store = KeysetPages([owed("task-a"), owed("task-a", 1), owed("task-b")])
+    admitted = []
+    await EventManagerMixin.reconcile_a2a_cognition_wakes(paging_agent(store, admitted))
+    assert admitted == [("task-a", 0), ("task-a", 1), ("task-b", 0)]
+    assert store.cursors == [None, ("task-a", 0), ("task-a", 1), ("task-b", 0)]

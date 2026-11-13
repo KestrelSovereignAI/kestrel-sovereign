@@ -12,6 +12,7 @@ This is the primary API for working with A2A tasks.
 
 import asyncio
 import logging
+import weakref
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
@@ -95,6 +96,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskMutationAuthorizationError,
     without_reserved_cancellation_receipt,
 )
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import ENDED as WAKE_ENDED
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
@@ -253,6 +255,11 @@ class TaskManager:
 
         # Event subscribers for SSE streaming
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
+        # Queues already given a stream-stop status: their subscriber reads
+        # nothing after it, so a second publication of it is skipped.
+        self._stopped_subscriber_queues: weakref.WeakSet[asyncio.Queue] = (
+            weakref.WeakSet()
+        )
 
         # Feature providers expose skills; they do not mint peer Agent Cards.
         self._providers: dict[str, tuple[tuple[AgentSkill, ...], TaskHandler]] = {}
@@ -1419,6 +1426,7 @@ class TaskManager:
             baseline=baseline,
             recipient_agent_id=authority_agent_id,
             expected_state=expected_state,
+            on_rearmed=self._announce_submitted_input,
         )
 
     async def execute_command(self, user_input: str) -> dict | None:
@@ -1875,12 +1883,17 @@ class TaskManager:
         if message is not None:
             task.history.append(message)
 
-        # Save updated task (use save() to persist both status and history)
+        # Save updated task (use save() to persist both status and history).
+        # A transition into SUBMITTED re-armed its input's wake obligation
+        # (#4041); the committed input goes to the same submission producer
+        # a new task's input does, so its new generation's wake is admitted
+        # now rather than at the next boot.
         saved = await self.task_store.save_recipient_lifecycle(
             task,
             baseline=baseline,
             recipient_agent_id=recipient_agent_id,
             expected_state=current_state,
+            on_rearmed=self._announce_submitted_input,
         )
         if saved is None:
             persisted = await self.task_store.get_for_recipient(
@@ -2364,6 +2377,37 @@ class TaskManager:
         while len(projected) > _PROJECTED_WAKE_SETTLEMENT_LIMIT:
             projected.popitem(last=False)
 
+    async def publish_ended_wake_settlements(self) -> int:
+        """Give this manager's open subscribers the status of ended settlements.
+
+        A settlement commits on whichever dispatcher's pass reached it, and
+        is projected there, to that manager's own subscribers (#4041). A
+        subscriber open here on the same task would otherwise wait forever:
+        when the settlement committed on a peer, or here when its projection
+        failed. Every subscribed task whose wake obligation ended is
+        therefore given its committed terminal status. Publication only: the
+        settling manager owns the durable projections and the completion
+        wake. Returns how many tasks were published to.
+        """
+        task_ids = [
+            task_id
+            for task_id, queues in self._subscribers.items()
+            if any(queue not in self._stopped_subscriber_queues for queue in queues)
+        ]
+        if not task_ids:
+            return 0
+        ended = await self.task_store.obligations.task_ids_in_state(
+            agent_id=self.did, state=WAKE_ENDED, task_ids=task_ids
+        )
+        published = 0
+        for task_id in sorted(ended):
+            task = await self.task_store.get_for_recipient(task_id, self.did)
+            if task is None or task.status.state not in TERMINAL_STATES:
+                continue
+            if await self._publish_to_subscribers(task, final=True):
+                published += 1
+        return published
+
     async def fail_task(
         self,
         task_id: str,
@@ -2616,19 +2660,40 @@ class TaskManager:
                     if is_execution_control_error(error):
                         raise
                     logger.exception("Task completion callback failed for %s", task.id)
+        await self._publish_to_subscribers(task, final=final)
+
+    async def _publish_to_subscribers(self, task: Task, *, final: bool) -> int:
+        """Put a task's durable status on its open local subscribers' queues.
+
+        A queue that already holds a stream-stop status is skipped: its
+        subscriber ends there, and a settlement's projection and a later
+        publication of the same ended settlement may both reach it (#4041).
+        Returns how many queues were published to.
+        """
+        queues = [
+            queue
+            for queue in self._subscribers.get(task.id, ())
+            if queue not in self._stopped_subscriber_queues
+        ]
+        if not queues:
+            return 0
         # A handler can return artifacts in its final Task without calling the
         # incremental artifact API. Publish those durable values before the
         # status that closes the stream. Replacements use the standard ID rule
         # so a client that already saw chunks does not append them twice.
         for artifact in task.artifacts:
             await self._notify_artifact_update(
-                task, artifact, append=False, last_chunk=final
+                task, artifact, append=False, last_chunk=final, queues=queues
             )
         event = TaskStatusUpdateEvent(
             task_id=task.id, context_id=task.context_id, status=task.status
         )
-        for queue in self._subscribers.get(task.id, ()):
+        stops = task.status.state in STREAM_STOP_STATES
+        for queue in queues:
             await queue.put(event)
+            if stops:
+                self._stopped_subscriber_queues.add(queue)
+        return len(queues)
 
     async def _notify_artifact_update(
         self,
@@ -2637,8 +2702,14 @@ class TaskManager:
         *,
         append: bool = False,
         last_chunk: bool = True,
+        queues: Sequence[asyncio.Queue] | None = None,
     ) -> None:
-        """Publish a native artifact update in the task's context."""
+        """Publish a native artifact update in the task's context.
+
+        ``queues`` narrows publication to those subscriber queues; by default
+        every open subscriber of the task that has not been given a
+        stream-stop status receives it.
+        """
         event = TaskArtifactUpdateEvent(
             task_id=task.id,
             context_id=task.context_id,
@@ -2646,7 +2717,13 @@ class TaskManager:
             append=append,
             last_chunk=last_chunk,
         )
-        for queue in self._subscribers.get(task.id, ()):
+        if queues is None:
+            queues = [
+                queue
+                for queue in self._subscribers.get(task.id, ())
+                if queue not in self._stopped_subscriber_queues
+            ]
+        for queue in queues:
             await queue.put(event)
 
     # =========================================================================

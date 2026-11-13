@@ -39,31 +39,31 @@ from typing import (
 from kestrel_sdk.signals import Signal
 
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     BOUND as OBLIGATION_BOUND,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     CONFLICT as OBLIGATION_CONFLICT,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     CONSUMER_ID as OBLIGATION_CONSUMER_ID,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     OWED as OBLIGATION_OWED,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     SETTLED as OBLIGATION_SETTLED,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     SOURCE as OBLIGATION_SOURCE,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     TABLE as OBLIGATIONS,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     NOT_OWED as OBLIGATION_NOT_OWED,
 )
-from kestrel_sovereign.a2a.wake_obligations import (
+from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import (
     BackfillReport,
     WakeObligation,
     WakeObligationRefused,

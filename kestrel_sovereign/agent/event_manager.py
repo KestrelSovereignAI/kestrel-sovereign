@@ -237,7 +237,7 @@ class EventManagerMixin:
         retry in-process, while boot reconciliation covers process loss.
         """
 
-        from kestrel_sovereign.a2a.wake_obligations import OWED
+        from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import OWED
         from kestrel_sovereign.signals import DurableAdmissionDisposition
         from kestrel_sovereign.signals.delivery import (
             ACCEPTED_STATUSES,
@@ -742,7 +742,7 @@ class EventManagerMixin:
         retention a missing row is not evidence of a lost wake.
         """
 
-        from kestrel_sovereign.a2a.wake_obligations import OWED
+        from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import OWED
         from kestrel_sovereign.signals import DurableAdmissionDisposition
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
@@ -776,6 +776,18 @@ class EventManagerMixin:
             page = await obligations.list_by_state(
                 agent_id=self.did, state=OWED, after=after
             )
+            if not page:
+                break
+            last = (page[-1].task_id, page[-1].input_revision)
+            if after is not None and not last > after:
+                # A keyset page must end strictly past its cursor. One that
+                # does not would page forever; refuse it before admitting
+                # any of its obligations a second time.
+                raise RuntimeError(
+                    "A2A wake obligation paging did not advance: a page after "
+                    f"{after!r} ended at {last!r}"
+                )
+            after = last
             for obligation in page:
                 disposition = await self._admit_owed_wake(obligation)
                 if disposition is DurableAdmissionDisposition.NOT_ADMITTED:
@@ -786,9 +798,6 @@ class EventManagerMixin:
                         "terminally; its settlement owns it",
                         obligation.task_id,
                     )
-            if not page:
-                break
-            after = (page[-1].task_id, page[-1].input_revision)
 
         tasks = await self.task_manager.list_cognition_wake_candidates(
             recipient_agent_id=self.did,
@@ -872,6 +881,10 @@ class EventManagerMixin:
     async def project_wake_settlement(self, outcome) -> None:
         """Project an ended wake settlement to the task's subscribers."""
         await self.task_manager.project_wake_settlement(outcome)
+
+    async def publish_ended_wake_settlements(self) -> None:
+        """Give open subscribers here the status of tasks a settlement ended."""
+        await self.task_manager.publish_ended_wake_settlements()
 
     async def validate_cognition_signal_execution(self, signal) -> str | None:
         """Fail closed when durable state withdraws an inbound A2A wake.

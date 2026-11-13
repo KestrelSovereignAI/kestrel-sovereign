@@ -25,6 +25,14 @@
         "sql": "CREATE INDEX a2a_task_changes_task ON a2a_task_changes (recipient_id, tenant, task_id, sequence)",
         "table": "a2a_task_changes"
       },
+      "idx_a2a_wake_obligations_live": {
+        "sql": "CREATE UNIQUE INDEX idx_a2a_wake_obligations_live ON a2a_wake_obligations (agent_id, consumer_id, live_delivery_id) WHERE live_delivery_id IS NOT NULL",
+        "table": "a2a_wake_obligations"
+      },
+      "idx_a2a_wake_obligations_state": {
+        "sql": "CREATE INDEX idx_a2a_wake_obligations_state ON a2a_wake_obligations (agent_id, consumer_id, state)",
+        "table": "a2a_wake_obligations"
+      },
       "idx_llm_calls_agent": {
         "sql": "CREATE INDEX idx_llm_calls_agent ON a2a_llm_calls(agent_did)",
         "table": "a2a_llm_calls"
@@ -106,7 +114,7 @@
         "table": "a2a_tool_dispatches"
       }
     },
-    "revision": 6,
+    "revision": 7,
     "tables": {
       "a2a_contexts": {
         "columns": [
@@ -1236,6 +1244,67 @@
           ]
         ],
         "sql": "CREATE TABLE a2a_tool_dispatches ( id INTEGER PRIMARY KEY AUTOINCREMENT, agent_did TEXT NOT NULL, session_id TEXT, turn_id TEXT NOT NULL, ts TEXT DEFAULT (datetime('now')), tool_name TEXT NOT NULL, adapter TEXT NOT NULL, args_redacted TEXT NOT NULL, result_status TEXT NOT NULL CHECK ( result_status IN ('success', 'error', 'empty', 'policy_denied', 'timeout') ), error_class TEXT, error_message TEXT, latency_ms INTEGER NOT NULL, result_size_bytes INTEGER, dispatch_id TEXT, parent_dispatch_id TEXT )"
+      },
+      "a2a_wake_obligations": {
+        "columns": [
+          [
+            "agent_id",
+            "TEXT",
+            true,
+            null,
+            1
+          ],
+          [
+            "consumer_id",
+            "TEXT",
+            true,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            true,
+            null,
+            3
+          ],
+          [
+            "input_revision",
+            "BIGINT",
+            true,
+            null,
+            4
+          ],
+          [
+            "generation",
+            "BIGINT",
+            true,
+            null,
+            0
+          ],
+          [
+            "state",
+            "TEXT",
+            true,
+            null,
+            0
+          ],
+          [
+            "live_delivery_id",
+            "TEXT",
+            false,
+            null,
+            0
+          ],
+          [
+            "updated_at",
+            "TEXT",
+            false,
+            "datetime('now')",
+            0
+          ]
+        ],
+        "sql": "CREATE TABLE a2a_wake_obligations ( agent_id TEXT NOT NULL, consumer_id TEXT NOT NULL, task_id TEXT NOT NULL, input_revision BIGINT NOT NULL CHECK (input_revision >= 0), generation BIGINT NOT NULL CHECK (generation >= 1), state TEXT NOT NULL CHECK (state IN ('owed', 'bound', 'ran', 'conflict', 'ended', 'released')), live_delivery_id TEXT, updated_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (agent_id, consumer_id, task_id, input_revision), CHECK (state <> 'bound' OR live_delivery_id IS NOT NULL), CHECK (state NOT IN ('owed', 'conflict') OR live_delivery_id IS NULL) )"
       }
     },
     "triggers": {

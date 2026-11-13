@@ -113,7 +113,7 @@ async def test_a2a_working_wake_reuses_input_but_continuation_is_a_new_operation
     submitted = signal_effect_provenance(event, agent_id=owner.did)
     # A later generation's wake of the same input (#4041), and the
     # working-revision identity earlier releases stored, are the same input.
-    from kestrel_sovereign.a2a.wake_obligations import wake_identity
+    from kestrel_sovereign.a2a.stores.unified.wake_obligation_store import wake_identity
     for identity in (wake_identity('native-task', 0, 2), '["native-task",0,9]'):
         working = signal_effect_provenance(replace(event, event_id='working-event',
             source_event_id=identity), agent_id=owner.did)

@@ -62,10 +62,13 @@ initializers under the shared schema lease and advances the stored revision in
 the same transaction. No row is converted. Every other stored revision still
 refuses startup and needs an offline migration.
 
-The one such upgrade today is CORE revision 5 to 6, which adds the
-`a2a_tool_dispatches` dispatch ids (#4002). A database already at a newer
-revision is refused by an older release, so after a host crosses revision 6,
-rolling back to an earlier release means restoring the pre-upgrade backup.
+Two such upgrades exist today, both on CORE. Revision 5 to 6 adds the
+`a2a_tool_dispatches` dispatch ids (#4002). Revision 6 to 7 adds the
+`a2a_wake_obligations` table (#4041); its rows are backfilled from task state
+by the durable signal ledger's schema bootstrap, not by this crossing. A
+database already at a newer revision is refused by an older release, so after
+a host crosses a revision, rolling back to an earlier release means restoring
+the pre-upgrade backup.
 
 ## Prepare the old host
 

@@ -114,18 +114,23 @@ async def test_cutover_retires_unselected_old_event_before_native_consumer_backf
 
 
 async def acknowledge_old(store, accepted):
-    lease = await store.claim_delivery(
-        agent_id="did:recipient",
-        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
-        executor_id="old-runtime",
+    """Leave the old wake as the draft runtime's acknowledgement left it.
+
+    That runtime claimed and acknowledged it. This release cannot claim it:
+    a submission wake no obligation binds is never claimable (#4041). So the
+    row is written in the exact state the old acknowledgement committed.
+    """
+    [delivery_id] = accepted.delivery_ids
+    now = store.to_timestamp_param(store.now_utc())
+    updated = await store.backend.execute(
+        f"UPDATE {store.DELIVERIES} SET status = 'acknowledged', attempts = 1, "
+        "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, "
+        "acknowledged_at = ?, terminal_at = ?, updated_at = ? "
+        "WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ? "
+        "AND status = 'pending'",
+        (now, now, now, "did:recipient", DURABLE_COGNITION_CONSUMER_ID, delivery_id),
     )
-    assert lease is not None and lease.event.event_id == accepted.event_id
-    assert await store.ack_delivery(
-        agent_id="did:recipient",
-        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
-        delivery_id=lease.delivery_id,
-        lease_token=lease.lease_token,
-    )
+    assert updated == 1
 
 
 async def test_archives_include_exact_signal_receipts_and_keep_unrelated_sources(
