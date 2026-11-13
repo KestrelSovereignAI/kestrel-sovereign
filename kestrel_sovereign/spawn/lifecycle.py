@@ -626,11 +626,19 @@ class SpawnedAgentLifecycle:
         callers still receive only exact child identities for teardown.
         """
 
+        # A directly stopped parent's timer retains finalization custody after
+        # its tracker is withdrawn. Its still-tracked descendants need that
+        # same cleanup-only root when the original timer reaches expiry.
         owned = {
+            child_did
+            for (_child_name, child_did), count in self._finalization_owner_counts.items()
+            if count > 0
+        }
+        owned.update({
             tracked.child_did
             for tracked in self._tracked.values()
             if self._tracked_child_has_cleanup_authority(tracked)
-        }
+        })
         changed = True
         while changed:
             changed = False
