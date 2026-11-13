@@ -6,6 +6,7 @@ constructing the complete native request used by sender verification.
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -13,6 +14,7 @@ from kestrel_sdk.native_a2a.server.context import ServerCallContext
 from kestrel_sdk.native_a2a.server.routes.common import DefaultServerCallContextBuilder
 from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message as ProtoMessage
 from starlette.requests import Request
@@ -21,6 +23,7 @@ from kestrel_sovereign.a2a.scope import NativeRecipientScope
 
 _CONTEXT_KEY = "kestrel.native_a2a_http_context"
 _Request = TypeVar("_Request", bound=ProtoMessage)
+_Decision = TypeVar("_Decision")
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,9 @@ async def wait_native_disconnect(context: ServerCallContext) -> None:
     request = _native_http_request(context).request
     message = await request.receive()
     if message["type"] != "http.disconnect":
-        raise RuntimeError("Native disconnect monitoring requires a consumed HTTP request")
+        raise RuntimeError(
+            "Native disconnect monitoring requires a consumed HTTP request"
+        )
 
 
 def _require_tenant(value: object, expected: str) -> None:
@@ -95,19 +100,14 @@ def _require_tenant(value: object, expected: str) -> None:
         )
 
 
-async def bind_native_request(
+def _native_selection(
     params: _Request,
     context: ServerCallContext,
     *,
     routing_key: str,
     scope: NativeRecipientScope,
-) -> _Request:
-    """Validate routing before authorization, then resolve REST path fields.
-
-    The returned protobuf is a copy. No carrier can change the selected agent,
-    and an inconsistent body/query tenant is rejected before path resolution.
-    This must precede signature verification and SDK-generated task/context IDs.
-    """
+) -> tuple[_NativeHTTPRequest, FieldDescriptor]:
+    """Validate pure selected-route claims before reading the HTTP body."""
     bound = _native_http_request(context)
     binding, request = bound.binding, bound.request
     if binding.routing_key != routing_key or binding.scope != scope:
@@ -130,8 +130,18 @@ async def bind_native_request(
         )
     for value in queries:
         _require_tenant(value, expected)
+    return bound, field
 
-    raw = await request.body()
+
+def _bound_native_payload(
+    params: _Request,
+    bound: _NativeHTTPRequest,
+    field: FieldDescriptor,
+    raw: bytes,
+) -> _Request:
+    """Bind pure body/path/protobuf carriers, never an HTTP reader failure."""
+    binding, request = bound.binding, bound.request
+    expected = binding.tenant
     if raw:
         try:
             body = json.loads(raw)
@@ -164,3 +174,48 @@ async def bind_native_request(
     result.CopyFrom(params)
     setattr(result, field.name, expected)
     return result
+
+
+def _native_input_decision(
+    decide: Callable[[], _Decision],
+    refusal_values: bool,
+) -> _Decision | StreamRefusal:
+    """Only synchronous canonical validation decisions can become values."""
+    try:
+        return decide()
+    except InvalidParamsError as error:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+
+        if not refusal_values or is_execution_control_error(error):
+            raise
+        return StreamRefusal(error)
+
+
+async def bind_native_request(
+    params: _Request,
+    context: ServerCallContext,
+    *,
+    routing_key: str,
+    scope: NativeRecipientScope,
+    refusal_values: bool = False,
+) -> _Request | StreamRefusal:
+    """Validate routing and resolve carriers without normalizing HTTP I/O.
+
+    Legacy callers raise the same validation errors. Streaming admission can
+    select explicit values at the pure decisions; the actual original body
+    await is outside both conversion boundaries and always propagates failure.
+    """
+    selected = _native_input_decision(
+        lambda: _native_selection(
+            params, context, routing_key=routing_key, scope=scope
+        ),
+        refusal_values,
+    )
+    if isinstance(selected, StreamRefusal):
+        return selected
+    bound, field = selected
+    raw = await bound.request.body()
+    return _native_input_decision(
+        lambda: _bound_native_payload(params, bound, field, raw),
+        refusal_values,
+    )

@@ -61,6 +61,7 @@ from kestrel_sovereign.a2a.extensions import (
     require_metadata_extensions,
 )
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
+from kestrel_sovereign.a2a.native_input import prepare_native_task_input
 from kestrel_sovereign.a2a.media import (
     encode_inline_json,
     skill_input_modes,
@@ -308,6 +309,8 @@ class NativeA2ARequestHandler(RequestHandler):
             metadata = MessageToDict(params.metadata)
             require_metadata_extensions(metadata, admitted.activated_extensions)
             claims = parse_message_metadata(metadata)
+            if claims.peer_stop is None:
+                prepare_native_task_input(params)
             modes = skill_input_modes(
                 self._card.default_input_modes,
                 self.manager.get_agent_skills(),
@@ -435,9 +438,11 @@ class NativeA2ARequestHandler(RequestHandler):
         except ContextOwnershipError as error:
             if is_execution_control_error(error):
                 raise
-            raise HTTPException(
+            refusal = HTTPException(
                 status_code=403, detail="A2A context is not available to this principal"
-            ) from error
+            )
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
 
     async def _open_stream(
         self, task_id: str, principal_id: str
@@ -530,9 +535,16 @@ class NativeA2ARequestHandler(RequestHandler):
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> AsyncGenerator[Event | StreamRefusal]:
         async with self.guard.admit(
-            params, "SendStreamingMessage", context
+            params, "SendStreamingMessage", context, refusal_values=True
         ) as admitted:
-            streaming = self._card.capabilities.streaming
+            streaming = (
+                self._card.capabilities.streaming
+                if not isinstance(admitted, StreamRefusal)
+                else False
+            )
+        if isinstance(admitted, StreamRefusal):
+            yield admitted
+            return
         if not streaming:
             yield StreamRefusal(
                 UnsupportedOperationError(
@@ -566,8 +578,12 @@ class NativeA2ARequestHandler(RequestHandler):
     async def on_subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext
     ) -> AsyncGenerator[Event | StreamRefusal]:
-        async with self.guard.admit(params, "SubscribeToTask", context) as admitted:
-            if not self._card.capabilities.streaming:
+        async with self.guard.admit(
+            params, "SubscribeToTask", context, refusal_values=True
+        ) as admitted:
+            if isinstance(admitted, StreamRefusal):
+                opened = admitted
+            elif not self._card.capabilities.streaming:
                 opened = StreamRefusal(
                     UnsupportedOperationError(
                         message="Streaming is not advertised by this agent"

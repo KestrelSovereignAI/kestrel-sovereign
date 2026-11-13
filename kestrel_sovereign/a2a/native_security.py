@@ -7,10 +7,15 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 from kestrel_sdk.native_a2a.server.context import ServerCallContext
-from kestrel_sdk.native_a2a.utils.errors import ExtensionSupportRequiredError, InternalError
+from kestrel_sdk.native_a2a.utils.errors import (
+    ExtensionSupportRequiredError,
+    InternalError,
+)
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from google.protobuf.message import Message as ProtoMessage
 from starlette.exceptions import HTTPException
 
+from kestrel_sovereign._async_ownership import OriginalContextExit
 from kestrel_sovereign.a2a.extensions import SIGNED_SENDER_URI
 from kestrel_sovereign.a2a.native_context import (
     bind_native_request,
@@ -120,72 +125,139 @@ class NativeDIDRequestGuard:
             authority.require_current(None)
             if allowed is not True:
                 raise HTTPException(
-                    status_code=403, detail="A2A recipient policy refused this principal"
+                    status_code=403,
+                    detail="A2A recipient policy refused this principal",
                 )
             yield
 
     @asynccontextmanager
     async def admit(
-        self, params: _Request, operation: str, context: ServerCallContext
-    ) -> AsyncIterator[AuthorizedNativeRequest[_Request]]:
+        self,
+        params: _Request,
+        operation: str,
+        context: ServerCallContext,
+        *,
+        refusal_values: bool = False,
+    ) -> AsyncIterator[AuthorizedNativeRequest[_Request] | StreamRefusal]:
         request = await bind_native_request(
             params,
             context,
             routing_key=self.routing_key,
             scope=self.scope,
+            refusal_values=True,
         )
+        if isinstance(request, StreamRefusal):
+            if refusal_values:
+                yield request
+            else:
+                raise request.error
+            return
         activated_extensions = frozenset(context.requested_extensions)
+        refusal = None
         if not self.required_extensions <= activated_extensions:
-            raise ExtensionSupportRequiredError(
-                message="Required Agent Card extensions were not activated"
-            )
-        async with _native_persistence_errors(), self.lifecycle_lease():
-            authority = self._new_authority()
-            authority.require_current(None)
-            try:
-                sender = await verify_native_request(
-                    native_header_values(context, SENDER_PROOF_HEADER),
-                    request,
-                    recipient=self.scope.recipient_id,
-                    operation=operation,
-                    extensions=activated_extensions,
-                    resolver=authority.resolver,
-                    replay_store=self.replay_store,
-                    policy=self.proof_policy,
-                    now_ts=int(self.clock()),
+            refusal = StreamRefusal(
+                ExtensionSupportRequiredError(
+                    message="Required Agent Card extensions were not activated"
                 )
-            except NativeSenderProofError as error:
-                if is_execution_control_error(error):
-                    raise
-                raise HTTPException(
-                    status_code=401,
-                    detail="A2A sender proof was not accepted",
-                    headers={
-                        "WWW-Authenticate": 'Kestrel-A2A-Sender-Proof realm="a2a"'
-                    },
-                ) from error
-            principal = await self._authorize(authority, sender)
-            yield AuthorizedNativeRequest(
-                request,
-                principal,
-                sender,
-                self.scope,
-                self.routing_key,
-                authority,
-                self,
-                activated_extensions,
             )
+        else:
+            async with (
+                _native_persistence_errors(),
+                OriginalContextExit(self.lifecycle_lease()),
+            ):
+                authority = self._new_authority()
+                refusal = self._current_decision(authority, None)
+                if refusal is None:
+                    try:
+                        sender = await verify_native_request(
+                            native_header_values(context, SENDER_PROOF_HEADER),
+                            request,
+                            recipient=self.scope.recipient_id,
+                            operation=operation,
+                            extensions=activated_extensions,
+                            resolver=authority.resolver,
+                            replay_store=self.replay_store,
+                            policy=self.proof_policy,
+                            now_ts=int(self.clock()),
+                        )
+                    except NativeSenderProofError as error:
+                        if is_execution_control_error(error):
+                            raise
+                        denied = HTTPException(
+                            status_code=401,
+                            detail="A2A sender proof was not accepted",
+                            headers={
+                                "WWW-Authenticate": 'Kestrel-A2A-Sender-Proof realm="a2a"'
+                            },
+                        )
+                        denied.__cause__ = error
+                        refusal = StreamRefusal(denied)
+                    else:
+                        principal = await self._authorization_decision(
+                            authority, sender
+                        )
+                        if isinstance(principal, StreamRefusal):
+                            refusal = principal
+                        else:
+                            yield AuthorizedNativeRequest(
+                                request,
+                                principal,
+                                sender,
+                                self.scope,
+                                self.routing_key,
+                                authority,
+                                self,
+                                activated_extensions,
+                            )
+        if refusal is not None:
+            # These values arise only at explicit decision branches. An actual
+            # original lease exit failure never reaches this settled publication.
+            if refusal_values:
+                yield refusal
+            else:
+                raise refusal.error
+
+    @staticmethod
+    def _current_decision(
+        authority: NativeRequestAuthority,
+        sender: NativeVerifiedSender | None,
+    ) -> StreamRefusal | None:
+        """Read the synchronous host policy decision, not a resource/I/O scope."""
+        try:
+            authority.require_current(sender)
+        except HTTPException as error:
+            if is_execution_control_error(error):
+                raise
+            return StreamRefusal(error)
+        return None
+
+    async def _authorization_decision(
+        self,
+        authority: NativeRequestAuthority,
+        sender: NativeVerifiedSender,
+    ) -> str | StreamRefusal:
+        refused = self._current_decision(authority, sender)
+        if refused is not None:
+            return refused
+        principal = await authority.authorize_sender(sender.sender)
+        refused = self._current_decision(authority, sender)
+        if refused is not None:
+            return refused
+        if not isinstance(principal, str) or not principal.strip():
+            return StreamRefusal(
+                HTTPException(
+                    status_code=403,
+                    detail="A2A recipient policy refused this principal",
+                )
+            )
+        return principal
 
     async def _authorize(
         self, authority: NativeRequestAuthority, sender: NativeVerifiedSender
     ) -> str:
-        authority.require_current(sender)
-        principal = await authority.authorize_sender(sender.sender)
-        authority.require_current(sender)
-        if not isinstance(principal, str) or not principal.strip():
-            raise HTTPException(
-                status_code=403, detail="A2A recipient policy refused this principal"
-            )
+        principal = await self._authorization_decision(authority, sender)
+        if isinstance(principal, StreamRefusal):
+            raise principal.error
         return principal
 
     @asynccontextmanager

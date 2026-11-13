@@ -1648,8 +1648,6 @@ class TaskManager:
             raise InvalidParamsError(
                 message="New task admission cannot select an existing task ID"
             )
-        if params.message.role != Role.ROLE_USER:
-            raise InvalidParamsError(message="Task admission requires a user message")
         prepared_input = prepare_native_task_input(params)
         push_outbox, push_config = await self._prepare_task_push(prepared_input)
         params = prepared_input.request
