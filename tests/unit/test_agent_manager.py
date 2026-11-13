@@ -2189,7 +2189,7 @@ async def test_expired_admission_fences_route_before_joining_stubborn_work(
             deadline=deadline,
             phase="stubborn readiness",
             agent=child,
-            on_expiry=lambda: manager._fence_expired_spawn_route(
+            on_expiry=lambda: manager._fence_agent_route(
                 "StubbornChild", child
             ),
         )

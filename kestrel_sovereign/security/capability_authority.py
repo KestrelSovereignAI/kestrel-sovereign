@@ -24,6 +24,7 @@ from kestrel_sdk.operator import OperatorAuthorizationError, OperatorContext
 from kestrel_sdk.resources import ResourceError
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock as AsyncReaderWriterLock
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 
@@ -123,7 +124,9 @@ class HostCapabilityAuthority:
             context.require_boundary(boundary_id)
             if binding.check_current(context, action, target) is not None:
                 raise TypeError("host authority checker must return None or raise")
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             # Current-check diagnostics may contain credentials or private data.
             # An unavailable checker must never become an admission fallback.
             raise self.access_denied(f"{self.label} authority is unavailable") from None

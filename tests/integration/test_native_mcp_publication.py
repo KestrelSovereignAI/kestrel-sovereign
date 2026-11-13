@@ -19,8 +19,16 @@ from kestrel_sovereign.auth import (
     current_caller_context,
 )
 from kestrel_sovereign.endpoints.mcp_server import router
-from kestrel_sovereign.execution_custody import execution_cleanup_debts
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCustody,
+    ProcessRuntimeExecutionFence,
+    bind_execution_custody,
+    execution_cleanup_debts,
+    retire_process_runtime_custody,
+)
 from kestrel_sovereign.mcp_server.http import NativeMCPHostMiddleware
+from kestrel_sovereign.mcp_server.oauth import NativeMCPAuthorizationServer
 from kestrel_sovereign.mcp_server.policy import MCPServerPolicy
 from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
 from kestrel_sovereign.mcp_server.transport import NativeMCPServer
@@ -467,3 +475,138 @@ async def test_sdk_resident_keeps_original_agent_runtime_without_borrowing_conso
     finally:
         for owner in prepared:
             await owner.close()
+
+
+@asynccontextmanager
+async def _publication_with_owned_process_custody(publication, monkeypatch):
+    previous, client = publication
+    await previous.close()
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence(previous.agent.did))
+    with monkeypatch.context() as patch:
+        patch.setattr(previous.agent, "_execution_custody", scope)
+        owner = await NativeMCPPublication.prepare(previous.app, previous.agent, previous.routing_key,
+            previous.policy, sovereign_key=lambda: KEY)
+        owner.publish()
+        try:
+            yield owner, client, scope
+        finally:
+            await owner.close()
+
+
+def _authorization_parameters(owner):
+    return {"response_type": "code", "client_id": "owned-provider",
+        "redirect_uri": "https://provider.example/callback", "scope": "memory:read",
+        "resource": owner.resource, "state": "original-state", "code_challenge": "a" * 43,
+        "code_challenge_method": "S256"}
+
+
+async def test_native_oauth_delivery_rechecks_original_execution_custody(publication, monkeypatch):
+    original = NativeMCPAuthorizationServer.authorization_endpoint
+    completed = []
+
+    async def retire_after_authorization(authorization, request):
+        response = await original(authorization, request)
+        assert response.status_code == 302
+        completed.append(response.headers["location"])
+        retire_process_runtime_custody(scope)
+        return response
+
+    monkeypatch.setattr(NativeMCPAuthorizationServer, "authorization_endpoint", retire_after_authorization)
+    async with _publication_with_owned_process_custody(publication, monkeypatch) as (owner, client, scope):
+        with pytest.raises(ExecutionAuthorityError, match="retired"):
+            await client.get(owner.resource + "/oauth/authorize", params=_authorization_parameters(owner))
+        assert len(completed) == 1, "The original OAuth operation did not reach the delivery boundary"
+        handle = parse_qs(urlsplit(completed[0]).query)["request"][0]
+        assert await owner.runtime.authorization.pending.read(handle) is not None
+
+
+async def test_private_consent_delivery_preserves_execution_control(publication, monkeypatch):
+    async with _publication_with_owned_process_custody(publication, monkeypatch) as (owner, client, scope):
+        response = await client.get(owner.resource + "/oauth/authorize", params=_authorization_parameters(owner))
+        assert response.status_code == 302
+        handle = parse_qs(urlsplit(response.headers["location"]).query)["request"][0]
+        original = owner.runtime.authorization.grants.read_authorization_request
+        completed = []
+
+        async def retire_after_read(value):
+            pending = await original(value)
+            assert pending is not None
+            completed.append(value)
+            retire_process_runtime_custody(scope)
+            return pending
+
+        monkeypatch.setattr(owner.runtime.authorization.grants, "read_authorization_request", retire_after_read)
+        description = await client.get("/api/mcp/server/consent/requests/" + handle, headers={"x-api-key": KEY})
+        assert completed == [handle]
+        assert description.status_code == 500, "Private consent was delivered after original execution custody ended"
+        assert description.json()["error"]["code"] == "execution_control", "Host authority discarded native execution-control evidence"
+        assert "client_name" not in description.text
+
+
+async def test_publication_rejects_replacement_execution_custody(publication, monkeypatch):
+    async with _publication_with_owned_process_custody(publication, monkeypatch) as (owner, _client, _scope):
+        replacement = ExecutionCustody(ProcessRuntimeExecutionFence(owner.agent.did))
+        monkeypatch.setattr(owner.agent, "_execution_custody", replacement)
+        with pytest.raises(HostCapabilityAccessDenied, match="runtime"):
+            owner.require_current()
+
+
+async def test_replacement_custody_does_not_hide_original_runtime_control(publication, monkeypatch):
+    async with _publication_with_owned_process_custody(publication, monkeypatch) as (owner, _client, scope):
+        retire_process_runtime_custody(scope)
+        monkeypatch.setattr(owner.agent, "_execution_custody",
+            ExecutionCustody(ProcessRuntimeExecutionFence(owner.agent.did)))
+        with pytest.raises(ExecutionAuthorityError, match="retired"):
+            owner.require_current()
+
+
+async def test_publication_keeps_ambient_request_execution_restrictions(publication, monkeypatch):
+    async with _publication_with_owned_process_custody(publication, monkeypatch) as (owner, _client, _scope):
+        with bind_execution_custody(ProcessRuntimeExecutionFence(owner.agent.did)) as request:
+            retire_process_runtime_custody(request)
+            with pytest.raises(ExecutionAuthorityError, match="retired"):
+                owner.require_current()
+
+
+async def test_public_manager_removal_fences_routes_before_failed_protocol_cleanup(native_tool_effect_agent, tmp_path):
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    # Real public manager removal and Agent.shutdown, with privately allocated
+    # MCP custody. No READY or successful MCP publication is fabricated.
+    agent = await native_tool_effect_agent(did="did:owned:mcp-public-remove")
+    manager = AgentManager(base_data_dir=tmp_path, startup_runtime_env={}, startup_roster_enabled=False)
+    async with manager.a2a_lifecycle_lease():
+        manager._register_agent("OwnedNativeMCP", agent)
+    app = FastAPI()
+    app.state.agent_manager = manager
+    policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
+        "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
+            "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}))
+    owner = NativeMCPPublication(app, agent, "OwnedNativeMCP", policy, sovereign_key=lambda: KEY, manager=manager)
+    agent._native_mcp_publication = owner
+    agent._resource_custody().acquire("native_mcp_server")
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = []
+
+    def factory(loop, coroutine, **kwargs):
+        frame = getattr(coroutine, "cr_frame", None)
+        inner = frame.f_locals.get("operation") if frame is not None else None
+        candidate = inner if inspect.iscoroutine(inner) else coroutine
+        code = getattr(candidate, "cr_code", None)
+        if code is not None and code.co_qualname == "NativeMCPPublication.close.<locals>.drain":
+            refused.append((coroutine, candidate))
+            raise RuntimeError("Owned public removal MCP closer acceptance unknown")
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    try:
+        loop.set_task_factory(factory)
+        with pytest.raises(RuntimeError) as failure:
+            await manager.remove_agent("OwnedNativeMCP")
+    finally:
+        loop.set_task_factory(previous)
+    assert len(refused) == 1 and execution_cleanup_debts(failure.value)
+    assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
+    assert agent._resource_custody().is_held("native_mcp_server")
+    assert manager.get_agent("OwnedNativeMCP") is None, "Public remove left a retiring agent routable after closer admission failed"
+    assert agent not in manager.list_agents().values(), "Public remove left a retiring agent discoverable"
+    assert manager._get_agent_for_lifecycle("OwnedNativeMCP") is agent, "Public fencing discarded private cleanup ownership"

@@ -11,7 +11,11 @@ from kestrel_sovereign._async_ownership import (
     raise_owned_outcome,
 )
 from kestrel_sovereign.agent.custody import ReleaseOutcome
-from kestrel_sovereign.execution_custody import execution_finite_error
+from kestrel_sovereign.execution_custody import (
+    ExecutionCustody,
+    execution_finite_error,
+    require_execution_work,
+)
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 from kestrel_sovereign.security.capability_authority import (
@@ -48,6 +52,9 @@ class NativeMCPPublication:
         self.app, self.agent, self.manager, self.routing_key = app, agent, manager, routing_key
         self.policy, self._sovereign_key = policy, sovereign_key
         self._did, self._identity = agent.did, agent.identity
+        self._execution_custody = getattr(agent, "_execution_custody", None)
+        if self._execution_custody is not None and not isinstance(self._execution_custody, ExecutionCustody):
+            raise TypeError("Native MCP requires its original execution custody")
         self._ready = agent._runtime_publication_ready
         self.backend = resolve_feature_database(agent).backend
         self.registry = native_mcp_registry(app)
@@ -68,7 +75,11 @@ class NativeMCPPublication:
         return self._close_operation.task if self._close_operation is not None else None
 
     def _runtime_current(self):
+        if self._execution_custody is not None:
+            self._execution_custody.require_work()
+        require_execution_work(self.agent)
         if (self.agent.did != self._did or self.agent.identity is not self._identity
+                or getattr(self.agent, "_execution_custody", None) is not self._execution_custody
                 or self.agent._runtime_publication_ready is not self._ready or not self._ready.is_set()
                 or resolve_feature_database(self.agent).backend is not self.backend
                 or vars(self.agent).get("_native_mcp_publication") is not self or self._retired):

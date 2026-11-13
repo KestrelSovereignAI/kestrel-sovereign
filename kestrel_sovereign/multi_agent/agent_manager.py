@@ -2820,7 +2820,7 @@ class AgentManager:
                     deadline=deadline,
                     phase="agent readiness",
                     agent=agent,
-                    on_expiry=lambda: self._fence_expired_spawn_route(
+                    on_expiry=lambda: self._fence_agent_route(
                         route_name,
                         agent,
                     ),
@@ -3538,10 +3538,7 @@ class AgentManager:
         observable.
         """
 
-        # The same exact-object fence serves expiry and failed withdrawal.
-        # Never overwrite a replacement generation's fence with a stale owner.
-        if self._get_agent_for_lifecycle(name) is agent:
-            self._fenced_agent_routes[self._canonical_agent_name(name)] = agent
+        self._fence_agent_route(name, agent)
 
         # Wake any concurrently initializing descendants before withdrawing
         # this private candidate.  The false marker makes the wake a failure,
@@ -5233,7 +5230,7 @@ class AgentManager:
 
         task.add_done_callback(retire)
 
-    def _fence_expired_spawn_route(
+    def _fence_agent_route(
         self, name: str, agent: KestrelAgent
     ) -> None:
         """Synchronously revoke one exact child's public routing authority."""
@@ -5277,7 +5274,7 @@ class AgentManager:
                 raise RuntimeError("Refusing to fence a different spawned child")
             resolved.append((child_name, agent))
         for child_name, agent in resolved:
-            self._fence_expired_spawn_route(child_name, agent)
+            self._fence_agent_route(child_name, agent)
 
     def _agent_route_is_fenced(self, name: str, agent: object) -> bool:
         return (
@@ -5300,7 +5297,7 @@ class AgentManager:
         rollback, so it is never cancelled here.
         """
 
-        self._fence_expired_spawn_route(name, agent)
+        self._fence_agent_route(name, agent)
         if not self._agent_route_is_fenced(name, agent):
             # Ignore a stale timer from an earlier occupant after this routing
             # name has completed release and become eligible for reuse.
@@ -5433,7 +5430,7 @@ class AgentManager:
             deadline=deadline,
             phase="agent readiness",
             agent=agent,
-            on_expiry=lambda: self._fence_expired_spawn_route(name, agent),
+            on_expiry=lambda: self._fence_agent_route(name, agent),
             admission=admission,
         )
 
@@ -5580,7 +5577,7 @@ class AgentManager:
                     deadline=deadline,
                     phase="agent readiness publication verification",
                     agent=agent,
-                    on_expiry=lambda: self._fence_expired_spawn_route(
+                    on_expiry=lambda: self._fence_agent_route(
                         name, agent
                     ),
                     admission=admission,
@@ -10405,6 +10402,12 @@ class AgentManager:
                 if agent is None:
                     return False
 
+                # Retirement begins before task admission or arbitrary cleanup.
+                # Public routing and hosted protocol authority must stay denied
+                # even if shutdown cannot admit its original closer. Private
+                # lifecycle maps retain this exact owner for cleanup.
+                self._fence_agent_route(name, agent)
+
                 # ``wait_for(agent.shutdown())`` loses the actual task on timeout
                 # and on cancellation.  KestrelAgent deliberately runs its
                 # cancellation tail before re-raising, so that task is the primary
@@ -12112,7 +12115,7 @@ class AgentManager:
                 deadline=signed_deadline,
                 phase="signed receipt persistence",
                 agent=candidate,
-                on_expiry=lambda: self._fence_expired_spawn_route(name, candidate),
+                on_expiry=lambda: self._fence_agent_route(name, candidate),
                 admission=admission,
             )
             # Ready hooks are wake-capable and the child becomes routable
@@ -12130,7 +12133,7 @@ class AgentManager:
                 deadline=signed_deadline,
                 phase="delegated budget custody",
                 agent=candidate,
-                on_expiry=lambda: self._fence_expired_spawn_route(name, candidate),
+                on_expiry=lambda: self._fence_agent_route(name, candidate),
                 admission=admission,
             )
 
@@ -12372,7 +12375,7 @@ class AgentManager:
                     mandate.ttl_seconds,
                 )
                 if remaining_ttl <= 0:
-                    self._fence_expired_spawn_route(admission.name, child)
+                    self._fence_agent_route(admission.name, child)
                     raise RuntimeError(
                         "Spawn mandate expired before governance commit"
                     )
@@ -12382,7 +12385,7 @@ class AgentManager:
                         timeout=remaining_ttl,
                     )
                 except TimeoutError:
-                    self._fence_expired_spawn_route(admission.name, child)
+                    self._fence_agent_route(admission.name, child)
                     raise RuntimeError(
                         "Spawn mandate expired before governance commit"
                     ) from None
@@ -12521,7 +12524,7 @@ class AgentManager:
             deadline=self._spawn_admission_deadline(child),
             phase="final signed receipt persistence",
             agent=child,
-            on_expiry=lambda: self._fence_expired_spawn_route(
+            on_expiry=lambda: self._fence_agent_route(
                 admission.name,
                 child,
             ),
