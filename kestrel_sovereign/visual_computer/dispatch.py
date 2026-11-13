@@ -171,12 +171,14 @@ def raise_driver_borrow_outcome(outcome, *, operation, retain_originals=False):
     This is the single result boundary shared by the Docker and worker drivers.
     """
     import asyncio
+    from kestrel_sdk.operator import OperatorAuthorizationError
     from kestrel_sovereign._async_ownership import raise_owned_outcome
     error = outcome.error
     from types import TracebackType
 
     from kestrel_sovereign.execution_custody import (
         execution_commit_outcome,
+        execution_evidence_carriers,
         is_execution_control_error,
     )
     def descriptive_fields_only(node):
@@ -190,13 +192,16 @@ def raise_driver_borrow_outcome(outcome, *, operation, retain_originals=False):
         trace = fields.get("_kestrel_retained_traceback")
         return (type(notes) is list and all(type(note) is str for note in notes)
                 and (trace is None or type(trace) is TracebackType))
-    cause = error.__cause__ if type(error) is asyncio.CancelledError else None
-    ordinary_cause = (cause is None or (type(cause) is ResourceOutcomeUnknown
-                      and cause.__cause__ is None and descriptive_fields_only(cause)))
     if (outcome.cancellation is None and type(error) is asyncio.CancelledError
-            and ordinary_cause and descriptive_fields_only(error)
+            and all(type(carrier) in (asyncio.CancelledError, OperatorAuthorizationError,
+                                     ResourceOutcomeUnknown)
+                    and descriptive_fields_only(carrier)
+                    for carrier in execution_evidence_carriers(error))
             and not is_execution_control_error(error)
             and execution_commit_outcome(error) is None):
+        # Native launch/reap joins retain nested cancellations and an original
+        # egress expiry as explicit causes. Classify the complete canonical
+        # graph; an unfamiliar type, group or fact-bearing carrier stays intact.
         # No receipt or no-effect claim follows from an interrupted driver.
         # The original ledger/native dispatch owner still decides custody.
         raise ResourceOutcomeUnknown("original_visual_operation_interrupted") from error

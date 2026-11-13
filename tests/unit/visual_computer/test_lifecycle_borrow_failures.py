@@ -12,6 +12,39 @@ from kestrel_sdk.operator import OperatorAuthorizationError
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import execution_terminal_error
+
+
+def retained_interruption(harness, session, original, terminal):
+    """Retain native-join-shaped errors on the actual revoked adapter task.
+
+    The cancellation is delivered by the original egress owner. Authorization
+    rejection comes from that same call's unchanged current-authority check.
+    These controlled adapter cases do not claim native Docker retirement.
+    """
+    if terminal == "bare":
+        return original
+    if terminal == "cancelled-join":
+        cause = asyncio.CancelledError("original nested launch join")
+    else:
+        call, = [call for key, call in harness.runtime.egress._calls.items()
+                 if key[3] == session.session_id and key[-1] == "session"]
+        clock = call.clock
+        call.clock = lambda: call.deadline
+        try:
+            call.check()
+        except OperatorAuthorizationError as error:
+            cause = error
+        else:
+            pytest.fail("the revoked original egress call accepted more work")
+        finally:
+            call.clock = clock
+        if terminal == "unknown-authorization":
+            unknown = ResourceOutcomeUnknown("original transport interrupted")
+            unknown.__cause__ = cause
+            cause = unknown
+    original.__cause__ = cause
+    return execution_terminal_error(original, retain_originals=True)
 
 
 async def two_sessions(harness):
@@ -41,8 +74,9 @@ async def assert_failed_then_healthy(harness, sessions, uncertain):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", ["borrower", "caller"])
+@pytest.mark.parametrize("terminal", ["bare", "cancelled-join", "authorization", "unknown-authorization"])
 async def test_lifecycle_pause_distinguishes_borrower_revocation_from_caller_cancel(
-        harness, monkeypatch, interruption):
+        harness, monkeypatch, interruption, terminal):
     h = harness
     sessions = await two_sessions(h)
     first, second = sessions
@@ -54,7 +88,10 @@ async def test_lifecycle_pause_distinguishes_borrower_revocation_from_caller_can
         if session.session_id == first.session_id:
             original_tasks.append(asyncio.current_task())
             entered.set()
-            await asyncio.Event().wait()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as error:
+                raise retained_interruption(h, first, error, terminal)
         return await control(session, request)
 
     monkeypatch.setattr(h.adapter, "control", held_first_control)
@@ -128,8 +165,9 @@ async def test_lifecycle_pause_expired_original_borrow_does_not_abort_later_sess
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", ["borrower", "caller"])
+@pytest.mark.parametrize("terminal", ["bare", "cancelled-join", "authorization", "unknown-authorization"])
 async def test_foreground_observe_retains_its_original_caller_and_joined_cleanup(
-        harness, monkeypatch, interruption):
+        harness, monkeypatch, interruption, terminal):
     h = harness
     context = h.context()
     with h.bind(context):
@@ -145,8 +183,9 @@ async def test_foreground_observe_retains_its_original_caller_and_joined_cleanup
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError as error:
-                original_errors.append(error)
-                raise
+                retained = retained_interruption(h, session, error, terminal)
+                original_errors.append(retained)
+                raise retained
             finally:
                 cleanup_entered.set()
                 await finish_cleanup.wait()

@@ -122,8 +122,9 @@ before the first partial stdin write. A partial send or lost acknowledgement
 stays unknown. When the complete original RPC reaches the worker after Stop or
 handback, the worker authenticates its originally issued consumer lease before
 journaling a pre-effect denied receipt; current lease eligibility is still
-checked before any input or repeated act delivery. The manual composition uses
-published SDK 0.45 with normal-index host and worker locks. Core successor
+checked before any input or repeated act delivery. The host uses the published
+SDK required by `pyproject.toml` and pinned in `uv.lock`; each worker image has
+its own normal-index dependency input and hash lock. Core successor
 review, CI and actual merged-base host/worker acceptance remain release gates;
 SDK installability does not establish Core product readiness.
 
