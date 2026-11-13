@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.65.6"
+version = "0.65.7"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -110,8 +110,9 @@ dependencies = [
     # 0.45 adds authenticated human control and acquisition custody; the
     # normal lock must resolve this published contract before host delivery.
     # 0.48 adds public argument coercion and the host control-error predicate.
-    # 0.52.2 owns the shared original-source handoff/body/retirement mechanics.
-    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.52.2,<1",
+    # 0.53 owns explicit source lifetimes, retained original failures and
+    # terminal semantic refusal values consumed by the native request adapter.
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.53.0,<1",
     # Native A2A implementation is owned by the shared SDK [a2a] extra.
     # Core and feature skill producers use the same reviewed vendored types.
     "protobuf>=5.29.5",
