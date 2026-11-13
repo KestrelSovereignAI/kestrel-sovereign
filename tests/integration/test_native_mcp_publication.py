@@ -3,7 +3,7 @@
 import asyncio
 import inspect
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from urllib.parse import parse_qs, urlsplit
 
 import httpx2
@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI, Request
 
 from kestrel_sovereign import server
-from kestrel_sovereign._async_ownership import OwnedOperation
+from kestrel_sovereign._async_ownership import OwnedOperation, await_owned_task
 from kestrel_sovereign.auth import (
     AuthMethod,
     CallerContext,
@@ -360,6 +360,29 @@ async def test_original_sdk_resident_admission_is_retained_before_publication(pu
     assert admission is not None and admission.task is p._resident, "Original SDK resident admission was not retained by its publication"
 
 
+@contextmanager
+def _refuse_original_mcp_close_admission():
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = []
+    original = RuntimeError("Owned original MCP closer factory acceptance unknown")
+
+    def factory(loop, coroutine, **kwargs):
+        frame = getattr(coroutine, "cr_frame", None)
+        inner = frame.f_locals.get("operation") if frame is not None else None
+        candidate = inner if inspect.iscoroutine(inner) else coroutine
+        code = getattr(candidate, "cr_code", None)
+        if code is not None and code.co_qualname == "NativeMCPPublication.close.<locals>.drain":
+            refused.append((coroutine, candidate))
+            raise original
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    loop.set_task_factory(factory)
+    try:
+        yield refused
+    finally:
+        loop.set_task_factory(previous)
+
+
 async def test_unresolved_native_mcp_close_admission_cannot_be_retried_as_absence(native_tool_effect_agent):
     # This is a private component allocation test. No READY, SDK lifespan,
     # protocol publication, or successful cleanup ACK is fabricated.
@@ -373,26 +396,8 @@ async def test_unresolved_native_mcp_close_admission_cannot_be_retried_as_absenc
     owner = NativeMCPPublication(app, agent, "OwnedAdmission", policy, sovereign_key=lambda: KEY)
     agent._native_mcp_publication = owner
     agent._resource_custody().acquire("native_mcp_server")
-    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
-    refused = []
-    original_error = RuntimeError("owned native MCP closer factory acceptance unknown")
-
-    def factory(loop, coroutine, **kwargs):
-        frame = getattr(coroutine, "cr_frame", None)
-        inner = frame.f_locals.get("operation") if frame is not None else None
-        candidate = inner if inspect.iscoroutine(inner) else coroutine
-        code = getattr(candidate, "cr_code", None)
-        if code is not None and code.co_qualname == "NativeMCPPublication.close.<locals>.drain":
-            refused.append((coroutine, candidate))
-            raise original_error
-        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
-
-    try:
-        loop.set_task_factory(factory)
-        with pytest.raises(RuntimeError) as opening:
-            await owner.close()
-    finally:
-        loop.set_task_factory(previous)
+    with _refuse_original_mcp_close_admission() as refused, pytest.raises(RuntimeError) as opening:
+        await owner.close()
     assert len(refused) == 1 and execution_cleanup_debts(opening.value)
     assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
     repeated = None
@@ -588,25 +593,8 @@ async def test_public_manager_removal_fences_routes_before_failed_protocol_clean
     owner = NativeMCPPublication(app, agent, "OwnedNativeMCP", policy, sovereign_key=lambda: KEY, manager=manager)
     agent._native_mcp_publication = owner
     agent._resource_custody().acquire("native_mcp_server")
-    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
-    refused = []
-
-    def factory(loop, coroutine, **kwargs):
-        frame = getattr(coroutine, "cr_frame", None)
-        inner = frame.f_locals.get("operation") if frame is not None else None
-        candidate = inner if inspect.iscoroutine(inner) else coroutine
-        code = getattr(candidate, "cr_code", None)
-        if code is not None and code.co_qualname == "NativeMCPPublication.close.<locals>.drain":
-            refused.append((coroutine, candidate))
-            raise RuntimeError("Owned public removal MCP closer acceptance unknown")
-        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
-
-    try:
-        loop.set_task_factory(factory)
-        with pytest.raises(RuntimeError) as failure:
-            await manager.remove_agent("OwnedNativeMCP")
-    finally:
-        loop.set_task_factory(previous)
+    with _refuse_original_mcp_close_admission() as refused, pytest.raises(RuntimeError) as failure:
+        await manager.remove_agent("OwnedNativeMCP")
     assert len(refused) == 1 and execution_cleanup_debts(failure.value)
     assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
     assert agent._resource_custody().is_held("native_mcp_server")
@@ -654,3 +642,125 @@ async def test_route_fence_release_requires_withdrawal_and_keeps_replacement_own
     assert manager._get_agent_for_lifecycle("OwnedFence") is replacement
     assert await manager.remove_agent("OwnedFence") is True
     assert not manager._fenced_agent_routes
+
+
+@pytest.mark.parametrize("storage_door", ["facade", "native-backend", "boot"])
+async def test_deferred_shutdown_keeps_original_mcp_storage_dependency(native_tool_effect_agent, monkeypatch, storage_door):
+    # This drives the real retained continuation and real native SQL owners.
+    # The MCP allocation is private, with actual unknown admission debt; no
+    # READY, SDK publication, dispatcher completion or release ACK is forged.
+    agent = await native_tool_effect_agent(did="did:owned:mcp-deferred-storage")
+    app = FastAPI()
+    app.state.agent = agent
+    policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
+        "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
+            "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}))
+    owner = NativeMCPPublication(app, agent, "OwnedDeferredMCP", policy, sovereign_key=lambda: KEY)
+    agent._native_mcp_publication = owner
+    agent._resource_custody().acquire("native_mcp_server")
+    with _refuse_original_mcp_close_admission() as refused, pytest.raises(RuntimeError) as admission:
+        await owner.close()
+    assert len(refused) == 1 and execution_cleanup_debts(admission.value)
+    if storage_door == "native-backend":
+        agent.storage = owner.backend
+    storage = agent._raw_storage if storage_door == "boot" else agent.storage
+    original_close = storage.close
+    precloses, closes = [], []
+
+    async def observe_close():
+        closes.append(storage)
+        return await original_close()
+
+    monkeypatch.setattr(storage, "close", observe_close)
+    if storage_door == "facade":
+        original_preclose = storage.dispose_cached_sqla_factory
+
+        async def observe_preclose():
+            precloses.append(storage)
+            return await original_preclose()
+
+        monkeypatch.setattr(storage, "dispose_cached_sqla_factory", observe_preclose)
+    continuation = (asyncio.create_task(agent._boot_teardown_storage()) if storage_door == "boot"
+        else await agent._ensure_durable_shutdown_continuation(None))
+    outcome = await await_owned_task(continuation)
+    assert not precloses, "Deferred shutdown disposed borrowed storage before original MCP retirement"
+    assert not closes, "Deferred shutdown closed borrowed primary storage before original MCP retirement"
+    assert outcome.error is not None and execution_cleanup_debts(outcome.error), (
+        "Deferred shutdown discarded original MCP admission debt instead of retaining its dependency"
+    )
+    assert agent._resource_custody().is_held("native_mcp_server")
+    assert agent._native_mcp_publication is owner
+    assert await owner.backend.fetch_val("SELECT 1") == 1
+
+
+async def test_deferred_shutdown_refuses_a_still_held_native_task_manager(native_tool_effect_agent, monkeypatch):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.a2a.task_manager import TaskManager
+    from kestrel_sovereign.features.storage_access import resolve_feature_database
+
+    agent = await native_tool_effect_agent(did="did:owned:deferred-task-manager")
+    backend = resolve_feature_database(agent).backend
+    manager = TaskManager.from_backend(backend, scope=NativeRecipientScope(agent.did), owns_backend=False)
+    await manager.initialize()
+    agent.task_manager = manager
+    agent._resource_custody().acquire("task_manager")
+    storage = agent.storage
+    original_preclose, original_close = storage.dispose_cached_sqla_factory, storage.close
+    precloses, closes = [], []
+
+    async def preclose():
+        precloses.append(storage)
+        return await original_preclose()
+
+    async def close():
+        closes.append(storage)
+        return await original_close()
+
+    monkeypatch.setattr(storage, "dispose_cached_sqla_factory", preclose)
+    monkeypatch.setattr(storage, "close", close)
+    try:
+        continuation = await agent._ensure_durable_shutdown_continuation(None)
+        outcome = await await_owned_task(continuation)
+        assert not precloses and not closes, "Deferred shutdown bypassed another original native storage borrower"
+        assert isinstance(outcome.error, RuntimeError)
+        assert agent._resource_custody().is_held("task_manager")
+        assert await backend.fetch_val("SELECT 1") == 1
+    finally:
+        await agent._resource_custody().release("task_manager", agent._boot_teardown_task_manager)
+
+
+async def test_deferred_shutdown_joins_the_original_mcp_close_before_storage(native_tool_effect_agent, monkeypatch):
+    agent = await native_tool_effect_agent(did="did:owned:mcp-deferred-join")
+    app = FastAPI()
+    app.state.agent = agent
+    policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
+        "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
+            "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}))
+    owner = NativeMCPPublication(app, agent, "OwnedDeferredJoin", policy, sovereign_key=lambda: KEY)
+    agent._native_mcp_publication = owner
+    agent._resource_custody().acquire("native_mcp_server")
+    original_close = owner.close
+    entered, rejoined = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def observe_close():
+        calls.append(owner)
+        (entered if len(calls) == 1 else rejoined).set()
+        return await original_close()
+
+    monkeypatch.setattr(owner, "close", observe_close)
+    async with owner._requests.read():
+        first = asyncio.create_task(owner.close())
+        await asyncio.wait_for(entered.wait(), 5)
+        original_operation = owner._close_operation
+        assert original_operation is not None
+        continuation = await agent._ensure_durable_shutdown_continuation(None)
+        await asyncio.wait_for(rejoined.wait(), 5)
+        assert owner._close_operation is original_operation
+        assert not continuation.done() and not original_operation.task.done()
+        assert await owner.backend.fetch_val("SELECT 1") == 1
+    await first
+    outcome = await await_owned_task(continuation)
+    assert outcome.error is outcome.cancellation is None
+    assert not agent._resource_custody().is_held("native_mcp_server")
+    assert original_operation.task.done()

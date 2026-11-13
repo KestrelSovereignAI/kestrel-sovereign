@@ -4892,9 +4892,6 @@ class KestrelAgent(
 
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
-        if self._resource_custody().is_held("native_mcp_server"):
-            logging.getLogger(__name__).error("boot rollback: retaining storage until native MCP retirement completes")
-            return ReleaseOutcome.RETAINED
         if self._resource_custody().is_held("task_manager"):
             # Native stores and executions borrow this primary connection.
             # A failed manager close must retain both handles until its retry
@@ -4927,16 +4924,40 @@ class KestrelAgent(
             custody.settle("llm_service", llm_outcome)
             if llm_outcome is not ReleaseOutcome.RELEASED:
                 return ReleaseOutcome.RETAINED
-        raw = self._raw_storage
-        if raw is not None and hasattr(raw, "close"):
-            outcome = reported_outcome(await raw.close())
-            if outcome is not ReleaseOutcome.RELEASED:
-                return outcome
-        await self._retire_tool_effect_store()
+        outcome = await self._close_primary_storage(self._raw_storage)
+        if outcome is not ReleaseOutcome.RELEASED:
+            return outcome
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
         return ReleaseOutcome.RELEASED
+
+    async def _join_primary_storage_borrowers(self) -> None:
+        """Original native borrower retirement precedes every storage phase."""
+        custody = self._resource_custody()
+        if custody.is_held("native_mcp_server"):
+            # close() observes its ONE retained operation, including unknown
+            # admission debt. Never treat a missing Task as a fresh attempt or
+            # replace the original control receipt with a generic refusal.
+            await custody.release("native_mcp_server", self._close_native_mcp_publication)
+        if custody.is_held("native_mcp_server") or custody.is_held("task_manager"):
+            self._raise_shutdown_control(control_only=True)
+            raise RuntimeError("Original native storage borrower retirement is incomplete")
+
+    async def _preclose_primary_storage(self, preclose) -> ReleaseOutcome:
+        """Dispose cached storage resources only after original native borrowers."""
+        await self._join_primary_storage_borrowers()
+        return reported_outcome(await preclose())
+
+    async def _close_primary_storage(self, storage) -> ReleaseOutcome:
+        """One physical primary-close boundary for rollback and both shutdowns."""
+        await self._join_primary_storage_borrowers()
+        closed = ReleaseOutcome.RELEASED
+        if storage is not None and hasattr(storage, "close"):
+            closed = reported_outcome(await storage.close())
+        if closed is ReleaseOutcome.RELEASED:
+            await self._retire_tool_effect_store()
+        return closed
 
     async def _retire_tool_effect_store(self) -> None:
         """Drop the borrower only after the primary storage owner retires."""
@@ -9817,12 +9838,8 @@ Expected Duration: {expected_duration}
         async def close_storage() -> ReleaseOutcome:
             precloses = ReleaseOutcome.RELEASED
             if storage_preclose is not None:
-                precloses = reported_outcome(await storage_preclose())
-            closed = ReleaseOutcome.RELEASED
-            if storage is not None and hasattr(storage, "close"):
-                closed = reported_outcome(await storage.close())
-            if closed is ReleaseOutcome.RELEASED:
-                await self._retire_tool_effect_store()
+                precloses = await self._preclose_primary_storage(storage_preclose)
+            closed = await self._close_primary_storage(storage)
             return closed if precloses is ReleaseOutcome.RELEASED else precloses
 
         if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
@@ -11484,10 +11501,6 @@ Expected Duration: {expected_duration}
             return tail_result(True)
         await self._join_llm_storage_dependents()
 
-        if custody.is_held("native_mcp_server"):
-            logging.getLogger(__name__).warning("Retaining primary storage until native MCP retirement completes")
-            return tail_result(True)
-
         if custody.is_held("task_manager"):
             # The finite prefix could not join the native manager. Keep its
             # primary backend and SQLAlchemy owners available for a retry.
@@ -11503,7 +11516,7 @@ Expected Duration: {expected_duration}
 
             async def run_preclose() -> None:
                 nonlocal preclose_reported
-                preclose_reported = reported_outcome(await storage_preclose())
+                preclose_reported = await self._preclose_primary_storage(storage_preclose)
 
             storage_preclose_status = await _bounded(
                 run_preclose(),
@@ -11528,9 +11541,7 @@ Expected Duration: {expected_duration}
             storage = self.storage
 
             async def close_storage() -> ReleaseOutcome:
-                closed = reported_outcome(await storage.close())
-                if closed is ReleaseOutcome.RELEASED:
-                    await self._retire_tool_effect_store()
+                closed = await self._close_primary_storage(storage)
                 if storage_preclose_status in {"error", "abandoned", "cancelled"}:
                     # The cached SQLAlchemy engine may still hold the store.
                     return ReleaseOutcome.RETAINED
