@@ -172,15 +172,6 @@ async def deployment(request, tmp_path):
                 with_search_path(url, quoted_search_path(schema, vector_schema))
             )
             try:
-                for table in TABLES:
-                    # migrate_add_embedding_profile_id probes an unscoped
-                    # information_schema, so a same-named table in another
-                    # schema can make it skip this one.
-                    await db.execute(
-                        f"ALTER TABLE {table} "
-                        "ADD COLUMN IF NOT EXISTS embedding_profile_id TEXT",
-                        (),
-                    )
                 yield _Deployment(db, f'"{vector_schema}".vector({DIM})')
             finally:
                 await db.close()

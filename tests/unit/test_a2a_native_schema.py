@@ -197,12 +197,12 @@ async def test_core_storage_boot_neither_creates_nor_mutates_draft_question_stat
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
     backend = native_a2a_backend_factory()
-    await backend.connect()
     db = None
     manager = manager_for(
         backend, NativeRecipientScope("did:recipient"), owns_backend=False
     )
     try:
+        await backend.connect()
         if legacy_present:
             await backend.execute_script(
                 "CREATE TABLE pending_a2a_questions (agent_id TEXT, task_id TEXT, recipient TEXT, original_question TEXT, deadline TEXT, status TEXT, receiver_settlement TEXT)"
@@ -232,11 +232,13 @@ async def test_core_storage_boot_neither_creates_nor_mutates_draft_question_stat
             await manager.initialize()
             assert await backend.table_exists("a2a_native_questions")
     finally:
-        await manager.close()
-        if db is not None:
-            await db.close()
-        else:
-            await backend.close()
+        try:
+            await manager.close()
+        finally:
+            if db is not None:
+                await db.close()
+            else:
+                await backend.close()
 
 
 async def test_two_native_managers_boot_concurrently_on_one_fresh_backend_scope(

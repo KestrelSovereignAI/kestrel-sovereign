@@ -115,6 +115,17 @@ async def _stop(runner) -> BaseException | None:
     return None
 
 
+async def _wait_for_recovered_execution(runner, executor, expected_calls: int) -> None:
+    """A reconciled latch is not admission or completion of the next attempt."""
+    await wait_until(
+        lambda: runner.readiness_failure is None and executor.await_count == expected_calls,
+        timeout=30, interval=0.01, message="the recovered execution never ran",
+    )
+    assert executor.await_count == expected_calls
+    await settle_occurrences(runner)
+    assert runner.readiness_failure is None
+
+
 def _lost_outcome(grouped: bool) -> BaseException:
     """An unknown commit outcome, alone or as native cleanup groups it.
 
@@ -368,12 +379,13 @@ async def test_the_polling_loop_clears_a_settled_latch(tmp_path):
             lambda: runner.readiness_failure is not None,
             timeout=30, interval=0.01, message="the commit outcome never latched",
         )
+        [pending] = runner._readiness_reconciliations
         await _expire_lease(db)
-        await wait_until(
-            lambda: runner.readiness_failure is None,
-            timeout=30, interval=0.01, message="the polling loop never cleared the latch",
-        )
-        assert executor.await_count == 2
+        await _wait_for_recovered_execution(runner, executor, 2)
+        assert await db.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE id = ?",
+            (pending.execution_id,),
+        ) == ("success", 2)
     finally:
         await _stop(runner)
         await db.close()
@@ -837,6 +849,20 @@ async def test_the_polling_loop_keeps_a_latch_while_a_recovered_claim_is_unsettl
     runner._renew_lease = _renew_until_stopped
     real_reconcile = runner._reconcile_readiness_latch
     passes = 0
+    recovery_phase = asyncio.Event()
+    recovery_entered = asyncio.Event()
+    release_recovery = asyncio.Event()
+    real_run_executor = runner._run_executor
+
+    async def gated_recovery(execution):
+        if recovery_phase.is_set():
+            # Admission and its real replacement claim precede target dispatch.
+            # Readiness may clear while this original occurrence is still here.
+            recovery_entered.set()
+            await release_recovery.wait()
+        return await real_run_executor(execution)
+
+    runner._run_executor = gated_recovery
 
     async def counted_reconcile():
         nonlocal passes
@@ -869,13 +895,22 @@ async def test_the_polling_loop_keeps_a_latch_while_a_recovered_claim_is_unsettl
         assert runner.readiness_failure is not None
         assert runner.readiness_failure_reconcilable
 
+        recovery_phase.set()
         await _expire_lease(db)
         await wait_until(
-            lambda: runner.readiness_failure is None,
+            lambda: recovery_entered.is_set() and runner.readiness_failure is None,
             timeout=30, interval=0.01, message="the polling loop never cleared the latch",
         )
-        assert executor.await_count == 3
+        assert runner.readiness_failure is None
+        assert executor.await_count == 2
+        release_recovery.set()
+        await _wait_for_recovered_execution(runner, executor, 3)
+        assert await db.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE id = ?",
+            (held[0],),
+        ) == ("success", 3)
     finally:
+        release_recovery.set()
         await _stop(runner)
         await db.close()
 

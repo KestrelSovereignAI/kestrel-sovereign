@@ -172,7 +172,6 @@ from kestrel_sovereign.spawn.mandate import (
     remaining_spawn_ttl_seconds,
 )
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.storage.db.interface import DatabaseError
 from kestrel_sovereign.storage.turn_provenance import (
     WakeReplyReceipt,
     turn_opener_metadata,
@@ -1072,6 +1071,15 @@ def _resolve_sync_enabled(explicit: Optional[bool] = None) -> bool:
         env_val,
     )
     return True
+
+
+@dataclass(frozen=True)
+class _BootstrapReply:
+    """Bootstrap's visible reply and the exact rows it actually persisted."""
+
+    content: str
+    user_message_id: int | None
+    assistant_message_id: int | None
 
 
 class KestrelAgent(
@@ -7868,7 +7876,7 @@ Expected Duration: {expected_duration}
         signal_wake: Optional[dict] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
         wake_reply: Optional[WakeReplyReceipt] = None,
-    ) -> Optional[str]:
+    ) -> _BootstrapReply | None:
         """
         Handle bootstrap/discovery flow for first-time agent wake-up.
 
@@ -7880,7 +7888,7 @@ Expected Duration: {expected_duration}
         the wake's reply (#3655).
 
         Returns:
-            Response string if in bootstrap mode, None if should continue to normal processing
+            Reply and actual row receipts, or None to continue normal processing
         """
         state = await self.bootstrap_service.get_bootstrap_state()
 
@@ -7909,17 +7917,17 @@ Expected Duration: {expected_duration}
             # reference it. Matches the shape of the adjacent
             # DISCOVERY branch (below) and the normal process_input
             # path.
-            await self.privacy_agent.add_conversation(
+            user_message_id = await self.privacy_agent.add_conversation(
                 "user", user_input,
                 metadata=turn_opener_metadata(signal_wake),
                 session_id=session_id,
             )
-            await self._persist_assistant_conversation(
+            assistant_message_id = await self._persist_assistant_conversation(
                 wake_up_msg, session_id=session_id, wake_reply=wake_reply,
             )
 
             logging.info("[BOOTSTRAP] Agent waking up - entering discovery mode")
-            return wake_up_msg
+            return _BootstrapReply(wake_up_msg, user_message_id, assistant_message_id)
 
         elif state == BootstrapState.DISCOVERY:
             # In discovery mode - process through discovery conversation.
@@ -7999,12 +8007,12 @@ Expected Duration: {expected_duration}
                 return None
 
             # Store user message and response in conversation history
-            await self.privacy_agent.add_conversation(
+            user_message_id = await self.privacy_agent.add_conversation(
                 "user", user_input,
                 metadata=turn_opener_metadata(signal_wake),
                 session_id=session_id,
             )
-            await self._persist_assistant_conversation(
+            assistant_message_id = await self._persist_assistant_conversation(
                 response,
                 session_id=session_id,
                 response=response,
@@ -8037,7 +8045,7 @@ Expected Duration: {expected_duration}
                             logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
 
-                    await self._persist_assistant_conversation(
+                    assistant_message_id = await self._persist_assistant_conversation(
                         completion_msg, session_id=session_id,
                         wake_reply=wake_reply,
                     )
@@ -8048,11 +8056,11 @@ Expected Duration: {expected_duration}
                         if not loaded:
                             self.context_builder._load_soul_md()
                     logging.info("[BOOTSTRAP] Discovery complete with avatar")
-                    return completion_msg
+                    return _BootstrapReply(completion_msg, user_message_id, assistant_message_id)
                 else:
                     # Discovery complete without avatar
                     completion_msg = await self.bootstrap_service.complete_bootstrap()
-                    await self._persist_assistant_conversation(
+                    assistant_message_id = await self._persist_assistant_conversation(
                         completion_msg, session_id=session_id,
                         wake_reply=wake_reply,
                     )
@@ -8063,17 +8071,17 @@ Expected Duration: {expected_duration}
                         if not loaded:
                             self.context_builder._load_soul_md()
                     logging.info("[BOOTSTRAP] Discovery complete")
-                    return completion_msg
+                    return _BootstrapReply(completion_msg, user_message_id, assistant_message_id)
 
             logging.info("[BOOTSTRAP] Discovery continuing...")
-            return response
+            return _BootstrapReply(response, user_message_id, assistant_message_id)
 
         elif state == BootstrapState.AVATAR:
             # Waiting for avatar description (fallback state)
             if user_input.lower() in ["skip", "no", "later"]:
                 completion_msg = await self.bootstrap_service.complete_bootstrap()
                 await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                return completion_msg
+                return _BootstrapReply(completion_msg, None, None)
             else:
                 # Generate avatar
                 visual_identity = self.features.get("VisualIdentityFeature")
@@ -8081,19 +8089,19 @@ Expected Duration: {expected_duration}
                     try:
                         avatar_result = await visual_identity.generate_avatar(user_input)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                        return f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?"
+                        return _BootstrapReply(f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?", None, None)
                     except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
                         if is_execution_control_error(e):
                             raise
                         logging.warning(f"Failed to generate avatar: {e}")
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                        return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
+                        return _BootstrapReply("Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!", None, None)
                     except Exception as e:
                         if is_execution_control_error(e):
                             raise
                         logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                        return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
+                        return _BootstrapReply("Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!", None, None)
 
         # State is COMPLETE or unknown - proceed to normal processing
         return None
@@ -8346,9 +8354,10 @@ Expected Duration: {expected_duration}
                                     # call leaves first-turn importance, emotion, concepts,
                                     # and schema routing permanently absent (#2331).
                                     await self._post_response_pipeline(
-                                        user_input, bootstrap_response, session_id
+                                        user_message_id=bootstrap_response.user_message_id,
+                                        assistant_message_id=bootstrap_response.assistant_message_id,
                                     )
-                                    return bootstrap_response
+                                    return bootstrap_response.content
 
                         # Handle explicit commands first (using the CommandHandler)
                         if user_input.startswith("!"):
@@ -8570,12 +8579,12 @@ Expected Duration: {expected_duration}
         provider: Optional[str] = None,
         use_last_identity: bool = False,
         wake_reply: Optional[WakeReplyReceipt] = None,
-    ) -> None:
-        """Persist an assistant row with resolved model/provider columns.
+    ) -> Optional[int]:
+        """Persist an assistant row and return its exact storage receipt.
 
         With ``wake_reply`` the row is a signal wake's reply: it is stamped
         with the wake's signal id, and the receipt records the stored row's
-        id (#3655).
+        id without a correlation readback (#3655).
         """
         identity = self._conversation_response_identity(
             response,
@@ -8592,42 +8601,17 @@ Expected Duration: {expected_duration}
             kwargs["model"] = resolved_model
         if resolved_provider is not None:
             kwargs["provider"] = resolved_provider
-        await self.privacy_agent.add_conversation(
+        message_id = await self.privacy_agent.add_conversation(
             "assistant",
             content,
             **kwargs,
         )
         mark_current_invocation_effect_checkpointed()
         if wake_reply is not None:
-            wake_reply.message_id = await self._stored_wake_reply_id(
-                wake_reply.signal_id
+            wake_reply.message_id = (
+                message_id if self.privacy_agent.can_store("conversation") else None
             )
-
-    async def _stored_wake_reply_id(self, signal_id: str) -> Optional[int]:
-        """The id of the row just stored as ``signal_id``'s reply, if any.
-
-        Asked only when the privacy agent stored the row durably. Otherwise a
-        row an earlier delivery of the same wake stored would answer for a
-        reply this turn kept only in memory.
-
-        The reply is already stored, and the id only tells the chat console
-        where to load it from. A read that fails leaves no id: the console
-        then shows its truncated-preview notice rather than presenting the
-        event's capped summary as the reply. It must not fail the turn, which
-        the dispatcher would record as an undelivered wake.
-        """
-        if not self.privacy_agent.can_store("conversation"):
-            return None
-        try:
-            return await self.storage.find_signal_wake_reply_id(signal_id)
-        except DatabaseError as error:
-            if is_execution_control_error(error):
-                raise
-            logging.warning(
-                "Could not read back the stored reply to signal %s", signal_id,
-                exc_info=True,
-            )
-            return None
+        return message_id
 
     async def _maybe_compact_codex_thread(
         self, session_id: Optional[str],
@@ -8992,8 +8976,9 @@ Expected Duration: {expected_duration}
             **semantic_recall_metadata,
             **turn_opener_metadata(signal_wake),
         }
+        user_message_id = None
         try:
-            await self.privacy_agent.add_conversation(
+            user_message_id = await self.privacy_agent.add_conversation(
                 "user", wrapped_user,
                 metadata=user_meta,
                 session_id=session_id,
@@ -9282,7 +9267,7 @@ Expected Duration: {expected_duration}
         # Keep the same actual tool receipts as streaming history. An enforcing
         # audit releases only reviewed text, so its raw tool side channels must
         # remain absent from both history and STOP, even on ALLOW.
-        await self._persist_assistant_conversation(
+        assistant_message_id = await self._persist_assistant_conversation(
             response_text,
             session_id=session_id,
             metadata={
@@ -9297,7 +9282,9 @@ Expected Duration: {expected_duration}
         # Post-response memory pipeline:
         # Phase 1 (sync): Emotional tagging — CPU-bound, safe inline
         # Phase 2 (async): Temporal analysis + associative linking — background
-        await self._post_response_pipeline(user_input, response_text, session_id)
+        await self._post_response_pipeline(
+            user_message_id=user_message_id, assistant_message_id=assistant_message_id,
+        )
 
         # Fire STOP hook (response cycle complete).
         #
@@ -9381,9 +9368,9 @@ Expected Duration: {expected_duration}
 
     async def _post_response_pipeline(
         self,
-        user_input: str,
-        response_text: str,
-        session_id: Optional[str] = None,
+        *,
+        user_message_id: int | None,
+        assistant_message_id: int | None,
     ) -> None:
         """
         Post-response memory tagging pipeline.
@@ -9413,73 +9400,54 @@ Expected Duration: {expected_duration}
         if not hasattr(self, 'memory_system') or not self.memory_system:
             return
 
-        # ── Phase 1: Inline emotional tagging (CPU-bound, safe) ─────────
-        # Look up the two most recent messages (user + assistant just stored)
-        conv_store = None
-        user_msg = None
-        assistant_msg = None
+        if user_message_id is None or assistant_message_id is None:
+            return  # No complete durable exchange was produced.
+        if (
+            type(user_message_id) is not int or user_message_id <= 0
+            or type(assistant_message_id) is not int or assistant_message_id <= 0
+            or user_message_id == assistant_message_id
+        ):
+            raise ValueError("An exchange requires distinct positive native row receipts")
+        conv_store = getattr(self._raw_storage, "conversation", None)
+        if conv_store is None:
+            return
+        try:
+            messages = await conv_store.get_messages_by_ids([user_message_id, assistant_message_id])
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logging.getLogger(__name__).exception("Post-response receipt lookup failed")
+            return
+        rows = {message["id"]: message for message in messages}
+        if (
+            set(rows) != {user_message_id, assistant_message_id}
+            or rows[user_message_id].get("role") != "user"
+            or rows[assistant_message_id].get("role") != "assistant"
+        ):
+            raise ValueError("Exchange receipts do not identify this agent's stored user/assistant rows")
+        user_msg, assistant_msg = rows[user_message_id], rows[assistant_message_id]
+        # Canonical persisted projections carry the privacy decision. Raw turn
+        # text cannot replace anonymized content in derived memory.
+        user_input = extract_raw_user_content(user_msg.get("content") or "")
+        response_text = assistant_msg.get("content") or ""
         tag_results = {"user": None, "assistant": None}
         try:
-            conv_store = getattr(self._raw_storage, 'conversation', None)
-            if not conv_store:
-                return
-
-            # Only rows written around this serialized turn can be our pair.
-            # Never decrypt/materialize an agent's entire lifetime merely to
-            # locate two canonical IDs.
-            recent = await conv_store.get_full_history_with_ids(limit=20)
-            if len(recent) < 2:
-                return
-
-            canonical_session_id = None
-            if session_id:
-                canonical_session_id = await conv_store.resolve_session_id(
-                    session_id
-                )
-
-            # Find OUR user+assistant pair by canonical content. User turns are
-            # persisted in sent form, so compare their raw projection rather
-            # than the transport wrapper. Scope to the active session when one
-            # is available so identical text in another conversation cannot be
-            # selected.
-            for msg in reversed(recent):
-                msg_meta = msg.get('metadata') or {}
-                if (
-                    canonical_session_id
-                    and str(msg_meta.get('session_id')) != str(canonical_session_id)
-                ):
-                    continue
-                if not assistant_msg and msg.get('role') == 'assistant' and msg.get('content') == response_text:
-                    assistant_msg = msg
-                elif (
-                    not user_msg
-                    and msg.get('role') == 'user'
-                    and extract_raw_user_content(msg.get('content') or '') == user_input
-                ):
-                    user_msg = msg
-                if user_msg and assistant_msg:
-                    break
-
-            if user_msg and assistant_msg:
-                tag_results = await self.context_manager.memory_manager.tag_exchange(
-                    user_content=user_input,
-                    assistant_content=response_text,
-                    user_message_id=user_msg.get('id'),
-                    assistant_message_id=assistant_msg.get('id'),
-                    memory_system=self.memory_system,
-                )
+            tag_results = await self.context_manager.memory_manager.tag_exchange(
+                user_content=user_input,
+                assistant_content=response_text,
+                user_message_id=user_message_id,
+                assistant_message_id=assistant_message_id,
+                memory_system=self.memory_system,
+            )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(f"Post-response Phase 1 (emotional tagging) failed: {e}", exc_info=True)
 
         # ── Phase 2: Background temporal + associative processing ───────
         # Snapshot IDs before spawning background work to avoid races
-        snapshot_user_msg_id = user_msg.get('id') if user_msg else None
+        snapshot_user_msg_id = user_message_id
         snapshot_user_metadata = dict((tag_results or {}).get("user") or {})
-
-        # Phase 1 can fail before a conversation store is acquired. Do not
-        # enqueue background work that is guaranteed to dereference None.
-        if conv_store is None:
-            return
 
         async def _background_memory_processing():
             try:
@@ -9495,6 +9463,8 @@ Expected Duration: {expected_duration}
                             await self.memory_system.analyzer.save_patterns(patterns)
                             logging.debug(f"Post-response: saved {len(patterns)} temporal patterns")
                     except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.error(f"Post-response temporal analysis failed: {e}", exc_info=True)
 
                 # Associative linking + schema routing share one canonical
@@ -9512,9 +9482,13 @@ Expected Duration: {expected_duration}
                                 snapshot_user_msg_id, derived
                             )
                     except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.error(f"Post-response memory graph processing failed: {e}", exc_info=True)
 
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.error(f"Post-response Phase 2 (background) failed: {e}", exc_info=True)
 
         # Background task — named for debug visibility and owned by shutdown.

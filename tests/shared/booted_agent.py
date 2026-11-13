@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AbstractSet
 
+from kestrel_sdk.payer_policy import PayerPolicy
+
 
 @asynccontextmanager
 async def booted_agent(
@@ -27,6 +29,8 @@ async def booted_agent(
     genesis: bool = True,
     released_schema: Path | None = None,
     database_url: str | None = None,
+    is_test_instance: bool = True,
+    payer_policy: PayerPolicy | None = None,
 ):
     """A booted agent past genesis and discovery, loading only ``features``
     (Feature class names) beyond the mandatory set.
@@ -41,7 +45,14 @@ async def booted_agent(
     ``database_url`` boots the agent on that PostgreSQL database instead of
     SQLite. Inception still writes the local birth record, which boot
     replicates into PostgreSQL as it does in production (#2871). The database
-    must be the caller's own, empty and disposable."""
+    must be the caller's own, empty and disposable.
+
+    ``is_test_instance=False`` creates a separate test-owned identity with
+    interactive approvals enabled; the default identity is tagged headless.
+
+    ``payer_policy`` uses the agent's normal resource policy, including an
+    explicit LLM-disabled policy for tests that exercise persistence only.
+    """
     from kestrel_sovereign.bootstrap import BootstrapState
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
     from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -54,7 +65,7 @@ async def booted_agent(
     db_path = Path(tmp_path) / "kestrel_prime.db"
     if released_schema is None:
         credentials = await create_kestrel_identity_async(
-            output_dir=str(tmp_path), is_test_instance=True, agent_name=name
+            output_dir=str(tmp_path), is_test_instance=is_test_instance, agent_name=name
         )
     else:
         from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -66,7 +77,7 @@ async def booted_agent(
         try:
             credentials = await create_kestrel_identity_async(
                 output_dir=str(tmp_path),
-                is_test_instance=True,
+                is_test_instance=is_test_instance,
                 agent_name=name,
                 database=database,
             )
@@ -83,6 +94,7 @@ async def booted_agent(
         storage_path=str(db_path),
         llm_service=llm_service,
         allowed_features=set(features),
+        payer_policy=payer_policy,
         **backend,
     )
     try:

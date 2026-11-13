@@ -107,9 +107,12 @@ async def test_streaming_normal_runs_post_response_pipeline(native_tool_effect_a
     text = await _drain_stream(agent)
     assert "Hello world" in text
     agent._post_response_pipeline.assert_awaited_once()
-    args = agent._post_response_pipeline.await_args[0]
-    assert args[0] == "my secret note"  # raw user input
-    assert args[1] == "Hello world"  # final assistant text
+    receipts = agent._post_response_pipeline.await_args.kwargs
+    ids = [receipts["user_message_id"], receipts["assistant_message_id"]]
+    assert all(type(row) is int and row > 0 for row in ids) and len(set(ids)) == 2
+    rows = {row["id"]: row for row in await agent._raw_storage.conversation.get_messages_by_ids(ids)}
+    assert rows[ids[0]]["role"] == "user" and "my secret note" in rows[ids[0]]["content"]
+    assert rows[ids[1]]["role"] == "assistant" and rows[ids[1]]["content"] == "Hello world"
 
 
 @pytest.mark.asyncio
@@ -161,7 +164,7 @@ async def test_nonstreaming_volatile_modes_skip_all_memory_work(mode):
     agent.context_manager.memory_manager.tag_exchange = AsyncMock()
 
     await KestrelAgent._post_response_pipeline(
-        agent, "raw private input", "private response", session_id="s1"
+        agent, user_message_id=None, assistant_message_id=None
     )
     await asyncio.sleep(0.05)
 

@@ -1948,24 +1948,14 @@ async def _migrate_pg_greenfield(db: "AsyncDatabase", *, table: str) -> None:
 
     dim = CONVERSATION_MESSAGE_EMBEDDING_DIM
 
-    rows = await db.fetchall(
-        f"""SELECT 1 FROM information_schema.columns
-            WHERE table_name = '{table}' AND column_name = 'embedding_vec'""",
-        (),
-    )
-    if rows:
+    if await db.column_exists(table, "embedding_vec"):
         logger.debug(
             "%s.embedding_vec already present — skipping greenfield PG migration.",
             table,
         )
         return
 
-    table_exists = await db.fetchall(
-        f"""SELECT 1 FROM information_schema.tables
-            WHERE table_name = '{table}'""",
-        (),
-    )
-    if not table_exists:
+    if not await db.table_exists(table):
         logger.debug(
             "%s table not yet present — skipping greenfield PG migration.", table,
         )
@@ -2048,7 +2038,8 @@ async def migrate_add_embedding_profile_id(
     """Add a nullable ``embedding_profile_id`` column to ``table``.
 
     Idempotent across both backends and tables — pre-checks the
-    column via ``information_schema`` / ``pragma_table_info``.
+    column on the same resolved relation the ALTER will modify (and via
+    ``pragma_table_info`` on SQLite).
     Wrapped in ``db.transaction()`` so a partial failure rolls back
     cleanly. Existing rows stay NULL; profile-filtered kNN will skip
     them so a deployment that upgrades into 0.21 sees no false
@@ -2058,24 +2049,13 @@ async def migrate_add_embedding_profile_id(
     """
     backend_type = getattr(db, "backend_type", None)
     if backend_type == "postgres":
-        rows = await db.fetchall(
-            f"""SELECT 1 FROM information_schema.columns
-                WHERE table_name = '{table}'
-                  AND column_name = 'embedding_profile_id'""",
-            (),
-        )
-        if rows:
+        if await db.column_exists(table, "embedding_profile_id"):
             logger.debug(
                 "%s.embedding_profile_id already present — skipping #1477 PG migration.",
                 table,
             )
             return
-        table_exists = await db.fetchall(
-            f"""SELECT 1 FROM information_schema.tables
-                WHERE table_name = '{table}'""",
-            (),
-        )
-        if not table_exists:
+        if not await db.table_exists(table):
             logger.debug(
                 "%s table not yet present — skipping #1477 PG migration.", table,
             )
@@ -2147,13 +2127,15 @@ async def migrate_create_embedding_profiles(db: "AsyncDatabase") -> None:
     matches against the stamped id directly — so this is purely a
     human-readable mapping.
 
-    Idempotent + transactional.
+    Idempotent + transactional. Creation targets current_schema(), even when
+    another registry is visible later in PostgreSQL's search path.
     """
     backend_type = getattr(db, "backend_type", None)
     if backend_type == "postgres":
         rows = await db.fetchall(
             """SELECT 1 FROM information_schema.tables
-               WHERE table_name = 'embedding_profiles'""",
+               WHERE table_schema = current_schema()
+                 AND table_name = 'embedding_profiles'""",
             (),
         )
         if rows:
@@ -2213,13 +2195,9 @@ async def migrate_embedding_profiles_add_parity(db: "AsyncDatabase") -> None:
     """
     backend_type = getattr(db, "backend_type", None)
     if backend_type == "postgres":
-        rows = await db.fetchall(
-            """SELECT 1 FROM information_schema.columns
-               WHERE table_name = 'embedding_profiles'
-                 AND column_name = 'parity_cosine'""",
-            (),
-        )
-        if rows:
+        # ALTER TABLE resolves this relation through the active search path;
+        # a same-named column in an unrelated schema cannot satisfy it.
+        if await db.column_exists("embedding_profiles", "parity_cosine"):
             return
         async with db.transaction():
             await db.execute(

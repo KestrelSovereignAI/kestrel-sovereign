@@ -86,18 +86,166 @@ class PathPolicy:
         return PolicyResult(Decision.REQUIRE_APPROVAL, match.reason)
 
 
+class SubcommandPolicyError(ValueError):
+    """A ``[features.computer_use.auto_approved_subcommands]`` entry is malformed."""
+
+
+_SUBCOMMAND_POLICY_KEYS = frozenset({"allow", "value_options", "flag_options", "deny_options"})
+
+
+@dataclass(frozen=True)
+class SubcommandPolicy:
+    """Which invocations of one auto-approved binary skip the queue.
+
+    ``allow:<bin>`` blesses every invocation of ``<bin>``. For a binary
+    whose subcommands range from reads to writes (``git status`` beside
+    ``git reset --hard``), that is broader than an operator who listed it
+    for reading meant. With a policy, only an invocation whose subcommand
+    is listed in ``allow`` is pre-approved; every other invocation routes
+    through the queue, exactly as an unlisted binary does. Nothing here
+    can turn a queued call into an allowed one.
+
+    Parsing fails closed:
+
+    - Before the subcommand, a token is accepted only if it is exactly a
+      listed ``flag_options`` entry, or exactly a listed ``value_options``
+      entry, which consumes the NEXT token as its value. Any other leading
+      option routes to the queue: ``git -c core.fsmonitor=<cmd> status``
+      runs ``<cmd>``. A value is never taken from an ``=`` form or glued
+      to a short option (``-C=path``, ``-Cpath``): a value inside a flag
+      token is invisible to :func:`evaluate_argv_paths`, which vets only
+      non-flag tokens, so the directory would escape the path policy.
+    - After the subcommand, a token naming a ``deny_options`` entry routes
+      to the queue. Long options also match by unambiguous prefix, because
+      git accepts one: ``--outp=FILE`` is ``--output=FILE``. Short options
+      match exactly, and bundled short flags are not unpacked, so a short
+      option dangerous for a subcommand means that subcommand does not
+      belong in ``allow``.
+    """
+
+    allow: frozenset[str]
+    value_options: frozenset[str] = frozenset()
+    flag_options: frozenset[str] = frozenset()
+    deny_options: frozenset[str] = frozenset()
+
+    def evaluate(self, binary: str, args: list[str]) -> PolicyResult:
+        """Decide one invocation of ``binary`` from its arguments (after ``argv[0]``)."""
+        index = 0
+        while index < len(args) and args[index].startswith("-"):
+            token = args[index]
+            if token in self.value_options:
+                index += 2
+            elif token in self.flag_options:
+                index += 1
+            else:
+                return PolicyResult(
+                    Decision.REQUIRE_APPROVAL, f"subcommand_option:{binary}:{token}"
+                )
+        if index >= len(args):
+            return PolicyResult(Decision.REQUIRE_APPROVAL, f"no_subcommand:{binary}")
+        subcommand = args[index]
+        if subcommand not in self.allow:
+            return PolicyResult(
+                Decision.REQUIRE_APPROVAL, f"subcommand:{binary}:{subcommand}"
+            )
+        for token in args[index + 1:]:
+            denied = self._denied_option(token)
+            if denied is not None:
+                return PolicyResult(
+                    Decision.REQUIRE_APPROVAL,
+                    f"subcommand_deny_option:{binary}:{subcommand}:{denied}",
+                )
+        return PolicyResult(Decision.ALLOW, f"allow:{binary}:{subcommand}")
+
+    def _denied_option(self, token: str) -> str | None:
+        if not token.startswith("--"):
+            return token if token in self.deny_options else None
+        name = token.partition("=")[0]
+        for option in self.deny_options:
+            if option == name or (
+                option.startswith("--") and len(name) > 2 and option.startswith(name)
+            ):
+                return option
+        return None
+
+
+def subcommand_policies_from_config(
+    raw: object, *, auto_approved: Iterable[str]
+) -> dict[str, SubcommandPolicy]:
+    """Build ``{binary: SubcommandPolicy}`` from ``auto_approved_subcommands``.
+
+    Raises :class:`SubcommandPolicyError` on any malformed entry rather
+    than dropping it: a policy that silently failed to load leaves its
+    binary blessing every subcommand, which is the hazard it exists to
+    remove. A policy for a binary that is not auto-approved is refused
+    too, since it could never apply and reads as protection that is not
+    there.
+    """
+    name = "features.computer_use.auto_approved_subcommands"
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise SubcommandPolicyError(f"{name} must be a table of binary = {{...}} entries")
+    approved = set(auto_approved)
+    policies: dict[str, SubcommandPolicy] = {}
+    for binary, entry in raw.items():
+        where = f"{name}.{binary}"
+        if binary not in approved:
+            raise SubcommandPolicyError(
+                f"{where} names a binary that is not in auto_approved_binaries, "
+                f"so the policy would never apply"
+            )
+        if not isinstance(entry, dict):
+            raise SubcommandPolicyError(f"{where} must be a table")
+        unknown = set(entry) - _SUBCOMMAND_POLICY_KEYS
+        if unknown:
+            raise SubcommandPolicyError(
+                f"{where} has unknown keys {sorted(unknown)}; "
+                f"expected {sorted(_SUBCOMMAND_POLICY_KEYS)}"
+            )
+        allow = _policy_words(entry, "allow", where=where, option=False)
+        if not allow:
+            raise SubcommandPolicyError(f"{where}.allow must name at least one subcommand")
+        policies[binary] = SubcommandPolicy(
+            allow=allow,
+            value_options=_policy_words(entry, "value_options", where=where, option=True),
+            flag_options=_policy_words(entry, "flag_options", where=where, option=True),
+            deny_options=_policy_words(entry, "deny_options", where=where, option=True),
+        )
+    return policies
+
+
+def _policy_words(entry: dict, key: str, *, where: str, option: bool) -> frozenset[str]:
+    value = entry.get(key, [])
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item and item.strip() == item for item in value
+    ):
+        raise SubcommandPolicyError(f"{where}.{key} must be a list of non-empty strings")
+    if any(item.startswith("-") != option for item in value):
+        kind = "options starting with '-'" if option else "subcommands, not options"
+        raise SubcommandPolicyError(f"{where}.{key} must list {kind}")
+    return frozenset(value)
+
+
 @dataclass
 class BinaryPolicy:
-    """Allow/deny policy for the executable in a shell command."""
+    """Allow/deny policy for the executable in a shell command.
+
+    ``subcommands`` narrows an allow-listed binary to the invocations its
+    :class:`SubcommandPolicy` names; a binary without one is allowed whole.
+    """
 
     allow: list[str] = None  # type: ignore[assignment]
     deny: list[str] = None  # type: ignore[assignment]
+    subcommands: dict[str, SubcommandPolicy] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.allow is None:
             self.allow = []
         if self.deny is None:
             self.deny = []
+        if self.subcommands is None:
+            self.subcommands = {}
 
     def evaluate(self, argv: list[str] | str) -> PolicyResult:
         """Evaluate ``argv[0]`` against the allow/deny lists.
@@ -143,6 +291,9 @@ class BinaryPolicy:
                     Decision.REQUIRE_APPROVAL,
                     f"compound_command:allow:{binary}",
                 )
+            narrowed = self.subcommands.get(binary)
+            if narrowed is not None:
+                return narrowed.evaluate(binary, tokens[1:])
             return PolicyResult(Decision.ALLOW, f"allow:{binary}")
         return PolicyResult(Decision.REQUIRE_APPROVAL, f"no_match:{binary}")
 

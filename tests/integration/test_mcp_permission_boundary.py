@@ -18,6 +18,7 @@ from tests.integration.mcp_permission_peers import (
     MCPTestPeer, docker_peer, gateway_peer, https_peer, owned_provider_network,
 )
 from tests.utils.native_tool_effects import drive_native
+from tests.shared.agent_http import authenticated_agent_app
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
 
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
@@ -44,7 +45,7 @@ async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, mo
                 models = await provider.adapter.list_models(provider.client)
                 assert [model.id for model in models] == ["owned-permission-model"]
                 response = await provider.adapter.get_response(provider.client, provider.model,
-                    [{"role": "user", "content": "Record the owned marker"}], tools=[{
+                    [{"role": "user", "content": "Record the owned marker using the connected MCP tool."}], tools=[{
                         "type": "function", "function": {"name": "record_marker", "parameters": {
                             "type": "object", "properties": {"marker": {"type": "string"}},
                             "required": ["marker"],
@@ -72,20 +73,11 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(
     import json
     import httpx2
     from cryptography.fernet import Fernet
-    from fastapi import FastAPI
-    from kestrel_sovereign import server
-    from kestrel_sovereign.api_errors import register_api_error_handlers
     from kestrel_sovereign.endpoints.agent import router
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
     from kestrel_sovereign.feature_registry import get_package_for_feature
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
-    from kestrel_sovereign.rate_limit import limiter
-    from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
-    from kestrel_sovereign.security.request_auth import (
-        AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware,
-        RequestAuthenticationService,
-    )
     from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
     async with AsyncExitStack() as cleanup:
@@ -139,17 +131,8 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(
         owner = "mcp:remote:" + loaded.data["connection"]
         handle, = [name for name, tool_owner in agent._tool_to_feature.items() if tool_owner == owner]
         await security.permission_store.set_permission(owner, handle, permission)
-        app = FastAPI()
-        app.state.agent = agent
-        app.state.limiter = limiter
-        app.state.request_authentication = RequestAuthenticationService(
-            api_key=lambda: server.get_api_key(generate_if_missing=False))
-        app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
-        app.middleware("http")(server.auth_middleware)
-        app.add_middleware(AuthenticatedSessionMiddleware,
-            secret_key="owned-native-invoke-session-signing-key", session_cookie="kestrel_session", max_age=600)
-        app.add_middleware(PrivateDeliveryMiddleware)
-        register_api_error_handlers(app)
+        app = authenticated_agent_app(agent,
+            session_secret="owned-native-invoke-session-signing-key")
         app.include_router(router)
         if operator_input:
             assert feature._input_host is not None, 'Saved input settings did not survive full native boot'

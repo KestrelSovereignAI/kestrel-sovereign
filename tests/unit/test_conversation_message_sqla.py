@@ -17,9 +17,9 @@ Covers:
   ``KESTREL_EMBEDDING_DIM`` env override + falls back to 768 on
   garbage input.
 - :func:`migrate_conversation_history_add_embedding_vec` is idempotent
-  on PG (skip if column present, skip if table missing), creates
-  extension + ALTER + HNSW in the right order, runs in a transaction,
-  and SQLite-side adds the BLOB column with no backfill.
+  on SQLite, adds the BLOB column with no backfill. Native PostgreSQL
+  migration, namespace, index, dimension and rollback contracts live in
+  tests/integration/test_conversation_embedding_receipts.py.
 """
 
 from __future__ import annotations
@@ -234,115 +234,16 @@ def _fake_db_with_fetchall(backend_type: str, fetchall_returns: list) -> MagicMo
     return db
 
 
-@pytest.mark.asyncio
-async def test_migration_noop_when_pg_column_already_exists():
-    """Idempotency: the migration must short-circuit (no DDL) when
-    ``embedding_vec`` already exists on PG."""
-    db = _fake_db_with_fetchall("postgres", [[(1,)]])
-    await migrate_conversation_history_add_embedding_vec(db)
-    db.execute.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_migration_noop_when_pg_table_missing():
-    """Fresh DB before ``_init_schema`` has run: bail rather than
-    crash. ``conversation_history`` is created by CORE_SCHEMA on the
-    same boot, so this branch only fires if migrations somehow run
-    out of order."""
-    db = _fake_db_with_fetchall(
-        "postgres",
-        [
-            [],   # embedding_vec column probe → absent
-            [],   # information_schema.tables probe → table missing
-        ],
-    )
-    await migrate_conversation_history_add_embedding_vec(db)
-    db.execute.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_migration_pg_creates_extension_before_alter():
-    """Regression from the saved_items / document_chunks PRs:
-    ``CREATE EXTENSION IF NOT EXISTS vector`` MUST come before
-    ``ALTER TABLE ... vector(N)``. The reverse order fails on fresh
-    PG with ``type "vector" does not exist`` and the migration is
-    caught by the non-fatal try/except at the call site — leaving
-    the column never created."""
-    db = _fake_db_with_fetchall(
-        "postgres",
-        [
-            [],         # embedding_vec column probe → absent
-            [(1,)],     # table-exists probe → table present
-        ],
-    )
-    await migrate_conversation_history_add_embedding_vec(db)
-
-    sql_calls = [c.args[0] for c in db.execute.call_args_list]
-    create_ext_idx = next(
-        (i for i, q in enumerate(sql_calls) if "CREATE EXTENSION" in q), None
-    )
-    alter_idx = next(
-        (i for i, q in enumerate(sql_calls) if "ADD COLUMN embedding_vec vector" in q),
-        None,
-    )
-    assert create_ext_idx is not None, "expected CREATE EXTENSION"
-    assert alter_idx is not None, "expected ALTER TABLE ADD COLUMN"
-    assert create_ext_idx < alter_idx
 
 
-@pytest.mark.asyncio
-async def test_migration_pg_creates_hnsw_index():
-    """The retriever's kNN performance depends on the HNSW cosine
-    index. If the migration silently skipped it (e.g. ran the ALTER
-    outside the transaction and then crashed), every query would
-    fall back to a full sequential scan."""
-    db = _fake_db_with_fetchall(
-        "postgres",
-        [
-            [],         # embedding_vec absent
-            [(1,)],     # table exists
-        ],
-    )
-    await migrate_conversation_history_add_embedding_vec(db)
-    sql_calls = [c.args[0] for c in db.execute.call_args_list]
-    assert any(
-        "hnsw" in q.lower() and "embedding_vec" in q and "vector_cosine_ops" in q
-        for q in sql_calls
-    ), f"expected HNSW index in {sql_calls!r}"
 
 
-@pytest.mark.asyncio
-async def test_migration_pg_uses_configured_dim():
-    """The ALTER must reference the dim resolved from
-    ``CONVERSATION_MESSAGE_EMBEDDING_DIM`` (768 by default)."""
-    db = _fake_db_with_fetchall(
-        "postgres",
-        [
-            [],
-            [(1,)],
-        ],
-    )
-    await migrate_conversation_history_add_embedding_vec(db)
-    sql_calls = [c.args[0] for c in db.execute.call_args_list]
-    assert any(
-        f"ADD COLUMN embedding_vec vector({CONVERSATION_MESSAGE_EMBEDDING_DIM})" in q
-        for q in sql_calls
-    )
 
 
-@pytest.mark.asyncio
-async def test_migration_wraps_in_transaction_pg():
-    """Partial failure must roll back so the next boot can retry from
-    a clean state."""
-    db = _fake_db_with_fetchall(
-        "postgres",
-        [
-            [],
-            [(1,)],
-        ],
-    )
-    await migrate_conversation_history_add_embedding_vec(db)
-    db.transaction.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -375,15 +375,18 @@ async def test_shutdown_terminalizes_an_original_cognition_commit_with_lost_ack(
         finally:
             conversation_body.reset(token)
 
-    def owns_conversation_commit(_connection, function, arguments):
+    def owns_conversation_commit(connection, _function, arguments):
         if (
             conversation_body.get()
-            and function.__name__ == "execute"
             and arguments
-            and str(arguments[0]).lstrip().startswith("INSERT INTO conversation_history ")
+            and isinstance(arguments[0], str)
+            and arguments[0].lstrip().startswith("INSERT INTO conversation_history ")
         ):
-            conversation_writers.add(asyncio.current_task())
-        return asyncio.current_task() in conversation_writers
+            conversation_writers.add(connection)
+        # The owned transaction's COMMIT task inherits the original turn's
+        # context, but is distinct from its INSERT task. Bind to the native
+        # connection that actually executed that turn's conversation INSERT.
+        return conversation_body.get() and connection in conversation_writers
 
     async def paused_input(*args, **kwargs):
         entered.set()

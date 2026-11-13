@@ -23,6 +23,9 @@ from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
 from tests.integration.native_memory_original_control import (
     native_memory_owners as native_memory_owners,
 )
+from tests.integration.native_memory_original_control import (
+    observe_native_transaction_errors,
+)
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 
@@ -102,6 +105,9 @@ async def test_actual_preturn_compaction_keeps_original_control(
             return result
 
         monkeypatch.setattr(db, name, intercept)
+    observe_native_transaction_errors(
+        monkeypatch, db, selected=lambda: bool(armed and fired), sources=sources,
+    )
     n.backend._execution_custody = ExecutionCustody(GenerationFence())
     if kind == "native-control":
         n.backend._pool = PostgresPoolAdapter(pool, lose_ack)
@@ -123,7 +129,7 @@ async def test_actual_preturn_compaction_keeps_original_control(
                 fired
                 and sources
                 and execution_commit_outcome(sources[0]) == "committed"
-            )
+            ), "Original native preturn SQL or transaction-exit control must remain observable"
             assert original in tuple(_explicit_control_chain(sources[0]))
             assert failure is not None and is_execution_control_error(failure), (
                 f"actual preturn compaction control was discarded: {door} {failure!r}"

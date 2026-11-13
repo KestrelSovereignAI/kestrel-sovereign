@@ -826,38 +826,75 @@ async def test_owned_sqlite_factory_uses_the_same_native_admission_contract(tmp_
     assert not backend.is_connected
 
 
+@asynccontextmanager
+async def _host_primary_services(backend, root):
+    """Own the actual host storage and LLM services through construction."""
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.storage import AsyncStorage
+
+    storage = AsyncStorage(backend=backend, agent_id="did:kestrel:host")
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(storage.close)
+        await storage.initialize()
+        llm = LLMService(usage_db=storage.db, agent_data_dir=root)
+        resources.push_async_callback(llm.close)
+        yield storage, llm
+
+
+async def test_host_primary_service_constructor_refusal_retires_actual_storage(
+    native_a2a_backend_factory, tmp_path,
+):
+    from kestrel_sovereign.llm.provider_policy import ProviderPolicyConfigError
+    from kestrel_sovereign.paths import project_dir
+
+    config = project_dir() / "kestrel.toml"
+    config.write_text('[llm]\ndenied_providers = 42\n', encoding="utf-8")
+    backend = native_a2a_backend_factory()
+    try:
+        with pytest.raises(ProviderPolicyConfigError, match="must be a list"):
+            async with _host_primary_services(backend, tmp_path):
+                raise AssertionError("The real malformed LLM config was accepted")
+        assert not backend.is_connected, "Failed service construction leaked actual storage"
+    finally:
+        # Negative-test cleanup, not a product or fixture retirement receipt.
+        await backend.close()
+
+
 @pytest.mark.parametrize("broken_session_schema", [False, True])
 async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
     native_a2a_backend_factory,
     tmp_path,
     broken_session_schema,
+    monkeypatch,
 ):
     # Imports happen after the suite has isolated every runtime/config path.
     from kestrel_sovereign.agent.boot import BootContext
     from kestrel_sovereign.features.base import Feature, tool
     from kestrel_sovereign.features.privacy import PrivacyAgent
     from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.privacy import PrivacyMode
-    from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+    from kestrel_sovereign.storage import PrivacyEnforcingStorage
 
     backend = native_a2a_backend_factory()
-    storage = AsyncStorage(backend=backend, agent_id="did:kestrel:host")
-    await storage.initialize()
-    llm = LLMService(usage_db=storage.db, agent_data_dir=tmp_path)
-    agent = KestrelAgent(
-        "did:kestrel:host",
-        storage_path=str(tmp_path / "host.db"),
-        llm_service=llm,
-        db_backend=backend.backend_type,
-        sync_enabled=False,
-        allowed_features=set(),
-    )
-    agent._raw_storage = storage
-    agent.storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
-    agent.privacy_agent = PrivacyAgent(storage, PrivacyMode.NORMAL)
-    ctx = BootContext(custody=agent._custody)
+    # Real service construction must not discover cloud instance credentials
+    # during this offline native storage/signal test.
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    services = AsyncExitStack()
+    ctx = None
     try:
+        storage, llm = await services.enter_async_context(_host_primary_services(backend, tmp_path))
+        agent = KestrelAgent(
+            "did:kestrel:host",
+            storage_path=str(tmp_path / "host.db"),
+            llm_service=llm,
+            db_backend=backend.backend_type,
+            sync_enabled=False,
+            allowed_features=set(),
+        )
+        agent._raw_storage = storage
+        agent.storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        agent.privacy_agent = PrivacyAgent(storage, PrivacyMode.NORMAL)
+        ctx = BootContext(custody=agent._custody)
         if broken_session_schema:
             # A real SQL failure after task/context initialization proves the
             # rollback owner was registered before initialize's first await.
@@ -919,9 +956,11 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         assert backend.is_connected
         assert await backend.fetch_one("SELECT 1") == (1,)
     finally:
-        await ctx.run_rollback()
-        await llm.close()
-        await storage.close()
+        try:
+            if ctx is not None:
+                await ctx.run_rollback()
+        finally:
+            await services.aclose()
 
 
 @asynccontextmanager

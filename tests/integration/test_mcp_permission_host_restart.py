@@ -134,6 +134,22 @@ async def host_campaign(tmp_path, monkeypatch, request):
     settings = getattr(request, 'param', {})
     transport = settings.get('transport', 'remote')
     assert transport in {'remote', 'gateway'}
+    native_a2a = settings.get('native_a2a', False)
+    peer_agents = []
+    sender_identity = recipient_identity = None
+    if native_a2a:
+        from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+
+        sender_data = home / 'sender'
+        sender_data.mkdir(mode=0o700)
+        await create_kestrel_identity_async(output_dir=str(sender_data), is_test_instance=True,
+            agent_name='OwnedA2ASender', did_web_domain='owned-a2a-sender.invalid',
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance='test:596-native-a2a-cognition')
+        sender_identity = load_agent_identity(storage_dir=sender_data, master_key=key)
+        recipient_identity = load_agent_identity(storage_dir=data, master_key=key)
+        peer_agents.append({'agent_name': 'a2a-sender', 'agent_data': str(sender_data),
+            'features': ['BootstrapFeature']})
     async with AsyncExitStack() as resources:
         provider = await resources.enter_async_context(https_peer(
             peer_root, monkeypatch, provider_model='owned-permission-model',
@@ -159,7 +175,10 @@ async def host_campaign(tmp_path, monkeypatch, request):
         descriptor = home / 'host-test.json'
         descriptor.write_text(json.dumps(dict(agent_name='permission-host', agent_data=str(data),
             transport=transport, selector=peer.selector, provider_url=provider.provider_url,
-            certificate=str(provider.tls_certificate), gateway=gateway_settings)))
+            certificate=str(provider.tls_certificate), gateway=gateway_settings,
+            native_a2a=native_a2a, peer_agents=peer_agents,
+            features=['MCPAgent', 'BootstrapFeature', 'TaskFeature'] if native_a2a else
+                ['MCPAgent', 'BootstrapFeature'])))
         if 'sqlite_worker_budget' in settings:
             monkeypatch.setenv('KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S',
                 settings['sqlite_worker_budget'])
@@ -174,7 +193,8 @@ async def host_campaign(tmp_path, monkeypatch, request):
         async with owned_gateway_network(monkeypatch, peer, gateway_settings) as gateway:
             with owned_provider_network(monkeypatch, peer, gateway=gateway):
                 yield SimpleNamespace(home=home, descriptor=descriptor, environment=environment,
-                    peer=peer, did=identity.agent_did, headers=headers)
+                    peer=peer, did=identity.agent_did, headers=headers,
+                    sender_identity=sender_identity, recipient_identity=recipient_identity)
 
 
 def owned_host_environment(home, *, api_key, data_key):

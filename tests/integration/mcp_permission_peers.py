@@ -214,7 +214,9 @@ def owned_provider_network(monkeypatch, peer, *, gateway=None):
         def require_owned(address):
             if gateway is not None and (gateway.owns_docker(address) or gateway.owns_listener(address)):
                 return
-            assert isinstance(address, tuple) and address[0] == "127.0.0.1" and address[1] in {endpoint.port, *peer.local_ports}
+            assert isinstance(address, tuple) and address[0] == "127.0.0.1" and address[1] in {endpoint.port, *peer.local_ports}, (
+                f"Native fixture refused {address!r}; owned IPv4 ports: {sorted({endpoint.port, *peer.local_ports})}"
+            )
             dials.append(address)
 
         def connect(sock, address):

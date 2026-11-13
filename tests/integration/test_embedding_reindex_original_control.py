@@ -22,8 +22,14 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.postgres import PostgresBackend, PostgresPoolAdapter
 from kestrel_sovereign.storage.embedding_column import ensure_embedding_vec_column
 from kestrel_sovereign.storage.sqla import embedding_profile
+from kestrel_sovereign.storage.sqla.migrations import (
+    migrate_add_embedding_profile_id,
+    migrate_create_embedding_profiles,
+    migrate_embedding_profiles_add_parity,
+)
 from tests.integration.native_memory_original_control import (
     native_memory_owners as native_memory_owners,
+    observe_native_transaction_errors,
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
@@ -105,21 +111,12 @@ async def test_actual_embedding_corpus_and_reindex_preserve_original_control(
 
     try:
         assert await ensure_embedding_vec_column(db, "saved_items", 3)
-        # Explicit component schema: the base native fixture does not promise
-        # complete startup migrations (some legacy PG probes are cross-schema).
-        # These are real DDL operations, not invented SQL/commit results.
+        # Prepare this independent component connection through the canonical
+        # migrations; another schema's table cannot stand in for these columns.
         for table in embedding_reindex.REINDEX_TABLES:
-            await db.execute(
-                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS embedding_profile_id TEXT"
-            )
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS embedding_profiles ("
-            "id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, "
-            "dim INTEGER NOT NULL, space_id TEXT NOT NULL, normalized BOOLEAN NOT NULL)"
-        )
-        await db.execute(
-            "ALTER TABLE embedding_profiles ADD COLUMN IF NOT EXISTS parity_cosine DOUBLE PRECISION"
-        )
+            await migrate_add_embedding_profile_id(db, table=table)
+        await migrate_create_embedding_profiles(db)
+        await migrate_embedding_profiles_add_parity(db)
         for row_id in ("corpus-a", "corpus-b"):
             await db.execute(
                 "INSERT INTO saved_items (id,agent_id,item_type,name,content,content_hash,embedding_profile_id) VALUES (?,?,?,?,?,?,?)",
@@ -186,6 +183,9 @@ async def test_actual_embedding_corpus_and_reindex_preserve_original_control(
 
         monkeypatch.setattr(db, "execute_commit", commit)
         monkeypatch.setattr(db, "execute", execute)
+        observe_native_transaction_errors(
+            monkeypatch, db, selected=lambda: bool(armed and fired), sources=sources,
+        )
 
         class Service:
             def describe(self):
@@ -261,7 +261,9 @@ async def test_actual_embedding_corpus_and_reindex_preserve_original_control(
             failure = error
         assert reached, f"selected actual producer was not reached: {door} {failure!r}"
         if kind == "native-control":
-            assert sources and is_execution_control_error(sources[0])
+            assert sources and is_execution_control_error(sources[0]), (
+                "Original native SQL or transaction-exit control must remain observable"
+            )
             if door in {"embed", "registry", "registry-describe"}:
                 assert not fired
             else:

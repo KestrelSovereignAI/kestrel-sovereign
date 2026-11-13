@@ -90,8 +90,8 @@ class ConversationManager:
     ) -> Optional[int]:
         """Resolve a just-inserted marker row's id by a UUID unique to this call.
 
-        ``add_conversation`` returns nothing, so both compaction and summary
-        used to recover the marker id with ``ORDER BY id DESC LIMIT 1`` — which
+        Before canonical write receipts, both compaction and summary
+        recovered the marker id with ``ORDER BY id DESC LIMIT 1`` — which
         returns whatever row was inserted LAST and races any concurrent
         conversation writer, mislinking ``summarized_into`` to another
         turn's/agent's row (F158). Embedding a per-call UUID in the marker

@@ -43,6 +43,7 @@ from uuid import uuid4
 import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db.interface import DatabaseError
 from kestrel_sovereign.storage.conversation_sessions import (
     canonical_order,
     PROJECTION_INPUT_COLUMNS,
@@ -2554,7 +2555,6 @@ async def test_the_watermark_is_comparable_on_both_backends(db_backend, monkeypa
     from kestrel_sovereign.storage.conversation_sessions import (
         CURRENT,
         REBUILT,
-        SessionWatermark,
     )
 
     _without_embeddings(monkeypatch)
@@ -3415,14 +3415,18 @@ async def test_a_database_holding_undatable_rows_is_repaired_on_both_engines(
             created_at_check(db.backend_type),
         ), "the constraint did not land after the rows were made to satisfy it"
 
-        with pytest.raises(Exception) as refused:
-            await db.execute(
-                "INSERT INTO conversation_history "
-                "(agent_id, role, content, created_at) "
-                "VALUES (?, 'user', 'after', NULL)",
-                (agent_id,),
-            )
+        with pytest.raises(DatabaseError) as refused:
+            async with db.transaction(savepoint=True):
+                await db.execute(
+                    "INSERT INTO conversation_history "
+                    "(agent_id, role, content, created_at) "
+                    "VALUES (?, 'user', 'after', NULL)",
+                    (agent_id,),
+                )
         assert CONSTRAINT_NAME in str(refused.value)
+        assert (await db.fetchone(
+            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?", (agent_id,),
+        ))[0] == 3
 
 
 @pytest.mark.asyncio
@@ -3455,16 +3459,20 @@ async def test_a_stamp_no_reader_can_date_is_refused_by_both_engines(db_backend)
     agent_id = f"did:test:null-stamp:{uuid4()}"
     async with _isolated_schema(db_backend) as db:
         await _create_projection_schema(db)
-        with pytest.raises(Exception) as refused:
-            await db.execute(
-                "INSERT INTO conversation_history "
-                "(agent_id, role, content, metadata, session_id, created_at) "
-                "VALUES (?, 'user', 'undatable', ?, ?, NULL)",
-                (agent_id, json.dumps({"session_id": UUID_A}), UUID_A),
-            )
+        with pytest.raises(DatabaseError) as refused:
+            async with db.transaction(savepoint=True):
+                await db.execute(
+                    "INSERT INTO conversation_history "
+                    "(agent_id, role, content, metadata, session_id, created_at) "
+                    "VALUES (?, 'user', 'undatable', ?, ?, NULL)",
+                    (agent_id, json.dumps({"session_id": UUID_A}), UUID_A),
+                )
         assert "conversation_history_created_at_canonical" in str(refused.value), (
             f"the row was refused, but not by the constraint: {refused.value}"
         )
+        assert (await db.fetchone(
+            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?", (agent_id,),
+        ))[0] == 0
         # Not followed by a COUNT: PostgreSQL aborts the whole transaction on a
         # constraint violation, so any statement issued after it on the same
         # connection fails with "current transaction is aborted" and would

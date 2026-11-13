@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .associative_linker import LinkedConcept
 from .async_graph_store import AsyncGraphStore, GraphNode
 
@@ -656,6 +658,8 @@ class SchemaRouter:
             if items:
                 await self._persist_action_items(items, message_id, epistemic, summary)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("Action item routing failed: %s", e)
 
         # 2. Decisions (graph nodes)
@@ -664,6 +668,8 @@ class SchemaRouter:
             if decisions:
                 await self._persist_decisions(decisions, message_id, epistemic, summary)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("Decision routing failed: %s", e)
 
         # 3. Interaction enrichment (edge properties) + person resolution.
@@ -671,6 +677,8 @@ class SchemaRouter:
         try:
             await self._enrich_person_interactions(concepts, content, message_id, summary)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.warning("Interaction enrichment failed: %s", e)
 
         return summary

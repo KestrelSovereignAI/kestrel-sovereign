@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from time import monotonic, perf_counter
 from typing import (
     AbstractSet, Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence,
-    Tuple,
+    Literal, Tuple, overload,
 )
 
 from kestrel_sovereign._async_ownership import run_blocking_operation
@@ -134,6 +134,26 @@ class ConversationSessionTimestampError(RuntimeError):
     """Exact session membership cannot be proven from stored chronology."""
 
 
+class ConversationWriteIdentityError(RuntimeError):
+    """The native conversation INSERT did not return its own valid row ID."""
+
+
+def _nonretryable_conversation_insert(error: BaseException) -> bool:
+    if is_execution_control_error(error):
+        return True
+    # Native transaction adapters retain ordinary body errors as explicit
+    # causes of TransactionError. A missing row is not an optional-schema
+    # failure, including when the transaction boundary has wrapped it.
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ConversationWriteIdentityError):
+            return True
+        current = current.__cause__
+    return False
+
+
 # A misconfigured agent drops an embedding on every turn. Its first drop is
 # logged, then at most one line per window, each carrying the running count.
 DROPPED_EMBEDDING_WARNING_INTERVAL_S = 300.0
@@ -212,6 +232,7 @@ class _PreparedConversationWrite:
 class _InsertedConversation:
     """What one conversation INSERT stored, before its transaction commits."""
 
+    row_id: int
     lexical_columns_written: bool
     # A vector no INSERT shape this schema offers could store; the row
     # landed without it.
@@ -1868,8 +1889,13 @@ class AsyncConversationStore:
                                session_id: Optional[str] = None,
                                rendered_content: Optional[str] = None,
                                model: Optional[str] = None,
-                               provider: Optional[str] = None) -> None:
-        """Prepare and persist a conversation message with per-agent encryption."""
+                               provider: Optional[str] = None) -> int:
+        """Persist through the canonical writer and return its exact row ID.
+
+        A caller-owned transaction retains final commit ownership; its row ID
+        is provisional until that caller commits. A failed/unknown commit never
+        turns into a successful return from the owned insertion boundary.
+        """
         prepared = await self._prepare_conversation_write(
             role,
             content,
@@ -1879,7 +1905,7 @@ class AsyncConversationStore:
             model,
             provider,
         )
-        await self._persist_prepared_conversation(prepared)
+        return await self._persist_prepared_conversation(prepared)
 
     async def _prepare_conversation_write(
         self,
@@ -1997,7 +2023,7 @@ class AsyncConversationStore:
     async def _persist_prepared_conversation(
         self,
         prepared: _PreparedConversationWrite,
-    ) -> None:
+    ) -> int:
         """Insert precomputed bytes and clean token-first work on failure."""
         try:
             inserted = await self._insert_message(
@@ -2063,6 +2089,7 @@ class AsyncConversationStore:
                     "Failed to upsert embedding_profiles row for agent %s: %s",
                     self.agent_id, exc,
                 )
+        return inserted.row_id
 
     async def _maybe_embed(self, content: str) -> Optional[List[float]]:
         """Compute an embedding for ``content`` if a service is wired.
@@ -2167,7 +2194,19 @@ class AsyncConversationStore:
                 raise
             logger.debug("Could not clean orphan lexical tokens: %s", exc)
 
-    async def _execute_confined(self, sql: str, params: tuple) -> None:
+    @overload
+    async def _execute_confined(
+        self, sql: str, params: tuple, *, returning_id: Literal[True],
+    ) -> int: ...
+
+    @overload
+    async def _execute_confined(
+        self, sql: str, params: tuple, *, returning_id: Literal[False] = False,
+    ) -> None: ...
+
+    async def _execute_confined(
+        self, sql: str, params: tuple, *, returning_id: bool = False,
+    ) -> int | None:
         """Run one write whose failure this store handles and moves past.
 
         Inside a transaction this task owns, a statement PostgreSQL refuses
@@ -2177,7 +2216,24 @@ class AsyncConversationStore:
         statement. Otherwise it runs as it always did: on its own when no
         transaction is open, and plainly when the backend cannot say whether
         one is, or cannot isolate a savepoint inside one.
+
+        An INSERT returning its row ID always requires an acknowledged native
+        transaction or isolated savepoint. Unknown/unsupported caller custody
+        is refused by AsyncDatabase rather than permitting an unowned commit.
         """
+        if returning_id:
+            # Fetch on this write's original transaction connection. The native
+            # row is withheld until its commit/savepoint exit is acknowledged.
+            async with self.db.transaction(savepoint=True):
+                row = await self.db.fetchone(sql + " RETURNING id", params)
+                if row is None or len(row) != 1 or type(row[0]) is not int:
+                    raise ConversationWriteIdentityError(
+                        "Canonical conversation INSERT must return one native integer row ID")
+                message_id = coerce_persistent_message_id(row[0])
+                if message_id is None:
+                    raise ConversationWriteIdentityError(
+                        "Canonical conversation INSERT must return a positive row ID")
+            return message_id
         if (
             self.db.owns_open_transaction is True
             and self.db.isolates_nested_savepoints
@@ -2233,8 +2289,9 @@ class AsyncConversationStore:
         follows runs through :meth:`_execute_confined`, so inside a caller's
         transaction a refused attempt does not take the fallback down with it.
 
-        Returns whether the lexical-index columns were written and, when no
-        vector-bearing shape was accepted, the dropped embedding. The caller
+        Returns the exact native row ID, whether the lexical-index columns were
+        written and, when no vector-bearing shape was accepted, the dropped
+        embedding. The caller
         counts that drop only once the row commits (#2913).
         """
         base_cols = (
@@ -2263,10 +2320,10 @@ class AsyncConversationStore:
                 f"VALUES ({base_binds}{base_vals_suffix})"
             )
             try:
-                await self._execute_confined(sql, base_params)
-                return _InsertedConversation(lexical_columns_written=True)
+                message_id = await self._execute_confined(sql, base_params, returning_id=True)
+                return _InsertedConversation(row_id=message_id, lexical_columns_written=True)
             except Exception as exc:
-                if is_execution_control_error(exc):
+                if _nonretryable_conversation_insert(exc):
                     raise
                 if not _is_missing_lexical_column_error(exc):
                     raise
@@ -2274,12 +2331,12 @@ class AsyncConversationStore:
                     "Lexical-index columns unavailable for agent %s (%s); "
                     "persisting without the blind index.", self.agent_id, exc,
                 )
-                await self.db.execute_commit(
+                message_id = await self._execute_confined(
                     f"INSERT INTO conversation_history ({legacy_cols}) "
                     f"VALUES ({legacy_binds}{base_vals_suffix})",
-                    legacy_params,
+                    legacy_params, returning_id=True,
                 )
-                return _InsertedConversation(lexical_columns_written=False)
+                return _InsertedConversation(row_id=message_id, lexical_columns_written=False)
 
         backend_type = getattr(self.db, "backend_type", None)
         try:
@@ -2300,11 +2357,11 @@ class AsyncConversationStore:
                 f"VALUES ({base_binds}{base_vals_suffix}, "
                 f"{emb_placeholder}, ?)"
             )
-            await self._execute_confined(
-                sql, base_params + (emb_bind, embedding_profile_id),
+            message_id = await self._execute_confined(
+                sql, base_params + (emb_bind, embedding_profile_id), returning_id=True,
             )
         except Exception as e:
-            if is_execution_control_error(e):
+            if _nonretryable_conversation_insert(e):
                 raise
             if _is_missing_lexical_column_error(e):
                 # The lexical migration is additive/non-fatal. Preserve the
@@ -2312,16 +2369,16 @@ class AsyncConversationStore:
                 # older schema shapes; otherwise failed lexical DDL silently
                 # removes the row from profile-filtered kNN.
                 try:
-                    await self._execute_confined(
+                    message_id = await self._execute_confined(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec, embedding_profile_id) "
                         f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder}, ?)",
-                        legacy_params + (emb_bind, embedding_profile_id),
+                        legacy_params + (emb_bind, embedding_profile_id), returning_id=True,
                     )
-                    return _InsertedConversation(lexical_columns_written=False)
+                    return _InsertedConversation(row_id=message_id, lexical_columns_written=False)
                 except Exception as legacy_exc:
-                    if is_execution_control_error(legacy_exc):
+                    if _nonretryable_conversation_insert(legacy_exc):
                         raise
                     if not _is_missing_column_error(
                         legacy_exc, "embedding_profile_id", "embedding_vec"
@@ -2350,44 +2407,44 @@ class AsyncConversationStore:
                     f"VALUES ({base_binds}{base_vals_suffix}, "
                     f"{emb_placeholder})"
                 )
-                await self._execute_confined(sql, base_params + (emb_bind,))
+                message_id = await self._execute_confined(sql, base_params + (emb_bind,), returning_id=True)
                 self._log_unstamped_embedding(e)
-                return _InsertedConversation(lexical_columns_written=True)
+                return _InsertedConversation(row_id=message_id, lexical_columns_written=True)
             except Exception as e2:
-                if is_execution_control_error(e2):
+                if _nonretryable_conversation_insert(e2):
                     raise
                 logger.debug(
                     "New lexical-index INSERT paths failed for agent %s (%s); "
                     "retrying the legacy embedding_vec path.", self.agent_id, e2,
                 )
                 try:
-                    await self._execute_confined(
+                    message_id = await self._execute_confined(
                         f"INSERT INTO conversation_history "
                         f"({legacy_cols}, embedding_vec) "
                         f"VALUES ({legacy_binds}{base_vals_suffix}, "
                         f"{emb_placeholder})",
-                        legacy_params + (emb_bind,),
+                        legacy_params + (emb_bind,), returning_id=True,
                     )
                     self._log_unstamped_embedding(e)
-                    return _InsertedConversation(lexical_columns_written=False)
+                    return _InsertedConversation(row_id=message_id, lexical_columns_written=False)
                 except Exception as e3:
-                    if is_execution_control_error(e3):
+                    if _nonretryable_conversation_insert(e3):
                         raise
                     logger.debug(
                         "Legacy embedding_vec INSERT also failed for agent %s "
                         "(%s); persisting without an embedding.", self.agent_id, e3,
                     )
-                    await self.db.execute_commit(
+                    message_id = await self._execute_confined(
                         f"INSERT INTO conversation_history ({legacy_cols}) "
                         f"VALUES ({legacy_binds}{base_vals_suffix})",
-                        legacy_params,
+                        legacy_params, returning_id=True,
                     )
                     # The last vector-bearing attempt names why the vector
                     # could not be stored in any shape this schema offers.
                     # Returned, not recorded: the row is not durable until
                     # its transaction commits.
                     return _InsertedConversation(
-                        lexical_columns_written=False,
+                        row_id=message_id, lexical_columns_written=False,
                         embedding_drop=DroppedConversationEmbedding(
                             profile_id=embedding_profile_id,
                             embedding_dim=len(embedding),
@@ -2396,7 +2453,7 @@ class AsyncConversationStore:
                             dropped_at=datetime.now(timezone.utc),
                         ),
                     )
-        return _InsertedConversation(lexical_columns_written=True)
+        return _InsertedConversation(row_id=message_id, lexical_columns_written=True)
 
     def _log_unstamped_embedding(self, error: BaseException) -> None:
         """Report a vector INSERT accepted only without ``embedding_profile_id``."""

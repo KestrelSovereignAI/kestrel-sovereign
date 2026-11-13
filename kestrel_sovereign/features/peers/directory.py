@@ -177,6 +177,16 @@ class PeerDirectoryRouter(Protocol):
 
 
 
+def create_local_host_http_client(*args, client_factory=None, **kwargs):
+    """Construct host-control HTTP without ambient proxy or TLS overrides.
+
+    An explicit constructor retains the embedding's late-bound instrumentation;
+    the local-host trust policy is shared by feature and direct callers.
+    """
+    constructor = httpx.AsyncClient if client_factory is None else client_factory
+    return constructor(*args, trust_env=False, **kwargs)
+
+
 class LocalHostPeerDirectory:
     """Discover the local host roster and open its governed native sessions.
 
@@ -190,7 +200,7 @@ class LocalHostPeerDirectory:
         *,
         transport_key: str = "",
         execution_custody: ExecutionCustody | None = None,
-        client_factory: Callable[..., Any] = httpx.AsyncClient,
+        client_factory: Callable[..., Any] | None = None,
         native_session_factory: Callable[..., Any] | None = None,
     ) -> None:
         self._host_url = host_url.rstrip("/")
@@ -288,7 +298,11 @@ class LocalHostPeerDirectory:
     async def _directory_entries(self, requester: PeerRequester) -> list[PeerIdentity]:
         self._require_requester(requester)
         try:
-            async with owned_native_http_client(self._client_factory()) as client:
+            # Host roster authentication is addressed to the configured host,
+            # never to an ambient proxy that would receive its transport key.
+            client = (self._client_factory() if self._client_factory is not None
+                      else create_local_host_http_client())
+            async with owned_native_http_client(client) as client:
                 require_execution_work(self)
                 response = await client.get(
                     f"{self._host_url}/api/agents",

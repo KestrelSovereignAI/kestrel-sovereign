@@ -1649,6 +1649,42 @@ effect and its durable terminal record.
    reusing MCP 2.x, per-agent routing, protected-resource metadata, credential
    governance and the normal memory/turn persistence path.
 
+The canonical conversation writer returns the native integer ID from its own
+`INSERT ... RETURNING id`. `AsyncStorage`, `PrivacyEnforcingStorage` and
+`PrivacyAgent` preserve that ID for persistent writes, including excluded
+semantic derivatives. Volatile writes return no persistent receipt (and the
+storage privacy wrapper rejects modes that cannot write a transcript). A
+caller-owned transaction retains final commit ownership: an external `log_turn`
+response must expose its user/assistant row IDs only after its whole exchange
+commits. Missing or nonpositive native IDs abort their insertion boundary;
+identity errors and execution-control errors never authorize a schema retry.
+Existing optional embedding/lexical schema attempts use isolated native
+savepoints and retain the exact successful insertion's ID. These contracts are
+covered by native SQLite/PostgreSQL receipt and transaction tests, plus actual
+SDK embedding calls to an owned local HTTP peer. They are storage prerequisites,
+not evidence of an installed inbound MCP connector or subsequent reflection and
+consolidation. That acceptance remains in #1990. The embedding migrations inspect
+the same resolved PostgreSQL relation as their ALTER statements through the
+canonical database API; a same-named table in another schema cannot satisfy the
+column checks. Native PostgreSQL transaction exits prove committability even
+without execution scopes or callbacks, so COMMIT-as-ROLLBACK cannot publish a
+successful receipt. Optional profile-registry writes roll back inside their own
+savepoint; a lost fence commit acknowledgement preserves the committed row's
+lexical tokens instead of treating them as orphaned prework. Savepoint exits use
+the same native ownership/acknowledgement boundary: an uncertain RELEASE cannot
+authorize a second INSERT or mint a durable top-level commit receipt.
+
+Post-response enrichment receives the actual user and assistant row IDs from
+normal, streaming and bootstrap persistence. It reads exactly those rows,
+rejects missing or wrong-role identities, and uses their canonical stored text
+for emotional and graph processing. Identical later exchanges and operator
+notices cannot replace either row; anonymized input stays anonymized in derived
+memory. Native SQL/lease control errors propagate through tagging and advisory
+schema lanes, and background owners retain the original task's terminal receipt.
+Ordinary advisory failures retain their existing partial-result behavior. These
+are memory-pipeline contracts, not inbound MCP installation or subsequent
+reflection/consolidation acceptance.
+
 Each PR requires a completed full-diff worktree review before creation, with
 findings fixed and meaningful regression tests. Pin the conformance runner
 versions/commits and record which protocol scenarios they actually support.

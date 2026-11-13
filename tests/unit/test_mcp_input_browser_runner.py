@@ -34,6 +34,18 @@ def test_input_browser_support_matches_the_public_host_feature_minimum():
         'Native input acceptance must use the same public MCP release as the declared host minimum')
 
 
+def test_input_browser_runtime_install_resolves_candidate_dependencies():
+    python = Path('/original runtime/bin/python')
+    wheel = Path('/owned/candidate core.whl')
+    command = runner().runtime_install_command(python, '0.17.0', wheel)
+    assert command[:3] == ['uv', 'pip', 'install']
+    assert '--no-deps' not in command, (
+        'Replacing Core without its declared dependencies leaves the base SDK installed')
+    assert command[command.index('--python') + 1] == str(python)
+    assert command[command.index('--index-url') + 1] == 'https://pypi.org/simple'
+    assert command[-2:] == ['kestrel-feature-mcp==0.17.0', str(wheel)]
+
+
 @pytest.mark.parametrize('fault', ['altered', 'missing', 'duplicate', 'empty'])
 def test_input_browser_rejects_wheel_without_exact_unique_source_bytes(tmp_path, fault):
     source = tmp_path / 'source'

@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tarfile
 import tomllib
@@ -37,6 +38,13 @@ def wheel_inventory(wheel, repository):
                 raise RuntimeError(f'Core wheel differs from source: {name}')
             result[name] = hashlib.sha256(body).hexdigest()
         return result
+
+
+def runtime_install_command(python, mcp_version, core_wheel):
+    """Install the exact runtime pair and resolve its declared dependencies."""
+    return ['uv', 'pip', 'install', '--python', str(python),
+            '--index-url', 'https://pypi.org/simple', '--reinstall',
+            f'kestrel-feature-mcp=={mcp_version}', str(core_wheel)]
 
 
 def build_input_image(client, owner, core, mcp, output):
@@ -95,10 +103,12 @@ raise SystemExit(result)
         add('owned/verify.py', verify.encode())
         add('owned/run.py', run.encode())
         add('.dockerignore', b'')
+        install = runtime_install_command('/work/.venv/bin/python', mcp_version,
+                                          '/owned/' + wheel.name)
         add('Dockerfile', f'''FROM {base}
 COPY core-tests/ /core-tests/
 COPY owned/ /owned/
-RUN uv pip install --python /work/.venv/bin/python --index-url https://pypi.org/simple --no-deps --reinstall kestrel-feature-mcp=={mcp_version} /owned/{wheel.name}
+RUN {shlex.join(install)}
 RUN uv pip check --python /work/.venv/bin/python
 ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 MCP_TEST_BROWSER_SUPPORT=/work
 WORKDIR /core-tests

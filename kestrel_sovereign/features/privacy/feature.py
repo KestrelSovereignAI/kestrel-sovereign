@@ -283,10 +283,11 @@ class PrivacyAgent:
                                session_id: Optional[str] = None,
                                rendered_content: Optional[str] = None,
                                model: Optional[str] = None,
-                               provider: Optional[str] = None):
+                               provider: Optional[str] = None) -> int | None:
         """
         Adds a conversation entry according to the current privacy config.
-        This is the central method for enforcing privacy rules.
+        Persistent writes return their canonical row ID; volatile writes return None.
+        A caller-owned transaction must still commit before that ID is durable.
 
         Args:
             role: Message role (user, assistant, system)
@@ -345,7 +346,7 @@ class PrivacyAgent:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        await self.storage.add_conversation(
+        return await self.storage.add_conversation(
             role, final_content, metadata, session_id,
             rendered_content=final_rendered,
             model=model, provider=provider,
