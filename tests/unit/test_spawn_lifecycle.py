@@ -44,18 +44,20 @@ def _make_mock_manager():
 
 def _make_durable_spawn_agent(
     agent_did: str,
-    mandate: SpawnMandate,
+    mandate: SpawnMandate | None = None,
     *,
     private_key=None,
 ):
-    """Build the minimum live agent backed by its exact signed receipt."""
+    """Build a sovereign root or a descendant with its exact signed receipt."""
 
-    edge = SimpleNamespace(
-        label="spawned_by",
-        source_id=agent_did,
-        target_id=mandate.parent_did,
-        properties=mandate.to_edge_properties(),
-    )
+    edges = []
+    if mandate is not None:
+        edges.append(SimpleNamespace(
+            label="spawned_by",
+            source_id=agent_did,
+            target_id=mandate.parent_did,
+            properties=mandate.to_edge_properties(),
+        ))
     return SimpleNamespace(
         agent_id=agent_did,
         did=agent_did,
@@ -63,7 +65,7 @@ def _make_durable_spawn_agent(
         _private_key=private_key,
         _persisted_spawn_mandate=mandate,
         storage=SimpleNamespace(
-            get_edges_from=AsyncMock(return_value=[edge]),
+            get_edges_from=AsyncMock(return_value=edges),
         ),
         shutdown=AsyncMock(),
     )
@@ -637,10 +639,30 @@ async def test_direct_stop_preserves_finite_authority_expiry_owner(
 
 
 @pytest.mark.asyncio
-async def test_directly_stopped_parent_expiry_terminates_live_descendant(
+async def test_parent_stop_refuses_live_signed_descendant_until_ttl_cascade(
     monkeypatch, tmp_path
 ) -> None:
-    """An expired stopped parent cannot leave a live child under dead authority."""
+    """Stop cannot strand verified children; real parent expiry cascades."""
+
+    from datetime import datetime, timedelta, timezone, tzinfo
+    import kestrel_sovereign.spawn.mandate as mandate_module
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import (
+        execution_observation_error,
+        is_execution_control_error,
+    )
+
+    authority_now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    class AuthorityClock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            assert tz is timezone.utc
+            return authority_now
+
+    # All imported remaining-TTL aliases execute this one canonical module's
+    # clock. Real signatures/policy still run; a runner pause cannot age them.
+    monkeypatch.setattr(mandate_module, "datetime", AuthorityClock)
 
     root_did = "did:test:direct-stop-root"
     parent_name = "DirectStoppedParent"
@@ -666,6 +688,8 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
         ),
         parent_private_key,
     )
+    assert parent_mandate.created_at == authority_now.isoformat()
+    assert child_mandate.created_at == authority_now.isoformat()
     registry = SpawnAuthorityRegistry(tmp_path)
     for name, did, mandate, port in (
         (parent_name, parent_did, parent_mandate, 8802),
@@ -684,11 +708,34 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
     manager = AgentManager(base_data_dir=tmp_path)
     lifecycle = SpawnedAgentLifecycle(manager)
     manager._lifecycle = lifecycle
+    parent_expiry_entered = asyncio.Event()
+    release_parent_expiry = asyncio.Event()
+    timer_seconds: dict[str, float] = {}
+    original_remaining_ttl = lifecycle._remaining_ttl_seconds
+    original_run_ttl_monitor = lifecycle._run_ttl_monitor
+
+    def remaining_ttl(created_at: str, ttl_seconds: int) -> float:
+        if ttl_seconds == parent_mandate.ttl_seconds:
+            return 0.01
+        return original_remaining_ttl(created_at, ttl_seconds)
+
+    async def run_ttl_monitor(
+        tracked_name: str, tracked_did: str, ttl_seconds: float
+    ) -> None:
+        timer_seconds[tracked_name] = ttl_seconds
+        if tracked_name == parent_name:
+            assert tracked_did == parent_did
+            parent_expiry_entered.set()
+            await release_parent_expiry.wait()
+        await original_run_ttl_monitor(tracked_name, tracked_did, ttl_seconds)
+
     monkeypatch.setattr(
         lifecycle,
         "_remaining_ttl_seconds",
-        lambda _created_at, _ttl_seconds: 0.01,
+        remaining_ttl,
     )
+    monkeypatch.setattr(lifecycle, "_run_ttl_monitor", run_ttl_monitor)
+    root = _make_durable_spawn_agent(root_did, private_key=root_private_key)
     parent = _make_durable_spawn_agent(
         parent_did,
         parent_mandate,
@@ -698,8 +745,10 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
         child_did,
         child_mandate,
     )
-    manager._agents.update({parent_name: parent, child_name: child})
-    manager._agent_names.update({parent_did: parent_name, child_did: child_name})
+    manager._agents.update({"Root": root, parent_name: parent, child_name: child})
+    manager._agent_names.update(
+        {root_did: "Root", parent_did: parent_name, child_did: child_name}
+    )
     manager._parent_children.update(
         {root_did: [parent_name], parent_did: [child_name]}
     )
@@ -708,18 +757,68 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
     )
     lifecycle.restore_persisted_child(child_name, child_mandate)
     lifecycle.restore_persisted_child(parent_name, parent_mandate)
+    child_expiry_owner = lifecycle._tracked[child_name].ttl_task
     expiry_owner = lifecycle._tracked[parent_name].ttl_task
-
-    assert await manager.remove_agent(parent_name) is True
-    assert manager.get_agent(child_name) is child
-
+    assert child_expiry_owner is not None
     assert expiry_owner is not None
-    await asyncio.wait_for(asyncio.shield(expiry_owner), timeout=0.5)
-    child.shutdown.assert_awaited_once()
-    assert manager.get_agent(child_name) is None
-    assert registry.get(parent_did).retired
-    assert registry.get(child_did).retired
-    assert manager._spawn_cap_slots_in_use() == 0
+    try:
+        try:
+            await parent_expiry_entered.wait()
+            assert timer_seconds[parent_name] == 0.01
+            assert timer_seconds[child_name] > parent_mandate.ttl_seconds
+            assert registry.get(parent_did).active
+            with pytest.raises(ValueError, match="has signed child agents"):
+                await manager.remove_agent(parent_name)
+            assert manager.get_agent(parent_name) is parent
+            assert manager.get_agent(child_name) is child
+            assert registry.get(parent_did).active
+            assert registry.get(child_did).active
+            assert not child_expiry_owner.done()
+            assert not expiry_owner.done()
+        finally:
+            # Observe real Stop refusal before expiry, independently of runner
+            # speed. Run and join the ORIGINAL real expiry task afterward.
+            authority_now = datetime.fromisoformat(parent_mandate.created_at) + timedelta(
+                seconds=parent_mandate.ttl_seconds
+            )
+            release_parent_expiry.set()
+            try:
+                assert mandate_module.remaining_spawn_ttl_seconds(
+                    parent_mandate.created_at, parent_mandate.ttl_seconds
+                ) == 0
+                assert mandate_module.remaining_spawn_ttl_seconds(
+                    child_mandate.created_at, child_mandate.ttl_seconds
+                ) > 0
+                await asyncio.wait_for(asyncio.shield(expiry_owner), timeout=0.5)
+            finally:
+                parent_outcome = await await_owned_task(expiry_owner)
+                failure = execution_observation_error(
+                    parent_outcome.error, parent_outcome.cancellation
+                )
+                if failure is not None:
+                    raise failure
+        parent.shutdown.assert_awaited_once()
+        child.shutdown.assert_awaited_once()
+        assert manager.get_agent(parent_name) is None
+        assert manager.get_agent(child_name) is None
+        assert registry.get(parent_did).retired
+        assert registry.get(child_did).retired
+        assert manager._spawn_cap_slots_in_use() == 0
+        assert child_expiry_owner.done()
+    finally:
+        # A failed assertion/mutation must not leave this fixture's hour-long
+        # child timer running. Validate before cleanup, then join its ORIGINAL.
+        cancelled_for_cleanup = not child_expiry_owner.done()
+        if cancelled_for_cleanup:
+            child_expiry_owner.cancel()
+        outcome = await await_owned_task(child_expiry_owner)
+        error = outcome.error
+        if (cancelled_for_cleanup and isinstance(error, asyncio.CancelledError)
+                and not is_execution_control_error(error)):
+            error = None
+        failure = execution_observation_error(error, outcome.cancellation)
+        if failure is not None:
+            raise failure
 
 
 @pytest.mark.asyncio
@@ -1735,13 +1834,7 @@ class TestResultCollection:
             )
 
         manager = AgentManager(base_data_dir=tmp_path)
-        root = SimpleNamespace(
-            agent_id=root_did,
-            did=root_did,
-            identity=None,
-            _private_key=root_private_key,
-            shutdown=AsyncMock(),
-        )
+        root = _make_durable_spawn_agent(root_did, private_key=root_private_key)
         parent = _make_durable_spawn_agent(
             parent_did,
             parent_mandate,
@@ -2289,13 +2382,7 @@ class TestExplicitTermination:
             )
 
         manager = AgentManager(base_data_dir=tmp_path)
-        root = SimpleNamespace(
-            agent_id=root_did,
-            did=root_did,
-            identity=None,
-            _private_key=root_private_key,
-            shutdown=AsyncMock(),
-        )
+        root = _make_durable_spawn_agent(root_did, private_key=root_private_key)
         parent = _make_durable_spawn_agent(
             parent_did,
             parent_mandate,
