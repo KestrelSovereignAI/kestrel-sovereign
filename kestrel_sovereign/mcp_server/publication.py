@@ -223,5 +223,8 @@ class NativeMCPPublication:
                 return ReleaseOutcome.RELEASED
             self._close_operation = OwnedOperation(drain(), name="native-mcp-server-close:" + self.routing_key,
                 retain_originals=True, retirement_resource=self)
-        outcome = await self._close_operation.observe()
+        # The publication retains the original physical owner. Finite shutdown
+        # observers may withdraw; the agent's continuation joins this SAME
+        # operation before closing its borrowed storage.
+        outcome = await self._close_operation.observe(defer_cancellation=False)
         return raise_owned_outcome(outcome, operation="native MCP publication close", retain_originals=True)

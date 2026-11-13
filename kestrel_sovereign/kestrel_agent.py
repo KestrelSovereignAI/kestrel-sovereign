@@ -10906,7 +10906,8 @@ Expected Duration: {expected_duration}
             getattr(dispatcher, "durable_shutdown_owner_fenced", False)
         )
         llm_owner_fenced = self._has_pending_llm_storage_dependents()
-        if not shutdown_cancelled and not dispatcher_owner_fenced and not llm_owner_fenced:
+        mcp_owner_fenced = custody.is_held("native_mcp_server")
+        if not shutdown_cancelled and not dispatcher_owner_fenced and not llm_owner_fenced and not mcp_owner_fenced:
             try:
                 await self.wait_for_shutdown_completion(defer_cancellation=False)
             except asyncio.CancelledError as cancellation:
@@ -10915,7 +10916,7 @@ Expected Duration: {expected_duration}
             except (Exception, BaseExceptionGroup) as failure:
                 remember_finite(failure, retain_ordinary=True)
                 tail_degraded = True
-        elif dispatcher_owner_fenced or llm_owner_fenced:
+        elif dispatcher_owner_fenced or llm_owner_fenced or mcp_owner_fenced:
             # The continuation owns storage close after the hostile cognition
             # task settles. Returning degraded keeps shutdown bounded without
             # making that live task peer-reclaimable in this process.
@@ -11500,6 +11501,13 @@ Expected Duration: {expected_duration}
             # join. Neither SQLAlchemy nor primary storage may close early.
             return tail_result(True)
         await self._join_llm_storage_dependents()
+
+        if custody.is_held("native_mcp_server"):
+            # The finite prefix withdrew only its observation. This explicit
+            # agent-owned continuation joins the original SDK/request drain
+            # and then enters the shared primary-storage retirement boundary.
+            await self._ensure_durable_shutdown_continuation(dispatcher)
+            return tail_result(True)
 
         if custody.is_held("task_manager"):
             # The finite prefix could not join the native manager. Keep its

@@ -32,6 +32,9 @@ from kestrel_sovereign.mcp_server.oauth import NativeMCPAuthorizationServer
 from kestrel_sovereign.mcp_server.policy import MCPServerPolicy
 from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
 from kestrel_sovereign.mcp_server.transport import NativeMCPServer
+from kestrel_sovereign.security.access_log import (
+    SensitiveQueryStringRedactionMiddleware,
+)
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.request_auth import (
@@ -60,6 +63,7 @@ async def publication(assistant_agent, monkeypatch):
     app.include_router(router)
     app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
     app.middleware("http")(server.auth_middleware)
+    app.add_middleware(SensitiveQueryStringRedactionMiddleware)
     app.add_middleware(NativeMCPHostMiddleware)
     app.add_middleware(PrivateDeliveryMiddleware)
     policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
@@ -764,3 +768,87 @@ async def test_deferred_shutdown_joins_the_original_mcp_close_before_storage(nat
     assert outcome.error is outcome.cancellation is None
     assert not agent._resource_custody().is_held("native_mcp_server")
     assert original_operation.task.done()
+
+
+async def test_close_observer_withdrawal_leaves_original_sdk_retirement_owned(publication):
+    p, _client = publication
+    p.publish()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def original_reader():
+        async with p.request_lifetime():
+            entered.set()
+            await release.wait()
+
+    reader = asyncio.create_task(original_reader())
+    await entered.wait()
+    closer = asyncio.create_task(p.close())
+    await asyncio.sleep(0)
+    original_operation = p._close_operation
+    assert original_operation is not None
+    closer.cancel()
+    try:
+        done, _pending = await asyncio.wait({closer}, timeout=0.1)
+        withdrew_promptly = closer in done
+        original_still_owned = (p._close_operation is original_operation
+            and not original_operation.task.done() and p.agent._resource_custody().is_held("native_mcp_server"))
+    finally:
+        release.set()
+        await reader
+        outcome = await await_owned_task(closer)
+        await p.close()
+    assert withdrew_promptly, "A finite MCP close observer could not withdraw from its original retained SDK drain"
+    assert original_still_owned, "Observer withdrawal discarded or acknowledged unfinished original MCP retirement"
+    assert isinstance(outcome.error, asyncio.CancelledError)
+
+
+async def test_actual_stalled_oauth_body_does_not_block_independent_shutdown(publication, monkeypatch):
+    from urllib.parse import urlencode
+
+    from kestrel_sovereign import kestrel_agent as agent_module
+
+    p, client = publication
+    p.publish()
+    # Exercise the production per-step configuration, without extending a
+    # deadline or changing any ownership helper. The original body stays open.
+    monkeypatch.setattr(agent_module, "KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S", 0.1)
+    body_waiting, release_body = asyncio.Event(), asyncio.Event()
+    attempted = []
+    original_manager = p.agent.task_manager
+    original_close = p.agent._close_native_task_manager
+
+    async def observe_manager_close(manager):
+        attempted.append(manager)
+        return await original_close(manager)
+
+    monkeypatch.setattr(p.agent, "_close_native_task_manager", observe_manager_close)
+
+    async def body():
+        yield urlencode(_authorization_parameters(p)).encode()
+        body_waiting.set()
+        await release_body.wait()
+
+    request = asyncio.create_task(client.post(p.resource + "/oauth/authorize", content=body(),
+        headers={"content-type": "application/x-www-form-urlencoded"}))
+    await asyncio.wait_for(body_waiting.wait(), 5)
+    shutdown = asyncio.create_task(p.agent.shutdown())
+    try:
+        done, _pending = await asyncio.wait({shutdown}, timeout=5)
+        finite_returned = shutdown in done
+        independent_cleanup_started = original_manager in attempted
+        backend_retained = p.backend.is_connected
+        sdk_retained = p.agent._resource_custody().is_held("native_mcp_server")
+        continuation = p.agent._durable_shutdown_continuation
+    finally:
+        release_body.set()
+        await await_owned_task(request)
+        await await_owned_task(shutdown)
+        if p.agent._durable_shutdown_continuation is None and p.backend.is_connected:
+            # A wiring mutation must still receive real physical test cleanup.
+            # The pre-recovery snapshot above remains the asserted evidence.
+            await p.agent._ensure_durable_shutdown_continuation(p.agent.dispatcher)
+        await p.agent.wait_for_shutdown_completion()
+    assert independent_cleanup_started, "A stalled native OAuth body blocked independent TaskManager shutdown"
+    assert finite_returned, "A stalled native OAuth body blocked the finite agent shutdown caller"
+    assert backend_retained and sdk_retained, "Finite shutdown acknowledged unfinished original MCP/SQL retirement"
+    assert continuation is not None, "Finite MCP shutdown did not retain its explicit original completion owner"
