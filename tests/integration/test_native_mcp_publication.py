@@ -333,31 +333,53 @@ async def test_failed_mcp_owner_check_still_revokes_a2a_authority(publication, t
             await rollback()
 
 
-async def test_invalid_mcp_shutdown_owner_does_not_skip_other_original_resources(publication, monkeypatch):
+@pytest.mark.parametrize("feature_slice", [None, 0.0])
+async def test_invalid_mcp_shutdown_owner_does_not_skip_other_original_resources(publication, monkeypatch, feature_slice):
+    if feature_slice is not None:
+        monkeypatch.setattr("kestrel_sovereign.kestrel_agent.KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S", feature_slice)
     p, _client = publication
     p.publish()
     original_manager = p.agent.task_manager
     original_close = p.agent._close_native_task_manager
     closed = []
+    closed_original = asyncio.Event()
 
     async def close(manager):
         result = await original_close(manager)
         closed.append(manager)
+        closed_original.set()
         return result
 
     monkeypatch.setattr(p.agent, "_close_native_task_manager", close)
-    p.agent._native_mcp_publication = object()
+    invalid_owner = object()
+    p.agent._native_mcp_publication = invalid_owner
     try:
         try:
             await p.agent.shutdown()
         except (AttributeError, TypeError):
             pass  # The original failed owner must not skip independent retirement.
+        # Finite shutdown may hand completion to its retained continuation.
+        # Observe that original owner BEFORE restoring the invalid MCP slot.
+        continuation = p.agent._durable_shutdown_continuation
+        if not closed_original.is_set() and continuation is not None:
+            observer = asyncio.create_task(closed_original.wait())
+            try:
+                await asyncio.wait({observer, continuation}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
         first_attempt_closed = original_manager in closed
+        invalid_owner_retained = p.agent._native_mcp_publication is invalid_owner
     finally:
         p.agent._native_mcp_publication = p
         await p.close()
+        # Mutation runs must retire their exact real test resources after the
+        # pre-recovery snapshot, even if the deferred phase was broken.
+        if p.agent._resource_custody().is_held("task_manager"):
+            await p.agent._resource_custody().release("task_manager", p.agent._boot_teardown_task_manager)
         await p.agent.shutdown()
     assert first_attempt_closed, "An invalid MCP owner skipped original TaskManager retirement before recovery"
+    assert invalid_owner_retained, "Unconfirmed native MCP owner was discarded before independent retirement"
 
 
 async def test_original_sdk_resident_admission_is_retained_before_publication(publication):
