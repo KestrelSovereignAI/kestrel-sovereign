@@ -11,6 +11,10 @@ from kestrel_sdk.security.aead import AEADCipher
 from kestrel_sdk.security.encryption import get_agent_key
 
 
+class MCPRecordBudgetExceeded(ValueError):
+    """A new authorization record exceeds its explicit encoding budget."""
+
+
 class MCPRecordKind(StrEnum):
     PENDING = "pending"
     GRANT = "grant"
@@ -59,7 +63,7 @@ class MCPAuthorizationRecords:
             raise TypeError("MCP authorization records require a JSON object")
         raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         if len(raw) > self.max_bytes:
-            raise ValueError("MCP authorization record exceeds its storage budget")
+            raise MCPRecordBudgetExceeded("MCP authorization record exceeds its storage budget")
         return AEADCipher(get_agent_key(self.agent_id, "service-keys")).encrypt(
             raw, aad=self._aad(kind, record_hash, expires_at)).decode("ascii")
 

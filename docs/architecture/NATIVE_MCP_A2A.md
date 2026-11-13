@@ -1645,6 +1645,11 @@ contract; the published official MCP SDK remains unchanged.
 Malformed Basic authentication is normalized only around Authlib's header
 decoder, before host-owned client lookup. Decoding errors cannot consume a code
 or revoke a grant, and unrelated host/SQL controls remain outside that catch.
+Pending admission also uses typed record-budget and expiration refusals. A
+caller-supplied oversized state returns the standard OAuth request error before
+SQL admission. A pending request that expires while original SQL waits settle
+returns a temporary-unavailability error. Host, cipher integrity and SQL errors
+are not converted into these caller-input refusals.
 
 Only explicit registered clients may authorize. Code exchange requires S256
 PKCE, the exact original redirect and resource, and the client's registered

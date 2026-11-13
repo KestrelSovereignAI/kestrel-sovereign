@@ -22,6 +22,10 @@ class PendingMCPQuotaExceeded(ValueError):
     """The target agent already has its configured pending-request quota."""
 
 
+class PendingMCPAuthorizationExpired(ValueError):
+    """Native admission settled after the pending authorization deadline."""
+
+
 @dataclass(frozen=True)
 class PendingMCPAuthorization:
     """An original OAuth request, never a token, authorization code or consent."""
@@ -117,7 +121,7 @@ class PendingMCPAuthorizations:
         # Publication follows the original COMMIT, which may itself wait.
         # No successful handle may outlive its deadline while SQL settles.
         if expired or expires <= self.now():
-            raise ValueError("The pending MCP authorization request expired during admission")
+            raise PendingMCPAuthorizationExpired("The pending MCP authorization request expired during admission")
         if quota_full:
             raise PendingMCPQuotaExceeded("The agent's pending MCP authorization quota is full")
         return handle

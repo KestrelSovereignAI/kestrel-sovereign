@@ -9,6 +9,7 @@ from kestrel_sdk.security.exceptions import DecryptionError
 
 from kestrel_sovereign.mcp_server.records import (
     MCPAuthorizationRecords,
+    MCPRecordBudgetExceeded,
     MCPRecordKind,
     hash_mcp_secret,
     new_mcp_secret,
@@ -58,7 +59,7 @@ def test_current_record_budget_applies_to_both_writes_and_authenticated_reads(re
     bounded = MCPAuthorizationRecords(records.agent_id, len(raw))
     sealed = bounded.seal(MCPRecordKind.GRANT, digest, 1600, value)
     assert bounded.open(MCPRecordKind.GRANT, digest, 1600, sealed) == value
-    with pytest.raises(ValueError, match="storage budget"):
+    with pytest.raises(MCPRecordBudgetExceeded, match="storage budget"):
         bounded.seal(MCPRecordKind.GRANT, digest, 1600, {"subject": "owned!"})
     with pytest.raises(ValueError, match="current storage budget"):
         MCPAuthorizationRecords(records.agent_id, len(raw) - 1).open(

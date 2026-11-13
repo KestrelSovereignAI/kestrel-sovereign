@@ -39,8 +39,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from .grants import MCPAuthorizationGrants
-from .pending import PendingMCPQuotaExceeded
-from .records import MCPRecordKind
+from .pending import PendingMCPAuthorizationExpired, PendingMCPQuotaExceeded
+from .records import MCPRecordBudgetExceeded, MCPRecordKind
 
 
 @dataclass
@@ -107,9 +107,10 @@ class NativeMCPAuthorizationServer:
             raise TokenError("invalid_target", "The exact MCP resource is required")
         try:
             handle = await self.pending.create(client.client_id, params)
-        except PendingMCPQuotaExceeded as error:
-            raise OAuth2Error(error="temporarily_unavailable",
-                description="Pending MCP consent capacity is full") from error
+        except MCPRecordBudgetExceeded as error:
+            raise InvalidRequestError(description="The MCP authorization request exceeds its configured budget") from error
+        except (PendingMCPQuotaExceeded, PendingMCPAuthorizationExpired) as error:
+            raise OAuth2Error(error="temporarily_unavailable", description=str(error)) from error
         return self.consent_url + "?" + urlencode({"request": handle})
 
     async def load_authorization_code(self, client: OAuthClientInformationFull, authorization_code: str) -> AuthorizationCode | None:

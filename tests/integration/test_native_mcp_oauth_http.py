@@ -1,7 +1,9 @@
 """Native HTTP OAuth handlers use original sovereign consent and SQL token custody."""
 
+import asyncio
 import base64
 import hashlib
+import logging
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx2
@@ -14,6 +16,9 @@ from kestrel_sovereign.mcp_server.oauth import NativeMCPAuthorizationServer
 from tests.integration.test_native_mcp_consent import API_KEY, RESOURCE
 from tests.integration.test_native_mcp_consent import consent_http as _consent_http
 from tests.integration.test_native_mcp_consent import native_pg as _native_pg
+from tests.integration.test_native_mcp_oauth_pending import (
+    wait_for_native_pending_sql_lock,
+)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 consent_http = _consent_http
@@ -353,3 +358,63 @@ async def test_malformed_basic_authentication_refuses_without_consuming_credenti
             assert await native.verify_token(accepted.json()["access_token"]) is not None
         else:
             assert await native.verify_token(access) is None
+
+
+@pytest.mark.parametrize("consent_http", [{"backend": backend, "max_request_bytes": 4096}
+    for backend in ("sqlite", "postgres")], indirect=True)
+@pytest.mark.parametrize("state", ["s" * 4096, "\U0001f985" * 1024], ids=["ascii", "unicode"])
+async def test_authorization_state_budget_refuses_without_creating_pending_consent(consent_http, state, caplog):
+    caplog.set_level(logging.WARNING, logger="httpx2")
+    native = provider(consent_http)
+    pending = consent_http[1]
+    count_sql = "SELECT COUNT(*) FROM mcp_server_oauth_pending WHERE agent_id = ?"
+    before = await pending.backend.fetch_one(count_sql, (pending.agent_id,))
+    request = authorization_request()
+    request["state"] = state
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native),
+            raise_app_exceptions=False), base_url="https://kestrel.example") as client:
+        refused = await client.get("/authorize", params=request)
+        assert refused.status_code == 302, "Oversized state escaped the standard OAuth refusal"
+        location = refused.headers["location"]
+        assert location.startswith(CALLBACK + "?")
+        values = parse_qs(urlsplit(location).query)
+        assert values["error"] == ["invalid_request"]
+        assert values["state"] == [state] and values["iss"] == [consent_http[6].issuer]
+        after = await pending.backend.fetch_one(count_sql, (pending.agent_id,))
+        assert before == after, "Oversized state consumed pending-consent capacity"
+        assert await pending.read(consent_http[2]) is not None
+        request["state"] = "bounded-original-state"
+        accepted = await client.get("/authorize", params=request)
+        assert accepted.status_code == 302, accepted.text
+        handle, = parse_qs(urlsplit(accepted.headers["location"]).query)["request"]
+        stored = await pending.read(handle)
+        assert stored is not None and stored.parameters.state == "bounded-original-state"
+
+
+@pytest.mark.parametrize("consent_http", ["postgres"], indirect=True)
+async def test_native_authorization_expiry_uses_standard_oauth_refusal(consent_http, native_pg):
+    native = provider(consent_http)
+    _backend, control, schema = native_pg
+    pending, clock = consent_http[1], consent_http[5]
+    task = None
+    try:
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native),
+                raise_app_exceptions=False), base_url="https://kestrel.example") as client:
+            async with control.transaction():
+                await control.execute(f'LOCK TABLE "{schema}".mcp_server_oauth_capacity IN ACCESS EXCLUSIVE MODE')
+                task = asyncio.create_task(client.get("/authorize", params=authorization_request()))
+                await wait_for_native_pending_sql_lock(control)
+                clock[0] += pending.policy.authorization_seconds + 1
+            refused = await task
+            assert refused.status_code == 302, "Native pending expiry escaped the standard OAuth refusal"
+            values = parse_qs(urlsplit(refused.headers["location"]).query)
+            assert values["error"] == ["temporarily_unavailable"]
+            assert values["state"] == [authorization_request()["state"]]
+            rows = await pending.backend.fetch_all("SELECT expires_at FROM mcp_server_oauth_pending WHERE agent_id = ?",
+                (pending.agent_id,))
+            assert rows == [], "Admission already expired at its native SQL lock persisted consent"
+    finally:
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

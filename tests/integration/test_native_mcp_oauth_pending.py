@@ -11,6 +11,7 @@ from mcp.server.auth.provider import AuthorizationParams
 
 from kestrel_sovereign.execution_custody import _explicit_control_chain
 from kestrel_sovereign.mcp_server.pending import (
+    PendingMCPAuthorizationExpired,
     PendingMCPAuthorizations,
     PendingMCPQuotaExceeded,
 )
@@ -22,6 +23,18 @@ from tests.integration.test_execution_authority_postgres import native_pg as _na
 
 native_pg = _native_pg
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+
+
+async def wait_for_native_pending_sql_lock(control):
+    """Observe the original native lock wait; the timeout is only a hang guard."""
+    async with asyncio.timeout(5):
+        while True:
+            await control.execute("SELECT pg_stat_clear_snapshot()")
+            if await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                "WHERE wait_event_type='Lock' AND (query LIKE '%mcp_server_oauth_%' "
+                "OR query LIKE 'COMMIT%') AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))"):
+                return
+            await asyncio.sleep(0.01)
 
 
 @pytest.fixture(params=["sqlite", "postgres"])
@@ -258,21 +271,14 @@ async def test_native_database_lock_wait_cannot_extend_pending_authorization_exp
                     await control.execute(f'LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE')
                 task = asyncio.create_task(store.create("owned-provider", parameters())
                     if operation == "create" else getattr(store, operation)(handle))
-                async with asyncio.timeout(5):
-                    while True:
-                        await control.execute("SELECT pg_stat_clear_snapshot()")
-                        if await control.fetchval("SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
-                            "WHERE wait_event_type='Lock' AND (query LIKE '%mcp_server_oauth_%' "
-                            "OR query LIKE 'COMMIT%') AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))"):
-                            break
-                        await asyncio.sleep(0.01)
+                await wait_for_native_pending_sql_lock(control)
                 clock[0] = 1601.0
         finally:
             if boundary == "commit":
                 await control.fetchval("SELECT pg_advisory_unlock(3679, $1)", lock_key)
         result, = await asyncio.gather(task, return_exceptions=True)
         if operation == "create":
-            assert isinstance(result, ValueError) and "expired" in str(result), (
+            assert isinstance(result, PendingMCPAuthorizationExpired) and "expired" in str(result), (
                 "An original SQL wait returned an already-expired OAuth handle"
             )
             rows = await store.backend.fetch_all("SELECT expires_at FROM mcp_server_oauth_pending")
