@@ -51,11 +51,14 @@ def run_child_pytest(
     source: str,
     args: list[str],
     timeout: float,
+    stderr: int = subprocess.STDOUT,
 ) -> subprocess.CompletedProcess:
     """Run ``test_file`` (written from ``source``) in ``directory``.
 
     The child's rootdir, ini file and cache are its own, and ``args`` name its
-    plugins and options. Its stdout and stderr are one stream, as in a CI log.
+    plugins and options. Its stdout and stderr are one stream, as in a CI log,
+    unless ``stderr`` names another destination for the latter, as
+    :func:`subprocess.run` takes it.
     ``timeout`` bounds the child's liveness, not its duration.
     """
     ini = directory / "pytest.ini"
@@ -71,7 +74,7 @@ def run_child_pytest(
         cwd=directory,
         env=child_pytest_env(),
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=stderr,
         text=True,
         timeout=timeout,
     )

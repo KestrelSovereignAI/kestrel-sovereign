@@ -116,6 +116,50 @@ The project includes a comprehensive test runner with smart features:
    cd tests/e2e && npx playwright test
    ```
 
+### Memory Ceiling (`KESTREL_TEST_MAX_RSS_GB`)
+
+A per-test `--timeout` does not bound memory. A test that runs away at
+0.3 GB/s reaches about 90 GB before a 300 s timeout fires. On 2026-11-13,
+seven xdist workers of one unit run reached 272 GiB together, and the host
+kernel-panicked (#4066).
+
+So every pytest process the root conftest configures runs a memory watchdog
+(`tests.shared.memory_watchdog`): the xdist controller and each worker. About
+every 0.5 s it reads the process's resident set size. Once that exceeds the
+ceiling, it writes to the process's real stderr the test the process is
+running, the RSS, and the stack of every thread. Then it ends the process with
+**exit status 86**.
+
+- A serial run exits 86. Its report follows the test's progress line.
+- Under xdist the controller reports `worker 'gwN' crashed while running
+  '<nodeid>'` as a failure, starts a replacement worker and goes on to its
+  summary. The watchdog's report is in the live log, not in that crash report.
+
+The ceiling is `KESTREL_TEST_MAX_RSS_GB`, in GiB (2^30 bytes); fractions are
+allowed. Unset, it is 8 GiB, below the roughly 16 GB of a GitHub-hosted
+runner. In the full guarded unit run measured for #4066, no healthy worker
+came near 6 GiB. CI sets nothing, so it runs with the watchdog on at the
+default. A value that is not a finite, positive number of GiB stops the run
+with a usage error before collection. The variable is read once the root
+conftest has loaded the project's `.env`, so an entry there sets it for every
+process of the run. A value already in the environment wins: `.env` never
+overrides one.
+
+To find what a runaway test holds, run it alone, by the nodeid the report
+names, under a lower ceiling:
+
+```bash
+KESTREL_TEST_MAX_RSS_GB=2 uv run pytest "<nodeid>"
+```
+
+Two limits:
+
+- The ceiling bounds each process, not the run. Four workers may together hold
+  four times the ceiling, so lower it to run many workers on a small machine.
+- The watchdog is a Python thread. A single C call that allocates while
+  holding the GIL, such as one `b"x" * n` of many gigabytes, is seen only once
+  it returns.
+
 ## Writing Tests
 
 ### SQLite WAL Mode Tests
@@ -348,6 +392,12 @@ Use `temp_db_with_keeper` fixture to prevent WAL checkpoint.
 
 ### Integration tests fail with "service unavailable"
 Use `--skip-check` to skip health checks, or start required services.
+
+### A run exits 86, or a worker "crashed while running" a test
+If the log has a `[memory watchdog]` line, the memory watchdog ended that
+process, and the line names the test and its RSS. A worker that crashed with no
+such line ended some other way, such as a segfault or the kernel's OOM killer.
+See [Memory Ceiling](#memory-ceiling-kestrel_test_max_rss_gb).
 
 ### Playwright tests timeout
 - Increase timeout in `playwright.config.cjs`

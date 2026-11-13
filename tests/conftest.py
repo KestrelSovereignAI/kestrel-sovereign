@@ -60,6 +60,7 @@ from tests.shared.environment_guard import (
     register as _register_environment_guard,
     unset_environment,
 )
+from tests.shared.memory_watchdog import register as _register_memory_watchdog
 from kestrel_sovereign import paths
 from tests.shared.host_runtime_isolation import (
     ISOLATION_DIRNAME,
@@ -224,6 +225,11 @@ def pytest_configure(config):
     except (ImportError, Exception):
         pass
 
+    # In the controller and in every xdist worker: a test that runs away on
+    # memory ends its process by name instead of exhausting the host (#4066).
+    # After .env, as workers inherit the controller's environment with it, so
+    # every process of the run reads the same ceiling.
+    _register_memory_watchdog(config)
     _cleanup_configure(config)
     _feedback_configure(config)
     # After .env: a local .env may supply TEST_POSTGRES_URL.
