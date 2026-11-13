@@ -724,11 +724,20 @@ async def test_deferred_shutdown_refuses_a_still_held_native_task_manager(native
 
     monkeypatch.setattr(storage, "dispose_cached_sqla_factory", preclose)
     monkeypatch.setattr(storage, "close", close)
+    failure = RuntimeError("Original task-manager close remains unconfirmed")
+    attempts = []
+
+    async def unconfirmed_close():
+        attempts.append(manager)
+        raise failure
+
     try:
-        continuation = await agent._ensure_durable_shutdown_continuation(None)
-        outcome = await await_owned_task(continuation)
+        with monkeypatch.context() as fault:
+            fault.setattr(manager, "close", unconfirmed_close)
+            continuation = await agent._ensure_durable_shutdown_continuation(None)
+            outcome = await await_owned_task(continuation)
         assert not precloses and not closes, "Deferred shutdown bypassed another original native storage borrower"
-        assert isinstance(outcome.error, RuntimeError)
+        assert outcome.error is failure and attempts == [manager], "Original task-manager close failure was not retained"
         assert agent._resource_custody().is_held("task_manager")
         assert await backend.fetch_val("SELECT 1") == 1
     finally:
@@ -888,3 +897,82 @@ async def test_retired_native_admission_redacts_outer_error_access_target(public
                 params={"request": handle, "state": "original-private-oauth-state"})
         assert response.status_code == 500 and len(refused) == 1, "Original retired authority did not refuse admission"
         assert observed == [(500, marker)], "Native MCP admission failure leaked its private access-log target"
+
+
+async def test_deferred_shutdown_joins_the_original_native_task_manager_before_storage(native_tool_effect_agent, monkeypatch):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.a2a.task_manager import TaskManager
+    from kestrel_sovereign.features.storage_access import resolve_feature_database
+
+    agent = await native_tool_effect_agent(did="did:owned:deferred-task-manager-join")
+    backend = resolve_feature_database(agent).backend
+    manager = TaskManager.from_backend(backend, scope=NativeRecipientScope(agent.did), owns_backend=False)
+    await manager.initialize()
+    agent.task_manager = manager
+    custody = agent._resource_custody()
+    custody.acquire("task_manager")
+    custody.acquire("storage")
+    original = manager.close
+    entered, release = asyncio.Event(), asyncio.Event()
+    order = []
+
+    async def close_original():
+        entered.set()
+        await release.wait()
+        await original()
+        order.append("manager")
+
+    storage = agent.storage
+    physical_close = storage.close
+
+    async def close_storage():
+        assert order == ["manager"], "Primary storage closed before original native task manager"
+        order.append("storage")
+        return await physical_close()
+
+    monkeypatch.setattr(manager, "close", close_original)
+    monkeypatch.setattr(storage, "close", close_storage)
+    continuation = await agent._ensure_durable_shutdown_continuation(None)
+    observer = asyncio.create_task(entered.wait())
+    try:
+        await asyncio.wait({observer, continuation}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+        joined_original = entered.is_set()
+        storage_retained = not order and custody.is_held("storage")
+        release.set()
+        outcome = await await_owned_task(continuation)
+    finally:
+        release.set()
+        observer.cancel()
+        await asyncio.gather(observer, return_exceptions=True)
+        if custody.is_held("task_manager"):
+            await custody.release("task_manager", agent._boot_teardown_task_manager)
+    assert joined_original, "Deferred shutdown did not join its original held native task manager"
+    assert storage_retained, "Deferred shutdown disposed primary storage during original task-manager close"
+    assert outcome.error is None and order == ["manager", "storage"]
+    assert not custody.is_held("task_manager")
+    assert custody.is_held("storage"), "An uncertified storage owner acquired a false custody acknowledgement"
+
+
+async def test_deferred_shutdown_preserves_an_unavailable_original_task_manager(native_tool_effect_agent):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.a2a.task_manager import TaskManager
+    from kestrel_sovereign.features.storage_access import resolve_feature_database
+
+    agent = await native_tool_effect_agent(did="did:owned:deferred-task-manager-missing")
+    backend = resolve_feature_database(agent).backend
+    original = TaskManager.from_backend(backend, scope=NativeRecipientScope(agent.did), owns_backend=False)
+    await original.initialize()
+    agent.task_manager = original
+    custody = agent._resource_custody()
+    custody.acquire("task_manager")
+    # Lose only the reference: the original actual borrowed store still lives.
+    agent.task_manager = None
+    try:
+        continuation = await agent._ensure_durable_shutdown_continuation(None)
+        outcome = await await_owned_task(continuation)
+        assert isinstance(outcome.error, RuntimeError) and "Original native task-manager owner is unavailable" in str(outcome.error), "Missing original native task-manager owner was not refused"
+        assert custody.is_held("task_manager"), "Missing native owner was acknowledged as a successful retirement"
+        assert await backend.fetch_val("SELECT 1") == 1
+    finally:
+        agent.task_manager = original
+        await custody.release("task_manager", agent._boot_teardown_task_manager)

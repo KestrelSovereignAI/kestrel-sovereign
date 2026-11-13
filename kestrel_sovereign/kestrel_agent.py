@@ -9849,6 +9849,13 @@ Expected Duration: {expected_duration}
         # an empty writer set is not proof of provider retirement. Both native
         # LLM settlement and close precede every borrowed storage release.
         await custody.release("llm_service", release_llm)
+        # The finite prefix may also have exhausted its TaskManager slice.
+        # Complete its canonical retryable store close before the common
+        # primary-storage gate; retaining a name alone cannot finish cleanup.
+        if custody.is_held("task_manager"):
+            if self.task_manager is None or not callable(getattr(self.task_manager, "close", None)):
+                raise RuntimeError("Original native task-manager owner is unavailable")
+            await custody.release("task_manager", self._boot_teardown_task_manager)
         if vars(self).get("_resolved_local_host_db") is not None:
             async def release_host_db() -> ReleaseOutcome:
                 await self._close_local_host_db()

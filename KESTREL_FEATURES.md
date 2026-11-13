@@ -859,6 +859,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/host/stop/circuit/reset`
   - `GET /api/host/stop/receipts`
   - `GET /api/host/stop/status`
+- [`kestrel_sovereign/endpoints/mcp_server.py`](kestrel_sovereign/endpoints/mcp_server.py)
+  - `GET /api/mcp/server/consent/requests/{handle}`
+  - `POST /api/mcp/server/consent/requests/{handle}/decision`
 - [`kestrel_sovereign/endpoints/memories.py`](kestrel_sovereign/endpoints/memories.py)
   - `GET /api/identity-chain`
   - `GET /api/memories`
