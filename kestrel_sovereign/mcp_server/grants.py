@@ -13,7 +13,7 @@ from mcp.server.auth.provider import (
 from mcp.shared.auth import OAuthToken
 
 from .consent import MCPConsentApproval, MCPConsentAuthority
-from .pending import PendingMCPAuthorizations
+from .pending import PendingMCPAuthorization, PendingMCPAuthorizations
 from .records import (
     MCPAuthorizationRecords,
     MCPRecordKind,
@@ -22,12 +22,16 @@ from .records import (
 )
 
 
+class MCPAuthorizationCommitRequired(RuntimeError):
+    """A credential operation cannot publish from an enclosing transaction."""
+
+
 class MCPAuthorizationGrants:
     """Borrow SQL and host authority; the original host owns both lifetimes.
 
     HTTP composition must retain the original agent/privacy authority reader and
     validate the token request's resource before entering these operations.
-    Nothing here authenticates an HTTP client or replaces the SDK's PKCE handler.
+    Nothing here authenticates an HTTP client or replaces OAuth PKCE verification.
     """
 
     def __init__(self, pending: PendingMCPAuthorizations, issuer: str, *,
@@ -50,7 +54,7 @@ class MCPAuthorizationGrants:
     def _require_top_level(self) -> None:
         self._require_current()
         if self.backend.owns_open_transaction is not False:
-            raise RuntimeError("MCP credentials require a certified top-level SQL commit boundary")
+            raise MCPAuthorizationCommitRequired("MCP credentials require a certified top-level SQL commit boundary")
 
     async def initialize(self) -> None:
         self._require_top_level()
@@ -136,6 +140,25 @@ class MCPAuthorizationGrants:
         await self.backend.execute("UPDATE mcp_server_oauth_grants SET revoked = 1 WHERE agent_id = ? AND grant_hash = ?",
             (self.agent_id, grant_hash))
         self._require_current()
+
+    async def read_authorization_request(self, handle: str) -> PendingMCPAuthorization | None:
+        """Read Console consent only under the original sovereign request."""
+        authentication = self.consent_authority.require_sovereign()
+        self._require_top_level()
+        pending = await self.pending.read(handle)
+        self.consent_authority.require_sovereign(expected=authentication)
+        return pending
+
+    async def deny_authorization_request(self, handle: str) -> PendingMCPAuthorization | None:
+        """Consume a denied request at its original COMMIT, without minting a grant."""
+        authentication = self.consent_authority.require_sovereign()
+        self._require_top_level()
+        async with self.pending.serialized():
+            self.consent_authority.require_sovereign(expected=authentication)
+            pending = await self.pending.claim(handle)
+            self.consent_authority.require_sovereign(expected=authentication)
+        self.consent_authority.require_sovereign(expected=authentication)
+        return pending if pending is not None and pending.expires_at > self.pending.now() else None
 
     async def issue_code(self, handle: str, approval: MCPConsentApproval) -> AuthorizationCode:
         """Consume the original pending request and mint its code in one commit."""

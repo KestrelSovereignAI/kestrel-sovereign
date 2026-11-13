@@ -1660,8 +1660,13 @@ the original top-level transaction. An authenticated revocation proves stored
 ownership even while current grant use is denied by a temporary key change.
 Token verification always checks current grant authority and audience.
 
-The first-party consent authority still requires its original live sovereign
-HTTP request. An authorization redirect only creates pending consent; it does
+The first-party consent authority requires its original live, durable sovereign
+HTTP request for approval, request details and denial. Signed-in users are not
+promoted into this lane. Request reads require the original top-level SQL
+boundary; denial atomically consumes the same pending request at its original
+COMMIT and never creates a grant. The store returns an explicit
+`MCPAuthorizationCommitRequired` refusal for an enclosing transaction.
+An authorization redirect only creates pending consent; it does
 not mint a grant. This foundation does not yet establish the Console consent
 UI, Core route publication, governed memory tools, atomic external `log_turn`,
 actual Claude/ChatGPT installation, or subsequent reflection/consolidation.

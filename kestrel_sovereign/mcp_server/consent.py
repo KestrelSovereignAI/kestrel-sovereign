@@ -116,15 +116,26 @@ class MCPConsentAuthority:
             raise HostCapabilityAccessDenied("The original MCP consent request changed")
         return binding.approval
 
-    @contextmanager
-    def approve(self, handle: str, pending: PendingMCPAuthorization,
-                scopes: tuple[str, ...]) -> Iterator[MCPConsentApproval]:
+    def require_sovereign(self, *, expected: InteractiveRequestAuthentication | None = None) -> InteractiveRequestAuthentication:
+        """Require the original live, durable sovereign credential for Console decisions."""
         authentication = current_request_authentication()
-        if authentication is None:
+        if authentication is None or (expected is not None and authentication is not expected):
             raise HostCapabilityAccessDenied("Interactive MCP consent is required")
+        authentication.require_current()
         caller = authentication.caller
         if not caller.is_sovereign or caller.auth_method is not AuthMethod.API_KEY:
             raise HostCapabilityAccessDenied("Sovereign MCP consent is required")
+        fingerprint = self.current_sovereign_fingerprint()
+        if (fingerprint is None or not caller.credential_fingerprint
+                or not hmac.compare_digest(fingerprint, caller.credential_fingerprint)):
+            raise HostCapabilityAccessDenied("Durable original sovereign credentials are required")
+        return authentication
+
+    @contextmanager
+    def approve(self, handle: str, pending: PendingMCPAuthorization,
+                scopes: tuple[str, ...]) -> Iterator[MCPConsentApproval]:
+        authentication = self.require_sovereign()
+        caller = authentication.caller
         client = self.policy.registered_client(pending.client_id)
         if (client is None or pending.parameters.resource != self.resource_url
                 or str(pending.parameters.redirect_uri) not in client.redirect_uris

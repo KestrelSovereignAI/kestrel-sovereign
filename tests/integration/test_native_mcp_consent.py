@@ -15,7 +15,10 @@ from mcp.server.auth.provider import AuthorizationParams
 from kestrel_sovereign import server
 from kestrel_sovereign.endpoints.auth_oauth import _create_jwt
 from kestrel_sovereign.mcp_server.consent import MCPConsentAuthority
-from kestrel_sovereign.mcp_server.grants import MCPAuthorizationGrants
+from kestrel_sovereign.mcp_server.grants import (
+    MCPAuthorizationCommitRequired,
+    MCPAuthorizationGrants,
+)
 from kestrel_sovereign.mcp_server.pending import PendingMCPAuthorizations
 from kestrel_sovereign.mcp_server.policy import MCPServerPolicy
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
@@ -107,7 +110,7 @@ async def consent_http(request, native_pg, tmp_path, monkeypatch):
                             async with backend.transaction():
                                 try:
                                     code = await grants.issue_code(selected_handle, approval)
-                                except RuntimeError as error:
+                                except MCPAuthorizationCommitRequired as error:
                                     return JSONResponse({"error": str(error)}, status_code=403)
                         else:
                             code = await grants.issue_code(selected_handle, approval)
@@ -127,6 +130,34 @@ async def consent_http(request, native_pg, tmp_path, monkeypatch):
                     return {"approved": True, "scopes": approval.scopes, "resource": approval.resource}
             except HostCapabilityAccessDenied as error:
                 return JSONResponse({"error": str(error)}, status_code=403)
+
+        async def console_decision(request: Request, handle: str, *, deny: bool):
+            operation = grants.deny_authorization_request if deny else grants.read_authorization_request
+            try:
+                if request.query_params.get("nested") == "1":
+                    async with backend.transaction():
+                        try:
+                            value = await operation(handle)
+                        except MCPAuthorizationCommitRequired as error:
+                            return JSONResponse({"error": str(error)}, status_code=403)
+                else:
+                    value = await operation(handle)
+            except HostCapabilityAccessDenied as error:
+                return JSONResponse({"error": str(error)}, status_code=403)
+            if value is None:
+                return JSONResponse({"error": "Original pending request unavailable"}, status_code=404)
+            if deny:
+                return JSONResponse({"denied": True})
+            return JSONResponse({"client_id": value.client_id, "resource": value.parameters.resource,
+                "scopes": value.parameters.scopes, "expires_at": value.expires_at})
+
+        @app.get("/api/owned-mcp-consent/requests/{request_handle}")
+        async def describe_request(request_handle: str, request: Request):
+            return await console_decision(request, request_handle, deny=False)
+
+        @app.post("/api/owned-mcp-consent/requests/{request_handle}/deny")
+        async def deny_request(request_handle: str, request: Request):
+            return await console_decision(request, request_handle, deny=True)
 
         async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
                 base_url="https://console.test") as client:
@@ -182,3 +213,44 @@ async def test_ephemeral_boot_key_cannot_authorize_a_durable_mcp_grant(consent_h
         sovereign_key_fingerprint(API_KEY))
     response = await client.post("/api/owned-mcp-consent", headers={"x-api-key": API_KEY})
     assert response.status_code == 403 and "Durable" in response.json()["error"] and not retained
+
+
+async def test_original_sovereign_reads_pending_consent_without_minting_or_consuming(consent_http):
+    client, pending, handle, _retained, _keys, _clock, _grants, _app = consent_http
+    response = await client.get("/api/owned-mcp-consent/requests/" + handle, headers={"x-api-key": API_KEY})
+    assert response.status_code == 200
+    assert response.json() == {"client_id": "owned-provider", "resource": RESOURCE,
+        "scopes": ["memory:read"], "expires_at": (await pending.read(handle)).expires_at}
+    assert "owned-secret" not in response.text and "code_challenge" not in response.text and "state" not in response.json()
+    assert await pending.read(handle) is not None
+
+
+@pytest.mark.parametrize("operation", ["read", "deny"])
+async def test_signed_in_user_cannot_read_or_deny_sovereign_consent(consent_http, operation):
+    client, pending, handle, _retained, _keys, _clock, _grants, _app = consent_http
+    path = "/api/owned-mcp-consent/requests/" + handle
+    response = await (client.get(path, headers={"authorization": "Bearer " + _create_jwt(ALICE)})
+        if operation == "read" else client.post(path + "/deny", headers={"authorization": "Bearer " + _create_jwt(ALICE)}))
+    assert response.status_code == 403, "Signed-in credentials acquired sovereign consent authority"
+    assert await pending.read(handle) is not None
+
+
+async def test_concurrent_sovereign_denials_consume_once_without_a_grant(consent_http):
+    client, pending, handle, _retained, _keys, _clock, _grants, _app = consent_http
+    responses = await asyncio.gather(*(client.post("/api/owned-mcp-consent/requests/" + handle + "/deny",
+        headers={"x-api-key": API_KEY}) for _ in range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 404]
+    assert await pending.read(handle) is None
+    for table in ("mcp_server_oauth_grants", "mcp_server_oauth_credentials"):
+        row = await pending.backend.fetch_one("SELECT COUNT(*) FROM " + table + " WHERE agent_id = ?", (pending.agent_id,))
+        assert row[0] == 0, "Deny minted durable OAuth authority"
+
+
+@pytest.mark.parametrize("operation", ["read", "deny"])
+async def test_sovereign_consent_read_and_deny_require_original_top_level_sql(consent_http, operation):
+    client, pending, handle, _retained, _keys, _clock, _grants, _app = consent_http
+    path = "/api/owned-mcp-consent/requests/" + handle
+    response = await (client.get(path + "?nested=1", headers={"x-api-key": API_KEY})
+        if operation == "read" else client.post(path + "/deny?nested=1", headers={"x-api-key": API_KEY}))
+    assert response.status_code == 403 and "top-level" in response.json()["error"]
+    assert await pending.read(handle) is not None, "Tentative Console decision consumed committed consent"
