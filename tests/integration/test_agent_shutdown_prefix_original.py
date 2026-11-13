@@ -10,7 +10,7 @@ from tests.integration.test_host_onboarding_original_admission import onboarding
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 from tests.utils.original_failure import OriginalFailure
-from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
 
 
 @pytest.fixture(autouse=True)

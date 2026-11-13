@@ -16,7 +16,7 @@ paths. Expectations
 never depend on the feature's kind, so a divergence fails one of the two.
 Numeric and boolean strings arrive coerced; an uncoercible value fails with the
 same named error; an ``ExecutionAuthorityError`` propagates as the same object;
-an ordinary exception becomes the same failure envelope. The arguments
+an ordinary exception remains native outcome uncertainty. The arguments
 PRE_TOOL_USE authorized, the method ran with, POST_TOOL_USE saw and the
 dispatch row recorded agree, including after a PRE_TOOL_USE hook rewrote them:
 a rewrite the tool's wrapper would still coerce does not run.
@@ -25,6 +25,9 @@ a rewrite the tool's wrapper would still coerce does not run.
 from __future__ import annotations
 
 import json
+from uuid import uuid4
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -153,15 +156,6 @@ def _hooks() -> tuple[HooksManager, _Recorder]:
     return manager, recorder
 
 
-class _Agent(OrchestratorEngineMixin, ToolRegistryMixin):
-    def __init__(self, store, hooks):
-        self.did = "did:test:binding-parity"
-        self.features = {}
-        self._direct_tools, self._tool_to_feature, self._explored_features = {}, {}, {}
-        self._direct_tool_defs, self._pinned_features = [], set()
-        self.hooks_manager, self.observability_store = hooks, store
-
-
 async def _recorded_arguments(backend) -> list:
     rows = await backend.fetch_all("SELECT args_redacted FROM a2a_tool_dispatches")
     return [json.loads(row[0]) for row in rows]
@@ -207,9 +201,11 @@ class _SubagentLLM:
 class _Path:
     """One way a model's or user's call reaches a feature's tool."""
 
-    def __init__(self, kind: str, tmp_path):
+    def __init__(self, kind: str, tmp_path, native_tool_effect_agent):
         self.kind = kind
         self.tmp_path = tmp_path
+        self.native_tool_effect_agent = native_tool_effect_agent
+        self.host = None
         self.recorder: _Recorder | None = None
         self.feature = None
         #: What ``probe_raise`` raises.
@@ -225,7 +221,22 @@ class _Path:
         for close in reversed(self._closers):
             await close()
 
+    async def _host(self):
+        if self.host is None:
+            self.host = await self.native_tool_effect_agent(did="did:test:binding-parity")
+            self.host.hooks_manager, self.recorder = _hooks()
+            self.backend = self.host.observability_store._backend
+        return self.host
+
+    async def _prepare(self):
+        pass
+
     async def call(self, tool_name: str, arguments: dict, command: str):
+        agent = await self._host()
+        await self._prepare()
+        return await drive_native(agent, lambda: self._call(tool_name, arguments, command))
+
+    async def _call(self, tool_name: str, arguments: dict, command: str):
         raise NotImplementedError
 
     def recorded(self) -> list:
@@ -236,16 +247,21 @@ class _Path:
 class _CommandPath(_Path):
     """``!probe 30 true`` through ``TaskManager.execute_command``."""
 
+    async def _prepare(self):
+        self.manager = await self._manager()
+
     async def _manager(self):
-        manager = await create_task_manager(
-            str(self.tmp_path / "command.db"),
-            scope=NativeRecipientScope("did:test:binding-parity"),
-            include_memory=False,
-            include_feedback=False,
-        )
+        if getattr(self, "manager", None) is not None:
+            return self.manager
+        from tests.utils.native_a2a import manager_for
+
+        agent = await self._host()
+        manager = manager_for(agent.tool_effect_store.database.backend,
+            NativeRecipientScope(agent.did), owns_backend=False)
+        await manager.initialize()
         self._closers.append(manager.close)
-        manager.hooks_manager, self.recorder = _hooks()
-        feature = self.make_feature(SimpleNamespace(did="did:test:binding-parity"))
+        manager.hooks_manager = agent.hooks_manager
+        feature = self.make_feature(agent)
         manager.register_provider(
             "probe_feature",
             [
@@ -257,7 +273,7 @@ class _CommandPath(_Path):
         )
         return manager
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         return await (await self._manager()).execute_command(command)
 
 
@@ -265,7 +281,7 @@ class _SkillPath(_CommandPath):
     """``TaskManager.execute_skill`` with JSON arguments, as a workflow step
     (``run_workflow``) sends them: no command parser coerces them first."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         manager = await self._manager()
         task = await manager.execute_skill(
             agent_id="probe_feature", skill_id=tool_name, args=dict(arguments), sync=True,
@@ -281,14 +297,7 @@ class _SkillPath(_CommandPath):
 
 class _OrchestratorPath(_Path):
     async def _agent(self):
-        backend = SQLiteBackend(str(self.tmp_path / "dispatch.db"))
-        await backend.connect()
-        store = ObservabilityStore(backend)
-        await store.initialize()
-        self._closers.append(store.close)
-        self.backend = backend
-        hooks, self.recorder = _hooks()
-        agent = _Agent(store, hooks)
+        agent = await self._host()
         feature = self.make_feature(agent)
         agent.features[type(feature).__name__] = feature
         return agent
@@ -300,7 +309,7 @@ class _OrchestratorPath(_Path):
 class _DirectPath(_OrchestratorPath):
     """A promoted tool called by the model in the chat loop."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         agent._register_explored_feature_tools(self.feature)
         assert tool_name in agent._direct_tools
@@ -319,7 +328,7 @@ class _BoundPath(_OrchestratorPath):
     """A tool mounted with ``register_dynamic_tools``, called through its
     governed binding (``bound_tool``), as an MCP App calls one."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         [tool] = [t for t in self.feature.get_tools() if t.name == tool_name]
         bindings = []
@@ -328,13 +337,13 @@ class _BoundPath(_OrchestratorPath):
             on_registered=lambda _mounted, binding: bindings.append(binding),
         )
         [binding] = bindings
-        return await binding.invoke(dict(arguments), session_id=SESSION, source="parity")
+        return await binding.invoke(dict(arguments), session_id=SESSION, source="parity", operation_id=uuid4().hex)
 
 
 class _NamedPath(_OrchestratorPath):
     """``execute_named_tool`` through the codex inline executor."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         executor = agent._make_inline_tool_executor(SESSION)
         effective, result = await executor(tool_name, dict(arguments))
@@ -351,15 +360,10 @@ class _SubagentPath(_Path):
 
     inline = False
 
-    async def call(self, tool_name, arguments, command):
-        hooks, self.recorder = _hooks()
+    async def _call(self, tool_name, arguments, command):
+        agent = await self._host()
         self.llm = _SubagentLLM(tool_name, arguments, inline=self.inline)
-        agent = SimpleNamespace(
-            llm_service=self.llm,
-            did="did:test:binding-parity",
-            hooks_manager=hooks,
-            get_turn_bound_session_id=lambda: SESSION,
-        )
+        agent.llm_service = self.llm
         envelope = await self.make_feature(agent).execute_as_subagent(task="probe it")
         assert envelope["success"] is True, envelope
         if self.inline:
@@ -380,12 +384,39 @@ class _SchedulerPath(_Path):
     """A scheduled tick naming the tool, through the scheduler's hook gate."""
 
     async def call(self, tool_name, arguments, command):
-        hooks, self.recorder = _hooks()
-        agent = SimpleNamespace(did="did:test:binding-parity", features={}, hooks_manager=hooks)
+        from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+        from tests.unit.test_tool_effect_scheduled_workflow import seed_occurrence
+        from tests.utils.scheduler_ticks import tick_and_settle
+
+        agent = await self._host()
         feature = self.make_feature(agent)
         agent.features[type(feature).__name__] = feature
         scheduler = SchedulerFeature(agent)
-        return await scheduler._lookup_raw_tool_result(tool_name, dict(arguments))
+        database = agent.tool_effect_store.database
+        scheduler._db, scheduler._agent_id = database, agent.did
+        outcomes = []
+
+        async def execute(name, args):
+            try:
+                result = await scheduler._lookup_raw_tool_result(name, args)
+            except BaseException as error:
+                outcomes.append((False, error))
+                raise
+            outcomes.append((True, result))
+            return result
+
+        runner = SchedulerRunner(database, agent.did, execute,
+            owner_id="owned-binding-parity-scheduler")
+        try:
+            await seed_occurrence(SimpleNamespace(database=database), runner, tool_name, arguments)
+            await tick_and_settle(runner)
+            assert len(outcomes) == 1, "Native scheduler never reached the argument probe"
+            returned, value = outcomes[0]
+            if not returned:
+                raise value
+            return value
+        finally:
+            await runner.stop()
 
 
 PATHS = {
@@ -401,11 +432,11 @@ PATHS = {
 
 
 @pytest_asyncio.fixture
-async def make_path(tmp_path):
+async def make_path(tmp_path, native_tool_effect_agent):
     made: list[_Path] = []
 
     def _make(path: str, kind: str) -> _Path:
-        made.append(PATHS[path](kind, tmp_path))
+        made.append(PATHS[path](kind, tmp_path, native_tool_effect_agent))
         return made[-1]
 
     yield _make
@@ -646,31 +677,19 @@ async def test_an_execution_authority_error_propagates_as_the_same_object(
     assert raised.value is denial
 
 
-#: How each path reports a tool that raised an ordinary exception.
-RAISED_RESULTS = {
-    "bound": {"success": False, "error": "lookup failed", "tool": "probe_raise"},
-    "command": {"success": False, "error": "lookup failed"},
-    "scheduler": {"success": False, "error": "lookup failed", "tool": "probe_raise"},
-    "skill": {"success": False, "error": "lookup failed"},
-    "direct": {"success": False, "error": "lookup failed", "tool": "probe_raise"},
-    "named": {"success": False, "error": "lookup failed", "tool": "probe_raise"},
-    "subagent": {"success": False, "error": "lookup failed", "tool": "probe_raise"},
-    "subagent_inline": {"success": False, "error": "lookup failed", "tool": "probe_raise"},
-}
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("path", sorted(PATHS))
-async def test_an_ordinary_exception_becomes_the_same_failure_envelope(
-    make_path, path, kind,
-):
+async def test_an_ordinary_exception_preserves_native_outcome_uncertainty(make_path, path, kind):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
     probe = make_path(path, kind)
-    probe.error = LookupError("lookup failed")
-
-    result = await probe.call("probe_raise", {}, "!probe-raise")
-
-    assert result == RAISED_RESULTS[path]
+    original = probe.error = LookupError("lookup failed")
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await probe.call("probe_raise", {}, "!probe-raise")
+    assert any(error is original for error in execution_evidence_carriers(caught.value))
+    assert await probe.host.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims ORDER BY rowid DESC LIMIT 1') == ('UNCONFIRMED',)
 
 
 # --- the wrappers themselves -------------------------------------------------
@@ -727,7 +746,8 @@ def test_a_tool_whose_wrapper_does_not_coerce_is_not_coerced_before_authorizatio
     for check in (coerce_declared_tool_arguments, normalize_direct_tool_arguments):
         arguments, error = check("hand_written", _HandWrittenTool(), supplied)
         assert error is None
-        assert arguments is supplied
+        assert arguments == supplied
+        assert arguments is not supplied, "approval must own a detached argument snapshot"
     # Nor is a hook's rewrite of it refused: it runs with what the hooks saw.
     assert hook_rewrite_argument_error("hand_written", _HandWrittenTool(), supplied) is None
 
@@ -738,7 +758,8 @@ def test_core_registers_its_control_error_predicate_with_the_sdk():
     assert is_host_control_error(ExecutionAuthorityError("retired")) is True
     assert is_host_control_error(LookupError("ordinary")) is False
     # Registering the same function again is the documented no-op.
-    register_control_error_predicate(is_execution_control_error)
+    from kestrel_sovereign.execution_custody import is_host_control_error as core_host_control
+    register_control_error_predicate(core_host_control)
     assert is_host_control_error(ExecutionAuthorityError("retired")) is True
 
 
@@ -785,34 +806,36 @@ MARKER = "PRIVATE-MARKER-3921-7f3a"
     [("probe_raise", {}), ("probe", {"limit": MARKER})],
     ids=["raised", "coercion-rejected"],
 )
-async def test_an_sdk_subagent_logs_nothing_a_call_carried(caplog, inline, tool_name, arguments):
+async def test_an_sdk_subagent_logs_nothing_a_call_carried(caplog, inline, tool_name, arguments, native_tool_effect_agent):
     """An SDK feature adopted through ``ensure_subagent_dispatch``: a tool that
     raises with a marker, and a value its type refuses that carries one, leave
     the marker in no captured log record, at DEBUG."""
     hooks, _ = _hooks()
-    llm = _SubagentLLM(tool_name, arguments, inline=inline)
-    feature = KINDS["sdk"](
-        SimpleNamespace(
-            llm_service=llm,
-            did="did:test:binding-parity",
-            hooks_manager=hooks,
-            get_turn_bound_session_id=lambda: SESSION,
-        )
-    )
-    feature.error = LookupError(f"could not read {MARKER}")
+    agent = await native_tool_effect_agent(did="did:test:sdk-subagent-private-log")
+    llm = agent.llm_service = _SubagentLLM(tool_name, arguments, inline=inline)
+    agent.hooks_manager = hooks
+    feature = KINDS["sdk"](agent)
+    original = feature.error = LookupError(f"could not read {MARKER}")
 
     with caplog.at_level(logging.DEBUG):
-        envelope = await feature.execute_as_subagent(task="probe it")
+        operation = lambda: feature.execute_as_subagent(task="probe it")
+        if tool_name == "probe_raise":
+            from kestrel_sovereign.execution_custody import execution_evidence_carriers
 
-    assert envelope["success"] is True, envelope
-    # The model still learns what failed: only the logs are content-free.
-    if inline:
-        [(_effective, result)] = llm.executed
-        reported = json.dumps(result)
-    else:
-        [message] = llm.tool_messages
-        reported = message["content"]
-    assert MARKER in reported
-    assert caplog.records, "the subagent logged nothing; the check below is vacuous"
-    leaked = [record.getMessage() for record in caplog.records if MARKER in record.getMessage()]
-    assert leaked == []
+            with pytest.raises(ResourceOutcomeUnknown) as caught:
+                await drive_native(agent, operation)
+            assert any(error is original for error in execution_evidence_carriers(caught.value))
+            assert llm.executed == [] and llm.tool_messages == []
+        else:
+            envelope = await drive_native(agent, operation)
+            assert envelope["success"] is True, envelope
+            if inline:
+                [(_effective, result)] = llm.executed
+                reported = json.dumps(result)
+            else:
+                [message] = llm.tool_messages
+                reported = message["content"]
+            assert MARKER in reported
+    records = [record for record in caplog.records if record.name.startswith("kestrel")]
+    assert records, "the subagent logged nothing; the check below is vacuous"
+    assert not [record.getMessage() for record in records if MARKER in record.getMessage()]

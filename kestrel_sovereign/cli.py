@@ -1104,10 +1104,13 @@ def cmd_tool_log_recent_failures(args) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         for row in result:
+            # A feature subagent's call names the dispatch that made it (#3778).
+            parent = row.get("parent_dispatch_id")
             print(
                 f"#{row['id']} {row['ts']} {row['tool_name']} "
                 f"{row['result_status']} {row['error_class'] or ''}: "
                 f"{row['error_message'] or ''}"
+                + (f" [inside dispatch {parent}]" if parent else "")
             )
     return 0
 
@@ -2490,6 +2493,10 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_decisions import add_decisions_subparser
     add_decisions_subparser(subparsers)
 
+    # kestrel corpus exclusions check  (corpus exclusion manifest, #3893)
+    from kestrel_sovereign.cli_corpus import add_corpus_subparser
+    add_corpus_subparser(subparsers)
+
     # kestrel start|terminate|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
@@ -2967,6 +2974,7 @@ def main() -> int:
     from kestrel_sovereign.cli_embeddings import run as cmd_embeddings
     from kestrel_sovereign.cli_serve import run as cmd_serve
     from kestrel_sovereign.cli_decisions import run as cmd_decisions
+    from kestrel_sovereign.cli_corpus import run as cmd_corpus
 
     commands = {
         "start": cmd_start,
@@ -3007,6 +3015,7 @@ def main() -> int:
         "embeddings": cmd_embeddings,
         "serve": cmd_serve,
         "decisions": cmd_decisions,
+        "corpus": cmd_corpus,
     }
 
     # Core dispatch dict first; then the extension registry. Feature-contributed

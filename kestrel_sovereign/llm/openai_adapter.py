@@ -7,6 +7,9 @@ Adapter for OpenAI's chat completion API with full support for:
 - Vision (image inputs)
 - API-based model discovery
 """
+
+from contextlib import aclosing
+
 import json
 import os
 import re
@@ -21,8 +24,9 @@ if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
 
+from .completion_protocol import GenerationProtocolError, decode_tool_arguments
 from .adapter import (
     LLMAdapter,
     LLMResponse,
@@ -95,9 +99,24 @@ def _structured_response_format(model: Type[BaseModel]) -> Dict[str, Any]:
     }}
 
 
+def _single_choice(choices: Any, *, allow_empty: bool = False) -> Any:
+    """One selected generation; usage-only stream trailers can have none."""
+    if not isinstance(choices, list):
+        raise LLMProtocolError("OpenAI completion choices must be a list.")
+    if not choices and allow_empty:
+        return None
+    if len(choices) != 1:
+        raise LLMProtocolError("OpenAI completion must contain one selected choice.")
+    choice = choices[0]
+    index = choice.get("index") if isinstance(choice, dict) else getattr(choice, "index", None)
+    if type(index) is not int or index != 0:
+        raise LLMProtocolError("OpenAI completion choice must have index zero.")
+    return choice
+
+
 def _finish_reason(choice: Any) -> Optional[str]:
     """A chat-completions choice's ``finish_reason``, if the provider gave one."""
-    reason = getattr(choice, "finish_reason", None)
+    reason = choice.get("finish_reason") if isinstance(choice, dict) else getattr(choice, "finish_reason", None)
     return reason if isinstance(reason, str) and reason else None
 
 
@@ -232,6 +251,16 @@ async def _maybe_await(value: Any) -> Any:
     if hasattr(value, "__await__"):
         return await value
     return value
+
+
+def _protocol_failure_usage(usage: Any, stop_reason: Optional[str]) -> Optional[LLMResponse]:
+    """Retain only reported token counts when native response parsing fails."""
+    if usage is None:
+        return None
+    inputs, outputs, total, writes, reads = _normalized_openai_usage(usage)
+    return LLMResponse(input_tokens=inputs, output_tokens=outputs, total_tokens=total,
+        cache_creation_input_tokens=writes, cache_read_input_tokens=reads,
+        stop_reason=stop_reason)
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -527,6 +556,8 @@ class OpenAIAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         retain_native_execution_http_client_close(getattr(client, "_client", None))
+        reported_native_usage = None
+        finish_reason = None
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -576,10 +607,12 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
-            message = response.choices[0].message
+            reported_native_usage = getattr(response, "usage", None)
+            choice = _single_choice(response.choices)
+            message = choice.message
             # #3355: the provider's own verdict on whether the response is
             # finished; ``length`` means it was cut at an output limit.
-            finish_reason = _finish_reason(response.choices[0])
+            finish_reason = _finish_reason(choice)
 
             # Parse tool calls if present
             # Use getattr to safely access tool_calls (may not exist on mock objects)
@@ -588,12 +621,7 @@ class OpenAIAdapter(LLMAdapter):
             if message_tool_calls:
                 parsed_tool_calls = []
                 for tc in message_tool_calls:
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        # SDK 0.7.0 malformed-JSON sentinel; same
-                        # convention as the streaming path.
-                        args = {"_raw": tc.function.arguments}
+                    args = decode_tool_arguments(tc.function.arguments)
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc.id,
@@ -638,6 +666,12 @@ class OpenAIAdapter(LLMAdapter):
                 cache_read_input_tokens=cache_read_input_tokens,
             ), finish_reason)
 
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(
+                _protocol_failure_usage(reported_native_usage, finish_reason)
+            ) from error
         except openai.RateLimitError as e:
             logger.error("OpenAI rate limit exceeded: %s", type(e).__name__)
             raise
@@ -661,128 +695,14 @@ class OpenAIAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        """
-        Gets a streaming response from the OpenAI model.
-
-        Note: Streaming with tools is complex as tool calls arrive in chunks.
-        This implementation yields text content only. For tool calls during
-        streaming, use the non-streaming get_response method.
-
-        Args:
-            client: OpenAI async client
-            model: Model name to use
-            messages: Chat messages
-            tools: Optional tools
-            response_format: Optional Pydantic model (streaming will yield JSON chunks)
-            **kwargs: Additional parameters
-
-        Yields:
-            Text chunks as they arrive
-        """
-        retain_native_execution_http_client_close(getattr(client, "_client", None))
-        try:
-            # Apply provider/model-specific system-prompt contributions (e.g. the
-            # GPT-5 behavior contract). #807 / #806.
-            messages = self._apply_system_prompt_contribution(messages, model)
-            # Normalize messages for OpenAI compatibility
-            normalized_messages = self._normalize_messages(messages)
-
-            extra_kwargs = {}
-            if tools:
-                extra_kwargs["tools"] = tools
-                extra_kwargs["tool_choice"] = "auto"
-
-            # Handle structured output in streaming mode
-            if response_format is not None and issubclass(response_format, BaseModel):
-                extra_kwargs["response_format"] = _structured_response_format(response_format)
-
-            # Pass through additional kwargs
-            if "max_tokens" in kwargs:
-                extra_kwargs["max_completion_tokens"] = kwargs["max_tokens"]
-            for key in ["temperature", "top_p", "frequency_penalty", "presence_penalty"]:
-                if key in kwargs:
-                    extra_kwargs[key] = kwargs[key]
-
-            # Provider-specific body extensions (issue #704).  See get_response().
-            if "extra_body" in kwargs and kwargs["extra_body"]:
-                extra_kwargs["extra_body"] = kwargs["extra_body"]
-
-            extra_kwargs = self._prepare_chat_completion_request(
-                extra_kwargs,
-                model=model,
-                options=kwargs.get("request_options"),
-            )
-
-            logger.info(f"Starting OpenAI stream for model: {model}")
-            async def acquire_stream(**request):
-                async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
-                    acquired = await client.chat.completions.create(**request)
-                    # The returned SDK stream now owns the same response;
-                    # failed SDK entry instead retires every hidden handle.
-                    responses.handles.clear()
-                    return acquired
-
-            stream = await with_retry(
-                acquire_stream,
-                model=model,
-                messages=normalized_messages,
-                stream=True,
-                acquired_result_cleanup=close_native_execution_stream,
-                **extra_kwargs
-            )
-
-            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
-            retain_native_execution_stream_close(stream, self)
-
-            splitter = _ThinkingContentSplitter(provider=self.name)
-            chunk_count = 0
-            finish_reason = None
-            try:
-                async for chunk in stream:
-                    report_call_progress()
-                    # #3355: the finish reason rides on the last choice chunk.
-                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                    delta = chunk.choices[0].delta
-                    reasoning_content = getattr(delta, "reasoning_content", None)
-                    if isinstance(reasoning_content, str) and reasoning_content:
-                        yield ThinkingDelta(reasoning_content, provider=self.name)
-                    content_delta = getattr(delta, "content", None)
-                    if isinstance(content_delta, str) and content_delta:
-                        for item in splitter.feed(content_delta):
-                            if isinstance(item, str):
-                                chunk_count += 1
-                            yield item
-            finally:
-                await close_native_execution_stream(stream, self)
-
-            for item in splitter.flush():
-                if isinstance(item, str):
-                    chunk_count += 1
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
+        )) as stream:
+            async for item in stream:
                 yield item
-
-            # #3355: the streamed text is already on screen, so a cut at the
-            # provider's output limit is marked by a final chunk.
-            notice = self._output_limit_notice(
-                model, finish_reason, _caller_output_budget(extra_kwargs),
-            )
-            if notice is not None:
-                yield output_ceiling_notice_chunk(notice, follows_text=chunk_count > 0)
-
-            logger.info(f"Stream completed. Total chunks: {chunk_count}")
-
-        except openai.RateLimitError as e:
-            logger.error("OpenAI rate limit exceeded during streaming: %s", type(e).__name__)
-            raise
-        except openai.APIConnectionError as e:
-            logger.error("OpenAI connection error during streaming: %s", type(e).__name__)
-            raise
-        except openai.APIError as e:
-            logger.error("OpenAI API error during streaming: %s", type(e).__name__)
-            raise
-        except Exception as e:
-            logger.error("OpenAI streaming failed: %s", type(e).__name__)
-            raise
 
     async def get_streaming_response_with_tools(
         self,
@@ -823,6 +743,8 @@ class OpenAIAdapter(LLMAdapter):
                             # Continue conversation with tool results
         """
         retain_native_execution_http_client_close(getattr(client, "_client", None))
+        reported_native_usage = None
+        finish_reason = None
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -898,6 +820,7 @@ class OpenAIAdapter(LLMAdapter):
                     report_call_progress()
                     # Extract usage from final chunk (OpenAI sends it with stream_options)
                     if hasattr(chunk, 'usage') and chunk.usage:
+                        reported_native_usage = chunk.usage
                         (
                             input_tokens,
                             output_tokens,
@@ -920,12 +843,13 @@ class OpenAIAdapter(LLMAdapter):
                                 call_cost = None
 
                     # Skip chunks with no choices (like the final usage-only chunk)
-                    if not chunk.choices:
+                    choice = _single_choice(chunk.choices, allow_empty=True)
+                    if choice is None:
                         continue
 
                     # #3355: the finish reason rides on the last choice chunk.
-                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                    delta = chunk.choices[0].delta
+                    finish_reason = _finish_reason(choice) or finish_reason
+                    delta = choice.delta
 
                     # Handle text content - yield immediately for real-time streaming
                     delta_reasoning_content = getattr(delta, "reasoning_content", None)
@@ -966,17 +890,24 @@ class OpenAIAdapter(LLMAdapter):
                                     "arguments": ""
                                 }
 
-                            # Accumulate id (usually comes in first chunk)
-                            if tc_delta.id:
-                                tool_calls_accumulator[idx]["id"] += tc_delta.id
+                            # Identity fields repeat whole values; only arguments fragment.
+                            current = tool_calls_accumulator[idx]
+                            for key, value in (("id", tc_delta.id), ("name", getattr(tc_delta.function, "name", None))):
+                                if value is None:
+                                    continue
+                                if type(value) is not str or not value:
+                                    raise LLMProtocolError("Native tool identity must be a non-empty string.")
+                                if current[key] and current[key] != value:
+                                    raise LLMProtocolError("Native tool delta returned conflicting identity.")
+                                current[key] = value
 
-                            # Accumulate function name (usually comes in first chunk)
                             if tc_delta.function:
-                                if tc_delta.function.name:
-                                    tool_calls_accumulator[idx]["name"] += tc_delta.function.name
                                 # Accumulate arguments (comes in multiple chunks)
-                                if tc_delta.function.arguments:
-                                    tool_calls_accumulator[idx]["arguments"] += tc_delta.function.arguments
+                                arguments = tc_delta.function.arguments
+                                if arguments is not None:
+                                    if type(arguments) is not str:
+                                        raise LLMProtocolError("Native tool argument fragments must be strings.")
+                                    current["arguments"] += arguments
 
                             if is_new_call:
                                 # Emit ToolCallStarted only after we've
@@ -1017,15 +948,8 @@ class OpenAIAdapter(LLMAdapter):
             parsed_tool_calls = None
             if tool_calls_accumulator:
                 parsed_tool_calls = []
-                for idx in sorted(tool_calls_accumulator.keys()):
-                    tc_data = tool_calls_accumulator[idx]
-                    try:
-                        args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
-                    except json.JSONDecodeError:
-                        # SDK 0.7.0 malformed-JSON fallback — see
-                        # contract docstring on
-                        # LLMAdapter.get_streaming_response_with_tools.
-                        args = {"_raw": tc_data["arguments"]}
+                for tc_data in tool_calls_accumulator.values():
+                    args = decode_tool_arguments(tc_data["arguments"] or "{}")
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc_data["id"],
@@ -1058,6 +982,12 @@ class OpenAIAdapter(LLMAdapter):
                 cache_read_input_tokens=cache_read_input_tokens,
             ), finish_reason)
 
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(
+                _protocol_failure_usage(reported_native_usage, finish_reason)
+            ) from error
         except openai.RateLimitError as e:
             logger.error("OpenAI rate limit exceeded during streaming with tools: %s", type(e).__name__)
             raise
@@ -1196,12 +1126,15 @@ class OpenAIAdapter(LLMAdapter):
             custom_id = item.get("custom_id", "")
             error = item.get("error")
             response_body = ((item.get("response") or {}).get("body") or None)
-            response = (
-                self._llm_response_from_chat_completion(response_body)
-                if response_body
-                else None
-            )
+            response = None
             error_text = json.dumps(error) if error is not None else None
+            if response_body:
+                try:
+                    response = self._llm_response_from_chat_completion(response_body)
+                except LLMProtocolError:
+                    # Each native batch item owns its outcome. A refused item
+                    # cannot hide valid neighbors or expose an executable call.
+                    error_text = "Invalid generation protocol in batch result."
             if BatchResult:
                 results.append(
                     BatchResult(
@@ -1702,18 +1635,14 @@ class OpenAIAdapter(LLMAdapter):
 
     def _llm_response_from_chat_completion(self, response_body: Any) -> LLMResponse:
         body = response_body if isinstance(response_body, dict) else _object_to_dict(response_body)
-        choices = body.get("choices") or []
-        message = (choices[0].get("message") if choices else {}) or {}
+        choice = _single_choice(body.get("choices"))
+        message = choice.get("message") or {}
         tool_calls = None
         if message.get("tool_calls"):
             tool_calls = []
             for tc in message["tool_calls"]:
                 fn = tc.get("function") or {}
-                args = fn.get("arguments") or "{}"
-                try:
-                    parsed = json.loads(args) if isinstance(args, str) else args
-                except json.JSONDecodeError:
-                    parsed = {"_raw": args}
+                parsed = decode_tool_arguments(fn.get("arguments"))
                 tool_calls.append(
                     ToolCall(
                         id=tc.get("id", ""),
@@ -1733,6 +1662,7 @@ class OpenAIAdapter(LLMAdapter):
             content=message.get("content"),
             tool_calls=tool_calls,
             raw=response_body,
+            stop_reason=_finish_reason(choice),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,

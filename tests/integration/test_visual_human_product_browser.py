@@ -38,7 +38,7 @@ async def test_initialized_manual_browser_and_safe_artifact_after_destroy(tmp_pa
     from kestrel_sovereign.features.visual_computer import feature as visual_feature
     from kestrel_sovereign.visual_computer.runtime import VisualAction
     from kestrel_sovereign.visual_computer.docker import PROVIDER
-    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+    from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
     import uvicorn
 
     (tmp_path/'home').mkdir();(tmp_path/'data').mkdir()

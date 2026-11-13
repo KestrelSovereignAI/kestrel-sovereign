@@ -71,7 +71,11 @@ from kestrel_sovereign.signals.sources.channels import (
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
-from tests.utils.virtual_clock import advanceable_loop_clock, await_within_hang_guard
+from tests.utils.virtual_clock import (
+    advanceable_loop_clock,
+    await_within_hang_guard,
+    pinned_loop_clock,
+)
 
 # How long a test waits for work it set in motion before calling it hung. This
 # bounds a deadlock, not the work: a passing run returns as soon as the awaited
@@ -165,6 +169,26 @@ def _registration(agent: _Agent, source: str = "provider.message") -> SourceRegi
         log_redaction=RedactionPolicy(summarize=lambda payload: "<redacted>"),
         retention_days=7,
     )
+
+
+def _observe_writer_slot_request(backend: SQLiteBackend) -> asyncio.Event:
+    """An event set once ``backend``'s next transaction asks for the writer slot.
+
+    Every SQLite transaction takes the slot at ``BEGIN IMMEDIATE`` (#4040), so
+    one contending with another connection's writer waits there, before its
+    scope handoff or any other statement runs.
+    """
+    requested = asyncio.Event()
+    connection = backend._connection
+    execute = connection.execute
+
+    def watching_execute(sql, *args, **kwargs):
+        if sql == "BEGIN IMMEDIATE":
+            requested.set()
+        return execute(sql, *args, **kwargs)
+
+    connection.execute = watching_execute
+    return requested
 
 
 def _signal(*, agent_id: str, source: str = "provider.message", message: str = " hello ", workflow: str = "wf-1") -> Signal:
@@ -4857,23 +4881,47 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
     async def reject_renewal(**_kwargs):
         return None
 
-    original_owner_heartbeat = dispatcher_a._durable_store.heartbeat_runtime_owner
-    fenced_heartbeat_times: list[float] = []
+    original_owner_heartbeat = dispatcher_a._durable_store.retain_unretired_runtime_owner
+    original_owner_schedule = dispatcher_a._schedule_runtime_owner_heartbeat
+    fenced_heartbeat_times: list[datetime] = []
+    fenced_heartbeat_delays: list[float | None] = []
     repeated_fenced_heartbeat = asyncio.Event()
 
+    def observe_owner_schedule(*, retry=False):
+        if not dispatcher_a.durable_shutdown_owner_fenced:
+            return original_owner_schedule(retry=retry)
+        # Measure the real timer's requested interval in one synchronous
+        # clock domain. A host pause is not a different scheduling policy.
+        with pinned_loop_clock() as clock:
+            original_owner_schedule(retry=retry)
+            timer = dispatcher_a._runtime_owner_heartbeat_timer
+            fenced_heartbeat_delays.append(
+                None if timer is None else timer.when() - clock.time()
+            )
+
     async def observe_owner_heartbeat(**kwargs):
-        await original_owner_heartbeat(**kwargs)
         if dispatcher_a.durable_shutdown_owner_fenced:
-            committed_at = time.monotonic()
+            # Use the store's explicit clock seam, not a claim that a busy
+            # test continuation can observe every callback within 500ms.
+            # These are real committed writes; peer recovery below must read
+            # them. A callback without its original write cannot pass.
+            committed_at = (
+                fenced_heartbeat_times[-1] + dispatcher_a._runtime_owner_stale_after
+                if fenced_heartbeat_times else datetime.now(timezone.utc)
+            )
+            renewed = await original_owner_heartbeat(**{**kwargs, "now": committed_at})
             fenced_heartbeat_times.append(committed_at)
             if committed_at - fenced_heartbeat_times[0] >= (
-                2 * dispatcher_a._runtime_owner_stale_after.total_seconds()
+                2 * dispatcher_a._runtime_owner_stale_after
             ):
                 repeated_fenced_heartbeat.set()
+            return renewed
+        return await original_owner_heartbeat(**kwargs)
 
     agent_a.process_input = hostile_turn
     dispatcher_a.renew_durable_delivery_lease = reject_renewal  # type: ignore[method-assign]
-    dispatcher_a._durable_store.heartbeat_runtime_owner = observe_owner_heartbeat
+    dispatcher_a._durable_store.retain_unretired_runtime_owner = observe_owner_heartbeat
+    dispatcher_a._schedule_runtime_owner_heartbeat = observe_owner_schedule
     try:
         await dispatcher_a.register_durable_consumer(consumer)
         await dispatcher_b.register_durable_consumer(consumer)
@@ -4882,14 +4930,20 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
             source_event_id="telegram:update:shutdown-owner-fence",
             consumer_id=consumer.consumer_id,
         )
-        await asyncio.wait_for(started.wait(), timeout=1)
-        assert (await asyncio.wait_for(first.wait(), timeout=1)).status is Status.FAILED
+        await await_within_hang_guard(started.wait(), step="the original hostile cognition starting")
+        assert (await await_within_hang_guard(
+            first.wait(), step="the original cognition lease loss",
+        )).status is Status.FAILED
         leased = (await dispatcher_a.list_durable_deliveries())[0]
 
         # The public shutdown is bounded. It returns with a live ownership
         # fence while the task keeps suppressing cancellation in the process.
-        assert await asyncio.wait_for(dispatcher_a.shutdown_durable_delivery(), timeout=1) is False
-        await asyncio.wait_for(repeated_cancellation.wait(), timeout=1)
+        assert await await_within_hang_guard(
+            dispatcher_a.shutdown_durable_delivery(), step="bounded durable shutdown",
+        ) is False
+        await await_within_hang_guard(
+            repeated_cancellation.wait(), step="the original cognition suppressing repeated cancellation",
+        )
         assert dispatcher_a.durable_shutdown_owner_fenced is True
         owner = await backend_a.fetch_one(
             "SELECT stopped_at FROM durable_signal_runtime_owners WHERE agent_id = ? AND owner_id = ?",
@@ -4897,23 +4951,27 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         )
         assert owner is not None and owner[0] is None
 
-        # Observe committed private fence heartbeats spanning two complete
-        # stale-owner windows before testing recovery. Waiting on the writes,
-        # rather than sleeping for an assumed scheduler cadence, stays
-        # deterministic on a loaded event loop and proves that the timer keeps
-        # the owner live after ordinary durable admission has closed.
-        await asyncio.wait_for(repeated_fenced_heartbeat.wait(), timeout=4)
-        assert all(
-            later - earlier < dispatcher_a._runtime_owner_stale_after.total_seconds()
-            for earlier, later in zip(
-                fenced_heartbeat_times, fenced_heartbeat_times[1:]
-            )
+        # Drive two complete logical stale-owner windows through actual
+        # timer-produced writes. The oracle is the peer's durable recovery
+        # decision, not elapsed wall time between test observations.
+        await await_within_hang_guard(
+            repeated_fenced_heartbeat.wait(), step="committed post-shutdown owner heartbeats",
         )
+        recovery_now = fenced_heartbeat_times[-1]
+        assert recovery_now - fenced_heartbeat_times[0] >= (
+            2 * dispatcher_a._runtime_owner_stale_after
+        )
+        assert fenced_heartbeat_delays
+        assert all(
+            delay is not None
+            and 0 < delay < dispatcher_a._runtime_owner_stale_after.total_seconds()
+            for delay in fenced_heartbeat_delays
+        ), "the original owner heartbeat timer exceeds its stale-owner window"
         assert await dispatcher_b._durable_store.recover_abandoned_leases(
             agent_id=agent_b.did,
             recovering_owner_id=dispatcher_b._durable_delivery_owner,
-            stale_before=datetime.now(timezone.utc)
-            - dispatcher_a._runtime_owner_stale_after,
+            stale_before=recovery_now - dispatcher_a._runtime_owner_stale_after,
+            now=recovery_now,
         ) == 0
 
         # Even after its lease's nominal deadline, a peer cannot reclaim while
@@ -4928,7 +4986,9 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         ) is None
 
         allow_exit.set()
-        await asyncio.wait_for(dispatcher_a.wait_for_durable_shutdown_release(), timeout=1)
+        await await_within_hang_guard(
+            dispatcher_a.wait_for_durable_shutdown_release(), step="the original fenced cognition retiring",
+        )
         assert dispatcher_a.durable_shutdown_owner_fenced is False
         owner = await backend_a.fetch_one(
             "SELECT stopped_at FROM durable_signal_runtime_owners WHERE agent_id = ? AND owner_id = ?",
@@ -4951,7 +5011,8 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         ) is not None
     finally:
         allow_exit.set()
-        dispatcher_a._durable_store.heartbeat_runtime_owner = original_owner_heartbeat
+        dispatcher_a._durable_store.retain_unretired_runtime_owner = original_owner_heartbeat
+        dispatcher_a._schedule_runtime_owner_heartbeat = original_owner_schedule
         try:
             await dispatcher_a.shutdown_durable_delivery()
             await dispatcher_a.wait_for_durable_shutdown_release()
@@ -6403,7 +6464,7 @@ async def test_runtime_owner_heartbeat_failure_keeps_a_bounded_future_retry(tmp_
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "owner-heartbeat-retry.db", "did:agent:one"
     )
-    original = dispatcher._durable_store.heartbeat_runtime_owner
+    original = dispatcher._durable_store.retain_unretired_runtime_owner
     attempts = 0
 
     async def fail_once(*args, **kwargs):
@@ -6413,7 +6474,7 @@ async def test_runtime_owner_heartbeat_failure_keeps_a_bounded_future_retry(tmp_
             raise RuntimeError("temporary durable store outage")
         return await original(*args, **kwargs)
 
-    dispatcher._durable_store.heartbeat_runtime_owner = fail_once
+    dispatcher._durable_store.retain_unretired_runtime_owner = fail_once
     try:
         dispatcher._start_runtime_owner_heartbeat()
         task = dispatcher._runtime_owner_heartbeat_task
@@ -6431,7 +6492,7 @@ async def test_runtime_owner_heartbeat_failure_keeps_a_bounded_future_retry(tmp_
             dispatcher._runtime_owner_stale_after.total_seconds() / 3
         )
     finally:
-        dispatcher._durable_store.heartbeat_runtime_owner = original
+        dispatcher._durable_store.retain_unretired_runtime_owner = original
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
@@ -6927,16 +6988,9 @@ async def test_implicit_claim_clock_is_sampled_after_contended_scope_handoff(
         source_event_id="provider:contended-claim",
         retention_days=7,
     )
-    entered_handoff = asyncio.Event()
+    entered_handoff = _observe_writer_slot_request(backend)
     writer_acquired = asyncio.Event()
     release_writer = asyncio.Event()
-    original_handoff = store._lock_scope_handoff
-
-    async def observe_handoff(**kwargs):
-        entered_handoff.set()
-        await original_handoff(**kwargs)
-
-    store._lock_scope_handoff = observe_handoff  # type: ignore[method-assign]
 
     async def hold_peer_writer():
         async with peer.transaction():
@@ -6966,7 +7020,8 @@ async def test_implicit_claim_clock_is_sampled_after_contended_scope_handoff(
             )
         await asyncio.wait_for(entered_handoff.wait(), timeout=1)
         # The method is now blocked at the database handoff, after its caller
-        # began but before it owns the serialization point.
+        # began but before it owns the serialization point: the writer slot
+        # its transaction takes at ``BEGIN IMMEDIATE`` (#4040).
         clock["now"] = base + timedelta(seconds=2)
         release_writer.set()
         claimed = await asyncio.wait_for(claim_task, timeout=1)
@@ -7110,16 +7165,9 @@ async def test_registration_backfill_clock_is_sampled_after_contended_scope_hand
         source="provider.message",
         agent_id=agent_id,
     )
-    entered_handoff = asyncio.Event()
+    entered_handoff = _observe_writer_slot_request(backend)
     writer_acquired = asyncio.Event()
     release_writer = asyncio.Event()
-    original_handoff = store._lock_scope_handoff
-
-    async def observe_handoff(**kwargs):
-        entered_handoff.set()
-        await original_handoff(**kwargs)
-
-    store._lock_scope_handoff = observe_handoff  # type: ignore[method-assign]
 
     async def hold_peer_writer():
         async with peer.transaction():
@@ -8978,7 +9026,7 @@ async def test_shutdown_drains_an_admitted_owner_heartbeat_before_release(tmp_pa
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "shutdown-owner-heartbeat.db", "did:agent:one"
     )
-    original_heartbeat = dispatcher._durable_store.heartbeat_runtime_owner
+    original_heartbeat = dispatcher._durable_store.retain_unretired_runtime_owner
     heartbeat_entered = asyncio.Event()
     allow_heartbeat = asyncio.Event()
     heartbeat_task = None
@@ -8989,7 +9037,7 @@ async def test_shutdown_drains_an_admitted_owner_heartbeat_before_release(tmp_pa
         await allow_heartbeat.wait()
         return await original_heartbeat(*args, **kwargs)
 
-    dispatcher._durable_store.heartbeat_runtime_owner = heartbeat_after_shutdown_admission
+    dispatcher._durable_store.retain_unretired_runtime_owner = heartbeat_after_shutdown_admission
     try:
         heartbeat_task = asyncio.create_task(dispatcher._heartbeat_runtime_owner())
         await asyncio.wait_for(heartbeat_entered.wait(), timeout=1.0)
@@ -9015,7 +9063,7 @@ async def test_shutdown_drains_an_admitted_owner_heartbeat_before_release(tmp_pa
             await dispatcher._heartbeat_runtime_owner()
     finally:
         allow_heartbeat.set()
-        dispatcher._durable_store.heartbeat_runtime_owner = original_heartbeat
+        dispatcher._durable_store.retain_unretired_runtime_owner = original_heartbeat
         if heartbeat_task is not None and not heartbeat_task.done():
             await heartbeat_task
         if shutdown_task is not None and not shutdown_task.done():

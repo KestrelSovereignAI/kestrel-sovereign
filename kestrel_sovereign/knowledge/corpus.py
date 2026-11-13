@@ -15,11 +15,12 @@ becoming trainable data.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import MISSING, dataclass, fields as dataclass_fields
+from dataclasses import MISSING, dataclass, fields as dataclass_fields, replace
 from enum import Enum
 import hashlib
 import json
 import math
+import re
 from time import monotonic
 from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
@@ -59,6 +60,7 @@ class GovernedCorpusBudgetExceeded(GovernedCorpusError):
 class CorpusEligibilityReason(str, Enum):
     INCLUDED = "included"
     EXCLUDED = "explicitly_excluded"
+    SESSION_UNATTESTED = "session_unattested"
     LIFECYCLE = "lifecycle_ineligible"
     EPISTEMIC_STATE = "epistemic_state_disallowed"
     PRIVACY = "privacy_classification_disallowed"
@@ -70,6 +72,14 @@ class CorpusEligibilityReason(str, Enum):
     DERIVATION_INPUT = "derivation_input_ineligible"
     ONTOLOGY = "ontology_pin_disallowed"
     VALIDATION = "validation_not_conformant"
+
+
+#: The decisions a source's session makes: an excluded session, or a session
+#: that cannot be known while some session is excluded. An inference built on
+#: material held out for either is held out with the same reason.
+_SESSION_HOLD_OUT_REASONS = frozenset(
+    {CorpusEligibilityReason.EXCLUDED, CorpusEligibilityReason.SESSION_UNATTESTED}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +128,35 @@ def _mapping_items(value: object, name: str) -> tuple[object, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise GovernedCorpusError(f"{name} must be an array")
     return tuple(value)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionAttestation:
+    """The sessions a host attests one revision's material was recorded in.
+
+    Some material names its session only in a record its producing agent can
+    edit, such as a strategy-ledger row in the agent's own data directory.
+    For such material the host keeps its own record (#3990), and a corpus
+    with session exclusions decides from it rather than from any locator the
+    agent could have influenced. ``sessions`` are the named sessions; a
+    recording in a turn with no session names none. ``attested`` is false
+    when the host holds no record for the material: its session is unknown.
+    """
+
+    sessions: frozenset[str] = frozenset()
+    attested: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.attested) is not bool:
+            raise GovernedCorpusError("session attestation attested must be a boolean")
+        if not isinstance(self.sessions, frozenset) or any(
+            not isinstance(item, str) or not item for item in self.sessions
+        ):
+            raise GovernedCorpusError(
+                "session attestation sessions must be a frozenset of non-empty keys"
+            )
+        if not self.attested and self.sessions:
+            raise GovernedCorpusError("an unattested revision names no session")
 
 
 _EXCLUSION_FIELDS = (
@@ -170,6 +209,15 @@ class GovernedCorpusPolicy:
     :func:`~kestrel_sovereign.knowledge.assertion.source_reference_segment`).
     A derived revision built on an excluded premise is rejected with it.  Ids
     are compared exactly: a display prefix of a saved-item id matches nothing.
+
+    A host may attest which sessions a revision's material was recorded in
+    (:class:`SessionAttestation`).  An attested session is matched exactly as
+    a session the locator names.  While any session is excluded, a revision
+    whose session is unknown, because the host holds no attestation for it or
+    a source is marked ``unattested-session``, is held out as well
+    (:meth:`withholds_unattested`): material whose session cannot be matched
+    does not enter a session-excluding corpus.  A policy without session
+    exclusions is unaffected.
     """
 
     policy_id: str
@@ -358,21 +406,148 @@ class GovernedCorpusPolicy:
         return cls(**values)
 
     def excludes(
-        self, assertion: Assertion, sources: Sequence[SourceOccurrence]
+        self,
+        assertion: Assertion,
+        sources: Sequence[SourceOccurrence],
+        attestation: SessionAttestation | None = None,
     ) -> bool:
-        """Whether a direct source this revision was read from is excluded."""
+        """Whether a direct source this revision was read from is excluded.
+
+        ``attestation`` is the host's record of the revision's sessions, when
+        it keeps one; a session it attests is excluded as a named one is.
+        """
         if isinstance(assertion.lineage, DirectLineage) and not set(
             self.excluded_source_occurrence_ids
         ).isdisjoint(assertion.lineage.source_occurrence_ids):
+            return True
+        if attestation is not None and not attestation.sessions.isdisjoint(
+            self.excluded_session_ids
+        ):
             return True
         references = {
             (SourceReferenceKind.SAVED_ITEM, item) for item in self.excluded_saved_item_ids
         } | {(SourceReferenceKind.SESSION, item) for item in self.excluded_session_ids}
         return any(not references.isdisjoint(source.references) for source in sources)
 
+    def withholds_unattested(
+        self,
+        sources: Sequence[SourceOccurrence],
+        attestation: SessionAttestation | None = None,
+    ) -> bool:
+        """Whether a revision is held out because its session is unknown.
+
+        Only while some session is excluded: its session could be that one.
+        Unknown when the host keeps a record for the revision's material and
+        holds none for it, or when a source is marked unattested.
+        """
+        if not self.excluded_session_ids:
+            return False
+        if attestation is not None and not attestation.attested:
+            return True
+        return any(
+            kind is SourceReferenceKind.UNATTESTED_SESSION
+            for source in sources
+            for kind, _ in source.references
+        )
+
     @property
     def digest(self) -> str:
         return _digest(self.to_mapping())
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusExclusionReceipt:
+    """Which Sovereign-signed exclusion manifest a corpus was built under (#3893).
+
+    ``manifest_sha256`` is the digest of the manifest's signed content, so a
+    manifest re-signed without change keeps it. A snapshot and its incremental
+    reads carry it, and the snapshot hash covers it.
+    """
+
+    manifest_sha256: str
+    sequence: int
+    issued_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest_sha256, str) or not _SHA256_HEX.fullmatch(
+            self.manifest_sha256
+        ):
+            raise GovernedCorpusError(
+                "exclusion manifest digest must be 64 lowercase hex characters"
+            )
+        if type(self.sequence) is not int or self.sequence < 1:
+            raise GovernedCorpusError("exclusion manifest sequence must be a positive integer")
+        if not isinstance(self.issued_at, str) or not self.issued_at:
+            raise GovernedCorpusError("exclusion manifest issued_at must be non-empty")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "manifest_sha256": self.manifest_sha256,
+            "sequence": self.sequence,
+            "issued_at": self.issued_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HostCorpusExclusions:
+    """Material the host holds out of every corpus it builds for one agent (#3893).
+
+    Read from the Sovereign-signed exclusion manifest
+    (:mod:`kestrel_sovereign.knowledge.corpus_exclusions`), never from the
+    consumer, so a consumer whose policy names no exclusions cannot leave them
+    out. They are applied together with the policy's own exclusion sets, by
+    the same rules, and recorded on the corpus as ``receipt``. The policy, and
+    therefore its digest, is left as the consumer supplied it.
+    """
+
+    receipt: CorpusExclusionReceipt
+    saved_item_ids: tuple[str, ...] = ()
+    session_ids: tuple[str, ...] = ()
+    source_occurrence_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, CorpusExclusionReceipt):
+            raise GovernedCorpusError("host exclusions need their manifest receipt")
+        for name in ("saved_item_ids", "session_ids", "source_occurrence_ids"):
+            object.__setattr__(
+                self, name, _ordered_texts(getattr(self, name), name, allow_empty=True)
+            )
+
+    def governing(self, policy: GovernedCorpusPolicy) -> GovernedCorpusPolicy:
+        """``policy`` with these exclusions added to its own, for eligibility only."""
+        return replace(
+            policy,
+            excluded_saved_item_ids=tuple(
+                set(policy.excluded_saved_item_ids).union(self.saved_item_ids)
+            ),
+            excluded_session_ids=tuple(
+                set(policy.excluded_session_ids).union(self.session_ids)
+            ),
+            excluded_source_occurrence_ids=tuple(
+                set(policy.excluded_source_occurrence_ids).union(
+                    self.source_occurrence_ids
+                )
+            ),
+        )
+
+
+def _host_exclusions(value: object) -> HostCorpusExclusions | None:
+    if value is not None and not isinstance(value, HostCorpusExclusions):
+        raise GovernedCorpusError("exclusions must be HostCorpusExclusions or null")
+    return value
+
+
+def _governing_policy(
+    policy: GovernedCorpusPolicy, exclusions: HostCorpusExclusions | None
+) -> GovernedCorpusPolicy:
+    return policy if exclusions is None else exclusions.governing(policy)
+
+
+def _receipt_of(exclusions: HostCorpusExclusions | None) -> CorpusExclusionReceipt | None:
+    return None if exclusions is None else exclusions.receipt
 
 
 _POLICY_FIELDS = dataclass_fields(GovernedCorpusPolicy)
@@ -474,8 +649,15 @@ class GovernedCorpusSnapshot:
     snapshot_hash: str
     observability: GovernedCorpusObservability
     verified: bool = True
+    exclusion_manifest: CorpusExclusionReceipt | None = None
 
     def __post_init__(self) -> None:
+        if self.exclusion_manifest is not None and not isinstance(
+            self.exclusion_manifest, CorpusExclusionReceipt
+        ):
+            raise GovernedCorpusError(
+                "snapshot exclusion_manifest must be CorpusExclusionReceipt or null"
+            )
         if self.schema_version != CORPUS_SCHEMA_VERSION:
             raise GovernedCorpusError("unsupported corpus snapshot schema version")
         if self.checkpoint.tenant_id != self.tenant_id:
@@ -512,6 +694,7 @@ class GovernedCorpusDelta:
     tombstones: tuple[GovernedCorpusTombstone, ...]
     snapshot_hash: str
     observability: GovernedCorpusObservability
+    exclusion_manifest: CorpusExclusionReceipt | None = None
 
     @property
     def since_generation(self) -> int:
@@ -536,6 +719,16 @@ class GovernedCorpusStorage(Protocol):
     async def list_assertion_revision_sources(self, revision_id: str) -> list[SourceOccurrence]: ...
 
     async def list_assertion_revision_sources_batch(self, revision_ids: Sequence[str]) -> Mapping[str, Sequence[SourceOccurrence]]: ...
+
+    async def assertion_session_attestations(
+        self, revisions: Sequence[tuple[Assertion, Sequence[SourceOccurrence]]]
+    ) -> Mapping[str, SessionAttestation]:
+        """The host's session record for each revision it keeps one for.
+
+        Keyed by revision id. A revision absent from the result has no host
+        record, and its locators alone say which sessions it names.
+        """
+        ...
 
     async def assertion_validation_statuses(self, assertions: Sequence[Assertion]) -> Mapping[str, CorpusValidationStatus]: ...
 
@@ -577,9 +770,17 @@ class GovernedAssertionCorpusService:
         semantic_capabilities=None,
         prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
         allow_prior_verified_snapshot: bool = False,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusSnapshot:
+        """Build one corpus.
+
+        ``exclusions`` are the host's own (:class:`HostCorpusExclusions`),
+        held out on top of the policy's; the host corpus capability always
+        supplies them.
+        """
         if not isinstance(limits, GovernedCorpusLimits):
             raise GovernedCorpusError("limits must be GovernedCorpusLimits")
+        exclusions = _host_exclusions(exclusions)
         try:
             async with asyncio.timeout(limits.max_wall_time_seconds):
                 return await self._snapshot(
@@ -591,6 +792,7 @@ class GovernedAssertionCorpusService:
                     semantic_capabilities=semantic_capabilities,
                     prior_verified_snapshot=prior_verified_snapshot,
                     allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+                    exclusions=exclusions,
                 )
         except TimeoutError as error:
             raise GovernedCorpusBudgetExceeded(
@@ -608,6 +810,7 @@ class GovernedAssertionCorpusService:
         semantic_capabilities=None,
         prior_verified_snapshot: GovernedCorpusSnapshot | None = None,
         allow_prior_verified_snapshot: bool = False,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusSnapshot:
         if not isinstance(policy, GovernedCorpusPolicy):
             raise GovernedCorpusError("policy must be GovernedCorpusPolicy")
@@ -668,6 +871,7 @@ class GovernedAssertionCorpusService:
             policy=policy,
             limits=limits,
             started=started,
+            exclusions=exclusions,
         )
         final_checkpoint = await self._event_checkpoint()
         if not self._same_checkpoint(checkpoint, final_checkpoint):
@@ -684,9 +888,17 @@ class GovernedAssertionCorpusService:
         inference_limits=None,
         maintenance_limits=None,
         semantic_capabilities=None,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusDelta:
+        """Read additions and tombstones after ``snapshot``.
+
+        Only under the exclusion manifest ``snapshot`` was built under: a
+        changed manifest may hold out what the base already holds, so it
+        needs a fresh snapshot.
+        """
         if not isinstance(limits, GovernedCorpusLimits):
             raise GovernedCorpusError("limits must be GovernedCorpusLimits")
+        exclusions = _host_exclusions(exclusions)
         try:
             async with asyncio.timeout(limits.max_wall_time_seconds):
                 return await self._changes_since(
@@ -697,6 +909,7 @@ class GovernedAssertionCorpusService:
                     inference_limits=inference_limits,
                     maintenance_limits=maintenance_limits,
                     semantic_capabilities=semantic_capabilities,
+                    exclusions=exclusions,
                 )
         except TimeoutError as error:
             raise GovernedCorpusBudgetExceeded(
@@ -713,11 +926,15 @@ class GovernedAssertionCorpusService:
         inference_limits=None,
         maintenance_limits=None,
         semantic_capabilities=None,
+        exclusions: HostCorpusExclusions | None = None,
     ) -> GovernedCorpusDelta:
         if not isinstance(snapshot, GovernedCorpusSnapshot):
             raise GovernedCorpusError("snapshot must be GovernedCorpusSnapshot")
         if snapshot.policy.digest != policy.digest:
             raise GovernedCorpusError("incremental reads require the same corpus policy")
+        receipt = _receipt_of(exclusions)
+        if snapshot.exclusion_manifest != receipt:
+            raise GovernedCorpusUnavailable("corpus_exclusion_manifest_changed")
         started = monotonic()
         head = await self._event_checkpoint()
         readiness = await self._storage.semantic_maintenance_training_readiness(
@@ -766,7 +983,9 @@ class GovernedAssertionCorpusService:
             candidates = await self._storage.assertion_inference_inputs(
                 AssertionQuery(assertion_ids=changed_ids, limit=limits.max_assertions)
             )
-            built, excluded = await self._examples(candidates, policy, limits, started)
+            built, excluded = await self._examples(
+                candidates, policy, limits, started, exclusions=exclusions
+            )
             additions = tuple(built)
         tombstones = tuple(
             GovernedCorpusTombstone(
@@ -779,8 +998,17 @@ class GovernedAssertionCorpusService:
             )
             for change in changes
             if not change.eligible
+        ) + await self._session_attestation_tombstones(
+            snapshot,
+            policy=_governing_policy(policy, exclusions),
+            limits=limits,
+            started=started,
+            generation=head.generation,
+            settled_assertion_ids=frozenset(
+                change.assertion_id for change in changes if change.assertion_id
+            ),
         )
-        snapshot_hash = _digest({
+        canonical = {
             "base": snapshot.snapshot_hash,
             "checkpoint": [head.generation, head.latest_event_id],
             "additions": [example.content_hash for example in additions],
@@ -789,7 +1017,10 @@ class GovernedAssertionCorpusService:
                 "revision_id": tombstone.revision_id, "operation": tombstone.operation,
                 "generation": tombstone.generation, "reason": tombstone.reason,
             } for tombstone in tombstones],
-        })
+        }
+        if receipt is not None:
+            canonical["exclusion_manifest"] = receipt.to_mapping()
+        snapshot_hash = _digest(canonical)
         observability = GovernedCorpusObservability(
             considered=len(changes), included=len(additions), excluded=dict(sorted(excluded.items())),
             snapshot_hash=snapshot_hash, policy_digest=policy.digest,
@@ -805,10 +1036,13 @@ class GovernedAssertionCorpusService:
             tombstones,
             snapshot_hash,
             observability,
+            receipt,
         )
 
-    async def _build_snapshot(self, *, candidates, checkpoint, capability_versions, policy, limits, started) -> GovernedCorpusSnapshot:
-        examples, excluded = await self._examples(candidates, policy, limits, started)
+    async def _build_snapshot(self, *, candidates, checkpoint, capability_versions, policy, limits, started, exclusions=None) -> GovernedCorpusSnapshot:
+        examples, excluded = await self._examples(
+            candidates, policy, limits, started, exclusions=exclusions
+        )
         canonical = {
             "schema_version": CORPUS_SCHEMA_VERSION,
             "tenant_id": checkpoint.tenant_id,
@@ -817,6 +1051,11 @@ class GovernedAssertionCorpusService:
             "policy": policy.to_mapping(),
             "examples": [example.content_hash for example in examples],
         }
+        receipt = _receipt_of(exclusions)
+        # Absent without a manifest, so such a corpus keeps the hash it had
+        # before manifests existed.
+        if receipt is not None:
+            canonical["exclusion_manifest"] = receipt.to_mapping()
         snapshot_hash = _digest(canonical)
         observability = GovernedCorpusObservability(
             considered=len(candidates), included=len(examples), excluded=dict(sorted(excluded.items())),
@@ -828,9 +1067,13 @@ class GovernedAssertionCorpusService:
             CorpusCheckpoint(checkpoint.tenant_id, checkpoint.generation, checkpoint.latest_event_id),
             dict(sorted(capability_versions.items())), policy,
             tuple(examples), snapshot_hash, observability,
+            exclusion_manifest=receipt,
         )
 
-    async def _examples(self, candidates, policy, limits, started) -> tuple[list[GovernedCorpusExample], dict[str, int]]:
+    async def _examples(self, candidates, policy, limits, started, *, exclusions=None) -> tuple[list[GovernedCorpusExample], dict[str, int]]:
+        # The host's exclusions decide eligibility; every digest an example
+        # carries stays the consumer's policy digest.
+        governing = _governing_policy(policy, exclusions)
         self._check_time(limits, started)
         validations = dict(
             await self._storage.assertion_validation_statuses(tuple(candidates))
@@ -843,6 +1086,14 @@ class GovernedAssertionCorpusService:
             if isinstance(assertion.lineage, DirectLineage)
         )
         source_cache = await self._source_batch(direct_revision_ids)
+        attestation_cache = await self._attestation_batch(
+            tuple(
+                assertion
+                for assertion in candidates
+                if isinstance(assertion.lineage, DirectLineage)
+            ),
+            source_cache,
+        )
         examples: list[GovernedCorpusExample] = []
         excluded: dict[str, int] = {}
         used_bytes = 0
@@ -854,7 +1105,7 @@ class GovernedAssertionCorpusService:
             )
             reason, sources = await self._govern_lineage(
                 assertion,
-                policy=policy,
+                policy=governing,
                 validation=validation,
                 validation_cache=validations,
                 limits=limits,
@@ -863,6 +1114,7 @@ class GovernedAssertionCorpusService:
                 stack=frozenset(),
                 governed_revisions=governed_revisions,
                 source_cache=source_cache,
+                attestation_cache=attestation_cache,
             )
             if reason is not CorpusEligibilityReason.INCLUDED:
                 excluded[reason.value] = excluded.get(reason.value, 0) + 1
@@ -895,6 +1147,7 @@ class GovernedAssertionCorpusService:
         stack: frozenset[str],
         governed_revisions: set[str],
         source_cache: dict[str, tuple[SourceOccurrence, ...]],
+        attestation_cache: dict[str, SessionAttestation | None],
     ) -> tuple[CorpusEligibilityReason, tuple[SourceOccurrence, ...]]:
         """Enforce policy recursively over exact derivation revisions."""
         self._check_time(limits, started)
@@ -906,11 +1159,17 @@ class GovernedAssertionCorpusService:
                 "max_assertions exhausted by derivation traversal"
             )
         sources: tuple[SourceOccurrence, ...] = ()
+        attestation: SessionAttestation | None = None
         if isinstance(assertion.lineage, DirectLineage):
             if assertion.revision_id not in source_cache:
                 source_cache.update(await self._source_batch((assertion.revision_id,)))
             sources = source_cache.get(assertion.revision_id, ())
-        reason = self._eligibility(assertion, validation, policy, sources)
+            if assertion.revision_id not in attestation_cache:
+                attestation_cache.update(
+                    await self._attestation_batch((assertion,), source_cache)
+                )
+            attestation = attestation_cache[assertion.revision_id]
+        reason = self._eligibility(assertion, validation, policy, sources, attestation)
         if reason is not CorpusEligibilityReason.INCLUDED:
             return reason, ()
         if isinstance(assertion.lineage, DirectLineage):
@@ -975,6 +1234,16 @@ class GovernedAssertionCorpusService:
         )
         if missing_direct_sources:
             source_cache.update(await self._source_batch(missing_direct_sources))
+        missing_attestations = tuple(
+            item
+            for item in inputs
+            if isinstance(item.lineage, DirectLineage)
+            and item.revision_id not in attestation_cache
+        )
+        if missing_attestations:
+            attestation_cache.update(
+                await self._attestation_batch(missing_attestations, source_cache)
+            )
         transitive_sources: dict[str, SourceOccurrence] = {}
         nested_stack = stack.union((assertion.revision_id,))
         for item in inputs:
@@ -992,9 +1261,10 @@ class GovernedAssertionCorpusService:
                 stack=nested_stack,
                 governed_revisions=governed_revisions,
                 source_cache=source_cache,
+                attestation_cache=attestation_cache,
             )
-            if item_reason is CorpusEligibilityReason.EXCLUDED:
-                return CorpusEligibilityReason.EXCLUDED, ()
+            if item_reason in _SESSION_HOLD_OUT_REASONS:
+                return item_reason, ()
             if item_reason is not CorpusEligibilityReason.INCLUDED:
                 return CorpusEligibilityReason.DERIVATION_INPUT, ()
             for source in item_sources:
@@ -1018,9 +1288,12 @@ class GovernedAssertionCorpusService:
         validation: CorpusValidationStatus,
         policy: GovernedCorpusPolicy,
         sources: Sequence[SourceOccurrence],
+        attestation: SessionAttestation | None = None,
     ) -> CorpusEligibilityReason:
-        if policy.excludes(assertion, sources):
+        if policy.excludes(assertion, sources, attestation):
             return CorpusEligibilityReason.EXCLUDED
+        if policy.withholds_unattested(sources, attestation):
+            return CorpusEligibilityReason.SESSION_UNATTESTED
         if assertion.status is not AssertionStatus.ACTIVE:
             return CorpusEligibilityReason.LIFECYCLE
         if validation.state is not ValidationState.CONFORMS or validation.action not in (ValidationWriteAction.ACCEPT, ValidationWriteAction.ACCEPT_WITH_REPORT):
@@ -1065,6 +1338,194 @@ class GovernedAssertionCorpusService:
             for revision_id in normalized
         }
 
+    async def _attestation_batch(
+        self,
+        assertions: Sequence[Assertion],
+        source_cache: Mapping[str, Sequence[SourceOccurrence]],
+    ) -> dict[str, SessionAttestation | None]:
+        """Load the host's session record for direct revisions, ``None`` where it keeps none.
+
+        Read at build time, from the record as it stands, so a stored locator
+        written before the record (or before it grew) never decides alone.
+        """
+        if not assertions:
+            return {}
+        revisions = tuple(
+            (assertion, tuple(source_cache.get(assertion.revision_id, ())))
+            for assertion in assertions
+        )
+        recorded = dict(await self._storage.assertion_session_attestations(revisions))
+        requested = {assertion.revision_id for assertion in assertions}
+        if not set(recorded) <= requested or any(
+            not isinstance(item, SessionAttestation) for item in recorded.values()
+        ):
+            raise GovernedCorpusUnavailable("session_attestations_invalid")
+        return {revision_id: recorded.get(revision_id) for revision_id in requested}
+
+    async def _session_attestation_tombstones(
+        self,
+        snapshot: GovernedCorpusSnapshot,
+        *,
+        policy: GovernedCorpusPolicy,
+        limits: GovernedCorpusLimits,
+        started: float,
+        generation: int,
+        settled_assertion_ids: frozenset[str],
+    ) -> tuple[GovernedCorpusTombstone, ...]:
+        """Withdraw base examples a fresh snapshot would now hold out on their session (#3990).
+
+        A host's session attestations are read when a corpus is built, and
+        they grow without any assertion change: content recorded again,
+        unchanged, in another session attests that session for the same
+        revision, and the change stream says nothing. So every base example
+        the stream left alone, and that is still the current revision, is
+        governed again against the attestations as they stand, by the lineage
+        rules a snapshot uses. One that is now ``explicitly_excluded`` or
+        ``session_unattested`` is tombstoned, and so is an inference built on
+        one. Each incremental read recomputes this against its base, so an
+        attestation that lands during one read is reported by the next.
+
+        Only attestations withdraw an example here, and only a policy that
+        excludes some session consults them. Material newly attested in
+        admitted sessions alone is not added: it stays out of incremental
+        reads until a fresh snapshot admits it.
+        """
+        if not policy.excluded_session_ids:
+            return ()
+        base = {
+            (example.assertion.assertion_id, example.assertion.revision_id)
+            for example in snapshot.examples
+            if example.assertion.assertion_id not in settled_assertion_ids
+        }
+        if not base:
+            return ()
+        assertion_ids = tuple(sorted({assertion_id for assertion_id, _ in base}))
+        if len(assertion_ids) > limits.max_assertions:
+            raise GovernedCorpusBudgetExceeded(
+                "max_assertions exhausted by the base snapshot"
+            )
+        current = sorted(
+            (
+                assertion
+                for assertion in await self._storage.assertion_inference_inputs(
+                    AssertionQuery(assertion_ids=assertion_ids, limit=len(assertion_ids))
+                )
+                if (assertion.assertion_id, assertion.revision_id) in base
+            ),
+            key=lambda item: (item.assertion_id, item.revision_id),
+        )
+        direct = tuple(
+            assertion
+            for assertion in current
+            if isinstance(assertion.lineage, DirectLineage)
+        )
+        source_cache = await self._source_batch(
+            tuple(assertion.revision_id for assertion in direct)
+        )
+        attestation_cache = await self._attestation_batch(direct, source_cache)
+        validation_cache: dict[str, CorpusValidationStatus] = {}
+        governed_revisions: set[str] = set()
+        withdrawn = await self._held_out_on_session(
+            tuple(
+                assertion
+                for assertion in direct
+                if attestation_cache.get(assertion.revision_id) is not None
+            ),
+            policy=policy,
+            limits=limits,
+            started=started,
+            validation_cache=validation_cache,
+            governed_revisions=governed_revisions,
+            source_cache=source_cache,
+            attestation_cache=attestation_cache,
+        )
+        if withdrawn:
+            # Every premise of an included inference was itself included, so
+            # an inference can be withdrawn only when a direct example was.
+            withdrawn.update(
+                await self._held_out_on_session(
+                    tuple(
+                        assertion
+                        for assertion in current
+                        if not isinstance(assertion.lineage, DirectLineage)
+                    ),
+                    policy=policy,
+                    limits=limits,
+                    started=started,
+                    validation_cache=validation_cache,
+                    governed_revisions=governed_revisions,
+                    source_cache=source_cache,
+                    attestation_cache=attestation_cache,
+                )
+            )
+        return tuple(
+            GovernedCorpusTombstone(
+                event_id="session-attestation:"
+                + _digest(
+                    {
+                        "v": 1,
+                        "assertion_id": assertion.assertion_id,
+                        "revision_id": assertion.revision_id,
+                        "reason": withdrawn[assertion.revision_id].value,
+                    }
+                ),
+                assertion_id=assertion.assertion_id,
+                revision_id=assertion.revision_id,
+                operation="session_attestation",
+                generation=generation,
+                reason=withdrawn[assertion.revision_id].value,
+            )
+            for assertion in current
+            if assertion.revision_id in withdrawn
+        )
+
+    async def _held_out_on_session(
+        self,
+        assertions: Sequence[Assertion],
+        *,
+        policy: GovernedCorpusPolicy,
+        limits: GovernedCorpusLimits,
+        started: float,
+        validation_cache: dict[str, CorpusValidationStatus],
+        governed_revisions: set[str],
+        source_cache: dict[str, tuple[SourceOccurrence, ...]],
+        attestation_cache: dict[str, SessionAttestation | None],
+    ) -> dict[str, CorpusEligibilityReason]:
+        """The revisions among ``assertions`` held out on their session, with why.
+
+        Governed exactly as a snapshot governs them; any other outcome is not
+        a session decision and is left to the change stream.
+        """
+        missing = tuple(
+            assertion
+            for assertion in assertions
+            if assertion.assertion_id not in validation_cache
+        )
+        if missing:
+            validation_cache.update(
+                await self._storage.assertion_validation_statuses(missing)
+            )
+        held_out: dict[str, CorpusEligibilityReason] = {}
+        for assertion in assertions:
+            reason, _ = await self._govern_lineage(
+                assertion,
+                policy=policy,
+                validation=validation_cache.get(
+                    assertion.assertion_id, CorpusValidationStatus(None, None)
+                ),
+                validation_cache=validation_cache,
+                limits=limits,
+                started=started,
+                depth=0,
+                stack=frozenset(),
+                governed_revisions=governed_revisions,
+                source_cache=source_cache,
+                attestation_cache=attestation_cache,
+            )
+            if reason in _SESSION_HOLD_OUT_REASONS:
+                held_out[assertion.revision_id] = reason
+        return held_out
+
     @staticmethod
     def _tombstone_reason(operation: str) -> str:
         """Preserve the persisted invalidation cause without inventing one."""
@@ -1101,8 +1562,10 @@ class GovernedAssertionCorpusService:
 
 __all__ = [
     "CORPUS_SCHEMA_VERSION", "CorpusCheckpoint", "CorpusEligibilityDecision", "CorpusEligibilityReason",
-    "CorpusValidationStatus", "GovernedAssertionCorpusService", "GovernedCorpusBudgetExceeded",
-    "GovernedCorpusDelta", "GovernedCorpusError", "GovernedCorpusExample", "GovernedCorpusLimits",
-    "GovernedCorpusObservability", "GovernedCorpusPolicy", "GovernedCorpusSnapshot",
-    "GovernedCorpusStorage", "GovernedCorpusTombstone", "GovernedCorpusUnavailable",
+    "CorpusExclusionReceipt", "CorpusValidationStatus", "GovernedAssertionCorpusService",
+    "GovernedCorpusBudgetExceeded", "GovernedCorpusDelta", "GovernedCorpusError",
+    "GovernedCorpusExample", "GovernedCorpusLimits", "GovernedCorpusObservability",
+    "GovernedCorpusPolicy", "GovernedCorpusSnapshot", "GovernedCorpusStorage",
+    "GovernedCorpusTombstone", "GovernedCorpusUnavailable", "HostCorpusExclusions",
+    "SessionAttestation",
 ]

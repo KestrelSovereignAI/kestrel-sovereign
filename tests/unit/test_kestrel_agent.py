@@ -38,10 +38,17 @@ from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
 from kestrel_sovereign.signals import DurableSignalStore
 from tests.utils.aiosqlite_workers import (
+    CloseStage,
     aiosqlite_worker,
     delay_aiosqlite_worker_exit,
+    observe_bounded_close_stages,
     wait_for_lifecycle_checkpoint,
     wait_until_aiosqlite_worker_exit_is_delayed,
+)
+from tests.utils.virtual_clock import (
+    await_within_hang_guard,
+    observe_asyncio_waits,
+    pinned_loop_clock,
 )
 
 
@@ -537,19 +544,13 @@ class TestPrivacyMode:
         assert agent.privacy_mode == PrivacyMode.ANONYMOUS
 
     @pytest.mark.asyncio
-    async def test_set_privacy_mode_changes_internal_state(self, tmp_path):
+    async def test_set_privacy_mode_changes_internal_state(self, tmp_path, native_tool_effect_agent):
         """set_privacy_mode() updates internal _privacy_mode."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL
-        )
+        agent = await native_tool_effect_agent(did="did:test:123")
 
-        # Mock storage and privacy agent (since not initialized)
-        agent.storage = MagicMock()
-        agent.storage.set_privacy_mode = MagicMock()
-        agent.privacy_agent = MagicMock()
-        agent.privacy_agent.set_mode = MagicMock()
+        # Observe the actual storage and policy transitions without replacing ownership.
+        agent.storage.set_privacy_mode = MagicMock(wraps=agent.storage.set_privacy_mode)
+        agent.privacy_agent.set_mode = MagicMock(wraps=agent.privacy_agent.set_mode)
         agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
 
         await agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
@@ -558,21 +559,18 @@ class TestPrivacyMode:
         assert agent.privacy_mode == PrivacyMode.EPHEMERAL
 
     @pytest.mark.asyncio
-    async def test_set_privacy_mode_updates_storage_wrapper(self, tmp_path):
+    async def test_set_privacy_mode_updates_storage_wrapper(self, tmp_path, native_tool_effect_agent):
         """set_privacy_mode() updates storage wrapper if initialized."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db")
-        )
+        agent = await native_tool_effect_agent(did="did:test:123")
 
         # Mock storage to verify call
-        mock_storage = MagicMock()
-        mock_storage.set_privacy_mode = MagicMock()
+        mock_storage = agent.storage
+        mock_storage.set_privacy_mode = MagicMock(wraps=mock_storage.set_privacy_mode)
         agent.storage = mock_storage
 
         # Mock privacy agent
-        mock_privacy_agent = MagicMock()
-        mock_privacy_agent.set_mode = MagicMock()
+        mock_privacy_agent = agent.privacy_agent
+        mock_privacy_agent.set_mode = MagicMock(wraps=mock_privacy_agent.set_mode)
         mock_privacy_agent.evaluate_transition = _no_confirm_evaluate()
         agent.privacy_agent = mock_privacy_agent
 
@@ -584,7 +582,7 @@ class TestPrivacyMode:
     @pytest.mark.asyncio
     async def test_storage_refusal_returns_retryable_non_applied_transition(
         self,
-        tmp_path,
+        tmp_path,native_tool_effect_agent
     ):
         """An in-flight durable fact cannot leave agent/privacy state split."""
         from kestrel_sovereign.storage.privacy_wrapper import (
@@ -592,16 +590,10 @@ class TestPrivacyMode:
             PrivacyViolationError,
         )
 
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL,
-        )
-        agent.storage = MagicMock()
-        agent.storage.set_privacy_mode.side_effect = PrivacyViolationError(
-            "explicit semantic fact operation is in flight"
-        )
-        agent.privacy_agent = MagicMock()
+        agent = await native_tool_effect_agent(did="did:test:123")
+        agent.storage.set_privacy_mode = MagicMock(side_effect=PrivacyViolationError(
+            "explicit semantic fact operation is in flight"))
+        agent.privacy_agent.set_mode = MagicMock(wraps=agent.privacy_agent.set_mode)
         agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
 
         result = await agent.set_privacy_mode_with_effects(
@@ -615,20 +607,22 @@ class TestPrivacyMode:
         agent.privacy_agent.set_mode.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path):
+    async def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path, native_tool_effect_agent):
         """set_privacy_mode() returns the canonical privacy-agent status message."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL,
-        )
+        agent = await native_tool_effect_agent(did="did:test:123")
 
-        mock_storage = MagicMock()
-        mock_storage.set_privacy_mode = MagicMock()
+        mock_storage = agent.storage
+        mock_storage.set_privacy_mode = MagicMock(wraps=mock_storage.set_privacy_mode)
         agent.storage = mock_storage
 
-        mock_privacy_agent = MagicMock()
-        mock_privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed from normal to isolated.")
+        mock_privacy_agent = agent.privacy_agent
+        original_set_mode = mock_privacy_agent.set_mode
+
+        def reported_transition(mode):
+            original_set_mode(mode)
+            return "Privacy mode changed from normal to isolated."
+
+        mock_privacy_agent.set_mode = MagicMock(side_effect=reported_transition)
         mock_privacy_agent.evaluate_transition = _no_confirm_evaluate()
         agent.privacy_agent = mock_privacy_agent
 
@@ -1688,7 +1682,7 @@ class TestLifecycle:
         shutdown paths. If a feature shutdown is cancelled by the outer
         timeout, the sweep must NOT report a successful shutdown — but it
         must also NOT skip the safety-critical durable cleanup tail
-        (background-task cleanup, memory shutdown, final sync snapshot,
+        (background-task cleanup, memory shutdown, owed-snapshot record,
         storage close). So storage MUST still close, and CancelledError
         MUST still propagate so wait_for surfaces the timeout.
         """
@@ -2811,7 +2805,7 @@ class TestLifecycle:
 
     @pytest.mark.asyncio
     async def test_sqlite_storage_close_reserves_worker_deadline_under_short_tail_guard(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         """A delayed SQLAlchemy disposal cannot steal SQLite's worker guard.
 
@@ -2821,6 +2815,11 @@ class TestLifecycle:
         following primary close retains the backend's declared worker-drain
         reservation and leaves no late callback for a closed event loop.
         """
+        import math
+
+        import kestrel_sovereign.storage.db.sqlite as sqlite_module
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        from kestrel_sovereign.kestrel_agent import await_agent_shutdown_completion
         from kestrel_sovereign.storage.sqla import make_session_factory
 
         release_worker = threading.Event()
@@ -2832,6 +2831,13 @@ class TestLifecycle:
         loop_errors = []
         worker = None
         shutdown_task = None
+        agent = None
+        clock = None
+        close_owner = None
+        preclose_owner = None
+        schedule = contextlib.ExitStack()
+        failures = []
+        withdrawals = []
 
         def capture_loop_error(active_loop, context):
             loop_errors.append(context)
@@ -2867,10 +2873,9 @@ class TestLifecycle:
                 assert connection is not None
                 worker = aiosqlite_worker(connection)
 
-                # Populate the production cache with a real file-backed
-                # SQLAlchemy factory, then delay its disposal.  Cancellation
-                # of this pre-close still disposes the engine in ``finally``;
-                # the test is about preserving the *next* SQLite close guard.
+                # Populate the real file-backed factory cache. Hold its SAME
+                # close owner beyond the finite pre-close observer guard,
+                # then let it finish; no abandoned observer is a native ACK.
                 factory = make_session_factory(raw_storage.db)
                 factory_close = factory.close
 
@@ -2891,12 +2896,75 @@ class TestLifecycle:
                 agent._sync_service = None
                 agent.storage = PrivacyEnforcingStorage(raw_storage, PrivacyMode.NORMAL)
 
+                from kestrel_sovereign import _async_ownership
+
+                original_create = _async_ownership.create_owned_task
+                native_closers = []
+                primary_admitted = asyncio.Event()
+
+                def observe_native_admission(*args, **kwargs):
+                    owner = original_create(*args, **kwargs)
+                    if kwargs.get("retirement_resource") is agent.storage:
+                        native_closers.append(owner)
+                        if len(native_closers) == 2:
+                            primary_admitted.set()
+                    return owner
+
+                monkeypatch.setattr(_async_ownership, "create_owned_task", observe_native_admission)
+                original_close = agent.storage.close
+                original_preclose = agent.storage.dispose_cached_sqla_factory
+
+                async def observe_close():
+                    nonlocal close_owner
+                    close_owner = asyncio.current_task()
+                    return await original_close()
+
+                async def observe_preclose():
+                    nonlocal preclose_owner
+                    preclose_owner = asyncio.current_task()
+                    return await original_preclose()
+
+                monkeypatch.setattr(agent.storage, "close", observe_close)
+                monkeypatch.setattr(
+                    agent.storage, "dispose_cached_sqla_factory", observe_preclose,
+                )
+                clock = schedule.enter_context(pinned_loop_clock())
+                bounded_waits = schedule.enter_context(observe_asyncio_waits())
+                stages = schedule.enter_context(observe_bounded_close_stages())
                 shutdown_task = asyncio.create_task(agent.shutdown())
                 await wait_for_lifecycle_checkpoint(
                     factory_disposal_started.wait(),
                     shutdown_task,
                     description="SQLAlchemy factory disposal started",
                 )
+                assert native_closers == [preclose_owner], (
+                    "Wrapped native pre-close was admitted without its original retirement resource"
+                )
+                preclose_bounds = [
+                    timeout for originals, timeout in bounded_waits
+                    if preclose_owner in originals
+                ]
+                assert len(preclose_bounds) == 1 and preclose_bounds[0] is not None
+                # Cross the actual original pre-close guard by one clock ULP,
+                # not by waiting for a loaded test continuation to wake up.
+                # Keep the native factory owner until that guard has fired.
+                crossed = asyncio.Event()
+                boundary = math.nextafter(clock.time() + preclose_bounds[0], math.inf)
+                barrier = loop.call_at(boundary, crossed.set)
+                try:
+                    clock.advance(boundary - clock.time())
+                    await await_within_hang_guard(
+                        crossed.wait(), step="the original pre-close guard expiring",
+                    )
+                finally:
+                    barrier.cancel()
+                await await_within_hang_guard(
+                    primary_admitted.wait(), step="original native primary close admission",
+                )
+                assert len(native_closers) == 2
+                assert native_closers[0] is preclose_owner and not preclose_owner.done()
+                assert preclose_owner in agent._durable_shutdown_tail_tasks
+                allow_factory_disposal.set()
                 await wait_for_lifecycle_checkpoint(
                     wait_until_aiosqlite_worker_exit_is_delayed(
                         worker_exit_delayed,
@@ -2904,28 +2972,65 @@ class TestLifecycle:
                     shutdown_task,
                     description="SQLite worker exit was delayed",
                 )
+                await stages.reached(connection, CloseStage.WORKER_EXIT)
                 assert workers == [worker]
                 assert not shutdown_task.done()
 
-                # The old single storage guard would spend its 0.02s fair
-                # share in factory disposal and abandon this close.  The
-                # split phases keep the primary worker close pending instead.
-                await asyncio.sleep(0.04)
-                assert not shutdown_task.done()
-
-                release_worker.set()
-                allow_factory_disposal.set()
-                await asyncio.wait_for(shutdown_task, timeout=1.0)
-                assert not worker.is_alive()
+                close_bounds = [
+                    timeout for originals, timeout in bounded_waits
+                    if close_owner in originals
+                ]
+                assert len(close_bounds) == 1 and close_bounds[0] is not None
+                # This is the timeout actually passed for this SAME original
+                # storage close, not elapsed time or a different tail step.
+                minimum = sqlite_module.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
+                assert (
+                    close_bounds[0] >= minimum
+                    or close_bounds[0] == pytest.approx(minimum)
+                ), close_bounds
+                assert worker.is_alive()
+        except BaseException as failure:  # noqa: BLE001 - preserve the original test/control through every independent native join
+            failures.append(failure)
         finally:
             release_worker.set()
             allow_factory_disposal.set()
-            if shutdown_task is not None and not shutdown_task.done():
-                await asyncio.wait_for(shutdown_task, timeout=1.0)
-            if worker is not None:
-                worker.join(timeout=1.0)
-            loop.set_exception_handler(prior_handler)
+            try:
+                if worker is not None:
+                    await await_within_hang_guard(
+                        asyncio.to_thread(worker.join, _HANG_GUARD_SECONDS),
+                        step="the SAME delayed SQLite worker physically retiring",
+                    )
+                    assert not worker.is_alive()
+            except BaseException as failure:  # noqa: BLE001 - a failed physical join must not skip the remaining original owners
+                failures.append(failure)
+            try:
+                if clock is not None:
+                    # Only after the real worker joined, wake its existing
+                    # native retirement poll inside the unchanged deadline.
+                    clock.advance(sqlite_module._AIOSQLITE_WORKER_SHUTDOWN_POLL_S * 1.1)
+                if shutdown_task is not None:
+                    await await_within_hang_guard(
+                        shutdown_task, step="the original agent shutdown settling",
+                    )
+            except BaseException as failure:  # noqa: BLE001 - retain the finite shutdown failure without skipping native completion
+                failures.append(failure)
+            try:
+                if agent is not None:
+                    await await_within_hang_guard(
+                        await_agent_shutdown_completion(
+                            agent, withdrawals=withdrawals, finite_errors=failures,
+                        ),
+                        step="all original agent-native cleanup owners settling",
+                    )
+            except BaseException as failure:  # noqa: BLE001 - compose every actual cleanup original, never claim a successful native join
+                failures.append(failure)
+            finally:
+                schedule.close()
+                loop.set_exception_handler(prior_handler)
 
+        terminal = execution_observation_error(*failures, *withdrawals)
+        if terminal is not None:
+            raise terminal
         assert worker is not None and not worker.is_alive()
         assert not any(
             "Event loop is closed" in str(context) for context in loop_errors
@@ -3099,16 +3204,6 @@ class TestLifecycle:
         agent._sync_service = None
         agent.storage = OversizedCloseStorage()
 
-        real_wait = asyncio.wait
-        bounded_waits = []
-
-        async def recording_wait(
-            aws, *, timeout=None, return_when=asyncio.ALL_COMPLETED
-        ):
-            aws = set(aws)
-            bounded_waits.append((aws, timeout))
-            return await real_wait(aws, timeout=timeout, return_when=return_when)
-
         with patch(
             "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
             budget,
@@ -3118,7 +3213,7 @@ class TestLifecycle:
         ), patch(
             "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
             0.01,
-        ), patch.object(asyncio, "wait", recording_wait):
+        ), observe_asyncio_waits() as bounded_waits:
             shutdown_task = asyncio.create_task(agent.shutdown())
             try:
                 await asyncio.wait_for(
@@ -3144,38 +3239,43 @@ class TestLifecycle:
                     )
 
     @pytest.mark.asyncio
-    async def test_cancellation_during_force_snapshot_completes_it_and_stops(
+    async def test_cancellation_during_owed_record_completes_it_and_stops(
         self, tmp_path
     ):
-        """Cancellation during force_snapshot: snapshot completes, stop() runs (#2409).
+        """Cancellation during the owed-snapshot record: it completes, stop() runs.
 
-        The final snapshot is shielded so cancellation neither aborts it nor
+        Shutdown uploads no snapshot (#4028); it records the remote snapshot
+        as owed. The record is shielded so cancellation neither aborts it nor
         skips the following ``stop()`` (which releases the sync worker), while
-        cancellation still propagates out of ``shutdown()``.
+        cancellation still propagates out of ``shutdown()`` (#2409).
         """
         agent = KestrelAgent(
             did="did:test:123",
             storage_path=str(tmp_path / "test.db"),
         )
 
-        snapshot_completed = asyncio.Event()
+        recorded = asyncio.Event()
         stop_called = asyncio.Event()
 
-        async def _slow_snapshot():
+        async def _slow_record():
             await asyncio.sleep(0.1)
-            snapshot_completed.set()
+            recorded.set()
+            return True
 
         async def _stop():
             stop_called.set()
 
         sync = MagicMock()
         sync.is_running = True
-        sync.force_snapshot = _slow_snapshot
+        sync.force_snapshot = AsyncMock(
+            side_effect=AssertionError("shutdown started a remote snapshot upload")
+        )
+        sync.record_remote_snapshot_owed = _slow_record
         sync.stop = _stop
         agent._sync_service = sync
 
         # A feature that cancels the whole shutdown, so cancellation is in
-        # flight when the durable tail (and its force_snapshot) runs.
+        # flight when the durable tail (and its owed record) runs.
         cancelling = MagicMock()
         cancelling.shutdown = AsyncMock(side_effect=asyncio.CancelledError())
         agent.features = {"Canceller": cancelling}
@@ -3188,8 +3288,10 @@ class TestLifecycle:
         with pytest.raises(asyncio.CancelledError):
             await agent.shutdown()
 
-        # Snapshot was NOT aborted by the in-flight cancellation...
-        assert snapshot_completed.is_set()
+        # The record was NOT aborted by the in-flight cancellation...
+        assert recorded.is_set()
+        # ...no upload started...
+        sync.force_snapshot.assert_not_awaited()
         # ...and stop() still ran...
         assert stop_called.is_set()
         # ...and storage still closed...
@@ -3280,8 +3382,10 @@ class TestLifecycle:
                 storage_close + ka.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S
             )
 
-        assert storage_close == pytest.approx(1.01)
-        assert (prefix, reserve) == pytest.approx((3.49, 1.51))
+        # One renewal attempt the close joins (#4040), then one worker
+        # shutdown window and its poll interval.
+        assert storage_close == pytest.approx(1.11)
+        assert (prefix, reserve) == pytest.approx((3.39, 1.61))
 
 
 # =============================================================================

@@ -2361,6 +2361,21 @@ class TestServerCommand:
             process_manager.SERVER_TERMINATE_TIMEOUT_SECONDS,
         )
 
+    def test_the_stop_and_the_lifespan_share_one_budget(self):
+        """``kestrel terminate``'s SIGKILL wait and the lifespan's deadline for
+        retained remote work come from one value (#4028), and the lifespan's
+        deadline leaves the graceful window and a reserve before SIGKILL."""
+        budget = process_manager.HOST_SHUTDOWN_BUDGET_SECONDS
+        assert process_manager.SERVER_TERMINATE_TIMEOUT_SECONDS == budget
+        assert process_manager.HOST_SHUTDOWN_REMOTE_WORK_SECONDS == (
+            budget - process_manager.HOST_SHUTDOWN_RESERVE_SECONDS
+        )
+        assert process_manager.HOST_SHUTDOWN_REMOTE_WORK_SECONDS > 0
+        assert (
+            process_manager.HOST_SHUTDOWN_RESERVE_SECONDS
+            > process_manager.SERVER_GRACEFUL_SHUTDOWN_SECONDS
+        )
+
     def test_start_agent_launches_the_server_command(self, pm):
         cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
         mock_process = MagicMock()

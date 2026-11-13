@@ -19,7 +19,7 @@ privacy: public
 > *"Slow is smooth, smooth is fast."*
 
 This is the canonical statement of how we build Kestrel Sovereign. The repo's
-[AGENTS.md](../AGENTS.md) and [CLAUDE.md](../CLAUDE.md) both link here — read
+[AGENTS.md](../AGENTS.md) links here — read
 this file once at the start of every session.
 
 ---

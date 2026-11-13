@@ -95,6 +95,7 @@ class _RecordingAdapter:
         if self.fail_with is not None:
             raise self.fail_with
         yield f"{self.name} streamed as {model}"
+        yield LLMResponse(stop_reason="stop", input_tokens=1, output_tokens=1, total_tokens=2)
 
 
 def _route(name, model, adapter, *, is_local=False):

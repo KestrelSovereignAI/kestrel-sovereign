@@ -91,7 +91,10 @@ async def test_active_forwarder_close_preserves_cancellation_carried_control(out
         result = (await asyncio.gather(advance, return_exceptions=True))[0]
         assert execution_commit_outcome(result) == outcome
     finally:
-        await stream.aclose()
+        from kestrel_sovereign._async_ownership import await_owned_operation
+        repeated = await await_owned_operation(stream.aclose(), retain_originals=True)
+        assert evidence in tuple(_explicit_control_chain(repeated.error))
+        assert execution_commit_outcome(repeated.error) == outcome
         if advance is not None:
             if not advance.done():
                 advance.cancel()

@@ -434,7 +434,14 @@ async def test_auxiliary_owner_trigger_refuses_before_planning(step_host):
 async def test_replacement_runtime_same_id_native_claim_serializes_old_writer(
     step_host, monkeypatch, at
 ):
-    """Absence never suffices: only one of TWO genuine native INSERTs ACKs."""
+    """Absence never suffices: only one of TWO genuine native INSERTs ACKs.
+
+    On SQLite every transaction begins IMMEDIATE (#4040, the P2-2 ruling), so
+    with old's INSERT uncommitted the second runtime's claim waits for the
+    writer slot and never reads the action's absence. Once old commits, it
+    meets the finished record exactly as a sequential call does: old's result
+    back, no planner call of its own, still one row.
+    """
     from contextlib import asynccontextmanager
 
     from kestrel_sovereign.visual_computer.repository import VisualCustodyRepository
@@ -532,7 +539,14 @@ async def test_replacement_runtime_same_id_native_claim_serializes_old_writer(
                 )
             )
             tasks.append(new)
-            await asyncio.wait_for(new_absent.wait(), 3)
+            serialized_at_begin = (
+                at == "before-commit" and h.store.db.backend_type == "sqlite"
+            )
+            if serialized_at_begin:
+                await asyncio.sleep(0.03)
+                assert not new_absent.is_set(), "a claim read past old's open write"
+            else:
+                await asyncio.wait_for(new_absent.wait(), 3)
             if at == "before-insert":
                 assert (await asyncio.wait_for(asyncio.shield(new), 3))[
                     "answer"
@@ -543,7 +557,13 @@ async def test_replacement_runtime_same_id_native_claim_serializes_old_writer(
                 assert not new.done() and not calls
             resume.set()
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            assert sum(type(result) is dict for result in results) == 1
+            if serialized_at_begin:
+                assert [
+                    result.get("answer") if type(result) is dict else result
+                    for result in results
+                ] == ["old", "old"]
+            else:
+                assert sum(type(result) is dict for result in results) == 1
             assert calls == (["new"] if at == "before-insert" else ["old"])
             row = await other_store.action(
                 other.scope(h.ctx), h.session.session_id, "stable-native"

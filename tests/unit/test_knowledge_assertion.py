@@ -41,6 +41,8 @@ from kestrel_sovereign.knowledge import (
     identity_preimage,
     normalize_iri,
     source_reference_segment,
+    with_source_reference,
+    without_source_references,
 )
 
 
@@ -287,6 +289,30 @@ def test_source_locator_names_saved_items_and_sessions_by_exact_id() -> None:
         source_reference_segment("conversation", session)
     with pytest.raises(AssertionValidationError):
         source_reference_segment(SourceReferenceKind.SAVED_ITEM, "")
+
+
+def test_a_reference_is_appended_after_the_producer_locator_and_strips_by_kind() -> None:
+    session = "dcd6f767-829d-4a7d-b8c7-d7a722e5de13"
+    item = "did:example:ava:imported#notes/1"
+    stem = "POST:/api/agent/invoke#tool:memory_agency.save_fact#op-1"
+
+    named = with_source_reference(stem, SourceReferenceKind.SESSION, session)
+    both = with_source_reference(named, "saved-item", item)
+
+    assert named == f"{stem}#session:{session}"
+    assert named.startswith(stem)
+    assert with_source_reference(stem, SourceReferenceKind.SESSION, None) == stem
+    assert without_source_references(both, SourceReferenceKind.SESSION) == (
+        f"{stem}#{source_reference_segment(SourceReferenceKind.SAVED_ITEM, item)}"
+    )
+    assert without_source_references(both, "saved-item") == named
+    assert without_source_references(stem, SourceReferenceKind.SESSION) == stem
+    # A segment that only looks like a reference names nothing and stays.
+    assert without_source_references(f"{stem}#session:", "session") == f"{stem}#session:"
+    with pytest.raises(AssertionValidationError):
+        with_source_reference(stem, SourceReferenceKind.SESSION, "")
+    with pytest.raises(AssertionValidationError):
+        without_source_references(stem, "conversation")
 
 
 def test_direct_and_derived_provenance_round_trip_including_derivation_reference() -> None:

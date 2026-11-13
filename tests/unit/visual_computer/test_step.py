@@ -9,6 +9,84 @@ from tests.unit.visual_computer.test_inference import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('revoke', [False, True], ids=['live-consumer', 'revoked-consumer'])
+async def test_current_native_claim_queued_before_later_stream_consumer_checks_it_at_commit(inference, monkeypatch, revoke):
+    import asyncio
+    import threading
+    from kestrel_sovereign._async_ownership import await_owned_operation, await_owned_task, create_owned_task, raise_owned_outcome
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, ProcessRuntimeExecutionFence, bind_execution_custody_snapshot,
+        execution_stream, is_execution_control_error, _explicit_control_chain,
+    )
+
+    x, children, queued, occupied = inference, [], asyncio.Event(), asyncio.Event()
+    h, ctx = x.h, x.ctx
+    connection = h.db.backend._connection
+    original_execute = connection._execute
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    physical, stage = [], False
+    planning, planned = RuntimeError('original native claim reached planner boundary'), []
+    def occupy():
+        loop.call_soon_threadsafe(occupied.set)
+        assert release.wait(10), 'Owned native SQLite queue was not released'
+    async def execute(function, *args, **kwargs):
+        nonlocal stage
+        current = getattr(connection._conn, '_current_row_owner', None)
+        if (not stage and getattr(function, '__name__', '') == 'commit'
+                and type(current).__name__ == '_CurrentVisualStepMutation'):
+            stage = True
+            blocker = create_owned_task(original_execute(occupy), retain_originals=True)
+            physical.append(blocker)
+            await occupied.wait()
+            committing = create_owned_task(original_execute(function, *args, **kwargs), retain_originals=True)
+            physical.append(committing)
+            await asyncio.sleep(0)
+            queued.set()
+            return raise_owned_outcome(await await_owned_task(committing), operation='original queued SQLite COMMIT', retain_originals=True)
+        return await original_execute(function, *args, **kwargs)
+    monkeypatch.setattr(connection, '_execute', execute)
+    async def plan(owner):
+        planned.append(owner)
+        raise planning
+    async def original_step():
+        with h.bind(ctx):
+            return await run_step(h.runtime, ctx, x.session.session_id, 'queued-original-step', 'Task',
+                planner=plan, configuration={}, configuration_current=lambda: None)
+    async def source():
+        child = create_owned_task(original_step(), retain_originals=True)
+        children.append(child)
+        try:
+            await queued.wait()
+            yield b'first'
+            yield b'second'
+        finally:
+            await await_owned_task(child)
+    later = ExecutionCustody(ProcessRuntimeExecutionFence('later-original-visual-consumer'))
+    stream = execution_stream(None, source())
+    try:
+        assert await anext(stream) == b'first'
+        with bind_execution_custody_snapshot((later,)):
+            assert await anext(stream) == b'second'
+        if revoke:
+            later.revoke('later original consumer retired before native COMMIT')
+        release.set()
+        outcome = await await_owned_task(children[0])
+        if revoke:
+            assert is_execution_control_error(outcome.error) and not planned
+        else:
+            assert planning in tuple(_explicit_control_chain(outcome.error)) and len(planned) == 1
+        actual = await h.db.fetchval('SELECT COUNT(*) FROM visual_computer_actions')
+        assert actual == (0 if revoke else 1), (
+            'Native current-row COMMIT discarded a later original consumer restriction', actual)
+    finally:
+        release.set()
+        for task in [*children, *physical]:
+            await await_owned_task(task)
+        await await_owned_operation(stream.aclose(), retain_originals=True)
+
+
 async def step(
     x, ctx, sid, *, identifier="stable-step", prompt="Click once", calls=None
 ):

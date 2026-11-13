@@ -35,10 +35,35 @@ from kestrel_sovereign.kestrel_agent import (
 from tests.integration.test_lighthouse_snapshot_original_control import (
     native_snapshot as native_snapshot,
 )
+from tests.utils.virtual_clock import await_within_hang_guard
+
+
+async def _observe_retained_native_tail(agent, checkpoint, *, step, state=None):
+    """Observe actual native progress AFTER the finite observer has returned.
+
+    A bounded observer can expire before HTTP reaches its peer. That does not
+    retire, cancel or replace its already-admitted original. Wait separately
+    for the real peer/closer checkpoint, retaining those same original Tasks;
+    this test observation never renews the production tail budget.
+    """
+    originals = frozenset(agent._durable_shutdown_tail_tasks)
+    assert originals and any(not task.done() for task in originals), (
+        "the finite observer must retain its pending native originals"
+    )
+    if state is not None:
+        state["upload_admission_barrier"].set()
+    await await_within_hang_guard(checkpoint.wait(), step=step)
+    assert originals <= agent._durable_shutdown_tail_tasks, (
+        "native progress replaced or forgot an original tail owner"
+    )
+    assert any(not task.done() for task in originals), (
+        "native retirement was reported before the held peer/close ACK"
+    )
+    return originals
 
 
 @pytest_asyncio.fixture
-async def prepared_tail(native_snapshot, tmp_path):
+async def prepared_tail(native_snapshot, tmp_path, request):
     (
         db,
         target,
@@ -66,9 +91,20 @@ async def prepared_tail(native_snapshot, tmp_path):
     )
     assert agent.storage is None
     agent._sync_service = service
+    admission = asyncio.Event()
+    if not getattr(request, "param", False):
+        admission.set()
+    state["upload_admission_barrier"] = admission
+    # The tail starts no upload (#4028); a scheduled backup still in flight
+    # when it runs is the snapshot its sync-stop retains.
+    state["inflight_snapshot"] = create_owned_task(
+        service.force_snapshot(), retain_originals=True
+    )
+    tasks.append(state["inflight_snapshot"])
     try:
         yield agent, native_snapshot
     finally:
+        admission.set()
         state["release_server"].set()
         release_close.set()
         tasks.extend(agent._durable_shutdown_tail_tasks)
@@ -77,6 +113,7 @@ async def prepared_tail(native_snapshot, tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("close_fails", [False, True])
 @pytest.mark.parametrize("cancel_waiter", [False, True])
+@pytest.mark.parametrize("prepared_tail", [False, True], indirect=True, ids=["ready-admission", "held-admission"])
 async def test_tail_deadline_joins_original_snapshot_and_preserves_actual_close_failure(
     prepared_tail, close_fails, cancel_waiter
 ):
@@ -99,7 +136,11 @@ async def test_tail_deadline_joins_original_snapshot_and_preserves_actual_close_
     try:
         cancelled, degraded = await agent._run_durable_shutdown_tail(0.15)
         tasks.extend(agent._durable_shutdown_tail_tasks)
-        assert not cancelled and degraded and entered.is_set()
+        assert not cancelled and degraded
+        originals = await _observe_retained_native_tail(
+            agent, entered, step="the original retained snapshot reaching its real HTTP peer", state=state,
+        )
+        assert entered.is_set()
         assert agent._durable_shutdown_tail_tasks
         assert any(not task.done() for task in agent._durable_shutdown_tail_tasks)
         assert not source_errors, "Observation deadline cancelled the original upload"
@@ -122,6 +163,7 @@ async def test_tail_deadline_joins_original_snapshot_and_preserves_actual_close_
         assert close_entered.is_set() and close_tasks
         assert all(task.done() for task in close_tasks)
         assert not agent._durable_shutdown_tail_tasks
+        assert all(task.done() for task in originals)
         assert all(
             client._client is None or client._client.is_closed for client in clients
         )
@@ -151,6 +193,7 @@ async def test_tail_deadline_joins_original_snapshot_and_preserves_actual_close_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prepared_tail", [False, True], indirect=True, ids=["ready-admission", "held-admission"])
 async def test_tail_callback_publication_failure_keeps_accepted_original_work(
     prepared_tail,
 ):
@@ -193,6 +236,9 @@ async def test_tail_callback_publication_failure_keeps_accepted_original_work(
             await agent._run_durable_shutdown_tail(0.15)
         assert caught.value is failure
         assert accepted and accepted[0] in agent._durable_shutdown_tail_tasks
+        originals = await _observe_retained_native_tail(
+            agent, entered, step="the callback-retained original snapshot reaching its real HTTP peer", state=state,
+        )
         assert entered.is_set() and not source_errors and not close_entered.is_set()
         assert vars(agent).get("_shutdown_control") is None
     finally:
@@ -202,10 +248,12 @@ async def test_tail_callback_publication_failure_keeps_accepted_original_work(
     await agent.wait_for_shutdown_completion()
     assert not agent._durable_shutdown_tail_tasks
     assert accepted[0].done()
+    assert all(task.done() for task in originals)
     assert all(client._client is None or client._client.is_closed for client in clients)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prepared_tail", [False, True], indirect=True, ids=["ready-admission", "held-admission"])
 async def test_native_close_can_observe_completion_without_joining_its_own_parent(
     prepared_tail,
 ):
@@ -232,12 +280,17 @@ async def test_native_close_can_observe_completion_without_joining_its_own_paren
 
     state["close_probe"] = observe_from_original_closer
     cancelled, degraded = await agent._run_durable_shutdown_tail(0.15)
-    assert not cancelled and degraded and entered.is_set()
+    assert not cancelled and degraded
+    originals = await _observe_retained_native_tail(
+        agent, entered, step="the self-observing original closer's snapshot reaching its real HTTP peer", state=state,
+    )
+    assert entered.is_set()
     state["release_server"].set()
     release_close.set()
     await asyncio.wait_for(agent.wait_for_shutdown_completion(), 3)
     assert observed and all(task in close_tasks for task in observed)
     assert not agent._durable_shutdown_tail_tasks
+    assert all(task.done() for task in originals)
     assert vars(agent).get("_shutdown_control") is None
 
 
@@ -264,6 +317,9 @@ async def test_late_native_callback_cancellation_is_retained_as_original_source(
     state["upload_failure_as_cancel"] = True
     state["release_server"].set()
     await agent._run_durable_shutdown_tail(0.15)
+    originals = await _observe_retained_native_tail(
+        agent, close_entered, step="the original failed upload reaching its real native-close boundary",
+    )
     assert close_entered.is_set() and source_errors
     original = source_errors[0]
     assert (
@@ -275,6 +331,7 @@ async def test_late_native_callback_cancellation_is_retained_as_original_source(
     )
     tasks.append(waiter)
     outcome = await await_owned_task(waiter)
+    assert all(task.done() for task in originals)
     assert original in tuple(_explicit_control_chain(outcome.error))
     assert original in tuple(
         _explicit_control_chain(vars(agent).get("_shutdown_control"))
@@ -644,16 +701,19 @@ async def test_borrowed_withdrawal_cannot_drop_a_completed_original_tail_failure
     agent, case = prepared_tail
     service, release_close, state, tasks = case[2], case[5], case[-2], case[-1]
     state["close_error"] = None
-    original_snapshot = service.force_snapshot
-    source = OSError("original snapshot finalizer failed after native HTTP close")
+    original_record = service.record_remote_snapshot_owed
+    source = OSError("original owed-record finalizer failed after native HTTP close")
     originals = []
 
-    async def snapshot():
+    async def record():
+        # A tail step retained past its guard while the in-flight snapshot
+        # finishes its native HTTP close, then failing ordinarily.
         originals.append(asyncio.current_task())
-        await original_snapshot()
+        await original_record()
+        await asyncio.wait({state["inflight_snapshot"]})
         raise source
 
-    monkeypatch.setattr(service, "force_snapshot", snapshot)
+    monkeypatch.setattr(service, "record_remote_snapshot_owed", record)
     await agent._run_durable_shutdown_tail(0.15)
     assert originals and originals[0] in agent._durable_shutdown_tail_tasks
     backend = SQLiteBackend(":memory:")
@@ -735,7 +795,7 @@ async def test_refused_completion_fallback_resnapshots_a_new_original_native_chi
     )
     children = []
     timeline = []
-    actual_snapshot = service.force_snapshot
+    actual_record = service.record_remote_snapshot_owed
 
     async def close():
         await release_sql.wait()
@@ -743,8 +803,11 @@ async def test_refused_completion_fallback_resnapshots_a_new_original_native_chi
 
     monkeypatch.setattr(backend, "close", close)
 
-    async def snapshot():
-        await actual_snapshot()
+    async def record():
+        # A tail step that outlives its guard behind the in-flight snapshot,
+        # then publishes a native child it cannot report.
+        await actual_record()
+        await asyncio.wait({state["inflight_snapshot"]})
         child = create_owned_task(
             backend.close(), retirement_resource=backend, retain_originals=True
         )
@@ -762,7 +825,7 @@ async def test_refused_completion_fallback_resnapshots_a_new_original_native_chi
         )
         raise failure
 
-    monkeypatch.setattr(service, "force_snapshot", snapshot)
+    monkeypatch.setattr(service, "record_remote_snapshot_owed", record)
     loop = asyncio.get_running_loop()
     previous_factory = loop.get_task_factory()
     callback_fault = OSError("original native terminal callback publication refused")

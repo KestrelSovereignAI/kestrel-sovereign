@@ -4,14 +4,15 @@ from kestrel_sovereign.execution_custody import owned_execution_stream
 import inspect
 import json
 import logging
+from kestrel_sovereign.tools.effect_invocation import journal_async_generator_invocation
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign._async_ownership import (
-    OwnedTaskOutcome,
+    OwnedTaskHandoff,
     await_owned_task,
     raise_owned_outcome,
 )
@@ -35,7 +36,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
-from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta, ToolInputSuspensionResponse
 from kestrel_sovereign.llm.generation_gate import judge_generation
 from kestrel_sovereign.llm.provider_policy import caller_call_override_scope
 from kestrel_sovereign.llm.invocation_context import (
@@ -56,40 +57,6 @@ from kestrel_sovereign.telemetry import (
     capture_turn_ids,
     start_span,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _DeferredToolBatchCancellation:
-    """Carry Stop across the streaming turn's history checkpoint."""
-
-    outcome: OwnedTaskOutcome[Any]
-
-    @contextmanager
-    def handoff(self):
-        """Keep finite evidence until the consumer resumes this handoff.
-
-        Owned stream forwarding resumes a source only after consumer advance.
-        Aborted delivery or generator close must project the original receipt,
-        not discard it as a yielded value that nobody received.
-        """
-        try:
-            yield self
-        except BaseException as consumer_error:
-            self.raise_outcome(consumer_error)
-
-    def raise_outcome(self, consumer_error: BaseException | None = None):
-        """Project this SAME finite batch evidence on every consumer exit."""
-        if consumer_error is not None:
-            from kestrel_sovereign.execution_custody import execution_terminal_error
-
-            raise execution_terminal_error(
-                self.outcome.error, self.outcome.cancellation, consumer_error,
-                retain_originals=True, isolate_control_originals=True,
-            )
-        return raise_owned_outcome(
-            self.outcome, operation="side-effecting orchestrator tool batch",
-            retain_originals=True,
-        )
 
 
 def resolve_turn_invocation_context(
@@ -149,6 +116,8 @@ def resolve_turn_invocation_context(
 # ``pane.pendingRevise``; the other is a no-op.
 REVISE_SENTINEL_PREFIX = "\x1eKESTREL:REVISE:"
 REVISE_SENTINEL_SUFFIX = "\x1e"
+# Confirmed operator input invalidates only the original live turn prose.
+RETRACT_SENTINEL_PREFIX = "\x1eKESTREL:RETRACT:"
 
 # #1662 eager-vision read-path bounds (independent of the upload endpoint's
 # per-file/count caps, since a content-addressed read can name any stored
@@ -212,6 +181,7 @@ TOOL_SENTINEL_SUFFIX = "\x1e"
 # stream; this tuple drives every strip/extract loop.
 _ALL_SENTINEL_PREFIXES = (
     REVISE_SENTINEL_PREFIX,
+    RETRACT_SENTINEL_PREFIX,
     THINKING_SENTINEL_PREFIX,
     TOOL_SENTINEL_PREFIX,
     PART_SENTINEL_PREFIX,
@@ -232,14 +202,17 @@ def _build_tool_sentinel(
     shell-command preview (start) or error text (error); ``ms`` the
     dispatch duration (done).
     """
-    payload = json.dumps({
+    return _encode_tool_sentinel({
         "phase": phase,
         "name": name,
         "index": index,
         "ms": ms,
         "detail": detail,
-    }, separators=(",", ":"))
-    return f"{TOOL_SENTINEL_PREFIX}{payload}{TOOL_SENTINEL_SUFFIX}"
+    })
+
+
+def _encode_tool_sentinel(payload: dict) -> str:
+    return f'{TOOL_SENTINEL_PREFIX}{json.dumps(payload, separators=(",", ":"))}{TOOL_SENTINEL_SUFFIX}'
 
 
 def is_only_sentinels(text: str) -> bool:
@@ -479,6 +452,61 @@ def _flush_part_list(pending: list, full_response: list):
 _TOOL_EVENT_PHASE = {"start": "start", "complete": "done", "error": "error"}
 
 
+def _matching_tool_part(event: dict, parts: list, consumed: list) -> int | None:
+    phase = _TOOL_EVENT_PHASE.get(event.get('type'))
+    name = event.get('tool', '')
+    return next((index for index, part in enumerate(parts) if not consumed[index]
+        and part.get('phase') == phase and part.get('name', '') == name), None)
+
+
+def _inline_tool_events(executed: list) -> list:
+    """The existing card contract for actual completed inline callbacks."""
+    return [event for entry in executed for event in (
+        {'type': 'start', 'tool': entry['name']},
+        {'type': 'complete', 'tool': entry['name'], 'ms': 0})]
+
+
+def _input_checkpoint_metadata(text: str, events: list) -> list[str]:
+    """Rebase the observed TOOL/PART timeline without replaying it to clients.
+
+    Confirmed callbacks can lack adapter wire markers. Add their missing card
+    events before the next observed matching event, or after the observed
+    timeline when no later anchor exists. Observed frames never change order.
+    Fresh collector parts are appended by the caller after these receipts.
+    """
+    _, tools, components = _parse_stream_sentinels(text)
+    consumed = [False] * len(tools)
+    matches = []
+    for event in events:
+        matched = _matching_tool_part(event, tools, consumed)
+        matches.append(matched)
+        if matched is not None:
+            consumed[matched] = True
+    insertions: dict[int | None, list[str]] = {}
+    previous_seq = -1
+    for index, (event, matched) in enumerate(zip(events, matches, strict=True)):
+        if matched is not None:
+            previous_seq = max(previous_seq, tools[matched]['seq'])
+            continue
+        next_seq = next((tools[item]['seq'] for item in matches[index + 1:]
+            if item is not None and tools[item]['seq'] > previous_seq), None)
+        phase = _TOOL_EVENT_PHASE[event['type']]
+        insertions.setdefault(next_seq, []).append(_build_tool_sentinel(phase,
+            event['tool'], ms=event.get('ms'), detail=event.get('error')))
+    timeline = [(part['seq'], True, part) for part in tools]
+    timeline.extend((part['seq'], False, part) for part in components)
+    result = []
+    for seq, is_tool, part in sorted(timeline, key=lambda item: item[0]):
+        result.extend(insertions.pop(seq, []))
+        payload = {key: value for key, value in part.items() if key not in {'pos', 'seq'}}
+        encoded = _encode_tool_sentinel(payload) if is_tool else build_part_sentinel(payload)
+        if encoded is None:
+            raise ValueError('Input checkpoint contains invalid component metadata')
+        result.append(encoded)
+    result.extend(insertions.pop(None, []))
+    return result
+
+
 def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
     """Assign each ``tool_events`` entry a ``pos`` (clean-text offset) by
     matching it to the TOOL sentinel part that produced it.
@@ -499,15 +527,7 @@ def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
     for ev in tool_events:
         if not isinstance(ev, dict):
             continue
-        want_phase = _TOOL_EVENT_PHASE.get(ev.get("type"))
-        name = ev.get("tool", "")
-        matched = None
-        for i, p in enumerate(parts):
-            if consumed[i]:
-                continue
-            if p.get("phase") == want_phase and p.get("name", "") == name:
-                matched = i
-                break
+        matched = _matching_tool_part(ev, parts, consumed)
         if matched is not None:
             consumed[matched] = True
             pos = parts[matched].get("pos")
@@ -531,6 +551,14 @@ def _build_revise_sentinel(marker: ToolCallStarted) -> str:
         "tool_name": marker.name,
     }, separators=(",", ":"))
     return f"{REVISE_SENTINEL_PREFIX}{payload}{REVISE_SENTINEL_SUFFIX}"
+
+
+def _build_retract_sentinel(request_id: str) -> str:
+    """Address a confirmed input checkpoint to its exact original turn."""
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError('Input checkpoint retraction requires the original request ID')
+    payload = json.dumps({'request_id': request_id}, separators=(',', ':'))
+    return f'{RETRACT_SENTINEL_PREFIX}{payload}{REVISE_SENTINEL_SUFFIX}'
 
 
 def _build_thinking_sentinel(delta: ThinkingDelta) -> str:
@@ -1024,6 +1052,7 @@ class StreamingMixin:
     @bind_async_generator_invocation(
         "request_id", track_request_lifecycle=True
     )
+    @journal_async_generator_invocation
     async def process_input_streaming(
         self,
         user_input: str,
@@ -1270,7 +1299,7 @@ class StreamingMixin:
                         yield safe_mode_block
                         return
                     transition_lock = self._get_privacy_transition_lock()
-                    async with transition_lock:
+                    async with transition_lock.policy_span():
                         from kestrel_sovereign.streams.tap import AgentStreamTap
                         AgentStreamTap.get_instance().capture_request_privacy(
                             self, request_id, self._request_generation_for_current_task(request_id))
@@ -1519,12 +1548,13 @@ class StreamingMixin:
         }
         if attachments:
             _user_meta["attachments"] = attachments
-        await self.privacy_agent.add_conversation(
+        user_message_id = await self.privacy_agent.add_conversation(
             "user", wrapped_user,
             metadata=_user_meta,
             session_id=session_id,
             rendered_content=prompt,
         )
+        assistant_message_id = None
         # Apply post-build assembly via the agent helper so this path
         # uses the same route-aware budget gate as the non-streaming
         # path (#1399). Without sharing the helper, route-capped
@@ -1784,6 +1814,19 @@ class StreamingMixin:
                 # VISIBLE text below — AFTER this item if it's a tool sentinel — so a
                 # component lands after its producing tool's card, not before it.
                 pending_parts.extend(drain_parts())
+                if isinstance(item, ToolInputSuspensionResponse):
+                    item.suspension.require_current(self)
+                    tool_response = item
+                    pre_tool_prose_snapshot = None
+                    full_response = _input_checkpoint_metadata(''.join(full_response),
+                        _inline_tool_events(item.executed_tool_calls))
+                    for sentinel in _flush_part_list(pending_parts, full_response):
+                        if not buffer_audit:
+                            yield sentinel
+                    if not buffer_audit:
+                        yield _build_retract_sentinel(item.suspension.turn.invocation_id)
+                        yield item.content
+                    continue
                 if isinstance(item, str):
                     # #1914: a component emitted by the tool that produced THIS
                     # visible text flushes here — after any tool done/error sentinel
@@ -1915,7 +1958,7 @@ class StreamingMixin:
         # ``_persist_assistant_turn_safely`` still stamps the ``cancelled``
         # marker on the empty row.
         if has_tool_calls and _stopped_generation(self, request_id) is not None:
-            await self._persist_assistant_turn_safely(
+            assistant_message_id = await self._persist_assistant_turn_safely(
                 "", metadata=None, session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
@@ -1939,10 +1982,11 @@ class StreamingMixin:
             # response hook can run the narration check (#1042 layer 3)
             # over the same envelopes the LLM saw.
             tool_response_chunks = []
+            input_followup = False
             tool_events = []
             tool_results: list = []
             deferred_tool_batch_cancellation: Optional[
-                _DeferredToolBatchCancellation
+                OwnedTaskHandoff
             ] = None
 
             def tool_batch_completed() -> bool:
@@ -2019,7 +2063,32 @@ class StreamingMixin:
                     continuation_user_content=prompt + lazy_hint,
                 )) as _owned_forwarder_1870:
                     async for chunk in _owned_forwarder_1870:
-                        if isinstance(chunk, _DeferredToolBatchCancellation):
+                        if isinstance(chunk, ToolInputSuspensionResponse):
+                            chunk.suspension.require_current(self)
+                            await self._append_executed_tool_breadcrumbs([], chunk.executed_tool_calls,
+                                tool_results, session_id=session_id)
+                            tool_events.extend(_inline_tool_events(chunk.executed_tool_calls))
+                            retained_metadata = _input_checkpoint_metadata(
+                                ''.join(full_response + tool_response_chunks), tool_events)
+                            fresh_parts = drain_parts()
+                            tool_response_chunks = retained_metadata
+                            input_followup = True
+                            pre_tool_text = ''
+                            pre_tool_prose_snapshot = ''
+                            pre_parts = []
+                            pending_visible_boundary = False
+                            join_separator = ''
+                            # Retain the original TOOL/PART timeline for history;
+                            # only fresh collector parts belong on the live wire.
+                            for sentinel in _flush_part_list(fresh_parts, tool_response_chunks):
+                                if not buffer_audit:
+                                    yield sentinel
+                            tool_response_chunks.append(chunk.content)
+                            if not buffer_audit:
+                                yield _build_retract_sentinel(chunk.suspension.turn.invocation_id)
+                                yield chunk.content
+                            continue
+                        if isinstance(chunk, OwnedTaskHandoff):
                             deferred_tool_batch_cancellation = chunk
                             # Resume once so the inner async generator reaches its return
                             # after the marker instead of leaving cleanup to finalization.
@@ -2126,6 +2195,9 @@ class StreamingMixin:
                     }
                     for tc in tool_response.tool_calls
                 ]
+                if input_followup:
+                    tool_calls_payload = [dict(id=row['tool_call_id'], name=row['name'],
+                        arguments=row['arguments']) for row in tool_results]
                 tool_final_text = await self._fire_post_response_hook(
                     post_tool_text, session_id,
                     pre_tool_prose=pre_tool_for_audit,
@@ -2232,7 +2304,7 @@ class StreamingMixin:
                 # their metadata exactly as before.
                 if buffer_audit:
                     meta = None
-                await self._persist_assistant_turn_safely(
+                assistant_message_id = await self._persist_assistant_turn_safely(
                     tool_final_text,
                     metadata=_with_semantic_recall_metadata(
                         meta, semantic_recall_metadata
@@ -2322,15 +2394,13 @@ class StreamingMixin:
             from kestrel_sovereign.security.narration_check import (
                 summarize_tool_result_for_audit,
             )
-            synth_tool_events = []
+            synth_tool_events = _inline_tool_events(inline_executed)
             tool_results: list = []
             features_by_tool_name = (
                 self._visible_features_by_tool_name()
                 if hasattr(self, "_visible_features_by_tool_name") else {}
             )
             for e in inline_executed:
-                synth_tool_events.append({"type": "start", "tool": e["name"]})
-                synth_tool_events.append({"type": "complete", "tool": e["name"], "ms": 0})
                 serialized = _serialize_tool_result(e["result"])
                 tool_results.append({
                     "tool_call_id": e["id"],
@@ -2350,6 +2420,13 @@ class StreamingMixin:
             context_replay_text, inline_parts, inline_components = _parse_stream_sentinels(
                 "".join(full_response)
             )
+            if isinstance(tool_response, ToolInputSuspensionResponse):
+                # A host checkpoint carries actual callbacks, never acceptance
+                # of the provider prose emitted before its input suspension.
+                context_replay_text = tool_response.content
+                pre_tool_prose_snapshot = None
+                inline_components = [{**part, 'pos': 0} for part in inline_components]
+                inline_parts = [{**part, 'pos': 0} for part in inline_parts]
             _stamp_tool_event_positions(synth_tool_events, inline_parts)
             tool_calls_payload = [
                 {"id": e["id"], "name": e["name"], "arguments": e["arguments"]}
@@ -2442,7 +2519,7 @@ class StreamingMixin:
             # branch: persisted == reloaded == released reviewed text.
             if buffer_audit:
                 inline_meta = None
-            await self._persist_assistant_turn_safely(
+            assistant_message_id = await self._persist_assistant_turn_safely(
                 final_text,
                 metadata=_with_semantic_recall_metadata(
                     inline_meta, semantic_recall_metadata
@@ -2470,7 +2547,7 @@ class StreamingMixin:
             # matching the cancel-before-dispatch path — before the audit fire /
             # STOP hook / memory pipeline.
             if _stopped_generation(self, request_id) is not None:
-                await self._persist_assistant_turn_safely(
+                assistant_message_id = await self._persist_assistant_turn_safely(
                     "", metadata=None, session_id=session_id,
                     request_id=request_id, response=tool_response,
                 )
@@ -2499,7 +2576,7 @@ class StreamingMixin:
             # cancelled row and return before metadata / persist / release /
             # memory / STOP (see the has_tool_calls branch for the full rationale).
             if _stopped_generation(self, request_id) is not None:
-                await self._persist_assistant_turn_safely(
+                assistant_message_id = await self._persist_assistant_turn_safely(
                     "", metadata=None, session_id=session_id,
                     request_id=request_id, response=tool_response,
                 )
@@ -2543,7 +2620,7 @@ class StreamingMixin:
             # as the tool branches: persisted == reloaded == released text.
             if buffer_audit:
                 _no_tool_meta = None
-            await self._persist_assistant_turn_safely(
+            assistant_message_id = await self._persist_assistant_turn_safely(
                 final_text,
                 metadata=_with_semantic_recall_metadata(
                     _no_tool_meta, semantic_recall_metadata
@@ -2573,7 +2650,7 @@ class StreamingMixin:
         # scheduled. Mirrors the non-streaming fire at kestrel_agent.py.
         post_pipeline = getattr(self, "_post_response_pipeline", None)
         if callable(post_pipeline) and not self._privacy_blocks_background_memory():
-            await post_pipeline(user_input, final_assistant_text, session_id)
+            await post_pipeline(user_message_id=user_message_id, assistant_message_id=assistant_message_id)
 
         # Fire STOP hook (streaming response cycle complete).
         #
@@ -2679,7 +2756,7 @@ class StreamingMixin:
         model: Optional[str] = None,
         provider: Optional[str] = None,
         require_success: bool = False,
-    ) -> None:
+    ) -> int | None:
         """Persist the assistant turn under cancellation-safe handling.
 
         FastAPI's ``StreamingResponse`` cancels the wrapping async
@@ -2803,6 +2880,7 @@ class StreamingMixin:
             raise pending_cancellation
         if isinstance(outcome.error, asyncio.CancelledError):
             raise outcome.error
+        return outcome.result if outcome.error is None else None
 
     async def _fire_post_response_hook(
         self,

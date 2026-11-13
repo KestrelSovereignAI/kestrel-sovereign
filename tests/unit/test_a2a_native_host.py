@@ -1,6 +1,7 @@
 """Native manager construction and the real host's signal boot phase."""
 
 import asyncio
+import contextvars
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -825,38 +826,75 @@ async def test_owned_sqlite_factory_uses_the_same_native_admission_contract(tmp_
     assert not backend.is_connected
 
 
+@asynccontextmanager
+async def _host_primary_services(backend, root):
+    """Own the actual host storage and LLM services through construction."""
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.storage import AsyncStorage
+
+    storage = AsyncStorage(backend=backend, agent_id="did:kestrel:host")
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(storage.close)
+        await storage.initialize()
+        llm = LLMService(usage_db=storage.db, agent_data_dir=root)
+        resources.push_async_callback(llm.close)
+        yield storage, llm
+
+
+async def test_host_primary_service_constructor_refusal_retires_actual_storage(
+    native_a2a_backend_factory, tmp_path,
+):
+    from kestrel_sovereign.llm.provider_policy import ProviderPolicyConfigError
+    from kestrel_sovereign.paths import project_dir
+
+    config = project_dir() / "kestrel.toml"
+    config.write_text('[llm]\ndenied_providers = 42\n', encoding="utf-8")
+    backend = native_a2a_backend_factory()
+    try:
+        with pytest.raises(ProviderPolicyConfigError, match="must be a list"):
+            async with _host_primary_services(backend, tmp_path):
+                raise AssertionError("The real malformed LLM config was accepted")
+        assert not backend.is_connected, "Failed service construction leaked actual storage"
+    finally:
+        # Negative-test cleanup, not a product or fixture retirement receipt.
+        await backend.close()
+
+
 @pytest.mark.parametrize("broken_session_schema", [False, True])
 async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
     native_a2a_backend_factory,
     tmp_path,
     broken_session_schema,
+    monkeypatch,
 ):
     # Imports happen after the suite has isolated every runtime/config path.
     from kestrel_sovereign.agent.boot import BootContext
     from kestrel_sovereign.features.base import Feature, tool
     from kestrel_sovereign.features.privacy import PrivacyAgent
     from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.privacy import PrivacyMode
-    from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
+    from kestrel_sovereign.storage import PrivacyEnforcingStorage
 
     backend = native_a2a_backend_factory()
-    storage = AsyncStorage(backend=backend, agent_id="did:kestrel:host")
-    await storage.initialize()
-    llm = LLMService(usage_db=storage.db, agent_data_dir=tmp_path)
-    agent = KestrelAgent(
-        "did:kestrel:host",
-        storage_path=str(tmp_path / "host.db"),
-        llm_service=llm,
-        db_backend=backend.backend_type,
-        sync_enabled=False,
-        allowed_features=set(),
-    )
-    agent._raw_storage = storage
-    agent.storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
-    agent.privacy_agent = PrivacyAgent(storage, PrivacyMode.NORMAL)
-    ctx = BootContext(custody=agent._custody)
+    # Real service construction must not discover cloud instance credentials
+    # during this offline native storage/signal test.
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    services = AsyncExitStack()
+    ctx = None
     try:
+        storage, llm = await services.enter_async_context(_host_primary_services(backend, tmp_path))
+        agent = KestrelAgent(
+            "did:kestrel:host",
+            storage_path=str(tmp_path / "host.db"),
+            llm_service=llm,
+            db_backend=backend.backend_type,
+            sync_enabled=False,
+            allowed_features=set(),
+        )
+        agent._raw_storage = storage
+        agent.storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        agent.privacy_agent = PrivacyAgent(storage, PrivacyMode.NORMAL)
+        ctx = BootContext(custody=agent._custody)
         if broken_session_schema:
             # A real SQL failure after task/context initialization proves the
             # rollback owner was registered before initialize's first await.
@@ -918,9 +956,11 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         assert backend.is_connected
         assert await backend.fetch_one("SELECT 1") == (1,)
     finally:
-        await ctx.run_rollback()
-        await llm.close()
-        await storage.close()
+        try:
+            if ctx is not None:
+                await ctx.run_rollback()
+        finally:
+            await services.aclose()
 
 
 @asynccontextmanager
@@ -2154,8 +2194,9 @@ async def test_network_discovery_and_recipient_admission_do_not_inherit_sender_c
     assert all(value is None for _, value in observed)
 
 
+@pytest.mark.parametrize("discovery_delay", [0.0, 0.2])
 async def test_blocking_peer_timeout_retires_http_subscription_without_replaying_task(
-    local_native_peer,
+    local_native_peer, monkeypatch, discovery_delay,
 ):
     import httpx
     from kestrel_sdk.native_a2a.types import ListTasksRequest
@@ -2164,16 +2205,48 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
     p = local_native_peer
-    p.directory.open_a2a_session = lambda selected, peer: (
-        open_hosted_native_peer_session(
+    if discovery_delay:
+        original_profile = p.recipient.get_public_profile
+
+        async def delayed_profile(*args, **kwargs):
+            await asyncio.sleep(discovery_delay)
+            return await original_profile(*args, **kwargs)
+
+        monkeypatch.setattr(p.recipient, "get_public_profile", delayed_profile)
+
+    timed_task_ids = []
+
+    async def arm_subscription_timeout(request):
+        if request.method != "POST":
+            return
+
+        async def trace(name, info):
+            if name != "http11.receive_response_headers.started":
+                return
+            # Time out the unanswered blocking response, not card discovery,
+            # signing or database admission. The actual HTTP read still owns
+            # and raises the timeout after the recipient opened its stream.
+            while not p.manager._subscribers:
+                await asyncio.sleep(0.001)
+            timed_task_ids.extend(p.manager._subscribers)
+            info["request"].extensions["timeout"]["read"] = 0.1
+
+        request.extensions["trace"] = trace
+
+    @asynccontextmanager
+    async def timed_session(selected, peer):
+        async with open_hosted_native_peer_session(
             p.app,
             p.host,
             sender=p.sender,
             requester=selected,
             peer=peer,
-            timeout=httpx.Timeout(0.1),
-        )
-    )
+            timeout=httpx.Timeout(10),
+        ) as session:
+            session._http.event_hooks["request"].append(arm_subscription_timeout)
+            yield session
+
+    p.directory.open_a2a_session = timed_session
     feature = PeersFeature(p.sender)
     feature._peer_router = p.directory
     feature._peer_requester = p.requester
@@ -2182,6 +2255,7 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
         feature.ask_agent("Peer", "An unanswered blocking native ask"), 5
     )
     assert result.data["sent"] is None and result.data["delivery_state"] == "unknown"
+    assert len(timed_task_ids) == 1, "One admitted subscription must own the timeout"
     async with asyncio.timeout(5):
         while p.manager._subscribers:
             await asyncio.sleep(0.001)
@@ -2194,6 +2268,7 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
     )
     assert (
         len(tasks.tasks) == 1
+        and tasks.tasks[0].id == timed_task_ids[0]
         and tasks.tasks[0].status.state
         == __import__(
             "kestrel_sdk.native_a2a.types", fromlist=["TaskState"]
@@ -2201,8 +2276,86 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
     )
 
 
+@pytest.fixture(params=["ordinary", "connection-winner"])
+def native_question_shutdown(request):
+    """Exercise the actual feature stop alongside Happy Eyeballs cancellation.
+
+    AnyIO cancels its connection task group after a real TCP attempt wins.
+    Release that original connection immediately before feature shutdown so
+    its housekeeping and our native cancellation reach the same reader.
+    """
+    if request.param == "ordinary":
+        async def stop(feature):
+            await feature.shutdown()
+
+        yield stop
+        return
+
+    from anyio._backends._asyncio import AsyncIOBackend
+
+    from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
+    from kestrel_sovereign.execution_custody import close_native_execution_stream
+
+    native_connect = AsyncIOBackend.connect_tcp
+    native_read = NativeQuestionSupervisor._read_pass
+    reading = contextvars.ContextVar("native_question_connection_attempt", default=False)
+    connected, release = asyncio.Event(), asyncio.Event()
+    held = False
+    stopping = False
+    resumed_reads = []
+
+    async def read(supervisor, *args, **kwargs):
+        if stopping:
+            # Cleanup of a failed regression still joins the ORIGINAL reader.
+            # A second cancel is test cleanup, never the production stop policy.
+            resumed_reads.append(asyncio.current_task())
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+        token = reading.set(True)
+        try:
+            return await native_read(supervisor, *args, **kwargs)
+        finally:
+            reading.reset(token)
+
+    async def connect(cls, *args, **kwargs):
+        nonlocal held
+        stream = await native_connect(*args, **kwargs)
+        if reading.get() and not held:
+            held = True
+            connected.set()
+            try:
+                await release.wait()
+            except BaseException:
+                await close_native_execution_stream(stream)
+                raise
+        return stream
+
+    async def stop(feature):
+        nonlocal stopping
+        async with asyncio.timeout(5):
+            await connected.wait()
+        stopping = True
+        release.set()
+        try:
+            await feature.shutdown()
+        finally:
+            stopping = False
+        assert not resumed_reads, (
+            "Native question reader lost feature shutdown cancellation during "
+            "TCP connection completion and started another recovery pass"
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(NativeQuestionSupervisor, "_read_pass", read)
+        patch.setattr(AsyncIOBackend, "connect_tcp", classmethod(connect))
+        try:
+            yield stop
+        finally:
+            release.set()
+
+
 async def test_public_question_tool_uses_native_intent_and_restarts_without_legacy_rows(
-    local_native_peer, monkeypatch
+    local_native_peer, monkeypatch, native_question_shutdown
 ):
     from google.protobuf.json_format import MessageToDict
 
@@ -2251,7 +2404,7 @@ async def test_public_question_tool_uses_native_intent_and_restarts_without_lega
         )
         assert MessageToDict(task.history[0].parts[1])["data"] == {"value": 42}
         assert not await p.backend.table_exists("a2a_outbound_tasks")
-        await first.shutdown()
+        await native_question_shutdown(first)
         # No in-memory subscriber or caller turn survives the feature restart.
         await p.manager.complete_task(
             task.id, "The native answer", recipient_agent_id=p.recipient.did
@@ -2369,6 +2522,15 @@ async def test_dead_question_resident_refuses_new_sends_before_delivery(
         await asyncio.gather(*agent.tasks, return_exceptions=True)
 
 
+@asynccontextmanager
+async def native_question_cleanup_errors():
+    """Keep native originals while letting pytest retire every other fixture."""
+    try:
+        yield
+    except (asyncio.CancelledError, BaseExceptionGroup) as error:
+        raise AssertionError("Native question fixture retained shutdown control") from error
+
+
 @pytest_asyncio.fixture
 async def native_question_peer(local_native_peer):
     from kestrel_sovereign.features.peers.feature import PeersFeature
@@ -2385,22 +2547,128 @@ async def native_question_peer(local_native_peer):
     feature = PeersFeature(p.sender)
     feature._peer_router, feature._peer_requester = p.directory, p.requester
     feature._own_name = "Sender"
+    quiescing = False
+    active_passes = set()
+    changed, parked = asyncio.Event(), asyncio.Event()
+
+    def retain_pass(operation):
+        async def observed(*args, **kwargs):
+            if quiescing:
+                await parked.wait()
+            owner = asyncio.current_task()
+            active_passes.add(owner)
+            try:
+                return await operation(*args, **kwargs)
+            finally:
+                active_passes.remove(owner)
+                changed.set()
+
+        return observed
+
+    async def stop_supervisor():
+        nonlocal quiescing
+        # Functional fixture cleanup starts between original observation
+        # passes, after their real SQL/native acknowledgements. Both resident
+        # loops still run concurrently during the test itself.
+        quiescing = True
+        async with asyncio.timeout(5):
+            while active_passes:
+                changed.clear()
+                await changed.wait()
+        await feature._cancel_owned_background_tasks()
+
     try:
         await feature.post_all_features_loaded(p.sender)
-        yield SimpleNamespace(**vars(p), feature=feature, dispatcher=dispatcher)
+        supervisor = feature._question_supervisor
+        supervisor._read_pass = retain_pass(supervisor._read_pass)
+        supervisor._deadline_iteration = retain_pass(supervisor._deadline_iteration)
+        yield SimpleNamespace(
+            **vars(p), feature=feature, dispatcher=dispatcher,
+            stop_supervisor=stop_supervisor,
+        )
     finally:
         async def join_signal_tasks():
             await asyncio.gather(*signal_agent.tasks, return_exceptions=True)
 
-        try:
+        async with native_question_cleanup_errors():
             async with AsyncExitStack() as cleanup:
                 cleanup.push_async_callback(join_signal_tasks)
                 cleanup.push_async_callback(dispatcher.shutdown_durable_delivery)
                 cleanup.push_async_callback(feature.shutdown)
-        except asyncio.CancelledError as error:
-            # Report the original cancellation/receipt as a fixture failure,
-            # so pytest still runs unrelated fixture finalizers in this worker.
-            raise AssertionError("Native question fixture retained shutdown cancellation") from error
+                cleanup.push_async_callback(stop_supervisor)
+
+
+@pytest.mark.parametrize("phase", ["read", "deadline"])
+async def test_native_question_fixture_joins_original_observation_before_stop(
+    native_question_peer, monkeypatch, phase,
+):
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+
+    p = native_question_peer
+    supervisor = p.feature._question_supervisor
+    unsettled = supervisor.store.unsettled
+    entered, release = asyncio.Event(), asyncio.Event()
+    readers = set()
+
+    async def retain_original_read():
+        rows = await unsettled()  # Real primary-ledger SQL, never a fake read.
+        # Select the actual resident loop for fault scheduling, not authority.
+        index = 0 if phase == "read" else 1
+        if asyncio.current_task().get_name() != f"native-question-service:{index}":
+            return rows
+        readers.add(asyncio.current_task())
+        entered.set()
+        await release.wait()
+        return rows
+
+    monkeypatch.setattr(supervisor.store, "unsettled", retain_original_read)
+    supervisor.notify()
+    stopping = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        stopping = create_owned_task(p.stop_supervisor())
+        _, pending = await asyncio.wait({stopping}, timeout=.05)
+        assert pending == {stopping}, (
+            "Native question fixture cancelled its original observation before settlement"
+        )
+        assert readers and all(not reader.done() for reader in readers)
+        release.set()
+        outcome = await asyncio.wait_for(await_owned_task(stopping), 5)
+        assert outcome.error is outcome.cancellation is None
+        assert p.feature._question_supervisor_task.done()
+    finally:
+        release.set()
+        if stopping is not None:
+            await await_owned_task(stopping)
+
+
+@pytest.mark.parametrize("carrier", ["cancellation", "mixed"])
+async def test_native_question_fixture_retains_control_after_real_shutdown(
+    native_question_peer, carrier,
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, execution_evidence_carriers,
+    )
+
+    p = native_question_peer
+    withdrawal = asyncio.CancelledError("original fixture withdrawal")
+    native = ExecutionCommitOutcomeError("unknown")
+    original = (withdrawal if carrier == "cancellation" else
+        BaseExceptionGroup("original native fixture control", [native, withdrawal]))
+    await p.stop_supervisor()
+    # Inject the original terminal carrier only after the actual feature has
+    # physically retired. No cleanup failure is discarded or treated as ACK.
+    with pytest.raises(BaseException) as caught:
+        async with native_question_cleanup_errors():
+            await p.feature.shutdown()
+            raise original
+    assert type(caught.value) is AssertionError, (
+        "Native question control escaped pytest-safe fixture retirement"
+    )
+    assert caught.value.__cause__ is original
+    assert any(error is withdrawal for error in execution_evidence_carriers(caught.value))
+    if carrier == "mixed":
+        assert any(error is native for error in execution_evidence_carriers(caught.value))
 
 
 async def test_public_question_sender_retains_live_submission_ownership_until_receipt(
@@ -2553,8 +2821,7 @@ async def test_native_follow_up_client_settles_its_original_question_on_read(
     assert first.data["sent"] is True
     # Prove that the follow-up client's receipt owns this settlement. Resident
     # recovery must not hide a missing root-question acknowledgement.
-    p.feature._question_supervisor_task.cancel()
-    await asyncio.gather(p.feature._question_supervisor_task, return_exceptions=True)
+    await p.stop_supervisor()
     followed = await p.feature.send_a2a_task(
         "Peer", "Additional context", continue_dispatch_id=first.data["dispatch_id"]
     )

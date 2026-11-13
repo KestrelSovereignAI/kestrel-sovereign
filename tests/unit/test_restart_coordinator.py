@@ -32,7 +32,12 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
-from kestrel_sovereign.auth import CallerContext, caller_context_scope
+from kestrel_sovereign.auth import (
+    CallerContext,
+    caller_context_binding_scope,
+    caller_context_scope,
+    capture_caller_context_binding,
+)
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCustody,
@@ -260,69 +265,29 @@ class _AllowingHooksManager:
         return None
 
 
-class _InlineRestartAgent(TurnLifecycleMixin, OrchestratorEngineMixin):
-    """Production lifecycle plus the real inline and named-tool dispatch path."""
-
-    def __init__(self, backend):
-        self.__dict__.update(vars(_make_agent(backend)))
-        self.features = {}
-        self.hooks_manager = _AllowingHooksManager()
-
-    def _visible_features_by_tool_name(self):
-        return {
-            feature.tool_name: feature
-            for feature in self.features.values()
-            if getattr(feature, "enabled", True)
-        }
-
-    async def _get_denied_tools(self, _feature_name):
-        return set()
-
-    def _register_explored_feature_tools(self, _feature):
-        return None
-
-    async def _emit_tool_update_event(self, _session_id):
-        return None
+async def _InlineRestartAgent(backend, *, native_tool_effect_agent):
+    """A native component host owning storage on the test primary backend."""
+    agent = await native_tool_effect_agent(did="did:test:agent", connected_backend=backend.backend)
+    agent._agent_name = "Test Agent"
+    agent.hooks_manager = _AllowingHooksManager()
+    return agent
 
 
-class _FrozenReaderHarness:
-    """Model the app-server reader and its per-call handler task."""
+from tests.utils.codex_inline import OwnedCallbackReader
+from tests.utils.native_tool_effects import drive_native
+
+
+class _FrozenReaderHarness(OwnedCallbackReader):
+    """One actual owned callback reader, with a pre-executor turn probe."""
 
     def __init__(self, agent):
+        super().__init__()
         self._agent = agent
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._reader: asyncio.Task | None = None
-        self.handler_turn_ids: list[str | None] = []
+        self.handler_turn_ids = []
 
-    async def start(self) -> None:
-        assert self._reader is None
-        self._reader = asyncio.create_task(self._read_loop())
-
-    async def _read_loop(self) -> None:
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                return
-            executor, name, args, done = item
-            asyncio.create_task(self._handle(executor, name, args, done))
-
-    async def _handle(self, executor, name, args, done) -> None:
+    async def _execute(self, executor, name, args):
         self.handler_turn_ids.append(self._agent._get_current_turn_id())
-        try:
-            done.set_result(await executor(name, args))
-        except Exception as exc:  # pragma: no cover - defensive harness path
-            done.set_exception(exc)
-
-    async def dispatch(self, executor, name, args):
-        done = asyncio.get_running_loop().create_future()
-        await self._queue.put((executor, name, args, done))
-        return await done
-
-    async def stop(self) -> None:
-        if self._reader is not None:
-            await self._queue.put(None)
-            await self._reader
-            self._reader = None
+        return await executor(name, args)
 
 
 class _NestedRestartLLMService:
@@ -3691,15 +3656,20 @@ async def _real_dispatch_feature(tmp_path, **kwargs):
     dispatcher routes against, so the post-restart sweep's wake is
     delivered for real.
     """
+    backend = await _backend(tmp_path)
+    agent = _RealDispatchAgent(backend, **kwargs)
+    result = await _wire_real_dispatch_feature(agent, backend)
+    _real_dispatch_lifecycles.append((result[0], agent))
+    return result
+
+
+async def _wire_real_dispatch_feature(agent, backend):
     from kestrel_sovereign.signals import (
         OrderedLockManager,
         SignalDispatcher,
         SignalLogStore,
         SourceRegistry,
     )
-
-    backend = await _backend(tmp_path)
-    agent = _RealDispatchAgent(backend, **kwargs)
 
     store = SignalLogStore(backend)
     await store.initialize()
@@ -3714,10 +3684,10 @@ async def _real_dispatch_feature(tmp_path, **kwargs):
     )
     agent.signal_registry = registry
     agent.dispatcher = dispatcher
+    await dispatcher.initialize_durable_delivery()
 
     feat = RestartCoordinatorFeature(agent)
     agent.restart_feature = feat
-    _real_dispatch_lifecycles.append((feat, agent))
     return feat, backend, agent
 
 
@@ -4942,78 +4912,114 @@ async def test_request_restart_captures_turn_session_through_lifecycle(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_inline_enqueued_wake_owns_session_for_followup_restart(tmp_path):
+async def test_inline_enqueued_wake_owns_session_for_followup_restart(tmp_path, native_tool_effect_agent):
     """An inline tool's child signal task owns the cognition turn it opens."""
     from kestrel_sovereign.signals.sources.restart import (
         build_signal_for_restart_completed,
     )
 
-    feat, backend, agent = await _real_dispatch_feature(tmp_path)
-    await feat.initialize()
-    wake_source = await insert_request(
-        backend,
-        requested_by_agent=agent.did,
-        reason="wake source",
-        origin_session_id="wake-session-B",
-    )
-    signal = build_signal_for_restart_completed(
-        wake_source,
-        target_agent=agent.did,
-        completed_at=datetime.now(timezone.utc).isoformat(),
-    )
-    enqueuer = _EnqueueCognitionFeature(agent, signal)
-    agent.features = {feat.name: feat, enqueuer.name: enqueuer}
-    agent.restart_request_reason = "restart filed from wake turn"
-    reader = _FrozenReaderHarness(agent)
+    agent = await native_tool_effect_agent(did="did:test:restart-inline")
+    backend = agent._raw_storage.db
+    agent.process_input_calls = []
+    agent.process_input_sessions = []
+    agent.process_input_should_raise = False
+    agent.restart_request_reason = None
+    agent.restart_feature = None
+    wake_turn = _RealDispatchAgent.process_input.__get__(agent)
+    # A wake carries its own caller, never the one of the invocation that
+    # enqueued it: the real process_input binds the dispatcher's, and the
+    # enqueuing invocation's binding is revoked when it ends, which the wake
+    # now outlives (#4023). This stub binds the test's sovereign caller in its
+    # place.
+    sovereign = capture_caller_context_binding()
 
-    # The app-server reader predates chat turn A. Its inline callback binds A,
-    # and the tool creates SignalDispatcher's background task while that
-    # binding is active. The task waits for A's conversation lock, then opens
-    # wake turn B and must use B's routed session as its own authority.
-    await reader.start()
+    async def process_input(prompt, session_id=None):
+        with caller_context_binding_scope(sovereign):
+            return await wake_turn(prompt, session_id=session_id)
+
+    agent.process_input = process_input
+    agent.background_tasks = agent._background_tasks
+    agent.drain_background_tasks = _RealDispatchAgent.drain_background_tasks.__get__(agent)
+    feat, backend, agent = await _wire_real_dispatch_feature(agent, backend)
     try:
-        async with agent._turn_lifecycle():
-            agent._active_session_id = "chat-session-A"
-            executor = agent._make_inline_tool_executor("chat-session-A")
-            await reader.dispatch(executor, "enqueue_test_cognition", {})
+        await feat.initialize()
+        wake_source = await insert_request(
+            backend,
+            requested_by_agent=agent.did,
+            reason="wake source",
+            origin_session_id="wake-session-B",
+        )
+        signal = build_signal_for_restart_completed(
+            wake_source,
+            target_agent=agent.did,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        enqueuer = _EnqueueCognitionFeature(agent, signal)
+        agent.features = {feat.name: feat, enqueuer.name: enqueuer}
+        agent.restart_request_reason = "restart filed from wake turn"
+        reader = _FrozenReaderHarness(agent)
+
+        # The app-server reader predates chat turn A. Its inline callback binds A,
+        # and the tool creates SignalDispatcher's background task while that
+        # binding is active. The task waits for A's conversation lock, then opens
+        # wake turn B and must use B's routed session as its own authority.
+        await reader.start()
+        try:
+            async def chat_input():
+                async with agent._turn_lifecycle():
+                    agent._active_session_id = "chat-session-A"
+                    executor = agent._make_inline_tool_executor("chat-session-A")
+                    await reader.dispatch(executor, "enqueue_test_cognition", {})
+            await drive_native(agent, chat_input)
+        finally:
+            await reader.stop()
+
+        await agent.drain_background_tasks()
+
+        pending = await list_requests(backend, status="pending")
+        followup = next(
+            row for row in pending if row.reason == "restart filed from wake turn"
+        )
+        assert reader.handler_turn_ids == [None]
+        assert agent.process_input_sessions == ["wake-session-B"]
+        assert followup.origin_session_id == "wake-session-B"
     finally:
-        await reader.stop()
-
-    await agent.drain_background_tasks()
-
-    pending = await list_requests(backend, status="pending")
-    followup = next(
-        row for row in pending if row.reason == "restart filed from wake turn"
-    )
-    assert reader.handler_turn_ids == [None]
-    assert agent.process_input_sessions == ["wake-session-B"]
-    assert followup.origin_session_id == "wake-session-B"
+        await feat.shutdown()
+        await agent._shutdown_background_tasks()
 
 
 @pytest.mark.asyncio
-async def test_inline_restart_preserves_session_across_frozen_reader_task(tmp_path):
+async def test_inline_restart_preserves_session_across_frozen_reader_task(tmp_path, *, native_tool_effect_agent):
     """The live Codex path carries its owning turn into the pre-turn reader."""
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    reader = _FrozenReaderHarness(agent)
+    effective_args = None
+    executor = None
+    reader = None
+    result = None
+    async def native_restart_operation():
+        nonlocal effective_args, executor, reader, result
+        reader = _FrozenReaderHarness(agent)
 
-    # Production starts one long-lived reader before later turns. Its child
-    # handlers therefore inherit this pre-turn context, not the active turn's.
-    await reader.start()
-    try:
-        async with agent._turn_lifecycle():
-            agent._active_session_id = "chat-inline-42"
-            executor = agent._make_inline_tool_executor("transport-session-99")
-            effective_args, result = await reader.dispatch(
-                executor,
-                "request_restart",
-                {"reason": "inline tool filed"},
-            )
-    finally:
-        await reader.stop()
+        # Production starts one long-lived reader before later turns. Its child
+        # handlers therefore inherit this pre-turn context, not the active turn's.
+        await reader.start()
+        try:
+            async with agent._turn_lifecycle():
+                agent._active_session_id = "chat-inline-42"
+                executor = agent._make_inline_tool_executor("transport-session-99")
+                effective_args, result = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {"reason": "inline tool filed"},
+                )
+        finally:
+            await reader.stop()
+
+    await drive_native(agent, native_restart_operation)
 
     assert reader.handler_turn_ids == [None]
     assert effective_args == {"reason": "inline tool filed"}
@@ -5024,39 +5030,47 @@ async def test_inline_restart_preserves_session_across_frozen_reader_task(tmp_pa
 
 @pytest.mark.asyncio
 async def test_inline_restart_carries_owning_caller_across_frozen_reader_task(
-    tmp_path,
+    tmp_path,*, native_tool_effect_agent
 ):
     """The persistent Codex reader must receive this turn's exact caller."""
 
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    reader = _FrozenReaderHarness(agent)
+    _effective_args = None
+    executor = None
+    reader = None
+    result = None
+    async def native_restart_operation():
+        nonlocal _effective_args, executor, reader, result
+        reader = _FrozenReaderHarness(agent)
 
-    # The app-server reader is born outside authenticated request handling and
-    # therefore carries no caller.  The later endpoint turn authenticates with
-    # the sovereign key and builds its per-turn executor on a different task.
-    with caller_context_scope(None):
-        await reader.start()
-    try:
-        with caller_context_scope(
-            CallerContext.sovereign(
-                identity="endpoint-sovereign",
-                credential="restart-authority-test-key",
-            )
-        ):
-            async with agent._turn_lifecycle():
-                agent._active_session_id = "chat-authorized"
-                executor = agent._make_inline_tool_executor("chat-authorized")
-                _effective_args, result = await reader.dispatch(
-                    executor,
-                    "request_restart",
-                    {"reason": "authorized inline callback"},
+        # The app-server reader is born outside authenticated request handling and
+        # therefore carries no caller.  The later endpoint turn authenticates with
+        # the sovereign key and builds its per-turn executor on a different task.
+        with caller_context_scope(None):
+            await reader.start()
+        try:
+            with caller_context_scope(
+                CallerContext.sovereign(
+                    identity="endpoint-sovereign",
+                    credential="restart-authority-test-key",
                 )
-    finally:
-        await reader.stop()
+            ):
+                async with agent._turn_lifecycle():
+                    agent._active_session_id = "chat-authorized"
+                    executor = agent._make_inline_tool_executor("chat-authorized")
+                    _effective_args, result = await reader.dispatch(
+                        executor,
+                        "request_restart",
+                        {"reason": "authorized inline callback"},
+                    )
+        finally:
+            await reader.stop()
+
+    await drive_native(agent, native_restart_operation)
 
     assert reader.handler_turn_ids == [None]
     assert result["success"] is True
@@ -5066,7 +5080,7 @@ async def test_inline_restart_carries_owning_caller_across_frozen_reader_task(
 
 @pytest.mark.asyncio
 async def test_inline_restart_cannot_borrow_readers_overlapping_sovereign_caller(
-    tmp_path,
+    tmp_path,*, native_tool_effect_agent
 ):
     """A callback is authorized by its owning turn, never the reader's turn.
 
@@ -5077,43 +5091,52 @@ async def test_inline_restart_cannot_borrow_readers_overlapping_sovereign_caller
     """
 
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    reader = _FrozenReaderHarness(agent)
+    _effective_args = None
+    executor = None
+    own = None
+    reader = None
+    wider = None
+    async def native_restart_operation():
+        nonlocal _effective_args, executor, own, reader, wider
+        reader = _FrozenReaderHarness(agent)
 
-    # Model overlap with turn A: the persistent reader and its handler task
-    # inherited A's still-live sovereign scope, while turn B explicitly has no
-    # caller.  B's executor must clear A instead of borrowing its authority.
-    with caller_context_scope(
-        CallerContext.sovereign(
-            identity="other-turn-sovereign",
-            credential="restart-authority-test-key",
-        )
-    ):
-        await reader.start()
-        try:
-            with caller_context_scope(None):
-                executor = agent._make_inline_tool_executor("unowned-turn")
-                _effective_args, wider = await reader.dispatch(
-                    executor,
-                    "request_restart",
-                    {
-                        "reason": "must not borrow reader authority",
-                        "operation": "update_then_restart",
-                        "update_profile": "sovereign_local_uv_sync",
-                        "target_ref": "main",
-                        "repo_path": str(tmp_path / "not-the-default"),
-                    },
-                )
-                _effective_args, own = await reader.dispatch(
-                    executor,
-                    "request_restart",
-                    {"reason": "the agent's own plain restart"},
-                )
-        finally:
-            await reader.stop()
+        # Model overlap with turn A: the persistent reader and its handler task
+        # inherited A's still-live sovereign scope, while turn B explicitly has no
+        # caller.  B's executor must clear A instead of borrowing its authority.
+        with caller_context_scope(
+            CallerContext.sovereign(
+                identity="other-turn-sovereign",
+                credential="restart-authority-test-key",
+            )
+        ):
+            await reader.start()
+            try:
+                with caller_context_scope(None):
+                    executor = agent._make_inline_tool_executor("unowned-turn")
+                    _effective_args, wider = await reader.dispatch(
+                        executor,
+                        "request_restart",
+                        {
+                            "reason": "must not borrow reader authority",
+                            "operation": "update_then_restart",
+                            "update_profile": "sovereign_local_uv_sync",
+                            "target_ref": "main",
+                            "repo_path": str(tmp_path / "not-the-default"),
+                        },
+                    )
+                    _effective_args, own = await reader.dispatch(
+                        executor,
+                        "request_restart",
+                        {"reason": "the agent's own plain restart"},
+                    )
+            finally:
+                await reader.stop()
+
+    await drive_native(agent, native_restart_operation)
 
     assert wider["success"] is False
     assert "authenticated sovereign-key caller" in wider["error"]
@@ -5128,52 +5151,28 @@ async def test_inline_restart_cannot_borrow_readers_overlapping_sovereign_caller
 
 @pytest.mark.asyncio
 async def test_inline_restart_without_turn_stays_unbound_across_reader_task(
-    tmp_path,
+    tmp_path,*, native_tool_effect_agent
 ):
     """An origin-less inline invocation cannot borrow ambient session hints."""
     from kestrel_sovereign.logging_config import session_id_var
 
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    agent._active_session_id = "unrelated-agent-global"
-    reader = _FrozenReaderHarness(agent)
-    executor = agent._make_inline_tool_executor("unowned-transport-session")
+    _effective_args = None
+    executor = None
+    reader = None
+    result = None
+    token = None
+    async def native_restart_operation():
+        nonlocal _effective_args, executor, reader, result, token
+        agent._active_session_id = "unrelated-agent-global"
+        reader = _FrozenReaderHarness(agent)
+        executor = agent._make_inline_tool_executor("unowned-transport-session")
 
-    token = session_id_var.set("unrelated-logging-session")
-    await reader.start()
-    try:
-        _effective_args, result = await reader.dispatch(
-            executor,
-            "request_restart",
-            {"reason": "origin-less inline tool"},
-        )
-    finally:
-        await reader.stop()
-        session_id_var.reset(token)
-
-    assert reader.handler_turn_ids == [None]
-    row = await get_request(backend, result["data"]["request"]["id"])
-    assert row.origin_session_id == ""
-
-
-@pytest.mark.asyncio
-async def test_off_turn_inline_restart_does_not_borrow_readers_live_turn(
-    tmp_path,
-):
-    """An off-turn executor stays unbound on a reader born in a live chat."""
-    backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
-    feat = RestartCoordinatorFeature(agent)
-    await feat.initialize()
-    agent.features = {feat.name: feat}
-    reader = _FrozenReaderHarness(agent)
-    executor = agent._make_inline_tool_executor("unowned-transport-session")
-
-    async with agent._turn_lifecycle() as turn_id:
-        agent._active_session_id = "unrelated-live-chat"
+        token = session_id_var.set("unrelated-logging-session")
         await reader.start()
         try:
             _effective_args, result = await reader.dispatch(
@@ -5183,6 +5182,48 @@ async def test_off_turn_inline_restart_does_not_borrow_readers_live_turn(
             )
         finally:
             await reader.stop()
+            session_id_var.reset(token)
+
+    await drive_native(agent, native_restart_operation)
+
+    assert reader.handler_turn_ids == [None]
+    row = await get_request(backend, result["data"]["request"]["id"])
+    assert row.origin_session_id == ""
+
+
+@pytest.mark.asyncio
+async def test_off_turn_inline_restart_does_not_borrow_readers_live_turn(
+    tmp_path,*, native_tool_effect_agent
+):
+    """An off-turn executor stays unbound on a reader born in a live chat."""
+    backend = await _backend(tmp_path)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    _effective_args = None
+    executor = None
+    reader = None
+    result = None
+    turn_id = None
+    async def native_restart_operation():
+        nonlocal _effective_args, executor, reader, result, turn_id
+        reader = _FrozenReaderHarness(agent)
+        executor = agent._make_inline_tool_executor("unowned-transport-session")
+
+        async with agent._turn_lifecycle() as turn_id:
+            agent._active_session_id = "unrelated-live-chat"
+            await reader.start()
+            try:
+                _effective_args, result = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {"reason": "origin-less inline tool"},
+                )
+            finally:
+                await reader.stop()
+
+    await drive_native(agent, native_restart_operation)
 
     assert reader.handler_turn_ids == [turn_id]
     row = await get_request(backend, result["data"]["request"]["id"])
@@ -5191,38 +5232,48 @@ async def test_off_turn_inline_restart_does_not_borrow_readers_live_turn(
 
 @pytest.mark.asyncio
 async def test_nested_inline_restart_preserves_session_across_two_readers(
-    tmp_path,
+    tmp_path,*, native_tool_effect_agent
 ):
     """The feature-subagent executor carries the turn across its own reader."""
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    parent_reader = _FrozenReaderHarness(agent)
-    feature_reader = _FrozenReaderHarness(agent)
-    llm_service = _NestedRestartLLMService(feature_reader)
-    agent.llm_service = llm_service
+    effective_args = None
+    feature_reader = None
+    llm_service = None
+    parent_executor = None
+    parent_reader = None
+    result = None
+    async def native_restart_operation():
+        nonlocal effective_args, feature_reader, llm_service, parent_executor, parent_reader, result
+        parent_reader = _FrozenReaderHarness(agent)
+        feature_reader = _FrozenReaderHarness(agent)
+        llm_service = _NestedRestartLLMService(feature_reader)
+        agent.llm_service = llm_service
 
-    # Both long-lived readers predate the turn. The parent executor restores
-    # the binding once, then execute_as_subagent builds another executor that
-    # must explicitly carry it through the feature reader's separate task.
-    await parent_reader.start()
-    await feature_reader.start()
-    try:
-        async with agent._turn_lifecycle():
-            agent._active_session_id = "chat-nested-42"
-            parent_executor = agent._make_inline_tool_executor(
-                "parent-transport-session"
-            )
-            effective_args, result = await parent_reader.dispatch(
-                parent_executor,
-                feat.tool_name,
-                {"task": "file a restart request"},
-            )
-    finally:
-        await parent_reader.stop()
-        await feature_reader.stop()
+        # Both long-lived readers predate the turn. The parent executor restores
+        # the binding once, then execute_as_subagent builds another executor that
+        # must explicitly carry it through the feature reader's separate task.
+        await parent_reader.start()
+        await feature_reader.start()
+        try:
+            async with agent._turn_lifecycle():
+                agent._active_session_id = "chat-nested-42"
+                parent_executor = agent._make_inline_tool_executor(
+                    "parent-transport-session"
+                )
+                effective_args, result = await parent_reader.dispatch(
+                    parent_executor,
+                    feat.tool_name,
+                    {"task": "file a restart request"},
+                )
+        finally:
+            await parent_reader.stop()
+            await feature_reader.stop()
+
+    await drive_native(agent, native_restart_operation)
 
     assert parent_reader.handler_turn_ids == [None]
     assert feature_reader.handler_turn_ids == [None]
@@ -5240,43 +5291,53 @@ async def test_nested_inline_restart_preserves_session_across_two_readers(
 
 @pytest.mark.asyncio
 async def test_nested_inline_restart_carries_caller_across_both_reader_tasks(
-    tmp_path,
+    tmp_path,*, native_tool_effect_agent
 ):
     """A feature subagent re-presents the endpoint caller at its own callback."""
 
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    parent_reader = _FrozenReaderHarness(agent)
-    feature_reader = _FrozenReaderHarness(agent)
-    llm_service = _NestedRestartLLMService(feature_reader)
-    agent.llm_service = llm_service
+    _effective_args = None
+    feature_reader = None
+    llm_service = None
+    parent_executor = None
+    parent_reader = None
+    result = None
+    async def native_restart_operation():
+        nonlocal _effective_args, feature_reader, llm_service, parent_executor, parent_reader, result
+        parent_reader = _FrozenReaderHarness(agent)
+        feature_reader = _FrozenReaderHarness(agent)
+        llm_service = _NestedRestartLLMService(feature_reader)
+        agent.llm_service = llm_service
 
-    with caller_context_scope(None):
-        await parent_reader.start()
-        await feature_reader.start()
-    try:
-        with caller_context_scope(
-            CallerContext.sovereign(
-                identity="endpoint-sovereign",
-                credential="restart-authority-test-key",
-            )
-        ):
-            async with agent._turn_lifecycle():
-                agent._active_session_id = "chat-nested-authorized"
-                parent_executor = agent._make_inline_tool_executor(
-                    "chat-nested-authorized"
+        with caller_context_scope(None):
+            await parent_reader.start()
+            await feature_reader.start()
+        try:
+            with caller_context_scope(
+                CallerContext.sovereign(
+                    identity="endpoint-sovereign",
+                    credential="restart-authority-test-key",
                 )
-                _effective_args, result = await parent_reader.dispatch(
-                    parent_executor,
-                    feat.tool_name,
-                    {"task": "file an authorized nested restart request"},
-                )
-    finally:
-        await parent_reader.stop()
-        await feature_reader.stop()
+            ):
+                async with agent._turn_lifecycle():
+                    agent._active_session_id = "chat-nested-authorized"
+                    parent_executor = agent._make_inline_tool_executor(
+                        "chat-nested-authorized"
+                    )
+                    _effective_args, result = await parent_reader.dispatch(
+                        parent_executor,
+                        feat.tool_name,
+                        {"task": "file an authorized nested restart request"},
+                    )
+        finally:
+            await parent_reader.stop()
+            await feature_reader.stop()
+
+    await drive_native(agent, native_restart_operation)
 
     assert result["success"] is True
     assert llm_service.result["success"] is True
@@ -5287,37 +5348,48 @@ async def test_nested_inline_restart_carries_caller_across_both_reader_tasks(
 
 
 @pytest.mark.asyncio
-async def test_nested_inline_restart_built_off_turn_stays_unbound(tmp_path):
+async def test_nested_inline_restart_built_off_turn_stays_unbound(tmp_path, *, native_tool_effect_agent):
     """Two inline boundaries cannot turn ambient session hints into authority."""
     from kestrel_sovereign.logging_config import session_id_var
 
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    agent._active_session_id = "unrelated-agent-global"
-    parent_reader = _FrozenReaderHarness(agent)
-    feature_reader = _FrozenReaderHarness(agent)
-    llm_service = _NestedRestartLLMService(feature_reader)
-    agent.llm_service = llm_service
-    parent_executor = agent._make_inline_tool_executor(
-        "unowned-parent-transport-session"
-    )
-
-    token = session_id_var.set("unrelated-logging-session")
-    await parent_reader.start()
-    await feature_reader.start()
-    try:
-        _effective_args, result = await parent_reader.dispatch(
-            parent_executor,
-            feat.tool_name,
-            {"task": "file a system restart request"},
+    _effective_args = None
+    feature_reader = None
+    llm_service = None
+    parent_executor = None
+    parent_reader = None
+    result = None
+    token = None
+    async def native_restart_operation():
+        nonlocal _effective_args, feature_reader, llm_service, parent_executor, parent_reader, result, token
+        agent._active_session_id = "unrelated-agent-global"
+        parent_reader = _FrozenReaderHarness(agent)
+        feature_reader = _FrozenReaderHarness(agent)
+        llm_service = _NestedRestartLLMService(feature_reader)
+        agent.llm_service = llm_service
+        parent_executor = agent._make_inline_tool_executor(
+            "unowned-parent-transport-session"
         )
-    finally:
-        await parent_reader.stop()
-        await feature_reader.stop()
-        session_id_var.reset(token)
+
+        token = session_id_var.set("unrelated-logging-session")
+        await parent_reader.start()
+        await feature_reader.start()
+        try:
+            _effective_args, result = await parent_reader.dispatch(
+                parent_executor,
+                feat.tool_name,
+                {"task": "file a system restart request"},
+            )
+        finally:
+            await parent_reader.stop()
+            await feature_reader.stop()
+            session_id_var.reset(token)
+
+    await drive_native(agent, native_restart_operation)
 
     assert parent_reader.handler_turn_ids == [None]
     assert feature_reader.handler_turn_ids == [None]
@@ -5331,35 +5403,46 @@ async def test_nested_inline_restart_built_off_turn_stays_unbound(tmp_path):
 
 @pytest.mark.asyncio
 async def test_off_turn_nested_restart_does_not_borrow_readers_live_turn(
-    tmp_path,
+    tmp_path,*, native_tool_effect_agent
 ):
     """Explicit unbound authority propagates through the nested executor."""
     backend = await _backend(tmp_path)
-    agent = _InlineRestartAgent(backend)
+    agent = (await _InlineRestartAgent(backend, native_tool_effect_agent=native_tool_effect_agent))
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
     agent.features = {feat.name: feat}
-    parent_reader = _FrozenReaderHarness(agent)
-    feature_reader = _FrozenReaderHarness(agent)
-    llm_service = _NestedRestartLLMService(feature_reader)
-    agent.llm_service = llm_service
-    parent_executor = agent._make_inline_tool_executor(
-        "unowned-parent-transport-session"
-    )
+    _effective_args = None
+    feature_reader = None
+    llm_service = None
+    parent_executor = None
+    parent_reader = None
+    result = None
+    turn_id = None
+    async def native_restart_operation():
+        nonlocal _effective_args, feature_reader, llm_service, parent_executor, parent_reader, result, turn_id
+        parent_reader = _FrozenReaderHarness(agent)
+        feature_reader = _FrozenReaderHarness(agent)
+        llm_service = _NestedRestartLLMService(feature_reader)
+        agent.llm_service = llm_service
+        parent_executor = agent._make_inline_tool_executor(
+            "unowned-parent-transport-session"
+        )
 
-    async with agent._turn_lifecycle() as turn_id:
-        agent._active_session_id = "unrelated-live-chat"
-        await parent_reader.start()
-        await feature_reader.start()
-        try:
-            _effective_args, result = await parent_reader.dispatch(
-                parent_executor,
-                feat.tool_name,
-                {"task": "file a system restart request"},
-            )
-        finally:
-            await parent_reader.stop()
-            await feature_reader.stop()
+        async with agent._turn_lifecycle() as turn_id:
+            agent._active_session_id = "unrelated-live-chat"
+            await parent_reader.start()
+            await feature_reader.start()
+            try:
+                _effective_args, result = await parent_reader.dispatch(
+                    parent_executor,
+                    feat.tool_name,
+                    {"task": "file a system restart request"},
+                )
+            finally:
+                await parent_reader.stop()
+                await feature_reader.stop()
+
+    await drive_native(agent, native_restart_operation)
 
     assert parent_reader.handler_turn_ids == [turn_id]
     assert feature_reader.handler_turn_ids == [turn_id]

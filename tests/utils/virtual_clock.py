@@ -16,10 +16,10 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Iterator, TypeVar
+from typing import Any, Iterator, TypeVar
 from unittest.mock import patch
 
 _T = TypeVar("_T")
@@ -27,6 +27,32 @@ _T = TypeVar("_T")
 # Bound for a wait that must finish promptly. Generous, so a GC pause on a
 # loaded xdist worker cannot fail a passing test.
 HANG_GUARD_SECONDS = 30.0
+
+
+@contextmanager
+def observe_asyncio_waits() -> Iterator[
+    list[tuple[frozenset[asyncio.Future[Any]], float | None]]
+]:
+    """Observe exact original waiters/bounds while delegating every real wait.
+
+    A bound is a policy input, not the time a busy test continuation wakes.
+    Observe only concrete builtin collections. Other shapes go unchanged to
+    native validation; copying a one-shot iterable or Future could change its
+    consumption or failure. Observation never changes completion or ownership.
+    """
+    original_wait = asyncio.wait
+    observations = []
+
+    async def recording_wait(
+        fs: Iterable[asyncio.Future[Any]], *, timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ):
+        if type(fs) in {set, frozenset, list, tuple}:
+            observations.append((frozenset(fs), timeout))
+        return await original_wait(fs, timeout=timeout, return_when=return_when)
+
+    with patch.object(asyncio, "wait", recording_wait):
+        yield observations
 
 
 class VirtualClock:
@@ -112,6 +138,14 @@ class AdvanceableClock:
         self._skipped += seconds
 
 
+class AdvanceableClockLoop(VirtualClockLoop):
+    """Manual deadline jumps while real native I/O polls keep advancing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._clock = AdvanceableClock(lambda: asyncio.BaseEventLoop.time(self))
+
+
 @contextmanager
 def advanceable_loop_clock() -> Iterator[AdvanceableClock]:
     """Let an ``async`` test jump the running loop's clock forward.
@@ -177,6 +211,14 @@ async def await_within_hang_guard(
         raise AssertionError(
             f"{step} did not happen within the {seconds:g}s hang guard"
         )
+    # Core's owned completion callback may already have harvested the one-shot
+    # native cancellation. Reconcile that exact receipt before observing its
+    # result; foreign Futures keep their existing native observation semantics.
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_native_completion
+    admission = getattr(future, "_kestrel_owned_admission", None)
+    if type(admission) is OwnedTaskAdmission and admission.task is future:
+        with owned_native_completion(future):
+            return future.result()
     return future.result()
 
 

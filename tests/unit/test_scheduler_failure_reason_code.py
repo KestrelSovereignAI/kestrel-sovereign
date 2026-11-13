@@ -307,8 +307,8 @@ async def test_a_tool_handler_resolves_the_owners_vocabulary_at_failure_time():
     asked = []
     vocabulary = {"signal_dispatch": frozenset()}
 
-    async def lookup(task_name, payload):
-        return ToolResult.failed("prose", data={"reason_code": "WORKFLOW_RUN_REJECTED"})
+    async def lookup(task_name, payload, complete):
+        return complete(ToolResult.failed("prose", data={"reason_code": "WORKFLOW_RUN_REJECTED"}))
 
     def reason_codes(task_name):
         asked.append(task_name)
@@ -338,7 +338,7 @@ async def test_a_builtin_handler_is_bounded_by_the_same_lookup():
             {"success": False, "error": "boom", "data": {"reason_code": "TRASH_SWEEP_BLOCKED"}}
         )
 
-    async def lookup(task_name, payload):
+    async def lookup(task_name, payload, complete):
         raise AssertionError("builtins bypass tool lookup")
 
     for declared, expected in (
@@ -436,7 +436,7 @@ async def test_a_builtin_outcome_is_bounded_by_the_same_lookup():
     async def builtin(payload):
         return ScheduledTaskOutcome(status="failed", result_text="{}", reason_code="SLEEP_FAILED")
 
-    async def lookup(task_name, payload):
+    async def lookup(task_name, payload, complete):
         raise AssertionError("builtins bypass tool lookup")
 
     for declared, expected in (

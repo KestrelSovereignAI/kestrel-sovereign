@@ -120,6 +120,25 @@ Because both paths resolve against each agent's own storage dir, two agents on o
 
 Releases before #3279 resolved a relative path against the host process's working directory, so every agent on a host wrote to one `<cwd>/.kestrel/computer_use_audit.jsonl`. That file is not moved or rewritten: it holds several agents' rows interleaved, and splitting it is an operator decision. Startup logs one INFO line naming the legacy file and the agent's new audit log when both exist and differ.
 
+### Narrowing an auto-approved binary to named subcommands
+
+`allow:<bin>` blesses every invocation of a listed binary. For a binary whose subcommands range from reads to writes, that is broader than listing it for reading means. With `git` auto-approved, `git -C <path> reset --hard` runs without a prompt in any read-allowed path, exactly as `git status` does. `auto_approved_subcommands` narrows a listed binary to the invocations it names. Every other invocation routes through the ApprovalQueue, as an unlisted binary does:
+
+```toml
+[features.computer_use.auto_approved_subcommands.git]
+allow = ["status", "log", "show", "diff", "rev-parse"]  # pre-approved subcommands
+value_options = ["-C"]          # leading options that take the NEXT token as their value
+flag_options = ["--no-pager"]   # leading options with no value
+deny_options = ["--output"]     # after the subcommand, any of these queues the call
+```
+
+Parsing fails closed:
+
+- **Before the subcommand,** a token must be exactly a listed `flag_options` entry, or exactly a listed `value_options` entry followed by its value as a separate token. Anything else queues. `git -c core.fsmonitor=<cmd> status` runs `<cmd>`, and a value glued into a flag token (`-C=path`, `-Cpath`) would escape the path policy, which vets only non-flag tokens.
+- **After the subcommand,** a long deny option also matches by unambiguous prefix, because git accepts one: `--outp=FILE` is `--output=FILE`. Short deny options match exactly, and bundled short flags are not unpacked. A subcommand with a dangerous short option does not belong in `allow`.
+
+A malformed entry, or one for a binary that is not in `auto_approved_binaries`, refuses initialization rather than loading as no policy. Both the `shell` tool and the codex native-command bridge evaluate the same `BinaryPolicy`. There is no default, so a binary without an entry is allowed whole, as before.
+
 `allowed_binaries` is accepted as a one-release deprecation synonym for `auto_approved_binaries`. If both are set the canonical key wins and a warning is logged; if only the legacy key is set it still works and a deprecation warning is logged. Rename it when you next edit your kestrel.toml.
 
 The toml is looked up in this order: (1) the agent's `storage_path` directory, (2) `<storage_path>/..`, (3) walking up from the source file to the repo root. Per-agent kestrel.toml under `agent_data/<name>/` is the typical home.

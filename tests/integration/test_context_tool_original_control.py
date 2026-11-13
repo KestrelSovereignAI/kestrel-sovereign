@@ -9,6 +9,7 @@ import pytest
 
 from tests.integration.native_memory_original_control import (
     native_memory_owners as native_memory_owners,
+    observe_native_transaction_errors,
 )
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 
@@ -181,8 +182,13 @@ async def test_actual_context_producers_and_tool_consumers_preserve_control(
     )
     feature = ContextFeature(agent)
     original = OSError("actual context producer native release acknowledgement lost")
-    reached, sources, fired = [], [], []
+    reached, sources, fired, carried = [], [], [], []
     pool, armed = n.backend._pool, False
+
+    def typed_carrier():
+        error = _CARRIERS[carrier]("declared typed native context carrier")
+        carried.append(error)
+        return error
 
     @asynccontextmanager
     async def lose_ack(native):
@@ -221,9 +227,7 @@ async def test_actual_context_producers_and_tool_consumers_preserve_control(
                 if selected:
                     sources.append(error)
                     if carrier != "native":
-                        raise _CARRIERS[carrier](
-                            "declared typed native context carrier"
-                        ) from error
+                        raise typed_carrier() from error
                 raise
             if selected and kind == "ordinary":
                 error_type = _CARRIERS.get(carrier, OSError)
@@ -233,6 +237,11 @@ async def test_actual_context_producers_and_tool_consumers_preserve_control(
             return result
 
         monkeypatch.setattr(db, name, intercept)
+
+    observe_native_transaction_errors(
+        monkeypatch, db, selected=lambda: bool(armed and fired), sources=sources,
+        make_carrier=typed_carrier if carrier != "native" else None,
+    )
     n.backend._execution_custody = ExecutionCustody(GenerationFence())
     if kind == "native-control":
         n.backend._pool = PostgresPoolAdapter(pool, lose_ack)
@@ -303,6 +312,14 @@ async def test_actual_context_producers_and_tool_consumers_preserve_control(
                 f"door={door} carrier={carrier} failure={failure!r} result={result!r}"
             )
             assert sources[0] in tuple(_explicit_control_chain(failure))
+            if carrier != "native":
+                assert len(carried) == 1, (
+                    "Requested typed native carrier was not exercised at its actual boundary"
+                )
+                assert type(carried[0]) is _CARRIERS[carrier]
+                assert carried[0] in tuple(_explicit_control_chain(failure)), (
+                    "Requested typed carrier must survive the producer and consumer"
+                )
             if door in insert_doors:
                 assert (
                     await n.observer.fetchval(

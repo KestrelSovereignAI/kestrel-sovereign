@@ -1,5 +1,5 @@
 from .adapter import LLMAdapter
-from kestrel_sdk.llm import ProviderCapabilities, ToolStreamingMode
+from kestrel_sdk.llm import LLMProtocolError, LLMResponse, ProviderCapabilities, ToolStreamingMode
 from typing import Any, Dict, List
 import logging
 
@@ -24,7 +24,7 @@ class MockAdapter(LLMAdapter):
         model: str,
         messages: List[Dict[str, Any]],
         **kwargs
-    ) -> str:
+    ) -> LLMResponse:
         """
         Return a mock response for demo purposes.
         """
@@ -72,13 +72,13 @@ class MockAdapter(LLMAdapter):
 
         # Generate a simple mock response based on the input
         if "hello" in user_message.lower() or "hi" in user_message.lower():
-            return "Hello! I'm a Kestrel AI agent running in a demo container. I'm designed to be your sovereign AI companion with full control over your data and interactions. How can I help you today?"
+            return LLMResponse(content="Hello! I'm a Kestrel AI agent running in a demo container. I'm designed to be your sovereign AI companion with full control over your data and interactions. How can I help you today?", stop_reason=None)
         elif "introduce" in user_message.lower() or "who are you" in user_message.lower():
-            return "I'm a Kestrel sovereign AI agent. I was created to give you full ownership and control over your AI interactions. Unlike other AI systems, I store everything locally and respect your privacy. I can help with creative tasks, web searches, model management, and much more!"
+            return LLMResponse(content="I'm a Kestrel sovereign AI agent. I was created to give you full ownership and control over your AI interactions. Unlike other AI systems, I store everything locally and respect your privacy. I can help with creative tasks, web searches, model management, and much more!", stop_reason=None)
         elif "what can you do" in user_message.lower():
-            return "As a Kestrel agent, I can:\n\n• Generate creative content and images\n• Search the web for information\n• Manage AI models and their usage\n• Maintain your digital sovereignty\n• Learn from our conversations\n• Help with various tasks through specialized tools\n\nI'm designed to be your personal AI companion that you fully control."
+            return LLMResponse(content="As a Kestrel agent, I can:\n\n• Generate creative content and images\n• Search the web for information\n• Manage AI models and their usage\n• Maintain your digital sovereignty\n• Learn from our conversations\n• Help with various tasks through specialized tools\n\nI'm designed to be your personal AI companion that you fully control.", stop_reason=None)
         else:
-            return f"I understand you said: '{user_message}'. As a demo Kestrel agent, I'm running in a container without real LLM access, but I can still demonstrate the interface! In a full deployment, I'd provide intelligent responses to help you with any task. Would you like to know more about Kestrel's features?"
+            return LLMResponse(content=f"I understand you said: '{user_message}'. As a demo Kestrel agent, I'm running in a container without real LLM access, but I can still demonstrate the interface! In a full deployment, I'd provide intelligent responses to help you with any task. Would you like to know more about Kestrel's features?", stop_reason=None)
 
     async def get_streaming_response(
         self,
@@ -88,7 +88,11 @@ class MockAdapter(LLMAdapter):
         **kwargs
     ):
         """
-        Mock streaming response - just yields the full response.
+        Yield the demo text and an unknown terminal, with no invented stop reason.
         """
+        if kwargs.get("tools"):
+            raise LLMProtocolError("Plain streaming does not accept tools.")
         response = await self.get_response(client, model, messages, **kwargs)
+        if response.content:
+            yield response.content
         yield response

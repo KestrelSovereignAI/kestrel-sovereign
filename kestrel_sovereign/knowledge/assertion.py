@@ -759,17 +759,30 @@ class SourceReferenceKind(str, Enum):
     A segment built by :func:`source_reference_segment` names one artifact, so a
     reader can tell which saved item or conversation session an occurrence came
     from without knowing any producer's own locator stem.
+
+    Producers append these segments with :func:`with_source_reference`, after
+    their own. A producer recording during a turn names the session that turn's
+    conversation rows are filed under, read through the turn lifecycle and
+    never from tool arguments, or names none when the turn has no session. A
+    producer that reads a saved item names it as ``saved-item:<id>`` the same
+    way.
+
+    A producer that takes a session only from a host attestation, never from
+    material the agent can edit, marks material with no attestation
+    ``unattested-session:<id>``, naming what went unattested. Its session is
+    unknown, so a corpus that excludes any session holds it out (#3990).
     """
 
     SAVED_ITEM = "saved-item"
     SESSION = "session"
+    UNATTESTED_SESSION = "unattested-session"
 
 
 _SOURCE_REFERENCE_KINDS = {kind.value: kind for kind in SourceReferenceKind}
 
 
 def source_reference_segment(kind: SourceReferenceKind | str, identifier: str) -> str:
-    """The locator segment naming one saved item or session, by its exact id.
+    """The locator segment naming one artifact of ``kind``, by its exact id.
 
     The id is percent-encoded, so an id containing ``#`` or ``:`` still reads
     back as one segment naming exactly that id.
@@ -777,6 +790,40 @@ def source_reference_segment(kind: SourceReferenceKind | str, identifier: str) -
     reference_kind = _enum(kind, SourceReferenceKind, "source reference kind")
     identifier = _plain_identifier(identifier, "source reference identifier")
     return f"{reference_kind.value}:{quote(identifier, safe='')}"
+
+
+def with_source_reference(
+    locator: str, kind: SourceReferenceKind | str, identifier: str | None
+) -> str:
+    """``locator`` with the segment naming one artifact of ``kind`` appended.
+
+    The segment goes last, so a producer stem that readers match as the
+    locator's prefix still leads it. ``None`` appends nothing: a producer that
+    does not know the artifact names none rather than guessing one.
+    """
+    if identifier is None:
+        return locator
+    return f"{locator}#{source_reference_segment(kind, identifier)}"
+
+
+def without_source_references(locator: str, kind: SourceReferenceKind | str) -> str:
+    """``locator`` without the segments that name a ``kind`` artifact."""
+    reference_kind = _enum(kind, SourceReferenceKind, "source reference kind")
+    kept = []
+    for segment in locator.split("#"):
+        reference = _source_reference(segment)
+        if reference is None or reference[0] is not reference_kind:
+            kept.append(segment)
+    return "#".join(kept)
+
+
+def _source_reference(segment: str) -> tuple[SourceReferenceKind, str] | None:
+    """The ``(kind, id)`` one locator segment names, if it names one."""
+    kind, separator, encoded = segment.partition(":")
+    reference_kind = _SOURCE_REFERENCE_KINDS.get(kind)
+    if reference_kind is None or not separator or not encoded:
+        return None
+    return reference_kind, unquote(encoded)
 
 
 @dataclass(frozen=True, slots=True)
@@ -808,14 +855,9 @@ class SourceOccurrence:
 
     @property
     def references(self) -> frozenset[tuple[SourceReferenceKind, str]]:
-        """The saved items and sessions this occurrence's locator names."""
-        found: set[tuple[SourceReferenceKind, str]] = set()
-        for segment in self.locator.split("#"):
-            kind, separator, encoded = segment.partition(":")
-            reference_kind = _SOURCE_REFERENCE_KINDS.get(kind)
-            if reference_kind is not None and separator and encoded:
-                found.add((reference_kind, unquote(encoded)))
-        return frozenset(found)
+        """The ``(kind, id)`` artifacts this occurrence's locator names."""
+        references = map(_source_reference, self.locator.split("#"))
+        return frozenset(item for item in references if item is not None)
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -1468,4 +1510,6 @@ __all__ = [
     "lineage_from_mapping",
     "normalize_iri",
     "source_reference_segment",
+    "with_source_reference",
+    "without_source_references",
 ]

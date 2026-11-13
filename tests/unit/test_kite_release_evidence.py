@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -305,9 +306,18 @@ def _config(tmp_path: Path, gate: KiteGate = KiteGate.STABLE_ONLY) -> KiteIsolat
     )
 
 
+_KITE_DID = "did:web:kite.invalid:kite"
+
+
 def _fake_create(cmd, *, cwd, env, check, text, capture_output):
     home = Path(env["KESTREL_HOME"])
     (home / "agent_data" / "kite").mkdir(parents=True)
+    # The birth record ``kestrel create`` leaves: the one agent root the
+    # harness names in the corpus exclusion manifest it signs.
+    with sqlite3.connect(home / "agent_data" / "kite" / "kestrel_prime.db") as birth:
+        birth.execute("CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)")
+        birth.execute("INSERT INTO graph_nodes VALUES (?, 'agent')", (_KITE_DID,))
+    birth.close()
     (home / "multi_agent.toml").write_text(
         "[host]\nport = 8888\nbind = '0.0.0.0'\n\n[agents.kite]\ndata_dir = 'agent_data/kite'\nport = 48991\nautostart = true\n",
         encoding="utf-8",
@@ -329,6 +339,55 @@ def test_prepare_creates_fresh_disjoint_test_home_and_experimental_profile(tmp_p
         harness.prepare()
 
 
+def test_prepare_provisions_the_corpus_exclusion_manifest_the_child_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The erasure drill's corpus builds verify a manifest naming kite (#3893).
+
+    Read through the child environment the server is launched with, so the
+    operator's own trust root and manifest, which that environment never
+    inherits, cannot stand in for the run's.
+    """
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+    from kestrel_sovereign.knowledge.corpus_exclusions import (
+        CORPUS_EXCLUSIONS_PATH_ENV,
+        load_corpus_exclusions,
+    )
+
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    monkeypatch.setenv(SOVEREIGN_TRUST_ROOT_ENV, str(operator / "root.did.json"))
+    monkeypatch.setenv(CORPUS_EXCLUSIONS_PATH_ENV, str(operator / "exclusions.json"))
+    config = _config(tmp_path)
+    harness = KiteHttpHarness(config, run=_fake_create)
+    harness._assert_port_unused = lambda: None  # type: ignore[method-assign]
+
+    harness.prepare()
+
+    child = config.environment()
+    assert child[SOVEREIGN_TRUST_ROOT_ENV] == str(config.sovereign_trust_root_path)
+    assert child[CORPUS_EXCLUSIONS_PATH_ENV] == str(config.corpus_exclusions_path)
+    manifest = load_corpus_exclusions(environ=child, agent_dids=frozenset({_KITE_DID}))
+    assert manifest.sequence == 1
+    exclusions = manifest.exclusions_for(_KITE_DID)
+    assert (
+        exclusions.source_occurrence_ids,
+        exclusions.session_ids,
+        exclusions.saved_item_ids,
+    ) == ((), (), ())
+    for path in (config.sovereign_trust_root_path, config.corpus_exclusions_path):
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_child_trust_root_and_manifest_settings_are_the_owning_modules_names() -> None:
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+    from kestrel_sovereign.knowledge import kite_release_evidence
+    from kestrel_sovereign.knowledge.corpus_exclusions import CORPUS_EXCLUSIONS_PATH_ENV
+
+    assert kite_release_evidence._SOVEREIGN_TRUST_ROOT_ENV == SOVEREIGN_TRUST_ROOT_ENV
+    assert kite_release_evidence._CORPUS_EXCLUSIONS_PATH_ENV == CORPUS_EXCLUSIONS_PATH_ENV
+
+
 def test_child_environment_is_minimal_and_overrides_production_configuration(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -344,6 +403,8 @@ def test_child_environment_is_minimal_and_overrides_production_configuration(
         "KESTREL_API_KEY": "production-api-key",
         "KESTREL_TRUST_POLICY": "/production/trust-policy.json",
         "SSL_CERT_FILE": "/production/trust.pem",
+        "KESTREL_SOVEREIGN_TRUST_ROOT_PATH": "/production/sovereign-root.did.json",
+        "KESTREL_CORPUS_EXCLUSIONS_PATH": "/production/corpus-exclusions.json",
     }
     for key, value in production_values.items():
         monkeypatch.setenv(key, value)

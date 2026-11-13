@@ -21,7 +21,7 @@ privacy: public
 
 > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug. Update it in the same change, not later.
 >
-> **Last major rewrite:** 2026-04 — replaced the single-string "provider" model with vendor / route / model. See GitHub epic #688 and the CLAUDE.md case study "Model Selection System — What NOT to Do".
+> **Last major rewrite:** 2026-04 — replaced the single-string "provider" model with vendor / route / model. See GitHub epic #688 and the AGENTS.md case study "Model Selection System — What NOT to Do".
 
 ## Principles
 
@@ -636,5 +636,5 @@ New hits in service / adapter / endpoint code fail review.
 
 ## Related decisions
 
-- CLAUDE.md "Model Selection System — What NOT to Do" — the case study this refactor closes out.
+- AGENTS.md "Model Selection System — What NOT to Do" — the case study this refactor closes out.
 - GitHub epic [#688](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/688) — the umbrella ticket for this architecture change.

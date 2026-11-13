@@ -4,9 +4,14 @@ No model or operator resources participate. The installed MCP feature is an
 explicit dependency of the dedicated MCP CI job, never an import-or-skip.
 """
 
+from uuid import uuid4
+
 import asyncio
-from contextlib import AsyncExitStack
+import json
+import os
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 import socket
 from types import SimpleNamespace
 
@@ -28,9 +33,45 @@ from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security import private_delivery
+
+
+@asynccontextmanager
+async def privacy_transition_probe(agent, monkeypatch):
+    """Observe a real transition's first blocked mutex/gate acquisition."""
+    attempted = asyncio.Event()
+    original_lock = agent._get_privacy_transition_lock
+    gate = agent._get_durable_persistence_gate()
+    transition = None
+
+    def observed_lock():
+        actual = original_lock()
+        if asyncio.current_task() is transition:
+            attempted.set()
+        return actual
+
+    async def change_privacy():
+        async with agent.privacy_transition():
+            pass
+
+    with monkeypatch.context() as patch:
+        patch.setattr(agent, '_get_privacy_transition_lock', observed_lock)
+        transition = asyncio.create_task(change_privacy())
+        try:
+            await asyncio.wait_for(attempted.wait(), 5)
+            inversion = gate._lock._waiting_writers != 0
+            if inversion:
+                transition.cancel()
+                await asyncio.gather(transition, return_exceptions=True)
+            yield transition, inversion
+        finally:
+            if not transition.done():
+                transition.cancel()
+            await asyncio.gather(transition, return_exceptions=True)
+
 from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware,
     RequestAuthenticationService,
@@ -41,6 +82,13 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(30)]
 API_KEY = "owned-apps-host-api-key"
 ALICE, BOB = "alice@apps.test", "bob@apps.test"
+
+
+@pytest.fixture
+def mcp_browser_support():
+    root = Path(os.environ['MCP_TEST_BROWSER_SUPPORT']).resolve(strict=True)
+    assert (root / 'web/test-support/parent-browser-build.mjs').is_file()
+    return root
 
 
 class OwnedAuditStore(ObservabilityStore):
@@ -68,6 +116,7 @@ class Boundary:
     queue: object
     requests: object
     feature: object
+    input_barrier: object = None
 
     @property
     def markers(self):
@@ -91,7 +140,7 @@ class Boundary:
 
 
 @pytest_asyncio.fixture
-async def apps_boundary(tmp_path, monkeypatch):
+async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request):
     from kestrel_feature_mcp.connection import bind_tool_caller
     from kestrel_feature_mcp.feature import MCPAgent
     from tests.integration.mcp_permission_peer import create_server
@@ -101,7 +150,23 @@ async def apps_boundary(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "1")
     monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", ALICE + "," + BOB)
     witness = tmp_path / "native-witness"
-    native = create_server(witness, apps=True)
+    settings = getattr(request, 'param', {})
+    input_barrier = (asyncio.Event(), asyncio.Event()) if settings.get('hold_first_input') else None
+    app_html = None
+    if settings.get('browser_app'):
+        import kestrel_feature_mcp
+        assert Path('/.dockerenv').is_file(), 'Browser App production requires an owned namespace'
+        build = await asyncio.create_subprocess_exec('node', 'web/test-support/parent-browser-build.mjs', 'input-app',
+            cwd=request.getfixturevalue('mcp_browser_support'),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        output, errors = await asyncio.wait_for(build.communicate(), 10)
+        assert build.returncode == 0, errors.decode()
+        app_html = output.decode()
+    native = create_server(witness, apps=True, operator_input=settings.get('operator_input'),
+        input_message=settings.get('input_message', 'Private city?'), input_tool=settings.get('input_tool'),
+        app_html=app_html, input_rounds=settings.get('input_rounds', 1),
+        input_schema=settings.get('input_schema'), input_content=settings.get('input_content'),
+        input_barrier=input_barrier)
     async with AsyncExitStack() as cleanup:
         listener = socket.socket()
         cleanup.callback(listener.close)
@@ -119,10 +184,7 @@ async def apps_boundary(tmp_path, monkeypatch):
                     await peer_task
                     raise RuntimeError("native MCP peer exited before startup")
                 await asyncio.sleep(0.01)
-        agent = KestrelAgent(did="did:test:owned-apps-host", storage_path=str(tmp_path / "agent.db"),
-                             allowed_features=set(), sync_enabled=False)
-        cleanup.push_async_callback(agent.llm_service.close)
-        agent.privacy_agent = PrivacyAgent(agent._raw_storage, agent.privacy_mode)
+        agent = await native_tool_effect_agent(did='did:test:owned-apps-host')
         backend = SQLiteBackend(str(tmp_path / "audit.db"))
         await backend.connect()
         cleanup.push_async_callback(backend.close)
@@ -138,8 +200,36 @@ async def apps_boundary(tmp_path, monkeypatch):
         await agent._register_feature(feature)
         cleanup.push_async_callback(agent._unregister_feature_runtime, feature, unload=True)
         assert not hasattr(feature, "enabled")
-        await feature.set_config({"apps": {"enabled": True,
-            "host": {"sandbox_url": "https://sandbox.apps.test/", "host_origin": "https://host.apps.test"},
+        host_configuration = {"sandbox_url": "https://sandbox.apps.test/", "host_origin": "https://host.apps.test"}
+        if settings.get('browser_app'):
+            origin = request.getfixturevalue('input_host_origin')
+            config = tmp_path / 'input-sandbox.json'
+            config.write_text(json.dumps({'listen': {'host': '127.0.0.1', 'port': 0}, 'sandbox': {
+                'hostOrigin': origin, 'maxMessageBytes': 2_097_152, 'maxHtmlBytes': 1_048_576, 'policy': {}}}))
+            errors = cleanup.enter_context((tmp_path / 'input-sandbox.log').open('wb'))
+            sandbox = await asyncio.create_subprocess_exec('node',
+                str(Path(kestrel_feature_mcp.__file__).parent / 'apps_sandbox/sandbox-service.mjs'),
+                '--config', str(config), env={'PATH': os.environ['PATH'], 'HOME': str(tmp_path)},
+                stdout=asyncio.subprocess.PIPE, stderr=errors)
+            async def close_sandbox():
+                if sandbox.returncode is None:
+                    sandbox.terminate()
+                try:
+                    assert await asyncio.wait_for(sandbox.wait(), 5) == 0
+                except TimeoutError:
+                    sandbox.kill()
+                    await sandbox.wait()
+                    raise
+            cleanup.push_async_callback(close_sandbox)
+            ready = json.loads(await asyncio.wait_for(sandbox.stdout.readline(), 10))
+            assert ready['event'] == 'mcp-apps-sandbox-listening'
+            host_configuration = {'host_origin': origin,
+                'sandbox_url': f'http://127.0.0.1:{ready["address"]["port"]}/proxy'}
+        await feature.set_config({**({'inputs': {'enabled': True,
+            'host': {'max_payload_bytes': settings.get('input_max_payload_bytes', 8192),
+                     'max_pending': settings.get('input_max_pending', 64), 'retention_seconds': 60.0}}}
+            if settings.get('operator_input') else {}), "apps": {"enabled": True,
+            "host": host_configuration,
             "max_pending_calls": 4, "max_publications": 8, "max_views": 8,
             "max_payload_bytes": 8192, "max_publications_per_owner": 4,
             "max_views_per_owner": 4, "retention_seconds": 60.0}})
@@ -171,14 +261,14 @@ async def apps_boundary(tmp_path, monkeypatch):
             with caller_context_scope(request.state.caller), part_collector(host=agent, session_id=value["session_id"]):
                 try:
                     return await initial.binding.invoke({"marker": value["marker"]},
-                        session_id=value["session_id"], source="chat")
+                        session_id=value["session_id"], source="chat", operation_id=uuid4().hex)
                 except ResourceOutcomeUnknown:
                     return JSONResponse({"error": "outcome_unknown_do_not_replay"}, status_code=503)
 
         client = await cleanup.enter_async_context(httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=app), base_url="https://host.apps.test"))
         yield Boundary(app, client, host, agent, publications, tools, witness, backend,
-                       permissions, queue, requests, feature)
+                       permissions, queue, requests, feature, input_barrier)
 
 
 async def test_initial_result_is_private_and_reopens_without_replaying_native_tool(apps_boundary):
@@ -254,7 +344,7 @@ async def test_app_tool_uses_original_core_one_shot_approval_and_required_audit(
     await b.permissions.set_permission("mcp:owned-apps", tool.binding.name, PermissionLevel.ASK)
     url = f"/api/mcp/apps/views/{view}/tools/call?session_id=original-chat"
     call = asyncio.create_task(b.client.post(url, headers=b.headers(),
-        json={"name": "mutate_marker", "arguments": {"marker": "approved"}}))
+        json={"name": "mutate_marker", "arguments": {"marker": "approved"}, "operation_id": uuid4().hex}))
     try:
         approval = await asyncio.wait_for(b.requests.get(), 5)
         assert not call.done() and b.markers == ["once"]
@@ -427,3 +517,74 @@ async def test_host_configuration_preflight_requires_the_actual_audited_publicat
     with pytest.raises(TypeError, match="audited deferred results"):
         b.agent.validate_mcp_apps_host_configuration({"sandbox_url": "https://sandbox.apps.test/"})
     assert b.agent._mcp_apps_hosts == [b.host] and not b.host.retired
+
+
+async def test_app_call_takes_privacy_mutex_before_persistence_lease(apps_boundary, monkeypatch):
+    b = apps_boundary
+    reference = await b.publish(marker='opened-once')
+    opened = await b.open(reference)
+    assert opened.status_code == 200, opened.text
+    view_id = opened.json()['view_id']
+    tool = next(item for item in b.tools if item.tool.native_tool.name == 'mutate_marker')
+    await b.permissions.set_permission('mcp:owned-apps', tool.binding.name, PermissionLevel.ALLOW)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = b.host.authority.operation
+
+    @asynccontextmanager
+    async def held_operation(*args, **kwargs):
+        async with original(*args, **kwargs) as check:
+            entered.set()
+            await release.wait()
+            yield check
+
+    monkeypatch.setattr(b.host.authority, 'operation', held_operation)
+    call = asyncio.create_task(b.client.post('/api/mcp/apps/views/' + view_id + '/tools/call',
+        params={'session_id': 'original-chat'}, headers=b.headers(),
+        json={'name': 'mutate_marker', 'arguments': {'marker': 'continued-once'},
+            'operation_id': uuid4().hex}))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        async with privacy_transition_probe(b.agent, monkeypatch) as (transition, inversion):
+            release.set()
+            result = await asyncio.wait_for(call, 5)
+            if not inversion:
+                await asyncio.wait_for(transition, 5)
+            assert not inversion, 'MCP App call took the shared persistence lease before the privacy mutex'
+            assert result.status_code == 200, result.text
+            assert b.markers == ['opened-once', 'continued-once']
+    finally:
+        release.set()
+        await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize('commit_outcome', ['committed', 'unknown'])
+async def test_native_app_audit_commit_preserves_reconciliation(apps_boundary, monkeypatch, commit_outcome):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    b = apps_boundary
+    reference = await b.publish()
+    opened = await b.open(reference)
+    assert opened.status_code == 200, opened.text
+    view_id = opened.json()['view_id']
+    tool = next(item for item in b.tools if item.tool.native_tool.name == 'mutate_marker')
+    await b.permissions.set_permission('mcp:owned-apps', tool.binding.name, PermissionLevel.ALLOW)
+    store = b.agent.observability_store
+    original = store.log_tool_dispatch
+
+    async def lost_acknowledgement(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise ExecutionCommitOutcomeError(commit_outcome)
+
+    monkeypatch.setattr(store, 'log_tool_dispatch', lost_acknowledgement)
+    response = await b.client.post('/api/mcp/apps/views/' + view_id + '/tools/call',
+        params={'session_id': 'original-chat'}, headers=b.headers(),
+        json={'name': 'mutate_marker', 'arguments': {'marker': 'native-effect-once'},
+              'operation_id': uuid4().hex})
+    assert b.markers == ['once', 'native-effect-once']
+    rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+    assert rows == [('success',), ('success',)]
+    assert response.status_code == 500, response.text
+    assert response.json()['error']['code'] == 'execution_control', (
+        'Native MCP App audit commit uncertainty lost its execution-control classification')
+    assert response.json()['error']['details'] == [{'commit_outcome': commit_outcome}]
+    assert 'Reconcile' in response.json()['error']['message']

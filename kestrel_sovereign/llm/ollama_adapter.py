@@ -8,6 +8,8 @@ Adapter for local Ollama instance with support for:
 - Structured output via JSON schema (Pydantic models)
 - API-based model discovery
 """
+
+from contextlib import aclosing
 import asyncio
 import json
 import logging
@@ -29,6 +31,7 @@ from typing import (
 import httpx
 from pydantic import BaseModel
 
+from .completion_protocol import decode_tool_arguments
 from .adapter import (
     LLMAdapter,
     LLMResponse,
@@ -1000,12 +1003,7 @@ class OllamaAdapter(LLMAdapter):
                     else:
                         continue
 
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except json.JSONDecodeError:
-                            # SDK 0.7.0 malformed-JSON sentinel.
-                            args = {"_raw": args}
+                    args = decode_tool_arguments(args)
 
                     parsed_tool_calls.append(ToolCall(
                         id=f"ollama_call_{i}",  # Ollama doesn't provide IDs
@@ -1046,10 +1044,9 @@ class OllamaAdapter(LLMAdapter):
     ) -> AsyncIterator[Union[str, ThinkingDelta, LLMResponse]]:
         """Stream text/thinking chunks then emit one terminal LLMResponse.
 
-        Shared by :meth:`get_streaming_response` (which filters the terminal
-        response out to preserve its text/thinking contract) and the no-tools
-        branch of :meth:`get_streaming_response_with_tools` (which forwards it
-        so the service layer can meter streamed turns — #1684). Ollama reports
+        Shared by both streaming methods. The plain facade retains the
+        terminal response, omits thinking deltas, and refuses tool evidence.
+        The with-tools facade also carries reasoning and tools. Ollama reports
         ``prompt_eval_count`` / ``eval_count`` on the final (``done``) chunk.
 
         A fired ``cancel_token`` ends the stream with ``CancelledError`` even
@@ -1208,31 +1205,14 @@ class OllamaAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        """
-        Gets a streaming response from Ollama (text/thinking contract).
-
-        Tool calls remain buffered through get_response until the native
-        generation has supplied its terminal evidence.
-
-        Delegates to :meth:`_stream_with_usage` and drops the terminal
-        usage-bearing :class:`LLMResponse` so existing callers keep their
-        ``AsyncIterator[Union[str, ThinkingDelta]]`` contract.
-
-        Yields:
-            Text chunks as they arrive. For structured output, yields JSON chunks.
-        """
-        async with owned_execution_stream(self, self._stream_with_usage(
-            client=client,
-            model=model,
-            messages=messages,
-            tools=tools,
-            response_format=response_format,
-            **kwargs
-        )) as owned_stream:
-            async for item in owned_stream:
-                if not isinstance(item, LLMResponse):
-                    yield item
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
+        )) as stream:
+            async for item in stream:
+                yield item
 
     async def get_streaming_response_with_tools(
         self,

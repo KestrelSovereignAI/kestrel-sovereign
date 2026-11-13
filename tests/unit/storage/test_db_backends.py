@@ -775,9 +775,31 @@ class TestSQLiteBackend:
 
         original_open_snapshot = backend._open_snapshot_read_connection
         entered_snapshot_worker = threading.Event()
+        snapshot_close_entered = asyncio.Event()
+        interrupt_acknowledged = False
+        close_saw_interrupt = []
+        snapshot_connections = []
+        native_interrupts = []
 
         async def open_observed_snapshot():
             conn = await original_open_snapshot()
+            snapshot_connections.append(conn)
+            native_interrupt = conn.interrupt
+            native_close = conn.close
+            native_interrupts.append(native_interrupt)
+
+            async def interrupt_observed():
+                nonlocal interrupt_acknowledged
+                await native_interrupt()
+                interrupt_acknowledged = True
+
+            async def close_observed():
+                close_saw_interrupt.append(interrupt_acknowledged)
+                snapshot_close_entered.set()
+                await native_close()
+
+            monkeypatch.setattr(conn, "interrupt", interrupt_observed)
+            monkeypatch.setattr(conn, "close", close_observed)
             await conn.set_progress_handler(entered_snapshot_worker.set, 100)
             return conn
 
@@ -787,7 +809,9 @@ class TestSQLiteBackend:
         transaction = asyncio.create_task(hold_transaction())
         snapshot_read = None
         try:
-            await transaction_entered.wait()
+            await await_within_hang_guard(
+                transaction_entered.wait(), step="the transaction owning its connection"
+            )
             snapshot_read = asyncio.create_task(
                 backend.fetch_all(
                     """
@@ -800,20 +824,36 @@ class TestSQLiteBackend:
                     """
                 )
             )
-            async with asyncio.timeout(0.5):
-                while not entered_snapshot_worker.is_set():
-                    await asyncio.sleep(0.005)
+            await wait_for_thread_event(
+                entered_snapshot_worker, step="the snapshot query entering SQLite"
+            )
 
             snapshot_read.cancel()
-            # A second cancellation would hide an inline-close regression.
-            await asyncio.sleep(0.05)
-            assert snapshot_read.done()
+            await await_within_hang_guard(
+                snapshot_close_entered.wait(), step="the original snapshot close entering"
+            )
+            assert close_saw_interrupt == [True], (
+                "Snapshot cancellation must acknowledge its native interrupt "
+                "before closing the owned connection"
+            )
+            # Observe the same task's terminal result without imposing a latency
+            # expectation or sending a second cancellation during its close.
             with pytest.raises(asyncio.CancelledError):
-                await snapshot_read
+                await await_within_hang_guard(
+                    snapshot_read, step="the cancelled snapshot read draining its close"
+                )
+            assert len(snapshot_connections) == 1
+            assert not aiosqlite_worker(snapshot_connections[0]).is_alive()
         finally:
             release_transaction.set()
             if snapshot_read is not None and not snapshot_read.done():
-                snapshot_read.cancel()
+                if not snapshot_read.cancelling():
+                    snapshot_read.cancel()
+                # If the interrupt guard regresses, release the real running
+                # SQLite query only after the ordering assertion has failed.
+                # The original admitted close and read still own their cleanup.
+                if native_interrupts and not interrupt_acknowledged:
+                    await native_interrupts[0]()
             await asyncio.gather(
                 transaction,
                 *([snapshot_read] if snapshot_read is not None else []),

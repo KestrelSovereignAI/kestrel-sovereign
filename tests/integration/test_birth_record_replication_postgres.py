@@ -77,14 +77,6 @@ async def pg_vector_schema():
                 )
             )
             try:
-                # migrate_add_embedding_profile_id probes an unscoped
-                # information_schema, so a same-named table in another schema
-                # can make it skip this one.
-                await db.execute(
-                    "ALTER TABLE document_chunks "
-                    "ADD COLUMN IF NOT EXISTS embedding_profile_id TEXT",
-                    (),
-                )
                 yield db, vector_schema
             finally:
                 await db.close()

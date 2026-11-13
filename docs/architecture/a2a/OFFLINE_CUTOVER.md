@@ -52,6 +52,21 @@ To cross the gate, follow this runbook with the host stopped:
 an affected agent is still running), then the preview and apply below, then
 `kestrel start`. `kestrel restart` refuses until the migration has completed.
 
+## Store schema revisions crossed at startup
+
+The cutover covers stored data. The native stores' own DDL is versioned
+separately, per component, in `a2a_native_store_schema`. A revision whose only
+change is additive DDL, such as nullable columns or new indexes, is crossed in
+place at startup: the task manager re-runs the component's idempotent store
+initializers under the shared schema lease and advances the stored revision in
+the same transaction. No row is converted. Every other stored revision still
+refuses startup and needs an offline migration.
+
+The one such upgrade today is CORE revision 5 to 6, which adds the
+`a2a_tool_dispatches` dispatch ids (#4002). A database already at a newer
+revision is refused by an older release, so after a host crosses revision 6,
+rolling back to an earlier release means restoring the pre-upgrade backup.
+
 ## Prepare the old host
 
 Drain legacy work while the old host can still communicate with its peers.

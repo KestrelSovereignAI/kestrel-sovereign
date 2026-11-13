@@ -16,6 +16,7 @@ reproduces the same strip-and-weld. These tests pin:
     server streams one separator and persists it as the seam, against a
     fixture the chat client's tests assert the same text from.
 """
+from tests.utils.native_streaming import streaming_agent
 import json
 from pathlib import Path
 
@@ -98,82 +99,24 @@ class TestStripAndWeld:
         assert "KESTREL:THINK" not in out
 
 
-def _passthrough():
-    class _Ctx:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-    return _Ctx()
 
 
-def _build_inline_agent(persisted):
-    """A mock agent wired for the inline-execution (codex) path: the LLM
-    stream yields plain text, a ToolCallStarted marker, then more plain
-    text, and the final LLMResponse carries executed_tool_calls (tools
-    already ran inside the call) rather than tool_calls."""
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock(
-        side_effect=lambda role, content, **kw: persisted.append(
-            {"role": role, "content": content, **kw}
-        )
-    )
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
 
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
-    agent.features = {}
-    agent.did = "did"
-    agent.extension = None
-    agent.is_request_cancelled = MagicMock(return_value=False)
-    agent._maybe_audit = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent.hooks_manager = None
-    agent._get_governing_constitution = AsyncMock(return_value="")
-    agent.check_solvency = AsyncMock(return_value="model")
-    agent._build_all_tools = MagicMock(return_value=[])
-    agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
+async def _build_inline_agent(native_tool_effect_agent, persisted):
+    agent = await streaming_agent(native_tool_effect_agent, persisted=persisted)
     agent._emit_revising_event = AsyncMock()
     agent._make_inline_tool_executor = MagicMock(return_value=None)
     agent._visible_features_by_tool_name = MagicMock(return_value={})
-    agent.user_prompt_template = MagicMock()
-    agent.user_prompt_template.format.return_value = "rendered"
-
-    context_result = MagicMock()
-    context_result.system_prompt = "system"
-    context_result.dynamic_user_context = "ctx"
-    context_result.messages = []
-    context_result.degraded_mode = False
-    agent.context_manager = MagicMock()
-    agent.context_manager.build_context = AsyncMock(return_value=context_result)
-
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-
-    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(agent)
-    agent._process_input_streaming_traced_locked = (
-        StreamingMixin._process_input_streaming_traced_locked.__get__(agent)
-    )
-    agent._persist_assistant_turn_safely = (
-        StreamingMixin._persist_assistant_turn_safely.__get__(agent)
-    )
     return agent
 
 
+
 @pytest.mark.asyncio
-async def test_inline_execution_path_welds_pre_and_post_tool_prose():
+async def test_inline_execution_path_welds_pre_and_post_tool_prose(native_tool_effect_agent):
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     persisted = []
-    agent = _build_inline_agent(persisted)
+    agent = await _build_inline_agent(native_tool_effect_agent, persisted)
 
     async def stream(**kw):
         yield "Let me check that."
@@ -188,7 +131,6 @@ async def test_inline_execution_path_welds_pre_and_post_tool_prose():
         ]
         yield resp
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     chunks = []
@@ -207,7 +149,7 @@ async def test_inline_execution_path_welds_pre_and_post_tool_prose():
 
 
 @pytest.mark.asyncio
-async def test_cancel_right_after_marker_persists_no_dangling_boundary():
+async def test_cancel_right_after_marker_persists_no_dangling_boundary(native_tool_effect_agent):
     """Codex review: the revise boundary is armed lazily. If the user
     cancels after the marker but before any post-tool text arrives, the
     persisted turn must NOT carry a trailing ``\\n\\n`` the client never
@@ -218,7 +160,7 @@ async def test_cancel_right_after_marker_persists_no_dangling_boundary():
     from kestrel_sdk.llm import ToolCallStarted
 
     persisted = []
-    agent = _build_inline_agent(persisted)
+    agent = await _build_inline_agent(native_tool_effect_agent, persisted)
 
     # is_request_cancelled flips True only once the stream is exhausted —
     # i.e. the user hits Stop after the LLM finished but before tools run.
@@ -235,7 +177,6 @@ async def test_cancel_right_after_marker_persists_no_dangling_boundary():
         )
         cancel_state["cancelled"] = True  # Stop pressed post-stream
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     async for _ in agent.process_input_streaming("go", session_id="s", request_id="r"):
@@ -305,7 +246,7 @@ def _replay(content, metadata):
     return formatted[0]["content"]
 
 
-async def _drive_tool_join(llm_items, orchestrator_items):
+async def _drive_tool_join(native_tool_effect_agent, llm_items, orchestrator_items):
     """Run one orchestrated tool turn; return (streamed chunks, assistant row).
 
     ``llm_items`` are first-stream strings or ``{"tool_call_started": ...}``
@@ -316,7 +257,7 @@ async def _drive_tool_join(llm_items, orchestrator_items):
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     persisted = []
-    agent = _build_inline_agent(persisted)
+    agent = await _build_inline_agent(native_tool_effect_agent, persisted)
 
     async def stream(**kw):
         for item in llm_items:
@@ -340,7 +281,6 @@ async def _drive_tool_join(llm_items, orchestrator_items):
                 tool_events.append({"type": event["type"], "tool": event["tool"]})
             yield item
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream(**kw)
     agent._handle_orchestrator_response_streaming = orchestrator
 
@@ -354,12 +294,12 @@ async def _drive_tool_join(llm_items, orchestrator_items):
 
 
 @pytest.mark.asyncio
-async def test_no_pending_boundary_join_keeps_separator():
+async def test_no_pending_boundary_join_keeps_separator(native_tool_effect_agent):
     """#2970 reproduction. No ToolCallStarted marker fired, so no revise
     boundary is pending at the join. Before the fix the seam was empty and both
     the client and the next turn's replay read "…STRATEGY.yaml?Only one…"."""
     tool_start = '\x1eKESTREL:TOOL:{"phase":"start","name":"strategy_view"}\x1e'
-    chunks, row = await _drive_tool_join(
+    chunks, row = await _drive_tool_join(native_tool_effect_agent,
         ["Let me open STRATEGY.yaml?"],
         [tool_start, "Only one permission is missing."],
     )
@@ -378,8 +318,8 @@ async def test_no_pending_boundary_join_keeps_separator():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", _JOIN_CASES, ids=[c["name"] for c in _JOIN_CASES])
-async def test_tool_join_matches_shared_fixture(case):
-    chunks, row = await _drive_tool_join(case["llm"], case["orchestrator"])
+async def test_tool_join_matches_shared_fixture(native_tool_effect_agent, case):
+    chunks, row = await _drive_tool_join(native_tool_effect_agent, case["llm"], case["orchestrator"])
     metadata = row["metadata"]
     pre = case["text"][: len(case["text"]) - len(case["content"]) - len(case["seam"])]
 

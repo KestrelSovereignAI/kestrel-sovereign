@@ -10,6 +10,7 @@ from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
+from kestrel_sdk.testing import drain_streaming_text_only
 from pydantic import BaseModel, Field
 
 from kestrel_sovereign.llm.service import LLMService
@@ -457,16 +458,14 @@ class TestAdapterStructuredOutput:
 
         model_to_use = chat_models[0].id
 
-        chunks = []
-        async for chunk in adapter.get_streaming_response(
-            client=client,
-            model=model_to_use,
-            messages=messages,
-            response_format=MathResponse,
-        ):
-            chunks.append(chunk)
-
-        full_response = "".join(chunks)
+        full_response = await drain_streaming_text_only(
+            adapter.get_streaming_response(
+                client=client,
+                model=model_to_use,
+                messages=messages,
+                response_format=MathResponse,
+            )
+        )
         assert full_response is not None
 
         # Should be valid JSON
@@ -562,17 +561,14 @@ class TestStreamingStructuredOutput:
             user_prompt="What is 3+3?", system_prompt="Answer math questions."
         )
 
-        chunks = []
-        async for chunk in adapter.get_streaming_response(
-            client=client,
-            model="gpt-5-mini",
-            messages=messages,
-            response_format=MathResponse,
-        ):
-            chunks.append(chunk)
-
-        # Reconstruct the full response from chunks
-        full_response = "".join(chunks)
+        full_response = await drain_streaming_text_only(
+            adapter.get_streaming_response(
+                client=client,
+                model="gpt-5-mini",
+                messages=messages,
+                response_format=MathResponse,
+            )
+        )
         assert full_response is not None
 
         # Should be valid JSON

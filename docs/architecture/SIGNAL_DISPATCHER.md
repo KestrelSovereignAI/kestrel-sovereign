@@ -59,7 +59,7 @@ The bird has at least five mechanisms that legitimately wake it up or trigger wo
 | Approval request | [features/security/approval_queue.py:81](../../kestrel_sovereign/features/security/approval_queue.py#L81) | Both a hook AND an event | Pick one |
 | Webhook (Stripe) | [kestrel_feature_wallet/onramp/webhook_handler.py:80](https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/kestrel_feature_wallet/onramp/webhook_handler.py#L80) | Stores + fires callback | Wake the bird |
 
-Each was added at a different time by a different author. Same accretion shape as the model-selection postmortem in [CLAUDE.md](../../CLAUDE.md). With one signal, the abstraction is invisible. With five, overdue.
+Each was added at a different time by a different author. Same accretion shape as the model-selection postmortem in [AGENTS.md](../../AGENTS.md). With one signal, the abstraction is invisible. With five, overdue.
 
 The existing `emit_event` / `add_event_listener` ([agent/event_manager.py:15-33](../../kestrel_sovereign/agent/event_manager.py#L15-L33)) looks like a bus but is **agent → UI only**. The missing direction — world → agent — was never built.
 
@@ -491,6 +491,73 @@ unadmitted attempts; each caller separately receives its actual allocation error
 with the original native receipt. A later admitted cleanup must settle the same
 delivery/token through its real CAS, without reviving ordinary runtime work.
 
+#### Runtime-owner renewal
+
+An owner that is not durably retired is renewed on every heartbeat tick, and
+nothing else decides that (#4001). What keeps it unretired does not matter: a
+shutdown that refused or failed, retained row debt, a retained cognition task,
+retained writer control, or a refused admission
+(`_runtime_owner_liveness_required`). Otherwise a peer judges it dead and
+reclaims leases it still holds, so the same work runs twice.
+
+Renewal is one fixed write, `retain_unretired_runtime_owner`, and it is the
+only path that renews an owner. It refreshes this owner's own existing,
+unstopped row. It never inserts a row, revives a stopped one, grants a lease or
+admits work, and on PostgreSQL it no longer depends on the owner leasing core
+cognition. On PostgreSQL it runs on a one-connection pool of its own, opened
+when the owner registers and checked out by nothing else, so ordinary work
+holding every connection of the operational or advisory pool cannot hold it
+back; it shares only the owner-scope advisory key, the transaction lock that
+serializes it with recovery. It never falls back to another pool, and closing
+the backend waits for a renewal in flight before closing that pool. A close
+cancelled during that wait keeps the cancellation, closes every pool, then
+raises it. This costs
+one PostgreSQL connection per backend that hosts an owner. On a SQLite file it runs on a
+connection of its own, kept between renewals and retired by the backend's
+close, never the shared work connection. Each renewal checks that the
+database's path still names the file the backend connected to, before it
+waits for the writer slot and again before it commits, and refuses otherwise.
+After a cancelled
+write's rollback cannot be confirmed, that connection's cleanup fence refuses
+every later write on it until it is replaced; renewal is not one of them, and
+it leaves the fence and the error it retains as they are. Only SQLite's writer
+slot is shared. Renewal tries for it in attempts of 0.1 s for at most 5 s
+before a retry, and between attempts ends, having written nothing, once the
+backend's close has begun. Close therefore waits only for a renewal that
+already holds the slot, and its reservation covers that one attempt. Because
+renewal commits from a second connection, every SQLite `transaction()` begins
+`BEGIN IMMEDIATE`: a deferred transaction that read before such a commit could
+not then write. An
+in-memory SQLite database has one connection for every writer, a peer's
+recovery included, so it renews there. On both backends each tick starts it
+in a task of its own (`_start_runtime_owner_renewal`), in an empty context.
+It therefore runs outside durable admission (`_admit_durable_operation`) and
+on no execution scope the agent's own work holds, so neither retained control
+nor a fenced original scope can refuse it. It never waits for other work: the
+tick starts it before the heartbeat's maintenance, and schedules the next tick
+without waiting for that maintenance, so a maintenance pass that stalls or
+fails never holds renewal back. No scheduling call postpones a tick that is
+already due sooner.
+
+Renewal stops only while shutdown marks the owner stopped
+(`_retire_runtime_owner`), and once that mark commits. Retirement runs after
+durable admission has drained, so that span lasts one renewal write. Stopping
+the heartbeat joins the heartbeat, then the renewal, and cancels the next tick
+after each join, so no heartbeat starts unjoined; a tick that lost the race to
+retirement renews nothing and is not a failure. If stopping the heartbeat or
+the mark fails, renewal resumes for the retry; a stop mark whose
+acknowledgement was lost is still a retirement, and the resumed renewal finds
+the owner stopped and renews nothing. A renewal that finds the owner stopped
+or gone renews nothing, and while debt that guards a lease stands it raises
+that debt as lost protection.
+
+The maintenance after it (`_heartbeat_runtime_owner`) recovers reservations,
+handoffs and leases. It runs under durable admission and in the owner's own
+execution scope, so its failures, including retained control, stay its own.
+While debt that guards a lease stands (`_runtime_owner_cleanup_required`), or
+once shutdown has closed admission, a heartbeat only renews and admits no
+cognition.
+
 #### Resuming on a wait handle instead of holding a turn
 
 A held wait (`wait("<kind>:<handle>")`, or any `run_wait_loop` caller) is
@@ -734,6 +801,46 @@ its whole body (#3310), so persisting under that lock queued inbound ACK
 ingress and cron dispatches behind any in-flight turn. The global order is
 CONVERSATION → privacy transition → persistence gate; nothing is acquired
 while the gate is held.
+
+**A dispatch, and any supervisor that awaits a dispatch's delivery, is its own
+unit of work and never part of the turn that enqueued it (#4023).** A Task
+copies its creator's context, and a turn's context carries two turn-scoped
+authorities:
+
+- membership of the turn's native privacy lifetime. The Task becomes a join
+  obligation of the turn's effect-journal retirement
+  (`ToolEffectTurn.close → join_native_scope`), which runs after the turn has
+  released CONVERSATION and holds the privacy-transition lock until every
+  member settles;
+- the turn's delegated CONVERSATION ownership, so a turn the Task starts while
+  the creating turn still holds CONVERSATION is treated as a re-entry into
+  that hold.
+
+A COGNITION wake for the same agent is a new turn. Enrolled in its producer's
+retirement, it takes CONVERSATION the moment the producing turn releases it,
+then waits for the privacy-transition lock the retirement still holds, while
+the retirement waits for the wake. Neither ever finishes, and the agent stays
+parked until the host restarts. On Claw this was most often the recipient's
+own `a2a.task_complete` self-wake after `respond_to_a2a_task` completed an
+inbound task from inside a turn.
+
+Every such Task is therefore created inside
+`kestrel_sovereign.signals.delivery.detached_from_enclosing_turn()`, which runs
+`outside_native_privacy_lifetime()` and `without_delegated_lock_ownership()`
+and owns no coordinator of its own:
+
+- the dispatcher's `enqueue_signal`, `enqueue_durable_cognition` and
+  `enqueue_durable_terminal` Tasks;
+- the `a2a.task_complete` and `a2a.task_submitted` wake supervisors in
+  `EventManagerMixin`, which TaskManager calls on whichever Task completed or
+  submitted the task;
+- the restart coordinator's `restart_completed_ack` supervisor, which a
+  `!restart coordinator` sweep starts from inside a turn;
+- `supervise_terminal_delivery` and `harvest_detached_delivery` in
+  `kestrel_sovereign/signals/delivery.py`.
+
+A new producer that enqueues or awaits a signal from a background Task follows
+the same rule.
 
 The same gate, held shared, is the lock the agent hands to Workflows as
 `workflow_await_signal_privacy_transition_lock` (#3484). Workflows holds it
@@ -1375,4 +1482,4 @@ The epic is shippable when:
 
 The bird started as a chat bot — one entry point, one mental model. Heartbeat was the first crack in that frame and was conceived as a periodic timer, not as one-of-N signals. Every signal added afterward solved a local problem in its author's vocabulary: scheduler author thought "cron"; A2A author thought "callback"; wallet author thought "webhook"; security author thought "hook." Three different problems, four different solutions, no consolidation.
 
-From inside the timeline this is invisible; from outside, it's the same accretion pattern documented in CLAUDE.md for model selection. The design is obvious in retrospect for the same reason every consolidation is obvious in retrospect: the abstraction only becomes visible once enough instances exist to suggest it.
+From inside the timeline this is invisible; from outside, it's the same accretion pattern documented in AGENTS.md for model selection. The design is obvious in retrospect for the same reason every consolidation is obvious in retrospect: the abstraction only becomes visible once enough instances exist to suggest it.

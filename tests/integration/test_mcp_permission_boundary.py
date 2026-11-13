@@ -12,10 +12,14 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from kestrel_sdk.resources import ResourceConflict
 
-from tests.integration.mcp_permission_peers import MCPTestPeer, docker_peer, https_peer
+from tests.integration.mcp_permission_peers import (
+    MCPTestPeer, docker_peer, gateway_peer, https_peer, owned_provider_network,
+)
+from tests.utils.native_tool_effects import drive_native
+from tests.shared.agent_http import authenticated_agent_app
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
-from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
@@ -26,6 +30,208 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120)]
 
+
+async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, monkeypatch):
+    """Use the installed provider and native SDK; never a metered vendor."""
+    from kestrel_llm_deepseek import DeepSeekAdapter
+
+    async with https_peer(tmp_path, monkeypatch, provider_model="owned-permission-model") as peer:
+        with owned_provider_network(monkeypatch, peer) as dials:
+            provider = DeepSeekAdapter.create_provider({
+                "api_key": "owned-synthetic-provider-key", "base_url": peer.provider_url,
+                "model": "owned-permission-model",
+            })
+            try:
+                models = await provider.adapter.list_models(provider.client)
+                assert [model.id for model in models] == ["owned-permission-model"]
+                response = await provider.adapter.get_response(provider.client, provider.model,
+                    [{"role": "user", "content": "Record the owned marker using the connected MCP tool."}], tools=[{
+                        "type": "function", "function": {"name": "record_marker", "parameters": {
+                            "type": "object", "properties": {"marker": {"type": "string"}},
+                            "required": ["marker"],
+                        }},
+                    }])
+                call, = response.tool_calls
+                assert call.name == "record_marker" and call.arguments == {"marker": "owned-provider-effect"}
+                assert await peer.witness(None, None) == [], "Provider tool selection must not execute the MCP tool"
+                assert dials
+            finally:
+                await provider.client.close()
+
+
+@pytest.mark.parametrize("permission,decision,witness,fault,operator_input", [
+    (PermissionLevel.DENY, "auto_denied", [], None, None),
+    (PermissionLevel.ALLOW, "auto_allowed", ["owned-provider-effect"], None, None),
+    (PermissionLevel.ALLOW, None, [], "wrong_choice", None),
+    (PermissionLevel.ALLOW, "auto_allowed", [], None, 'form'),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_full_boot_http_invoke_governs_external_mcp_effect(
+    tmp_path, monkeypatch, permission, decision, witness, fault, streaming, operator_input,
+):
+    """Drive actual agent boot, HTTP invoke, provider SDK and native MCP."""
+    import json
+    import httpx2
+    from cryptography.fernet import Fernet
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.feature_registry import get_package_for_feature
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+    from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
+
+    async with AsyncExitStack() as cleanup:
+        runtime = cleanup.enter_context(monkeypatch.context())
+        runtime.chdir(tmp_path)
+        runtime.setenv("KESTREL_HOME", str(tmp_path))
+        runtime.setenv("KESTREL_DB_PATH", str(tmp_path))
+        runtime.setenv("KESTREL_API_KEY", "owned-native-invoke-key")
+        runtime.setenv("AWS_EC2_METADATA_DISABLED", "true")
+        data_key = tmp_path / "owned-data-key"
+        data_key.write_bytes(Fernet.generate_key())
+        data_key.chmod(0o600)
+        runtime.setenv("KESTREL_DATA_KEY_FILE", str(data_key))
+        runtime.setenv("KESTREL_DATA_KEY", data_key.read_text().strip())
+        peer = await cleanup.enter_async_context(https_peer(
+            tmp_path, runtime, provider_model="owned-permission-model", provider_fault=fault,
+            operator_input=operator_input))
+        dials = cleanup.enter_context(owned_provider_network(runtime, peer))
+        package = get_package_for_feature('MCPAgent')
+        assert package is not None
+        (tmp_path / "kestrel.toml").write_text(
+            '[llm]\nroute_priority=["deepseek:api"]\n'
+            '[llm.vendors.deepseek.routes.api]\n'
+            'api_key="owned-synthetic-provider-key"\n'
+            f'base_url={json.dumps(peer.provider_url)}\nmodel="owned-permission-model"\n'
+            + (f'[features.{json.dumps(package.name)}.config.inputs]\nenabled=true\n' if operator_input else ''))
+        identity = await create_kestrel_identity_async(output_dir=str(tmp_path), is_test_instance=True,
+            agent_name="OwnedNativeInvoke", did_web_domain="owned-native-invoke.invalid",
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:3679-owned-native-invoke")
+        service = LLMService(agent_data_dir=tmp_path)
+        cleanup.push_async_callback(service.close)
+        agent = KestrelAgent(did=identity.agent_did, storage_path=str(tmp_path / "kestrel_prime.db"),
+            llm_service=service, allowed_features={"MCPAgent", "BootstrapFeature"}, sync_enabled=False)
+
+        async def shutdown():
+            from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
+
+            async with asyncio.timeout(30):
+                await shutdown_fixture_agent(agent)
+                await agent.wait_for_shutdown_completion()
+                assert not service.has_pending_close_owners()
+
+        cleanup.push_async_callback(shutdown)
+        await asyncio.wait_for(agent.initialize(), 30)
+        assert {type(feature).__name__ for feature in agent.features.values()} == MANDATORY_FEATURES | {"MCPAgent", "BootstrapFeature"}
+        feature = next(feature for feature in agent.features.values() if type(feature).__name__ == "MCPAgent")
+        security = next(feature for feature in agent.features.values() if type(feature).__name__ == "SecurityFeature")
+        loaded = await feature.load_tool(peer.selector)
+        assert loaded.status.value == "ok", loaded.to_dict()
+        owner = "mcp:remote:" + loaded.data["connection"]
+        handle, = [name for name, tool_owner in agent._tool_to_feature.items() if tool_owner == owner]
+        await security.permission_store.set_permission(owner, handle, permission)
+        app = authenticated_agent_app(agent,
+            session_secret="owned-native-invoke-session-signing-key")
+        app.include_router(router)
+        if operator_input:
+            assert feature._input_host is not None, 'Saved input settings did not survive full native boot'
+            app.include_router(feature.get_router())
+        client = await cleanup.enter_async_context(httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="https://owned-console.invalid",
+            headers={"X-API-Key": "owned-native-invoke-key"}))
+        greeting = await asyncio.wait_for(client.post("/api/agent/invoke", json={
+            "input": "Hello", "session_id": "owned-native-permission",
+        }), 30)
+        assert greeting.status_code == 200, greeting.text
+        assert await peer.witness(feature, loaded.data["connection"]) == []
+        onboarding = await asyncio.wait_for(client.post("/api/agent/invoke", json={
+            "input": "!skip-discovery", "session_id": "owned-native-permission",
+        }), 30)
+        assert onboarding.status_code == 200, onboarding.text
+        assert await agent.bootstrap_service.is_bootstrap_needed() is False
+        before_calls = len([r for r in peer.provider_requests() if r["path"].endswith("/chat/completions")])
+        result = await asyncio.wait_for(client.post("/api/agent/stream" if streaming else "/api/agent/invoke", json={
+            "input": "Record the owned marker using the connected MCP tool.",
+            "provider": "deepseek:api", "model": "owned-permission-model",
+            "session_id": "owned-native-permission",
+        }), 30)
+        assert await peer.witness(feature, loaded.data["connection"]) == witness
+        decisions = [row["decision"] for row in await security.permission_store.get_audit_log()
+            if row["feature"] == owner and row["tool"] == handle]
+        if fault is None:
+            assert result.status_code == 200, result.text
+            assert decisions == [decision], {"response": result.text, "provider_requests": peer.provider_requests()}
+            if operator_input:
+                after_calls = len([r for r in peer.provider_requests() if r['path'].endswith('/chat/completions')])
+                assert after_calls - before_calls == 1, 'Input wait retained the model loop instead of returning control'
+                assert 'waiting for operator input' in result.text
+                listed = await client.get('/api/mcp/inputs', params={'session_id': 'owned-native-permission'})
+                assert listed.status_code == 200, listed.text
+                row, = listed.json()['inputs']
+                if not streaming:
+                    from fastapi import Request
+                    from kestrel_sdk.signals import RedactionPolicy, ResourceLock, Signal, SignalMode, SourceRegistration, Trust
+                    from kestrel_sovereign.auth import caller_context_scope
+                    template = tmp_path / 'owned-input-wake.md'
+                    template.write_text('Record the owned marker using the connected MCP tool.')
+                    agent.signal_registry.register(SourceRegistration(name='owned.mcp.input', schema=dict,
+                        default_mode=SignalMode.COGNITION, allowed_modes=frozenset({SignalMode.COGNITION}),
+                        prompt_template=template, trust=Trust.TRUSTED, resources=frozenset(),
+                        log_redaction=RedactionPolicy(summarize=lambda _payload: '', store_raw_trusted=False)))
+                    signal = Signal(source='owned.mcp.input', kind='once', mode=SignalMode.COGNITION,
+                        payload={}, target_agent=agent.did, caller='owned-test-timer', origin_trust=Trust.TRUSTED)
+                    @app.post('/api/owned-input-wake')
+                    async def wake(request: Request):
+                        with caller_context_scope(request.state.caller):
+                            outcome = await agent.dispatcher.dispatch_signal(signal)
+                            return {'status': outcome.status.value, 'error': outcome.error}
+                    locks = agent._get_lock_manager()
+                    wake_call = None
+                    try:
+                        # Real CONVERSATION contention: a queued wake must not
+                        # turn its inherited HTTP credential into an approver.
+                        async with locks.acquire({ResourceLock.CONVERSATION}, label='owned-input-contention'):
+                            wake_call = asyncio.create_task(client.post('/api/owned-input-wake'))
+                            async with asyncio.timeout(5):
+                                while not any(d['blocked_acquirers'] for d in locks.active_hold_diagnostics()
+                                        if d['resource'] == ResourceLock.CONVERSATION.value):
+                                    assert not wake_call.done(), ('Signal did not reach the real conversation lock: '
+                                        + wake_call.result().text)
+                                    await asyncio.sleep(.01)
+                        woke = await asyncio.wait_for(wake_call, 15)
+                        assert woke.status_code == 200 and woke.json()['status'] == 'ok', woke.text
+                        assert await peer.witness(feature, loaded.data['connection']) == []
+                        assert await feature._input_host.store.database.fetchall(
+                            'SELECT reason FROM mcp_input_decisions') == [('no_approver',)]
+                        after_wake = await client.get('/api/mcp/inputs', params={'session_id': 'owned-native-permission'})
+                        assert after_wake.json()['inputs'] == [row]
+                        assert await feature._input_host.store.database.fetchone(
+                            'SELECT COUNT(*) FROM mcp_inputs') == (1,), 'Unattended signal created an operator wait'
+                    finally:
+                        if wake_call is not None:
+                            if not wake_call.done(): wake_call.cancel()
+                            await asyncio.gather(wake_call, return_exceptions=True)
+                continued = await client.post('/api/mcp/inputs/' + row['request_id'] + '/responses',
+                    params={'session_id': 'owned-native-permission'}, json={'revision': row['revision'],
+                        'operation_id': uuid.uuid4().hex, 'responses': {'private-form-key': {
+                            'action': 'accept', 'content': {'city': 'owned-private-answer'}}}})
+                assert continued.status_code == 200, continued.text
+                assert continued.json()['state'] == 'RESOLVED'
+                assert await peer.witness(feature, loaded.data['connection']) == ['owned-provider-effect']
+        else:
+            if streaming:
+                from kestrel_sovereign.llm.completion_protocol import GenerationProtocolError
+                from kestrel_sovereign.llm.streaming_errors import agent_stream_error_block
+                assert result.status_code == 200, result.text
+                assert agent_stream_error_block(GenerationProtocolError()) in result.text, result.text
+            else:
+                assert result.status_code == 502, result.text
+                assert "generation_incomplete" in result.text, result.text
+            assert decisions == []
+            after_calls = len([r for r in peer.provider_requests() if r["path"].endswith("/chat/completions")])
+            assert after_calls - before_calls == 1, "The malformed pinned route was retried"
+        assert dials
 
 @dataclass
 class MCPBoundary:
@@ -41,10 +247,13 @@ class MCPBoundary:
     selector: str
     peer: MCPTestPeer
 
-    def invoke(self, marker):
-        task = asyncio.create_task(self.agent.execute_named_tool(
-            self.handle, {'marker': marker}, session_id='mcp-boundary', source='mcp-seam-test',
+    async def run_named(self, tool, arguments):
+        return await drive_native(self.agent, lambda: self.agent.execute_named_tool(
+            tool, arguments, session_id='mcp-boundary', source='mcp-seam-test',
         ))
+
+    def invoke(self, marker):
+        task = asyncio.create_task(self.run_named(self.handle, {'marker': marker}))
         self.calls.append(task)
         return task
 
@@ -59,9 +268,17 @@ class MCPBoundary:
         assert await self.witness() == expected_witness
         return result
 
+    async def registration_refused_with_witness(self, call):
+        with pytest.raises(ResourceConflict, match='Tool registration changed during effect admission'):
+            await call
+        assert await self.witness() == []
+        assert await self.agent.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims',
+        ) == [('NOT_EXECUTED',)]
+
 
 @pytest_asyncio.fixture(params=[pytest.param("container", marks=pytest.mark.docker_mcp), "remote"])
-async def mcp_boundary(request, tmp_path, monkeypatch):
+async def mcp_boundary(request, tmp_path, monkeypatch, native_tool_effect_agent):
     # No importorskip: the installed-feature job must fail on a missing package.
     import kestrel_feature_mcp
     from kestrel_feature_mcp.feature import MCPAgent
@@ -69,14 +286,17 @@ async def mcp_boundary(request, tmp_path, monkeypatch):
     assert "site-packages" in str(Path(kestrel_feature_mcp.__file__).resolve())
     identity = uuid.uuid4().hex
     async with AsyncExitStack() as cleanup:
-        peer = await cleanup.enter_async_context(
-            docker_peer(tmp_path) if request.param == "container" else https_peer(tmp_path, monkeypatch))
-        agent = KestrelAgent(did=f'did:test:mcp-seam-{identity}', storage_path=str(tmp_path / 'agent.db'))
-        cleanup.push_async_callback(agent.llm_service.close)
-        backend = SQLiteBackend(str(tmp_path / "enablement.db"))
-        await backend.connect()
-        cleanup.push_async_callback(backend.close)
-        enablement = FeatureEnablementStore(backend)
+        factories = {
+            "container": lambda: docker_peer(tmp_path),
+            "remote": lambda: https_peer(tmp_path, monkeypatch),
+            "gateway": lambda: gateway_peer(tmp_path, monkeypatch),
+            "gateway-held": lambda: gateway_peer(tmp_path, monkeypatch, hold_tool_reply=True),
+            "gateway-lingering": lambda: gateway_peer(tmp_path, monkeypatch, linger_after_stdio=True),
+        }
+        peer = await cleanup.enter_async_context(factories[request.param]())
+        agent = await native_tool_effect_agent(did=f'did:test:mcp-seam-{identity}')
+        await agent._raw_storage.initialize()
+        enablement = FeatureEnablementStore(agent._raw_storage.db.backend)
         await enablement.initialize()
         agent._feature_enablement_store = enablement
         feature = MCPAgent(agent)
@@ -105,11 +325,14 @@ async def mcp_boundary(request, tmp_path, monkeypatch):
         await feature.initialize()
         cleanup.push_async_callback(feature.shutdown)
         agent.features[feature.name] = feature
-        loaded = await feature.load_tool(peer.selector)
+        loaded = await peer.load(feature)
         assert loaded.status.value == 'ok', loaded.to_dict()
         initial_manager = feature.manager
-        container = loaded.data['container' if peer.kind == 'container' else 'connection']
-        owner = f'mcp:{peer.kind}:' + container
+        if peer.kind == "gateway":
+            container, owner = "gateway", "mcp:gateway"
+        else:
+            container = loaded.data['container' if peer.kind == 'container' else 'connection']
+            owner = f'mcp:{peer.kind}:' + container
         handles = [name for name, candidate in agent._tool_to_feature.items() if candidate == owner]
         assert len(handles) == 1
         assert handles[0].endswith('__record_marker'), agent._direct_tool_defs
@@ -136,14 +359,14 @@ async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary):
         ('mcp_gateway_call', {'tool_name': 'record_marker', 'arguments': {'marker': 'gateway-denied'}}),
     ]:
         with pytest.raises(ToolNotRegisteredError):
-            await peer.agent.execute_named_tool(generic, arguments, session_id='mcp-boundary')
+            await peer.run_named(generic, arguments)
     assert await peer.witness() == []
     audit = await peer.store.get_audit_log()
     assert any(row['feature'] == peer.owner and row['tool'] == peer.handle
                and row['decision'] == 'auto_denied' for row in audit)
 
 
-async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary):
+async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary, approved_timeout=5):
     peer = mcp_boundary
     await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.ASK)
     first = peer.invoke('approved-once')
@@ -152,7 +375,7 @@ async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_bou
     assert request.tool_args == {'marker': 'approved-once'}
     assert await peer.witness() == []
     assert await peer.queue.submit_decision(request.id, True, scope='once')
-    result = await peer.result_with_witness(asyncio.wait_for(first, 5), ['approved-once'])
+    result = await peer.result_with_witness(asyncio.wait_for(first, approved_timeout), ['approved-once'])
     assert result['status'] == 'ok'
     assert not await peer.queue.submit_decision(request.id, True, scope='once')
     second = peer.invoke('not-approved-again')
@@ -168,24 +391,22 @@ async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_bou
     assert decisions.count('user_denied') == 1
 
 
-async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary):
+async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary, approved_timeout=5):
     peer = mcp_boundary
     await peer.store.set_permission(peer.owner, peer.handle, PermissionLevel.ASK)
     pending = peer.invoke('approved-for-old-connection')
     request = await asyncio.wait_for(peer.requests.get(), 5)
     original = peer.current_connection()
-    reloaded = await peer.feature.load_tool(peer.selector)
+    reloaded = await peer.peer.load(peer.feature)
     assert reloaded.status.value == 'ok', reloaded.to_dict()
     current = peer.current_connection()
     assert current is not original and not original.is_connected
     assert await peer.queue.submit_decision(request.id, True, scope='once')
-    result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
-    assert result['status'] == 'error', result
-    assert 'changed; rediscover' in result['error']
+    await peer.registration_refused_with_witness(asyncio.wait_for(pending, 5))
     fresh = peer.invoke('approved-for-new-connection')
     following = await asyncio.wait_for(peer.requests.get(), 5)
     assert await peer.queue.submit_decision(following.id, True, scope='once')
-    result = await peer.result_with_witness(asyncio.wait_for(fresh, 5), ['approved-for-new-connection'])
+    result = await peer.result_with_witness(asyncio.wait_for(fresh, approved_timeout), ['approved-for-new-connection'])
     assert result['status'] == 'ok'
 
 
@@ -210,8 +431,7 @@ async def test_same_instance_disable_enable_restores_the_governed_connection(mcp
         assert peer.feature.manager is not original_manager
     assert peer.current_connection() is not original_connection
     assert await peer.queue.submit_decision(request.id, True, scope="once")
-    result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
-    assert result["status"] == "error" and "changed; rediscover" in result["error"]
+    await peer.registration_refused_with_witness(asyncio.wait_for(pending, 5))
 
     fresh = peer.invoke("approved-after-reenable")
     following = await asyncio.wait_for(peer.requests.get(), 5)
@@ -222,6 +442,7 @@ async def test_same_instance_disable_enable_restores_the_governed_connection(mcp
     assert result["status"] == "ok"
 
 
+@pytest.mark.docker_mcp
 @pytest.mark.parametrize("mcp_boundary", ["container"], indirect=True)
 async def test_disable_cannot_release_custody_ahead_of_an_admitted_docker_acquisition(mcp_boundary, monkeypatch):
     from kestrel_feature_mcp.manager import MCPToolManager
@@ -264,7 +485,7 @@ async def test_disable_cannot_release_custody_ahead_of_an_admitted_docker_acquis
         assert not await peer.agent.get_enablement_deltas("mcp_server")
         assert not any(owner.startswith("mcp:") for owner in peer.agent._tool_to_feature.values())
         with pytest.raises(ToolNotRegisteredError):
-            await peer.agent.execute_named_tool(peer.handle, {"marker": "after-disable"}, session_id="mcp-boundary")
+            await peer.run_named(peer.handle, {"marker": "after-disable"})
         refused = await peer.feature.load_tool(peer.selector)
         assert refused.status.value == "error" and "shutting down" in refused.error
         assert len(managers) == 1
@@ -293,8 +514,7 @@ async def test_pending_approval_cannot_execute_while_remote_unload_waits_on_stor
     try:
         await asyncio.wait_for(entered.wait(), 5)
         assert await peer.queue.submit_decision(request.id, True, scope="once")
-        result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
-        assert result["status"] == "error" and "changed; rediscover" in result["error"]
+        await peer.registration_refused_with_witness(asyncio.wait_for(pending, 5))
     finally:
         release.set()
         unloaded = await asyncio.wait_for(unloading, 5)
@@ -386,9 +606,7 @@ async def test_restore_database_read_failure_does_not_block_another_remote(mcp_b
         handles = [name for name, candidate in peer.agent._tool_to_feature.items() if candidate == owner]
         assert len(handles) == 1
         await peer.store.set_permission(owner, handles[0], PermissionLevel.ALLOW)
-        result = await peer.agent.execute_named_tool(
-            handles[0], {"marker": "after-store-read-failure"}, session_id="mcp-boundary",
-        )
+        result = await peer.run_named(handles[0], {"marker": "after-store-read-failure"})
         assert await peer.witness() == ["after-store-read-failure"]
         assert result["status"] == "ok"
     finally:

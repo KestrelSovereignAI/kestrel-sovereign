@@ -16,6 +16,7 @@ changed, which is the one thing a reader can already see.
 from __future__ import annotations
 
 import re
+import shlex
 
 import pytest
 import yaml
@@ -170,3 +171,226 @@ def test_pytest_reaches_its_own_deadline_before_the_runner_kills_the_step(
         f"The runner would win the race and report a timeout with no "
         f"traceback."
     )
+
+
+def test_mcp_lane_runs_the_actual_host_process_restart_campaign():
+    """Installed MCP CI must not omit host/auth/restore and approval restart."""
+    step = _suite_step('mcp-permission-seam', 'tests/integration/test_mcp_permission_boundary.py')
+    assert 'tests/integration/test_mcp_permission_host_restart.py' in shlex.split(step['run'])
+    assert 'tests/integration/test_mcp_permission_unknown_restart.py' in shlex.split(step['run'])
+    assert 'tests/integration/test_tool_effect_host_boot.py' in shlex.split(step['run'])
+    assert 'tests/integration/test_a2a_native_permission_cognition.py' in shlex.split(step['run'])
+    assert ('tests/unit/test_async_ownership.py::'
+        'test_repeated_withdrawal_does_not_accumulate_completion_callbacks') in shlex.split(step['run'])
+    job = yaml.safe_load(CI_WORKFLOW.read_text())['jobs']['mcp-permission-seam']
+    installations = [shlex.split(item['run']) for item in job['steps']
+        if str(item.get('run', '')).startswith('uv sync ')]
+    assert len(installations) == 1
+    installation = installations[0]
+    assert installation[installation.index('--python') + 1] == '3.14'
+
+
+@pytest.mark.asyncio
+async def test_owned_process_shutdown_preserves_full_original_diagnostic(tmp_path):
+    """A native fixture process proves log retention, not Core shutdown success."""
+    import asyncio
+    import sys
+    from tests.integration.test_mcp_permission_host_restart import RunningHost
+
+    diagnostic = ('owned-prefix-' * 400) + '\nowned original shutdown failure\n' + ('owned-suffix-' * 400)
+    log_path = tmp_path / 'failed-shutdown.log'
+    with log_path.open('wb') as log:
+        process = await asyncio.create_subprocess_exec(sys.executable, '-I', '-c',
+            'import sys; sys.stdout.write(sys.argv[1])', diagnostic,
+            stdout=log, stderr=asyncio.subprocess.STDOUT)
+        await process.wait()
+    host = RunningHost({'pid': process.pid}, process, log_path)
+    with pytest.raises(AssertionError) as raised:
+        await host.stop()
+    assert all(line in str(raised.value) for line in diagnostic.splitlines())
+
+
+def test_native_mcp_host_carries_the_documented_ci_sqlite_budget(tmp_path, monkeypatch):
+    from tests.integration.test_mcp_permission_host_restart import owned_host_environment
+
+    setting = 'KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S'
+    jobs = yaml.safe_load(CI_WORKFLOW.read_text())['jobs']
+    configured = jobs['integration-tests']['env'][setting]
+    assert jobs['mcp-permission-seam']['env'][setting] == configured
+    assert jobs['native-postgres-tests']['env'][setting] == configured
+    monkeypatch.setenv(setting, configured)
+    monkeypatch.setenv('UNOWNED_OPERATOR_SETTING', 'must-not-cross')
+    environment = owned_host_environment(tmp_path, api_key='owned-api', data_key='owned-data')
+    assert environment[setting] == configured
+    assert environment['HOME'] == environment['KESTREL_HOME'] == str(tmp_path)
+    assert 'UNOWNED_OPERATOR_SETTING' not in environment
+    monkeypatch.delenv(setting)
+    assert setting not in owned_host_environment(tmp_path, api_key='owned-api', data_key='owned-data')
+
+
+def test_owned_lifespan_observer_reports_original_pending_shutdown(tmp_path):
+    """A child owns its timer; the parent's pytest backstop stays armed."""
+    from tests.shared.child_pytest import run_child_pytest
+
+    result = run_child_pytest(tmp_path, conftest='',
+        test_file='test_lifespan_diagnostics.py',
+        source='''from tests.unit.test_ci_timeout_budget import _assert_original_shutdown_diagnostics
+
+def test_original_shutdown(tmp_path, capfd, caplog):
+    _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog)
+''', args=['test_lifespan_diagnostics.py', '-q'], timeout=15)
+    assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize('interval', [0, -1, float('nan'), float('inf')])
+def test_owned_lifespan_observer_requires_finite_positive_interval(tmp_path, interval):
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    with pytest.raises(ValueError, match='finite and positive'):
+        ObservedHost(None, 'unused', tmp_path, shutdown_trace_interval=interval)
+
+
+async def _wait_for_original_shutdown_snapshots(caplog):
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 1
+    while caplog.text.count('Owned shutdown snapshot') < 2 and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+
+
+def _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog):
+    """Real ASGI lifespan diagnostics; this is not a Core boot/retirement test."""
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    phases = []
+
+    @asynccontextmanager
+    async def lifespan(app):
+        phases.append('startup')
+        yield
+        await _wait_for_original_shutdown_snapshots(caplog)
+        phases.append('shutdown')
+
+    observed = ObservedHost(FastAPI(lifespan=lifespan), 'unused', tmp_path,
+        shutdown_trace_interval=0.025)
+    import faulthandler
+    import pytest
+
+    def process_timer_is_not_owned(*args, **kwargs):
+        raise AssertionError('Lifespan observer changed the process-wide crash timer')
+
+    with pytest.MonkeyPatch.context() as boundary:
+        boundary.setattr(faulthandler, 'dump_traceback_later', process_timer_is_not_owned)
+        boundary.setattr(faulthandler, 'cancel_dump_traceback_later', process_timer_is_not_owned)
+        with TestClient(observed):
+            assert phases == ['startup']
+    assert phases == ['startup', 'shutdown']
+    diagnostic = capfd.readouterr().err
+    assert 'threading.py' in diagnostic and 'File "' in diagnostic
+    assert 'Owned shutdown thread:' in caplog.text
+    assert 'Owned shutdown pending task:' in caplog.text
+    assert 'Owned shutdown await:' in caplog.text
+    assert 'lifespan' in caplog.text
+    assert caplog.text.count('Owned shutdown snapshot') >= 2
+    # The timer is scoped to that original lifespan, not left for another app.
+    import time
+    time.sleep(0.06)
+    assert capfd.readouterr().err == ''
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fail_shutdown', [False, True])
+async def test_owned_lifespan_observer_retires_pending_callback_on_every_exit(
+    tmp_path, caplog, fail_shutdown,
+):
+    """A completed lifespan cannot inspect another lifetime on the same loop."""
+    import asyncio
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    failure = RuntimeError('original owned lifespan shutdown failure')
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await _wait_for_original_shutdown_snapshots(caplog)
+        if fail_shutdown:
+            raise failure
+
+    messages = asyncio.Queue()
+    started = asyncio.Event()
+    sent = []
+
+    async def send(message):
+        sent.append(message['type'])
+        if message['type'] == 'lifespan.startup.complete':
+            started.set()
+
+    observed = ObservedHost(FastAPI(lifespan=lifespan), 'unused', tmp_path,
+        shutdown_trace_interval=0.025)
+    serving = asyncio.create_task(observed(
+        {'type': 'lifespan', 'asgi': {'version': '3.0'}}, messages.get, send))
+    try:
+        messages.put_nowait({'type': 'lifespan.startup'})
+        await asyncio.wait_for(started.wait(), timeout=1)
+        messages.put_nowait({'type': 'lifespan.shutdown'})
+        if fail_shutdown:
+            with pytest.raises(RuntimeError) as raised:
+                await asyncio.wait_for(serving, timeout=1)
+            assert raised.value is failure
+        else:
+            await asyncio.wait_for(serving, timeout=1)
+        assert sent == ['lifespan.startup.complete',
+            'lifespan.shutdown.failed' if fail_shutdown else 'lifespan.shutdown.complete']
+        # Keep the SAME loop alive beyond the diagnostic interval. TestClient
+        # closing its own loop would conceal an unretired callback.
+        assert caplog.text.count('Owned shutdown snapshot') >= 2
+        diagnostic = caplog.text
+        await asyncio.sleep(0.15)
+        assert caplog.text == diagnostic
+    finally:
+        if not serving.done():
+            serving.cancel()
+        await asyncio.gather(serving, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_owned_shutdown_observer_reports_busy_original_sqlite_worker(tmp_path, caplog):
+    """Observe the actual worker's native call without reading SQL or results."""
+    import asyncio
+    import threading
+    import aiosqlite
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    entered, release = threading.Event(), threading.Event()
+
+    def original_work():
+        entered.set()
+        assert release.wait(5), 'Test did not release its original SQLite worker'
+        return 1
+
+    async with aiosqlite.connect(':memory:') as connection:
+        await connection.create_function('owned_observation_only', 0, original_work)
+
+        async def query():
+            async with connection.execute('SELECT owned_observation_only()') as cursor:
+                return await cursor.fetchone()
+
+        original = asyncio.create_task(query())
+        try:
+            assert await asyncio.to_thread(entered.wait, 1), 'Original SQLite work never entered'
+            ObservedHost(None, 'unused', tmp_path).record_shutdown_tasks()
+            assert 'Owned shutdown SQLite worker:' in caplog.text
+            assert 'function=Connection.execute' in caplog.text
+            assert 'future_done=False future_cancelled=False' in caplog.text
+            assert 'owned_observation_only' not in caplog.text
+            assert not original.done()
+        finally:
+            release.set()
+            result = await original
+        assert result == (1,)

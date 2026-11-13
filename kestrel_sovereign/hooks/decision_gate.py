@@ -19,6 +19,7 @@ apart again: chat, subagent, and scheduler dispatch all route through
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from typing import Any, Optional
 
 from kestrel_sdk.hooks.base import PermissionDecision
@@ -53,6 +54,11 @@ class BlockedDecision:
     @property
     def is_ask(self) -> bool:
         return self.decision == PermissionDecision.ASK
+
+    @property
+    def error_class(self) -> str:
+        """The ``error_class`` a refused call's dispatch row names (#3953)."""
+        return "ApprovalRequired" if self.is_ask else "PermissionDenied"
 
     @property
     def error(self) -> str:
@@ -137,6 +143,10 @@ def decided_tool_input(hook_input: Any, hook_output: Any) -> Any:
     output's own ``updated_input`` overrides it (#3953). An executed call runs
     with these and a refused one is recorded with them: a redaction a hook made
     before a later hook denied is never undone in the record.
+
+    Detach the decided binding from retained hook inputs and outputs before
+    task or claim persistence awaits. The same owned values then supply the
+    request record, effect digest, execution and audit.
     """
     updated = getattr(hook_output, "updated_input", None)
-    return updated if updated is not None else hook_input.tool_input
+    return deepcopy(updated if updated is not None else hook_input.tool_input)

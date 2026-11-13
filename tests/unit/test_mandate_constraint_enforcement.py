@@ -311,25 +311,37 @@ async def test_initialize_reattaches_enforcement_on_any_boot_path(tmp_path):
         spawn_mandate=mandate,
     )
 
+    service = LLMService()
     agent = KestrelAgent(
         did=creds.agent_did,
         storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
-        llm_service=LLMService(),
+        llm_service=service,
     )
-    await agent.initialize()
+    try:
+        await agent.initialize()
+    
+        hooks = agent.hooks_manager.get_hooks(HookEvent.PRE_TOOL_USE)
+        assert any(isinstance(h, MandateRestrictionHook) for h in hooks)
+        assert getattr(agent, "spawn_mandate", None) is not None
+        assert agent.spawn_mandate.additional_constraints["restricted_tools"] == [
+            RESTRICTED_TOOL
+        ]
+        assert agent._persisted_spawn_mandate.features_allowed == [
+            "RetiredOptionalFeature"
+        ]
+        assert agent.spawn_mandate.features_allowed == []
+        valid, message = await agent._verify_spawn_mandate_constraints()
+        assert valid is True, message
+    finally:
+        from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
-    hooks = agent.hooks_manager.get_hooks(HookEvent.PRE_TOOL_USE)
-    assert any(isinstance(h, MandateRestrictionHook) for h in hooks)
-    assert getattr(agent, "spawn_mandate", None) is not None
-    assert agent.spawn_mandate.additional_constraints["restricted_tools"] == [
-        RESTRICTED_TOOL
-    ]
-    assert agent._persisted_spawn_mandate.features_allowed == [
-        "RetiredOptionalFeature"
-    ]
-    assert agent.spawn_mandate.features_allowed == []
-    valid, message = await agent._verify_spawn_mandate_constraints()
-    assert valid is True, message
+        try:
+            await shutdown_fixture_agent(agent)
+            await agent.wait_for_shutdown_completion()
+        finally:
+            await service.close()
+    assert not agent._raw_storage.db.backend.is_connected
+    assert not service.has_pending_close_owners()
 
 
 @pytest.mark.asyncio

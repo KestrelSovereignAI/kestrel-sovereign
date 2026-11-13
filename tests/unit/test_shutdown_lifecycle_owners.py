@@ -357,7 +357,7 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
         phases.append("host")
         raise RuntimeError("host failure")
 
-    async def fail_agents(_app) -> None:
+    async def fail_agents(_app, **_remote_work_deadline) -> None:
         phases.append("agents")
         raise RuntimeError("agent failure")
 
@@ -1275,22 +1275,21 @@ async def test_manager_quarantines_cancellation_hostile_cognition_within_shutdow
 
     manager._release_child_budget = release_budget
     removal = asyncio.create_task(manager.remove_agent("hostile"))
-    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
+    try:
+        await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=30.0)
 
-    assert await asyncio.wait_for(removal, timeout=0.2) is True
-    assert manager.get_agent("hostile") is None
-    assert released == ["hostile"]
-    quarantined = manager.quarantined_shutdowns()
-    assert len(quarantined) == 1
-    assert next(iter(quarantined.values()))["pending"] is True
-    assert agent.cancellation_attempts >= 1
-
-    # Do not leave the deliberately hostile fixture running beyond this test.
-    agent.allow_shutdown_finish.set()
-    for _ in range(100):
-        if not next(iter(manager.quarantined_shutdowns().values()))["pending"]:
-            break
-        await asyncio.sleep(0)
+        assert await asyncio.wait_for(removal, timeout=0.2) is True
+        assert manager.get_agent("hostile") is None
+        assert released == ["hostile"]
+        quarantined = manager.quarantined_shutdowns()
+        assert len(quarantined) == 1
+        assert next(iter(quarantined.values()))["pending"] is True
+        assert agent.cancellation_attempts >= 1
+    finally:
+        # A failed timing assertion must not leave this deliberately hostile
+        # task suppressing cancellation during pytest's event-loop teardown.
+        agent.allow_shutdown_finish.set()
+        await manager.drain_quarantined_shutdowns()
     assert next(iter(manager.quarantined_shutdowns().values()))["pending"] is False
 
 

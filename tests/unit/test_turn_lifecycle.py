@@ -852,6 +852,32 @@ async def test_session_less_and_blank_sessions_resolve_to_none():
 
 
 @pytest.mark.asyncio
+async def test_a_session_key_is_reported_exactly_as_the_turn_was_given_it():
+    """#3875: the conversation store files rows under the untrimmed key.
+
+    A trimmed copy names a session no row belongs to, so a wake origin or a
+    fact's source naming it would miss an exclusion of the real session. The
+    key survives a captured cross-task binding and the feature helper too.
+    """
+    from kestrel_sovereign.features.base import Feature
+
+    padded = " chat-A "
+    agent = _StubAgent()
+    async with agent._turn_lifecycle():
+        agent._active_session_id = padded
+        assert agent.get_turn_bound_session_id() == padded
+        assert Feature._turn_session_id(SimpleNamespace(agent=agent)) == padded
+        binding = capture_turn_session_binding(agent)
+
+        async def _reader():
+            with bind_turn_session(binding):
+                return agent.get_turn_bound_session_id()
+
+        assert binding.session_id == padded
+        assert await asyncio.create_task(_reader()) == padded
+
+
+@pytest.mark.asyncio
 async def test_private_turn_session_accessor_is_a_compatibility_alias():
     agent = _StubAgent()
     async with agent._turn_lifecycle():
@@ -865,15 +891,22 @@ async def test_private_turn_session_accessor_is_a_compatibility_alias():
 
 @pytest.mark.asyncio
 async def test_capture_supports_private_turn_session_accessor_compatibility():
-    """Cross-task capture matches the direct feature-read compatibility path."""
+    """Cross-task capture matches the direct feature-read compatibility path.
+
+    Both keep the key exactly as filed, surrounding whitespace included (#3875).
+    """
+    from kestrel_sovereign.features.base import Feature
+
     agent = _PrivateAccessorOnlyAgent()
     async with agent._turn_lifecycle():
         agent._active_session_id = "  chat-compat  "
         binding = capture_turn_session_binding(agent)
+        feature_read = Feature._turn_session_id(SimpleNamespace(agent=agent))
 
     assert binding.agent is agent
     assert binding.turn_id is not None
-    assert binding.session_id == "chat-compat"
+    assert binding.session_id == "  chat-compat  "
+    assert binding.session_id == feature_read
 
 
 @pytest.mark.asyncio

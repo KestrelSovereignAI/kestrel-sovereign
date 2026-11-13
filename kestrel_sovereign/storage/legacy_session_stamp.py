@@ -443,8 +443,8 @@ async def stamp_legacy_sessions(db: Any, agent_id: Optional[str] = None) -> Dict
                 # fence and the writes are one decision. A bare READ COMMITTED
                 # transaction on PostgreSQL lets an archive or delete commit
                 # between the ledger read and the updates, and SQLite's
-                # deferred BEGIN reads first and then fails its upgrade to the
-                # writer slot outright. The lock takes an advisory lock there
+                # deferred BEGIN, before #4040, read first and then failed its
+                # upgrade to the writer slot outright. The lock takes an advisory lock there
                 # and BEGINs IMMEDIATE here — and a BATCH is exactly the
                 # bounded unit it wants, which the unbounded plan above was
                 # not.

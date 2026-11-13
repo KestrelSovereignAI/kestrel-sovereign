@@ -123,7 +123,7 @@ async def _dispatch(components, results):
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(

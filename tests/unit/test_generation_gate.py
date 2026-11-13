@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import gc
 import importlib
 import inspect
 import json
@@ -633,7 +634,7 @@ async def _booted_agent(tmp_path):
             # native close reservation. Otherwise the larger storage floor
             # consumes the entire default five-second shutdown and gives the
             # LLM/client prefix zero time, cancelling its original closers.
-            from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+            from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
 
             reserve_native_shutdown_budget(agent, cleanup)
             # Keep cold migrations outside the generation's own watchdog.
@@ -839,6 +840,14 @@ async def test_only_a_natural_end_becomes_the_answer(tmp_path, monkeypatch, path
                 lambda providers, tools, model_override: None,
             )
 
+        if cause == "watchdog":
+            # Python 3.13 collects its oldest generation all at once, stopping
+            # the event loop while it runs: up to 0.56 s on a laptop for the
+            # garbage earlier tests leave in a worker. On CI runners the loop
+            # stalled for 1.3 to 1.5 s before this case's first chunk, and its
+            # one-second bound abandoned the provider as silent (#4040).
+            # Collected now, no full collection falls due inside the turn.
+            gc.collect()
         if _generation_is_first(path):
             bound_the_generation()
         started = loop.time()
@@ -1132,6 +1141,39 @@ async def _call(service, entry: str, executor) -> Any:
         if isinstance(item, str):
             text += item
     return text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry', ['generate_with_messages', 'stream_with_tool_detection'])
+@pytest.mark.parametrize('codex_callback', [False, True])
+async def test_input_suspension_is_original_control_across_adapter_and_service(
+        two_route_service, entry, codex_callback):
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.tools.effect_journal import ToolInputSuspended
+
+    service, install = two_route_service
+    first = _InlineToolAdapter(act=True, ending='answers')
+    spare = install(first)
+    signal = ToolInputSuspended(None, [], None)
+
+    async def execute(name, arguments):
+        assert (name, arguments) == INLINE_TOOL
+        raise signal
+
+    executor = execute
+    if codex_callback:
+        handler = CodexAdapter()._make_tool_call_handler(execute, 'owned-input-thread',
+            frozenset({INLINE_TOOL[0]}))
+
+        async def executor(name, arguments):
+            return await handler(dict(threadId='owned-input-thread', callId='owned-input-call',
+                tool=name, arguments=arguments))
+
+    with pytest.raises(ToolInputSuspended) as raised:
+        await _call(service, entry, executor)
+    assert raised.value is signal, 'An original input suspension was converted into provider output'
+    assert first.calls == 1 and spare.calls == 0, 'An input suspension triggered another provider'
+    assert first.tool_results == [], 'An input suspension was accepted as a successful tool response'
 
 
 #: Both route walks a turn's answer comes from, x every way the gate rejects

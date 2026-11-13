@@ -2,25 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-// Wave 5C of #1048: when the server fires a `revising` SSE event for
-// the dispatch's request_id, the chat UI must drop the pre-tool prose
-// it already painted into the in-flight bubble and let the next
-// streamed chunk start fresh.
-//
-// The protocol pieces:
-// * Wave 5B emits `revising` from agent/streaming.py the moment a
-//   ToolCallStarted marker arrives in the LLM stream.
-// * /api/agent/notifications/sse forwards the event with payload
-//   { request_id, index, tool_name, ... } so multi-pane / multi-tab
-//   clients can route to the right bubble.
-// * Wave 5C (this) registers a listener that flips
-//   `pane.pendingRevise = true` and the streaming loop honors that
-//   on the next chunk by resetting the accumulated text.
-//
-// These tests exercise the streaming-loop reset directly. The SSE
-// listener registration is covered by inspecting the connectNotifications
-// machinery indirectly — flipping `pane.pendingRevise` is the
-// observable contract.
+// Ordinary tool revisions preserve prose and weld a readable boundary. A
+// confirmed operator-input checkpoint separately retracts only its addressed
+// live turn, while keeping actual cards, components and other conversations.
 
 // Spy hooks: every call to renderStreamingMarkdown / finalizeMarkdown
 // captures its content arg so tests can assert on the FULL accumulated
@@ -992,3 +976,83 @@ TOOL_JOIN_CASES.forEach((tc, i) => {
         });
     });
 });
+
+for (const mode of ['coalesced', 'split-prefix', 'characters', 'sealed-bubbles', 'same-packet-parts', 'foreign-turn', 'stale-generation', 'superseded-stream']) {
+    test(`input checkpoint retracts only the owning turn (${mode})`, async () => {
+        renderCalls.length = 0; finalizeCalls.length = 0;
+        window.SharedMarkdown.renderMarkdown = text => String(text);
+        window.SharedMarkdown.renderStreamingMarkdown = text => {renderCalls.push(text);return String(text);};
+        const agent = `input-retraction-${mode}`;
+        const pane = getOrCreateChatPane(agent);
+        apiModule.default.setHostAgent(agent);
+        mountChatPane(agent);
+        pane.sessionId = `session-${mode}`;
+        const prior = await chatModule.addMessage('agent', 'PRIOR HISTORY', pane.element);
+        const other = getOrCreateChatPane(`other-${mode}`);
+        const unrelated = await chatModule.addMessage('agent', 'OTHER PANE', other.element);
+        const ctrl = controlledStream();
+        const original = apiModule.default.streamInvoke;
+        let requestId;
+        apiModule.default.streamInvoke = (...args) => { requestId = args[7]; return ctrl.iter; };
+        try {
+            messageInput.value = 'go';
+            const sending = sendMessage();
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(typeof requestId, 'string');
+            ctrl.push('UNFINISHED FIRST');
+            ctrl.push('\x1eKESTREL:TOOL:{"phase":"done","name":"record_marker"}\x1e');
+            await new Promise(resolve => setImmediate(resolve));
+            assert.ok(renderCalls.some(text => text.includes('UNFINISHED FIRST')));
+            chatModule.registerPartRenderer('owned-input-component', () => '<span>OWNED-COMPONENT</span>');
+            const component = '\x1eKESTREL:PART:{"type":"owned-input-component","data":{}}\x1e';
+            let mountedComponent;
+            if (mode === 'sealed-bubbles') {
+                ctrl.push(component + 'UNFINISHED SEALED BUBBLE');
+                await new Promise(resolve => setImmediate(resolve));
+                mountedComponent = pane.element.children.find(node =>
+                    node.querySelector('.message-content')?.innerHTML.includes('OWNED-COMPONENT'));
+                assert.ok(mountedComponent, 'The component must mount before input suspension');
+            }
+            if (mode === 'stale-generation') pane.generation++;
+            if (mode === 'superseded-stream') pane.activeTurnId++;
+            const rid = mode === 'foreign-turn' ? 'some-other-turn' : requestId;
+            const frame = `\x1eKESTREL:RETRACT:${JSON.stringify({request_id: rid})}\x1e`;
+            const wire = 'UNFINISHED SECOND' + (mode === 'same-packet-parts' ? component : '') + frame + 'Waiting for operator input.';
+            const packets = mode === 'characters' ? [...wire]
+                : mode === 'split-prefix' ? ['UNFINISHED SECOND\x1eKESTREL:RET', frame.slice('\x1eKESTREL:RET'.length) + 'Waiting for operator input.']
+                : [wire];
+            for (const packet of packets) {
+                ctrl.push(packet);
+                await new Promise(resolve => setImmediate(resolve));
+            }
+            ctrl.end();
+            await sending;
+            const finalText = pane.element.children.filter(node => node !== prior)
+                .map(node => node.querySelector('.message-content')?.innerHTML || '').join('');
+            if (['foreign-turn', 'stale-generation', 'superseded-stream'].includes(mode)) {
+                assert.match(finalText.replace(/<[^>]*>/g, ''), /UNFINISHED\s+FIRST/);
+                if (mode === 'foreign-turn') assert.match(finalText, /UNFINISHED SECOND/);
+            } else {
+                assert.ok(!finalText.includes('UNFINISHED'),
+                    'Confirmed operator input must retract unfinished prose from the live turn');
+                assert.match(finalText, /Waiting for operator input/);
+                const cards = pane.element.children.filter(node => node !== prior
+                    && node.querySelector('.message-content')?.innerHTML.includes('tool-activity-call'));
+                assert.equal(cards.length, 1, 'The completed tool card must survive prose retraction exactly once');
+            }
+            if (mode === 'sealed-bubbles' || mode === 'same-packet-parts') {
+                const components = pane.element.children.filter(node =>
+                    node.querySelector('.message-content')?.innerHTML.includes('OWNED-COMPONENT'));
+                assert.equal(components.length, 1, 'Retraction must keep each actual component exactly once');
+                if (mountedComponent) assert.equal(components[0], mountedComponent,
+                    'Retraction must retain the original mounted component');
+            }
+            assert.ok(pane.element.children.includes(prior), 'Retraction must preserve conversation history');
+            assert.ok(other.element.children.includes(unrelated), 'Retraction must preserve other panes');
+            assert.ok(!finalText.includes('KESTREL:'), 'Control frames must never render as prose');
+        } finally {
+            ctrl.end();
+            apiModule.default.streamInvoke = original;
+        }
+    });
+}

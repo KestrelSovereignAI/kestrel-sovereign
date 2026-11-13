@@ -581,19 +581,22 @@ class TestChangeAwareSnapshot:
         await sync.stop()
 
     @pytest.mark.asyncio
-    async def test_completed_snapshot_fingerprint_is_recorded(self, temp_db, tmp_path, monkeypatch):
-        """Snapshot reads can touch SQLite WAL/SHM metadata. The stored
-        fingerprint must describe the completed pass so the next unchanged
-        cycle can skip."""
+    async def test_the_fingerprint_read_before_the_snapshot_is_recorded(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        """A change while the pass uploads is not in its snapshots, so the
+        fingerprint the pass records is the one it read first, and the next
+        cycle uploads again (#4028). A read after the upload would take that
+        change as backed up."""
         current_fingerprint = {"value": "before-snapshot"}
 
-        class MetadataTouchingTarget(MockSyncTarget):
+        class ChangedWhileUploading(MockSyncTarget):
             async def sync_snapshot(self, db_path: Path) -> SyncResult:
                 result = await super().sync_snapshot(db_path)
-                current_fingerprint["value"] = "after-snapshot"
+                current_fingerprint["value"] = "written-during-upload"
                 return result
 
-        target = MetadataTouchingTarget(name="touching")
+        target = ChangedWhileUploading(name="uploading")
         sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))
         monkeypatch.setattr(
             sync,
@@ -604,11 +607,54 @@ class TestChangeAwareSnapshot:
         await sync.start()
 
         first = await sync.snapshot_if_changed()
-        assert first["touching"].success
-        assert sync._state.last_fingerprint == "after-snapshot"
+        assert first["uploading"].success
+        assert sync._state.last_fingerprint == "before-snapshot"
 
         second = await sync.snapshot_if_changed()
-        assert "__unchanged__" in second
+        assert "__unchanged__" not in second, "a write made during the upload was skipped"
+        assert second["uploading"].success
+        await sync.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("keeper_open", [True, False])
+    async def test_a_snapshot_read_leaves_an_idle_database_unchanged(
+        self, temp_db_with_keeper, tmp_path, keeper_open
+    ):
+        """Recording the fingerprint read before the pass relies on the
+        snapshot's own SQLite read changing nothing the fingerprint sees:
+        with the agent's connection held open over a WAL with frames in it,
+        and with no other connection."""
+        from kestrel_sovereign.storage.sync.targets import _write_consistent_snapshot
+
+        class SqliteCopyTarget(MockSyncTarget):
+            async def sync_snapshot(self, db_path: Path) -> SyncResult:
+                copy = tmp_path / f"copy-{len(self._state.uploads)}.db"
+                _write_consistent_snapshot(Path(db_path), copy)
+                self._state.uploads.append((copy.read_bytes(), {"type": "snapshot"}))
+                return SyncResult(
+                    success=True,
+                    target_name=self.name,
+                    bytes_synced=copy.stat().st_size,
+                    frames_synced=0,
+                    timestamp=datetime.now(timezone.utc),
+                )
+
+        db_path, keeper = temp_db_with_keeper
+        keeper.execute("INSERT INTO test (value) VALUES ('in the wal')")
+        keeper.commit()
+        if not keeper_open:
+            keeper.close()
+        target = SqliteCopyTarget(name="sqlite-copy")
+        sync = SyncService(db_path=str(db_path), state_file=str(tmp_path / "sync.state"))
+        sync.add_target(target)
+        await sync.start()
+
+        first = await sync.snapshot_if_changed()
+        assert first[target.name].success
+
+        second = await sync.snapshot_if_changed()
+        assert "__unchanged__" in second, "the snapshot's own read looked like a change"
+        assert len(target._state.uploads) == 1
         await sync.stop()
 
     @pytest.mark.asyncio

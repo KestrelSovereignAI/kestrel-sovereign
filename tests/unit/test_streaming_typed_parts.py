@@ -7,8 +7,8 @@ re-render the component bubble. Mirrors the harness in
 ``test_streaming_persists_full_assistant_text`` (the persist contract this
 extends).
 """
+from tests.utils.native_streaming import streaming_agent
 import json
-from contextlib import asynccontextmanager
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -16,79 +16,21 @@ from unittest.mock import AsyncMock, MagicMock
 from kestrel_sovereign.agent.parts import build_part_sentinel
 
 
-@asynccontextmanager
-async def _passthrough():
-    yield
 
 
-def _make_agent(add_convo_calls):
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock(
-        side_effect=lambda role, content, **kw: add_convo_calls.append({
-            "role": role, "content": content, **kw,
-        })
-    )
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
-    agent.features = {}
-    agent.did = "test-did"
-    agent._get_privacy_policy_epoch = lambda: "normal:streaming-test:0"
-    agent.extension = None
-    agent._cached_features_prompt = ""
-    agent.is_request_cancelled = MagicMock(return_value=False)
-    agent.emit_event = AsyncMock()
-    agent._maybe_audit = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent.hooks_manager = None
-    agent._get_governing_constitution = AsyncMock(return_value="")
-    agent.check_solvency = AsyncMock(return_value="test-model")
-    agent._build_all_tools = MagicMock(return_value=[])
-    agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
-    agent.user_prompt_template = MagicMock()
-    agent.user_prompt_template.format.return_value = "rendered prompt"
-
-    context_result = MagicMock()
-    context_result.system_prompt = "system"
-    context_result.dynamic_user_context = "ctx"
-    context_result.messages = []
-    agent.context_manager = MagicMock()
-    agent.context_manager.build_context = AsyncMock(return_value=context_result)
-
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-    return agent
 
 
-def _bind(agent):
-    from kestrel_sovereign.agent.streaming import StreamingMixin
 
-    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(agent)
-    agent._process_input_streaming_traced_locked = (
-        StreamingMixin._process_input_streaming_traced_locked.__get__(agent)
-    )
-    agent._persist_assistant_turn_safely = (
-        StreamingMixin._persist_assistant_turn_safely.__get__(agent)
-    )
-    agent._emit_revising_event = (
-        StreamingMixin._emit_revising_event.__get__(agent)
-    )
+
 
 
 @pytest.mark.asyncio
-async def test_post_tool_part_passes_through_and_persists_to_metadata():
+async def test_post_tool_part_passes_through_and_persists_to_metadata(native_tool_effect_agent):
     from kestrel_sdk.llm import ToolCallStarted
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
 
     async def mock_stream_with_tool_detection(**kwargs):
         yield "Updating the list. "
@@ -98,7 +40,6 @@ async def test_post_tool_part_passes_through_and_persists_to_metadata():
             tool_calls=[ToolCall(id="tc1", name="todo_add", arguments={})],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
 
     part_sentinel = build_part_sentinel(
@@ -119,7 +60,6 @@ async def test_post_tool_part_passes_through_and_persists_to_metadata():
         yield "added one item."
 
     agent._handle_orchestrator_response_streaming = mock_orchestrator_streaming
-    _bind(agent)
 
     yielded = []
     async for chunk in agent.process_input_streaming("update todos", session_id="s1"):
@@ -146,16 +86,20 @@ async def test_post_tool_part_passes_through_and_persists_to_metadata():
     assert part["data"] == {"title": "ship #1914", "status": "open"}
     assert part["id"] == "t1"
     assert part["pos"] == len("Done — ")
+    assert await agent._raw_storage.db.fetchone(
+        "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ? AND session_id = ?",
+        (agent.did, "s1"),
+    ) == (2,), "Native streaming fixture omitted actual SQL persistence"
 
 
 @pytest.mark.asyncio
-async def test_no_tool_turn_persists_emitted_part():
+async def test_no_tool_turn_persists_emitted_part(native_tool_effect_agent):
     """A turn with no tool calls can still emit a component part (e.g. from a
     hook); it is stripped from content and persisted with position 0."""
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
 
     part_sentinel = build_part_sentinel({"type": "notice", "data": {"body": "hello"}})
 
@@ -164,9 +108,7 @@ async def test_no_tool_turn_persists_emitted_part():
         yield "All set."
         yield LLMResponse(content="", tool_calls=[])
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
-    _bind(agent)
 
     yielded = []
     async for chunk in agent.process_input_streaming("hi", session_id="s2"):
@@ -187,7 +129,7 @@ async def test_no_tool_turn_persists_emitted_part():
 
 
 @pytest.mark.asyncio
-async def test_inline_executed_tool_emitted_part_drained_and_persisted():
+async def test_inline_executed_tool_emitted_part_drained_and_persisted(native_tool_effect_agent):
     """On the codex app-server inline path, a feature tool runs INSIDE the LLM
     call and emits a part via ``emit_part`` (buffered on the collector). The
     streaming layer must drain it into a live PART sentinel AND persist it to
@@ -199,7 +141,7 @@ async def test_inline_executed_tool_emitted_part_drained_and_persisted():
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
     agent._make_inline_tool_executor = MagicMock(return_value=None)
     agent._visible_features_by_tool_name = MagicMock(return_value={})
     agent.context_manager.build_context.return_value.degraded_mode = False
@@ -217,9 +159,7 @@ async def test_inline_executed_tool_emitted_part_drained_and_persisted():
         ]
         yield resp
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
-    _bind(agent)
 
     yielded = []
     async for chunk in agent.process_input_streaming("update todos", session_id="s3"):
@@ -249,7 +189,7 @@ async def test_inline_executed_tool_emitted_part_drained_and_persisted():
 
 
 @pytest.mark.asyncio
-async def test_inline_part_lands_after_tool_done_sentinel_before_text():
+async def test_inline_part_lands_after_tool_done_sentinel_before_text(native_tool_effect_agent):
     """A Codex inline tool emits its part while running, then the adapter yields
     the tool's done sentinel, then answer text. The part must land AFTER the
     done sentinel (so it renders below the completed tool card) but BEFORE the
@@ -259,7 +199,7 @@ async def test_inline_part_lands_after_tool_done_sentinel_before_text():
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
 
     done_sentinel = _build_tool_sentinel("done", "todo_add", ms=5)
 
@@ -272,9 +212,7 @@ async def test_inline_part_lands_after_tool_done_sentinel_before_text():
         yield "All done."
         yield LLMResponse(content="", tool_calls=[])
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
-    _bind(agent)
 
     yielded = []
     async for chunk in agent.process_input_streaming("go", session_id="s7"):
@@ -294,7 +232,7 @@ async def test_inline_part_lands_after_tool_done_sentinel_before_text():
 
 
 @pytest.mark.asyncio
-async def test_parts_dropped_when_post_response_hook_blocks_text():
+async def test_parts_dropped_when_post_response_hook_blocks_text(native_tool_effect_agent):
     """If a POST_RESPONSE hook rewrites/blocks the assistant text (audit denial),
     the component parts must NOT persist — otherwise reload would render the
     structured bubbles next to the blocked placeholder, leaking what the hook
@@ -303,7 +241,7 @@ async def test_parts_dropped_when_post_response_hook_blocks_text():
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
     # The hook BLOCKS: it replaces the post-tool text with a denial placeholder.
     agent._fire_post_response_hook = AsyncMock(
         side_effect=lambda text, sid, **_: "[Response blocked by audit]"
@@ -316,7 +254,6 @@ async def test_parts_dropped_when_post_response_hook_blocks_text():
             content="", tool_calls=[ToolCall(id="tc1", name="todo_add", arguments={})],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
 
     part_sentinel = build_part_sentinel({"type": "todo", "data": {"secret": "x"}})
@@ -327,7 +264,6 @@ async def test_parts_dropped_when_post_response_hook_blocks_text():
         yield "now."
 
     agent._handle_orchestrator_response_streaming = mock_orchestrator_streaming
-    _bind(agent)
 
     async for _ in agent.process_input_streaming("update", session_id="s4"):
         pass
@@ -341,14 +277,14 @@ async def test_parts_dropped_when_post_response_hook_blocks_text():
 
 
 @pytest.mark.asyncio
-async def test_part_position_uses_utf16_offset_after_emoji():
+async def test_part_position_uses_utf16_offset_after_emoji(native_tool_effect_agent):
     """A part after a non-BMP char (emoji) must persist a UTF-16 offset, since
     history reload feeds ``pos`` to JS ``String.slice`` (UTF-16 code units).
     "\U0001F422 " is 2 code points but 3 UTF-16 units (surrogate pair + space)."""
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
 
     part_sentinel = build_part_sentinel({"type": "notice", "data": {"body": "x"}})
 
@@ -358,9 +294,7 @@ async def test_part_position_uses_utf16_offset_after_emoji():
         yield "tail"
         yield LLMResponse(content="", tool_calls=[])
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
-    _bind(agent)
 
     async for _ in agent.process_input_streaming("hi", session_id="s5"):
         pass
@@ -371,14 +305,14 @@ async def test_part_position_uses_utf16_offset_after_emoji():
 
 
 @pytest.mark.asyncio
-async def test_post_response_hook_emitted_part_is_persisted():
+async def test_post_response_hook_emitted_part_is_persisted(native_tool_effect_agent):
     """A part emitted by a POST_RESPONSE hook (after streaming) is drained and
     persisted at the end of the text, rather than silently lost."""
     from kestrel_sovereign.agent.parts import emit_part
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
 
     def _hook(text, sid, **_):
         emit_part("notice", {"body": "from hook"})
@@ -390,9 +324,7 @@ async def test_post_response_hook_emitted_part_is_persisted():
         yield "Hello there."
         yield LLMResponse(content="", tool_calls=[])
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
-    _bind(agent)
 
     async for _ in agent.process_input_streaming("hi", session_id="s6"):
         pass
@@ -404,7 +336,7 @@ async def test_post_response_hook_emitted_part_is_persisted():
 
 
 @pytest.mark.asyncio
-async def test_bang_command_emitted_part_reaches_stream():
+async def test_bang_command_emitted_part_reaches_stream(native_tool_effect_agent):
     """#1894: a ``!todo`` command delegates to the non-streaming handler, which
     runs OUTSIDE the normal per-turn collector. The streaming layer must bind a
     collector around the delegation so a todo tool's ``emit_part`` still surfaces
@@ -414,7 +346,7 @@ async def test_bang_command_emitted_part_reaches_stream():
     from kestrel_sovereign.agent.parts import current_part_collector, current_tool_publication_context, emit_part
 
     add_convo_calls = []
-    agent = _make_agent(add_convo_calls)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=add_convo_calls)
 
     async def fake_process_input(user_input, *args, **kwargs):
         # Simulate the command handler running the todo_add tool, which emits a
@@ -425,7 +357,6 @@ async def test_bang_command_emitted_part_reaches_stream():
         return "Added todo: ship #1894"
 
     agent.process_input = fake_process_input
-    _bind(agent)
 
     yielded = []
     async for chunk in agent.process_input_streaming("!todo add ship #1894", session_id="s8"):

@@ -116,6 +116,7 @@ from kestrel_sovereign.agent.invocation import (
     bind_async_invocation,
     mark_current_invocation_effect_checkpointed,
 )
+from kestrel_sovereign.tools.effect_invocation import journal_async_invocation
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.orchestrator_engine import (
@@ -138,6 +139,7 @@ from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.mcp_apps import MCPAppsHostMixin
 from kestrel_sovereign.mcp_oauth import MCPOAuthHostMixin
+from kestrel_sovereign.mcp_input import MCPInputHostMixin
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
@@ -170,7 +172,6 @@ from kestrel_sovereign.spawn.mandate import (
     remaining_spawn_ttl_seconds,
 )
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.storage.db.interface import DatabaseError
 from kestrel_sovereign.storage.turn_provenance import (
     WakeReplyReceipt,
     turn_opener_metadata,
@@ -438,7 +439,7 @@ KESTREL_AGENT_SHUTDOWN_TIMEOUT_S = float(
 )
 
 # Headroom carved out of the sweep budget for the durable cleanup tail
-# (background tasks, memory, sync snapshot, storage close). The fallible
+# (background tasks, memory, owed-snapshot record, storage close). The fallible
 # prefix may only spend budget up to (deadline - this reserve), so the
 # durable tail always has time to run *within* the outer deadline instead of
 # relying on the outer wait_for cancellation to trigger it.
@@ -448,7 +449,7 @@ KESTREL_SHUTDOWN_DURABLE_RESERVE_S = float(
 
 # Per-feature *cap* for the whole-agent shutdown sweep (#2409). A single
 # feature that hangs in shutdown() must not stall the sweep or starve the
-# durable cleanup tail (background tasks, memory, sync snapshot, storage
+# durable cleanup tail (background tasks, memory, owed-snapshot record, storage
 # close); once this elapses the feature is abandoned and the sweep moves on.
 # The effective bound is min(this cap, fair share of the remaining sweep
 # budget) — see shutdown() — so this cap never lets one feature exceed its
@@ -459,7 +460,7 @@ KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S = float(
 
 # Minimum per-step guard (seconds) for the durable cleanup tail. Even when the
 # budget is nearly exhausted, each durable step (background-task cleanup,
-# memory, final snapshot, storage close) gets at least this nonzero attempt so
+# memory, owed-snapshot record, storage close) gets at least this nonzero attempt so
 # data is never silently dropped for lack of a sliver of time. The tail is
 # still bounded overall: a step that exceeds its guard is ABANDONED (not
 # awaited — so a coroutine that suppresses cancellation cannot hang the tail
@@ -1072,6 +1073,15 @@ def _resolve_sync_enabled(explicit: Optional[bool] = None) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class _BootstrapReply:
+    """Bootstrap's visible reply and the exact rows it actually persisted."""
+
+    content: str
+    user_message_id: int | None
+    assistant_message_id: int | None
+
+
 class KestrelAgent(
     ConstitutionMixin,
     StreamingMixin,
@@ -1085,6 +1095,7 @@ class KestrelAgent(
     TurnLifecycleMixin,
     MCPAppsHostMixin,
     MCPOAuthHostMixin,
+    MCPInputHostMixin,
 ):
     """
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.
@@ -1872,6 +1883,7 @@ class KestrelAgent(
         # (``features/isolated_runtime.py``), which never receives this object.
         self._raw_storage = None
         self.storage = None
+        self.tool_effect_store = None
         # Set only from the durable spawned_by edge during initialize().
         # AgentManager consumes this private projection when rebuilding its
         # runtime authority indexes; it must never trust an arbitrary in-memory
@@ -3064,6 +3076,7 @@ class KestrelAgent(
                     llm_service=self.llm_service,
                     _assertion_tenant_capability=assertion_tenant_capability,
                     semantic_capabilities=self.semantic_capabilities,
+                    sovereign_trust_root_path=getattr(self, "_sovereign_trust_root_path", None),
                 )
                 logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
             else:
@@ -3081,6 +3094,7 @@ class KestrelAgent(
                     llm_service=self.llm_service,
                     _assertion_tenant_capability=assertion_tenant_capability,
                     semantic_capabilities=self.semantic_capabilities,
+                    sovereign_trust_root_path=getattr(self, "_sovereign_trust_root_path", None),
                 )
                 logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
         else:
@@ -3091,6 +3105,7 @@ class KestrelAgent(
                 llm_service=self.llm_service,
                 _assertion_tenant_capability=assertion_tenant_capability,
                 semantic_capabilities=self.semantic_capabilities,
+                sovereign_trust_root_path=getattr(self, "_sovereign_trust_root_path", None),
             )
             logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
 
@@ -3273,9 +3288,11 @@ class KestrelAgent(
         # Native admission and context ownership share the primary connection.
         # AsyncStorage owns this backend; every A2A store borrows it so partial
         # boot rollback cannot retire storage still held by other services.
+        scope = NativeRecipientScope(self.did)
+        await self._initialize_tool_effect_store()
         self.task_manager = TaskManager.from_backend(
             self._raw_storage._backend,
-            scope=NativeRecipientScope(self.did),
+            scope=scope,
             owns_backend=False,
             hooks_manager=self.hooks_manager,  # Pass hooks manager for security
             on_task_complete=self._on_background_task_complete,  # For notifications
@@ -3604,7 +3621,8 @@ class KestrelAgent(
 
         # Sync service — event-driven snapshots to all configured targets.
         # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
-        # Snapshots fire on shutdown, scheduled backup, or explicit !backup command.
+        # Snapshots fire on the scheduled backup or an explicit request. Shutdown
+        # only records the remote snapshot as owed (#4028).
         self._sync_service = None
         if self._db_backend.lower() != "postgres" and self._sync_enabled and not self.maintenance_boot:
             try:
@@ -4911,10 +4929,19 @@ class KestrelAgent(
             outcome = reported_outcome(await raw.close())
             if outcome is not ReleaseOutcome.RELEASED:
                 return outcome
+        await self._retire_tool_effect_store()
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
         return ReleaseOutcome.RELEASED
+
+    async def _retire_tool_effect_store(self) -> None:
+        """Drop the borrower only after the primary storage owner retires."""
+        journal = getattr(self, "tool_effect_store", None)
+        if journal is not None:
+            await journal.close()
+            if self.tool_effect_store is journal:
+                self.tool_effect_store = None
 
     async def _boot_teardown_background_tasks(self) -> ReleaseOutcome:
         """Cancel agent-owned background work and reap it, within one bound."""
@@ -5166,6 +5193,32 @@ class KestrelAgent(
         if privacy_agent is None:
             return None
         return privacy_agent.privacy_config
+
+    async def _initialize_tool_effect_store(self) -> None:
+        """Open the original journal only under an installed persistent policy.
+
+        Boot and privacy transitions share this boundary. A volatile boot
+        opens no journal; returning to persistence must open the same durable
+        envelope before the transition can report success.
+        """
+        from kestrel_sovereign.tool_effect_store import ToolEffectStore
+
+        async with self._get_durable_persistence_gate().exclusive():
+            privacy = self.privacy_config
+            if privacy is None:
+                raise RuntimeError("Tool effect journal requires initialized privacy policy")
+            if not privacy.allows_persistent_storage():
+                return
+            journal = self.tool_effect_store
+            if journal is not None:
+                if not journal.initialized or journal.database is not self._raw_storage.db:
+                    raise RuntimeError("Original tool effect journal is unavailable")
+                return
+            journal = ToolEffectStore(self._raw_storage.db, scope=NativeRecipientScope(self.did))
+            # Failed initialization cannot publish a replacement or discard
+            # the original envelope and the evidence that prevents replay.
+            await journal.initialize()
+            self.tool_effect_store = journal
 
     def _get_privacy_transition_lock(self) -> ReentrantTransitionLock:
         """Return the lock that serializes privacy transitions with active turns.
@@ -5530,6 +5583,7 @@ class KestrelAgent(
             self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
             status_message = self.privacy_agent.set_mode(mode)
             self._install_privacy_mandate(plan)
+            await self._initialize_tool_effect_store()
         if plan.warning:
             status_message = f"{status_message} {plan.warning}"
 
@@ -7822,7 +7876,7 @@ Expected Duration: {expected_duration}
         signal_wake: Optional[dict] = None,
         invocation_context: Optional[LLMInvocationContext] = None,
         wake_reply: Optional[WakeReplyReceipt] = None,
-    ) -> Optional[str]:
+    ) -> _BootstrapReply | None:
         """
         Handle bootstrap/discovery flow for first-time agent wake-up.
 
@@ -7834,7 +7888,7 @@ Expected Duration: {expected_duration}
         the wake's reply (#3655).
 
         Returns:
-            Response string if in bootstrap mode, None if should continue to normal processing
+            Reply and actual row receipts, or None to continue normal processing
         """
         state = await self.bootstrap_service.get_bootstrap_state()
 
@@ -7863,17 +7917,17 @@ Expected Duration: {expected_duration}
             # reference it. Matches the shape of the adjacent
             # DISCOVERY branch (below) and the normal process_input
             # path.
-            await self.privacy_agent.add_conversation(
+            user_message_id = await self.privacy_agent.add_conversation(
                 "user", user_input,
                 metadata=turn_opener_metadata(signal_wake),
                 session_id=session_id,
             )
-            await self._persist_assistant_conversation(
+            assistant_message_id = await self._persist_assistant_conversation(
                 wake_up_msg, session_id=session_id, wake_reply=wake_reply,
             )
 
             logging.info("[BOOTSTRAP] Agent waking up - entering discovery mode")
-            return wake_up_msg
+            return _BootstrapReply(wake_up_msg, user_message_id, assistant_message_id)
 
         elif state == BootstrapState.DISCOVERY:
             # In discovery mode - process through discovery conversation.
@@ -7953,12 +8007,12 @@ Expected Duration: {expected_duration}
                 return None
 
             # Store user message and response in conversation history
-            await self.privacy_agent.add_conversation(
+            user_message_id = await self.privacy_agent.add_conversation(
                 "user", user_input,
                 metadata=turn_opener_metadata(signal_wake),
                 session_id=session_id,
             )
-            await self._persist_assistant_conversation(
+            assistant_message_id = await self._persist_assistant_conversation(
                 response,
                 session_id=session_id,
                 response=response,
@@ -7991,7 +8045,7 @@ Expected Duration: {expected_duration}
                             logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
 
-                    await self._persist_assistant_conversation(
+                    assistant_message_id = await self._persist_assistant_conversation(
                         completion_msg, session_id=session_id,
                         wake_reply=wake_reply,
                     )
@@ -8002,11 +8056,11 @@ Expected Duration: {expected_duration}
                         if not loaded:
                             self.context_builder._load_soul_md()
                     logging.info("[BOOTSTRAP] Discovery complete with avatar")
-                    return completion_msg
+                    return _BootstrapReply(completion_msg, user_message_id, assistant_message_id)
                 else:
                     # Discovery complete without avatar
                     completion_msg = await self.bootstrap_service.complete_bootstrap()
-                    await self._persist_assistant_conversation(
+                    assistant_message_id = await self._persist_assistant_conversation(
                         completion_msg, session_id=session_id,
                         wake_reply=wake_reply,
                     )
@@ -8017,17 +8071,17 @@ Expected Duration: {expected_duration}
                         if not loaded:
                             self.context_builder._load_soul_md()
                     logging.info("[BOOTSTRAP] Discovery complete")
-                    return completion_msg
+                    return _BootstrapReply(completion_msg, user_message_id, assistant_message_id)
 
             logging.info("[BOOTSTRAP] Discovery continuing...")
-            return response
+            return _BootstrapReply(response, user_message_id, assistant_message_id)
 
         elif state == BootstrapState.AVATAR:
             # Waiting for avatar description (fallback state)
             if user_input.lower() in ["skip", "no", "later"]:
                 completion_msg = await self.bootstrap_service.complete_bootstrap()
                 await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                return completion_msg
+                return _BootstrapReply(completion_msg, None, None)
             else:
                 # Generate avatar
                 visual_identity = self.features.get("VisualIdentityFeature")
@@ -8035,24 +8089,25 @@ Expected Duration: {expected_duration}
                     try:
                         avatar_result = await visual_identity.generate_avatar(user_input)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                        return f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?"
+                        return _BootstrapReply(f"Avatar generated!\n\n{avatar_result}\n\nI'm ready to help. What would you like to work on?", None, None)
                     except (ConnectionError, TimeoutError, ValueError, KeyError, AttributeError) as e:
                         if is_execution_control_error(e):
                             raise
                         logging.warning(f"Failed to generate avatar: {e}")
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                        return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
+                        return _BootstrapReply("Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!", None, None)
                     except Exception as e:
                         if is_execution_control_error(e):
                             raise
                         logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                         await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
-                        return "Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!"
+                        return _BootstrapReply("Avatar generation had an issue, but we can try again later with !avatar. I'm ready to help!", None, None)
 
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
     @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    @journal_async_invocation
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, pre_turn_guard=None, *, invocation_id: Optional[str] = None, invocation_provenance=None, wake_reply: Optional[WakeReplyReceipt] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
@@ -8136,11 +8191,9 @@ Expected Duration: {expected_duration}
         # storage/context. There is no durable receipt to inspect yet, so keep
         # the existing retryable pre-init deferral instead of crashing inside
         # the genesis gate or returning a terminal user-facing block.
-        if getattr(self, "storage", None) is None:
-            raise RuntimeError(
-                "agent not fully initialized: context_manager and storage "
-                "unavailable; deferring turn for retry until initialize() completes"
-            )
+        from kestrel_sovereign.agent.runtime_start import require_input_storage_ready
+
+        require_input_storage_ready(self)
 
         # GENESIS READINESS: no bootstrap, context build, or provider cognition
         # may precede the durable audit receipt. The shared helper also covers
@@ -8249,7 +8302,7 @@ Expected Duration: {expected_duration}
                     # completes fully before the turn reads any policy, or waits until
                     # the turn has finished consuming its prompt.
                     transition_lock = self._get_privacy_transition_lock()
-                    async with transition_lock:
+                    async with transition_lock.policy_span():
                         # The source's own admission runs HERE, first, and nowhere
                         # else. Placing it one line earlier — outside the mutex — is
                         # what rounds 1-3 each did, and each time a transition landed
@@ -8301,9 +8354,10 @@ Expected Duration: {expected_duration}
                                     # call leaves first-turn importance, emotion, concepts,
                                     # and schema routing permanently absent (#2331).
                                     await self._post_response_pipeline(
-                                        user_input, bootstrap_response, session_id
+                                        user_message_id=bootstrap_response.user_message_id,
+                                        assistant_message_id=bootstrap_response.assistant_message_id,
                                     )
-                                    return bootstrap_response
+                                    return bootstrap_response.content
 
                         # Handle explicit commands first (using the CommandHandler)
                         if user_input.startswith("!"):
@@ -8525,12 +8579,12 @@ Expected Duration: {expected_duration}
         provider: Optional[str] = None,
         use_last_identity: bool = False,
         wake_reply: Optional[WakeReplyReceipt] = None,
-    ) -> None:
-        """Persist an assistant row with resolved model/provider columns.
+    ) -> Optional[int]:
+        """Persist an assistant row and return its exact storage receipt.
 
         With ``wake_reply`` the row is a signal wake's reply: it is stamped
         with the wake's signal id, and the receipt records the stored row's
-        id (#3655).
+        id without a correlation readback (#3655).
         """
         identity = self._conversation_response_identity(
             response,
@@ -8547,42 +8601,17 @@ Expected Duration: {expected_duration}
             kwargs["model"] = resolved_model
         if resolved_provider is not None:
             kwargs["provider"] = resolved_provider
-        await self.privacy_agent.add_conversation(
+        message_id = await self.privacy_agent.add_conversation(
             "assistant",
             content,
             **kwargs,
         )
         mark_current_invocation_effect_checkpointed()
         if wake_reply is not None:
-            wake_reply.message_id = await self._stored_wake_reply_id(
-                wake_reply.signal_id
+            wake_reply.message_id = (
+                message_id if self.privacy_agent.can_store("conversation") else None
             )
-
-    async def _stored_wake_reply_id(self, signal_id: str) -> Optional[int]:
-        """The id of the row just stored as ``signal_id``'s reply, if any.
-
-        Asked only when the privacy agent stored the row durably. Otherwise a
-        row an earlier delivery of the same wake stored would answer for a
-        reply this turn kept only in memory.
-
-        The reply is already stored, and the id only tells the chat console
-        where to load it from. A read that fails leaves no id: the console
-        then shows its truncated-preview notice rather than presenting the
-        event's capped summary as the reply. It must not fail the turn, which
-        the dispatcher would record as an undelivered wake.
-        """
-        if not self.privacy_agent.can_store("conversation"):
-            return None
-        try:
-            return await self.storage.find_signal_wake_reply_id(signal_id)
-        except DatabaseError as error:
-            if is_execution_control_error(error):
-                raise
-            logging.warning(
-                "Could not read back the stored reply to signal %s", signal_id,
-                exc_info=True,
-            )
-            return None
+        return message_id
 
     async def _maybe_compact_codex_thread(
         self, session_id: Optional[str],
@@ -8947,8 +8976,9 @@ Expected Duration: {expected_duration}
             **semantic_recall_metadata,
             **turn_opener_metadata(signal_wake),
         }
+        user_message_id = None
         try:
-            await self.privacy_agent.add_conversation(
+            user_message_id = await self.privacy_agent.add_conversation(
                 "user", wrapped_user,
                 metadata=user_meta,
                 session_id=session_id,
@@ -9234,11 +9264,17 @@ Expected Duration: {expected_duration}
             user_message=user_input,
         )
 
-        # Store agent response (linked to session for resumed conversations)
-        await self._persist_assistant_conversation(
+        # Keep the same actual tool receipts as streaming history. An enforcing
+        # audit releases only reviewed text, so its raw tool side channels must
+        # remain absent from both history and STOP, even on ALLOW.
+        assistant_message_id = await self._persist_assistant_conversation(
             response_text,
             session_id=session_id,
-            metadata=semantic_recall_metadata,
+            metadata={
+                **(semantic_recall_metadata or {}),
+                **({"tool_results": stop_tool_results}
+                   if stop_tool_results and not audit_enforcing else {}),
+            } or None,
             response=response,
             wake_reply=wake_reply,
         )
@@ -9246,7 +9282,9 @@ Expected Duration: {expected_duration}
         # Post-response memory pipeline:
         # Phase 1 (sync): Emotional tagging — CPU-bound, safe inline
         # Phase 2 (async): Temporal analysis + associative linking — background
-        await self._post_response_pipeline(user_input, response_text, session_id)
+        await self._post_response_pipeline(
+            user_message_id=user_message_id, assistant_message_id=assistant_message_id,
+        )
 
         # Fire STOP hook (response cycle complete).
         #
@@ -9330,9 +9368,9 @@ Expected Duration: {expected_duration}
 
     async def _post_response_pipeline(
         self,
-        user_input: str,
-        response_text: str,
-        session_id: Optional[str] = None,
+        *,
+        user_message_id: int | None,
+        assistant_message_id: int | None,
     ) -> None:
         """
         Post-response memory tagging pipeline.
@@ -9362,73 +9400,54 @@ Expected Duration: {expected_duration}
         if not hasattr(self, 'memory_system') or not self.memory_system:
             return
 
-        # ── Phase 1: Inline emotional tagging (CPU-bound, safe) ─────────
-        # Look up the two most recent messages (user + assistant just stored)
-        conv_store = None
-        user_msg = None
-        assistant_msg = None
+        if user_message_id is None or assistant_message_id is None:
+            return  # No complete durable exchange was produced.
+        if (
+            type(user_message_id) is not int or user_message_id <= 0
+            or type(assistant_message_id) is not int or assistant_message_id <= 0
+            or user_message_id == assistant_message_id
+        ):
+            raise ValueError("An exchange requires distinct positive native row receipts")
+        conv_store = getattr(self._raw_storage, "conversation", None)
+        if conv_store is None:
+            return
+        try:
+            messages = await conv_store.get_messages_by_ids([user_message_id, assistant_message_id])
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logging.getLogger(__name__).exception("Post-response receipt lookup failed")
+            return
+        rows = {message["id"]: message for message in messages}
+        if (
+            set(rows) != {user_message_id, assistant_message_id}
+            or rows[user_message_id].get("role") != "user"
+            or rows[assistant_message_id].get("role") != "assistant"
+        ):
+            raise ValueError("Exchange receipts do not identify this agent's stored user/assistant rows")
+        user_msg, assistant_msg = rows[user_message_id], rows[assistant_message_id]
+        # Canonical persisted projections carry the privacy decision. Raw turn
+        # text cannot replace anonymized content in derived memory.
+        user_input = extract_raw_user_content(user_msg.get("content") or "")
+        response_text = assistant_msg.get("content") or ""
         tag_results = {"user": None, "assistant": None}
         try:
-            conv_store = getattr(self._raw_storage, 'conversation', None)
-            if not conv_store:
-                return
-
-            # Only rows written around this serialized turn can be our pair.
-            # Never decrypt/materialize an agent's entire lifetime merely to
-            # locate two canonical IDs.
-            recent = await conv_store.get_full_history_with_ids(limit=20)
-            if len(recent) < 2:
-                return
-
-            canonical_session_id = None
-            if session_id:
-                canonical_session_id = await conv_store.resolve_session_id(
-                    session_id
-                )
-
-            # Find OUR user+assistant pair by canonical content. User turns are
-            # persisted in sent form, so compare their raw projection rather
-            # than the transport wrapper. Scope to the active session when one
-            # is available so identical text in another conversation cannot be
-            # selected.
-            for msg in reversed(recent):
-                msg_meta = msg.get('metadata') or {}
-                if (
-                    canonical_session_id
-                    and str(msg_meta.get('session_id')) != str(canonical_session_id)
-                ):
-                    continue
-                if not assistant_msg and msg.get('role') == 'assistant' and msg.get('content') == response_text:
-                    assistant_msg = msg
-                elif (
-                    not user_msg
-                    and msg.get('role') == 'user'
-                    and extract_raw_user_content(msg.get('content') or '') == user_input
-                ):
-                    user_msg = msg
-                if user_msg and assistant_msg:
-                    break
-
-            if user_msg and assistant_msg:
-                tag_results = await self.context_manager.memory_manager.tag_exchange(
-                    user_content=user_input,
-                    assistant_content=response_text,
-                    user_message_id=user_msg.get('id'),
-                    assistant_message_id=assistant_msg.get('id'),
-                    memory_system=self.memory_system,
-                )
+            tag_results = await self.context_manager.memory_manager.tag_exchange(
+                user_content=user_input,
+                assistant_content=response_text,
+                user_message_id=user_message_id,
+                assistant_message_id=assistant_message_id,
+                memory_system=self.memory_system,
+            )
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logging.error(f"Post-response Phase 1 (emotional tagging) failed: {e}", exc_info=True)
 
         # ── Phase 2: Background temporal + associative processing ───────
         # Snapshot IDs before spawning background work to avoid races
-        snapshot_user_msg_id = user_msg.get('id') if user_msg else None
+        snapshot_user_msg_id = user_message_id
         snapshot_user_metadata = dict((tag_results or {}).get("user") or {})
-
-        # Phase 1 can fail before a conversation store is acquired. Do not
-        # enqueue background work that is guaranteed to dereference None.
-        if conv_store is None:
-            return
 
         async def _background_memory_processing():
             try:
@@ -9444,6 +9463,8 @@ Expected Duration: {expected_duration}
                             await self.memory_system.analyzer.save_patterns(patterns)
                             logging.debug(f"Post-response: saved {len(patterns)} temporal patterns")
                     except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.error(f"Post-response temporal analysis failed: {e}", exc_info=True)
 
                 # Associative linking + schema routing share one canonical
@@ -9461,9 +9482,13 @@ Expected Duration: {expected_duration}
                                 snapshot_user_msg_id, derived
                             )
                     except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
                         logging.error(f"Post-response memory graph processing failed: {e}", exc_info=True)
 
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.error(f"Post-response Phase 2 (background) failed: {e}", exc_info=True)
 
         # Background task — named for debug visibility and owned by shutdown.
@@ -9769,6 +9794,8 @@ Expected Duration: {expected_duration}
             closed = ReleaseOutcome.RELEASED
             if storage is not None and hasattr(storage, "close"):
                 closed = reported_outcome(await storage.close())
+            if closed is ReleaseOutcome.RELEASED:
+                await self._retire_tool_effect_store()
             return closed if precloses is ReleaseOutcome.RELEASED else precloses
 
         if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
@@ -10063,6 +10090,21 @@ Expected Duration: {expected_duration}
             reap(), name=f"agent_shutdown_quarantine_reaper:{self.did}"
         )
 
+    def cancel_retained_remote_work(self, reason: str) -> list[str]:
+        """Cancel the remote work this agent's shutdown still waits on.
+
+        The host calls this once its shutdown budget is spent (#4028). Its
+        sync service's ``stop()`` waits for a snapshot pass another task
+        started; that upload can take many minutes, so the host cancels it
+        rather than letting SIGKILL cut it off. Returns one description per
+        cancelled pass, naming its target. Local cleanup (storage close) is
+        not touched.
+        """
+        sync_service = getattr(self, "_sync_service", None)
+        if sync_service is None:
+            return []
+        return sync_service.cancel_inflight_snapshots(reason)
+
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
     # - _maybe_evict_direct_tools, _build_features_prompt_section
@@ -10263,7 +10305,7 @@ Expected Duration: {expected_duration}
         The whole method is a *fallible prefix* wrapped in one try/finally.
         The prefix stops every agent-owned worker and every feature; the
         ``finally`` runs the safety-critical durable tail (background-task
-        cleanup, memory shutdown, final sync snapshot, storage close).
+        cleanup, memory shutdown, owed-snapshot record, storage close).
 
         Cancellation contract (#2409): agent.shutdown() is wrapped in
         ``asyncio.wait_for(..., timeout=SHUTDOWN_TIMEOUT)`` by the CLI /
@@ -10951,7 +10993,7 @@ Expected Duration: {expected_duration}
         """Run the safety-critical durable shutdown steps.
 
         These persist data and prevent leaks (agent-owned background-task
-        cleanup, memory shutdown, the final sync snapshot, and storage
+        cleanup, memory shutdown, the owed-snapshot record, and storage
         close) and MUST complete even when a feature/MCP/LLM/TaskManager
         shutdown above was cancelled by the outer ``asyncio.wait_for``
         timeout. Each step guards its own errors so one failure never skips
@@ -11002,14 +11044,12 @@ Expected Duration: {expected_duration}
         run_storage = hasattr(self.storage, "close")
         if storage_close_timeout is None:
             storage_close_timeout = _minimum_storage_close_timeout(self.storage)
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
-
         # Native storage owns physical backend retirement even when its close
         # reservation is zero (PostgreSQL). A cancelled observer must retain
         # that original owner, never close the coroutine joining its backend.
         native_storage_resource = (
             self.storage
-            if isinstance(getattr(self.storage, "db", None), AsyncDatabase)
+            if getattr(self.storage, "native_retirement_owner", None) is self.storage
             else None
         )
         if storage_preclose_timeout is None:
@@ -11034,7 +11074,7 @@ Expected Duration: {expected_duration}
         # requirement, because that would silently discard the outer-budget
         # clamp when a configuration cannot fit.
         tail_deadline = loop.time() + max(0.0, tail_reserve)
-        # The sync path makes TWO guarded steps (snapshot + stop), so it must
+        # The sync path makes TWO guarded steps (owed record + stop), so it must
         # count as two in the fair-division denominator — otherwise sync-stop
         # runs at pending_steps==1 and claims the entire remaining budget,
         # starving the data-critical storage-close of its fair share.
@@ -11175,7 +11215,7 @@ Expected Duration: {expected_duration}
             their original Task and eventual physical-close evidence instead.
             When ``shielded`` the underlying task keeps running if the
             tail's own await is cancelled externally (used for
-            ``force_snapshot`` so cancellation neither aborts it nor skips the
+            the owed-snapshot record so cancellation neither aborts it nor skips the
             following ``stop()``); it is still bounded by ``guard``. An explicit
             retirement resource retains the Task past that observation bound;
             completion remains owned and a later completion waiter joins it.
@@ -11341,36 +11381,43 @@ Expected Duration: {expected_duration}
                 "memory-system",
             )
 
-        # Final snapshot to all sync targets before closing storage. The
-        # snapshot is SHIELDED so cancellation neither aborts it nor skips the
-        # ``stop()`` that releases the sync worker.
+        # Shutdown uploads no snapshot (#4028). An agent database is gigabytes
+        # and its upload takes many minutes, far past any stop the host can
+        # wait for, so a final upload was always cut off by SIGKILL. Record
+        # the remote snapshot as owed instead: the next scheduled backup sends
+        # it. Storage close below keeps the local work. The record is SHIELDED
+        # so cancellation neither aborts it nor skips the ``stop()``.
         if run_sync:
             status = await _bounded(
-                sync_service.force_snapshot(),
+                sync_service.record_remote_snapshot_owed(),
                 _step_guard(),
-                "sync-snapshot",
+                "sync-snapshot-owed",
                 shielded=True,
                 retirement_resource=sync_service,
             )
-            # Always attempt stop() — even if the snapshot was abandoned or
+            # Always attempt stop() — even if the record was abandoned or
             # cancellation was observed — so the sync worker is released.
+            # stop() waits for a pass some other task started, which is
+            # remote work the host's shutdown budget bounds
+            # (``cancel_retained_remote_work``).
 
             async def release_sync() -> ReleaseOutcome:
                 stopped = reported_outcome(await sync_service.stop())
                 if status in {"abandoned", "cancelled"}:
-                    # Work the unfinished snapshot started may still be
-                    # running against the sync targets (#3522).
+                    # The unfinished record may still be writing the sync
+                    # state file (#3522).
                     return ReleaseOutcome.RETAINED
                 return stopped
 
+            # SHIELDED, as the final snapshot it replaced was: a pass it
+            # waits for keeps its grace when the tail itself is cancelled.
             await _bounded(
                 custody.release("sync_service", release_sync),
                 _step_guard(),
                 "sync-stop",
+                shielded=True,
                 retirement_resource=sync_service,
             )
-            if status == "ok":
-                logging.info("Sync service: final snapshot flushed")
 
         # Another lifecycle caller may already have spent the dispatcher guard
         # and installed the unique continuation while this tail was stopping
@@ -11443,6 +11490,8 @@ Expected Duration: {expected_duration}
 
             async def close_storage() -> ReleaseOutcome:
                 closed = reported_outcome(await storage.close())
+                if closed is ReleaseOutcome.RELEASED:
+                    await self._retire_tool_effect_store()
                 if storage_preclose_status in {"error", "abandoned", "cancelled"}:
                     # The cached SQLAlchemy engine may still hold the store.
                     return ReleaseOutcome.RETAINED

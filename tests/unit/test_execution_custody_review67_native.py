@@ -37,6 +37,10 @@ def test_cold_feature_reclamation_cannot_erase_namespace_launch_custody(tmp_path
 
 @pytest.mark.asyncio
 async def test_normal_stop_registry_close_joins_native_poll_commit(tmp_path, monkeypatch):
+    import threading
+
+    import aiosqlite
+
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
     from kestrel_sovereign.execution_custody import execution_commit_outcome
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -49,30 +53,31 @@ async def test_normal_stop_registry_close_joins_native_poll_commit(tmp_path, mon
     registry = DistributedInvocationRegistry(store)
     agent = _ReplicaAgent("did:test:original-stop-poll")
     assert await registry.register(agent, "original-turn", 1)
-    entered, release = asyncio.Event(), asyncio.Event()
-    native_commit = db.backend._connection.commit
+    # The owner heartbeat renews on its own thread and connection (#3889).
+    entered, release = threading.Event(), threading.Event()
+    native_commit = aiosqlite.Connection.commit
     commits = []
 
-    async def held_commit():
-        await native_commit()
-        task_name = asyncio.current_task().get_name()
-        if task_name == "distributed-stop-relay" or task_name.startswith("distributed-stop-owner-poll:"):
+    async def held_commit(connection):
+        await native_commit(connection)
+        if asyncio.current_task().get_name().startswith("distributed-stop-owner-poll:") and not commits:
             commits.append(True)
             entered.set()
-            await release.wait()
+            release.wait(timeout=30)
 
-    monkeypatch.setattr(db.backend._connection, "commit", held_commit)
+    monkeypatch.setattr(aiosqlite.Connection, "commit", held_commit)
     registry.start()
     stopping = None
     try:
-        await asyncio.wait_for(entered.wait(), 3)
+        assert await asyncio.to_thread(entered.wait, 3)
         stopping = create_owned_task(registry.close())
         done, _ = await asyncio.wait({stopping}, timeout=.05)
-        assert not done, "normal registry close cancelled accepted poll COMMIT acknowledgement"
+        assert not done, "normal registry close abandoned an accepted renewal COMMIT acknowledgement"
         release.set()
         outcome = await await_owned_task(stopping)
         assert outcome.error is None and execution_commit_outcome(outcome.error) is None
         assert registry._terminal_control is None and registry._relay_task is None
+        assert not registry._heartbeat.alive
         assert len(commits) == 1
     finally:
         release.set()

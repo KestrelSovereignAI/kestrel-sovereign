@@ -1,6 +1,7 @@
 """Close timeout and the earlier native drain retain every delivered caller C."""
 import asyncio
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -65,6 +66,16 @@ async def test_close_deadline_keeps_actual_withdrawal_and_same_retained_owner(na
 @pytest.mark.asyncio
 async def test_close_drain_keeps_two_distinct_actual_observer_withdrawals(native_pg, tmp_path, monkeypatch):
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch))
+    await _assert_close_drain_withdrawals(tmp_path, monkeypatch, source=source)
+
+
+@pytest.mark.asyncio
+async def test_close_drain_observer_uses_original_join_and_ignores_foreign_borrower(tmp_path, monkeypatch):
+    """Healthy native SQLite control; the separate PG source remains CI-only."""
+    await _assert_close_drain_withdrawals(tmp_path, monkeypatch, foreign_borrower=True)
+
+
+async def _assert_close_drain_withdrawals(tmp_path, monkeypatch, *, source=None, foreign_borrower=False):
     path = tmp_path / "drain-two-withdrawals.db"
     database = await AsyncDatabase.sqlite(str(path))
     backend, connection = database.backend, database.backend._connection
@@ -72,9 +83,10 @@ async def test_close_drain_keeps_two_distinct_actual_observer_withdrawals(native
     await database.execute("CREATE TABLE effects (id INTEGER)")
     await connection.execute("BEGIN")
     await connection.execute("INSERT INTO effects VALUES (1)")
-    entered, release, waiting, unwinding, second = (asyncio.Event() for _ in range(5))
-    actual_rollback, actual_wait, actual_shield = connection.rollback, asyncio.wait, asyncio.shield
-    withdrawals, owner = [], None
+    entered, release, waiting, unwinding, joining = (asyncio.Event() for _ in range(5))
+    actual_rollback = connection.rollback
+    withdrawals, owner, borrowed = [], None, None
+    from tests.shared.owned_task_observation import observe_bounded_asyncio_wait, observe_owned_task
     async def rollback():
         await actual_rollback()
         entered.set()
@@ -83,47 +95,61 @@ async def test_close_drain_keeps_two_distinct_actual_observer_withdrawals(native
                 await release.wait()
             except asyncio.CancelledError:
                 unwinding.set()
-    async def wait(tasks, *args, **kwargs):
-        if asyncio.current_task() is owner:
+    def entered_wait(tasks):
+        if asyncio.current_task() is owner and drain in tasks:
             waiting.set()
-        try:
-            return await actual_wait(tasks, *args, **kwargs)
-        except asyncio.CancelledError as error:
-            if asyncio.current_task() is owner:
-                withdrawals.append(error)
-            raise
-    async def shield(*args, **kwargs):
-        try:
-            return await actual_shield(*args, **kwargs)
-        except asyncio.CancelledError as error:
-            if asyncio.current_task() is owner:
-                withdrawals.append(error)
-                second.set()
-            raise
+    def withdrew_wait(tasks, error):
+        if asyncio.current_task() is owner and drain in tasks:
+            withdrawals.append(error)
+    def entered_join(task):
+        if asyncio.current_task() is owner and task is drain:
+            joining.set()
+    def joined(task, outcome):
+        if asyncio.current_task() is owner and task is drain and outcome.cancellation is not None:
+            withdrawals.append(outcome.cancellation)
     monkeypatch.setattr(connection, "rollback", rollback)
-    monkeypatch.setattr(asyncio, "wait", wait)
-    monkeypatch.setattr(asyncio, "shield", shield)
+    observe_bounded_asyncio_wait(monkeypatch, on_enter=entered_wait, on_withdrawal=withdrew_wait)
+    observe_owned_task(monkeypatch, on_enter=entered_join, on_outcome=joined)
     backend._handoff_cancelled_write(connection)
     drain = backend._cancelled_write_drain
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        backend._cancelled_write_drain_error = source.error
+        if source is not None:
+            backend._cancelled_write_drain_error = source.error
         owner = create_owned_task(backend.close(), retain_originals=True)
         await asyncio.wait_for(waiting.wait(), 5)
+        if foreign_borrower:
+            borrower_entered = asyncio.Event()
+            async def borrow():
+                borrower_entered.set()
+                await asyncio.wait({drain})
+            borrowed = create_owned_task(borrow(), retain_originals=True)
+            await asyncio.wait_for(borrower_entered.wait(), 5)
+            borrowed.cancel('foreign drain observer withdrawal')
+            observed = await await_owned_task(borrowed)
+            assert isinstance(observed.error, asyncio.CancelledError)
+            assert withdrawals == [] and not drain.cancelling()
         owner.cancel("actual earlier drain waiter C1")
         await asyncio.wait_for(unwinding.wait(), 5)
+        await asyncio.wait_for(joining.wait(), 5)
         owner.cancel("actual canonical drain join C2")
-        await asyncio.wait_for(second.wait(), 5)
         release.set()
         result = await await_owned_task(owner)
-        source.assert_retained(result.error)
+        if source is not None:
+            source.assert_retained(result.error)
         assert len(withdrawals) == 2 and withdrawals[0] is not withdrawals[1]
+        assert withdrawals[0].args == ('actual earlier drain waiter C1',)
+        assert withdrawals[1].args == ('actual canonical drain join C2',)
         assert all(error in tuple(_explicit_control_chain(result.error)) for error in withdrawals)
         assert drain.done() and backend._connection is None and not worker.is_alive()
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as observer:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as observer:
             assert observer.execute("SELECT count(*) FROM effects").fetchone()[0] == 0
     finally:
         release.set()
+        if borrowed is not None:
+            if not borrowed.done():
+                borrowed.cancel('retire foreign drain observer')
+            await await_owned_task(borrowed)
         if owner is not None:
             await await_owned_task(owner)
         await await_owned_task(drain)

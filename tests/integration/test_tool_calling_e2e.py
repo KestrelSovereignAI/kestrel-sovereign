@@ -137,12 +137,13 @@ class TestOpenAIAdapterToolCalling:
         mock_tool_call.function.name = "model_agent"
         mock_tool_call.function.arguments = '{"task": "list all models"}'
 
-        mock_choice = MagicMock()
+        mock_choice = MagicMock(index=0, finish_reason="tool_calls")
         mock_choice.message.content = "I'll list the models for you."
         mock_choice.message.tool_calls = [mock_tool_call]
 
         mock_response = MagicMock()
         mock_response.choices = [mock_choice]
+        mock_response.usage = None
 
         mock_client = MagicMock()
         mock_client.chat.completions.create = AsyncMock(return_value=mock_response)

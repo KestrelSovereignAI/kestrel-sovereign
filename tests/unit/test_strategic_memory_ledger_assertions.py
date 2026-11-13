@@ -34,6 +34,7 @@ from kestrel_sovereign.knowledge import (
     DirectLineage,
     EpistemicState,
     SourceOccurrence,
+    SourceReferenceKind,
 )
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.security.assertion_tenant_resolver import (
@@ -44,6 +45,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyEnforcingStorage,
     PrivacyViolationError,
 )
+from tests.utils.live_turn import TurnBoundAgent, live_turn
 
 
 # --------------------------------------------------------------------------
@@ -1149,6 +1151,317 @@ async def test_adding_a_pattern_through_the_tool_writes_an_assertion(wired):
     assert len(held) == 1
     assert held[0].predicate.value.endswith("strategicPattern")
     assert isinstance(held[0].lineage, DirectLineage)
+
+
+@pytest.mark.asyncio
+async def test_a_row_recorded_during_a_session_names_that_session(governed, tmp_path):
+    """#3875: a corpus can hold out what was recorded in a given session."""
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    storage, _, tenant_id = governed
+    agent = TurnBoundAgent(
+        storage=storage, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+
+    with live_turn(agent, "exam-session"):
+        await feature.strategy_add_pattern(
+            pattern="Recorded during the exam", source="s", implication="i"
+        )
+        blocker = await feature.strategy_add_blocker(
+            issue="#42", title="Blocked during the exam", repo="o/r"
+        )
+    await feature.strategy_add_pattern(
+        pattern="Recorded off any turn", source="s", implication="i"
+    )
+
+    # The file names no session: the agent can edit it (#3990).
+    assert "session_id" not in blocker.data["blocker"]
+    named = {}
+    for held in await active(storage):
+        sources = await storage.list_assertion_revision_sources(held.revision_id)
+        assert ledger_assertions.has_adapter_provenance(sources)
+        named[held.object.value] = [source.references for source in sources]
+    assert sorted(named.values()) == [
+        [frozenset()],
+        [frozenset({(SourceReferenceKind.SESSION, "exam-session")})],
+        [frozenset({(SourceReferenceKind.SESSION, "exam-session")})],
+    ]
+
+
+async def attest(storage, row, section_key, session_id):
+    """Attest ``row`` as the strategy-ledger tool does before writing it."""
+    await storage.attest_strategy_ledger_row(
+        section_key=section_key,
+        content_digest=ledger_assertions.attestation_digest(section_key, row),
+        session_id=session_id,
+    )
+
+
+async def source_references(storage) -> dict:
+    """Each projected row's id, mapped to the references its sources name."""
+    named = {}
+    for held in await every(storage):
+        sources = await storage.list_assertion_revision_sources(held.revision_id)
+        named[held.object.value.rsplit(":", 1)[-1]] = [
+            source.references for source in sources
+        ]
+    return named
+
+
+@pytest.mark.asyncio
+async def test_an_attested_session_that_cannot_be_named_fails_alone(
+    governed, ledger
+):
+    """A session a locator cannot carry is refused, never dropped.
+
+    Writing the row's assertion without its session would escape an exclusion
+    of the session it was recorded in. Only that row fails; the rest of the
+    pass projects, and a later pass refuses it again rather than give up.
+    """
+    storage, _, _ = governed
+    unnameable = ledger.add_pattern("Recorded in an unnameable session", "s", "i")
+    nameable = ledger.add_pattern("Recorded in a nameable session", "s", "i")
+    await attest(storage, unnameable, "patterns_learned", "\texam\t")
+    await attest(storage, nameable, "patterns_learned", "exam")
+
+    report = await project(storage, ledger)
+    assert (report.projected, report.failed) == (1, 1)
+    (held,) = await every(storage)
+    sources = await storage.list_assertion_revision_sources(held.revision_id)
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, "exam")})
+    ]
+
+    again = await project(storage, ledger)
+    assert (again.unchanged, again.failed) == (1, 1)
+    assert len(await every(storage)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_row_names_only_sessions_attested_for_its_content(governed, ledger):
+    """#3990: the file is the agent's to edit, so nothing in it is provenance.
+
+    An attestation is read back by the row's content digest after the file is
+    re-read from disk, digit-only session keys included. A ``session_id``
+    field the agent wrote by hand names nothing: the row's content was never
+    attested, so it is marked unattested instead.
+    """
+    storage, _, _ = governed
+    recorded = ledger.add_pattern("Recorded in session 1314", "s", "i")
+    await attest(storage, recorded, "patterns_learned", "1314")
+    assert ledger.save() is None
+    written = ledger.path.read_text(encoding="utf-8")
+    assert "session_id" not in written
+    ledger.path.write_text(
+        written.replace(
+            "blockers: []",
+            "- id: pat_handwritten\n"
+            "  pattern: Written by hand\n"
+            "  session_id: 2718\n"
+            "blockers: []",
+        ),
+        encoding="utf-8",
+    )
+    reloaded = StrategyLedger(ledger.path)
+    reloaded.load()
+
+    await project(storage, reloaded)
+    handwritten = next(
+        row for row in reloaded.patterns if row["id"] == "pat_handwritten"
+    )
+    assert await source_references(storage) == {
+        recorded["id"]: [frozenset({(SourceReferenceKind.SESSION, "1314")})],
+        "pat_handwritten": [
+            frozenset(
+                {
+                    (
+                        SourceReferenceKind.UNATTESTED_SESSION,
+                        ledger_assertions.attestation_digest(
+                            "patterns_learned", handwritten
+                        ),
+                    )
+                }
+            )
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_row_attested_in_several_sessions_names_each(governed, ledger):
+    """One digest may carry several sessions; the source names every one."""
+    storage, _, _ = governed
+    row = ledger.add_pattern("Recorded twice", "s", "i")
+    for session_id in ("session-t", None, "session-s"):
+        await attest(storage, row, "patterns_learned", session_id)
+
+    await project(storage, ledger)
+    assert await source_references(storage) == {
+        row["id"]: [
+            frozenset(
+                {
+                    (SourceReferenceKind.SESSION, "session-s"),
+                    (SourceReferenceKind.SESSION, "session-t"),
+                }
+            )
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_unreadable_attestations_project_nothing(governed, ledger):
+    """A source is immutable, so a row is never projected without its record.
+
+    Projecting it unattested would hold it out of every session-excluding
+    corpus even after the record reads again; the pass waits for the next.
+    """
+    storage, raw, _ = governed
+    row = ledger.add_pattern("Attested", "s", "i")
+    await attest(storage, row, "patterns_learned", "exam")
+    await raw.db.execute("ALTER TABLE strategy_ledger_row_attestations RENAME TO moved")
+    try:
+        report = await project(storage, ledger)
+    finally:
+        await raw.db.execute("ALTER TABLE moved RENAME TO strategy_ledger_row_attestations")
+
+    assert report.skipped_reason == "row_attestations_unreadable"
+    assert await every(storage) == []
+    await project(storage, ledger)
+    assert await source_references(storage) == {
+        row["id"]: [frozenset({(SourceReferenceKind.SESSION, "exam")})]
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_row_names_a_padded_session_exactly_as_its_rows_are_filed(
+    governed, tmp_path
+):
+    """A session key is named as filed, never trimmed.
+
+    The conversation store keeps a caller's session key verbatim, surrounding
+    whitespace included. A source naming a trimmed copy names a session no row
+    is filed under, and excluding the real one would not hold the row out.
+    """
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    storage, _, tenant_id = governed
+    agent = TurnBoundAgent(
+        storage=storage, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+    padded = " exam-session "
+
+    with live_turn(agent, padded):
+        await storage.add_conversation(
+            "user", "Record the exam pattern.", session_id=padded
+        )
+        await feature.strategy_add_pattern(
+            pattern="Recorded during the exam", source="s", implication="i"
+        )
+
+    history = await storage.get_conversation_history(limit=10)
+    assert {entry["metadata"]["session_id"] for entry in history} == {padded}
+    (held,) = await active(storage)
+    sources = await storage.list_assertion_revision_sources(held.revision_id)
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, padded)})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writers_never_lose_an_attestation(governed, tmp_path):
+    """#3990: two stale ledgers write the same pattern while one attests.
+
+    Writer S attests the row as the file stood, then waits. Writer T writes
+    the same pattern meanwhile, taking that id. S's write then finds the file
+    changed, so the row it adds takes the next id, which it attests before
+    writing. Every row names the session that wrote it; the id S first
+    attested also names S, because the row now there has exactly the content
+    S recorded.
+    """
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    storage, raw, tenant_id = governed
+    agent_s = TurnBoundAgent(
+        storage=storage, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    agent_t = TurnBoundAgent(
+        storage=storage, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    writer_s = StrategicMemoryFeature(agent_s)
+    writer_t = StrategicMemoryFeature(agent_t)
+    await writer_s.initialize()
+    await writer_t.initialize()
+
+    attest_row = storage.attest_strategy_ledger_row
+    attested = asyncio.Event()
+    release = asyncio.Event()
+
+    async def attest_then_wait(**kwargs):
+        await attest_row(**kwargs)
+        if kwargs["session_id"] == "session-s" and not attested.is_set():
+            attested.set()
+            await release.wait()
+
+    storage.attest_strategy_ledger_row = attest_then_wait
+
+    async def record_in_s():
+        with live_turn(agent_s, "session-s", turn_id="turn-s"):
+            return await writer_s.strategy_add_pattern(
+                pattern="Recorded twice", source="s", implication="i"
+            )
+
+    pending = asyncio.ensure_future(record_in_s())
+    await asyncio.wait_for(attested.wait(), timeout=10)
+    with live_turn(agent_t, "session-t", turn_id="turn-t"):
+        in_t = await writer_t.strategy_add_pattern(
+            pattern="Recorded twice", source="s", implication="i"
+        )
+    release.set()
+    in_s = await asyncio.wait_for(pending, timeout=10)
+
+    assert in_s.data["persisted"] is True and in_t.data["persisted"] is True
+    row_t = in_t.data["pattern_id"]
+    row_s = in_s.data["pattern_id"]
+    assert row_s == f"{row_t}-2"
+    on_disk = StrategyLedger(writer_s._ledger.path)
+    on_disk.load()
+    assert [row["id"] for row in on_disk.patterns] == [row_t, row_s]
+    recorded = await raw.db.fetchall(
+        "SELECT content_digest, session_id FROM strategy_ledger_row_attestations"
+    )
+    digests = {
+        row["id"]: ledger_assertions.attestation_digest("patterns_learned", row)
+        for row in on_disk.patterns
+    }
+    assert sorted(recorded) == sorted(
+        [
+            (digests[row_t], "session-s"),
+            (digests[row_t], "session-t"),
+            (digests[row_s], "session-s"),
+        ]
+    )
+
+    await writer_t._reindex_ledger(on_disk.persisted_snapshot)
+    assert await source_references(storage) == {
+        row_t: [
+            frozenset(
+                {
+                    (SourceReferenceKind.SESSION, "session-s"),
+                    (SourceReferenceKind.SESSION, "session-t"),
+                }
+            )
+        ],
+        row_s: [frozenset({(SourceReferenceKind.SESSION, "session-s")})],
+    }
 
 
 @pytest.mark.asyncio

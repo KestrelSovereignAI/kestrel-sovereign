@@ -15,6 +15,7 @@ import kestrel_sovereign
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
     OwnedTaskAdmission,
+    acquire_lock_keeping_cancellation,
     await_owned_task,
     create_owned_task,
     owned_task_error,
@@ -177,9 +178,11 @@ async def test_borrowed_callback_removal_failure_cannot_demote_caller_cancellati
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("allocation", ["completion", "shield"])
+@pytest.mark.parametrize("allocation", ["completion", "observation"])
 async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation):
-    release, refused = asyncio.Event(), asyncio.Event()
+    from tests.shared.owned_task_observation import refuse_owned_observation_allocation
+
+    release = asyncio.Event()
     failure = RuntimeError("controlled original completion allocation refusal")
 
     async def original():
@@ -187,21 +190,8 @@ async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch
         return "original result"
 
     source = create_owned_task(original(), retain_originals=True)
-    loop = asyncio.get_running_loop()
-    allocate = loop.create_future
-
-    def controlled_allocation():
-        frame = sys._getframe(1)
-        if allocation == "shield" and frame.f_code.co_name == "shield":
-            frame = frame.f_back
-        if (not refused.is_set() and frame.f_code.co_name == "await_owned_task"
-                and frame.f_locals.get("task") is source
-                and (allocation == "completion" or sys._getframe(1).f_code.co_name == "shield")):
-            refused.set()
-            raise failure
-        return allocate()
-
-    monkeypatch.setattr(loop, "create_future", controlled_allocation)
+    refused = refuse_owned_observation_allocation(monkeypatch, lambda: source,
+        allocation=allocation, error=failure)
     observer = asyncio.create_task(await_owned_task(source))
     try:
         await asyncio.wait_for(refused.wait(), 2)
@@ -217,6 +207,35 @@ async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch
         release.set()
         await asyncio.gather(observer, return_exceptions=True)
         await await_owned_task(source)
+
+
+@pytest.mark.asyncio
+async def test_bounded_wait_observer_preserves_unbounded_and_first_completed(monkeypatch):
+    from tests.shared.owned_task_observation import observe_bounded_asyncio_wait
+
+    loop = asyncio.get_running_loop()
+    ready, pending = loop.create_future(), loop.create_future()
+    ready.set_result('original result')
+    observations = []
+    entries = []
+
+    async def before_wait(owners, timeout):
+        observations.append((set(owners), timeout))
+
+    observe_bounded_asyncio_wait(monkeypatch, before_wait,
+        on_enter=lambda owners: entries.append(tuple(owners)))
+    try:
+        async with asyncio.timeout(1):
+            done, waiting = await asyncio.wait(iter((ready, pending)),
+                return_when=asyncio.FIRST_COMPLETED)
+        assert done == {ready} and waiting == {pending}
+        assert entries == [(ready, pending)]
+        assert ready.result() == 'original result' and observations == []
+        done, waiting = await asyncio.wait({pending}, timeout=0.01)
+        assert done == set() and waiting == {pending} and not pending.cancelled()
+        assert observations == [({pending}, 0.01)]
+    finally:
+        pending.set_result('original pending result')
 
 
 @pytest.mark.asyncio
@@ -262,6 +281,38 @@ async def test_native_original_policy_keeps_caused_cancellation_without_changing
     assert (await await_owned_task(task)).error is expected
     if retain_originals:
         assert cancellation.__cause__ is cause
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain_originals", [False, True])
+async def test_original_policy_applies_to_native_outer_completion(tmp_path, retain_originals):
+    cause = ValueError("original physical epilogue failure")
+    cancellation = asyncio.CancelledError("original physical outer completion")
+    effect = tmp_path / "original-native-outer-effect"
+    owners = []
+    async def operation():
+        effect.write_text("original effect completed once")
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        async def physical():
+            await coroutine
+            raise cancellation from cause
+        task = asyncio.Task(physical(), loop=loop, **options)
+        owners.append(task)
+        return task
+    try:
+        loop.set_task_factory(factory)
+        owner = create_owned_task(operation(), retain_originals=retain_originals)
+        loop.set_task_factory(previous)
+        outcome = await await_owned_task(owner)
+        assert outcome.error is (cancellation if retain_originals else cause), (
+            "Original admission policy was lost at the native outer completion")
+        assert (await await_owned_task(owner)).error is outcome.error
+        assert effect.read_text() == "original effect completed once" and len(owners) == 1 and owner.done()
+    finally:
+        loop.set_task_factory(previous)
+        for owner in owners:
+            await await_owned_task(owner)
 
 
 @pytest.mark.asyncio
@@ -343,6 +394,52 @@ async def test_repeated_cancellation_waits_for_owned_task_completion():
     release_owned.set()
     with pytest.raises(asyncio.CancelledError):
         await owner_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bounded', [False, True])
+async def test_repeated_withdrawal_does_not_accumulate_completion_callbacks(tmp_path, bounded):
+    """Cancellation must not grow the original owner's observation inventory."""
+    from kestrel_sovereign._async_ownership import wait_owned_or_pending
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    release = asyncio.Event()
+    database = await AsyncDatabase.sqlite(str(tmp_path / 'original-owner.db'))
+    await database.execute('CREATE TABLE original_receipt(value TEXT)')
+
+    async def original():
+        await release.wait()
+        await database.execute("INSERT INTO original_receipt VALUES ('settled')")
+        return 'settled'
+
+    source = create_owned_task(original(), retain_originals=True)
+    operation = (wait_owned_or_pending(source, cancellation_grace=10,
+        cancel_on_caller_cancellation=False) if bounded else await_owned_task(source))
+    observer = asyncio.create_task(operation)
+    try:
+        await asyncio.sleep(0)
+        # Inspect the real completion Future, without replacing allocation,
+        # cancellation delivery, or the native database operation.
+        awaited = observer.get_coro()
+        while awaited.cr_code.co_name not in {'await_owned_task', 'wait_owned_or_pending'}:
+            awaited = awaited.cr_await
+        completion = awaited.cr_frame.f_locals['completion']
+        for number in range(128):
+            observer.cancel(f'withdrawal-{number}')
+            await asyncio.sleep(0)
+        assert not source.done() and not source.cancelling()
+        assert len(completion._callbacks or ()) <= 2, (
+            'each withdrawal retained another callback on the original completion')
+    finally:
+        release.set()
+        outcome = await observer
+        try:
+            assert outcome.error is None and outcome.result == 'settled'
+            assert outcome.cancellation.args == ('withdrawal-0',)
+            row = await database.fetchone('SELECT COUNT(*) FROM original_receipt')
+            assert row[0] == 1
+        finally:
+            await database.close()
 
 
 @pytest.mark.asyncio
@@ -628,8 +725,9 @@ async def test_closing_owned_iterator_interrupts_blocked_source():
 
 
 @pytest.mark.asyncio
-async def test_cancelling_unstarted_iterator_owner_interrupts_source():
-    """The exposed cancellation owner works before its coroutine first runs."""
+@pytest.mark.parametrize('watch_started', [False, True])
+async def test_cancelling_unstarted_iterator_owner_interrupts_source(watch_started):
+    """The same cancellation owner retires its source before or after startup."""
 
     entered = asyncio.Event()
     finalized = asyncio.Event()
@@ -647,9 +745,13 @@ async def test_cancelling_unstarted_iterator_owner_interrupts_source():
         operation="never-started watcher",
         cleanup_requested=lambda: True,
     )
-    # This is the endpoint race: registration exposes the watcher and Stop
-    # cancels it in the same event-loop turn, before its coroutine body runs.
-    assert owned.owner_task.cancel() is True
+    if watch_started:
+        await entered.wait()
+        await asyncio.sleep(0)
+    # Registration can expose the watcher before its first step, or Stop can
+    # arrive while its original borrowed observation is already suspended.
+    from kestrel_sovereign._async_ownership import cancel_owned_task
+    assert cancel_owned_task(owned.owner_task) is True
 
     await asyncio.wait_for(entered.wait(), timeout=0.2)
     for _attempt in range(20):
@@ -769,3 +871,348 @@ async def test_blocking_operation_finishes_before_cancellation_propagates():
 
     with pytest.raises(asyncio.CancelledError):
         await owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["plain", "sdk", "audit", "cancelled-future"])
+async def test_unadmitted_native_cancellation_has_one_stable_terminal_observation(kind):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    original = asyncio.CancelledError("unadmitted native original cancellation")
+    if kind in {"sdk", "audit"}:
+        original.__cause__ = (ResourceOutcomeUnknown("unadmitted original effect acknowledgement")
+            if kind == "sdk" else ToolAuditUnconfirmedError("unadmitted original audit acknowledgement"))
+    async def source():
+        raise original
+    if kind == "cancelled-future":
+        task = asyncio.get_running_loop().create_future()
+        task.cancel("unadmitted native Future cancellation")
+    else:
+        task = asyncio.create_task(source())
+    first = await await_owned_task(task)
+    if kind != "cancelled-future":
+        assert first.error is original
+    original_graph = tuple(_explicit_control_chain(first.error))
+    for _ in range(3):
+        again = await await_owned_task(task)
+        assert again.error is first.error, "Repeated native observation manufactured another cancellation"
+        assert owned_task_error(task) is first.error
+        assert tuple(_explicit_control_chain(first.error)) == original_graph
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit", "plain"])
+async def test_private_cancellation_is_bound_to_its_original_admission_and_carrier(kind):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import cancel_owned_task, is_owned_task_cancellation
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, execution_observation_error
+    entered = asyncio.Event()
+    async def source():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as error:
+            if kind is not None:
+                error.__cause__ = (ResourceOutcomeUnknown("original requested cancellation retains effect uncertainty")
+                    if kind == "sdk" else ToolAuditUnconfirmedError("original requested cancellation retains audit uncertainty")
+                    if kind == "audit" else RuntimeError("independent explicit source failure"))
+            raise
+    owner = create_owned_task(source(), retain_originals=True)
+    await entered.wait()
+    assert cancel_owned_task(owner)
+    outcome = await await_owned_task(owner)
+    assert is_owned_task_cancellation(owner, outcome.error) is (kind is None)
+    assert not is_owned_task_cancellation(asyncio.current_task(), outcome.error)
+    assert not is_owned_task_cancellation(owner, asyncio.CancelledError("independent cancellation")), (
+        "Independent cancellation became an authenticated original private Stop")
+    assert (await await_owned_task(owner)).error is outcome.error
+    if kind is None:
+        combined = execution_observation_error(outcome.error,
+            asyncio.CancelledError("independent original cancellation"), prefer_cancellation=True)
+        assert not is_owned_task_cancellation(owner, combined), (
+            "Combined original evidence became an authenticated private Stop")
+
+
+def test_native_cancellation_helpers_reject_invalid_input():
+    from kestrel_sovereign._async_ownership import cancel_owned_task, owned_task_completion_error
+    with pytest.raises(TypeError, match="original native Task"):
+        cancel_owned_task(object())
+    with pytest.raises(TypeError, match="requires BaseException or None"):
+        owned_task_completion_error(object(), object())
+
+
+@pytest.mark.asyncio
+async def test_native_cancellation_recovery_never_uses_exception_truthiness():
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import owned_task_completion_error
+    class FalsyCancellation(asyncio.CancelledError):
+        def __bool__(self):
+            return False
+    original = FalsyCancellation("original native cancellation with false truth value")
+    original.__cause__ = ResourceOutcomeUnknown("original acknowledgement remains uncertain")
+    async def source():
+        raise original
+    owner = create_owned_task(source(), retain_originals=True)
+    try:
+        await owner
+    except asyncio.CancelledError as received:
+        assert owned_task_completion_error(owner, received) is original, (
+            "Native cancellation recovery replaced an original because its truth value was false")
+    else:
+        pytest.fail("Original native cancellation disappeared")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdraw_during_restoration", [False, True])
+async def test_native_cancellation_recovery_preserves_actual_writer_restoration_withdrawal(
+    tmp_path, withdraw_during_restoration,
+):
+    from kestrel_sovereign._async_ownership import owned_native_wait, owned_task_completion_error, owned_task_error
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, _explicit_control_chain
+    from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
+    lock = ReentrantTransitionLock()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = asyncio.CancelledError("original source failed while descendant owns writer")
+    original.__cause__ = ExecutionCommitOutcomeError("unknown")
+    original_graph = tuple(_explicit_control_chain(original))
+    token = object()
+    tasks, received_errors = [], []
+    effect = tmp_path / "actual-descendant-writer-effect"
+    async def writer():
+        async with lock:
+            entered.set()
+            await release.wait()
+            effect.write_text("original writer completed once")
+    async def child():
+        tasks.append(create_owned_task(writer(), retain_originals=True))
+        await entered.wait()
+        raise original
+    async def parent():
+        async with lock.policy_span():
+            async with lock:
+                source = create_owned_task(child(), retain_originals=True)
+                tasks.append(source)
+                try:
+                    async with owned_native_wait((source,)):
+                        await source
+                except asyncio.CancelledError as received:
+                    received_errors.append(received)
+                    recovered = owned_task_completion_error(source, received)
+                    assert lock._writer is asyncio.current_task(), "Cancellation escaped before original writer restoration"
+                    return source, recovered
+                pytest.fail("Original native cancellation disappeared")
+    owner = asyncio.create_task(parent())
+    try:
+        async with asyncio.timeout(1):
+            while not (lock._parked and lock._parked[-1].restoring):
+                await asyncio.sleep(0)
+        assert not effect.exists() and not owner.done()
+        if withdraw_during_restoration:
+            owner.cancel(token)
+            await asyncio.sleep(0)
+            assert not owner.done(), "Restoration cancellation detached the actual descendant writer"
+        release.set()
+        source, recovered = await owner
+        assert owned_task_error(source) is original
+        assert original in tuple(_explicit_control_chain(recovered))
+        if withdraw_during_restoration:
+            actual = [error for error in _explicit_control_chain(received_errors[0])
+                if isinstance(error, asyncio.CancelledError) and len(error.args) == 1 and error.args[0] is token]
+            assert len(actual) == 1
+            assert actual[0] in tuple(_explicit_control_chain(recovered)), (
+                "Native cancellation recovery discarded actual writer-restoration withdrawal")
+        assert tuple(_explicit_control_chain(original)) == original_graph
+        assert effect.read_text() == "original writer completed once" and lock._writer is None
+        assert all(task.done() for task in tasks)
+    finally:
+        release.set()
+        await asyncio.gather(owner, *tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handling_error", [False, True])
+@pytest.mark.parametrize("mode", [
+    pytest.param("eager", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
+    pytest.param("eager-preconsumed", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
+    "prior-callback", "canonical-prior-callback",
+])
+@pytest.mark.parametrize("kind", [None, "plain", "sdk", "audit"])
+async def test_original_completion_capture_cannot_rely_on_callback_registration(tmp_path, mode, kind, handling_error):
+    import inspect
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_completion_error, owned_task_error
+    from kestrel_sovereign.execution_custody import (
+        ToolAuditUnconfirmedError, _explicit_control_chain, execution_cleanup_debts,
+        is_tool_execution_terminal_error,
+    )
+    original = asyncio.CancelledError("original outer completion before capture")
+    if kind in {"sdk", "audit"}:
+        original.__cause__ = (ResourceOutcomeUnknown("original outer effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original outer audit uncertain"))
+    effect = tmp_path / "original-outer-completion-effect"
+    bodies, consumed, owners = [], [], []
+    async def operation():
+        bodies.append(asyncio.current_task())
+        effect.write_text("original physical effect completed once")
+        if kind is not None:
+            raise original
+        return "original outer success"
+    payload = operation()
+    admission = OwnedTaskAdmission()
+    caller_error = RuntimeError("unrelated caller exception during original admission")
+    def admit():
+        return create_owned_task(payload, admission=admission, retain_originals=True)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def consume(task):
+        if mode == "canonical-prior-callback":
+            task._kestrel_owned_terminal_error = None
+        try:
+            task.exception()
+        except asyncio.CancelledError as error:
+            consumed.append(error)
+    def factory(loop, coroutine, **options):
+        if mode == "canonical-prior-callback":
+            task = asyncio.Task(coroutine, loop=loop, **options)
+            owners.append(task)
+            task.add_done_callback(consume)
+            return task
+        async def outer():
+            if mode == "prior-callback":
+                await asyncio.sleep(0)
+            coroutine.close()
+            effect.write_text("original physical effect completed once")
+            if kind is not None:
+                raise original
+            return "original outer success"
+        if mode.startswith("eager"):
+            options["eager_start"] = True
+        task = asyncio.Task(outer(), loop=loop, **options)
+        owners.append(task)
+        if mode == "prior-callback":
+            task.add_done_callback(consume)
+        elif mode == "eager-preconsumed":
+            consume(task)
+        return task
+    try:
+        loop.set_task_factory(factory)
+        if handling_error:
+            try:
+                raise caller_error
+            except RuntimeError:
+                owner = admit()
+        else:
+            owner = admit()
+        loop.set_task_factory(previous)
+        try:
+            value = await owner
+        except asyncio.CancelledError as received:
+            recovered = owned_task_completion_error(owner, received)
+        else:
+            assert kind is None and value == "original outer success"
+            recovered = owned_task_error(owner)
+        if kind is None:
+            assert recovered is None
+        elif mode in {"eager", "canonical-prior-callback"}:
+            assert recovered is original, (
+                "Scheduled completion capture lost an already-terminal original before native await")
+            assert is_tool_execution_terminal_error(recovered) is (kind in {"sdk", "audit"})
+        else:
+            assert consumed and consumed[0] is original
+            assert is_tool_execution_terminal_error(recovered), (
+                "Registered completion callback falsely certified a consumed original cancellation")
+            assert any(task is owner for _, task in execution_cleanup_debts(recovered)), (
+                "Unobservable original completion lost its exact native owner debt")
+            assert original not in tuple(_explicit_control_chain(recovered)), "Lost original identity was fabricated"
+        assert owned_task_error(owner) is recovered
+        assert caller_error not in tuple(_explicit_control_chain(recovered))
+        assert (await await_owned_task(owner)).error is recovered
+        assert effect.read_text() == "original physical effect completed once"
+        assert len(bodies) == int(mode == "canonical-prior-callback")
+        assert len(owners) == 1 and owner.done()
+        assert inspect.getcoroutinestate(payload) == inspect.CORO_CLOSED
+    finally:
+        loop.set_task_factory(previous)
+        for owner in owners:
+            await await_owned_task(owner)
+        payload.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit"])
+@pytest.mark.parametrize("observer_fails", [False, True])
+async def test_native_completion_retains_independent_observer_io_failure(tmp_path, kind, observer_fails):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import owned_native_completion
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    source = RuntimeError("original native physical failure") if kind == "ordinary" else None
+    if kind in {"sdk", "audit"}:
+        source = asyncio.CancelledError("original native physical cancellation")
+        source.__cause__ = (ResourceOutcomeUnknown("original native effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original native audit uncertain"))
+    effect = tmp_path / "original-native-source-effect"
+    async def operation():
+        effect.write_text("original native source physically completed")
+        if source is not None:
+            raise source
+        return "original physical success"
+    owner = create_owned_task(operation(), retain_originals=True)
+    handle = (tmp_path / "actual-observer-receipt").open("w")
+    observer_errors = []
+    observed, value = None, None
+    try:
+        with owned_native_completion(owner):
+            try:
+                value = await owner
+            finally:
+                handle.close()
+                if observer_fails:
+                    try:
+                        handle.write("receipt after actual close")
+                    except ValueError as error:
+                        observer_errors.append(error)
+                        raise
+    except BaseException as error:
+        observed = error
+    finally:
+        handle.close()
+        await await_owned_task(owner)
+    chain = tuple(_explicit_control_chain(observed))
+    if source is not None:
+        assert source in chain
+    if observer_fails:
+        assert len(observer_errors) == 1 and observer_errors[0] in chain, (
+            "Original native completion erased independent observer I/O failure")
+    elif source is None:
+        assert observed is None and value == "original physical success"
+    assert owner.done() and handle.closed
+    assert effect.read_text() == "original native source physically completed"
+
+
+@pytest.mark.asyncio
+async def test_acquire_lock_keeping_cancellation_returns_every_cancellation_once_held():
+    """#4040: a closer cancelled while it waits for a lock still gets the
+    lock, and the cancellation is handed back rather than raised."""
+    lock = asyncio.Lock()
+    await lock.acquire()
+    acquiring = asyncio.create_task(acquire_lock_keeping_cancellation(lock))
+    try:
+        for _ in range(2):
+            while not lock._waiters:
+                await asyncio.sleep(0)
+            acquiring.cancel()
+            await asyncio.sleep(0)
+            assert not acquiring.done()
+    finally:
+        lock.release()
+    cancellation = await asyncio.wait_for(acquiring, 5)
+    assert isinstance(cancellation, asyncio.CancelledError)
+    assert lock.locked(), "the waiter does not hold the lock it was granted"
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_acquire_lock_keeping_cancellation_without_cancellation_returns_none():
+    lock = asyncio.Lock()
+    assert await acquire_lock_keeping_cancellation(lock) is None
+    assert lock.locked()
+    lock.release()

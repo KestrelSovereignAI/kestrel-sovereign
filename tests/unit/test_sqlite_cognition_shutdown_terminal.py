@@ -268,3 +268,50 @@ async def test_original_sqlite_retry_ack_excludes_local_and_fresh_claims(
             if competing is not None:
                 await await_owned_task(competing)
             await sibling.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_api", ["driver", "sql"])
+async def test_original_sqlite_ack_helper_holds_the_actual_committed_worker(
+    tmp_path, monkeypatch, commit_api,
+):
+    """Select a physical COMMIT, independently of its Python entry point."""
+    import aiosqlite
+
+    path = tmp_path / "original-commit.db"
+    async with aiosqlite.connect(path) as connection:
+        await connection.execute("CREATE TABLE original_effect (id INTEGER PRIMARY KEY)")
+        await connection.commit()
+        await connection.execute("INSERT INTO original_effect VALUES (1)")
+
+        async def commit():
+            if commit_api == "driver":
+                await connection.commit()
+            else:
+                async with connection.execute("COMMIT"):
+                    pass
+
+        with hold_original_sqlite_commit_ack(
+            monkeypatch, lambda native, *_: native is connection,
+        ) as acknowledgement:
+            operation = asyncio.create_task(commit())
+            observed = asyncio.create_task(acknowledgement.entered.wait())
+            try:
+                await asyncio.wait((operation, observed), timeout=5,
+                    return_when=asyncio.FIRST_COMPLETED)
+                assert acknowledgement.entered.is_set(), (
+                    "the selected original SQLite COMMIT acknowledgement was not observed"
+                )
+                assert not operation.done(), "the original COMMIT receipt escaped its hold"
+                async with aiosqlite.connect(path) as reader:
+                    async with reader.execute("SELECT id FROM original_effect") as cursor:
+                        assert await cursor.fetchall() == [(1,)], (
+                            "the helper held SQL before COMMIT instead of its successful ACK"
+                        )
+            finally:
+                acknowledgement.release.set()
+                try:
+                    await operation
+                finally:
+                    observed.cancel()
+                    await asyncio.gather(observed, return_exceptions=True)

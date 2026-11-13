@@ -126,7 +126,7 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
                 task = feature._track_owned_runtime_task(effect(), name="native-bounded-receipt")
             else:
                 task = manager._track_execution_task(
-                    effect(), task_id=str(index), authority_agent_id=agent.did,
+                    effect, task_id=str(index), authority_agent_id=agent.did,
                 )
             task.add_done_callback(lambda done: completed.set())
             await asyncio.wait_for(completed.wait(), 5)
@@ -225,8 +225,9 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
         target_key = (stage, id(resource))
 
     original_wait = asyncio.wait
+    from tests.shared.owned_task_observation import observe_bounded_asyncio_wait
 
-    async def wait_after_native_setup(tasks, *, timeout):
+    async def wait_after_native_setup(tasks, timeout):
         if timeout == 0.02 and any(
             task is vars(service).get("_llm_close_tasks", {}).get(target_key)
             for task in tasks
@@ -243,10 +244,9 @@ async def test_llm_bounded_handoff_retains_late_native_control_and_later_cleanup
                 # earlier pending timeout is not evidence about a later error.
                 retry_entered.set()
                 await retry_release.wait()
-        return await original_wait(tasks, timeout=timeout)
 
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.02)
-    monkeypatch.setattr(asyncio, "wait", wait_after_native_setup)
+    observe_bounded_asyncio_wait(monkeypatch, wait_after_native_setup)
     try:
         first_close = asyncio.create_task(service.close())
         if interrupt:

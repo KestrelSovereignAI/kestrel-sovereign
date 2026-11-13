@@ -17,7 +17,7 @@ native_pg = _native_pg
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
 @pytest.mark.parametrize("source_cancel", [False, True])
-@pytest.mark.parametrize("target", ["snapshot", "stop", "storage"])
+@pytest.mark.parametrize("target", ["owed-record", "stop", "storage"])
 @pytest.mark.parametrize("eager", [False, True])
 async def test_tail_original_admission_keeps_debt_and_independent_physical_cleanup(
     native_pg, tmp_path, monkeypatch, mode, source_cancel, target, eager,
@@ -33,7 +33,8 @@ async def test_tail_original_admission_keeps_debt_and_independent_physical_clean
     class Sync:
         is_running = True
 
-        async def force_snapshot(self):
+        # The tail records the snapshot as owed rather than uploading (#4028).
+        async def record_remote_snapshot_owed(self):
             await effects.execute("INSERT INTO effects VALUES (351)")
 
         async def stop(self):
@@ -48,8 +49,8 @@ async def test_tail_original_admission_keeps_debt_and_independent_physical_clean
         code, frame = getattr(operation, "cr_code", None), getattr(operation, "cr_frame", None)
         if code is None or frame is None:
             return False
-        if target == "snapshot":
-            return code is Sync.force_snapshot.__code__
+        if target == "owed-record":
+            return code is Sync.record_remote_snapshot_owed.__code__
         return code.co_qualname == "ResourceCustody.release" and frame.f_locals.get("name") == ("sync_service" if target == "stop" else "storage")
 
     fault = NativeAdmissionFault(selected, source.error, mode, eager=eager)
@@ -62,7 +63,7 @@ async def test_tail_original_admission_keeps_debt_and_independent_physical_clean
         resource = agent.storage if target == "storage" else sync
         assert any(value is resource and task is fault.task for value, task in execution_cleanup_debts(result.error))
         ids = [row[0] for row in await effects.fetch_all("SELECT id FROM effects ORDER BY id")]
-        assert ids == ([352] if target == "snapshot" else [351] if target == "stop" else [351, 352])
+        assert ids == ([352] if target == "owed-record" else [351] if target == "stop" else [351, 352])
         assert (db.backend._connection is connection and worker.is_alive()) if target == "storage" else (db.backend._connection is None and not worker.is_alive())
         assert not agent._runtime_publication_ready.is_set(), "partial fixture is not Agent READY acceptance"
     finally:

@@ -5,6 +5,7 @@ Tool activity now rides the same in-band sentinel channel as REVISE/THINK
 tests pin the builder, the single-pass strip+extract parser (with position),
 and the strip helpers used by the persist + TTS paths.
 """
+from tests.utils.native_streaming import streaming_agent
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,7 +24,6 @@ from kestrel_sovereign.agent.streaming import (
     is_only_sentinels,
     TOOL_SENTINEL_PREFIX,
 )
-from tests.unit.test_streaming_typed_parts import _bind, _make_agent
 
 
 def test_build_tool_sentinel_shape():
@@ -165,13 +165,13 @@ def test_rebase_event_in_retracted_pre_tool_text_pins_to_start():
     assert events[0]["pos"] == 4
 
 
-async def _persist_multi_iteration_tool_turn(*, with_part=False, emoji=False):
+async def _persist_multi_iteration_tool_turn(native_tool_effect_agent, *, with_part=False, emoji=False):
     """Drive the orchestrated-tool persistence branch with position sentinels."""
     from kestrel_sdk.llm import ToolCallStarted
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     persisted = []
-    agent = _make_agent(persisted)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=persisted)
     pre_tool = "I need to inspect this."
     boundary = (
         "Only one permission is missing: administration: read.\n\n"
@@ -203,10 +203,8 @@ async def _persist_multi_iteration_tool_turn(*, with_part=False, emoji=False):
             yield build_part_sentinel({"type": "notice", "data": {"body": "same"}})
         yield tail
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = llm_stream
     agent._handle_orchestrator_response_streaming = orchestrator_stream
-    _bind(agent)
 
     async for _ in agent.process_input_streaming("inspect", session_id="multi"):
         pass
@@ -217,9 +215,9 @@ async def _persist_multi_iteration_tool_turn(*, with_part=False, emoji=False):
 
 
 @pytest.mark.asyncio
-async def test_tool_positions_without_parts_index_persisted_post_tool_content():
+async def test_tool_positions_without_parts_index_persisted_post_tool_content(native_tool_effect_agent):
     """Non-empty retracted prose must not drift card offsets on persistence."""
-    assistant, boundary = await _persist_multi_iteration_tool_turn()
+    assistant, boundary = await _persist_multi_iteration_tool_turn(native_tool_effect_agent, )
     events = assistant["metadata"]["tool_events"]
 
     assert assistant["content"] == boundary + "The header names it directly."
@@ -231,9 +229,9 @@ async def test_tool_positions_without_parts_index_persisted_post_tool_content():
 
 
 @pytest.mark.asyncio
-async def test_tool_positions_are_identical_with_and_without_component_parts():
-    without_parts, _ = await _persist_multi_iteration_tool_turn(with_part=False)
-    with_parts, _ = await _persist_multi_iteration_tool_turn(with_part=True)
+async def test_tool_positions_are_identical_with_and_without_component_parts(native_tool_effect_agent):
+    without_parts, _ = await _persist_multi_iteration_tool_turn(native_tool_effect_agent, with_part=False)
+    with_parts, _ = await _persist_multi_iteration_tool_turn(native_tool_effect_agent, with_part=True)
 
     assert [e["pos"] for e in without_parts["metadata"]["tool_events"]] == [
         e["pos"] for e in with_parts["metadata"]["tool_events"]
@@ -241,8 +239,8 @@ async def test_tool_positions_are_identical_with_and_without_component_parts():
 
 
 @pytest.mark.asyncio
-async def test_tool_positions_use_utf16_without_component_parts():
-    assistant, boundary = await _persist_multi_iteration_tool_turn(emoji=True)
+async def test_tool_positions_use_utf16_without_component_parts(native_tool_effect_agent):
+    assistant, boundary = await _persist_multi_iteration_tool_turn(native_tool_effect_agent, emoji=True)
 
     expected = len(boundary.encode("utf-16-le")) // 2
     assert [e["pos"] for e in assistant["metadata"]["tool_events"]] == [
@@ -252,13 +250,13 @@ async def test_tool_positions_use_utf16_without_component_parts():
 
 
 @pytest.mark.asyncio
-async def test_inline_executed_tool_positions_rebase_without_component_parts():
+async def test_inline_executed_tool_positions_rebase_without_component_parts(native_tool_effect_agent):
     """Codex inline execution removes ``inline_pre_len`` from card offsets."""
     from kestrel_sdk.llm import ToolCallStarted
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     persisted = []
-    agent = _make_agent(persisted)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=persisted)
     agent.observability_store.log_tool_dispatch = AsyncMock()
     agent._make_inline_tool_executor = MagicMock(return_value=None)
     agent._visible_features_by_tool_name = MagicMock(return_value={})
@@ -284,9 +282,7 @@ async def test_inline_executed_tool_positions_rebase_without_component_parts():
         ]
         yield response
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = stream
-    _bind(agent)
 
     async for _ in agent.process_input_streaming("inspect", session_id="inline"):
         pass
@@ -301,12 +297,12 @@ async def test_inline_executed_tool_positions_rebase_without_component_parts():
 
 
 @pytest.mark.asyncio
-async def test_codex_native_tool_positions_use_utf16_without_component_parts():
+async def test_codex_native_tool_positions_use_utf16_without_component_parts(native_tool_effect_agent):
     """The no-tool-call branch still converts native sentinel offsets."""
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     persisted = []
-    agent = _make_agent(persisted)
+    agent = await streaming_agent(native_tool_effect_agent, persisted=persisted)
     boundary = "🐢 Native result.\n\n"
 
     async def stream(**kwargs):
@@ -316,9 +312,7 @@ async def test_codex_native_tool_positions_use_utf16_without_component_parts():
         yield "Details follow."
         yield LLMResponse(content="", tool_calls=[])
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = stream
-    _bind(agent)
 
     async for _ in agent.process_input_streaming("search", session_id="native"):
         pass
@@ -338,3 +332,51 @@ class _M:
         self.name = name
         self.index = index
         self.id = id
+
+
+def test_input_checkpoint_retains_observed_order_and_anchors_missing_callback_events():
+    from kestrel_sovereign.agent.parts import build_part_sentinel
+    from kestrel_sovereign.agent.streaming import (
+        _build_tool_sentinel, _input_checkpoint_metadata, _parse_stream_sentinels,
+        _inline_tool_events, _stamp_tool_event_positions,
+    )
+    wire = ('unfinished' + build_part_sentinel({'type': 'notice', 'data': 'before'})
+        + _build_tool_sentinel('done', 'first')
+        + build_part_sentinel({'type': 'notice', 'data': 'between'})
+        + _build_tool_sentinel('start', 'second'))
+    events = _inline_tool_events([{'name': 'first'}, {'name': 'second'}])
+    rebased = ''.join(_input_checkpoint_metadata(wire, events))
+    text, tools, components = _parse_stream_sentinels(rebased)
+    assert text == ''
+    _stamp_tool_event_positions(events, tools)
+    assert [event['seq'] for event in events] == [1, 2, 4, 5]
+    assert [part['seq'] for part in components] == [0, 3]
+    assert all(part['pos'] == 0 for part in tools + components)
+    assert [part['data'] for part in components] == ['before', 'between']
+
+
+def test_input_checkpoint_matches_repeated_tool_names_without_reordering_observed_frames():
+    from kestrel_sovereign.agent.parts import build_part_sentinel
+    from kestrel_sovereign.agent.streaming import (
+        _build_tool_sentinel, _input_checkpoint_metadata, _parse_stream_sentinels,
+        _inline_tool_events, _stamp_tool_event_positions,
+    )
+    wire = (_build_tool_sentinel('start', 'same') + _build_tool_sentinel('done', 'same')
+        + build_part_sentinel({'type': 'notice', 'data': 'between'})
+        + _build_tool_sentinel('done', 'same'))
+    events = _inline_tool_events([{'name': 'same'}, {'name': 'same'}])
+    text, tools, components = _parse_stream_sentinels(''.join(_input_checkpoint_metadata(wire, events)))
+    assert text == ''
+    _stamp_tool_event_positions(events, tools)
+    assert [event['seq'] for event in events] == [0, 1, 3, 4]
+    assert components[0]['seq'] == 2
+
+
+def test_input_checkpoint_rejects_oversized_component_metadata():
+    import json
+    import pytest
+    from kestrel_sovereign.agent.parts import MAX_PART_PAYLOAD_BYTES, PART_SENTINEL_PREFIX
+    from kestrel_sovereign.agent.streaming import _input_checkpoint_metadata
+    wire = PART_SENTINEL_PREFIX + json.dumps({'type': 'notice', 'data': 'x' * MAX_PART_PAYLOAD_BYTES}) + '\x1e'
+    with pytest.raises(ValueError, match='invalid component metadata'):
+        _input_checkpoint_metadata(wire, [])

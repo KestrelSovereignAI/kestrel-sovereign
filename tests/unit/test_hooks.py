@@ -1417,5 +1417,60 @@ class TestSnapshotEnforcementOverrides:
 
 # === Run tests ===
 
+@pytest.mark.parametrize("source", ["threaded", "updated"])
+def test_decided_binding_does_not_borrow_nested_hook_values(source):
+    from kestrel_sovereign.hooks.decision_gate import decided_tool_input
+
+    payload = {"items": [{"marker": "approved"}]}
+    hook_input = HookInput(session_id="owned-binding",
+        hook_event_name=HookEvent.PRE_TOOL_USE.value, tool_name="owned-tool",
+        tool_input=payload)
+    output = HookOutput.modify(payload) if source == "updated" else HookOutput.allow()
+    approved = decided_tool_input(hook_input, output)
+    payload["items"][0]["marker"] = "late mutation"
+    assert approved == {"items": [{"marker": "approved"}]}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", [None, PermissionDecision.ALLOW])
+async def test_hook_chain_preserves_stop_before_any_following_hook(tmp_path, decision):
+    from kestrel_sovereign.hooks.decision_gate import decided_tool_input, evaluate_blocking_decision
+    from kestrel_sovereign.hooks.manager import deciding_hook
+
+    stop = HookOutput(continue_execution=False, permission_decision=decision,
+                      stop_reason="Owned chain stopped")
+    witness = tmp_path / "unexpected-following-hook.txt"
+
+    class OutputHook(Hook):
+        def __init__(self, name, output, priority):
+            super().__init__(name, events=[HookEvent.PRE_TOOL_USE], priority=priority)
+            self.output = output
+        async def execute(self, input):
+            return self.output
+
+    class FollowingHook(Hook):
+        def __init__(self):
+            super().__init__("following", events=[HookEvent.PRE_TOOL_USE], priority=40)
+        async def execute(self, input):
+            witness.write_text("unexpected-following-hook", encoding="utf-8")
+            return HookOutput.allow()
+
+    manager = HooksManager()
+    manager.register(OutputHook("warning", HookOutput.warn("Owned warning", "critical"), 10))
+    manager.register(OutputHook("redact", HookOutput.modify({"value": "redacted"}), 20))
+    manager.register(OutputHook("stop", stop, 30))
+    manager.register(FollowingHook())
+    input = HookInput(session_id="owned-stop", hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                      tool_name="owned-tool", tool_input={"value": "private"})
+    result = await manager.execute_hooks(HookEvent.PRE_TOOL_USE, input)
+    assert not witness.exists(), "The hook chain continued after an explicit stop"
+    assert result is stop
+    assert result.continue_execution is False and result.stop_reason == "Owned chain stopped"
+    assert result.warning_message == "Owned warning" and result.warning_severity == "critical"
+    assert deciding_hook(result) == "stop"
+    assert evaluate_blocking_decision(result) is not None
+    assert decided_tool_input(input, result) == {"value": "redacted"}

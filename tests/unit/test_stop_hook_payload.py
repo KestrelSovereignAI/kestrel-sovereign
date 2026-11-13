@@ -21,19 +21,16 @@ non-streaming paths.
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
+from tests.utils.native_streaming import streaming_agent
+from tests.utils.native_tool_effects import drive_native
+from tests.unit.test_orchestrator_engine import _base_agent
 
 
-@asynccontextmanager
-async def _passthrough():
-    """Stand-in for the privacy-transition-lock and turn-lifecycle context
-    managers. The hook-payload tests don't depend on their semantics."""
-    yield
 
 
 def _record_stop_hook_input(captured: list):
@@ -46,87 +43,29 @@ def _record_stop_hook_input(captured: list):
     return _capture
 
 
-def _build_streaming_mock_agent(*, stop_captured: list, hooks_present: bool = True):
-    """Build a MagicMock agent wired up to run process_input_streaming with
-    the real StreamingMixin methods bound. Captures any STOP HookInput
-    fired via execute_hooks_parallel into ``stop_captured``."""
-    from kestrel_sovereign.agent.streaming import StreamingMixin
-
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock()
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
-    agent.features = {}
-    agent.did = "did:test:streaming"
-    agent.extension = None
-    agent._cached_features_prompt = ""
-    agent.is_request_cancelled = MagicMock(return_value=False)
-    agent._maybe_audit = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent._get_governing_constitution = AsyncMock(return_value="")
-    agent.check_solvency = AsyncMock(return_value="test-model")
-    agent._build_all_tools = MagicMock(return_value=[])
-    agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
-    agent.user_prompt_template = MagicMock()
-    agent.user_prompt_template.format.return_value = "rendered"
-    agent.operator_signal_producer = None
-
-    ctx = MagicMock()
-    ctx.system_prompt = "system"
-    ctx.dynamic_user_context = ""
-    ctx.messages = []
-    agent.context_manager = MagicMock()
-    agent.context_manager.build_context = AsyncMock(return_value=ctx)
-
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-
+async def _build_streaming_mock_agent(native_tool_effect_agent, *, stop_captured, hooks_present=True):
+    agent = await streaming_agent(native_tool_effect_agent)
     if hooks_present:
-        hooks_manager = MagicMock()
-        # USER_PROMPT_SUBMIT and POST_RESPONSE both go through ``execute_hooks``;
-        # return a benign output so the streaming pipeline doesn't choke. We
-        # only care about STOP, which goes through ``execute_hooks_parallel``.
-        from kestrel_sdk.hooks.base import HookOutput
-        benign_output = HookOutput()
-        hooks_manager.execute_hooks = AsyncMock(return_value=benign_output)
-        hooks_manager.get_enabled_hooks = MagicMock(return_value=[])
-        hooks_manager.execute_hooks_parallel = AsyncMock(
+        agent.hooks_manager.execute_hooks_parallel = AsyncMock(
             side_effect=_record_stop_hook_input(stop_captured)
         )
-        agent.hooks_manager = hooks_manager
     else:
         agent.hooks_manager = None
-
-    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(agent)
-    agent._process_input_streaming_traced_locked = (
-        StreamingMixin._process_input_streaming_traced_locked.__get__(agent)
-    )
-    agent._persist_assistant_turn_safely = (
-        StreamingMixin._persist_assistant_turn_safely.__get__(agent)
-    )
     return agent
 
 
+
 @pytest.mark.asyncio
-async def test_streaming_stop_hook_carries_user_message_and_response_text_no_tools():
+async def test_streaming_stop_hook_carries_user_message_and_response_text_no_tools(native_tool_effect_agent):
     """Plain text turn (no tool calls) — STOP HookInput must carry user
     message + response text, with tool_calls/tool_results None."""
     captured: list[HookInput] = []
-    agent = _build_streaming_mock_agent(stop_captured=captured)
+    agent = await _build_streaming_mock_agent(native_tool_effect_agent, stop_captured=captured)
 
     async def _stream_no_tools(**kwargs):
         for piece in ["Hello ", "world."]:
             yield piece
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = _stream_no_tools
 
     user_msg = "What's the weather like?"
@@ -145,7 +84,7 @@ async def test_streaming_stop_hook_carries_user_message_and_response_text_no_too
 
 
 @pytest.mark.asyncio
-async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fired():
+async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fired(native_tool_effect_agent):
     """Tool-using turn — STOP HookInput must carry the tool_calls the LLM
     emitted and the tool_results envelopes the dispatcher gathered, so a
     per-turn subscriber sees the complete shape of the turn."""
@@ -153,7 +92,7 @@ async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fir
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     captured: list[HookInput] = []
-    agent = _build_streaming_mock_agent(stop_captured=captured)
+    agent = await _build_streaming_mock_agent(native_tool_effect_agent, stop_captured=captured)
 
     async def _stream_with_tool(**kwargs):
         yield "Looking that up. "
@@ -164,7 +103,6 @@ async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fir
             ],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = _stream_with_tool
 
     # The orchestrator-streaming generator's signature accepts
@@ -213,7 +151,7 @@ async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fir
 
 
 @pytest.mark.asyncio
-async def test_streaming_stop_hook_captures_chained_tool_iterations():
+async def test_streaming_stop_hook_captures_chained_tool_iterations(native_tool_effect_agent):
     """Multi-iteration tool flow (model calls A, sees result, calls B)
     must produce a STOP payload where tool_calls and tool_results line up
     by index across all iterations — not just the first. Without this,
@@ -223,7 +161,7 @@ async def test_streaming_stop_hook_captures_chained_tool_iterations():
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     captured: list[HookInput] = []
-    agent = _build_streaming_mock_agent(stop_captured=captured)
+    agent = await _build_streaming_mock_agent(native_tool_effect_agent, stop_captured=captured)
 
     async def _stream_with_initial_tool(**kwargs):
         yield "Step one. "
@@ -232,7 +170,6 @@ async def test_streaming_stop_hook_captures_chained_tool_iterations():
             tool_calls=[ToolCall(id="tc-A", name="lookup_a", arguments={"q": "first"})],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = _stream_with_initial_tool
 
     # Orchestrator stream simulates the second iteration: after lookup_a
@@ -272,7 +209,7 @@ async def test_streaming_stop_hook_captures_chained_tool_iterations():
 
 
 @pytest.mark.asyncio
-async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatch():
+async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatch(native_tool_effect_agent):
     """Cancellation edge: when streaming is stopped after the initial LLM
     emitted tool_calls but BEFORE any result envelope is appended, the
     STOP payload must still carry tool_calls (from the LLM's initial
@@ -284,7 +221,7 @@ async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatc
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     captured: list[HookInput] = []
-    agent = _build_streaming_mock_agent(stop_captured=captured)
+    agent = await _build_streaming_mock_agent(native_tool_effect_agent, stop_captured=captured)
 
     async def _stream_with_tool(**kwargs):
         yield "About to call. "
@@ -295,7 +232,6 @@ async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatc
             ],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = _stream_with_tool
 
     # Orchestrator stream: simulates immediate cancellation — never appends
@@ -323,16 +259,15 @@ async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatc
 
 
 @pytest.mark.asyncio
-async def test_streaming_stop_hook_skipped_when_no_hooks_manager():
+async def test_streaming_stop_hook_skipped_when_no_hooks_manager(native_tool_effect_agent):
     """If the agent has no hooks_manager, the STOP block is a no-op —
     no AttributeError. Pure regression guard."""
     captured: list[HookInput] = []
-    agent = _build_streaming_mock_agent(stop_captured=captured, hooks_present=False)
+    agent = await _build_streaming_mock_agent(native_tool_effect_agent, stop_captured=captured, hooks_present=False)
 
     async def _stream(**kwargs):
         yield "done"
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = _stream
 
     yielded = []
@@ -349,7 +284,7 @@ async def test_streaming_stop_hook_skipped_when_no_hooks_manager():
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_response_accepts_tool_results_out_param():
+async def test_orchestrator_response_accepts_tool_results_out_param(native_tool_effect_agent):
     """``_handle_orchestrator_response`` mirrors the streaming sibling's
     ``tool_results`` plumbing — the caller passes a list, the dispatcher
     appends each envelope. Verifies the new param threads to
@@ -357,8 +292,7 @@ async def test_orchestrator_response_accepts_tool_results_out_param():
     from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = MagicMock()
-    agent.llm_service = MagicMock()
+    agent = await _base_agent(native_tool_effect_agent)
     agent.llm_service.generate_with_messages = AsyncMock(
         return_value=LLMResponse(content="done", tool_calls=None)
     )
@@ -397,7 +331,7 @@ async def test_orchestrator_response_accepts_tool_results_out_param():
         content="",
         tool_calls=[ToolCall(id="tc-1", name="lookup", arguments={})],
     )
-    result = await handler(
+    result = await drive_native(agent, lambda: handler(
         response=initial,
         feature_tools=[],
         system_prompt="sys",
@@ -406,7 +340,7 @@ async def test_orchestrator_response_accepts_tool_results_out_param():
         user_message="hi",
         session_id="s-non",
         tool_results=caller_tool_results,
-    )
+    ))
 
     assert result == "done"
     # The batch was called exactly once, and the caller's tool_results list

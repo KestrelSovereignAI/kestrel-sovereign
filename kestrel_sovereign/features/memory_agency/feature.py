@@ -805,6 +805,9 @@ class MemoryAgencyFeature(Feature):
                 confidence=clamped_confidence,
                 confidence_requested=confidence_val,
                 invocation_id=ensure_invocation_id(current_invocation_id()),
+                # From the turn lifecycle, never a tool argument, so the
+                # fact's source names the session it was taught in (#3875).
+                session_id=self._turn_session_id(),
             )
         except (
             FactLifecycleError,

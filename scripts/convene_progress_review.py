@@ -134,7 +134,7 @@ def build_progress_review_evidence() -> Evidence:
             "Emma Genesis conditions from previous council not all verified",
         ],
         architecture_docs=[
-            "CLAUDE.md - Agent instructions",
+            "AGENTS.md - Agent instructions",
             "council_config.toml - Council configuration",
             "kestrel_sovereign/features/ - discovered feature module inventory (see KESTREL_FEATURES.md)",
         ],

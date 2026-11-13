@@ -26,6 +26,13 @@ default read timeout alone is 600s, and generation is retried up to 5 times), so
 a hard acquire deadline would cancel healthy work. A blocked hold that crosses
 the escalation threshold emits ERROR once and appears in authenticated detailed
 health; the goal is that the next stall is legible without a manual bisect.
+
+A report says who holds a lock, not what it is blocked on. A turn parked before
+its first LLM call held an agent's CONVERSATION lock for 17 hours with nothing
+in the log saying where it was waiting (#4001). So once a hold outlasts
+``HOLD_AWAIT_CHAIN_SECONDS``, and again when it escalates, the report carries
+the holding task's await chain: every suspended frame, followed into the tasks
+it awaits, down to the future it is parked on.
 """
 
 from __future__ import annotations
@@ -33,12 +40,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import Context, ContextVar
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Iterable, Optional
+from typing import AsyncIterator, Iterable, Iterator, Optional
 
 from kestrel_sdk.signals import ResourceLock
+
+from kestrel_sovereign.await_chain import format_await_chain
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +56,22 @@ _delegated_lock_ownership: ContextVar[dict[int, frozenset[object]]] = ContextVar
     "kestrel_delegated_lock_ownership",
     default={},
 )
+
+
+@contextmanager
+def without_delegated_lock_ownership() -> Iterator[None]:
+    """Create Tasks that hold none of their creator's delegated locks (#4023).
+
+    A Task copies its creator's context, delegation included. Work started
+    here is its own unit: a COGNITION wake created inside a turn must queue
+    for CONVERSATION like any other turn, not be treated as a re-entry into
+    the hold of the turn that created it.
+    """
+    reset = _delegated_lock_ownership.set({})
+    try:
+        yield
+    finally:
+        _delegated_lock_ownership.reset(reset)
 
 
 # How long to wait before reporting, and then re-reporting, a contended
@@ -72,6 +97,13 @@ SLOW_HOLD_WARN_SECONDS = 60.0
 # emit one ERROR per hold and expose the same threshold to health reporting.
 BLOCKED_HOLD_ERROR_SECONDS = 60 * 60.0
 
+# A hold this long has been reported twice, so it is no longer a blip. The
+# first report at or past it, blocked or not, logs the holding task's await
+# chain, once per hold; the escalation logs it again, since a long stall may
+# have moved. Once, because a chain runs to dozens of lines and a stuck hold is
+# reported every ``SLOW_HOLD_WARN_SECONDS`` for as long as it lasts (#4001).
+HOLD_AWAIT_CHAIN_SECONDS = 2 * 60.0
+
 
 @dataclass(frozen=True)
 class LockHolder:
@@ -90,6 +122,15 @@ class LockHolder:
 
     def held_seconds(self) -> float:
         return time.monotonic() - self.acquired_at
+
+
+def _holder_await_chain(holder: LockHolder) -> str:
+    """Where the holding task is parked, as a suffix for its hold report."""
+    if holder.owner_task is None:
+        chain = "  (the holding task was not recorded)"
+    else:
+        chain = format_await_chain(holder.owner_task)
+    return f" The holder is parked at (outermost frame first):\n{chain}"
 
 
 def lock_sort_key(name: ResourceLock) -> tuple[int, str]:
@@ -267,42 +308,56 @@ class OrderedLockManager:
         so the count comes from the manager's own waiter bookkeeping.
         """
         escalated = False
+        chain_logged = False
         while True:
             await asyncio.sleep(SLOW_HOLD_WARN_SECONDS)
             holder = self._holders.get(name)
             if holder is None:
                 return
             waiting = self._waiters.get(name, 0)
-            if waiting:
-                held_seconds = holder.held_seconds()
-                if held_seconds >= BLOCKED_HOLD_ERROR_SECONDS and not escalated:
-                    logger.error(
-                        "%s has held the %s lock for %.0fs with %d acquirer(s) "
-                        "blocked behind it; the hold exceeded the %.0fs "
-                        "escalation threshold and is degrading readiness.",
-                        holder.label,
-                        name.value,
-                        held_seconds,
-                        waiting,
-                        BLOCKED_HOLD_ERROR_SECONDS,
-                    )
-                    escalated = True
-                else:
-                    logger.warning(
-                        "%s has held the %s lock for %.0fs with %d acquirer(s) "
-                        "blocked behind it.",
-                        holder.label,
-                        name.value,
-                        held_seconds,
-                        waiting,
-                    )
+            held_seconds = holder.held_seconds()
+            escalating = (
+                bool(waiting)
+                and held_seconds >= BLOCKED_HOLD_ERROR_SECONDS
+                and not escalated
+            )
+            chain = ""
+            if escalating or (
+                not chain_logged and held_seconds >= HOLD_AWAIT_CHAIN_SECONDS
+            ):
+                chain = _holder_await_chain(holder)
+                chain_logged = True
+            if escalating:
+                logger.error(
+                    "%s has held the %s lock for %.0fs with %d acquirer(s) "
+                    "blocked behind it; the hold exceeded the %.0fs "
+                    "escalation threshold and is degrading readiness.%s",
+                    holder.label,
+                    name.value,
+                    held_seconds,
+                    waiting,
+                    BLOCKED_HOLD_ERROR_SECONDS,
+                    chain,
+                )
+                escalated = True
+            elif waiting:
+                logger.warning(
+                    "%s has held the %s lock for %.0fs with %d acquirer(s) "
+                    "blocked behind it.%s",
+                    holder.label,
+                    name.value,
+                    held_seconds,
+                    waiting,
+                    chain,
+                )
             else:
                 logger.info(
                     "%s has held the %s lock for %.0fs (nothing is waiting on "
-                    "it).",
+                    "it).%s",
                     holder.label,
                     name.value,
-                    holder.held_seconds(),
+                    held_seconds,
+                    chain,
                 )
 
     def is_held(self, name: ResourceLock) -> bool:

@@ -16,7 +16,6 @@ from kestrel_sovereign.execution_custody import (
     execution_cleanup_debts,
     is_execution_control_error,
 )
-from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.storage import AsyncStorage
 from tests.integration.test_execution_authority_postgres import native_pg as _native_pg
 
@@ -65,7 +64,7 @@ async def test_wake_reply_reads_preserve_original_native_control(
                     scope.revoke("original message read admission retired")
                 with pytest.raises(Exception) as caught:
                     if door == "wake_readback":
-                        await KestrelAgent._stored_wake_reply_id(agent, signal_id)
+                        await storage.find_signal_wake_reply_id(signal_id)
                     else:
                         await get_message(request, message_id)
         finally:

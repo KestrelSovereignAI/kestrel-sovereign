@@ -35,12 +35,14 @@ from kestrel_sovereign.ui_contributions import compute_ui_manifest
 from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
 
 
-def _agent(tmp_path: Path) -> KestrelAgent:
-    agent = KestrelAgent(
-        did="did:test:sdk-contributions",
-        storage_path=str(tmp_path / "agent.db"),
-        llm_service=SimpleNamespace(),
-    )
+def _agent(tmp_path: Path, *, existing_agent=None) -> KestrelAgent:
+    agent = existing_agent
+    if agent is None:
+        agent = KestrelAgent(
+            did="did:test:sdk-contributions",
+            storage_path=str(tmp_path / "agent.db"),
+            llm_service=SimpleNamespace(),
+        )
     agent.task_manager = None
     agent.signal_registry = SourceRegistry()
     agent.wait_registry = WaitRegistry()
@@ -143,18 +145,13 @@ async def test_explicit_context_config_refresh_rerenders_without_recollecting(tm
 
 
 @pytest.mark.asyncio
-async def test_privacy_transition_republishes_all_active_context_clauses(tmp_path):
-    agent = _agent(tmp_path)
+async def test_privacy_transition_republishes_all_active_context_clauses(tmp_path, native_tool_effect_agent):
+    agent = _agent(tmp_path, existing_agent=await native_tool_effect_agent(did="did:test:sdk-contributions"))
     feature = SDKFixtureFeature(agent)
     await agent._register_feature(feature)
     runtime = agent.feature_contribution_runtime
 
     feature.context_text = "privacy-safe replacement"
-    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
-    agent.privacy_agent = SimpleNamespace(
-        set_mode=lambda _mode: "Privacy mode changed.",
-        privacy_config=None,
-    )
     agent._privacy_mode = PrivacyMode.NORMAL
     agent.features = {}
     agent.llm_service = None
@@ -167,8 +164,7 @@ async def test_privacy_transition_republishes_all_active_context_clauses(tmp_pat
 
 @pytest.mark.asyncio
 async def test_privacy_transition_awaits_context_preparation_before_rendering(
-    tmp_path,
-):
+    tmp_path, native_tool_effect_agent):
     """The new privacy policy is visible while async feature state reloads."""
 
     class PreparingFixture(SDKFixtureFeature):
@@ -184,16 +180,11 @@ async def test_privacy_transition_awaits_context_preparation_before_rendering(
             await self.allow_prepare.wait()
             self.context_text = "rehydrated after privacy resume"
 
-    agent = _agent(tmp_path)
+    agent = _agent(tmp_path, existing_agent=await native_tool_effect_agent(did="did:test:sdk-contributions"))
     feature = PreparingFixture(agent)
     await agent._register_feature(feature)
     runtime = agent.feature_contribution_runtime
     original = runtime.active_context_clauses()
-    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
-    agent.privacy_agent = SimpleNamespace(
-        set_mode=lambda _mode: "Privacy mode changed.",
-        privacy_config=None,
-    )
     agent._privacy_mode = PrivacyMode.NORMAL
     agent.features = {}
     agent.llm_service = None
@@ -253,8 +244,7 @@ async def test_context_preparation_failure_is_sanitized_before_registry_mutation
 
 @pytest.mark.asyncio
 async def test_context_preparation_cancellation_is_sanitized_and_fail_closed(
-    tmp_path, caplog
-):
+    tmp_path, caplog, native_tool_effect_agent):
     """A feature cannot forge cancellation text or preserve stale prompt bytes."""
 
     secret = "token=context-prepare-cancel-must-stay-private"
@@ -265,15 +255,10 @@ async def test_context_preparation_cancellation_is_sanitized_and_fail_closed(
         async def prepare_context_clause_refresh(self):
             raise asyncio.CancelledError(secret)
 
-    agent = _agent(tmp_path)
+    agent = _agent(tmp_path, existing_agent=await native_tool_effect_agent(did="did:test:sdk-contributions"))
     feature = CancellingPrepareFixture(agent)
     await agent._register_feature(feature)
     runtime = agent.feature_contribution_runtime
-    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
-    agent.privacy_agent = SimpleNamespace(
-        set_mode=lambda _mode: "Privacy mode changed.",
-        privacy_config=None,
-    )
     agent._privacy_mode = PrivacyMode.NORMAL
     agent.features = {}
     agent.llm_service = None
@@ -364,8 +349,7 @@ async def test_external_context_preparation_cancellation_propagates_sanitized(
 
 @pytest.mark.asyncio
 async def test_privacy_transition_cancellation_suppresses_context_and_latches_safe_mode(
-    tmp_path, caplog
-):
+    tmp_path, caplog, native_tool_effect_agent):
     secret = "privacy-transition-cancel-detail-must-not-survive"
 
     class BlockingPrepareFixture(SDKFixtureFeature):
@@ -380,15 +364,10 @@ async def test_privacy_transition_cancellation_suppresses_context_and_latches_sa
             self.prepare_started.set()
             await self.never.wait()
 
-    agent = _agent(tmp_path)
+    agent = _agent(tmp_path, existing_agent=await native_tool_effect_agent(did="did:test:sdk-contributions"))
     feature = BlockingPrepareFixture(agent)
     await agent._register_feature(feature)
     runtime = agent.feature_contribution_runtime
-    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
-    agent.privacy_agent = SimpleNamespace(
-        set_mode=lambda _mode: "Privacy mode changed.",
-        privacy_config=None,
-    )
     agent._privacy_mode = PrivacyMode.NORMAL
     agent.features = {}
     agent.llm_service = None
@@ -418,21 +397,16 @@ async def test_privacy_transition_cancellation_suppresses_context_and_latches_sa
 
 
 @pytest.mark.asyncio
-async def test_privacy_suppression_failure_latches_safe_mode(tmp_path):
+async def test_privacy_suppression_failure_latches_safe_mode(tmp_path, native_tool_effect_agent):
     """A privacy transition never resumes cognition over untrusted context."""
 
-    agent = _agent(tmp_path)
+    agent = _agent(tmp_path, existing_agent=await native_tool_effect_agent(did="did:test:sdk-contributions"))
     feature = SDKFixtureFeature(agent)
     await agent._register_feature(feature)
     runtime = agent.feature_contribution_runtime
     original = runtime.active_context_clauses()[0]
     foreign = replace(original, body="foreign privacy replacement")
     runtime.context_clause_registry._clauses[original.identity] = foreign
-    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
-    agent.privacy_agent = SimpleNamespace(
-        set_mode=lambda _mode: "Privacy mode changed.",
-        privacy_config=None,
-    )
     agent._privacy_mode = PrivacyMode.NORMAL
     agent.features = {}
     agent.llm_service = None

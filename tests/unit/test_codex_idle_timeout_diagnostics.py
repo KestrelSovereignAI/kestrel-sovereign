@@ -34,18 +34,18 @@ from kestrel_sovereign.llm.codex_app_server import (
 
 class TestRecentStderr:
     def test_returns_empty_when_no_stderr_captured(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._stderr_tail = []
         assert c.recent_stderr(10) == []
 
     def test_returns_tail_slice(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._stderr_tail = [f"line {i}" for i in range(20)]
         got = c.recent_stderr(5)
         assert got == ["line 15", "line 16", "line 17", "line 18", "line 19"]
 
     def test_n_larger_than_buffer_returns_all(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._stderr_tail = ["a", "b", "c"]
         assert c.recent_stderr(100) == ["a", "b", "c"]
 
@@ -85,12 +85,12 @@ class TestRecentCodexLog:
             conn.close()
 
     def test_returns_empty_when_codex_home_unset(self):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._codex_home = None
         assert c.recent_codex_log(30) == []
 
     def test_returns_empty_when_db_missing(self, tmp_path):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._codex_home = tmp_path  # no logs_2.sqlite in here
         assert c.recent_codex_log(30) == []
 
@@ -101,7 +101,7 @@ class TestRecentCodexLog:
             (2000, "WARN", "codex_app_server", "second event"),
             (3000, "ERROR", "codex_protocol", "third event"),
         ])
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._codex_home = tmp_path
         got = c.recent_codex_log(10)
         # Chronological order: oldest → newest
@@ -116,7 +116,7 @@ class TestRecentCodexLog:
         db_path = tmp_path / "logs_2.sqlite"
         rows = [(i, "INFO", "x", f"event {i}") for i in range(20)]
         self._make_db(db_path, rows)
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._codex_home = tmp_path
         got = c.recent_codex_log(3)
         assert len(got) == 3
@@ -128,7 +128,7 @@ class TestRecentCodexLog:
     def test_null_body_does_not_crash(self, tmp_path):
         db_path = tmp_path / "logs_2.sqlite"
         self._make_db(db_path, [(100, "INFO", "codex_core", None)])
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._codex_home = tmp_path
         got = c.recent_codex_log(10)
         assert len(got) == 1
@@ -138,7 +138,7 @@ class TestRecentCodexLog:
         # File exists but isn't a valid sqlite DB — must not raise.
         db_path = tmp_path / "logs_2.sqlite"
         db_path.write_bytes(b"this is not sqlite")
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._codex_home = tmp_path
         assert c.recent_codex_log(30) == []
 
@@ -146,7 +146,7 @@ class TestRecentCodexLog:
         db_path = tmp_path / "logs_2.sqlite"
         long_body = "x" * 1000
         self._make_db(db_path, [(1, "INFO", "t", long_body)])
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._codex_home = tmp_path
         got = c.recent_codex_log(1)
         assert len(got[0]) <= 500
@@ -167,7 +167,7 @@ class TestIterTurnEventsIdleTimeoutLogsTailsServerSide:
 
     @pytest.mark.asyncio
     async def test_idle_timeout_logs_stderr_tail_keeps_exception_clean(self, caplog):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._closed_error = None
         c._stderr_tail = ["websocket closed", "auth refresh failed"]
         c._codex_home = None  # skip log tail path
@@ -196,7 +196,7 @@ class TestIterTurnEventsIdleTimeoutLogsTailsServerSide:
         TestRecentCodexLog._make_db(db_path, [
             (1, "ERROR", "codex_protocol", "MARKER_FROM_CODEX_LOG"),
         ])
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._closed_error = None
         c._stderr_tail = []
         c._codex_home = tmp_path
@@ -218,7 +218,7 @@ class TestIterTurnEventsIdleTimeoutLogsTailsServerSide:
 
     @pytest.mark.asyncio
     async def test_idle_timeout_with_no_tails_emits_no_diagnostic_logs(self, caplog):
-        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c = CodexAppServerClient(binary="offline-codex-not-invoked")
         c._closed_error = None
         c._stderr_tail = []
         c._codex_home = None

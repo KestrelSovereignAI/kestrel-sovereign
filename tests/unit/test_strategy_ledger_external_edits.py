@@ -1004,6 +1004,63 @@ class TestCommit:
         assert not commit.refused and not commit.reloaded
         assert "p" in [r["pattern"] for r in ledger.patterns]
 
+    def test_a_value_admit_declines_is_written_nowhere(self, tmp_path):
+        """#3990: what must precede a write is done before anything reaches the file."""
+        ledger = self._ledger(tmp_path)
+        before = _ledger_path(tmp_path).read_bytes()
+        seen = []
+
+        def admit(entry) -> bool:
+            seen.append(entry["id"])
+            return False
+
+        commit = ledger.commit(lambda book: book.add_pattern("p"), admit=admit)
+
+        assert commit.unadmitted and commit.refused and not commit.persisted
+        assert commit.value["pattern"] == "p"
+        assert _ledger_path(tmp_path).read_bytes() == before
+        assert ledger.data == _LEDGER, "the declined row is not held in memory"
+        assert seen == [pattern_row_id({"pattern": "p"})] * 2
+
+    def test_an_admitted_value_is_written(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+
+        commit = ledger.commit(
+            lambda book: book.add_pattern("p"),
+            admit=lambda entry: entry["pattern"] == "p",
+        )
+
+        assert commit.persisted and not commit.unadmitted
+        assert "p" in [r["pattern"] for r in _on_disk(tmp_path)[PATTERNS_KEY]]
+
+    def test_the_value_to_admit_is_computed_against_the_file_as_it_stands(
+        self, tmp_path
+    ):
+        """A stale copy names an id the file now holds; the caller clears the real one."""
+        ledger = self._ledger(tmp_path)
+        taken = pattern_row_id({"pattern": "p"})
+        _edit_on_disk(
+            tmp_path,
+            lambda d: d[PATTERNS_KEY].append({"id": taken, "pattern": "p"}),
+        )
+        admitted = set()
+
+        def admit(entry) -> bool:
+            return entry["id"] in admitted
+
+        declined = ledger.commit(lambda book: book.add_pattern("p"), admit=admit)
+        assert declined.unadmitted and declined.reloaded
+        assert declined.value["id"] == f"{taken}-2"
+
+        admitted.add(declined.value["id"])
+        commit = ledger.commit(lambda book: book.add_pattern("p"), admit=admit)
+
+        assert commit.persisted and commit.reloaded
+        assert [r["id"] for r in _on_disk(tmp_path)[PATTERNS_KEY]][-2:] == [
+            taken,
+            f"{taken}-2",
+        ]
+
 
 class TestAtomicFile:
     def test_a_missing_file_has_no_bytes_and_no_digest(self, tmp_path):

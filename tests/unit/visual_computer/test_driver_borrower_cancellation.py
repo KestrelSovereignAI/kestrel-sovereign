@@ -20,6 +20,7 @@ from kestrel_sovereign.auth import caller_context_scope
 from kestrel_sovereign.endpoints.agent_helpers import get_caller
 from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 from kestrel_sovereign.visual_computer.docker import DockerComputerDriver
+from kestrel_sovereign.visual_computer.http import _error as visual_http_error
 from kestrel_sovereign.visual_computer.runtime import VisualAction
 from tests.unit.visual_computer.test_host import AUTH, intent, path
 from tests.unit.visual_computer.test_host import (
@@ -48,7 +49,7 @@ async def borrowed(visual_host, harness, monkeypatch, tmp_path):
     blocker = asyncio.Event()
     state = SimpleNamespace(client=client, app=app, feature=feature, h=harness,
         driver=driver, session=session, sid=sid, payload=payload, entered=entered,
-        left=left, blocker=blocker, facts={'entries': 0}, cleanup=None)
+        left=left, blocker=blocker, facts={'entries': 0}, cleanup=None, registered_tool_error=None)
     original_act = harness.adapter.act
     async def act(session, request):
         owner = asyncio.current_task()
@@ -85,8 +86,14 @@ async def borrowed(visual_host, harness, monkeypatch, tmp_path):
         # neither constructed nor restored from a frozen caller DTO here.
         caller = get_caller(request)
         assert caller is request.state.caller and caller.is_sovereign
-        with caller_context_scope(caller):
-            result = await tool.execute(request_json=(await request.body()).decode())
+        try:
+            with caller_context_scope(caller):
+                result = await tool.execute(request_json=(await request.body()).decode())
+        except ResourceOutcomeUnknown as error:
+            # The SDK preserves the original typed uncertainty. This probe's
+            # HTTP transport uses the same visual error mapping as the real route.
+            state.registered_tool_error = error
+            return visual_http_error(error, prepared=False)
         return JSONResponse(result)
     route = APIRoute('/api/visual-computer/registered-tool-probe', registered_tool, methods=['POST'])
     app.router.routes.append(route)
@@ -136,14 +143,14 @@ async def test_session_stop_is_unknown_without_cancelling_original_caller(borrow
         assert b.facts['owner_cancelling_at_error'] == 0
         assert active.cancelled() is False
         assert isinstance(b.facts['original_error'], ResourceOutcomeUnknown)
+        assert response.status_code == 503, response.text
+        assert response.json()['error']['code'] == 'visual_outcome_unknown'
         if boundary == 'http':
-            assert response.status_code == 503, response.text
-            assert response.json()['error']['code'] == 'visual_outcome_unknown'
             assert response.headers['cache-control'].startswith('private, no-store')
         else:
-            assert response.status_code == 200, response.text
-            assert response.json() == {'success': False, 'error': 'original_visual_operation_interrupted',
-                                       'tool': 'visual_computer_action'}
+            assert b.registered_tool_error is b.facts['original_error'], (
+                'Registered SDK tool replaced the original unknown outcome'
+            )
         await assert_unknown_original(b)
     finally:
         if not active.done():

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.utils.native_tool_effects import drive_native
 
 from kestrel_sdk.features.base import Feature as SdkFeature, tool as sdk_tool
 from kestrel_sdk.tools.base import ToolCategory
@@ -45,6 +46,11 @@ class _ExternalFeature(SdkFeature):
     )
     async def ping(self) -> str:
         return "pong"
+
+
+async def _run_external(feature, **kwargs):
+    feature.agent.features[feature.name] = feature
+    return await drive_native(feature.agent, lambda: feature.execute_as_subagent(**kwargs))
 
 
 def _orchestrator_gate(feature) -> bool:
@@ -184,16 +190,14 @@ def _self_call_names(func) -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_external_feature_executes_as_subagent_end_to_end():
+async def test_external_feature_executes_as_subagent_end_to_end(native_tool_effect_agent):
     """Exercise the borrowed cluster end-to-end on an external feature."""
     cls = ensure_subagent_dispatch(_ExternalFeature)
-    fake_agent = SimpleNamespace(
-        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
-        hooks_manager=None,
-    )
+    fake_agent = await native_tool_effect_agent(did="did:test:external-dispatch")
+    fake_agent.llm_service = SimpleNamespace(generate=AsyncMock(return_value="all done"))
     feature = cls(agent=fake_agent)
 
-    result = await feature.execute_as_subagent(task="say something")
+    result = await _run_external(feature, task="say something")
 
     assert result["success"] is True
     assert result["result"] == "all done"
@@ -201,7 +205,7 @@ async def test_external_feature_executes_as_subagent_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_external_feature_legacy_no_argument_prompt_override_dispatches():
+async def test_external_feature_legacy_no_argument_prompt_override_dispatches(native_tool_effect_agent):
     """Published visual features still implement the old prompt override.
 
     Core must not fail the whole subagent before its tool can run merely
@@ -213,13 +217,11 @@ async def test_external_feature_legacy_no_argument_prompt_override_dispatches():
             return "legacy visual identity prompt"
 
     cls = ensure_subagent_dispatch(LegacyVisualPrompt)
-    fake_agent = SimpleNamespace(
-        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
-        hooks_manager=None,
-    )
+    fake_agent = await native_tool_effect_agent(did="did:test:external-dispatch")
+    fake_agent.llm_service = SimpleNamespace(generate=AsyncMock(return_value="all done"))
     feature = cls(agent=fake_agent)
 
-    result = await feature.execute_as_subagent(task="make a selfie")
+    result = await _run_external(feature, task="make a selfie")
 
     assert result["success"] is True, result
     assert result["result"] == "all done"
@@ -229,7 +231,7 @@ async def test_external_feature_legacy_no_argument_prompt_override_dispatches():
 
 
 @pytest.mark.asyncio
-async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool():
+async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool(native_tool_effect_agent):
     """A hard-coded old prompt must not contradict the executable palette."""
 
     class LegacyVisualPrompt(_ExternalFeature):
@@ -257,13 +259,11 @@ async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool():
             return "Available tools: generate_selfie, generate_avatar"
 
     cls = ensure_subagent_dispatch(LegacyVisualPrompt)
-    fake_agent = SimpleNamespace(
-        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
-        hooks_manager=None,
-    )
+    fake_agent = await native_tool_effect_agent(did="did:test:external-dispatch")
+    fake_agent.llm_service = SimpleNamespace(generate=AsyncMock(return_value="all done"))
     feature = cls(agent=fake_agent)
 
-    result = await feature.execute_as_subagent(
+    result = await _run_external(feature,
         task="make an avatar", denied_tools={"ping", "generate_selfie"}
     )
 
@@ -276,7 +276,7 @@ async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool():
 
 
 @pytest.mark.asyncio
-async def test_filtered_current_prompt_overrides_cannot_advertise_denied_tools():
+async def test_filtered_current_prompt_overrides_cannot_advertise_denied_tools(native_tool_effect_agent):
     """Current positional and keyword-only overrides also yield to policy."""
     called = []
 
@@ -304,11 +304,9 @@ async def test_filtered_current_prompt_overrides_cannot_advertise_denied_tools()
 
     for prompt_class in (PositionalPrompt, KeywordPrompt):
         cls = ensure_subagent_dispatch(prompt_class)
-        fake_agent = SimpleNamespace(
-            llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
-            hooks_manager=None,
-        )
-        result = await cls(agent=fake_agent).execute_as_subagent(
+        fake_agent = await native_tool_effect_agent(did="did:test:external-dispatch")
+        fake_agent.llm_service = SimpleNamespace(generate=AsyncMock(return_value="all done"))
+        result = await _run_external(cls(agent=fake_agent),
             task="make an avatar", denied_tools={"ping"}
         )
         assert result["success"] is True, result
@@ -321,7 +319,7 @@ async def test_filtered_current_prompt_overrides_cannot_advertise_denied_tools()
 
 
 @pytest.mark.asyncio
-async def test_external_feature_keyword_only_runtime_prompt_receives_toolset():
+async def test_external_feature_keyword_only_runtime_prompt_receives_toolset(native_tool_effect_agent):
     seen = []
 
     class KeywordPrompt(_ExternalFeature):
@@ -330,12 +328,10 @@ async def test_external_feature_keyword_only_runtime_prompt_receives_toolset():
             return "keyword-only prompt"
 
     cls = ensure_subagent_dispatch(KeywordPrompt)
-    fake_agent = SimpleNamespace(
-        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
-        hooks_manager=None,
-    )
+    fake_agent = await native_tool_effect_agent(did="did:test:external-dispatch")
+    fake_agent.llm_service = SimpleNamespace(generate=AsyncMock(return_value="all done"))
 
-    result = await cls(agent=fake_agent).execute_as_subagent(task="ping")
+    result = await _run_external(cls(agent=fake_agent), task="ping")
 
     assert result["success"] is True, result
     assert seen == [["ping"]]
@@ -345,18 +341,16 @@ async def test_external_feature_keyword_only_runtime_prompt_receives_toolset():
 
 
 @pytest.mark.asyncio
-async def test_prompt_builder_internal_type_error_is_not_signature_fallback():
+async def test_prompt_builder_internal_type_error_is_not_signature_fallback(native_tool_effect_agent):
     class BrokenPrompt(_ExternalFeature):
         def _get_subagent_prompt(self, runtime_tools=None) -> str:
             raise TypeError("internal prompt builder defect")
 
     cls = ensure_subagent_dispatch(BrokenPrompt)
-    fake_agent = SimpleNamespace(
-        llm_service=SimpleNamespace(generate=AsyncMock(return_value="not reached")),
-        hooks_manager=None,
-    )
+    fake_agent = await native_tool_effect_agent(did="did:test:external-dispatch")
+    fake_agent.llm_service = SimpleNamespace(generate=AsyncMock(return_value="not reached"))
 
-    result = await cls(agent=fake_agent).execute_as_subagent(task="ping")
+    result = await _run_external(cls(agent=fake_agent), task="ping")
 
     assert result["success"] is False
     assert "internal prompt builder defect" in result["error"]

@@ -40,14 +40,12 @@ from urllib.parse import unquote
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Top-level onboarding files that are checked in addition to ``docs/**/*.md``.
-# These are the files the issue calls out explicitly plus ``CLAUDE.md``, the
-# root pointer to ``AGENTS.md``.
+# These are the files the issue calls out explicitly.
 TOP_LEVEL_SOURCES = (
     "README.md",
     "QUICKSTART.md",
     "CONTRIBUTING.md",
     "AGENTS.md",
-    "CLAUDE.md",
 )
 
 # Directory (relative to the repo root) whose Markdown is scanned recursively.

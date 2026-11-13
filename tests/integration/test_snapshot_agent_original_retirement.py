@@ -38,6 +38,16 @@ async def _retire_partial_agent_fixture(agent, usage_db):
     await usage_db.close()
 
 
+def _start_inflight_snapshot(service, tasks):
+    """A snapshot pass already in flight when the tail runs, as a scheduled
+    backup still uploading at shutdown is. The tail itself uploads nothing
+    (#4028): it records the snapshot as owed, and its sync-stop retains this
+    pass and its native retirement."""
+    inflight = create_owned_task(service.force_snapshot(), retain_originals=True)
+    tasks.append(inflight)
+    return inflight
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("withdrawal", [False, True])
 @pytest.mark.parametrize("close_cancels", [False, True])
@@ -66,6 +76,7 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
             "actual native close ACK cancelled"
         )
         state["close_error"].__cause__ = OSError("actual native close ACK failed")
+    inflight = _start_inflight_snapshot(service, tasks)
     tail = create_owned_task(
         agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
@@ -184,19 +195,17 @@ async def test_agent_retains_periodic_stop_and_explicit_snapshot_owners(
     worker = service._poll_task
     tasks.append(worker)
     await asyncio.wait_for(entered.wait(), 3)
-    original_snapshot, original_stop = service.force_snapshot, service.stop
+    original_stop = service.stop
     dispatched = {}
-
-    async def snapshot():
-        dispatched["snapshot"] = asyncio.current_task()
-        return await original_snapshot()
 
     async def stop():
         dispatched["stop"] = asyncio.current_task()
         return await original_stop()
 
-    monkeypatch.setattr(service, "force_snapshot", snapshot)
     monkeypatch.setattr(service, "stop", stop)
+    # An explicit pass in flight beside the periodic one; the tail starts no
+    # snapshot of its own (#4028), so its stop is the root that joins both.
+    inflight = _start_inflight_snapshot(service, tasks)
     tail = create_owned_task(
         agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
@@ -208,16 +217,16 @@ async def test_agent_retains_periodic_stop_and_explicit_snapshot_owners(
                 break
             await asyncio.sleep(0.01)
         assert tail.done() and len(close_tasks) == 2
-        assert not worker.done() and all(not owner.done() for owner in close_tasks)
+        assert not worker.done() and not inflight.done()
+        assert all(not owner.done() for owner in close_tasks)
         owners = {owner for owner in agent_shutdown_completion_owners(agent)
                   if not owner.done()}
-        assert set(dispatched) == {"snapshot", "stop"}
-        assert len(set(dispatched.values())) == 2
-        assert set(dispatched.values()) <= owners, (
-            "snapshot and periodic-stop roots must BOTH remain owned"
+        assert set(dispatched) == {"stop"}
+        assert dispatched["stop"] in owners, (
+            "the stop that joins the periodic and explicit passes must remain owned"
         )
         release_close.set()
-        await asyncio.gather(*owners, worker, return_exceptions=True)
+        await asyncio.gather(*owners, worker, inflight, return_exceptions=True)
         for _ in range(10):
             await asyncio.sleep(0)
         debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
@@ -264,6 +273,7 @@ async def test_tail_captures_original_cause_bearing_native_callback_cancellation
     agent, usage_db = await _partial_native_agent(tmp_path, monkeypatch)
     agent._sync_service = service
     agent._resource_custody().acquire("sync_service")
+    inflight = _start_inflight_snapshot(service, tasks)
     tail = create_owned_task(
         agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
@@ -327,12 +337,13 @@ async def test_refused_snapshot_owner_preserves_unstarted_service_debt(
         asyncio.get_running_loop(),
         asyncio.get_running_loop().get_task_factory(),
     )
-    refusal = RuntimeError("actual final snapshot Task admission refused")
+    refusal = RuntimeError("actual owed-snapshot record Task admission refused")
     source = OriginalFailure.capture(refusal)
     refused = []
 
     def refuse_snapshot(loop, coroutine, **kwargs):
-        if _operation_name(coroutine) == "SyncService.force_snapshot":
+        # The tail's sync step records the snapshot as owed (#4028).
+        if _operation_name(coroutine) == "SyncService.record_remote_snapshot_owed":
             refused.append(coroutine)
             raise refusal
         return (
@@ -405,6 +416,7 @@ async def test_completion_from_original_native_join_graph_keeps_owner_fenced(
                 await completion_probe()
 
         monkeypatch.setattr(service, "force_snapshot", original_snapshot)
+    inflight = _start_inflight_snapshot(service, tasks)
     tail = create_owned_task(
         agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
@@ -491,6 +503,7 @@ async def test_timely_agent_snapshot_and_stop_retain_both_native_failures(
             await asyncio.sleep(0.01)
         assert worker.done() and state["close_errors"][0] in tuple(_explicit_control_chain(owned_task_error(worker)))
         assert source_errors and source_errors[0] in tuple(_explicit_control_chain(owned_task_error(worker)))
+        inflight = _start_inflight_snapshot(service, tasks)
         await agent._run_durable_shutdown_tail(5)
         assert len(close_tasks) == 2 and all(owner.done() for owner in close_tasks)
         terminal = vars(agent).get("_shutdown_control")
@@ -559,6 +572,7 @@ async def test_agent_retains_exact_original_tail_observer_cancellation(
             raise
 
     monkeypatch.setattr(asyncio, "wait", observe_original_withdrawal)
+    inflight = _start_inflight_snapshot(service, tasks)
     tail = create_owned_task(
         agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
@@ -655,6 +669,7 @@ async def test_timely_native_cancel_receipt_survives_an_earlier_completion_reade
 
     loop.set_task_factory(observe_admitted_task)
     try:
+        inflight = _start_inflight_snapshot(service, tasks)
         await agent._run_durable_shutdown_tail(5)
         assert len(observed) == 1 and state["close_error"] in tuple(_explicit_control_chain(observed[0])), (
             "first native completion reader did not observe original cancellation"
@@ -702,6 +717,7 @@ async def test_timely_original_callback_cancellation_is_raised_after_successful_
     state["release_server"].set()
     release_close.set()
     try:
+        inflight = _start_inflight_snapshot(service, tasks)
         cancelled, _ = await agent._run_durable_shutdown_tail(5)
         assert cancelled and source_errors
         original = source_errors[0]
@@ -722,10 +738,13 @@ async def test_timely_original_callback_cancellation_is_raised_after_successful_
 @pytest.mark.parametrize("close_cancels", [False, True])
 @pytest.mark.parametrize("refusal_cancels", [False, True])
 @pytest.mark.parametrize("late_background", [False, True])
-async def test_actual_snapshot_failure_and_stop_refusal_keep_both_originals(
+async def test_refused_stop_keeps_its_debt_and_inflight_snapshot_keeps_its_failure(
     native_snapshot, tmp_path, monkeypatch, door, close_cancels, refusal_cancels,
     late_background,
 ):
+    """A refused sync-stop never joined the pass in flight (#4028): the stop's
+    refusal and unstarted service debt stay with the Agent, and the pass's
+    actual native close failure stays with the pass's own requester."""
     from inspect import CORO_CLOSED, getcoroutinestate
 
     from kestrel_sovereign.kestrel_agent import await_agent_shutdown_completion
@@ -790,16 +809,21 @@ async def test_actual_snapshot_failure_and_stop_refusal_keep_both_originals(
     try:
         tail_failure = None
         try:
+            inflight = _start_inflight_snapshot(service, tasks)
             await agent._run_durable_shutdown_tail(5)
         except BaseException as error:
             tail_failure = error
-        assert (
-            tail_failure is not None
-            and refused
-            and len(close_tasks) == 1
-            and close_tasks[0].done()
-        )
+        assert tail_failure is not None and refused
         assert all(getcoroutinestate(coro) == CORO_CLOSED for coro in refused)
+        await asyncio.wait({inflight}, timeout=5)
+        assert inflight.done() and len(close_tasks) == 1 and close_tasks[0].done()
+        pass_failure = owned_task_error(inflight)
+        assert original in tuple(_explicit_control_chain(pass_failure))
+        assert any(
+            resource is clients[0] and owner is close_tasks[0]
+            for resource, owner in execution_cleanup_debts(pass_failure)
+        ), "the in-flight snapshot lost its own native close debt"
+
         if late_background:
             from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 
@@ -833,17 +857,11 @@ async def test_actual_snapshot_failure_and_stop_refusal_keep_both_originals(
             except BaseException as error:
                 selected = error
         chain = tuple(_explicit_control_chain(selected))
-        assert original in chain and refusal in chain, (
-            "accepted native failure and refused subsequent stop lost an original carrier"
-        )
+        assert refusal in chain, "the refused stop lost its original carrier"
         assert any(
             resource is service and owner is None
             for resource, owner in execution_cleanup_debts(selected)
-        )
-        assert any(
-            resource is clients[0] and owner is close_tasks[0]
-            for resource, owner in execution_cleanup_debts(selected)
-        )
+        ), "the refused stop's unstarted service debt was acknowledged"
     finally:
         loop.set_task_factory(factory)
         await _retire_partial_agent_fixture(agent, usage_db)
@@ -890,6 +908,7 @@ async def test_native_retirement_control_cannot_be_demoted_to_observer_withdrawa
         )
 
     try:
+        inflight = _start_inflight_snapshot(service, tasks)
         await agent._run_durable_shutdown_tail(5)
         assert close_tasks and all(task.done() for task in close_tasks)
         assert original in tuple(_explicit_control_chain(agent._shutdown_control))

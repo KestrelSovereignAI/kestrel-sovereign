@@ -7,8 +7,9 @@ Neither a chat part nor a request body can supply any of those authorities.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -110,6 +111,7 @@ class _Reader:
     caller: CallerContext
     session_id: str
     authentication: object
+    borrowed: AsyncExitStack = field(default_factory=AsyncExitStack, repr=False)
     active: bool = True
     baseline_check: Callable[[], None] | None = None
     physical: _PhysicalView | None = None
@@ -117,10 +119,31 @@ class _Reader:
     delivered: bool = False
 
 
+@dataclass(frozen=True)
+class _OwnedAppCall:
+    task: asyncio.Task
+    cancel: Callable[[asyncio.Task], object] = field(repr=False)
+    active: bool = field(default=True, init=False)
+
+    def _cancel(self, task):
+        from kestrel_sovereign.callbacks import require_callback_result
+
+        require_callback_result(self.cancel(task))
+
+    async def wait(self):
+        from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+
+        if not self.active:
+            raise ResourceConflict('Original MCP App call ownership ended')
+        outcome = await await_owned_task(self.task, cancel_on_caller_cancellation=self._cancel)
+        return raise_owned_outcome(outcome, operation='MCP App call', retain_originals=True)
+
+
 class _Call(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     name: str = Field(min_length=1, max_length=256)
     arguments: dict
+    operation_id: str = Field(min_length=1, max_length=256)
 
 
 class _Empty(BaseModel):
@@ -132,6 +155,16 @@ def _native(value):
 
 
 def _error(error, prepared):
+    from kestrel_sovereign.api_errors import (
+        api_error_response, execution_control_api_error, tool_effect_api_error,
+    )
+
+    failure = execution_control_api_error(error)
+    if failure is None and not prepared:
+        failure = tool_effect_api_error(error)
+    if failure is not None:
+        return api_error_response(status_code=failure.status_code, code=failure.code,
+            message=failure.message, details=failure.details)
     if prepared or isinstance(error, (ResourceOutcomeUnknown, TimeoutError)):
         status, code = 503, "mcp_app_outcome_unknown_do_not_replay"
     elif isinstance(error, (HostCapabilityAccessDenied, CSRFError)):
@@ -193,6 +226,32 @@ class MCPAppsHost:
         # The baseline does not call View.require_current(), which calls us.
         reader.baseline_check()
 
+    def current_call_session_id(self):
+        """The original authenticated App call, never an ambient chat selector."""
+        reader = self._reader.get()
+        if reader is None:
+            return None
+        if not reader.active or reader.baseline_check is None or reader.physical is None:
+            raise HostCapabilityAccessDenied('Original MCP App call is unavailable')
+        reader.baseline_check()
+        reader.physical.view.require_current()
+        return reader.session_id
+
+    @asynccontextmanager
+    async def borrow_input_view(self, view, *, request):
+        """Reauthenticate a fresh input continuation against the original View."""
+        async with self._resolve_context(request) as context:
+            async with self._operation(context, _Action.CALL) as check:
+                identifier = next((key for key, physical in self._views.items()
+                    if physical.view is view), None)
+                if identifier is None:
+                    raise ResourceConflict('Original MCP input View is unavailable')
+                self._physical(identifier)
+                check()
+                async with self._transport_operation(context, None, check) as transport:
+                    yield transport
+                    check()
+
     @asynccontextmanager
     async def _resolve_context(self, request):
         self._require_live(request)
@@ -226,7 +285,8 @@ class MCPAppsHost:
                     check_current=check_current, authority_gate=self._gate):
                 token = self._reader.set(reader)
                 try:
-                    yield context
+                    async with reader.borrowed:
+                        yield context
                 finally:
                     try:
                         if reader.opened_id is not None and not reader.delivered:
@@ -241,6 +301,8 @@ class MCPAppsHost:
     @asynccontextmanager
     async def _operation(self, context, action):
         reader = self._reader.get()
+        if action is _Action.CALL:
+            await reader.borrowed.enter_async_context(self.agent._get_privacy_transition_lock())
         async with self.authority.operation(context, action, self._agent_id) as baseline:
             reader.baseline_check = baseline
             def check():
@@ -367,7 +429,15 @@ class MCPAppsHost:
             host = original_host()
             async def build(_context, value):
                 physical = host._physical(view_id)
-                result = await host._publications.executor.invoke(physical.view, value.name, value.arguments)
+                executor = host._publications.executor
+                try:
+                    result = await executor.invoke(physical.view, value.name,
+                        value.arguments, operation_id=value.operation_id)
+                except ResourceConflict as error:
+                    pending = executor.input_required(error, physical.view)
+                    if pending is None:
+                        raise
+                    return JSONResponse({'input_required': pending}, status_code=202)
                 return JSONResponse(_native(result))
             return respond(host, request, _Action.CALL, build, _Call)
 
@@ -401,6 +471,36 @@ class MCPAppsHost:
 
 
 class MCPAppsHostMixin:
+    supports_owned_mcp_app_calls = True
+
+    @asynccontextmanager
+    async def mcp_app_call_scope(self, operation, *, name, cancel):
+        """Own one View child through its native execution and physical join."""
+        from kestrel_sovereign._async_ownership import (
+            OwnedCallbackScope, await_owned_task, bind_owned_coordinator,
+        )
+        from kestrel_sovereign.callbacks import invoke_host_callback
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        if not callable(cancel):
+            raise TypeError('MCP App calls require their original cancellation policy')
+        with bind_owned_coordinator(self._get_privacy_transition_lock()):
+            scope = OwnedCallbackScope()
+            owner = _OwnedAppCall(scope.start(lambda: invoke_host_callback(operation), name=name), cancel)
+            pending = None
+            try:
+                yield owner
+            except BaseException as error:
+                pending = error
+                raise
+            finally:
+                object.__setattr__(owner, 'active', False)
+                scope.close()
+                outcome = await await_owned_task(owner.task)
+                terminal = execution_observation_error(pending, outcome.error, outcome.cancellation)
+                if terminal is not None and terminal is not pending:
+                    raise terminal
+
     supports_mcp_apps_host = True
 
     def create_mcp_apps_router(self, feature, *, resolve_host):

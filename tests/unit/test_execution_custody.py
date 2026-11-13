@@ -89,7 +89,7 @@ def test_repeated_revoke_never_changes_original_reason_or_revives():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["tool", "named_subagent", "feature_tool"])
-async def test_native_dispatch_rechecks_after_awaited_permission_hook(boundary):
+async def test_native_dispatch_rechecks_after_awaited_permission_hook(boundary, native_tool_effect_agent):
     from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
     from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
     from kestrel_sovereign.hooks.manager import HooksManager
@@ -107,58 +107,69 @@ async def test_native_dispatch_rechecks_after_awaited_permission_hook(boundary):
             await release.wait()
             return HookOutput()
 
-    class Agent(OrchestratorEngineMixin):
-        hooks_manager = HooksManager()
-
-    agent = Agent()
+    from kestrel_sovereign.features.base import Feature
+    from tests.unit.test_feature_subagent_tool_executor import _FakeTool
+    from tests.utils.native_tool_effects import drive_native
+    agent = await native_tool_effect_agent(did="did:test:permission-custody")
+    agent.hooks_manager = HooksManager()
     agent.hooks_manager.register(AwaitPermission())
 
     async def effect(args):
         executed.append(args)
         return {"success": True}
 
+    class PermissionFeature(Feature):
+        tool_name = "feature"
+        tool_description = "Original permission test feature"
+
+        async def initialize(self):
+            pass
+
+        async def execute_as_subagent(self, **kwargs):
+            return await effect(kwargs)
+
+    feature = PermissionFeature(agent)
+    agent.features[feature.name] = feature
+    leaf = _FakeTool("effect", {"success": True})
+
+    async def execute(**args):
+        return await effect(args)
+
+    leaf.execute = execute
+
+    scope_ready = asyncio.get_running_loop().create_future()
+
     async def dispatch_native():
-        if boundary == "tool":
-            return await agent._execute_tool_with_hooks(
-                "effect", "Feature", {}, "session", effect,
+        async def invoke():
+            if boundary == "tool":
+                return await agent._execute_tool_with_hooks(
+                    "effect", feature.name, {}, "session", effect,
+                )
+            if boundary == "named_subagent":
+                return await agent._execute_named_subagent(
+                    feature, tool_name="feature", args={"task": "work"},
+                    session_id="session", source="test",
+                )
+            return await feature._execute_subagent_tool(
+                tool_name="effect", args={}, tools_by_name={"effect": leaf},
             )
-        if boundary == "named_subagent":
-            from types import SimpleNamespace
+        async def operation():
+            with bind_execution_custody(Authority()) as scope:
+                scope_ready.set_result(scope)
+                return await invoke()
+        return await drive_native(agent, operation)
 
-            async def denied(_name):
-                return set()
-
-            async def execute_as_subagent(**args):
-                return await effect(args)
-
-            agent._get_denied_tools = denied
-            feature = SimpleNamespace(execute_as_subagent=execute_as_subagent)
-            return await agent._execute_named_subagent(
-                feature, tool_name="feature", args={"task": "work"}, session_id="session", source="test",
-            )
-        from types import SimpleNamespace
-        from kestrel_sovereign.features.base import Feature
-
-        async def execute(**args):
-            return await effect(args)
-
-        feature = SimpleNamespace(agent=agent, name="Feature")
-        return await Feature._execute_subagent_tool(
-            feature, tool_name="effect", args={},
-            tools_by_name={"effect": SimpleNamespace(execute=execute)},
-        )
-
-    with bind_execution_custody(Authority()) as scope:
-        dispatch = asyncio.create_task(dispatch_native())
-        try:
-            await asyncio.wait_for(entered.wait(), timeout=5)
-            scope.revoke("authority lost during permission await")
-            release.set()
-            with pytest.raises(ExecutionAuthorityError):
-                await dispatch
-        finally:
-            release.set()
-            await asyncio.gather(dispatch, return_exceptions=True)
+    dispatch = asyncio.create_task(dispatch_native())
+    try:
+        scope = await asyncio.wait_for(scope_ready, timeout=5)
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        scope.revoke("authority lost during permission await")
+        release.set()
+        with pytest.raises(ExecutionAuthorityError):
+            await dispatch
+    finally:
+        release.set()
+        await asyncio.gather(dispatch, return_exceptions=True)
     assert executed == []
 
 
@@ -878,7 +889,7 @@ async def test_codex_transport_reader_does_not_inherit_first_occurrence(monkeypa
     from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
     from kestrel_sovereign.execution_custody import current_execution_custody
     monkeypatch.setenv("HOME", str(tmp_path))
-    client = CodexAppServerClient.__new__(CodexAppServerClient)
+    client = CodexAppServerClient(binary="offline-codex-not-invoked")
     client._binary = "/test/no-provider"
     client._closed_error = None
     observed = []

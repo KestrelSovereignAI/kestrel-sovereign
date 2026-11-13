@@ -84,8 +84,7 @@
     },
     {
       "existing_code_refs": [
-        "AGENTS.md",
-        "CLAUDE.md"
+        "AGENTS.md"
       ],
       "findings": [],
       "missing_code_refs": [],
@@ -374,7 +373,7 @@
     },
     {
       "existing_code_refs": [
-        "CLAUDE.md",
+        "AGENTS.md",
         "kestrel_sovereign/agent/model_preference.py",
         "kestrel_sovereign/endpoints/models.py",
         "kestrel_sovereign/features/privacy/pii_detector.py",
@@ -712,13 +711,14 @@
     },
     {
       "existing_code_refs": [
-        "CLAUDE.md",
+        "AGENTS.md",
         "kestrel_sovereign/a2a/task_manager.py",
         "kestrel_sovereign/agent/event_manager.py",
         "kestrel_sovereign/features/scheduler/runner.py",
         "kestrel_sovereign/features/security/approval_queue.py",
         "kestrel_sovereign/heartbeat.py",
         "kestrel_sovereign/kestrel_agent.py",
+        "kestrel_sovereign/signals/delivery.py",
         "kestrel_sovereign/waits/engine.py"
       ],
       "findings": [],
@@ -2217,12 +2217,17 @@
     },
     {
       "existing_code_refs": [
-        "pyproject.toml",
         "tests/frontend/api_client.test.mjs",
+        "tests/integration/test_a2a_native_permission_cognition.py",
         "tests/integration/test_compute_security_integration.py",
         "tests/integration/test_core_only_boot.py",
         "tests/integration/test_identity_export_import.py",
+        "tests/integration/test_mcp_gateway_host_restart.py",
+        "tests/integration/test_mcp_gateway_permission_boundary.py",
         "tests/integration/test_mcp_permission_boundary.py",
+        "tests/integration/test_mcp_permission_host_restart.py",
+        "tests/integration/test_mcp_permission_peer_stdio.py",
+        "tests/integration/test_native_permission_entrypoints.py",
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_storage_backend_parity.py",
         "tests/unit/test_agent_backend_routing_contracts.py",
@@ -2244,8 +2249,7 @@
         "tests/unit/test_security_feature.py",
         "tests/unit/test_sovereignty_export_receipt_contracts.py",
         "tests/unit/test_sse_connection_limits.py",
-        "tests/unit/test_webhooks_feature.py",
-        "uv.lock"
+        "tests/unit/test_webhooks_feature.py"
       ],
       "findings": [
         "missing_code_refs"
@@ -4806,6 +4810,30 @@
       "render": "public",
       "status": "proposed",
       "title": "Core 0.54.2",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.64.1.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.64.1",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.64.2.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.64.2",
       "type": "Release Note"
     },
     {

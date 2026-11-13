@@ -7,7 +7,6 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.features.model.feature import ModelAgent
-from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
 
@@ -26,17 +25,12 @@ def _no_confirm_evaluate():
 
 class TestPrivacyConsentCaller:
     @pytest.mark.asyncio
-    async def test_set_privacy_mode_requests_consent_before_transition(self, tmp_path):
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL,
-        )
-        agent.storage = MagicMock()
-        agent.storage.set_privacy_mode = MagicMock()
-        agent.privacy_agent = MagicMock()
-        agent.privacy_agent.set_mode = MagicMock()
-        agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
+    async def test_set_privacy_mode_requests_consent_before_transition(self, native_tool_effect_agent, monkeypatch):
+        agent = await native_tool_effect_agent(did="did:test:123")
+        monkeypatch.setattr(agent.storage, "set_privacy_mode",
+            MagicMock(wraps=agent.storage.set_privacy_mode))
+        monkeypatch.setattr(agent.privacy_agent, "set_mode",
+            MagicMock(wraps=agent.privacy_agent.set_mode))
         consent = _make_consent()
         agent.features = {"ConsentFeature": consent}
 
@@ -48,6 +42,9 @@ class TestPrivacyConsentCaller:
         )
         agent.storage.set_privacy_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
         agent.privacy_agent.set_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
+        assert agent.privacy_mode is PrivacyMode.EPHEMERAL
+        assert agent.storage.privacy_mode is PrivacyMode.EPHEMERAL
+        assert agent.privacy_agent.privacy_mode is PrivacyMode.EPHEMERAL
 
 
 def _make_ctx_builder_stub():

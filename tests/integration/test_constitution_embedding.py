@@ -10,7 +10,7 @@ This module verifies that:
 6. Constitutional governance is immutable
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import asyncio
 from pathlib import Path

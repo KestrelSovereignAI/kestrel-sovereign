@@ -96,3 +96,15 @@ def test_oversized_root_is_rejected_with_bounded_read(tmp_path):
     path.write_bytes(b"x" * (MAX_TRUST_ROOT_BYTES + 1))
     with pytest.raises(SovereignTrustRootError, match="exceeds"):
         load_sovereign_trust_root(explicit_path=path, environ={})
+
+
+def test_a_fifo_in_place_of_the_root_is_refused_without_blocking(tmp_path):
+    """An agent that replaces the root with a FIFO cannot hold its reader (#3893)."""
+    from tests.utils.fifo import call_against_fifo
+
+    path = tmp_path / "root.did.json"
+    error = call_against_fifo(
+        path, lambda: load_sovereign_trust_root(explicit_path=path, environ={})
+    )
+    assert isinstance(error, SovereignTrustRootError)
+    assert "not a regular file" in str(error)

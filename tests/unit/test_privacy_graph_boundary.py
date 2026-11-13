@@ -1962,6 +1962,7 @@ async def test_rename_under_held_turn_lock_does_not_deadlock(tmp_path, mode):
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin  # noqa: E402
 from kestrel_sovereign.features.base import Feature  # noqa: E402
+from tests.utils.codex_inline import OwnedCallbackReader  # noqa: E402
 
 
 class _InlineOrchestratorHost(OrchestratorEngineMixin):
@@ -1996,47 +1997,6 @@ class _InlineOrchestratorHost(OrchestratorEngineMixin):
         return await rename_agent_core(self, args["new_name"])
 
 
-class _AppServerReaderHarness:
-    """Reproduces the codex app-server reader-task topology WITHOUT a live server.
-
-    The reader loop is spawned once; each dispatched tool call runs in its OWN task
-    spawned FROM the reader (mirrors ``codex_app_server`` running each
-    ``item/tool/call`` on a per-call task), so the tool never runs on the turn task
-    — exactly the topology that deadlocks without the captured reentry token.
-    """
-
-    def __init__(self):
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._reader = None
-
-    async def ensure_started(self):
-        if self._reader is None:
-            self._reader = asyncio.create_task(self._read_loop())
-
-    async def _read_loop(self):
-        while True:
-            executor, name, args, done = await self._queue.get()
-            if executor is None:
-                return
-            asyncio.create_task(self._handle(executor, name, args, done))
-
-    async def _handle(self, executor, name, args, done):
-        try:
-            done.set_result(await executor(name, args))
-        except Exception as exc:  # pragma: no cover - defensive
-            done.set_exception(exc)
-
-    async def dispatch(self, executor, name, args):
-        done = asyncio.get_event_loop().create_future()
-        await self._queue.put((executor, name, args, done))
-        return await done
-
-    async def stop(self):
-        if self._reader is not None:
-            await self._queue.put((None, None, None, None))
-            await self._reader
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
 async def test_inline_rename_from_app_server_task_does_not_deadlock(tmp_path, mode):
@@ -2052,17 +2012,17 @@ async def test_inline_rename_from_app_server_task_does_not_deadlock(tmp_path, mo
         wrapper = PrivacyEnforcingStorage(raw, mode)
         lock = ReentrantTransitionLock()
         host = _InlineOrchestratorHost(wrapper, raw, lock)
-        harness = _AppServerReaderHarness()
+        harness = OwnedCallbackReader()
 
         # Streaming path: hold the transition lock across the whole "turn", build
         # the inline executor INSIDE the held lock (as the orchestrator does, so it
         # captures this turn's token), then dispatch the rename onto a reader-spawned
         # task and AWAIT it — the turn is now blocked on the app-server's result
         # exactly as in production, while the tool runs on a foreign task.
-        async with lock:
+        async with lock.policy_span():
             assert lock.locked()
             executor = host._make_inline_tool_executor("sess-inline")
-            await harness.ensure_started()
+            await harness.start()
             _eff, outcome = await asyncio.wait_for(
                 harness.dispatch(
                     executor, "rename_agent", {"new_name": "RenamedInline"}
@@ -2149,7 +2109,7 @@ async def test_concurrent_reader_tasks_with_shared_token_serialize():
                 events.append(f"{label}-exit")
                 inside -= 1
 
-    async with lock:  # the streamed turn holds the transition lock across the turn
+    async with lock.policy_span():  # retain policy while reader writers serialize
         assert lock.locked()
         token = lock.current_reentry_token()
         assert token is not None
@@ -2196,7 +2156,7 @@ async def test_owner_cancel_drains_active_cross_task_writer_before_release():
                 await release_writer.wait()
 
     async def owner_turn():
-        async with lock:
+        async with lock.policy_span():
             token = lock.current_reentry_token()
             assert token is not None
             asyncio.create_task(reader(token))
@@ -2268,7 +2228,7 @@ async def test_reader_cancel_also_unblocks_owner_drain():
                 await asyncio.Event().wait()  # park until cancelled
 
     async def owner_turn():
-        async with lock:
+        async with lock.policy_span():
             token = lock.current_reentry_token()
             reader_holder["task"] = asyncio.create_task(reader(token))
             await writer_inside.wait()
@@ -2303,11 +2263,11 @@ async def test_concurrent_inline_renames_serialize_durable_writes(tmp_path):
         wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
         lock = ReentrantTransitionLock()
         host = _InlineOrchestratorHost(wrapper, raw, lock)
-        harness = _AppServerReaderHarness()
+        harness = OwnedCallbackReader()
 
-        async with lock:
+        async with lock.policy_span():
             executor = host._make_inline_tool_executor("sess-inline")
-            await harness.ensure_started()
+            await harness.start()
             results = await asyncio.wait_for(
                 asyncio.gather(
                     harness.dispatch(executor, "rename_agent", {"new_name": "AlphaName"}),
@@ -2390,93 +2350,70 @@ class _RenameSubagentFeature(Feature):
         return self._tools
 
 
-class _NestedSubagentOrchestratorHost(OrchestratorEngineMixin):
-    """Parent turn host that builds the REAL parent inline executor, then dispatches
-    a feature SUBAGENT whose own inline tool call performs the durable rename on a
-    SECOND reader task. ``execute_named_tool`` runs on the parent reader task INSIDE
-    the parent executor's bound-token scope — exactly where the subagent executor
-    must capture the token for it to survive onto the nested reader task."""
-
-    def __init__(self, lock, feature, harness):
-        self._privacy_transition_lock = lock
-        self._feature = feature
-        self._harness = harness
-
-    def _get_privacy_transition_lock(self):
-        return self._privacy_transition_lock
-
-    async def execute_named_tool(self, name, args, *, session_id, source, _capture):
-        assert name == "dispatch_subagent"
-        _capture["effective_args"] = args
-        # Built here (on the parent reader task, inside the parent's bound-token
-        # scope) so the REAL subagent executor captures the owning turn's token,
-        # then the durable rename is dispatched onto a NESTED reader task.
-        subagent_executor = self._feature._make_feature_inline_tool_executor(
-            parts_sink=[]
-        )
-        _eff, result = await self._harness.dispatch(
-            subagent_executor, "rename_agent", {"new_name": args["new_name"]}
-        )
-        return result
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
 async def test_nested_subagent_rename_from_app_server_task_does_not_deadlock(
-    tmp_path, mode
+    tmp_path, mode, native_tool_effect_agent
 ):
-    """P1 follow-up (the NESTED subagent case neither prior cross-task test reaches):
-    the streamed turn holds the transition lock and dispatches a feature subagent
-    through the REAL parent inline executor onto the codex app-server's reader task;
-    that subagent's OWN inline tool loop then dispatches a durable ``rename_agent``
-    onto a SECOND reader task. Both reader tasks are foreign to the lock owner, so
-    the nested rename can only proceed if the subagent executor
-    (``_make_feature_inline_tool_executor``) captured the owning turn's reentry token
-    and re-presented it — WITHOUT it the turn (blocked awaiting the app-server) and
-    the tool (blocked acquiring the lock the turn holds) DEADLOCK. A ``wait_for``
-    timeout makes a regression fail loudly instead of hanging the suite (#2672 review
-    P1 follow-up)."""
-    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT_ID) as raw:
-        await raw.add_node(_structural_node("agent"))  # stored label "Kestrel"
-        wrapper = PrivacyEnforcingStorage(raw, mode)
-        lock = ReentrantTransitionLock()
-        rename_agent = _RenameAgent(wrapper, raw, lock)  # _get_privacy_transition_lock → lock
-        feature = _RenameSubagentFeature(rename_agent)
-        harness = _AppServerReaderHarness()
-        host = _NestedSubagentOrchestratorHost(lock, feature, harness)
+    """Nested reader writes use a real journal and the original policy span."""
+    from kestrel_sovereign.features.privacy.feature import PrivacyAgent
+    from kestrel_sovereign.tools.effect_journal import ToolEffectPrivacyRefused
+    from tests.unit.test_tool_effect_invocation import governed
 
-        # Streaming path: hold the transition lock across the whole "turn", build the
-        # parent inline executor INSIDE the held lock (so it captures this turn's
-        # token), then dispatch the subagent onto a reader-spawned task and AWAIT it —
-        # the turn is now blocked on the app-server result exactly as in production
-        # while BOTH the subagent dispatch and its nested rename run on foreign tasks.
-        async with lock:
-            assert lock.locked()
-            parent_executor = host._make_inline_tool_executor("sess-nested")
-            await harness.ensure_started()
-            _eff, result = await asyncio.wait_for(
-                harness.dispatch(
-                    parent_executor,
-                    "dispatch_subagent",
-                    {"new_name": "NestedRenamed"},
-                ),
-                timeout=5.0,
-            )
-        await harness.stop()
+    agent = await native_tool_effect_agent(did=AGENT_ID)
+    raw = agent._raw_storage
+    await raw.add_node(_structural_node("agent"))
+    agent.storage = PrivacyEnforcingStorage(raw, mode)
+    agent.privacy_agent = PrivacyAgent(raw, mode)
+    agent._agent_name = "Kestrel"
+    lock = agent._get_privacy_transition_lock()
+    feature = _RenameSubagentFeature(agent)
+    agent.features[feature.name] = feature
+    harness = OwnedCallbackReader()
+    from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory
 
-        assert rename_agent._agent_name == "NestedRenamed"  # live name always updates
-        if mode is PrivacyMode.NORMAL:
-            assert result["success"] is True
-            assert result["skipped_privacy"] is False
-            assert result["db_row_written"] is True
-            assert await _metadata_value(raw, "name") == "NestedRenamed"
-            node = await raw.get_node(AGENT_ID)
-            assert node.label == "NestedRenamed"           # durable node renamed
+    class DispatchSubagent:
+        name = 'owned.nested_rename_dispatch'
+        schema = ToolSchema(name, 'Invoke the original nested rename feature', ToolCategory.UTILITY,
+            parameters=[ToolParameter('new_name', 'string', 'Original name', required=True)])
+
+        async def execute(self, *, new_name):
+            executor = feature._make_feature_inline_tool_executor(parts_sink=[])
+            _effective, result = await harness.dispatch(executor, 'rename_agent', {'new_name': new_name})
+            return result
+
+    mounted = []
+    agent.register_dynamic_tools('owned-nested-rename', [DispatchSubagent()],
+        on_registered=lambda tool, binding: mounted.append(binding))
+    binding, = mounted
+
+    @governed
+    async def invoke(owner, user_input, *, invocation_id=None):
+        async with lock.policy_span():
+            executor = agent._make_inline_tool_executor("sess-nested")
+            await harness.start()
+            return await asyncio.wait_for(harness.dispatch(
+                executor, binding.name, {"new_name": "NestedRenamed"},
+            ), timeout=5.0)
+
+    try:
+        if mode is PrivacyMode.EPHEMERAL:
+            with pytest.raises(ToolEffectPrivacyRefused):
+                await invoke(agent, "Nested rename", invocation_id="nested-rename")
+            assert agent._agent_name == "Kestrel"
+            assert await _metadata_value(raw, "name") is None
+            assert await agent.tool_effect_store.database.fetchone(
+                "SELECT COUNT(*) FROM tool_effect_claims") == (0,)
         else:
-            assert result["skipped_privacy"] is True
-            assert await _metadata_value(raw, "name") is None  # nothing durable
-            node = await raw.get_node(AGENT_ID)
-            assert node.label == "Kestrel"                 # stored node untouched
+            _effective, result = await invoke(agent, "Nested rename", invocation_id="nested-rename")
+            assert result["success"] is True and result["db_row_written"] is True, result
+            assert agent._agent_name == "NestedRenamed"
+            assert await _metadata_value(raw, "name") == "NestedRenamed"
+            assert (await raw.get_node(AGENT_ID)).label == "NestedRenamed"
+            assert await agent.tool_effect_store.database.fetchall(
+                "SELECT state FROM tool_effect_claims") == [("RETURNED_OK",), ("RETURNED_OK",)]
+    finally:
+        await harness.stop()
 
 
 @pytest.mark.asyncio
@@ -2882,3 +2819,43 @@ async def test_agent_node_openrouter_key_hash_free_text_rejected(
         with pytest.raises(PrivacyViolationError):
             await wrapper.add_node(node, capability=CAP)
         assert await raw.get_node(AGENT_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_privacy_reader_keeps_withdrawal_through_physical_callback_completion(tmp_path):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    entered, finish = asyncio.Event(), asyncio.Event()
+    receipt = tmp_path / 'privacy-reader-settled'
+    harness = OwnedCallbackReader()
+    await harness.start()
+
+    async def execute(name, arguments):
+        entered.set()
+        await finish.wait()
+        receipt.write_text('original privacy callback settled')
+        return arguments, {'success': True}
+
+    calling = asyncio.create_task(harness.dispatch(execute, 'original', {}))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=0.5)
+        calling.cancel('original privacy reader withdrawal')
+        await asyncio.sleep(0)
+        assert not calling.done(), 'Privacy reader abandoned its accepted callback'
+        finish.set()
+        completed, pending = await asyncio.wait({calling}, timeout=0.5)
+        assert not pending, 'Privacy reader did not collect its original callback'
+        with pytest.raises(BaseException) as caught:
+            await calling
+        evidence = execution_evidence_carriers(caught.value)
+        assert any(isinstance(error, asyncio.CancelledError)
+            and error.args == ('original privacy reader withdrawal',) for error in evidence), (
+                'Privacy reader replaced the original caller withdrawal')
+        assert not any(isinstance(error, asyncio.InvalidStateError) for error in evidence)
+        assert receipt.read_text() == 'original privacy callback settled'
+    finally:
+        finish.set()
+        if not calling.done():
+            calling.cancel()
+        await asyncio.gather(calling, return_exceptions=True)
+        await harness.stop()

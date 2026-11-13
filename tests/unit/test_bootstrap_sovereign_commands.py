@@ -18,18 +18,16 @@ from kestrel_sovereign.command_policy import (
     SAFE_MODE_COMMANDS,
     SOVEREIGN_COMMANDS,
 )
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.kestrel_agent import KestrelAgent, _BootstrapReply
 
 
-def _bootstrap_agent() -> KestrelAgent:
+async def _bootstrap_agent(*, native_tool_effect_agent) -> KestrelAgent:
     """Build the smallest initialized agent that exercises ``process_input``."""
-    agent = KestrelAgent.__new__(KestrelAgent)
-    agent.storage = object()
+    agent = await native_tool_effect_agent(did="did:test:bootstrap")
     agent._safe_mode = False
     agent._constitution_audit_pending = False
     agent.did = "did:test:bootstrap"
-    agent.privacy_agent = MagicMock()
-    agent.privacy_agent.get_status.return_value = "Privacy: normal"
+    agent.privacy_agent.get_status = MagicMock(return_value="Privacy: normal")
     agent._maybe_refresh_user_byok_resolver = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent._maybe_audit = AsyncMock()
@@ -41,15 +39,15 @@ def _bootstrap_agent() -> KestrelAgent:
     agent._turn_lifecycle = _noop_lifecycle
     agent.bootstrap_service = MagicMock()
     agent.bootstrap_service.is_bootstrap_needed = AsyncMock(return_value=True)
-    agent._handle_bootstrap = AsyncMock(return_value="onboarding greeting")
+    agent._handle_bootstrap = AsyncMock(return_value=_BootstrapReply("onboarding greeting", None, None))
     agent._post_response_pipeline = AsyncMock()
     agent.command_handler = CommandHandler(agent)
     return agent
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_reanchor_command_reaches_sovereign_command_handler():
-    agent = _bootstrap_agent()
+async def test_bootstrap_reanchor_command_reaches_sovereign_command_handler(*, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
     caller = CallerContext.sovereign()
     real_handle = agent.command_handler.handle
     agent.command_handler.handle = AsyncMock(wraps=real_handle)
@@ -69,8 +67,8 @@ async def test_bootstrap_reanchor_command_reaches_sovereign_command_handler():
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_safe_mode_command_reaches_sovereign_command_handler():
-    agent = _bootstrap_agent()
+async def test_bootstrap_safe_mode_command_reaches_sovereign_command_handler(*, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
     caller = CallerContext.sovereign()
     real_handle = agent.command_handler.handle
     agent.command_handler.handle = AsyncMock(wraps=real_handle)
@@ -90,8 +88,8 @@ async def test_bootstrap_safe_mode_command_reaches_sovereign_command_handler():
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_verify_constitution_returns_blocked_diagnostic():
-    agent = _bootstrap_agent()
+async def test_bootstrap_verify_constitution_returns_blocked_diagnostic(*, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
     del agent._genesis_audit_cognition_block
     agent._ensure_genesis_audit_ready = AsyncMock(
         side_effect=AssertionError("verification command must bypass genesis cognition")
@@ -120,8 +118,8 @@ async def test_bootstrap_verify_constitution_returns_blocked_diagnostic():
     ],
 )
 @pytest.mark.asyncio
-async def test_bootstrap_allows_read_only_diagnostic_commands(command, expected):
-    agent = _bootstrap_agent()
+async def test_bootstrap_allows_read_only_diagnostic_commands(command, expected, *, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
 
     result = await agent.process_input(command)
 
@@ -134,8 +132,8 @@ async def test_bootstrap_allows_read_only_diagnostic_commands(command, expected)
     ["!get-privacy-mode", "!privacy-status", "!bootstrap-status"],
 )
 @pytest.mark.asyncio
-async def test_bootstrap_allows_established_readiness_diagnostics(command):
-    agent = _bootstrap_agent()
+async def test_bootstrap_allows_established_readiness_diagnostics(command, *, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
     agent.command_handler.handle = AsyncMock(return_value="diagnostic handled")
 
     result = await agent.process_input(command)
@@ -146,8 +144,8 @@ async def test_bootstrap_allows_established_readiness_diagnostics(command):
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_non_recovery_command_returns_explicit_command_result():
-    agent = _bootstrap_agent()
+async def test_bootstrap_non_recovery_command_returns_explicit_command_result(*, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
     agent.command_handler.handle = AsyncMock(return_value="command unexpectedly ran")
 
     result = await agent.process_input("!tasks")
@@ -160,8 +158,8 @@ async def test_bootstrap_non_recovery_command_returns_explicit_command_result():
 
 
 @pytest.mark.asyncio
-async def test_ordinary_prompt_containing_command_tokens_stays_in_onboarding():
-    agent = _bootstrap_agent()
+async def test_ordinary_prompt_containing_command_tokens_stays_in_onboarding(*, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
     agent.command_handler.handle = AsyncMock(return_value="command unexpectedly ran")
     prompt = "Please explain !status and !reanchor-constitution before we begin."
 
@@ -170,12 +168,12 @@ async def test_ordinary_prompt_containing_command_tokens_stays_in_onboarding():
     assert result == "onboarding greeting"
     agent.command_handler.handle.assert_not_awaited()
     agent._handle_bootstrap.assert_awaited_once()
-    agent._post_response_pipeline.assert_awaited_once()
+    agent._post_response_pipeline.assert_awaited_once_with(user_message_id=None, assistant_message_id=None)
 
 
 @pytest.mark.asyncio
-async def test_one_shot_legacy_policy_cannot_split_routing_from_authorization():
-    agent = _bootstrap_agent()
+async def test_one_shot_legacy_policy_cannot_split_routing_from_authorization(*, native_tool_effect_agent):
+    agent = (await _bootstrap_agent(native_tool_effect_agent=native_tool_effect_agent))
     one_shot_sovereign_commands = iter(["!reanchor-constitution"])
     agent.command_handler.SOVEREIGN_COMMANDS = one_shot_sovereign_commands
 

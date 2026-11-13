@@ -36,6 +36,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerRequester,
     PeerSelfTargetError,
     PeerTransportError,
+    create_local_host_http_client,
 )
 from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
@@ -230,9 +231,8 @@ class PeersFeature(Feature):
             host_url,
             execution_custody=getattr(self.agent, "_execution_custody", None),
             transport_key=getattr(self, "_transport_key", ""),
-            client_factory=lambda *args, **kwargs: httpx.AsyncClient(
-                *args,
-                **kwargs,
+            client_factory=lambda *args, **kwargs: create_local_host_http_client(
+                *args, client_factory=httpx.AsyncClient, **kwargs,
             ),
             native_session_factory=getattr(self, "_native_session_factory", None),
         )
@@ -739,8 +739,8 @@ class PeersFeature(Feature):
     )
     @execution_work_operation
     async def ask_agent(self, agent_name: str, message: str) -> ToolResult:
-        from kestrel_sdk.native_a2a.types import Message
         from google.protobuf.json_format import MessageToDict
+        from kestrel_sdk.native_a2a.types import Message
 
         from kestrel_sovereign.a2a.projections import message_text
 
@@ -800,9 +800,9 @@ class PeersFeature(Feature):
         """The common native request, reservation and send path for peer tools."""
         from uuid import uuid4
 
+        from google.protobuf.json_format import ParseDict, ParseError
         from kestrel_sdk.native_a2a.types import Message, Part, Role, SendMessageRequest
         from kestrel_sdk.native_a2a.utils.errors import A2AError
-        from google.protobuf.json_format import ParseDict, ParseError
 
         from kestrel_sovereign.a2a.extensions import (
             PEER_STOP_URI,
@@ -974,8 +974,8 @@ class PeersFeature(Feature):
 
     @staticmethod
     def _native_dispatch_result(receipt, recipient: str) -> ToolResult:
-        from kestrel_sdk.native_a2a.types import Message
         from google.protobuf.json_format import MessageToDict
+        from kestrel_sdk.native_a2a.types import Message
 
         data = {
             "sent": True,
@@ -1158,8 +1158,8 @@ class PeersFeature(Feature):
 
     @staticmethod
     def _native_peer_result(dispatch, response):
-        from kestrel_sdk.native_a2a.types import Message
         from google.protobuf.json_format import MessageToDict
+        from kestrel_sdk.native_a2a.types import Message
 
         from kestrel_sovereign.a2a.projections import message_text
 

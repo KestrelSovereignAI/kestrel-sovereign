@@ -11,7 +11,7 @@ call (a thought signature) crashed on ``None.name``.
 These tests pin:
 
 * a request with tools carries them on its config as ``function_declarations``
-  (``GenerateContentConfig.tools``), on the plain and the streamed path, and a
+  (``GenerateContentConfig.tools``), on non-streaming and tool-aware streams; a
   request without tools carries no ``tools`` key at all;
 * a ``function_call`` part becomes a ``ToolCall``, and a part whose
   ``function_call`` is ``None`` never does;
@@ -23,7 +23,6 @@ These tests pin:
 from __future__ import annotations
 
 import json
-import logging
 from types import SimpleNamespace
 from typing import Any, List
 from unittest.mock import AsyncMock
@@ -31,6 +30,7 @@ from unittest.mock import AsyncMock
 import pytest
 from pydantic import BaseModel
 
+from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
 
@@ -140,16 +140,14 @@ async def test_get_response_sends_the_tools_as_function_declarations():
 
 
 @pytest.mark.asyncio
-async def test_streaming_response_sends_the_tools_as_function_declarations():
+async def test_plain_stream_refuses_tools_before_native_request():
     client = _client(chunks=[_chunk([_text("Sunny")], text="Sunny")])
-
-    streamed = await _collect(VertexAIAdapter().get_streaming_response(
-        client=client, model=MODEL, messages=MESSAGES, tools=TOOLS,
-    ))
-
-    assert streamed == ["Sunny"]
-    config = _sent_config(client.aio.models.generate_content_stream)
-    assert config["tools"] == [{"function_declarations": EXPECTED_DECLARATIONS}]
+    with pytest.raises(LLMProtocolError):
+        await _collect(VertexAIAdapter().get_streaming_response(
+            client=client, model=MODEL, messages=MESSAGES, tools=TOOLS,
+        ))
+    client.aio.models.generate_content_stream.assert_not_called()
+    client.aio.models.generate_content.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -168,7 +166,7 @@ async def test_a_request_without_tools_carries_no_tools_key(tools):
     await adapter.get_response(
         client=client, model=MODEL, messages=MESSAGES, tools=tools, max_tokens=64,
     )
-    await _collect(adapter.get_streaming_response(
+    await _collect(adapter._stream_with_usage(
         client=client, model=MODEL, messages=MESSAGES, tools=tools, max_tokens=64,
     ))
 
@@ -265,8 +263,10 @@ async def test_streaming_with_tools_surfaces_the_call_end_to_end():
         client=client, model=MODEL, messages=MESSAGES, tools=TOOLS,
     ))
 
-    assert len(items) == 1
-    response = items[0]
+    assert len(items) == 2
+    assert isinstance(items[0], ToolCallStarted)
+    response = items[1]
+    assert items[0].id == response.tool_calls[0].id
     assert isinstance(response, LLMResponse)
     assert response.has_tool_calls
     assert [(c.name, c.arguments) for c in response.tool_calls] == [
@@ -301,20 +301,14 @@ async def test_a_streamed_function_call_rides_the_terminal_response():
 
 
 @pytest.mark.asyncio
-async def test_the_text_only_stream_logs_a_call_it_cannot_carry(caplog):
+async def test_plain_stream_refuses_unrequested_native_function_call():
     client = _client(chunks=[
         _chunk([_call("get_weather", {"location": "Tokyo"})], finish_reason="STOP"),
     ])
-
-    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.llm.vertex_adapter"):
-        streamed = await _collect(VertexAIAdapter().get_streaming_response(
-            client=client, model=MODEL, messages=MESSAGES, tools=TOOLS,
+    with pytest.raises(LLMProtocolError):
+        await _collect(VertexAIAdapter().get_streaming_response(
+            client=client, model=MODEL, messages=MESSAGES,
         ))
-
-    assert streamed == []
-    dropped = [r for r in caplog.records if "text-only stream" in r.getMessage()]
-    assert len(dropped) == 1
-    assert "get_weather" in dropped[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +318,7 @@ async def test_the_text_only_stream_logs_a_call_it_cannot_carry(caplog):
 
 def _real_vertex_client(handler):
     genai = pytest.importorskip("google.genai")
-    httpx = pytest.importorskip("httpx")
+    httpx = pytest.importorskip("httpx2")
     genai_types = pytest.importorskip("google.genai.types")
     oauth2 = pytest.importorskip("google.oauth2.credentials")
     if "httpx_async_client" not in genai_types.HttpOptions.model_fields:
@@ -371,7 +365,7 @@ _CALL_CANDIDATE = {
 
 @pytest.mark.asyncio
 async def test_real_sdk_puts_the_declarations_on_the_vertex_wire_and_reads_the_call():
-    import httpx
+    import httpx2 as httpx
 
     sent = []
 
@@ -390,8 +384,10 @@ async def test_real_sdk_puts_the_declarations_on_the_vertex_wire_and_reads_the_c
     body = json.loads(sent[0].content)
     assert body["tools"] == [{"functionDeclarations": _WIRE_DECLARATIONS}]
 
-    assert len(items) == 1
-    response = items[0]
+    assert len(items) == 2
+    assert isinstance(items[0], ToolCallStarted)
+    response = items[1]
+    assert items[0].id == response.tool_calls[0].id
     assert response.has_tool_calls
     assert [(c.name, c.arguments) for c in response.tool_calls] == [
         ("get_weather", {"location": "Tokyo"}),
@@ -401,7 +397,7 @@ async def test_real_sdk_puts_the_declarations_on_the_vertex_wire_and_reads_the_c
 
 @pytest.mark.asyncio
 async def test_real_sdk_stream_puts_the_declarations_on_the_wire_and_carries_the_call():
-    import httpx
+    import httpx2 as httpx
 
     sent = []
 
@@ -434,7 +430,7 @@ async def test_real_sdk_stream_puts_the_declarations_on_the_wire_and_carries_the
 
 @pytest.mark.asyncio
 async def test_real_sdk_request_without_tools_has_no_tools_on_the_wire():
-    import httpx
+    import httpx2 as httpx
 
     sent = []
 

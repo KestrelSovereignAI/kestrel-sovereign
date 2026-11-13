@@ -27,7 +27,7 @@ from uuid import uuid4
 
 from kestrel_sdk.operator import OperatorContext
 from kestrel_sdk.storage.database import DatabaseBackend
-from kestrel_sovereign.auth import CallerContext, caller_context_scope, current_caller_context
+from kestrel_sovereign.auth import CallerContext, caller_context_scope, caller_identity_digest, current_caller_context
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.security.capability_authority import (
     AsyncReaderWriterLock, HostCapabilityAccessDenied, HostCapabilityAuthority,
@@ -153,12 +153,6 @@ class MCPOAuthAction(StrEnum):
     READ = "mcp-oauth.read"
     CANCEL = "mcp-oauth.cancel"
     DISCONNECT = "mcp-oauth.disconnect"
-
-
-def _principal_id(caller: CallerContext) -> str:
-    # A credential lane and role cannot alias a different lane's equal-looking subject.
-    value = [caller.role.value, caller.auth_method.value, caller.identity]
-    return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -386,7 +380,7 @@ class MCPOAuthConnectionLease:
         self._require_owner()
         authentication = current_request_authentication()
         if (authentication is None or current_caller_context() is not authentication.caller
-                or _principal_id(authentication.caller) != self._principal_id):
+                or caller_identity_digest(authentication.caller) != self._principal_id):
             raise HostCapabilityAccessDenied("original MCP OAuth principal is required")
         authentication.require_current()
         self._renew(authentication)
@@ -466,7 +460,7 @@ class MCPOAuthHost:
         if authentication.expires_at is not None:
             deadline = min(deadline, authentication.expires_at)
         return OperatorContext(tenant_id=self._agent_id, acting_agent_id=self._agent_id,
-            principal_id=_principal_id(authentication.caller),
+            principal_id=caller_identity_digest(authentication.caller),
             granted_actions=frozenset(action.value for action in MCPOAuthAction),
             granted_capabilities=frozenset({"mcp-oauth"}),
             permitted_boundary_ids=frozenset({self._agent_id}),

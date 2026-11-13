@@ -38,6 +38,7 @@ from kestrel_sdk.signals import (
 )
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from tests.unit.test_non_streaming_turn_privacy_span import _turn_agent
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     PreTurnRefusal,
@@ -401,26 +402,9 @@ async def test_an_admitting_guard_runs_the_turn_once_with_its_signal(
 # ---------------------------------------------------------------------------
 
 
-def _real_turn_agent(did: str) -> KestrelAgent:
-    """A real agent stopped just short of the machinery a turn body needs."""
-    agent = KestrelAgent(did=did, storage_path=":memory:")
-    agent.storage = object()
-    agent.context_manager = object()
-    agent.bootstrap_service = None
-    agent._safe_mode = False
-
-    async def _noop(*args, **kwargs):
-        return None
-
-    agent._maybe_audit = _noop
-    agent._maybe_refresh_user_byok_resolver = _noop
-    agent._genesis_audit_cognition_block = _noop
-    return agent
-
-
 @pytest.mark.asyncio
 async def test_refusal_survives_the_real_process_input_task_boundary(
-    tmp_path, template
+    tmp_path, template, native_tool_effect_agent
 ):
     """`PreTurnRefusal` must reach the dispatcher intact from the real agent.
 
@@ -431,7 +415,7 @@ async def test_refusal_survives_the_real_process_input_task_boundary(
     exception gets mangled into something generic, which would turn this policy
     decision into `Status.FAILED` with a traceback. Pin the whole path.
     """
-    agent = _real_turn_agent("did:test:3310-real-refusal")
+    agent = await _turn_agent("did:test:3310-real-refusal", native_tool_effect_agent)
     turn_bodies: list[str] = []
 
     async def traced(user_input, *args, **kwargs):
@@ -491,9 +475,9 @@ async def test_refusal_survives_the_real_process_input_task_boundary(
 
 
 @pytest.mark.asyncio
-async def test_real_process_input_admits_and_runs_the_turn(tmp_path, template):
+async def test_real_process_input_admits_and_runs_the_turn(tmp_path, template, native_tool_effect_agent):
     """The admitting case on the same real path, so the refusal test can fail."""
-    agent = _real_turn_agent("did:test:3310-real-admit")
+    agent = await _turn_agent("did:test:3310-real-admit", native_tool_effect_agent)
     turn_bodies: list[str] = []
     locked_in_body: list[bool] = []
 
@@ -534,7 +518,7 @@ async def test_real_process_input_admits_and_runs_the_turn(tmp_path, template):
 
 @pytest.mark.asyncio
 async def test_a_transition_inside_the_dispatch_cannot_reach_the_turn(
-    tmp_path, template
+    tmp_path, template, native_tool_effect_agent
 ):
     """#3310 acceptance: the reproduction yields no turn.
 
@@ -554,18 +538,7 @@ async def test_a_transition_inside_the_dispatch_cannot_reach_the_turn(
     """
     from kestrel_sovereign.privacy import PrivacyMode
 
-    agent = KestrelAgent(did="did:test:3310-repro", storage_path=":memory:")
-    agent.storage = object()
-    agent.context_manager = object()
-    agent.bootstrap_service = None
-    agent._safe_mode = False
-
-    async def _noop(*args, **kwargs):
-        return None
-
-    agent._maybe_audit = _noop
-    agent._maybe_refresh_user_byok_resolver = _noop
-    agent._genesis_audit_cognition_block = _noop
+    agent = await _turn_agent("did:test:3310-repro", native_tool_effect_agent)
 
     flipped = asyncio.Event()
     turn_prompts: list[str] = []

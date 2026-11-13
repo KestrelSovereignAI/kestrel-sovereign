@@ -15,6 +15,162 @@ tags:
 Core issue #3569 extends existing PostgreSQL advisory and native transaction
 custody. This is a host authority contract, not a causation-derived permission.
 
+Privacy policy retention and exclusive execution have separate lifetimes within
+one `ReentrantTransitionLock`. Journal admission records the original native
+lifetime without pinning policy, so independent approvals and privacy revocation
+can progress. Turn entry uses `policy_span()` after the conversation lock; a
+non-turn invocation activates its policy span at the first effect. Each effect
+and identity write acquires the exclusive writer through classification and
+settlement. Releasing that writer does not delay asynchronous acceptance: the
+original journal lifetime retains accepted workers until journal finalization.
+An explicit resident task context preserves runtime ownership and cannot enroll
+a continuing service as an invocation child. A captured token identifies the live policy span and
+never grants writer ownership or original execution admission. Ordinary token
+writers are distinct from the original root and accepted native children;
+neither an effect nor child acceptance can borrow their token membership.
+Concurrent original members join one first activation of their lifetime.
+Privacy draining excludes callers actually waiting for the current task,
+whose completion depends on its return, while still joining independent peers.
+Each durable shared frame has one live gate-owned record; copied context routes
+reentry but cannot substitute for the actual frame owner during cycle checks.
+
+The shared native task helpers record exact accepted tasks before dispatch.
+`owned_native_wait` records actual must-join dependencies for every static task
+and each original callback accepted during its wait. Gather, bounded joins and
+callback readers share that observation boundary; creation ancestry cannot
+substitute for an actual wait or grant execution authority. An owned join parks the current writer for those original execution owners and
+restores its full frame before any parent continuation or exception handler
+resumes. A close wrapper may delegate that loan to an original source sibling
+only through active waits whose endpoints have original admission in the same
+lifetime. Borrowed observers and generic join ancestry cannot bridge that path.
+Bounded observation includes writer restoration: later withdrawals remain with
+the first cancellation, and the original task is sampled after restoration.
+A still-pending handoff retains its exact task and finite observation errors;
+shared native-source projections exclude the observer's cancellations.
+Writer restoration, privacy lifetime closure, native-work joins and journal
+closure use the same finite observation composer. It keeps original cause and
+group graphs intact; an ordinary cancellation envelope retains its original
+withdrawal while preserving each original in its explicit graph. Codex sends
+failed native callback admission to the original turn even if the callback
+body never entered. The shared Codex connection retains only native source
+facts, while each turn receives its own complete observation evidence.
+Both bounded and ordinary joins retain a successful collected result when
+writer restoration adds an independent observation error.
+
+Stream taps transfer short provider work through the actual text producer's
+native factory, rather than treating its policy token as child admission.
+`AgentStreamTap.producer_privacy()` is an asynchronous context manager yielding
+that factory. Provider acquisition and each sentence finish within this native
+admission; waiting for more text does not hold a provider writer. If the text
+lifetime is closing, admission waits for its original physical work and the
+acknowledged drain handoff. A successful final drain retains the same request
+generation and receives a native factory for its own policy decision. The
+native worker binds the privacy identity established by its actual admission,
+clearing a copied retired text token when it opens a fresh policy span. All
+other turn values come from the consumer context copied at Task construction;
+the tap does not rebind any part of the consumer's turn context by hand.
+Stopped, foreign, or unsuccessfully completed deliveries cannot admit work.
+
+`reserve_execution_stream()` reserves that original native producer before its
+parent admission closes, using the same forwarder as `execution_stream()`.
+Reservation does not advance the source: its first admitted consumer pull opens
+the dispatch gate. Every later consumer adds its custody to that same producer,
+including work already queued on a native executor. A lifecycle may derive its
+descendant factory inside the actually admitted producer; copying the original
+parent factory cannot authorize descendants after that parent begins closing.
+An invalid descendant lifecycle fails before source work. Callers must close a
+reserved stream even when it is never pulled. The forwarder retains one owned
+close operation across repeated or concurrent observers, preserving original
+admission and physical-close failures without closing the source twice. A
+reserved producer that never entered its body is joined before its acquired
+source is closed; an entered generator advances and closes in its original Task
+and context.
+Children already queued before a later consumer retain the shared stream scope
+membership too. Work checks and explicit backend snapshots read that membership
+at dispatch; authority validation also locks scopes added during an original
+validator's wait. Current visual-row admissions capture a read-only work check
+over those same live scope references; a queued native COMMIT checks them again
+inside its actual SQLite worker, where event-loop ContextVars are unavailable.
+This check grants no authority and does not change original-result privileges.
+
+The forwarder reserves its single retirement owner before producer admission.
+A lifecycle cleanup factory admits that owner into the original native lifetime
+without holding a privacy writer while it waits for a close request. Each close
+observer lends its writer to that same admitted retirement owner; its actual
+source join can delegate the loan to the original producer. A failed producer
+does not have to remain writer-eligible for an acquired source to be closed.
+Producer completion opens the retirement gate even without another consumer
+pull. Failed cleanup admission retains the acquired resource and exact accepted
+task, when any, and refuses payload dispatch. The producer registration callback
+keeps its two-argument physical-owner contract. Optional resource registration
+also receives the forwarder, allowing a feature to keep that original producer
+in its inventory until the retained retirement task settles.
+
+Close suppresses only its own private interruption of an unentered producer;
+native admission/COMMIT failures and real observer withdrawals remain visible.
+Finite close observations use the canonical observation composer for ordinary
+errors too, preserving each retained source graph and excluding an earlier
+caller's withdrawal from later observers. Invalid cleanup factories must fail
+with resource debt: neither an absent return nor a published non-Task value is
+an admitted physical retirement owner. Repeated close retains an original
+cancellation carrying native control; it does not acknowledge that failure away.
+The native Task must carry this exact original admission binding; a completed
+Task borrowed from another operation cannot certify cleanup. After terminal
+consumption, any unacknowledged physical source close still harvests the same
+producer and watcher outcome, including entered sources, without closing twice.
+Terminal-marker delivery can precede the producer's native epilogue. Retirement
+joins that same producer and watcher even while either remains pending. A
+delivered body error or work-only refusal does not itself mean physical close
+failed; it can be omitted only after the terminal reader joined without
+withdrawal and the original source close acknowledged. A separate native
+epilogue or watcher failure, COMMIT/UNKNOWN evidence, and retirement debt remain
+visible. Source-only control projection is not a filter for ordinary physical
+errors.
+Genuine source cancellation remains visible even after terminal delivery; only
+the iterator's own requested close interruption can be suppressed. The shared
+terminal classifier also preserves SDK effect uncertainty. A bare work refusal
+is not a physical close failure, but its cause cannot hide an uncertain effect.
+Source unwinding, cancellation observation, and requested-close suppression use
+the same terminal classifier. Once the source has handled its private close
+interruption, a later completion-publication failure is independent evidence,
+including a plain cancellation. A prior cancellation request cannot acknowledge
+that later failure away. Terminal inspection reads the original task receipt.
+Watcher Stop suppression additionally requires the exact original cancellation
+recorded from an actual watcher cancellation request. Independent watcher
+publication and completion failures stay visible even when they are plain
+cancellation. Before its first step, a failed watcher cannot cancel the source
+unless the watcher itself received a real cancellation request; uncertain
+completion evidence remains a failure rather than that private handoff.
+Writer restoration preserves a collected physical-close result alongside a
+later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
+original admission failure; the closer observes the canonical source-owner
+outcome without starting or closing another source.
+
+Closing journal admission uses the original native parent-admission tree of a
+retained worker, not the writer-loan wait graph. Its admitted gather children can
+finish in the original journal; unrelated native siblings and copied-context
+observers cannot obtain that business authority. Python task ancestry alone is
+not a native admission receipt.
+
+Gather retains this barrier through sibling cancellation and physical
+harvesting. Stream producers relinquish the writer at the controlled item
+handshake and reacquire it before advancing. Codex reader callbacks use an
+original callback cohort accepted before their task gate opens. Arbitrary Event
+waits, copied context, and eventual join edges cannot lend a writer.
+
+Span closure closes root factories and drains original accepted work before
+releasing policy retention. Accepted continuations retain their original native
+receipts while closing; stale tokens and factories fail explicitly. Journal
+completion signals retain their exact executor association rather than acting
+as execution identities themselves.
+
+SDK 0.51.2's shared host error policy preserves original decorated-tool errors
+when the host declares durable effect ownership. Core classifies an ordinary
+post-dispatch exception as unconfirmed before task, workflow, or transport
+projection. An explicit returned failure or a nominal known resource conflict
+remains a definite returned error. Existing cancellation, control, and unknown
+outcome carriers retain their original identity and evidence.
+
 Corpus-profile surveys and operator reindexing preserve original native control
 before unreadable-table/zero-count fallbacks, batch splitting, failed-row
 accounting or registry/parity success. Actual localhost SDK outputs, scoped
@@ -807,7 +963,31 @@ is terminal FAILED, never ordinary RETRY or terminal-ACKable; a retained route's
 late control outcome uses the same rule. Native terminal cleanup is a fixed
 original agent/consumer/delivery/owner/token CAS on the existing backend, not a
 generic SQL executor or new admission. No new provider cursor acknowledgement
-is inferred. Failed terminal writes remain exact-identity cleanup debt and block
+is inferred. SDK outcome uncertainty and unconfirmed required audits use this
+same nonretryable delivery rule through completed-result reads, claim settlement,
+retained-task cleanup and public error propagation. They do not imply Core
+authority loss. Delivery retention explicitly opts into
+`execution_native_source_error(..., include_tool_terminal=True)`; its default
+Core source projection and the authority predicate remain unchanged. The opt-in
+recovers exact original SDK/audit sources from canonical finite envelopes and
+excludes unrelated observer withdrawals, rather than retaining observer history.
+Completed cognition reads share one canonical outcome reader, including the
+returned result as well as the Task's exception. A reconciliation result retains
+its actual original exception in a private slot that is absent from public
+dataclass fields and serialization. Immediate and retained reconciliation both
+join the same exact-token terminalizer. A failed terminal write retains that
+source and its original claim for bounded metadata reconciliation, rather than
+releasing work for replay. The terminal row uses the canonical content-free
+failure message. The shared tool-delivery classifier also covers operation
+conflict, superseded/closed attempts and existing-operation reconciliation;
+their meaning cannot be downgraded by an ordinary sibling error. Core authority
+classification remains separate.
+Signal delivery observers read the canonical original completion after a native
+success as well as after exceptions. SDK/audit uncertainty cannot authorize a
+successful checkpoint or ordinary replay restoration. Their supervisor finalizer
+uses the same finite observation composer to retain an independent finalizer
+failure without changing the original source graph or public SDK/audit type.
+Failed terminal writes remain exact-identity cleanup debt and block
 clean owner release. Cleanup liveness can update only an existing unstopped
 managed owner that still holds a leased or receipt-pending retry cognition,
 under the canonical recovery
@@ -1068,8 +1248,15 @@ Repeated retries retain bounded diagnostic notes rather than
 manufacturing another owner or acknowledgement. Operator reconciliation is
 required when the original lease can no longer establish terminal state.
 
-The first distributed Stop admission settles control-bearing renewal failures
-as `ABANDONED` before asynchronous cleanup can claim `COMPLETED`. Both native
+The first distributed Stop admission settles control-bearing failures of its
+confirmation read as `ABANDONED` before asynchronous cleanup can claim
+`COMPLETED`. (Only the owner heartbeat, on its own thread and connection,
+renews the owner lease; #3889.) Control a heartbeat renewal raised outranks
+every lease-loss outcome of admission and turn binding: the caller receives
+that original exception, and from then on the registry settles no generation
+as `COMPLETED`, only as `ABANDONED`. A settlement decides again once its
+transaction holds the database, before it deletes anything, so one that was
+queued behind another writer when the renewal failed is `ABANDONED` too. Both native
 HTTP and bridge invocation/streaming routes classify explicit control causes
 before ordinary Stop, retry, refusal or provider-error normalization. Source
 closure and transport cleanup select original terminal evidence before later
@@ -2124,3 +2311,172 @@ not completed-worker exception history or writes onto another operation's source
 Advisory cleanup records and joins the accepted original closer even if its
 callback publication fails. Whole-agent shutdown separately retains its current
 caller's finite evidence without publishing that caller history into shared state.
+
+
+Tool-effect operation closure also certifies pre-claim work. A required audit
+can become uncertain before any business claim exists. The original native
+terminal writer persists that uncertainty in the operation latch without
+inventing a claim or changing an acknowledged business result. An operation key
+is single use. Both interrupted OPEN and completed CLOSED operations require
+reconciliation on reuse, including claim-free and NOT_EXECUTED attempts. A
+physical CLOSED row cannot certify that the original caller observed its COMMIT
+acknowledgment. Removing a refusal or restarting cannot reopen that key. A new
+explicit intention receives a fresh key; it never supersedes the old attempt.
+
+Finite composition preserves the public SDK ResourceOutcomeUnknown type and
+the first uncertainty diagnostic in a fresh envelope. Its explicit cause keeps
+all original errors; the originals' causes remain immutable. Native control
+and explicitly preferred caller cancellation retain their existing priority.
+
+Codex request publication stays behind the original accepted Task's gate until
+cohort and request/active-inventory publication succeed. A refused publication
+cannot dispatch the tool. The physical wrapper owns scoped completion reporting,
+which cannot hide behind a failed payload gate or Task callback subscription.
+The exact accepted Task remains in its original callback cohort and settles
+before that cohort retires. The adapter joins the cohort even when inventory
+publication failed; ordinary scoped failures do not retire a foreign thread's
+shared connection.
+
+
+Journal seal follows physical native completion, including required audits that
+have not created business claims. The privacy coordinator owns one canonical
+join routine. Journal closure joins its actual admitting Task's accepted native
+descendants without retiring borrowed outer privacy backing or joining its
+ancestors/unrelated cohorts. It harvests original native control and retirement
+debt even when a descendant completed before closure began. Ordinary errors
+from task ancestry do not establish this journal's business uncertainty. General
+privacy cleanup still joins outstanding owners without replaying handled errors.
+Only then does the fixed original terminal writer
+capture and persist operation uncertainty. The final privacy retirement reuses
+the same join routine and additionally waits for its physical writer.
+
+An owned Task can supply a synchronous completion publisher. The canonical
+physical wrapper invokes it outside the payload start gate, after settling the
+body, even if Task callback subscriptions failed. A publisher's failure retains
+all original causes in a fresh finite envelope. Declared async functions,
+callable objects and async generators refuse before native allocation. Deferred
+return values fail clearly; they cannot silently leave completion unobserved.
+Codex stores the original publisher/caller snapshot with its exact accepted Task
+in one inventory. It does not depend on fallible duplicate Task metadata or a
+second callback subscription. Connection retirement harvests that same publisher
+if cancellation prevented the Task from taking its first step. A caller snapshot
+used to classify a scoped refusal still confers no business authority.
+
+After an inline tool returns, a failed Codex reply is delivery uncertainty.
+The original physical completion owner publishes it to the journal captured at
+registration and to the original handler's terminal latch, independently of the
+resident reader's context or a turn event consumer. It blocks a later live
+effect and survives operation closure without changing confirmed claims or
+successful required audit rows. The original send error remains explicit.
+
+Stream-journal exit and source close use immutable finite observation composition.
+An original native closer error cannot acquire GeneratorExit or another finite
+observer's cause in its own original graph.
+
+OwnedTaskHandoff owns a finite native outcome through delivery. Streaming
+producers keep its handoff active until consumer advance; non-streaming journal
+returns keep that same handoff active through journal retirement. If retirement
+raises before the result reaches its consumer, both the native source and the
+original caller withdrawal remain explicit. The handoff grants no work authority.
+Every source graph, including ordinary SDK unknowns and cancellation, stays
+immutable when the consumer itself fails; the canonical observation composer
+retains the finite delivery error separately.
+
+A fresh explicit intent must pass its original caller's live/native-scope and
+uncertainty checks before durable admission. Admitted same-input nested turns
+share one live uncertainty fence in both directions, while retaining distinct
+durable operation keys. No copied context or unrelated task acquires authority.
+The live fence also observes already-completed native controls through the same
+original-child selector used by journal closure. It projects physical sources,
+not a finite observer's withdrawal or ordinary foreign consumer failures.
+
+Claim admission and protected pre-body audit use the same reconciliation
+classification as Root closure. A native COMMIT acknowledgment or retirement
+failure reaches the live journal latch before an enclosing feature can catch it
+and request another effect. Known validation refusals remain recoverable. Claim
+counts reflect the actual SQL outcome; uncertainty never invents a business claim.
+
+Operation uncertainty includes the Root's original SDK unknown-outcome, native
+commit outcome and unresolved native retirement debt, even if no individual
+business claimant populated the live uncertainty list. Known claim-free
+precondition refusals retain their known classification and can be followed by
+a new explicit intention. They never authorize implicit reuse of the closed
+operation key or invent an uncertain business claim. Aggregated denial scopes preserve exact
+original scope identities and membership; finite composition does not promise
+a particular ordering for independent source errors.
+
+A journal publishes its own qualifying terminal into that shared live fence
+before its first retirement await, after joining native owners, and if the
+terminal writer fails. The fixed writer derives its persistent latch from the
+same fence. Claim-free SDK unknowns therefore cannot close a nested operation
+and then resume an unfenced parent, even on the same original Task or while
+native retirement remains pending. Repeated publication retains one original
+terminal carrier; known refusals remain recoverable.
+
+An independent input detaches inherited business context only when no original
+native privacy lifetime belongs to its executing Task and the canonical request
+registration/bound-operation inventory proves that exact Task owns its active
+delivery. Registration records its original Task weakly; a copied generation or
+an agent-global active projection grants no such ownership. Actual nested native
+members retain their parent's fence. Matching copied retry ids/generations also
+cannot reuse a live journal from another Task: a fresh input must readmit the
+original durable key and honor OPEN/reconciliation and input-conflict refusal.
+Publishing a request-operation binding also requires an original active owner;
+a copied requester cannot add itself to that authority-bearing inventory.
+An original requester may explicitly capture a revocable binding publisher for
+its response driver. The iterator publishes its actual producer before opening
+the payload gate. The same inventory pairs that producer with its cancellation
+task, so Stop retains the existing final-item/cleanup handshake. Publication
+uses the captured delivery's cancellation generation and expires with that
+registration; it grants no input ownership to the foreign response driver.
+Chat and bridge capture the same stream-binding callback at original request
+registration. Neither deferred serializer may publish from copied context after
+the producer has started. Both publish the actual producer and its existing
+Stop watcher before opening the payload gate.
+
+The original owned-task completion receipt snapshots the physical Task outcome in
+the creator's first done callback, including cancelled outer completion wrappers.
+A body diagnostic cache cannot replace that result, and a foreign native await
+cannot erase it for a later lifecycle join. The original retain-originals policy
+still controls ordinary cancellation normalization. Observation-publication failure
+is explicitly caused by its original error; pending Stop requests do not convert
+a synchronously raised publication cancellation into a private interrupt. Repeated
+owner joins preserve independent failures without repeating physical source close.
+
+An original admission token authenticates private cancellation at source entry,
+unwind and watcher handoff. A request count or prior close alone cannot erase a
+distinct physical cancellation. If the original terminal-capture callback was
+refused and cancelled completion cannot be reconstructed after native consumption,
+the same receipt/Task retain unobservable-completion uncertainty and retirement
+debt. A later source close cannot prove that lost completion ordinary or settled.
+
+Dispatcher error suppression uses the shared terminal-delivery classifier,
+including original SDK and audit uncertainty through cancellation causes and
+exception groups. Monitored withdrawal and lease renewal join the original
+worker before applying that rule. An uncertain effect cannot become a proven
+no-op or acknowledged turn. The same rule governs persistence, post-commit
+repair and outcome-log loss; the existing bounded writer latch retains only
+original terminal sources, without finite observer history. Core authority
+classification remains separate: a terminal tool failure grants no authority
+and does not by itself revoke a resident runtime. Cognition's existing typed
+reconciliation result still maps non-Core terminal failures to the public
+content-free failed result before durable settlement.
+A completed cancelled cognition task is harvested before reading its physical
+result, because native `Task.result()` can consume its original cancellation
+cause. Successful results still share the canonical completion observation.
+
+Owned gather retains late sibling terminal delivery through the shared rule,
+even after a successful FIRST_COMPLETED winner or an earlier ordinary failure.
+A cancellation-shaped SDK/audit source is not ordinary sibling cleanup.
+Typed cognition failures and Stop dispositions are constructed by the same
+failure-result factory that schedules their audit. The queued and returned
+result have the same identity until public normalization, so the original
+terminal audit is submitted once without exposing private reconciliation data.
+
+Tool-terminal source projection honors authenticated Core source provenance.
+An explicitly source-free Core admission refusal after a healthy journal COMMIT
+remains a finite observer result; scanning its leaves cannot make it a native
+writer failure. Additional non-Core SDK/audit or reconciliation sources are
+still retained exactly, including when independently composed with that finite
+refusal. The foreground observer keeps the actual committed/refused evidence;
+only genuine native sources enter the shared writer latch.

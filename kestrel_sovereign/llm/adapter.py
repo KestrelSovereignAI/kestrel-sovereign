@@ -26,9 +26,9 @@ from dataclasses import dataclass
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, TYPE_CHECKING, Union
 
-from kestrel_sdk.llm import LLMResponse, ToolCall
+from kestrel_sdk.llm import LLMProtocolError, LLMResponse, ToolCall, ToolCallStarted
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
 from .cancellation import CancelToken
@@ -141,6 +141,64 @@ class ToolCallWithExtraContent(ToolCall):
     """
 
     extra_content: Optional[Dict[str, Any]] = None
+
+
+class InlineToolOutcome(tuple):
+    """What an inline tool executor returns: ``(effective_args, result)``.
+
+    Every reader that unpacks or indexes it still sees that 2-tuple.
+    ``dispatch_id`` also names the ``a2a_tool_dispatches`` row the call is
+    recorded under. An adapter that runs tools inside its call copies it onto
+    the call's ``executed_tool_calls`` entry, so the row recorded from that
+    entry carries it, and a feature subagent's own calls, which name it as
+    their parent, can be traced to it (#3778). ``None`` when the executor has
+    no dispatch to name.
+    """
+
+    dispatch_id: Optional[str]
+
+    def __new__(
+        cls,
+        effective_args: Dict[str, Any],
+        result: Any,
+        dispatch_id: Optional[str] = None,
+    ) -> "InlineToolOutcome":
+        outcome = super().__new__(cls, (effective_args, result))
+        outcome.dispatch_id = dispatch_id
+        return outcome
+
+    def __getnewargs__(self) -> tuple:
+        return (self[0], self[1], self.dispatch_id)
+
+
+class ToolInputSuspensionResponse(LLMResponse):
+    """Typed Core checkpoint, carrying no claim of provider completion."""
+
+    def __init__(self, suspension, owner):
+        from kestrel_sovereign.tools.effect_journal import (
+            TOOL_INPUT_REQUIRED_MESSAGE,
+        )
+
+        suspension.require_current(owner)
+        super().__init__(content=TOOL_INPUT_REQUIRED_MESSAGE)
+        self.suspension = suspension
+        self.executed_tool_calls = list(suspension.completed)
+
+    @classmethod
+    def from_current_turn(cls, owner):
+        """The same boundary for a batch whose receipts the caller already owns."""
+        from kestrel_sovereign.tools.effect_journal import ToolInputSuspended, current_tool_effect_turn
+        from kestrel_sovereign.turn_scope import capture_turn_scope
+
+        return cls(ToolInputSuspended(current_tool_effect_turn(owner), [], capture_turn_scope(owner)), owner)
+
+
+def inline_tool_dispatch_id(outcome: Any) -> Optional[str]:
+    """The ``dispatch_id`` an inline executor's return names, if any."""
+    if not isinstance(outcome, InlineToolOutcome):
+        return None
+    dispatch_id = outcome.dispatch_id
+    return dispatch_id if isinstance(dispatch_id, str) and dispatch_id else None
 
 
 def tool_call_history_entry(tool_call: ToolCall) -> Dict[str, Any]:
@@ -294,12 +352,14 @@ __all__ = [
     "LLMAdapter",
     "LLMResponse",
     "CancelToken",
+    "InlineToolOutcome",
     "ThinkingDelta",
     "ThinkingContentSplitter",
     "ToolCall",
     "ToolCallWithExtraContent",
     "build_messages",
     "messages_for",
+    "inline_tool_dispatch_id",
     "split_thinking_from_content",
     "tool_call_history_entry",
 ]
@@ -400,6 +460,34 @@ class LLMAdapter(_SDKLLMAdapter):
     #: providers only surface usage on the final chunk, where the terminal
     #: ``LLMResponse`` already carries it.
     supports_partial_usage_flush: bool = False
+
+    async def _plain_stream(
+        self, client: Any, model: str, messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None, **kwargs: Any,
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """One projection of the canonical provider stream for all plain facades."""
+        from contextlib import aclosing
+        from .completion_protocol import adapter_stream
+
+        if tools:
+            raise LLMProtocolError("Plain streaming does not accept tools.")
+        async with aclosing(adapter_stream(
+            self.get_streaming_response_with_tools(
+                client=client, model=model, messages=messages, tools=None, **kwargs,
+            ),
+        )) as stream:
+            async for item in stream:
+                if isinstance(item, ThinkingDelta):
+                    continue
+                if isinstance(item, ToolCallStarted) or (
+                    isinstance(item, LLMResponse) and (
+                        item.has_tool_calls or item.stop_reason in {"tool_calls", "function_call", "tool_use"}
+                    )
+                ):
+                    raise LLMProtocolError("Plain streaming received unexpected tool evidence.")
+                if not isinstance(item, (str, LLMResponse)):
+                    raise LLMProtocolError("Plain streaming received an invalid response item.")
+                yield item
 
     async def probe_reachable(
         self,

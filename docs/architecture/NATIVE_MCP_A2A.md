@@ -48,8 +48,14 @@ Core consumes that extra and resolves it in its lock; base SDK consumers remain
 lightweight. Feature skill producers and the host use the same native types.
 Clean wheel and sdist installs must exercise the same wire/oracle tests as source.
 Full conformance, interoperability and host acceptance remain release gates.
-Return to the upstream distribution when a released SDK passes these same checks;
-remove the vendored implementation and switch all callers together.
+The vendored copy is Kestrel's maintained fork, not a temporary step back to
+the upstream distribution. Its update policy is in the SDK README.
+Core runs the official A2A TCK at a pinned upstream commit plus
+`tests/interop/a2a_tck/UPSTREAM.patch`. That patch only connects the suite to
+Kestrel (authentication, tenant routing) and fixes defects in the suite itself.
+It never makes the suite accept behavior the specification forbids. Re-pin only
+when a TCK change covers a requirement Kestrel must meet, or the pinned commit
+no longer runs.
 Exact versions belong in dependency locks,
 and dependency ranges must admit the releases we actually test. Old dependency
 caps are subject to migration, not reasons to downgrade the protocol target.
@@ -329,6 +335,87 @@ exact-True capability before connection acquisition or Apps/OAuth enablement.
 Other SDK-only hosts must implement the same contract. It is independent of caller
 authority and permission checks and does not authorize a retry.
 
+### Durable tool-effect admission
+
+The host binds each logical invocation to its authenticated recipient, caller
+namespace and original input. The primary SQLite or PostgreSQL database records
+keyed digests and server-generated attempt/claim identifiers, without retaining
+tool arguments or results. The journal key is wrapped by the original data key;
+boot refuses an unavailable or inconsistent journal rather than creating a fresh
+replay history. An operation identifier correlates intent and grants no authority.
+
+Journal schema revision 2 hashes the same exact finite JSON value domain as
+native inline content, with sorted object keys and ASCII escaping. Large
+integers and surrogateescaped filenames retain their original values. Earlier
+journal revisions refuse initialization before creating keys or admitting work;
+a different hash encoding cannot silently replace existing replay history.
+
+Each governed tool leaf acknowledges a STARTED claim before dispatch. A claim
+that might have executed fences replay after a lost reply or process restart,
+including a known returned error. An uncertain settlement also fences further
+effects in the live turn even if its database transaction failed. Each admitted
+operation ID is consumed once, including claim-free or NOT_EXECUTED operations.
+Reusing an ID with unchanged input requires reconciliation; changed input
+conflicts. An explicitly new intent gets a fresh ID.
+This is a local replay fence, not a cross-vendor exactly-once guarantee.
+
+Result classification finishes before claim settlement. A failed classifier
+settles that same claim as UNCONFIRMED and fences the turn. After RETURNED_OK,
+native result serialization or persistence failures preserve the acknowledged
+claim and its first audit receipt. Shared completion handling records uncertainty
+on the original turn, retains the original exception and prevents another effect.
+Model, named and inline execution use that same boundary before recovery or
+terminal propagation. Inline adapters receive the original typed uncertainty
+carrier immediately; neither a later effect nor successful root completion is
+permitted. Acknowledged claim and audit states remain unchanged. The protected
+operation includes canonical subagent leaf serialization, post-tool policy,
+required audit, private delivery and final return shaping; wrapping only the
+journaled body does not protect those completion steps. Canonical parent dispatch
+retains the actual return evidence of its leaves, and its own hooks, delivery
+and final named-result serialization remain inside the shared boundary. The
+original turn must be confirmed before another protected operation starts and
+before any recovered output is handed to a consumer.
+Canonical subagent repair checks that same original confirmation before its
+decision model and again after the decision returns, before requesting a
+repair turn. An adapter swallowing a terminal leaf cannot spend another
+model call, and a leaf failing during the decision cannot authorize repair.
+Opaque Feature task handlers validate required fields and canonical Task outcome
+invariants before acknowledging their claim. A malformed reply produces a FAILED
+Task with `outcome_unknown` from the admitted baseline for the recipient writer;
+concurrent committed task data remains authoritative.
+An explicit unknown native reply fences its original input and settles its
+opaque claim as UNCONFIRMED while preserving the validated Task state and
+artifacts. Native synchronous Task completion includes registration-context
+exit, persistence, post-hooks and final return. Workflows and typed commands
+retain uncertainty when a returned Task cannot be read; a completion failure
+cannot become another execution attempt. The original Feature host and input
+are retained across those readers, and the existing journal refuses further
+Task admission after uncertainty. Required audit uncertainty also fences that
+input when it occurs before a tool body starts. The complete inner leaf boundary
+includes unknown-tool, argument, permission and hook-rewrite refusal audits;
+an inline provider catching their error cannot authorize another leaf.
+Completion retention covers cancellation and mixed `BaseExceptionGroup`
+carriers as well as ordinary errors. Cancellation and process-control objects
+propagate unchanged after their original uncertainty is retained.
+
+Terminal retirement closes only the original attempt through the shared native
+result-custody writer. It retains the original connection generation or pool
+recipe, wrapped-key lifetime and catalog identities of both journal tables. The
+writer checks native programs and constraints under its existing locks, owns
+COMMIT/rollback and connection retirement, and cannot admit another tool claim.
+Cancellation retains the caller's withdrawal and actual commit evidence.
+`KESTREL_TOOL_EFFECT_TERMINAL_TIMEOUT_S` sets the finite positive checkout/body
+budget (default 5 seconds). Expiry still joins any accepted native transaction
+and connection retirement; it never certifies that the tool did not execute.
+
+Local `TaskManager.execute_skill(sync=False)` returns the accepted native Task
+while its feature worker runs. Its dispatch claim is durable before scheduling;
+the originating journal turn joins that exact worker before finalization. A
+copied context cannot authorize another task to enter a closing turn. Both the
+original provider registration and registry generation remain checked at the
+actual leaf. A withdrawn provider settles its task as FAILED without dispatch.
+Native network A2A task and signal lifecycles retain their existing owners.
+
 A local A2A skill whose execution met a `ResourceOutcomeUnknown` marks its
 task with `outcome_unknown: true` metadata (#3946). That covers a skill raising
 it, a Core or SDK `@tool` wrapper that returns it to a model as an ordinary
@@ -353,6 +440,66 @@ If a flagged task cannot be recorded, or another writer's terminal state wins,
 `execute_skill` raises `ResourceOutcomeUnknown` instead, caused by any storage
 failure.
 
+### Tool invocation outcome
+
+One tool invocation's outcome has one immutable type,
+`kestrel_sovereign.tools.invocation_outcome.ToolInvocationOutcome` (#3977). It
+is the contract the host tool executor and the normalized tool-execution
+envelope consume. No dispatch path uses it yet; each still shapes its own
+result, and migrating them is separate work. The variants are closed:
+
+| Variant | Carries |
+|---|---|
+| `Success` | the returned result, which may be a host-private dict |
+| `ControlDeny` | an execution-control exception or a blocking `BlockedDecision`, with its `error_class` |
+| `Cancelled` | a cancellation or process-control carrier, as its cause |
+| `Deferred` | the `DeferredToolResult` itself |
+| `Error` | an ordinary exception, with its `error_class` |
+
+The variant says how the invocation ended, never what its result reports: a
+returned failed or partial envelope is a `Success`, and its status stays
+whatever `infer_tool_result_status` reads from it. `outcome_unknown` is a fact
+set on any variant, never a variant of its own, so retry depends only on
+whether execution met a `ResourceOutcomeUnknown`, as in #3946.
+
+`classify_tool_invocation` is the one total map from what a path produces:
+exactly one of the value it returned, the exception it raised or the
+blocking decision its PRE hook chain produced. A tool's own return value is
+never read as a host refusal. Anything that is not an `Exception` is
+`Cancelled`. An exception `is_execution_control_error` reads as control is
+`ControlDeny`, never an `Error`, and an `Error` refuses to hold one. Every
+other exception is an `Error`. `outcome_unknown` is set when the raised
+exception, or an error the path reports it met and flattened into its result,
+carries a `ResourceOutcomeUnknown` by `observed_outcome_unknown` (the error,
+an explicit cause or an exception-group member; implicit context never
+counts), or when the path returned the host's unconfirmed-outcome marker.
+
+`project_public` reproduces what the model sees on main, and the match over
+the type ends in `assert_never`, which pyright checks:
+
+- `Success` is its result; a host-private result becomes the plain dict a
+  copy of it already is. Copying or pickling a `Success` keeps only that
+  public result, so a dispatch receipt or failure marker never leaves the host.
+- `Deferred` is its public dictionary, a plain copy. The original keeps its
+  one-shot factory unconsumed for the existing completion boundary; the
+  completed result is a `Success`. A `Deferred` cannot be deep-copied or
+  pickled.
+- `ControlDeny` holding a `BlockedDecision` is that decision's envelope, as
+  the chat, named and bound paths return it. A feature subagent's
+  own tool loop words its refusal differently today; the type keeps the
+  decision itself and leaves that wording to the migration.
+- Execution control, a cancellation and an `Error` that requires
+  reconciliation (`is_tool_execution_terminal_error`) are never a result: the
+  projection raises the original object, unchanged, as every path does.
+- Any other `Error` is `{"success": False, "error": str(error)}`, the envelope
+  each `@tool` wrapper builds its own on (they add `tool` and buffered parts).
+
+The classifier reads what a path hands on after its own shaping. A wrapper
+that turned an exception into a failure envelope produced a `Success`, and an
+error it reports flattening is passed as observed evidence. Where the named
+inline executor recovers an uncertain failure as the host's unconfirmed
+marker, that is a `Success` with `outcome_unknown`.
+
 ### Tasks and operator input
 
 An MCP task is identified by agent, connection and remote task ID. Its durable
@@ -369,19 +516,24 @@ extensible for future supported methods without claiming them today. Do not
 advertise it until the durable wait provider and tool-call result path handle
 both shapes. Register the task before releasing the originating dispatch.
 
-The Phase 0 candidate `mcp==2.3.0` does **not** ship the 2026 Tasks extension.
-Its exported `CreateTaskResult` is the old 2025 core type and must not be used
-for this extension; the required native `tasks/get`, `tasks/update` and
-`tasks/cancel` implementation is absent. Its tool-call-only result claims and
-resource/prompt parsers follow the extension's current method set; they are not
-support gaps. A6 is gated on
-[#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684): select
-an actual official extension/SDK package and revision supporting the published
-tool-call task contract, or contribute that support to the official SDK, then raise dependency
-bounds as needed. The candidate is not a ceiling to retain. No partial
-advertisement, private wire types or generic-result adapter fills this gap.
-Until that gate passes, do not advertise Tasks; surface a server's required-
-capability error clearly instead of accepting work whose result cannot be read.
+The Phase 0 candidate `mcp==2.3.0` does **not** ship concrete classes for the
+2026 Tasks extension. Its exported `CreateTaskResult` is the old 2025 core type
+and must not be used for this extension. Implement the published task contract
+through the official SDK's public `ClientExtension` and `ResultClaim` interfaces,
+with typed requests/results checked against the official 2026-07-28 schema and
+recorded schema provenance. Keep MCP on its published official Python SDK.
+This uses the SDK's extension mechanism; it does not introduce a private wire
+protocol or a generic-result adapter, and it does not require an upstream PR or
+a separate Python Tasks distribution before implementation can proceed.
+
+[#3684](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3684)
+still requires the durable task/wait provider, authorized task operations,
+tool-call result handling and interoperability tests. The method-specific
+result claims must follow the extension's published method set. Raise dependency
+bounds when required; the Phase 0 version is not a ceiling. Until the actual
+provider handles these requirements, do not advertise Tasks. Surface a server's
+required-capability error clearly instead of accepting work whose result cannot
+be retrieved.
 
 When `tasks/get` reports `input_required`, classify its `inputRequests` using
 the same machine/operator rules and policy below. Respond through
@@ -423,6 +575,49 @@ restart, key rotation or expiry. Rejected/expired state makes the continuation
 explicitly non-resumable; retain an unknown dispatch outcome if execution cannot
 be established. Never drop state and submit a fresh side effect automatically.
 Results without `resultType` remain `complete` as the SDK specifies.
+
+Core's optional `mcp-input` host owns encrypted checkpoint custody and fresh
+authenticated readers at `/api/mcp/inputs`. The MCP 0.17 tool-call path can
+persist a form checkpoint and return an audited `mcp_input` part containing only
+its reference and original chat selector. Neither is an authorization grant.
+The original effect turn records the pending input through its existing nested
+turn state and refuses another admission before approvals or network I/O.
+Both orchestrator modes return a waiting message without another model call.
+Inline providers propagate a typed host suspension with the original live turn
+and completed tool receipts. It is not an accepted model completion: unfinished
+provider prose is retracted and excluded from saved history. Both transports
+retain actual tool receipts in history and STOP hooks unless an enforcing
+response audit withholds those unreviewed side channels.
+Ordinary tool batches use the same typed checkpoint. Codex forwards its
+original control to the owning turn's event sink, settles accepted callbacks,
+and requests native `turn/interrupt` with the original thread and turn IDs.
+Missing IDs or a failed/malformed acknowledgement fail the turn; the unfinished
+thread is retired before another call can reuse it. Unrelated turns keep their
+connection and authority. The checkpoint never claims provider completion.
+
+Submitting `/api/mcp/inputs/{reference}/responses` independently authenticates
+the principal and chat, validates the original form schema, invokes the current
+governed tool binding and atomically consumes the waiting revision before the
+native continuation. Permission denial leaves the checkpoint waiting; a claimed
+or uncertain response never becomes a fresh initial call. Completed public
+projections and next-form references remain encrypted so a reloaded card can
+recover them without replay. The response deadline does not delete historical
+encrypted reconciliation records. SQLite and PostgreSQL share the same custody
+contract on the primary database.
+The pending limit counts unresolved operation chains rather than individual
+rounds. A successor reuses its predecessor's reservation only through the
+original live response claim and an atomic, single-successor transition.
+Unsettled response claims keep their reservation; restart does not free quota
+or permit replay. Readers display the current checkpoint once per chain.
+
+App continuations additionally retain the original physical View and its fresh
+private reader through the actual outer HTTP send. A closed or lost View cannot
+be adopted after restart. Native private results are delivered only to that
+View; an initial App publication follows Core's normal audited part path.
+Each App call uses Core's original owned child and one shared cancellation
+policy; its privacy span is acquired before the input or App persistence gate.
+The current delivery covers forms from governed tool calls. Resource/prompt
+operator waits and durable Tasks are not established by these tool-call tests.
 
 For operator-required input, signal-driven turns and
 `NON_INTERACTIVE_SESSION_IDS` keep the shipped #3439 behavior:
@@ -1453,6 +1648,42 @@ effect and its durable terminal record.
 5. Implement the server direction under [#1990](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1990),
    reusing MCP 2.x, per-agent routing, protected-resource metadata, credential
    governance and the normal memory/turn persistence path.
+
+The canonical conversation writer returns the native integer ID from its own
+`INSERT ... RETURNING id`. `AsyncStorage`, `PrivacyEnforcingStorage` and
+`PrivacyAgent` preserve that ID for persistent writes, including excluded
+semantic derivatives. Volatile writes return no persistent receipt (and the
+storage privacy wrapper rejects modes that cannot write a transcript). A
+caller-owned transaction retains final commit ownership: an external `log_turn`
+response must expose its user/assistant row IDs only after its whole exchange
+commits. Missing or nonpositive native IDs abort their insertion boundary;
+identity errors and execution-control errors never authorize a schema retry.
+Existing optional embedding/lexical schema attempts use isolated native
+savepoints and retain the exact successful insertion's ID. These contracts are
+covered by native SQLite/PostgreSQL receipt and transaction tests, plus actual
+SDK embedding calls to an owned local HTTP peer. They are storage prerequisites,
+not evidence of an installed inbound MCP connector or subsequent reflection and
+consolidation. That acceptance remains in #1990. The embedding migrations inspect
+the same resolved PostgreSQL relation as their ALTER statements through the
+canonical database API; a same-named table in another schema cannot satisfy the
+column checks. Native PostgreSQL transaction exits prove committability even
+without execution scopes or callbacks, so COMMIT-as-ROLLBACK cannot publish a
+successful receipt. Optional profile-registry writes roll back inside their own
+savepoint; a lost fence commit acknowledgement preserves the committed row's
+lexical tokens instead of treating them as orphaned prework. Savepoint exits use
+the same native ownership/acknowledgement boundary: an uncertain RELEASE cannot
+authorize a second INSERT or mint a durable top-level commit receipt.
+
+Post-response enrichment receives the actual user and assistant row IDs from
+normal, streaming and bootstrap persistence. It reads exactly those rows,
+rejects missing or wrong-role identities, and uses their canonical stored text
+for emotional and graph processing. Identical later exchanges and operator
+notices cannot replace either row; anonymized input stays anonymized in derived
+memory. Native SQL/lease control errors propagate through tagging and advisory
+schema lanes, and background owners retain the original task's terminal receipt.
+Ordinary advisory failures retain their existing partial-result behavior. These
+are memory-pipeline contracts, not inbound MCP installation or subsequent
+reflection/consolidation acceptance.
 
 Each PR requires a completed full-diff worktree review before creation, with
 findings fixed and meaningful regression tests. Pin the conformance runner

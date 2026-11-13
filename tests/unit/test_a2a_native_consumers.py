@@ -9,28 +9,20 @@ from kestrel_sdk.native_a2a.types import Part, Role, SendMessageRequest, TaskSta
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.a2a.lifecycle import task_state_from_label
-from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.agent.preturn_state import _a2a_inbox_section
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.tasks.feature import TaskFeature
-from tests.utils.native_a2a import manager_for
+from tests.utils.native_tool_effects import drive_native
 
 
 @pytest_asyncio.fixture
-async def inbox(native_a2a_backend_factory):
-    backend = native_a2a_backend_factory()
-    await backend.connect()
-    scope = NativeRecipientScope("did:kestrel:recipient", "tenant")
-    manager = manager_for(backend, scope)
-    agent = SimpleNamespace(did=scope.recipient_id, task_manager=manager)
+async def inbox(native_feature_case):
+    manager, agent = native_feature_case.manager, native_feature_case.agent
     feature = TaskFeature(agent)
     feature.set_task_manager(manager)
-    try:
-        await manager.initialize()
-        yield manager, feature, agent
-    finally:
-        await manager.close()
+    agent.features[feature.name] = feature
+    yield manager, feature, agent
 
 
 async def admit(manager):
@@ -175,6 +167,7 @@ async def test_catalog_commands_and_workflows_use_registered_native_skills(inbox
             return ToolResult.failed("deliberate failure")
 
     provider = NativeWorkflowFeature(agent)
+    agent.features[provider.name] = provider
     manager.register_provider(
         provider.name,
         provider.get_agent_skills(),
@@ -195,7 +188,7 @@ async def test_catalog_commands_and_workflows_use_registered_native_skills(inbox
         for skill in manager.get_agent_skills()
     )
     value = {"nested": [None, {}, [], False]}
-    outcome = await tasks.run_workflow(
+    outcome = await drive_native(agent, lambda: tasks.run_workflow(
         [
             {
                 "feature": provider.name,
@@ -203,15 +196,15 @@ async def test_catalog_commands_and_workflows_use_registered_native_skills(inbox
                 "args": {"value": value},
             },
         ]
-    )
+    ))
     assert outcome.status is ToolResultStatus.OK
     assert outcome.data["completed"] == 1 and outcome.data["failed"] == 0
     assert outcome.data["results"][0]["result"]["result"] == value
-    failed = await tasks.run_workflow(
+    failed = await drive_native(agent, lambda: tasks.run_workflow(
         [
             {"feature": provider.name, "skill": "native_workflow_fail", "args": {}},
         ]
-    )
+    ))
     assert failed.status is ToolResultStatus.ERROR
     assert failed.data["failed"] == 1 and failed.data["completed"] == 0
     manager.unregister_provider(provider.name)

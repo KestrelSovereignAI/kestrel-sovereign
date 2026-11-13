@@ -250,6 +250,10 @@ class LedgerCommit:
     #: The file had changed on disk, so it was re-read and only this change
     #: was applied to what it now holds.
     reloaded: bool = False
+    #: Refused because the caller's ``admit`` check declined ``value``: the
+    #: value is what the change computed against the file as it now stands,
+    #: for the caller to clear before committing again.
+    unadmitted: bool = False
 
     @property
     def persisted(self) -> bool:
@@ -548,7 +552,11 @@ class StrategyLedger:
         self._capture_snapshot(confirmed=True)
         return None
 
-    def commit(self, change: Callable[["StrategyLedger"], Any]) -> LedgerCommit:
+    def commit(
+        self,
+        change: Callable[["StrategyLedger"], Any],
+        admit: Optional[Callable[[Any], bool]] = None,
+    ) -> LedgerCommit:
         """Apply ``change`` and persist it without erasing edits made on disk.
 
         ``change`` is one caller's mutation, written against a ledger: it finds
@@ -567,6 +575,14 @@ class StrategyLedger:
 
         A write that fails outright (a full disk) keeps the change in memory,
         to be carried by the next successful write.
+
+        ``admit``, when given, is asked before any write whether the value
+        ``change`` returned may be written. A value it declines is written
+        nowhere: the commit is refused with ``unadmitted`` set, its ``value``
+        computed against the file as it now stands, so the caller can do what
+        must precede the write and commit again (#3990). Nothing is awaited in
+        here, so no other caller can act on the ledger between the check and
+        the write.
         """
         before = copy.deepcopy(self.data)
         unsaved = self._unsaved_normalization
@@ -579,6 +595,11 @@ class StrategyLedger:
             conflict: Optional[str] = str(e)
         else:
             conflict = None
+        if conflict is None and admit is not None and not admit(value):
+            # Not written. The copy read at start may be stale, so the value
+            # the caller is to clear is computed against the file below.
+            conflict = "its value has not been admitted"
+        elif conflict is None:
             # Reset here too: a replaced ``save`` must not inherit a refusal
             # an earlier write recorded.
             self._write_refusal = None
@@ -598,7 +619,7 @@ class StrategyLedger:
                 refused=True,
             )
         held = self._holds_unwritten_change
-        outcome = self._reload_and_reapply(change)
+        outcome = self._reload_and_reapply(change, admit)
         if held and outcome.reloaded and not outcome.refused:
             logger.warning(
                 "%s changed on disk while a change an earlier failed write "
@@ -617,9 +638,15 @@ class StrategyLedger:
         return LedgerCommit(error=error, refused=True)
 
     def _reload_and_reapply(
-        self, change: Callable[["StrategyLedger"], Any]
+        self,
+        change: Callable[["StrategyLedger"], Any],
+        admit: Optional[Callable[[Any], bool]] = None,
     ) -> LedgerCommit:
-        """Apply ``change`` to the file as it is now, and write that."""
+        """Apply ``change`` to the file as it is now, and write that.
+
+        Writes nothing when ``admit`` declines the value ``change`` returns;
+        see :meth:`commit`.
+        """
         path = self.path
         previous = self._disk_digest
         try:
@@ -654,6 +681,16 @@ class StrategyLedger:
         except LedgerChangeConflict as e:
             return self._refused_commit(
                 f"this change does not apply to {path} as it now stands: {e}"
+            )
+        if admit is not None and not admit(value):
+            return LedgerCommit(
+                value=value,
+                error=self._refusal(
+                    "the value this change writes has not been admitted"
+                ),
+                refused=True,
+                reloaded=reloaded,
+                unadmitted=True,
             )
 
         if reloaded:
@@ -735,6 +772,12 @@ class StrategyLedger:
     def add_pattern(
         self, pattern: str, source: str = "", implication: str = ""
     ) -> Dict[str, Any]:
+        """Append one pattern.
+
+        The row names no session: the file is in the agent's own data
+        directory, so the session a row was recorded in is attested where the
+        agent cannot write (#3990).
+        """
         rows = self.patterns
         entry = {
             "id": _unique_id(
@@ -764,6 +807,8 @@ class StrategyLedger:
         repository. Without it, reconciliation has to try every configured repo
         and bind to whichever one happens to contain a number 42 — which is how
         a blocker gets resolved against a stranger's closed ticket.
+
+        The row names no session, as for :meth:`add_pattern`.
         """
         rows = self.blockers
         entry = {

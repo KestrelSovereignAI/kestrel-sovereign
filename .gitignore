@@ -25,6 +25,8 @@
 # Stream fixture the server and chat-client test suites both assert against.
 !tests/fixtures/stream_tool_join_cases.json
 !tests/fixtures/artifacts/publication-digest.json
+# Pinned CORE store DDL the native-schema revision guard compares against.
+!tests/fixtures/native_store_schema.json
 # Reviewed TCK observations contain requirement statuses, never credentials.
 !tests/interop/a2a_tck/COVERAGE.json
 # These are immutable, digest-pinned semantic package resources—not local

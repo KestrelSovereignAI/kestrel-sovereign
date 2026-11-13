@@ -33,6 +33,8 @@ from kestrel_sdk.tools.base import ToolCategory, ToolSchema
 
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.hooks.manager import HooksManager
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 TOOL_SLEEP_S = 0.02
 
@@ -102,18 +104,13 @@ class _Recorder(Hook):
 
 
 class _TurnBinding:
-    """The agent's turn-bound session accessor. ``release()`` models the turn
-    binding going away while the subagent is still running — the reason
-    ``execute_as_subagent`` resolves the session once, up front."""
+    """Release the real live turn's session after its feature captured it."""
 
-    def __init__(self, session_id):
-        self._session_id = session_id
+    def __init__(self, agent):
+        self.agent = agent
 
     def release(self):
-        self._session_id = None
-
-    def __call__(self):
-        return self._session_id
+        self.agent._active_session_id = None
 
 
 class _LoopDoorLLM:
@@ -157,29 +154,37 @@ class _InlineDoorLLM:
 DOORS = {"loop": _LoopDoorLLM, "inline": _InlineDoorLLM}
 
 
-def _make(door: str, tool: _SlowTool, *, session_id, recorder: _Recorder, args=None):
-    binding = _TurnBinding(session_id)
+async def _make(door: str, tool: _SlowTool, *, session_id, recorder: _Recorder, args=None,
+          native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:probe")
+    binding = _TurnBinding(agent)
     manager = HooksManager()
     manager.register(recorder)
-    agent = SimpleNamespace(
-        llm_service=DOORS[door](binding, tool.name, args or {}),
-        did="did:test:probe",
-        hooks_manager=manager,
-        get_turn_bound_session_id=binding,
-    )
+    agent.hooks_manager = manager
+    agent.llm_service = DOORS[door](binding, tool.name, args or {})
     feature = _ProbeFeature(agent)
     feature._fake_tools = [tool]
+    feature._test_session = session_id
+    agent.features[feature.name] = feature
     return feature
+
+
+async def _run_feature(feature, **kwargs):
+    async def operation():
+        async with feature.agent._turn_lifecycle():
+            feature.agent._active_session_id = feature._test_session
+            return await feature.execute_as_subagent(**kwargs)
+    return await drive_native(feature.agent, operation)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("door", sorted(DOORS))
-async def test_tool_that_ran_fires_pre_and_post_under_the_dispatching_turn(door):
+async def test_tool_that_ran_fires_pre_and_post_under_the_dispatching_turn(door, *, native_tool_effect_agent):
     tool = _SlowTool("search_memory", returns={"success": True, "data": {"hits": 2}})
     recorder = _Recorder()
-    feature = _make(door, tool, session_id="sess-turn", recorder=recorder, args={"q": "x"})
+    feature = (await _make(door, tool, session_id="sess-turn", recorder=recorder, args={"q": "x"}, native_tool_effect_agent=native_tool_effect_agent))
 
-    envelope = await feature.execute_as_subagent(task="search for x")
+    envelope = await _run_feature(feature, task="search for x")
 
     assert envelope["success"] is True, envelope
     assert tool.executed_with == {"q": "x"}
@@ -204,17 +209,17 @@ async def test_tool_that_ran_fires_pre_and_post_under_the_dispatching_turn(door)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("door", sorted(DOORS))
-async def test_tool_that_raised_fires_post_reporting_the_failure(door):
+async def test_uncertain_tool_raises_without_a_normal_post_hook(door, *, native_tool_effect_agent):
     tool = _SlowTool("broken", returns=ValueError("bad input"))
     recorder = _Recorder()
-    feature = _make(door, tool, session_id="sess-turn", recorder=recorder)
+    feature = (await _make(door, tool, session_id="sess-turn", recorder=recorder, native_tool_effect_agent=native_tool_effect_agent))
 
-    await feature.execute_as_subagent(task="anything")
-
-    assert recorder.event_names() == ["PreToolUse", "PostToolUse"]
-    post = recorder.edges[1]
-    assert post["session_id"] == "sess-turn"
-    assert post["tool_response"] == {"success": False, "error": "ValueError: bad input"}
+    with pytest.raises(ResourceOutcomeUnknown):
+        await _run_feature(feature, task="anything")
+    assert recorder.event_names() == ["PreToolUse"]
+    assert recorder.edges[0]['session_id'] == 'sess-turn'
+    assert await feature.agent.tool_effect_store.database.fetchone(
+        'SELECT result_status, error_class FROM a2a_tool_dispatches') == ('error','ResourceOutcomeUnknown')
 
 
 @pytest.mark.asyncio
@@ -224,15 +229,15 @@ async def test_tool_that_raised_fires_post_reporting_the_failure(door):
     [HookOutput.deny("not allowed"), HookOutput.ask("appr-1", "needs approval")],
     ids=["deny", "ask"],
 )
-async def test_blocked_call_fires_no_post(door, decision):
+async def test_blocked_call_fires_no_post(door, decision, *, native_tool_effect_agent):
     """A refused call never ran, so it gets no POST — the chat path's
     contract. The observability hook closes its start at the turn's ``Stop``,
     which now reaches it because the call is filed under that turn."""
     tool = _SlowTool("dangerous", returns={"success": True})
     recorder = _Recorder(pre_decision=decision)
-    feature = _make(door, tool, session_id="sess-turn", recorder=recorder)
+    feature = (await _make(door, tool, session_id="sess-turn", recorder=recorder, native_tool_effect_agent=native_tool_effect_agent))
 
-    await feature.execute_as_subagent(task="anything")
+    await _run_feature(feature, task="anything")
 
     assert tool.executed_with is None
     assert recorder.event_names() == ["PreToolUse"]
@@ -241,15 +246,78 @@ async def test_blocked_call_fires_no_post(door, decision):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("door", sorted(DOORS))
-async def test_session_less_turn_files_hooks_under_empty_session_not_a_sentinel(door):
+async def test_session_less_turn_files_hooks_under_empty_session_not_a_sentinel(door, *, native_tool_effect_agent):
     """No chat session → ``""``, as ``USER_PROMPT_SUBMIT`` stamps a
     session-less turn. A named sentinel is what made every subagent call the
     agent ever made — across restarts — one never-ending pseudo-session."""
     tool = _SlowTool("search_memory", returns={"success": True})
     recorder = _Recorder()
-    feature = _make(door, tool, session_id=None, recorder=recorder)
+    feature = (await _make(door, tool, session_id=None, recorder=recorder, native_tool_effect_agent=native_tool_effect_agent))
 
-    await feature.execute_as_subagent(task="anything")
+    await _run_feature(feature, task="anything")
 
     assert recorder.event_names() == ["PreToolUse", "PostToolUse"]
     assert [e["session_id"] for e in recorder.edges] == ["", ""]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_args", [False, True])
+@pytest.mark.parametrize("scenario,decision", [
+    ("allow", None), ("bare_stop", None), ("bare_stop", "allow"),
+    ("stop_then_deny", None), ("stop_then_deny", "allow"),
+])
+async def test_real_subagent_tool_cannot_cross_a_stopped_hook_chain(
+    tmp_path, capture_args, scenario, decision, native_tool_effect_agent,
+):
+    from kestrel_sovereign.features.base import tool
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sdk.hooks.base import PermissionDecision
+
+    witness = tmp_path / "owned-subagent-effect.txt"
+
+    class OwnedEffectFeature(Feature):
+        @property
+        def tool_description(self):
+            return "Owned subagent policy probe"
+        async def initialize(self):
+            pass
+        @tool(name="record_marker", description="Record the owned subagent marker")
+        async def record_marker(self, marker: str):
+            witness.write_text(marker, encoding="utf-8")
+            return {"success": True, "data": {"marker": marker}}
+
+    class PolicyHook(Hook):
+        def __init__(self, name, output, priority):
+            super().__init__(name, events=[HookEvent.PRE_TOOL_USE], priority=priority)
+            self.output = output
+        async def execute(self, input):
+            return self.output
+
+    agent = await native_tool_effect_agent(did="did:test:owned-subagent-policy")
+    agent.hooks_manager = HooksManager()
+    agent.hooks_manager.register(PolicyHook("redact", HookOutput.modify({"marker": "owned-redacted-marker"}), 5))
+    if scenario != "allow":
+        output = HookOutput(continue_execution=False, stop_reason="Owned stop",
+            permission_decision=PermissionDecision.ALLOW if decision == "allow" else None)
+        agent.hooks_manager.register(PolicyHook("stop", output, 10))
+    if scenario == "stop_then_deny":
+        agent.hooks_manager.register(PolicyHook("later-deny", HookOutput.deny("Owned later denial"), 50))
+    feature = OwnedEffectFeature(agent)
+    agent.features[feature.name] = feature
+    tools = {item.name: item for item in feature.get_tools()}
+    name, = tools
+    output = await drive_native(agent, lambda: feature._execute_subagent_tool(tool_name=name,
+        args={"marker": "owned-private-marker"}, tools_by_name=tools,
+        session_id="owned-subagent-turn", return_with_effective_args=capture_args))
+    if capture_args:
+        effective, result = output
+        assert effective == {"marker": "owned-redacted-marker"}
+    else:
+        result = output
+    if scenario == "allow":
+        assert result["success"] is True
+        assert witness.read_text(encoding="utf-8") == "owned-redacted-marker"
+    else:
+        assert not witness.exists(), "A stopped subagent performed its real tool effect"
+        assert result["success"] is False
+        assert "NOT executed" in result["error"]

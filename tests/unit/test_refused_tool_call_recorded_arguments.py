@@ -90,7 +90,7 @@ class _SubagentInline(_Notes, parity._SubagentInlinePath):
 class _Registered(_Notes, parity._OrchestratorPath):
     """A feature tool the chat loop resolves by name: not promoted (#2929)."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         assert tool_name not in agent._direct_tools
         return await agent._dispatch_tool_call(
@@ -114,7 +114,7 @@ class _Dispatcher(_Notes, parity._OrchestratorPath):
         agent.get_turn_bound_session_id = lambda: parity.SESSION
         return agent
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         return await agent._dispatch_tool_call(
             ToolCall(id="tc-1", name=tool_name, arguments=dict(arguments)),
@@ -130,7 +130,7 @@ class _Dispatcher(_Notes, parity._OrchestratorPath):
 class _NamedDispatcher(_Dispatcher):
     """A feature's subagent dispatcher called through ``execute_named_tool``."""
 
-    call = parity._NamedPath.call
+    _call = parity._NamedPath._call
 
 
 class _UncapturedNamedDispatcher(_Dispatcher):
@@ -140,7 +140,7 @@ class _UncapturedNamedDispatcher(_Dispatcher):
     allowed: its transport records the call. Only the completion hook it
     fires is this path's own audit."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         return await agent.execute_named_tool(
             tool_name, dict(arguments), session_id=parity.SESSION, source="mcp",
@@ -165,11 +165,11 @@ DISPATCH = {"task": f"look up {SECRET}", "context": "a note"}
 
 
 @pytest_asyncio.fixture
-async def make_probe(tmp_path):
+async def make_probe(tmp_path, native_tool_effect_agent):
     made: list = []
 
     def _make(path: str, kind: str):
-        made.append({**TOOL_PATHS, **COMPLETION_PATHS}[path](kind, tmp_path))
+        made.append({**TOOL_PATHS, **COMPLETION_PATHS}[path](kind, tmp_path, native_tool_effect_agent))
         return made[-1]
 
     yield _make
@@ -436,11 +436,18 @@ async def test_a_subagent_call_the_chat_loop_refused_is_recorded_as_policy_denie
 ALL_PATHS = sorted({**TOOL_PATHS, **DISPATCHER_PATHS})
 
 
-def _call_for(path: str) -> tuple[str, dict, dict]:
-    """The tool a path calls, its arguments, and the binding they record."""
+def _call_for(path: str) -> tuple[str, dict, dict, list]:
+    """The tool a path calls, its arguments, the binding they record, and
+    every binding the path's audit records.
+
+    A dispatcher's subagent then makes its own ``probe`` call, recorded ahead
+    of the dispatcher's envelope, which is written once the subagent returns
+    (#3778).
+    """
     if path in DISPATCHER_PATHS:
-        return "probe_feature", dict(DISPATCH), dict(DISPATCH)
-    return "probe", {"limit": "30", "exact": "true"}, {"limit": 30, "exact": True}
+        return "probe_feature", dict(DISPATCH), dict(DISPATCH), [{"limit": 1}, dict(DISPATCH)]
+    bound = {"limit": 30, "exact": True}
+    return "probe", {"limit": "30", "exact": "true"}, bound, [bound]
 
 
 @pytest.mark.asyncio
@@ -450,7 +457,7 @@ async def test_an_allowed_call_records_the_arguments_it_ran_with(make_probe, pat
     """The ALLOW path is unchanged: the spy allows, the call runs, and the
     record names the binding it ran with."""
     probe = make_probe(path, kind)
-    tool_name, arguments, bound = _call_for(path)
+    tool_name, arguments, bound, recorded = _call_for(path)
 
     with _chain():
         result = await probe.call(tool_name, arguments, "")
@@ -458,7 +465,7 @@ async def test_an_allowed_call_records_the_arguments_it_ran_with(make_probe, pat
     assert result.get("success") is True, result
     # A dispatcher's subagent then authorizes its own tool call too.
     assert probe.recorder.authorized[0] == bound
-    assert await _recorded(probe) == [bound]
+    assert await _recorded(probe) == recorded
 
 
 @pytest.mark.asyncio
@@ -466,13 +473,13 @@ async def test_an_allowed_call_records_the_arguments_it_ran_with(make_probe, pat
 @pytest.mark.parametrize("path", ALL_PATHS)
 async def test_a_call_no_hook_sees_records_its_own_arguments(make_probe, path, kind):
     probe = make_probe(path, kind)
-    tool_name, arguments, bound = _call_for(path)
+    tool_name, arguments, _bound, recorded = _call_for(path)
 
     with patch.object(parity, "_hooks", lambda: (HooksManager(), _Spy(HookEvent.PRE_TOOL_USE))):
         result = await probe.call(tool_name, arguments, "")
 
     assert result.get("success") is True, result
-    assert await _recorded(probe) == [bound]
+    assert await _recorded(probe) == recorded
 
 
 class _BoundResponseLogFails(_Bound):
@@ -492,10 +499,10 @@ class _BoundResponseLogFails(_Bound):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(KINDS))
 async def test_a_governed_refusal_the_dispatch_could_not_finish_keeps_its_arguments(
-    tmp_path, kind,
+    tmp_path, kind, native_tool_effect_agent,
 ):
     """The binding's fallback row names what the hooks refused, too."""
-    probe = _BoundResponseLogFails(kind, tmp_path)
+    probe = _BoundResponseLogFails(kind, tmp_path, native_tool_effect_agent)
     try:
         with _chain(
             _Decide(REFUSALS["deny"](), event=HookEvent.PRE_TOOL_USE),
@@ -546,11 +553,11 @@ class _DispatcherResponseLogFailsOnce(_Dispatcher):
 @pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
 @pytest.mark.parametrize("kind", sorted(KINDS))
 async def test_a_refused_dispatch_whose_response_write_failed_completes_with_what_was_refused(
-    tmp_path, kind, in_place, decision, failure,
+    tmp_path, kind, in_place, decision, failure, native_tool_effect_agent,
 ):
     """The error recovery's completion hook reports the refused arguments,
     not the call's: the redaction an earlier hook made stays made."""
-    probe = _DispatcherResponseLogFailsOnce(kind, tmp_path)
+    probe = _DispatcherResponseLogFailsOnce(kind, tmp_path, native_tool_effect_agent)
     probe.failure = failure
     completion = _Completion()
     try:

@@ -10,17 +10,23 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import math
-from collections.abc import AsyncIterator, Callable
-from contextlib import contextmanager
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Generic, TypeVar, cast
 from weakref import WeakKeyDictionary
 
+from kestrel_sdk.native_a2a.utils.source_ownership import (
+    CallbackSource as OwnedCallbackSource,
+    SourceAcquisition,
+    SourceHandoff,
+    run_source_body,
+)
+
 _T = TypeVar("_T")
-_ITERATOR_TERMINAL = object()
-_ITERATOR_INTERRUPTED = object()
 _TASK_ERROR_UNSET = object()
 # Only used when publication of the completion callback itself failed. A
 # timer yields to the SAME native owner without another Task/collector or a
@@ -31,6 +37,140 @@ _NATIVE_CREATE_TASK = asyncio.create_task
 _NATIVE_CREATE_TASK_CODE = asyncio.create_task.__code__
 _NATIVE_LOOP_CREATE_TASK = asyncio.BaseEventLoop.create_task
 _NATIVE_LOOP_CREATE_TASK_CODE = asyncio.BaseEventLoop.create_task.__code__
+
+# Routing only. Each coordinator independently validates the actual caller and
+# original native admission; inheriting this context grants no membership.
+_OWNED_COORDINATORS = contextvars.ContextVar("kestrel_owned_coordinators", default=())
+
+
+@contextmanager
+def bind_owned_coordinator(coordinator):
+    current = _OWNED_COORDINATORS.get()
+    reset = _OWNED_COORDINATORS.set((*current, coordinator) if coordinator not in current else current)
+    try:
+        yield
+    finally:
+        _OWNED_COORDINATORS.reset(reset)
+
+
+@contextmanager
+def without_owned_coordinators():
+    """Create independent work that no enclosing coordinator admits (#4023).
+
+    A Task created inside a coordinator's scope becomes that scope's join
+    obligation. Work that is its own unit, and outlives its creator's span,
+    is created with no coordinator routed, and copies none into its context.
+    """
+    reset = _OWNED_COORDINATORS.set(())
+    try:
+        yield
+    finally:
+        _OWNED_COORDINATORS.reset(reset)
+
+
+@asynccontextmanager
+async def owned_native_wait(targets):
+    """Park an actual writer for exact accepted native execution owners.
+
+    Restoration completes before caller code, including cancellation handlers,
+    resumes. Eventual join edges and copied context alone cannot lend a writer.
+    """
+    targets = tuple(targets)
+    waiter = asyncio.current_task()
+    with ExitStack() as dependencies:
+        def join_original(task):
+            dependencies.enter_context(owned_task_join_dependency(task, waiter=waiter))
+
+        for target in targets:
+            if type(target) is OwnedCallbackScope:
+                # Future reader callbacks join this exact waiting frame before
+                # their producer returns them. The cohort grants no authority.
+                target._join_observers.add(join_original)
+                dependencies.callback(target._join_observers.discard, join_original)
+                for task in tuple(target.tasks):
+                    join_original(task)
+            else:
+                join_original(target)
+        async with AsyncExitStack() as stack:
+            for coordinator in _OWNED_COORDINATORS.get():
+                await stack.enter_async_context(coordinator.park_native_wait(targets))
+            yield
+
+
+@asynccontextmanager
+async def owned_native_yield():
+    """Relinquish delegated writers at the iterator's controlled handshake."""
+    async with AsyncExitStack() as stack:
+        for coordinator in _OWNED_COORDINATORS.get():
+            await stack.enter_async_context(coordinator.yield_native_writer())
+        yield
+
+
+class OwnedCallbackScope:
+    """Original native work accepted during one provider wait."""
+
+    def __init__(self):
+        self.tasks = set()
+        self._join_observers = set()
+        self.closed = False
+        self.coordinators = tuple(c for c in _OWNED_COORDINATORS.get()
+                                  if c.current_native_scope() is not None)
+        self.factories = tuple(c.capture_native_work_factory(acquire_span=False)
+                               for c in self.coordinators)
+        for coordinator in self.coordinators:
+            coordinator.register_callback_scope(self)
+
+    def start(self, operation, *, name=None, context=None, on_completion=None):
+        """Accept original work with an explicitly selected execution context.
+
+        The retained privacy factory owns resource-lifetime admission separately;
+        a fresh context need not inherit the caller's validators or private data.
+        """
+        if self.closed:
+            raise RuntimeError("native callback admission is closed")
+        if len(self.factories) > 1:
+            raise RuntimeError("a callback must have one original privacy coordinator")
+        published = asyncio.get_running_loop().create_future()
+
+        async def run():
+            opening = await published
+            if opening is not None:
+                raise opening
+            return await operation()
+
+        task = (self.factories[0](run, name=name, context=context,
+                                 on_completion=on_completion) if self.factories else
+                create_owned_task(run(), name=name, context=context,
+                                  retain_originals=True, on_completion=on_completion))
+        # Physical acceptance precedes cohort publication. Keep that exact
+        # owner even when an observer/coordinator refuses its publication.
+        self.tasks.add(task)
+        try:
+            self.accept(task)
+        except BaseException as error:
+            _retain_owned_admission_error(task, error, gate=published)
+        else:
+            published.set_result(None)
+        return task
+
+    def accept(self, task):
+        """Retain a producer's exact accepted Task, including failed publication."""
+        if self.closed:
+            raise RuntimeError("native callback admission is closed")
+        self.tasks.add(task)
+        for observer in tuple(self._join_observers):
+            observer(task)
+        for coordinator in self.coordinators:
+            coordinator.callback_accepted(self, task)
+        return task
+
+    def close(self):
+        self.closed = True
+
+    @asynccontextmanager
+    async def wait(self):
+        async with owned_native_wait((self,)):
+            yield
 
 
 @contextmanager
@@ -82,8 +222,20 @@ def owned_task_join_ancestors(task=None):
 def _tracks_owned_task_join(function):
     @wraps(function)
     async def joined(task, *args, **kwargs):
-        with owned_task_join_dependency(task):
-            return await function(task, *args, **kwargs)
+        outcome = None
+        try:
+            async with owned_native_wait((task,)):
+                outcome = await function(task, *args, **kwargs)
+        except BaseException as error:
+            if outcome is None:
+                raise
+            # The native join already collected its exact outcome. Restoring
+            # a delegated writer belongs to this observer; withdrawal there
+            # cannot discard the original receipt or an earlier cancellation.
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            return OwnedTaskOutcome(outcome.result,
+                execution_observation_error(outcome.error, error), outcome.cancellation)
+        return outcome
     return joined
 
 
@@ -99,6 +251,91 @@ class OwnedTaskAdmission:
     _acceptance_unknown: bool = field(default=False, repr=False)
     _reconciled_tasks: tuple[asyncio.Task, ...] = field(default=(), repr=False)
     _unpublished_wrapper: object = field(default=None, repr=False)
+    error: BaseException | None = field(default=None, repr=False)
+    _terminal_error: object = field(default=_TASK_ERROR_UNSET, repr=False)
+    _retain_originals: bool = field(default=False, repr=False)
+    _cancel_token: object = field(default_factory=object, repr=False)
+    _completion_capture_registered: bool = field(default=False, repr=False)
+    _canonical_wrapper_only: bool = field(default=False, repr=False)
+    _wrapper_started: bool = field(default=False, repr=False)
+    _canonical_error: BaseException | None = field(default=None, repr=False)
+    _start_refused: bool = field(default=False, repr=False)
+
+    @property
+    def dispatch_refused(self) -> bool:
+        """The exact canonical wrapper can only retire its sealed failed gate."""
+        return self._start_refused and self._canonical_wrapper_only
+
+
+def cancel_owned_task(task: asyncio.Task) -> bool:
+    """Request cancellation through this exact native admission's private token.
+
+    A pending request count is not proof that a received error was its Stop.
+    Tasks created elsewhere keep native cancellation semantics; this request
+    neither adopts their operation nor creates an admission receipt.
+    """
+    if not isinstance(task, _NATIVE_TASK):
+        raise TypeError("owned cancellation requires an original native Task")
+    admission = getattr(task, "_kestrel_owned_admission", None)
+    token = (admission._cancel_token
+        if type(admission) is OwnedTaskAdmission and admission.task is task else None)
+    return task.cancel(token)
+
+
+def is_owned_task_cancellation(task, error) -> bool:
+    """Authenticate this original Task's requested private cancellation."""
+    if not isinstance(task, _NATIVE_TASK) or not isinstance(error, asyncio.CancelledError):
+        return False
+    from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+    admission = getattr(task, "_kestrel_owned_admission", None)
+    return (type(admission) is OwnedTaskAdmission and admission.task is task
+        and len(error.args) == 1 and error.args[0] is admission._cancel_token
+        and error.__cause__ is None
+        and not is_tool_execution_terminal_error(error))
+
+
+def owned_task_completion_error(task, observed=None):
+    """Reconcile every native completion with its authoritative original receipt."""
+    if observed is not None and not isinstance(observed, BaseException):
+        raise TypeError("native completion observation requires BaseException or None")
+    original = owned_task_error(task) if task.done() else None
+    if original is None:
+        return observed
+    from kestrel_sovereign.execution_custody import (
+        execution_evidence_carriers, execution_observation_error,
+        execution_observer_cancellations,
+    )
+    # A bare native await can consume the Task's exception and manufacture a
+    # cancellation surrogate. Recover its receipt, while retaining any actual
+    # withdrawal already composed during privacy writer restoration.
+    if isinstance(observed, asyncio.CancelledError):
+        if execution_observer_cancellations(observed):
+            return execution_observation_error(original, observed, prefer_cancellation=True)
+        return original
+    if observed is None or any(error is observed for error in execution_evidence_carriers(original)):
+        return original
+    return execution_observation_error(original, observed)
+
+
+@contextmanager
+def owned_native_completion(task):
+    """Observe an original native await without changing its ownership or timing.
+
+    Enclose the existing native wait and writer restoration. Physical success,
+    ordinary failure and cancellation all reconcile the same original receipt;
+    no replacement Task, completion waiter or additional await is introduced.
+    """
+    try:
+        yield
+    except BaseException as observed:
+        terminal = owned_task_completion_error(task, observed)
+        if terminal is observed:
+            raise
+        raise terminal
+    else:
+        terminal = owned_task_completion_error(task)
+        if terminal is not None:
+            raise terminal
 
 
 def _has_owned_task_metadata(task) -> bool:
@@ -115,17 +352,47 @@ def _has_owned_task_metadata(task) -> bool:
     return type(admission) is OwnedTaskAdmission and admission.task is task
 
 
-def _retain_owned_admission_error(task, error):
-    """Core-only failed start-gate handoff; the payload must remain unstarted."""
+def _retain_owned_admission_error(task, error, *, admission=None, gate=None):
+    """Retain failed admission on its original receipt and settle its gate.
+
+    Task metadata is a diagnostic cache. Refusing that cache cannot strand an
+    accepted owner or replace its original publication failure.
+    """
     from kestrel_sovereign.execution_custody import execution_observation_error, retained_execution_error
-    cached = getattr(task, "_kestrel_owned_terminal_error", None)
-    terminal = retained_execution_error(execution_observation_error(cached, error))
-    task._kestrel_owned_terminal_error = terminal
+    receipt_error = None
+    if admission is None:
+        try:
+            admission = getattr(task, '_kestrel_owned_admission', None)
+        except BaseException as publication:
+            receipt_error = publication
+    if type(admission) is OwnedTaskAdmission and admission.task is task:
+        receipt_error = execution_observation_error(
+            receipt_error, admission.error,
+            admission._terminal_error if admission._terminal_error is not _TASK_ERROR_UNSET else None,
+        )
+    try:
+        cached = getattr(task, "_kestrel_owned_terminal_error", None)
+    except BaseException as publication:
+        cached = publication
+    terminal = retained_execution_error(execution_observation_error(receipt_error, cached, error))
+    try:
+        task._kestrel_owned_terminal_error = terminal
+    except BaseException as publication:
+        terminal = retained_execution_error(execution_observation_error(terminal, publication))
+    if type(admission) is OwnedTaskAdmission and admission.task is task:
+        admission.error = terminal
+        if admission._terminal_error is not _TASK_ERROR_UNSET:
+            # Physical observation is single-capture, but ownership publication
+            # can still fail after an eager Task finishes. Extend its original
+            # receipt without harvesting the consumed native exception again.
+            admission._terminal_error = terminal
+    if gate is not None and not gate.done():
+        gate.set_result(terminal)
     return terminal
 
 
 def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
-                      retirement_resource=None, loop=None, admission=None):
+                      retirement_resource=None, loop=None, admission=None, on_completion=None):
     """Capture the original carrier inside a child before asyncio can erase it.
 
     Creation retains normal copied-context semantics. The caller still owns
@@ -147,42 +414,85 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     if admission is None:
         admission = OwnedTaskAdmission()
     gate = None
+    admitted_coordinators = ()
     unstarted_closed = False
     async def run():
         nonlocal started
+        admission._wrapper_started = True
+        observed = None
         try:
             if gate is not None:
                 opening = await gate
                 if opening is not None:
                     raise opening
             started = True
-            return await operation
+            reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
+                (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
+            )))
+            try:
+                return await operation
+            finally:
+                _OWNED_COORDINATORS.reset(reset)
         except BaseException as error:
             from kestrel_sovereign.execution_custody import (
                 execution_terminal_error,
                 execution_observation_error,
                 retained_execution_error,
             )
-            task = asyncio.current_task()
-            cached = getattr(task, "_kestrel_owned_terminal_error", None)
-            terminal = retained_execution_error(
-                execution_observation_error(cached, error)
-                if cached is not None and cached is not error else
-                execution_terminal_error(error, retain_originals=retain_originals)
+            admission._canonical_error = execution_terminal_error(
+                error, retain_originals=retain_originals,
             )
+            observed = error
             try:
-                task._kestrel_owned_terminal_error = terminal
+                task = asyncio.current_task()
+                cached = getattr(task, "_kestrel_owned_terminal_error", None)
+                observed = retained_execution_error(
+                    execution_observation_error(cached, error)
+                    if cached is not None and cached is not error else
+                    execution_terminal_error(error, retain_originals=retain_originals)
+                )
+                task._kestrel_owned_terminal_error = observed
             except BaseException as publication:
-                raise execution_observation_error(terminal, publication)
+                observed = execution_observation_error(observed, publication)
+                admission._canonical_error = observed
+                raise observed
             raise
+        finally:
+            if on_completion is not None:
+                # This belongs to the original physical wrapper, outside its
+                # payload gate. Task callback subscription is not required to
+                # observe a failed gate, including two publication failures.
+                try:
+                    completion = on_completion(asyncio.current_task(), observed)
+                    if completion is not None:
+                        if inspect.iscoroutine(completion):
+                            completion.close()
+                        raise TypeError("native completion publisher must return synchronously with None")
+                except BaseException as publication:
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    combined = execution_observation_error(observed, publication)
+                    try:
+                        asyncio.current_task()._kestrel_owned_terminal_error = combined
+                    except BaseException as cache_error:
+                        combined = execution_observation_error(combined, cache_error)
+                    admission._canonical_error = combined
+                    raise combined
     wrapper = run()
     def close_unstarted(_task):
         nonlocal unstarted_closed
-        if not started and not unstarted_closed:
-            unstarted_closed = True
-            close = getattr(operation, "close", None)
-            if callable(close):
-                close()
+        try:
+            if not started and not unstarted_closed:
+                unstarted_closed = True
+                close = getattr(operation, "close", None)
+                if callable(close):
+                    close()
+        finally:
+            if _task is not None and _task.done():
+                admission._completion_capture_registered = True
+                # This is the first callback installed by the original creator.
+                # Snapshot the physical outcome before a foreign await consumes
+                # asyncio's original CancelledError, including outer epilogues.
+                owned_task_error(_task)
 
     def fail_start(task, opening):
         from kestrel_sovereign.execution_custody import (
@@ -190,7 +500,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         )
         terminal = execution_terminal_error(opening, retain_originals=retain_originals)
         try:
-            _retain_owned_admission_error(task, terminal)
+            terminal = _retain_owned_admission_error(task, terminal, admission=admission)
         except BaseException as publication:
             terminal = execution_observation_error(terminal, publication)
         finally:
@@ -201,6 +511,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             finally:
                 if not gate.done():
                     gate.set_result(terminal)
+                admission._start_refused = not gate.cancelled() and gate.result() is not None
         return terminal
 
     creation_attempted = False
@@ -209,6 +520,13 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         if (type(admission) is not OwnedTaskAdmission or admission.task is not None
                 or admission._acceptance_unknown):
             raise TypeError("owned admission requires a fresh original receipt")
+        admission._retain_originals = retain_originals
+        if on_completion is not None:
+            publisher_call = getattr(on_completion, '__call__', None)
+            if (not callable(on_completion)
+                    or any(inspect.iscoroutinefunction(publisher) or inspect.isasyncgenfunction(publisher)
+                           for publisher in (on_completion, publisher_call))):
+                raise TypeError("native completion publisher must be a synchronous callable")
         owner_loop = asyncio.get_running_loop()
         gate = owner_loop.create_future()
         task_factory = owner_loop.get_task_factory()
@@ -236,9 +554,11 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 query_error = failure
             if query_error is None and len(matches) == 1:
                 task = admission.task = matches[0]
+                admission._canonical_wrapper_only = True
                 try:
                     task._kestrel_owned_admission = admission
                     task.add_done_callback(close_unstarted)
+                    admission._completion_capture_registered = True
                 except BaseException as publication:
                     from kestrel_sovereign.execution_custody import execution_observation_error
                     error = execution_observation_error(error, publication)
@@ -299,9 +619,25 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             )
         raise
     admission.task = task
+    admission._canonical_wrapper_only = isinstance(task, _NATIVE_TASK) and _NATIVE_TASK.get_coro(task) is wrapper
     try:
         task._kestrel_owned_admission = admission
         task.add_done_callback(close_unstarted)
+        admission._completion_capture_registered = True
+        # An eager factory can return an already-finished outer Task. Capture
+        # and close its unentered payload before exposing it to native awaiters;
+        # scheduling a done callback alone leaves the original C consumable.
+        if task.done():
+            close_unstarted(task)
+        # An explicit context narrows the original ownership handoff. Resident
+        # contexts deliberately carry no invocation coordinator. Routing still
+        # cannot enroll anything unless the actual creator is an original member.
+        coordinators = (_OWNED_COORDINATORS.get() if context is None else
+                        context.get(_OWNED_COORDINATORS, ()))
+        admitted_coordinators = tuple(
+            coordinator for coordinator in coordinators
+            if coordinator.admit_owned_task(asyncio.current_task(), task, admission)
+        )
     except BaseException as opening:
         if gate is not None:
             # The payload is still behind its failed gate. Retain this actual
@@ -355,7 +691,8 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
         if not pending or remaining <= 0:
             break
         try:
-            _, pending = await asyncio.wait(pending, timeout=remaining)
+            async with owned_native_wait(pending):
+                _, pending = await asyncio.wait(pending, timeout=remaining)
         except asyncio.CancelledError as error:
             withdrawal = execution_terminal_error(
                 withdrawal, error, retain_originals=True,
@@ -363,11 +700,36 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
     return OwnedTaskOutcome((originals - pending, pending), None, withdrawal)
 
 
+async def acquire_lock_keeping_cancellation(lock: asyncio.Lock) -> BaseException | None:
+    """Acquire ``lock`` however often the caller is cancelled meanwhile.
+
+    For a closer that must still release what it owns after the lock's
+    holder finishes, such as a backend close joining a runtime-owner renewal
+    (#4040). A cancellation while waiting is kept rather than raised, and
+    returned once the lock is held, for the caller to deliver after its
+    cleanup. A grant that a cancellation overtook is passed on by
+    ``asyncio.Lock`` itself, so the lock is never left held by this waiter.
+    """
+    from kestrel_sovereign.execution_custody import execution_terminal_error
+
+    cancellation: BaseException | None = None
+    while True:
+        try:
+            await lock.acquire()
+        except asyncio.CancelledError as error:
+            cancellation = execution_terminal_error(
+                cancellation, error, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+            continue
+        return cancellation
+
+
 async def gather_owned(operations, *, cancel_siblings_on_error=True,
                        retirement_resource=None, retain_originals=False,
                        name_prefix: str | None = None,
                        isolate_control_originals=False,
-                       return_when=asyncio.ALL_COMPLETED):
+                       return_when=asyncio.ALL_COMPLETED, work_factory=None):
     """Join accepted children even if later admission or observation fails.
 
     Independent native retirement can disable sibling cancellation: all
@@ -377,10 +739,13 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     receipts. Indexed names are diagnostic only, never a second owner.
     FIRST_COMPLETED races are finite observers: after the first outcome, every
     remaining accepted peer is cancelled and physically joined before return.
+    An explicit native work factory receives lazy operation factories instead
+    of coroutines. It owns gated admission and original-error retention; this
+    gather still owns joining every accepted Task, including a failed gate.
     """
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
-        is_execution_control_error,
+        is_tool_execution_terminal_error,
     )
     if return_when not in (asyncio.ALL_COMPLETED, asyncio.FIRST_COMPLETED):
         raise ValueError("owned gather requires ALL_COMPLETED or FIRST_COMPLETED")
@@ -388,72 +753,89 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     pending = set()
     primary = None
     first_observed = False
-    try:
-        for index, operation in enumerate(operations):
-            admission = OwnedTaskAdmission()
-            try:
-                children.append(create_owned_task(
-                    operation, retirement_resource=retirement_resource,
-                    retain_originals=retain_originals,
-                    name=f"{name_prefix}:{index}" if name_prefix is not None else None,
-                    admission=admission,
-                ))
-            except BaseException as error:
-                if admission.task is not None:
-                    # Publication failed, not acceptance. This exact gated
-                    # child must be harvested without cancelling away its
-                    # original opening failure.
-                    children.append(admission.task)
-                    outcome = await await_owned_task(admission.task)
-                    error = execution_terminal_error(
-                        error, outcome.error, outcome.cancellation,
-                        retain_originals=retain_originals,
+    accepted_scope = OwnedCallbackScope()
+    async with AsyncExitStack() as parked:
+        await parked.enter_async_context(accepted_scope.wait())
+        try:
+            for index, operation in enumerate(operations):
+                admission = OwnedTaskAdmission()
+                try:
+                    name = f"{name_prefix}:{index}" if name_prefix is not None else None
+                    if work_factory is None:
+                        child = create_owned_task(
+                            operation, retirement_resource=retirement_resource,
+                            retain_originals=retain_originals, name=name, admission=admission,
+                        )
+                    else:
+                        child = work_factory(operation, name=name)
+                        admission.task = child
+                    children.append(child)
+                    accepted_scope.accept(child)
+                except BaseException as error:
+                    if admission.task is not None:
+                        # Publication failed, not acceptance. This exact gated
+                        # child must be harvested without cancelling away its
+                        # original opening failure.
+                        if not children or children[-1] is not admission.task:
+                            children.append(admission.task)
+                        if admission.task not in accepted_scope.tasks:
+                            try:
+                                accepted_scope.accept(admission.task)
+                            except BaseException as publication_error:
+                                error = execution_terminal_error(error, publication_error,
+                                    retain_originals=retain_originals,
+                                    isolate_control_originals=isolate_control_originals)
+                        outcome = await await_owned_task(admission.task)
+                        error = execution_terminal_error(
+                            error, outcome.error, outcome.cancellation,
+                            retain_originals=retain_originals,
+                            isolate_control_originals=isolate_control_originals,
+                        )
+                    error = owned_task_admission_error(
+                        retirement_resource, admission, error,
+                    )
+                    if cancel_siblings_on_error:
+                        raise error
+                    primary = execution_terminal_error(
+                        primary, error, retain_originals=retain_originals,
                         isolate_control_originals=isolate_control_originals,
                     )
-                error = owned_task_admission_error(
-                    retirement_resource, admission, error,
-                )
-                if cancel_siblings_on_error:
-                    raise error
-                primary = execution_terminal_error(
-                    primary, error, retain_originals=retain_originals,
-                    isolate_control_originals=isolate_control_originals,
-                )
-        pending = set(children)
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            first_observed = return_when == asyncio.FIRST_COMPLETED
-            for child in done:
-                error = owned_task_error(child)
-                if error is not None:
-                    raise error
-            if first_observed:
-                break
-    except BaseException as error:
-        primary = execution_terminal_error(
-            primary, error, retain_originals=retain_originals,
+            pending = set(children)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                first_observed = return_when == asyncio.FIRST_COMPLETED
+                for child in done:
+                    error = owned_task_error(child)
+                    if error is not None:
+                        raise error
+                if first_observed:
+                    break
+        except BaseException as error:
+            primary = execution_terminal_error(
+                primary, error, retain_originals=retain_originals,
+                isolate_control_originals=isolate_control_originals,
+            )
+        finally:
+            accepted_scope.close()
+        if first_observed or (primary is not None and cancel_siblings_on_error):
+            for child in children:
+                if not child.done():
+                    child.cancel()
+        errors = [primary]
+        results = []
+        for child in children:
+            outcome = await await_owned_task(child)
+            results.append(outcome.result)
+            if outcome.error is not None and (not issubclass(type(outcome.error), asyncio.CancelledError) or is_tool_execution_terminal_error(outcome.error)):
+                errors.append(outcome.error)
+            errors.append(outcome.cancellation)
+        terminal = execution_terminal_error(
+            *errors, retain_originals=retain_originals,
             isolate_control_originals=isolate_control_originals,
         )
-    if first_observed or (primary is not None and cancel_siblings_on_error):
-        for child in children:
-            if not child.done():
-                child.cancel()
-    errors = [primary]
-    results = []
-    for child in children:
-        outcome = await await_owned_task(child)
-        results.append(outcome.result)
-        if outcome.error is not None and (not isinstance(outcome.error, asyncio.CancelledError) or is_execution_control_error(outcome.error)):
-            errors.append(outcome.error)
-        errors.append(outcome.cancellation)
-    terminal = execution_terminal_error(
-        *errors, retain_originals=retain_originals,
-        isolate_control_originals=isolate_control_originals,
-    )
-    if terminal is not None:
-        raise terminal
-    return results
-
+        if terminal is not None:
+            raise terminal
+        return results
 
 class _ConsumerCloseRecord:
     """Whether the consumer of one owned iterator closed it early.
@@ -536,6 +918,34 @@ class OwnedTaskOutcome(Generic[_T]):
     cancellation: asyncio.CancelledError | None
 
 
+@dataclass(frozen=True, slots=True)
+class OwnedTaskHandoff(Generic[_T]):
+    """Retain a finite original outcome until its consumer accepts delivery."""
+
+    outcome: OwnedTaskOutcome[_T]
+    operation: str
+
+    @contextmanager
+    def handoff(self):
+        try:
+            yield self
+        except BaseException as consumer_error:
+            self.raise_outcome(consumer_error)
+
+    def raise_outcome(self, consumer_error: BaseException | None = None):
+        if consumer_error is not None:
+            from kestrel_sovereign.execution_custody import execution_observation_error
+
+            raise execution_observation_error(
+                self.outcome.error, self.outcome.cancellation, consumer_error,
+                prefer_cancellation=(self.outcome.cancellation is not None
+                    or isinstance(self.outcome.error, asyncio.CancelledError)),
+            )
+        return raise_owned_outcome(
+            self.outcome, operation=self.operation, retain_originals=True,
+        )
+
+
 def owned_task_admission_error(resource, admission, failure):
     """Private debt for one failed admission; never decorate the source.
 
@@ -555,42 +965,79 @@ def owned_task_admission_error(resource, admission, failure):
     )
 
 
+class OwnedOperation:
+    """One lifecycle-retained operation and its original admission outcome.
+
+    Construction admits once. Every observer joins that exact native Task;
+    repeated or concurrent observations never retry its physical operation.
+    """
+
+    def __init__(self, operation, *, retirement_resource=None,
+                 retain_originals=False, name=None, context=None, owner_factory=None):
+        admission = OwnedTaskAdmission()
+        self._opening = None
+        factory_returned = False
+        try:
+            if owner_factory is None:
+                self._task = create_owned_task(
+                    operation, retirement_resource=retirement_resource,
+                    retain_originals=retain_originals, name=name, context=context,
+                    admission=admission,
+                )
+            else:
+                self._task = owner_factory(operation, context, admission, retirement_resource)
+                factory_returned = True
+                if (not isinstance(self._task, _NATIVE_TASK) or self._task is not admission.task
+                        or getattr(self._task, '_kestrel_owned_admission', None) is not admission):
+                    raise TypeError("original operation factory did not retain its native admission")
+                opening = admission.error
+                if opening is not None:
+                    self._opening = owned_task_admission_error(retirement_resource, admission, opening)
+        except BaseException as failure:
+            # Only a native Task is an accepted physical owner. A malformed
+            # factory publication cannot turn an arbitrary value into a receipt.
+            accepted = (admission if isinstance(admission.task, _NATIVE_TASK)
+                and (not factory_returned or getattr(admission.task, '_kestrel_owned_admission', None) is admission)
+                else OwnedTaskAdmission())
+            self._opening = owned_task_admission_error(retirement_resource, accepted, failure)
+            self._task = accepted.task
+
+    @property
+    def task(self):
+        """The exact admitted owner, or None after a true allocation refusal."""
+        return self._task
+
+    @property
+    def admission_error(self):
+        return self._opening
+
+    async def observe(self, **observation):
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        if self._task is None:
+            return OwnedTaskOutcome(None, self._opening, observation.get("pending_cancellation"))
+        if self._opening is None:
+            return await await_owned_task(self._task, **observation)
+        # Do not cancel a failed start gate into a substitute CancelledError.
+        outcome = await await_owned_task(
+            self._task, pending_cancellation=observation.get("pending_cancellation"))
+        return OwnedTaskOutcome(
+            outcome.result,
+            execution_observation_error(self._opening, outcome.error),
+            outcome.cancellation,
+        )
+
+
 async def await_owned_operation(operation, *, retirement_resource=None,
                                 retain_originals=False, name=None, context=None,
                                 **observation):
     """Admit and physically join one operation, including publication failure.
 
-    This is only for an existing asynchronous join boundary. Bounded or
-    synchronous handoffs must instead inventory their explicit receipt in the
-    existing lifecycle owner. No registry, replacement Task, retry or new
-    observation deadline is introduced here.
+    Lifecycles that need multiple observers retain an OwnedOperation directly.
+    This convenience boundary uses the same original admission and join path.
     """
-    from kestrel_sovereign.execution_custody import execution_terminal_error
-    admission = OwnedTaskAdmission()
-    opening = None
-    try:
-        task = create_owned_task(
-            operation, retirement_resource=retirement_resource,
-            retain_originals=retain_originals, name=name, context=context,
-            admission=admission,
-        )
-    except BaseException as failure:
-        opening = owned_task_admission_error(retirement_resource, admission, failure)
-        task = admission.task
-        if task is None:
-            return OwnedTaskOutcome(None, opening, observation.get("pending_cancellation"))
-    if opening is None:
-        return await await_owned_task(task, **observation)
-    # Do not cancel the failed start gate into a substitute CancelledError.
-    outcome = await await_owned_task(
-        task, pending_cancellation=observation.get("pending_cancellation"),
-    )
-    return OwnedTaskOutcome(
-        outcome.result,
-        execution_terminal_error(opening, outcome.error, retain_originals=True,
-                                 isolate_control_originals=True),
-        outcome.cancellation,
-    )
+    return await OwnedOperation(operation, retirement_resource=retirement_resource,
+        retain_originals=retain_originals, name=name, context=context).observe(**observation)
 
 
 def owned_task_observation_control(outcome):
@@ -622,15 +1069,41 @@ class PendingOwnedTask(Generic[_T]):
 
     task: asyncio.Future[_T]
     cancellation: asyncio.CancelledError
+    observation_error: BaseException | None = None
 
     def raise_abandonment(self):
         from kestrel_sovereign.execution_custody import (
-            ExecutionAuthorityError, execution_terminal_error,
+            ExecutionAuthorityError, execution_error_with_cause, execution_observation_error,
         )
         pending = ExecutionAuthorityError("native operation remains pending in its retained lifecycle owner")
         pending.native_owner = self.task
-        pending.__cause__ = self.cancellation
-        raise execution_terminal_error(self.cancellation, pending)
+        # The pending native fact and this observer's withdrawals have
+        # different lifetimes. Keep the typed public refusal without making
+        # its finite cancellation graph part of the shared native source.
+        refusal = ExecutionAuthorityError(*pending.args)
+        refusal.native_owner = self.task
+        raise execution_error_with_cause(refusal,
+            execution_observation_error(pending, self.cancellation, self.observation_error))
+
+
+class _CoreSourceHandoff(SourceHandoff[_T]):
+    """Project retained SDK withdrawals through Core's existing control policy."""
+
+    async def publish(self, value: _T) -> bool:
+        try:
+            return await super().publish(value)
+        except BaseExceptionGroup as withdrawals:
+            if not all(isinstance(error, asyncio.CancelledError)
+                       for error in withdrawals.exceptions):
+                raise
+            from kestrel_sovereign.execution_custody import execution_observation_error
+
+            # The SDK owns frame retention; only Core knows its typed control
+            # graph. Preserve every actual withdrawal and the first one's args
+            # without turning a repeated cancellation into an ordinary failure.
+            raise execution_observation_error(
+                *withdrawals.exceptions, prefer_cancellation=True,
+            )
 
 
 class OwnedAsyncIterator(Generic[_T]):
@@ -646,7 +1119,7 @@ class OwnedAsyncIterator(Generic[_T]):
 
     def __init__(
         self,
-        iterator_factory: Callable[[], AsyncIterator[_T]],
+        iterator_factory: Callable[[], AsyncIterable[_T] | OwnedCallbackSource[_T]],
         *,
         operation: str,
         cleanup_requested: Callable[[], bool] | None = None,
@@ -657,20 +1130,23 @@ class OwnedAsyncIterator(Generic[_T]):
         self._iterator_factory = iterator_factory
         self._operation = operation
         self._cleanup_requested = cleanup_requested
-        self._items: asyncio.Queue[tuple[object, _T | None]] = asyncio.Queue()
-        self._continue = asyncio.Event()
-        self._stop = asyncio.Event()
-        self._item_outstanding = False
-        self._waiting_for_continue = False
+        self._handoff = _CoreSourceHandoff[_T](
+            yield_writer=owned_native_yield, wait_writer=self._wait_for_source,
+        )
+        self._callback_source = False
         self._interrupt_after_continue = False
         self._closed = False
+        self._active_close_calls = 0
+        self._owner_cancelled_by_close = False
         self._interrupted_by_cleanup = False
         self._cleanup_error: BaseException | None = None
         # asyncio discards a cancelled task's original exception after its
         # first retrieval. Both the reader and closer need the same evidence.
         self._terminal_error: BaseException | None = None
         self._terminal_published = False
+        self._terminal_consumed = False
         self._cancellation_watch_started = False
+        self._watcher_private_cancellation: asyncio.CancelledError | None = None
         self._construction_error = None
         self._cancellation_owner = None
         self._consumer_close = _ConsumerCloseRecord()
@@ -700,8 +1176,6 @@ class OwnedAsyncIterator(Generic[_T]):
             # this one construction transaction, including the first callback.
             self._consumer_close.owner = self._owner
             self._owner.add_done_callback(self._publish_owner_completion)
-            if owner_started is not None:
-                owner_started(self, self._owner)
             self._cancellation_owner = create_owned_task(
                 self._watch_owner_cancellation(),
                 name=f"owned_async_iterator_cancel:{operation}",
@@ -710,6 +1184,8 @@ class OwnedAsyncIterator(Generic[_T]):
             self._cancellation_owner.add_done_callback(
                 self._interrupt_if_watch_never_started
             )
+            if owner_started is not None:
+                owner_started(self, self._owner)
         except BaseException as error:
             self._owner = self._owner if self._owner is not None else owner_admission.task
             self._cancellation_owner = (self._cancellation_owner if self._cancellation_owner is not None
@@ -730,10 +1206,10 @@ class OwnedAsyncIterator(Generic[_T]):
                 *getattr(error, "_kestrel_native_retirement_debts", ()),
                 (self, self._owner),
             )
-            self._stop.set()
-            self._owner.cancel()
+            self._handoff.request_stop()
+            cancel_owned_task(self._owner)
             if self._cancellation_owner is not None:
-                self._cancellation_owner.cancel()
+                cancel_owned_task(self._cancellation_owner)
             raise error
         dispatch.set()
 
@@ -746,7 +1222,7 @@ class OwnedAsyncIterator(Generic[_T]):
         # the original owner's terminal outcome, never a replacement body.
         if not self._terminal_published:
             self._terminal_published = True
-            self._items.put_nowait((_ITERATOR_TERMINAL, None))
+            self._handoff.publish_terminal()
 
     @property
     def terminal_error(self) -> BaseException | None:
@@ -754,12 +1230,13 @@ class OwnedAsyncIterator(Generic[_T]):
 
         if not self._owner.done():
             return None
-        if self._terminal_error is not None:
-            return self._terminal_error
-        try:
-            return self._owner.exception()
-        except asyncio.CancelledError as error:
-            return error
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        return execution_observation_error(self._terminal_error, owned_task_error(self._owner))
+
+    @property
+    def producer_task(self) -> asyncio.Task[None]:
+        """Return the exact physical source owner, independently of its watcher."""
+        return self._owner
 
     @property
     def owner_task(self) -> asyncio.Task[None]:
@@ -782,28 +1259,20 @@ class OwnedAsyncIterator(Generic[_T]):
     async def __anext__(self) -> _T:
         if self._closed:
             raise StopAsyncIteration
-        if self._item_outstanding:
-            self._item_outstanding = False
-            self._continue.set()
-            if self._interrupt_after_continue:
-                self._interrupt_after_continue = False
-                asyncio.get_running_loop().call_soon(
-                    self._cancel_owner_if_running
-                )
-
-        marker, item = await self._items.get()
-        if marker is _ITERATOR_INTERRUPTED:
+        received, item = await self._handoff.pull()
+        if not received and self._interrupted_by_cleanup:
             # Do not join here. The consumer may first publish its bounded Stop
             # acknowledgement; its ``finally`` then calls ``aclose`` and owns
-            # the source cleanup through terminalization.
+            # the source cleanup through terminalization. A fast physical
+            # completion does not change this demand-interruption disposition.
             raise StopAsyncIteration
-        if marker is _ITERATOR_TERMINAL:
+        if not received:
             self._closed = True
-            outcome = await self._join_source_owners()
+            outcome = await self.join_source_owners()
+            self._terminal_consumed = outcome.cancellation is None
             raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
             raise StopAsyncIteration
 
-        self._item_outstanding = True
         return cast(_T, item)
 
     async def _watch_owner_cancellation(self) -> None:
@@ -818,17 +1287,19 @@ class OwnedAsyncIterator(Generic[_T]):
                 # remains owned by this iterator and is harvested below.
                 raise outcome.error
         except asyncio.CancelledError as error:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-            if is_execution_control_error(error):
+            from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+            if is_tool_execution_terminal_error(error) or not asyncio.current_task().cancelling():
                 raise
+            if self._is_private_watcher_cancellation(error):
+                self._watcher_private_cancellation = error
             if self._owner.done():
                 return
-            if self._item_outstanding:
+            if self._handoff.item_outstanding:
                 # Let the consumer resume the source once. A source already at
                 # EOF can publish its real cleanup result; a provider that
                 # blocks in the next ``anext`` is interrupted one loop turn later.
                 self._interrupt_after_continue = True
-            elif self._waiting_for_continue:
+            elif self._handoff.waiting_for_ack:
                 # The consumer already released the handshake in this event-loop
                 # turn. Let the owner publish a synchronous EOF/failure first,
                 # then interrupt only if it actually blocks in the next source step.
@@ -838,33 +1309,61 @@ class OwnedAsyncIterator(Generic[_T]):
             else:
                 self._cancel_owner_if_running()
             raise
-        except BaseException:
-            # Losing the cancellation observer cannot leave an operational
-            # producer running without its lifecycle handoff. Interrupt once;
-            # the reader/closer still physically joins that SAME producer.
-            self._stop.set()
-            self._continue.set()
-            if not self._owner.done() and not self._owner.cancelling():
-                self._owner.cancel()
-            raise
 
-    async def _join_source_owners(self):
+    async def join_source_owners(self, *, closing=False, body_close_acknowledged=False):
         """Retain the source AND its original cancellation observer outcomes."""
-        from kestrel_sovereign.execution_custody import execution_terminal_error, execution_observation_error, is_execution_control_error
-        def compose(*errors):
-            if self._construction_error is not None:
-                return execution_observation_error(*errors)
-            return execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError, execution_commit_outcome, execution_cleanup_debts,
+            _explicit_control_chain, execution_observation_error,
+            is_tool_execution_terminal_error,
+        )
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
-        if isinstance(watcher_error, asyncio.CancelledError) and not is_execution_control_error(watcher_error):
+        if self._cancellation_owner is not None:
+            # A join can observe a finished Task before its scheduled done
+            # callback runs. Reconcile the same pre-first-step Stop here too.
+            self._interrupt_if_watch_never_started(self._cancellation_owner)
+        if (issubclass(type(watcher_error), asyncio.CancelledError)
+                and watcher_error is self._watcher_private_cancellation
+                and not is_tool_execution_terminal_error(watcher_error)):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
-        return OwnedTaskOutcome(
+        terminal, owner_error = self._terminal_error, outcome.error
+        body_only = (terminal is not None
+            and not any(isinstance(error, asyncio.CancelledError) for error in _explicit_control_chain(terminal)) and (
+            not is_tool_execution_terminal_error(terminal)
+            or (type(terminal) is ExecutionAuthorityError
+                and terminal.__cause__ is None
+                and not execution_cleanup_debts(terminal)
+                and execution_commit_outcome(terminal) is None)))
+        if closing and body_close_acknowledged and self._terminal_consumed and body_only:
+            # Only this exact, already-delivered ordinary body error may be
+            # omitted from physical retirement. A delivered work-only
+            # refusal likewise says nothing about physical close. COMMIT,
+            # UNKNOWN, cancellation, and retirement debt remain failures.
+            # A distinct native epilogue or
+            # watcher result remains intact, including ordinary failures.
+            if owner_error is terminal:
+                owner_error = None
+            terminal = None
+        if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
+                and not self._interrupted_by_cleanup
+                and is_owned_task_cancellation(self._owner, owner_error)
+                and self._cleanup_error is None):
+            # Authenticate only this producer's individual acknowledgement.
+            # A composed cancellation may also carry an independent watcher.
+            owner_error = None
+        originals = (terminal, owner_error, watcher_error)
+        result = OwnedTaskOutcome(
             outcome.result,
-            compose(self._terminal_error, outcome.error, watcher_error),
-            compose(outcome.cancellation, watcher.cancellation if watcher is not None else None),
+            execution_observation_error(*originals, prefer_cancellation=all(
+                error is None or isinstance(error, asyncio.CancelledError) for error in originals)),
+            execution_observation_error(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
+        return result
+
+    def _is_private_watcher_cancellation(self, error):
+        return is_owned_task_cancellation(self._cancellation_owner, error)
 
     def _interrupt_if_watch_never_started(
         self,
@@ -883,134 +1382,123 @@ class OwnedAsyncIterator(Generic[_T]):
         if (
             watcher.cancelled()
             and not self._cancellation_watch_started
-            and not self._owner.done()
         ):
-            self._cancel_owner_if_running()
+            error = owned_task_error(watcher)
+            if self._is_private_watcher_cancellation(error):
+                if isinstance(error, asyncio.CancelledError):
+                    self._watcher_private_cancellation = error
+                if not self._owner.done():
+                    self._cancel_owner_if_running()
 
-    def _cancel_owner_if_running(self) -> None:
+    def _cancel_owner_if_running(self) -> bool:
+        if self._callback_source:
+            # A callback owns its body AND finally. Its existing false-emission
+            # protocol requests retirement without injecting Task.cancel into
+            # an unknown active phase and turning aborted cleanup into an ACK.
+            self._handoff.request_stop()
+            return False
         if not self._owner.done() and not self._owner.cancelling():
-            self._owner.cancel()
+            return cancel_owned_task(self._owner)
+        return False
+
+    @asynccontextmanager
+    async def _wait_for_source(self) -> AsyncIterator[None]:
+        # SourceHandoff acknowledges its previous frame BEFORE this wait. Keep
+        # the existing EOF-before-interrupt ordering: the original producer's
+        # ACK wake precedes this one-turn cancellation translation.
+        if self._interrupt_after_continue and not self._handoff.item_outstanding:
+            self._interrupt_after_continue = False
+            asyncio.get_running_loop().call_soon(self._cancel_owner_if_running)
+        async with owned_native_wait((self._owner,)):
+            yield
+
+    def _classify_source_failure(self, error: BaseException) -> None:
+        from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+
+        if is_tool_execution_terminal_error(error):
+            return
+        close_requested = self._handoff.stopped
+        if close_requested and not isinstance(error, asyncio.CancelledError):
+            self._cleanup_error = error
+        cancellation_requested = close_requested or (
+            self._cleanup_requested is not None and self._cleanup_requested() is True
+        )
+        if cancellation_requested and is_owned_task_cancellation(self._owner, error):
+            self._interrupted_by_cleanup = True
+            # End demand promptly, but do NOT claim the original finally or
+            # registered resources are physically retired. aclose owns that join.
+            self._handoff.request_stop()
 
     async def _run(self) -> None:
-        iterator: AsyncIterator[_T] | None = None
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        def acquire(_resources: SourceAcquisition) -> AsyncIterable[_T] | OwnedCallbackSource[_T]:
+            source = self._iterator_factory()
+            self._callback_source = isinstance(source, OwnedCallbackSource)
+            return source
+
         try:
-            iterator = self._iterator_factory()
-            try:
-                async for item in iterator:
-                    if self._stop.is_set():
-                        break
-                    await self._items.put((self, item))
-                    self._waiting_for_continue = True
-                    try:
-                        await self._continue.wait()
-                    finally:
-                        self._waiting_for_continue = False
-                    self._continue.clear()
-                    if self._stop.is_set():
-                        break
-            except BaseException as error:
-                # Import lazily: execution_custody also uses this primitive.
-                # A cancellation carrying authority/commit evidence is not
-                # our private producer interrupt, even during requested close.
-                from kestrel_sovereign.execution_custody import (
-                    is_execution_control_error,
-                )
-                if is_execution_control_error(error):
-                    raise
-                # An exception raised while a requested close interrupts
-                # ``anext`` belongs to generator unwinding, not ordinary
-                # source execution. Preserve that distinction for lifecycle
-                # acknowledgement at the transport boundary.
-                close_requested = self._stop.is_set()
-                cancellation_requested = close_requested
-                if (
-                    not cancellation_requested
-                    and self._cleanup_requested is not None
-                ):
-                    try:
-                        cancellation_requested = self._cleanup_requested() is True
-                    except Exception:
-                        # An observability predicate must not replace the
-                        # iterator's actual terminal failure.
-                        cancellation_requested = False
-                # A Stop marker can race a source's independent terminal
-                # failure after its final item. Only an initiated close owns a
-                # non-cancellation unwind as cleanup debt; the marker extends
-                # ownership solely to cancellation that interrupted the source.
-                if close_requested and not isinstance(
-                    error,
-                    asyncio.CancelledError,
-                ):
-                    self._cleanup_error = error
-                if cancellation_requested and isinstance(
-                    error,
-                    asyncio.CancelledError,
-                ):
-                    self._interrupted_by_cleanup = True
-                    self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
-                    return
-                raise
-        except BaseException as error:
-            self._terminal_error = error
-            raise
+            outcome = await run_source_body(
+                acquire, self._handoff, on_body_error=self._classify_source_failure,
+            )
+            if outcome.retirement_errors:
+                # Ordinary physical errors are originals too. The finite
+                # composer retains them in a fresh carrier instead of adding
+                # the other failures to an original exception's cause graph.
+                self._cleanup_error = execution_observation_error(*outcome.retirement_errors)
+            # Acknowledge only the authenticated, causeless private producer
+            # interrupt, as before delegation. It is not the request reader's
+            # withdrawal; those remain in their actual join. Late retirement
+            # and policy failures still remain independent original failures.
+            body_error = outcome.body_error
+            # A closer may enrich the earlier failure's graph. Authenticate
+            # its current state after retirement, not the earlier flag alone.
+            if (self._interrupted_by_cleanup
+                    and is_owned_task_cancellation(self._owner, body_error)):
+                body_error = None
+            errors = tuple(error for error in (
+                body_error, *outcome.retirement_errors, *outcome.observation_errors,
+            ) if error is not None)
+            if errors:
+                self._terminal_error = execution_observation_error(*errors)
+                raise self._terminal_error
         finally:
-            try:
-                if iterator is not None:
-                    close_iterator = getattr(iterator, "aclose", None)
-                    if callable(close_iterator):
-                        try:
-                            await close_iterator()
-                        except BaseException as error:
-                            from kestrel_sovereign.execution_custody import (
-                                execution_terminal_error,
-                            )
-                            self._cleanup_error = error
-                            self._terminal_error = execution_terminal_error(
-                                self._terminal_error, error,
-                                retain_originals=True, isolate_control_originals=True,
-                            )
-                            raise self._terminal_error
-            finally:
-                self._publish_owner_completion(self._owner)
+            self._publish_owner_completion(self._owner)
 
     async def aclose(self) -> None:
         """Stop producing and join the source iterator's owner task."""
 
-        if self._closed:
+        if (self._closed and not self._active_close_calls and self._owner.done()
+                and (self._cancellation_owner is None or self._cancellation_owner.done())):
             return
-        self._closed = True
-        # Record the disposition BEFORE the producer is interrupted, so the
-        # producer's unwind reads why it was cancelled rather than guessing
-        # from the exception it happens to receive.
-        self._consumer_close.closed = True
-        self._stop.set()
-        self._continue.set()
-        owner_cancelled_by_close = False
-        if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
-            owner_cancelled_by_close = self._owner.cancel()
-        outcome = await self._join_source_owners()
-        from kestrel_sovereign.execution_custody import is_execution_control_error
-        if (
-            (owner_cancelled_by_close or self._construction_error is not None)
-            and isinstance(outcome.error, asyncio.CancelledError)
-            and self._cleanup_error is None
-            and not is_execution_control_error(outcome.error)
-        ):
-            # Cancellation is the private interrupt used to wake a producer
-            # blocked in ``anext``. Once the owner's finally block has closed
-            # the iterator, it is a successful close, while cancellation of
-            # the caller itself still takes precedence below.
-            outcome = OwnedTaskOutcome(None, None, outcome.cancellation)
-        if self._construction_error is not None and outcome.error is None:
-            # Reconcile ONLY the original constructor task reservation, after
-            # its actual frame/lock cleanup AND watcher have physically joined.
-            # A real owner/closer failure keeps this debt and every other debt.
-            error = self._construction_error
-            error._kestrel_native_retirement_debts = tuple(
-                debt for debt in error._kestrel_native_retirement_debts
-                if not (debt[0] is self and debt[1] is self._owner)
-            )
-        raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
+        # These are lexical observers, not physical-retirement evidence. An
+        # overlapping call must still collect the same original outcome when
+        # both native owners finish before an earlier closer resumes. Only
+        # sequential repeats after every close returned remain quiet.
+        self._active_close_calls += 1
+        try:
+            if not self._closed:
+                self._closed = True
+                # Demand closure is not physical retirement. Initiate Stop once;
+                # concurrent closers independently join these SAME original owners
+                # without injecting cancellation into an already-active finally.
+                self._consumer_close.closed = True
+                self._handoff.request_stop()
+                if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
+                    self._owner_cancelled_by_close = self._cancel_owner_if_running()
+            outcome = await self.join_source_owners(closing=True)
+            if self._construction_error is not None and outcome.error is None:
+                # Reconcile ONLY the original constructor task reservation, after
+                # its actual frame/lock cleanup AND watcher have physically joined.
+                # A real owner/closer failure keeps this debt and every other debt.
+                error = self._construction_error
+                error._kestrel_native_retirement_debts = tuple(
+                    debt for debt in error._kestrel_native_retirement_debts
+                    if not (debt[0] is self and debt[1] is self._owner)
+                )
+            raise_owned_outcome(outcome, operation=self._operation, retain_originals=True)
+        finally:
+            self._active_close_calls -= 1
 
 
 async def create_owned_iterator(iterator_factory, **options):
@@ -1043,30 +1531,71 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     observation belongs to OwnedTaskOutcome; producer-supplied retained error
     remains readable, but this join does not invent cross-owner source caching.
     """
-    retained = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
-    if retained is not _TASK_ERROR_UNSET:
-        if task.done() and not task.cancelled():
-            # Capturing inside the child preserves original evidence, but does
-            # not acknowledge asyncio's native exception notification. Harvest
-            # that completed result as well so a joined task cannot later emit
-            # an orphaned "exception was never retrieved" diagnostic.
-            task.exception()
-        return retained
+    from kestrel_sovereign.execution_custody import execution_observation_error, execution_terminal_error
+    admission = getattr(task, "_kestrel_owned_admission", None)
+    if type(admission) is not OwnedTaskAdmission or admission.task is not task:
+        admission = None
+    if admission is not None and admission._terminal_error is not _TASK_ERROR_UNSET:
+        return admission._terminal_error
     if not task.done():
         raise RuntimeError("owned task has not reached terminal state")
+    cached = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
+    if admission is None and cached is not _TASK_ERROR_UNSET and task.cancelled():
+        # A Task/Future admitted elsewhere has no original Core receipt to
+        # reconcile. Its retained terminal observation is already the only
+        # original cancellation; retrieving asyncio again manufactures one.
+        return cached
     try:
-        error = task.exception()
+        physical = task.exception()
     except asyncio.CancelledError as cancellation:
-        error = cancellation
-    if _has_owned_task_metadata(task):
+        physical = cancellation
+    bare_cancellation = (
+        isinstance(physical, asyncio.CancelledError) and not physical.args
+        and physical.__cause__ is None
+    )
+    # Python can attach the observer's active exception as implicit context
+    # while task.exception() manufactures a consumed-C surrogate. That ambient
+    # context is neither original completion evidence nor capture proof.
+    if (admission is not None and admission._canonical_wrapper_only
+            and admission._canonical_error is not None and bare_cancellation):
+        # Exact wrapper identity rules out an independent outer epilogue. Its
+        # own source receipt survives an earlier observer consuming native C.
+        physical = admission._canonical_error
+    if admission is not None:
+        # Composition can inspect a retirement debt naming THIS completed Task.
+        # Its physical result is already harvested: expose that same snapshot
+        # to the nested evidence lookup instead of recursively harvesting it.
+        admission._terminal_error = physical
+        physical = execution_terminal_error(physical, retain_originals=admission._retain_originals)
+        admission._terminal_error = physical
+    unobservable = None
+    if (admission is not None
+            and (not admission._completion_capture_registered
+                 or (not admission._canonical_wrapper_only and bare_cancellation))
+            and not (admission._canonical_wrapper_only and not admission._wrapper_started)
+            and task.cancelled() and physical is not cached):
+        from kestrel_sdk.resources import ResourceOutcomeUnknown
+        # A foreign observer can consume an independent physical C even when
+        # our callback was registered. Its exact lost graph is unrecoverable. Keep
+        # this original Task's observation debt; ordinary gate failure cannot
+        # certify that the outer physical completion was ordinary or successful.
+        missing = ResourceOutcomeUnknown("original native completion is unobservable before owned capture")
+        missing.__cause__ = admission.error
+        unobservable = owned_task_admission_error(admission, admission, missing)
+    error = execution_observation_error(
+        admission.error if admission is not None else None,
+        admission._canonical_error if admission is not None else None,
+        cached if cached is not _TASK_ERROR_UNSET else None,
+        physical, unobservable,
+    )
+    if cached is _TASK_ERROR_UNSET and _has_owned_task_metadata(task):
         try:
             task._kestrel_owned_terminal_error = error  # type: ignore[attr-defined]
         except BaseException as publication:
-            # This producer promised native metadata, then refused its cache.
-            # Report that broken contract alongside the physical outcome; a
-            # failed publication must never replace UNKNOWN/source C with it.
-            from kestrel_sovereign.execution_custody import execution_observation_error
-            return execution_observation_error(error, publication)
+            # A diagnostic cache refusal is independent of the physical result.
+            error = execution_observation_error(error, publication)
+    if admission is not None:
+        admission._terminal_error = error
     return error
 
 
@@ -1080,19 +1609,21 @@ async def await_owned_task(
 ) -> OwnedTaskOutcome[_T]:
     """Retrieve ``task`` despite repeated cancellation of its caller.
 
-    The shielded waiter carries only a successful result, never the owned
+    The completion waiter carries only a successful result, never the owned
     task's exception. The owned result is retrieved exactly once after
-    terminalization, avoiding orphaned-task and shield-future warnings.
+    terminalization, avoiding orphaned-task and observer-future warnings.
 
     The waiter is a plain future rather than a task: event-loop teardown
-    cancels every task, and a waiter task cancelled while ``task`` still runs
-    would make each ``shield`` raise at once, without yielding, so this loop
-    would spin and ``task`` could never finish. Nothing but this function
-    holds the future, so only ``task`` completing resolves it.
+    cancels every task. Only the original task completing resolves this
+    signal. ``asyncio.wait`` gives each observation a private cancellable
+    waiter and removes its callback on withdrawal. Repeated ``shield`` on
+    Python 3.14 instead retains an awaited-by callback for every cancellation
+    until the original signal completes, making cancellation grow its own
+    observation inventory without bound.
 
     ``cancel_on_caller_cancellation`` forwards the first caller cancellation
     once to an operation that needs it to begin unwinding. Subsequent caller
-    cancellations remain shielded until that same owner physically settles.
+    cancellations cannot reach the original task while that owner settles.
     True uses the task's native cancel method. A synchronous callable instead
     routes that first request through the original lifecycle owner's delivery
     policy. A failed forwarder cannot abandon the operation: its error is
@@ -1100,13 +1631,23 @@ async def await_owned_task(
 
     A borrowed observer can set ``defer_cancellation=False``: it neither
     cancels nor adopts the original Task, and actual caller withdrawal escapes
-    immediately. The successful completion signal still avoids shield's
-    synthetic cancellation when the original Task itself was cancelled.
+    immediately. Cancellation of the original Task is retrieved from that
+    Task, rather than from the observer's completion signal.
     """
     if not defer_cancellation and (cancel_on_caller_cancellation or pending_cancellation is not None):
         raise ValueError("borrowed observation cannot forward or own pending cancellation")
     completion: asyncio.Future[None] | None = None
     publication_errors = []
+
+    def retain_publication_failure(error):
+        # A synchronous publication can call caller.cancel() and then raise its
+        # OWN CancelledError before any cancellation is delivered at an await.
+        # Keep that failure's phase explicit; it is never a private Stop ACK.
+        if isinstance(error, asyncio.CancelledError):
+            from kestrel_sovereign.execution_custody import execution_error_with_cause
+            error = execution_error_with_cause(
+                RuntimeError("original completion observation publication failed"), error)
+        publication_errors.append(error)
 
     def mark_complete(_task: asyncio.Future[_T]) -> None:
         if completion is not None and not completion.done():
@@ -1121,7 +1662,7 @@ async def await_owned_task(
         completion = asyncio.get_running_loop().create_future()
         task.add_done_callback(mark_complete)
     except BaseException as error:
-        publication_errors.append(error)
+        retain_publication_failure(error)
     try:
         while not task.done():
             if publication_errors and not defer_cancellation:
@@ -1134,10 +1675,10 @@ async def await_owned_task(
                 elif not defer_cancellation:
                     # This Future belongs only to the borrowed observer. Its
                     # cancellation cannot reach the producer, and an extra
-                    # shield would delay terminal readers behind close return.
+                    # observation waiter would delay terminal readers behind close return.
                     await completion
                 else:
-                    await asyncio.shield(completion)
+                    await asyncio.wait((completion,))
             except asyncio.CancelledError as error:
                 if pending_cancellation is None:
                     pending_cancellation = error
@@ -1157,17 +1698,17 @@ async def await_owned_task(
                     except BaseException as failure:  # noqa: BLE001 - forwarding failure cannot abandon its owner
                         forwarding_error = failure
             except BaseException as error:  # noqa: BLE001 - observing a producer never discharges its ownership
-                # Shield creates and publishes another plain observer Future.
+                # Waiting creates and publishes another plain observer Future.
                 # Its failure is observation debt, not physical completion.
                 # Reuse the existing positive-interval must-join path; borrowed
                 # observers may leave, but original owners must still join.
-                publication_errors.append(error)
+                retain_publication_failure(error)
     finally:
         if completion is not None:
             try:
                 task.remove_done_callback(mark_complete)
             except BaseException as error:
-                publication_errors.append(error)
+                retain_publication_failure(error)
 
     if not defer_cancellation and pending_cancellation is not None:
         from kestrel_sovereign.execution_custody import execution_observation_error
@@ -1205,6 +1746,8 @@ async def wait_owned_or_pending(
     The caller MUST retain and physically join the task elsewhere. One timer
     starts on first cancellation; repeated interruption cannot reset it or
     re-cancel the native unwind. A pending result does not assert settlement.
+    A delegated privacy writer must finish restoration before caller code
+    resumes, even when its original child outlives the observation grace.
     """
     if not math.isfinite(cancellation_grace) or cancellation_grace <= 0:
         raise ValueError("cancellation_grace must be finite and positive")
@@ -1216,19 +1759,35 @@ async def wait_owned_or_pending(
     task.add_done_callback(wake)
     cancellation = None
     timer = None
+    restoration_error = None
     try:
-        while not task.done() and not completion.done():
-            try:
-                await asyncio.shield(completion)
-            except asyncio.CancelledError as error:
-                if cancellation is None:
-                    cancellation = error
-                    timer = loop.call_later(cancellation_grace, wake)
-                    if cancel_on_caller_cancellation:
-                        task.cancel()
+        try:
+            async with owned_native_wait((task,)):
+                while not task.done() and not completion.done():
+                    try:
+                        await asyncio.wait((completion,))
+                    except asyncio.CancelledError as error:
+                        if cancellation is None:
+                            cancellation = error
+                            timer = loop.call_later(cancellation_grace, wake)
+                            if cancel_on_caller_cancellation:
+                                task.cancel()
+        except BaseException as error:
+            # Context restoration is part of this observation. Its withdrawal
+            # cannot bypass either the first cancellation or a late native ACK.
+            restoration_error = error
+        # Restoring a delegated writer can outlive the grace. Observe the
+        # original owner again so a now-settled receipt is never called pending.
         if not task.done():
-            return PendingOwnedTask(task, cancellation)
-        return await await_owned_task(task, cancellation)
+            if cancellation is None and restoration_error is not None:
+                raise restoration_error
+            return PendingOwnedTask(task, cancellation, restoration_error)
+        outcome = await await_owned_task(task, cancellation)
+        if restoration_error is not None:
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            return OwnedTaskOutcome(outcome.result,
+                execution_observation_error(outcome.error, restoration_error), outcome.cancellation)
+        return outcome
     finally:
         task.remove_done_callback(wake)
         if timer is not None:
@@ -1283,6 +1842,7 @@ async def run_blocking_operation(
 
 __all__ = [
     "OwnedAsyncIterator",
+    "OwnedCallbackSource",
     "OwnedTaskOutcome",
     "PendingOwnedTask",
     "await_owned_task",

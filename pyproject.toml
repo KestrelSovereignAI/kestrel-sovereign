@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.62.2"
+version = "0.65.6"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -110,15 +110,18 @@ dependencies = [
     # 0.45 adds authenticated human control and acquisition custody; the
     # normal lock must resolve this published contract before host delivery.
     # 0.48 adds public argument coercion and the host control-error predicate.
-    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.48.0,<1",
+    # 0.52.2 owns the shared original-source handoff/body/retirement mechanics.
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.52.2,<1",
     # Native A2A implementation is owned by the shared SDK [a2a] extra.
     # Core and feature skill producers use the same reviewed vendored types.
     "protobuf>=5.29.5",
     # RFC 8785 for the Kestrel sender extension's complete native request digest.
     "rfc8785>=0.1.4,<1",
     # Core web framework
-    # Public cancellation checkpoint used by MCP OAuth cleanup.
-    "anyio>=4.7,<5",
+    # 4.16.0 preserves native Task.cancel() racing with a successful TCP
+    # connection's own cancellation (anyio#1214). Older versions can leave
+    # A2A question recovery running forever while feature shutdown joins it.
+    "anyio>=4.16.0",
     # Pre-1.0 router internals changed in a minor release. Advance this tested
     # current line with the native router/CSRF/frontend acceptance checks.
     "fastapi>=0.143.3,<0.144",
@@ -141,7 +144,7 @@ dependencies = [
     # Cloud LLM providers
     # Pydantic AI 2's OpenAI integration requires >=3.26. The host lock is
     # verified with the Phoenix extra and the native MCP feature together.
-    "openai>=3.26.0,<4",
+    "openai>=3.46.0,<4",
     # google-generativeai reaches httplib2 through google-api-python-client;
     # >=0.32.0 fixes proxy-bypass request smuggling on that core path.
     "httplib2>=0.32.0",
@@ -227,7 +230,7 @@ dependencies = [
     # Google auth for cloud deployments
     "google-auth>=2.40.3",
     # Google Vertex AI (unified SDK for Gemini API and Vertex AI)
-    "google-genai>=1.0.0",
+    "google-genai>=2.34.0,<3",
     "google-cloud-logging>=3.5.0",
     # GCP Secret Manager (used by ``kestrel deploy secrets sync`` to push
     # local .env values into Secret Manager — port of
@@ -259,7 +262,7 @@ dependencies = [
     # Below that, install builds from an sdist and needs a Rust toolchain.
     # Documented in README Prerequisites; accepted deliberately (#2966).
     "pqcrypto>=1.0,<2.0",
-    "kestrel-llms[all]==0.1.8",
+    "kestrel-llms[all]>=0.2.0,<0.3",
 ]
 
 [project.urls]
@@ -271,9 +274,10 @@ Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussio
 
 [project.optional-dependencies]
 # Installed native MCP seam tests remain separate from core-only boot tests.
-mcp-integration = ["kestrel-feature-mcp>=0.12.0,<1"]
+mcp-integration = ["kestrel-feature-mcp>=0.17.0,<1"]
 # Test dependencies (not needed in production)
 test = [
+    "mcp>=2.3.0",
     "pyright==1.1.403",
     # >=9.0.3 fixes unsafe temporary-file handling in pytest's debugger.
     "pytest>=9.0.3",
@@ -419,6 +423,7 @@ dev = [
 
 # Mirror of [project.optional-dependencies.test] for uv sync compatibility
 test = [
+    "mcp>=2.3.0",
     "pyright==1.1.403",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",

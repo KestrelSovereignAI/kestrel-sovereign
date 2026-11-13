@@ -150,6 +150,7 @@ function isAgentBusy(agentName) {
 // first sets it; the other becomes a no-op.
 const REVISE_SENTINEL_PREFIX = '\x1eKESTREL:REVISE:';
 const REVISE_SENTINEL_SUFFIX = '\x1e';
+const RETRACT_SENTINEL_PREFIX = '\x1eKESTREL:RETRACT:';
 const THINKING_SENTINEL_PREFIX = '\x1eKESTREL:THINK:';
 const THINKING_SENTINEL_SUFFIX = '\x1e';
 // #1659: typed tool-activity sentinel — pairs with streaming.py
@@ -165,6 +166,7 @@ const PART_SENTINEL_PREFIX = '\x1eKESTREL:PART:';
 const PART_SENTINEL_SUFFIX = '\x1e';
 const STREAM_SENTINELS = [
     { kind: 'revise', prefix: REVISE_SENTINEL_PREFIX, suffix: REVISE_SENTINEL_SUFFIX },
+    { kind: 'retract', prefix: RETRACT_SENTINEL_PREFIX, suffix: REVISE_SENTINEL_SUFFIX },
     { kind: 'thinking', prefix: THINKING_SENTINEL_PREFIX, suffix: THINKING_SENTINEL_SUFFIX },
     { kind: 'tool', prefix: TOOL_SENTINEL_PREFIX, suffix: TOOL_SENTINEL_SUFFIX },
     { kind: 'part', prefix: PART_SENTINEL_PREFIX, suffix: PART_SENTINEL_SUFFIX },
@@ -982,6 +984,7 @@ function stripStreamSentinels(chunk) {
     let sawSentinel = false;
     const thoughts = [];
     const tools = [];
+    const retractions = [];
     // #1914: typed component parts ({type,data,id?}) parsed out of this chunk,
     // each stamped with its clean-text offset like a tool event.
     const parts = [];
@@ -1049,6 +1052,15 @@ function stripStreamSentinels(chunk) {
             // means the boundary spans the packet edge — the loop welds
             // this packet's leading prose against the prior fullContent.
             if (!sawVisible) leadingReviseBoundary = true;
+        } else if (found.kind === 'retract') {
+            try {
+                const payload = JSON.parse(payloadText);
+                if (payload && typeof payload.request_id === 'string' && payload.request_id) {
+                    retractions.push({ requestId: payload.request_id, pos: textBefore.length });
+                }
+            } catch (_) {
+                // Invalid wire metadata cannot acquire authority over a turn.
+            }
         } else if (found.kind === 'tool') {
             try {
                 const payload = JSON.parse(payloadText);
@@ -1089,6 +1101,7 @@ function stripStreamSentinels(chunk) {
         thoughts,
         tools,
         parts,
+        retractions,
         reviseBoundaryPending,
         leadingReviseBoundary,
     };
@@ -3367,6 +3380,7 @@ export async function sendMessage(
     try {
         if (deps().state.useStreaming) {
             const msgDiv = addMessageStreaming('agent', pane.element);
+            msgDiv.dataset.streamRequestId = clientRequestId;
             pane.streamingMsgDiv = msgDiv;
             // Cumulative content offset of the CURRENT streaming bubble's
             // first character. Stays at 0 for a normal stream; bumped
@@ -3440,7 +3454,7 @@ export async function sendMessage(
                     // Strip any complete sentinels in processable.
                     // Revise markers and thinking markers are wire
                     // metadata; visible prose stays in the accumulator.
-                    let { textBefore, textAfter, sawSentinel, thoughts, tools, parts, reviseBoundaryPending, leadingReviseBoundary } =
+                    let { textBefore, textAfter, sawSentinel, thoughts, tools, parts, retractions, reviseBoundaryPending, leadingReviseBoundary } =
                         stripStreamSentinels(processable);
                     if (thoughts.length) {
                         appendThinkingItems(pane.thinkingItems, thoughts);
@@ -3483,6 +3497,36 @@ export async function sendMessage(
                     if (pane.pendingRevise) {
                         pane.pendingRevise = false;
                         pendingReviseBoundary = true;
+                    }
+                    const retraction = retractions.findLast(item => item.requestId === clientRequestId);
+                    if (retraction && isPaneFresh() && ownsStream()) {
+                        // The frame is ordered with the prose. Keep every real
+                        // tool/part from this packet, rebased around the removed
+                        // prefix, and retain previously mounted components.
+                        textBefore = textBefore.slice(retraction.pos);
+                        tools = tools.map(item => ({ ...item, pos: Math.max(0, item.pos - retraction.pos) }));
+                        parts = parts.map(item => ({ ...item, pos: Math.max(0, item.pos - retraction.pos) }));
+                        for (const bubble of Array.from(pane.element.children)) {
+                            if (bubble.dataset.streamRequestId !== clientRequestId) continue;
+                            const events = bubble._streamToolEvents || [];
+                            if (events.length) {
+                                updateStreamingMessage(bubble, '', pane.element, [],
+                                    events.map(item => ({ ...item, pos: 0 })));
+                                bubble.querySelector('.message-content')?.classList.remove('streaming');
+                            } else {
+                                unmountRenderers(bubble, { retire: 'children' });
+                                bubble.remove();
+                            }
+                        }
+                        pane.toolEvents = pane.toolEvents.map(item => ({ ...item, pos: 0 }));
+                        pane.toolEventsBaseline = pane.toolEvents.length;
+                        pane.streamingMsgDiv = null;
+                        pane.streamBaseline = 0;
+                        pane.streamRawContentLength = 0;
+                        fullContent = '';
+                        pendingReviseBoundary = false;
+                        reviseBoundaryPending = false;
+                        leadingReviseBoundary = false;
                     }
                     const chunk = sawSentinel ? textBefore + textAfter : textBefore;
                     const haveTools = tools && tools.length;
@@ -3537,6 +3581,7 @@ export async function sendMessage(
                         if (!slice && !paneStreamToolEvents(pane).length) return;
                         if (!pane.streamingMsgDiv) {
                             pane.streamingMsgDiv = addMessageStreaming('agent', pane.element);
+                            pane.streamingMsgDiv.dataset.streamRequestId = clientRequestId;
                         }
                         updateStreamingMessage(
                             pane.streamingMsgDiv, slice,
@@ -3678,6 +3723,7 @@ export async function sendMessage(
                             pane.streamingMsgDiv = addMessageStreaming(
                                 'agent', pane.element,
                             );
+                            pane.streamingMsgDiv.dataset.streamRequestId = clientRequestId;
                         }
                         const baseline = pane.streamBaseline || 0;
                         const slice = fullContent.slice(baseline);
@@ -4595,6 +4641,7 @@ function escapeThinkingLabel(text) {
 }
 
 export function updateStreamingMessage(msgDiv, content, paneElement = null, thinkingItems = [], toolEvents = null) {
+    msgDiv._streamToolEvents = toolEvents ? toolEvents.map(event => ({ ...event })) : [];
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
         const thinkingHtml = renderThinkingBubbles(thinkingItems);
@@ -4665,6 +4712,7 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     // sliced to the same stream-baseline as ``content`` (#1560) and skipping
     // any already shown in a pre-restart bubble.
     const toolEvents = (pane && includePaneArtifacts) ? paneStreamToolEvents(pane) : null;
+    msgDiv._streamToolEvents = toolEvents ? toolEvents.map(event => ({ ...event })) : [];
     const generation = pane?.generation;
     const originalParent = msgDiv.parentNode;
     await finalizeAgentContent(contentDiv, content, toolEvents);

@@ -83,6 +83,17 @@ _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 # return control to SQLite.
 _SQLITE_BUSY_TIMEOUT_S = 30.0
 _CANCELLED_OPERATION_DRAIN_TIMEOUT_S = _SQLITE_BUSY_TIMEOUT_S
+# A runtime-owner renewal waits for SQLite's writer slot in attempts of at most
+# this long, and between attempts ends, having written nothing, once close has
+# retired it (#4040). Close therefore joins only a renewal that already holds
+# the slot, and the slice is part of its reservation (``minimum_close_timeout_s``).
+_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S = 0.1
+# How long one renewal keeps trying for the writer slot before it fails and a
+# heartbeat retries it: the bound PostgreSQL's renewal puts on its whole
+# transaction (#4001), so a renewal waiting behind another writer is retried
+# within a heartbeat interval rather than holding its slot for the shared busy
+# timeout.
+_SQLITE_OWNER_RENEWAL_DEADLINE_S = 5.0
 
 # Backoff between attempts of a cancellation-drain rollback that the drain's
 # own interrupt aborted. Attempts stop at the drain deadline above.
@@ -1131,8 +1142,13 @@ class SQLiteBackend(DatabaseBackend):
         keeps the primary-backend reservation equal to the single-connection
         lifecycle contract also used by SQLAlchemy factories, without
         shrinking the rest of whole-agent shutdown.
+
+        Close first joins a runtime-owner renewal that already holds SQLite's
+        writer slot, which is bounded by one renewal attempt
+        (``_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S``); its connections' deadline is
+        taken after that join, so the join never consumes it (#4040).
         """
-        return _minimum_close_timeout_s()
+        return _SQLITE_OWNER_RENEWAL_BUSY_SLICE_S + _minimum_close_timeout_s()
     
     def _wal_sidecars(self) -> tuple[Path, ...]:
         """The files SQLite creates beside a WAL database while it is in use."""
@@ -1345,7 +1361,10 @@ class SQLiteBackend(DatabaseBackend):
             self._closing = False
             self._connection_generation = uuid.uuid4().hex
             self._original_results_closing = False
-            
+            # Close retired renewal's connection; this connection's renewals
+            # open another (#4001).
+            self._runtime_owner_renewal_retired = False
+
             logger.debug(f"Connected to SQLite: {self.db_path}")
             
         except Exception as e:
@@ -1355,6 +1374,16 @@ class SQLiteBackend(DatabaseBackend):
         """Close database connection and wait for background thread to stop."""
         from .original_result_custody import _drain_original_results
         await _drain_original_results(self)
+        loop = asyncio.get_running_loop()
+        # A renewal still waiting for SQLite's writer slot sees this between
+        # attempts and ends having written nothing, so the join below waits
+        # only for one that already holds the slot (#4040).
+        self._runtime_owner_renewal_retired = True
+        # Renewal's own connection first (#4001). Every connection's close
+        # shares the deadline taken after that join, which never consumes it.
+        (
+            close_deadline, renewal_failure, pending_cancellation,
+        ) = await self._retire_runtime_owner_renewal()
         conn = self._connection
         failure = (
             self._cancelled_write_drain_error
@@ -1362,19 +1391,31 @@ class SQLiteBackend(DatabaseBackend):
             and is_execution_control_error(self._cancelled_write_drain_error)
             else None
         )
+        if renewal_failure is not None:
+            failure = execution_terminal_error(
+                failure, renewal_failure,
+                retain_originals=True, isolate_control_originals=True,
+            )
         if conn is None:
-            self._raise_if_connection_retirement_pending()
+            try:
+                self._raise_if_connection_retirement_pending()
+            except BaseException as error:
+                raise execution_terminal_error(
+                    failure, error, pending_cancellation, retain_originals=True,
+                    isolate_control_originals=True,
+                )
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
-            if failure is not None:
-                raise failure
+            terminal = execution_terminal_error(
+                failure, pending_cancellation, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            if terminal is not None:
+                raise terminal
             return
 
-        pending_cancellation: Optional[BaseException] = None
-        loop = asyncio.get_running_loop()
         diagnostics = self._close_diagnostics()
-        close_deadline = loop.time() + self.minimum_close_timeout_s
         # Fence new cancellation handoffs before sampling the retained drain.
         # A write cancelled from this point onward is retired by connection
         # close itself, so spawning a rollback task would orphan it after the
@@ -1594,19 +1635,32 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
+        return await self._open_sibling_connection(
+            busy_timeout_s=_SQLITE_BUSY_TIMEOUT_S, query_only=True,
+        )
+
+    async def _open_sibling_connection(
+        self, *, busy_timeout_s: float, query_only: bool,
+    ) -> aiosqlite.Connection:
+        """Open a one-shot connection of its own to the connected file.
+
+        It shares nothing with the shared connection: not its operation lock,
+        its open transaction or its cancellation-cleanup fence. Only SQLite's
+        writer slot on the file is shared. The file is the one this backend
+        connected to; a replaced pathname is refused.
+        """
         self.assert_connected_file_still_valid()
         conn = await aiosqlite.connect(
             self._resolved_path.as_uri() + "?mode=rw",
             uri=True,
-            timeout=_SQLITE_BUSY_TIMEOUT_S,
+            timeout=busy_timeout_s,
         )
         try:
             self.assert_connected_file_still_valid()
-            await conn.execute(
-                f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_S * 1000)}"
-            )
+            await conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_s * 1000)}")
             await conn.execute("PRAGMA foreign_keys=ON")
-            await conn.execute("PRAGMA query_only=ON")
+            if query_only:
+                await conn.execute("PRAGMA query_only=ON")
             conn.row_factory = aiosqlite.Row
             return conn
         except BaseException as error:
@@ -1619,6 +1673,209 @@ class SQLiteBackend(DatabaseBackend):
             except BaseException as cleanup_error:
                 raise execution_terminal_error(error, cleanup_error)
             raise
+
+    async def retain_unretired_runtime_owner(
+        self, *, agent_id: str, owner_id: str, timestamp: Callable[[], str],
+    ) -> bool:
+        """Renew one existing, unstopped managed owner on fixed SQL (#4001).
+
+        The SQLite counterpart of ``PostgresBackend``'s method of this name:
+        the only write that renews a dispatcher's owner. It cannot insert or
+        revive an owner, grant a lease or admit work. ``timestamp`` is sampled
+        once this write holds SQLite's writer slot, as a heartbeat taken
+        before waiting for it is not trustworthy liveness evidence. Returns
+        whether the owner was renewed.
+
+        A file database is renewed on a connection of its own, never the
+        shared one. That connection's cancellation-cleanup fence keeps later
+        writers off work a cancelled caller abandoned on it. This write leaves
+        the fence, and the error it retains, as they are: a write on another
+        connection cannot commit that work. Were
+        renewal held back by that fence, a peer reaching the file through its
+        own connection would find the owner stale and reclaim leases it still
+        holds. Only SQLite's writer slot is shared. While another connection
+        holds it, renewal tries for it in attempts of
+        ``_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S`` until
+        ``_SQLITE_OWNER_RENEWAL_DEADLINE_S`` has passed, then fails and a
+        later heartbeat retries it. Between attempts it ends, having written
+        nothing, once :meth:`close` has retired it (#4040): close then waits
+        only for a renewal that already holds the slot. An in-memory database
+        has no second connection, and none for a peer either: every writer to
+        it, a peer's recovery included, passes the same fence, so it is
+        renewed on the shared connection.
+
+        Renewal's connection stays open between renewals, as PostgreSQL's
+        renewal pool does, and :meth:`close` retires it. A connection opened
+        and closed on every renewal put a bounded close on every heartbeat;
+        one that overran its budget left the backend owning its close, and a
+        test that advances the loop clock past a heartbeat interval overran
+        every one. A renewal that fails, or is interrupted, may leave its
+        transaction holding the writer slot, so its connection is retired
+        then too, which rolls that transaction back; the next renewal opens
+        another. Once close has retired renewal, close retires it instead.
+        """
+        from kestrel_sovereign.signals.durable import DurableSignalStore
+
+        if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
+            raise ValueError("owner renewal requires exact owner identities")
+        if not owner_id.startswith("dispatcher:"):
+            raise ValueError("owner renewal requires its managed owner")
+        sql = (
+            f"UPDATE {DurableSignalStore.RUNTIME_OWNERS} "
+            "SET heartbeat_at = CASE WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END, "
+            "updated_at = CASE WHEN heartbeat_at >= ? THEN heartbeat_at ELSE ? END "
+            "WHERE agent_id = ? AND owner_id = ? AND stopped_at IS NULL"
+        )
+        if self._resolved_path is None:
+            async with self.transaction():
+                now = timestamp()
+                updated = await self.execute(
+                    sql, (now, now, now, now, agent_id, owner_id)
+                )
+            return updated == 1
+        self._require_execution_backend()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SQLITE_OWNER_RENEWAL_DEADLINE_S
+        async with self._runtime_owner_renewal_lock():
+            conn = await self._runtime_owner_renewal_connection_locked()
+            retired = False
+            try:
+                try:
+                    while True:
+                        if getattr(self, "_runtime_owner_renewal_retired", False):
+                            retired = True
+                            break
+                        # Opening the connection checked the file it reached;
+                        # the pathname may have been replaced since (#4040).
+                        self.assert_connected_file_still_valid()
+                        try:
+                            await conn.execute("BEGIN IMMEDIATE")
+                            break
+                        except sqlite3.OperationalError as error:
+                            code = getattr(error, "sqlite_errorcode", None)
+                            if not (
+                                isinstance(code, int)
+                                and code & 0xFF == sqlite3.SQLITE_BUSY
+                            ) or loop.time() >= deadline:
+                                raise
+                    if not retired:
+                        now = timestamp()
+                        cursor = await conn.execute(
+                            sql, (now, now, now, now, agent_id, owner_id)
+                        )
+                        updated = cursor.rowcount
+                        await cursor.close()
+                        # Nothing commits on a file this backend no longer
+                        # reaches by its path: the cleanup below rolls back.
+                        self.assert_connected_file_still_valid()
+                        await conn.commit()
+                except sqlite3.Error as error:
+                    raise QueryError(f"SQLite owner renewal failed: {error}") from error
+            except BaseException as error:
+                if getattr(self, "_runtime_owner_renewal_retired", False):
+                    # Close retires this connection, rolling back whatever
+                    # this renewal left open, once it has joined it.
+                    raise
+                cleanup_error = await self._retire_runtime_owner_renewal_connection_locked()
+                if cleanup_error is not None:
+                    raise execution_terminal_error(
+                        error, cleanup_error, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
+                    )
+                raise
+        if retired:
+            raise ConnectionError("owner renewal requires the original backend")
+        return updated == 1
+
+    def _runtime_owner_renewal_lock(self) -> asyncio.Lock:
+        """Held by each renewal across its write, and by close (#4001).
+
+        Created on first use, as hand-built test backends never run
+        ``__init__``.
+        """
+        return vars(self).setdefault("_runtime_owner_renewal_mutex", asyncio.Lock())
+
+    async def _runtime_owner_renewal_connection_locked(self) -> aiosqlite.Connection:
+        """The connection only runtime-owner renewal writes on (#4001).
+
+        Call with :meth:`_runtime_owner_renewal_lock` held. Opened by the
+        first renewal and kept for the next; nothing else uses it. A
+        connection close retired is not reopened until ``connect`` succeeds
+        again: a renewal racing close gets none back.
+        """
+        conn = getattr(self, "_runtime_owner_renewal_connection", None)
+        if conn is not None:
+            return conn
+        if getattr(self, "_runtime_owner_renewal_retired", False):
+            raise ConnectionError("owner renewal requires the original backend")
+        conn = await self._open_sibling_connection(
+            busy_timeout_s=_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S, query_only=False,
+        )
+        self._runtime_owner_renewal_connection = conn
+        return conn
+
+    async def _retire_runtime_owner_renewal_connection_locked(
+        self, *, deadline: Optional[float] = None,
+    ) -> BaseException | None:
+        """Close renewal's connection, rolling back what it left open (#4001).
+
+        Call with :meth:`_runtime_owner_renewal_lock` held. Returns the close
+        failure rather than raising it, so a caller retiring other
+        connections still retires them. A close past its budget stays owned
+        by this backend until its worker exits, as every close here does.
+        """
+        conn = getattr(self, "_runtime_owner_renewal_connection", None)
+        if conn is None:
+            return None
+        self._runtime_owner_renewal_connection = None
+        try:
+            await _close_aiosqlite_connection(
+                conn,
+                retained_closes=self._retired_connection_closes,
+                deadline=deadline,
+                diagnostics=self._close_diagnostics(),
+            )
+        except BaseException as error:
+            return error
+        return None
+
+    async def _retire_runtime_owner_renewal(
+        self,
+    ) -> tuple[float, BaseException | None, BaseException | None]:
+        """Join a renewal in flight, then retire renewal's connection (#4040).
+
+        Call once :meth:`close` has marked renewal retired: a renewal still
+        waiting for SQLite's writer slot then ends at its next attempt having
+        written nothing, so the join waits for at most one attempt
+        (``_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S``) and one UPDATE and COMMIT.
+        Closing renewal's connection under a renewal would end it, so the
+        join comes first. A cancellation of the caller during either is kept
+        rather than raised, so close still retires every connection, and is
+        returned for close to deliver after that.
+
+        Returns the deadline every connection's close shares, taken after the
+        join so that the join never consumes it; the failure retiring
+        renewal's connection; and the caller's cancellation.
+        """
+        from kestrel_sovereign._async_ownership import acquire_lock_keeping_cancellation
+
+        lock = self._runtime_owner_renewal_lock()
+        cancellation = await acquire_lock_keeping_cancellation(lock)
+        try:
+            self._runtime_owner_renewal_retired = True
+            deadline = asyncio.get_running_loop().time() + _minimum_close_timeout_s()
+            failure = await self._retire_runtime_owner_renewal_connection_locked(
+                deadline=deadline,
+            )
+        finally:
+            lock.release()
+        if isinstance(failure, asyncio.CancelledError) and not is_execution_control_error(failure):
+            cancellation = execution_terminal_error(
+                cancellation, failure, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+            failure = None
+        return deadline, failure, cancellation
 
     @asynccontextmanager
     async def _read_connection(
@@ -2310,7 +2567,12 @@ class SQLiteBackend(DatabaseBackend):
                 row = cursor.fetchone()
                 if row is None or row[1] <= 0:
                     return None
-                if re.search(r'\b(?:CHECK|COLLATE|REFERENCES|FOREIGN|CONFLICT|AUTOINCREMENT)\b', row[2], re.IGNORECASE):
+                if table in {'tool_effect_operations', 'tool_effect_claims'}:
+                    from kestrel_sovereign.tool_effect_store import TOOL_EFFECT_OPERATIONS_SQL, TOOL_EFFECT_CLAIMS_SQL
+
+                    if row[2] != (TOOL_EFFECT_OPERATIONS_SQL if table == 'tool_effect_operations' else TOOL_EFFECT_CLAIMS_SQL):
+                        return None
+                elif re.search(r'\b(?:CHECK|COLLATE|REFERENCES|FOREIGN|CONFLICT|AUTOINCREMENT)\b', row[2], re.IGNORECASE):
                     return None
                 cursor.execute(f"SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='{table}' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='{table}' COLLATE NOCASE LIMIT 1")
                 if cursor.fetchone() is not None:
@@ -2359,6 +2621,20 @@ class SQLiteBackend(DatabaseBackend):
         require_owner()
         return result
 
+    @staticmethod
+    def _original_auxiliary_relation_matches(journal, observed, accepted):
+        if observed == accepted:
+            return True
+        # The primary writer above has already checked the exact locked
+        # relation and, if needed, made a live ordinary admission for the
+        # connection's new global data_version. Auxiliary tables share that
+        # SAME native configuration. They cannot independently renew it or
+        # excuse any schema, rootpage, column or native-program change.
+        return (observed is not None and accepted is not None
+            and observed[:-1] == accepted[:-1]
+            and observed[-1][:-1] == accepted[-1][:-1]
+            and observed[-1] == journal._sqlite_relation[-1])
+
     async def _verify_original_signal_outcome(self, conn, journal):
         journal.require_original(self)
         journal.require_sqlite_cleanup(self, conn)
@@ -2378,10 +2654,11 @@ class SQLiteBackend(DatabaseBackend):
             raise journal.write_refusal('row_missing_or_changed')
         if await self._read_original_signal_outcome_relation(journal) != journal._sqlite_relation:
             raise journal.write_refusal('destination_changed')
-        from .native_row_custody import _current_step
-        if _current_step(journal):
-            for role, accepted in zip(("owners", "requests"), journal._aux_relations):
-                if await self._read_original_signal_outcome_relation(journal, role=role) != accepted:
+        from .native_row_custody import _native_auxiliary_roles
+        if _native_auxiliary_roles(journal):
+            for role, accepted in zip(_native_auxiliary_roles(journal), journal._aux_relations):
+                if not self._original_auxiliary_relation_matches(journal,
+                        await self._read_original_signal_outcome_relation(journal, role=role), accepted):
                     raise journal.write_refusal('auxiliary_destination_changed')
 
 
@@ -2433,12 +2710,13 @@ class SQLiteBackend(DatabaseBackend):
                                 original_outcome._observer_depth -= 1
                             original_outcome._sqlite_relation = observed
                     if original_outcome is not None:
-                        from .native_row_custody import _current_step
-                        if _current_step(original_outcome):
-                            for role, accepted in zip(("owners", "requests"), original_outcome._aux_relations):
-                                if await self._read_original_signal_outcome_relation(original_outcome, role=role) != accepted:
+                        from .native_row_custody import _current_step, _native_auxiliary_roles
+                        if _native_auxiliary_roles(original_outcome):
+                            for role, accepted in zip(_native_auxiliary_roles(original_outcome), original_outcome._aux_relations):
+                                if not self._original_auxiliary_relation_matches(original_outcome,
+                                        await self._read_original_signal_outcome_relation(original_outcome, role=role), accepted):
                                     raise original_outcome.write_refusal('auxiliary_destination_changed')
-                            if original_outcome._mode == "claim":
+                            if _current_step(original_outcome) and original_outcome._mode == "claim":
                                 async with conn.execute("UPDATE main.visual_computer_owners SET generation = generation + 1 WHERE owner = ?", (original_outcome._identity[0],)) as locked:
                                     if locked.rowcount != 1:
                                         raise original_outcome.write_refusal('original_owner_absent')
@@ -2468,6 +2746,12 @@ class SQLiteBackend(DatabaseBackend):
                         await self._rollback_after_failure(conn, error=e, original_outcome=original_outcome)
                     if original_outcome is not None and type(e) is NativeJournalConfigurationError:
                         raise original_outcome.write_refusal('native_programs_changed') from e
+                    from kestrel_sovereign.a2a.stores.unified.base import NativeStoreConflict
+                    if original_outcome is not None and isinstance(e, NativeStoreConflict):
+                        # A closed native CAS refusal is already a typed
+                        # conflict. Rollback above retires its transaction;
+                        # wrapping it as QueryError loses that contract.
+                        raise
                     if is_execution_control_error(e):
                         raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
@@ -2596,14 +2880,15 @@ class SQLiteBackend(DatabaseBackend):
         body_error = None
         try:
             if conn is self._connection:
-                from kestrel_sovereign._async_ownership import create_owned_task
+                from kestrel_sovereign._async_ownership import create_owned_task, owned_native_completion
                 execute_task = create_owned_task(conn.execute(query, params))
                 self._pending_read_executions.add(execute_task)
                 try:
                     # Do not cancel the native cursor-return owner. If this
                     # caller unwinds, the cancellation drain closes that exact
                     # returned statement before permitting another write.
-                    cursor = await asyncio.shield(execute_task)
+                    with owned_native_completion(execute_task):
+                        cursor = await asyncio.shield(execute_task)
                 except asyncio.CancelledError as error:
                     # shield synthesizes a cancellation when its child raises
                     # CancelledError. Recover that child's original receipt;
@@ -2780,10 +3065,19 @@ class SQLiteBackend(DatabaseBackend):
     async def transaction(self, *, immediate: bool = False, savepoint: bool = False) -> AsyncIterator[None]:
         """Transaction context manager.
 
-        ``BEGIN IMMEDIATE`` is reserved for one-time schema migrations that
-        must acquire SQLite's writer slot before inspecting a migration marker.
-        Normal data mutations retain deferred ``BEGIN`` so read-first flows do
-        not unnecessarily block one another.
+        Every transaction begins ``BEGIN IMMEDIATE``, taking SQLite's writer
+        slot before its first statement, so none has to upgrade a read
+        snapshot into a write (#4040). A deferred transaction that read, then
+        wrote after another connection committed, failed at once with
+        ``database is locked``: WAL refuses to upgrade a stale snapshot, and
+        the busy timeout does not apply. Runtime-owner renewal commits on a
+        connection of its own every heartbeat, so a deferred read-then-write
+        failed intermittently; taking the slot first, a transaction only
+        waits for it, within the busy timeout. Transactions on this
+        connection are already serialized by its write guard, so this costs
+        them nothing among themselves; a transaction that only reads holds
+        the slot for as long as it runs, as a writing one does.
+        ``immediate`` is accepted for compatibility and has no further effect.
         """
         conn = self._ensure_connected()
 
@@ -2830,7 +3124,7 @@ class SQLiteBackend(DatabaseBackend):
                 self._txn_owner = asyncio.current_task()
                 self._after_commit = AfterCommitCallbacks()
                 try:
-                    await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                    await conn.execute("BEGIN IMMEDIATE")
                     yield
                     self._require_native_transaction()
                     await self._commit_write(conn)

@@ -22,6 +22,7 @@ def _chat_response(content="ok"):
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
+                index=0,
                 message=SimpleNamespace(content=content, tool_calls=None)
             )
         ],
@@ -60,7 +61,7 @@ def _client():
                             "response": {
                                 "body": {
                                     "choices": [
-                                        {"message": {"content": "first"}}
+                                        {"index": 0, "message": {"content": "first"}}
                                     ],
                                     "usage": {
                                         "prompt_tokens": 1,
@@ -150,7 +151,7 @@ async def _capture_chat_completion_request(
         client.chat.completions.create.return_value = _EmptyAsyncStream()
         method = (
             adapter.get_streaming_response
-            if path == "streaming"
+            if path == "streaming" and not tools
             else adapter.get_streaming_response_with_tools
         )
         async for _ in method(

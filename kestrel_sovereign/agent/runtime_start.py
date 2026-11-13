@@ -27,3 +27,12 @@ def require_runtime_start_allowed(agent: Any) -> None:
         raise MaintenanceBootError(
             "maintenance boot holds business work until this generation is retired"
         )
+
+
+def require_input_storage_ready(agent: Any) -> None:
+    """Defer an input before journal writes when boot has no primary storage."""
+    if getattr(agent, "storage", None) is None:
+        raise RuntimeError(
+            "agent not fully initialized: context_manager and storage "
+            "unavailable; deferring turn for retry until initialize() completes"
+        )

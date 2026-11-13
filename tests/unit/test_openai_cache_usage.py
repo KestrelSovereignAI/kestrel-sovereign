@@ -10,6 +10,16 @@ import pytest
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 
 
+@pytest.mark.parametrize("reason", [None, "stop", "length", "future_reason"])
+def test_raw_chat_completion_preserves_native_completion_reason(reason):
+    response = OpenAIAdapter()._llm_response_from_chat_completion({
+        "choices": [{"index": 0, "message": {"content": "owned"}, "finish_reason": reason}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+    })
+    assert response.stop_reason == reason
+    assert (response.input_tokens, response.output_tokens, response.total_tokens) == (2, 3, 5)
+
+
 @pytest.mark.asyncio
 async def test_nonstreaming_response_maps_cached_prompt_tokens() -> None:
     usage = SimpleNamespace(
@@ -26,6 +36,8 @@ async def test_nonstreaming_response_maps_cached_prompt_tokens() -> None:
         return_value=SimpleNamespace(
             choices=[
                 SimpleNamespace(
+                    index=0,
+                    finish_reason=None,
                     message=SimpleNamespace(
                         content="ok",
                         tool_calls=None,
@@ -52,7 +64,7 @@ async def test_nonstreaming_response_maps_cached_prompt_tokens() -> None:
 def test_raw_chat_completion_maps_dict_cache_details() -> None:
     response = OpenAIAdapter()._llm_response_from_chat_completion(
         {
-            "choices": [{"message": {"content": "ok"}}],
+            "choices": [{"index": 0, "message": {"content": "ok"}}],
             "usage": {
                 "prompt_tokens": 120,
                 "completion_tokens": 5,
@@ -74,7 +86,7 @@ def test_raw_chat_completion_maps_dict_cache_details() -> None:
 def test_raw_chat_completion_accepts_compatible_top_level_cache_fields() -> None:
     response = OpenAIAdapter()._llm_response_from_chat_completion(
         {
-            "choices": [{"message": {"content": "ok"}}],
+            "choices": [{"index": 0, "message": {"content": "ok"}}],
             "usage": {
                 "prompt_tokens": 120,
                 "completion_tokens": 5,
@@ -94,7 +106,7 @@ def test_raw_chat_completion_accepts_compatible_top_level_cache_fields() -> None
 def test_missing_cache_details_remains_unreported() -> None:
     response = OpenAIAdapter()._llm_response_from_chat_completion(
         {
-            "choices": [{"message": {"content": "ok"}}],
+            "choices": [{"index": 0, "message": {"content": "ok"}}],
             "usage": {
                 "prompt_tokens": 12,
                 "completion_tokens": 2,

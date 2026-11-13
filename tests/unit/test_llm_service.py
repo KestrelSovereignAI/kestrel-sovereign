@@ -23,6 +23,7 @@ from kestrel_sdk.llm import (
 from pydantic import BaseModel, SecretStr
 from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
 
+from kestrel_sovereign.llm.streaming import LLMStreamingError
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
 from kestrel_sovereign.llm.output_ceiling import attach_stop_reason, response_stop_reason
@@ -2683,7 +2684,7 @@ class TestInvocationBoundary:
         assert meter_calls[0]["completion_tokens"] == 5
 
     @pytest.mark.asyncio
-    async def test_unknown_plain_stream_usage_is_logged_but_never_billed(
+    async def test_missing_plain_stream_terminal_is_failed_without_billing(
         self, llm_service, mock_adapter, caplog
     ):
         async def basic_stream(**_kwargs):
@@ -2703,18 +2704,18 @@ class TestInvocationBoundary:
             companion_id="legacy-companion", user_id="legacy-user"
         )
 
-        with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
-            items = [
+        with pytest.raises(LLMStreamingError), caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
+            _ = [
                 item
                 async for item in llm_service.get_streaming_response(
                     system_prompt="system", user_prompt="hello"
                 )
             ]
 
-        assert items == ["legacy chunk"]
         llm_service._track_model_usage.assert_not_awaited()
         store.log_llm_call.assert_awaited_once()
         logged = store.log_llm_call.await_args.kwargs
+        assert logged["success"] is False
         assert logged["input_tokens"] is None
         assert logged["output_tokens"] is None
         assert logged["metadata"]["usage_available"] is False
@@ -3319,6 +3320,7 @@ class TestStreamingMandatePreference:
         async def mock_streaming(*args, **kwargs):
             yield "Hello "
             yield "world"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         chunks = []
@@ -3345,6 +3347,7 @@ class TestStreamingMandatePreference:
         async def mock_streaming(*args, **kwargs):
             yield "Streamed "
             yield "response"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         messages = [{"role": "user", "content": "Test"}]
@@ -3366,6 +3369,7 @@ class TestStreamingMandatePreference:
         """Request cancellation token is forwarded to adapter streams."""
         async def mock_streaming(*args, **kwargs):
             yield "response"
+            yield _finished(LLMResponse(content="complete"))
 
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
         token = Mock(return_value=False)
@@ -3429,6 +3433,7 @@ class TestStreamingMandatePreference:
 
         async def mock_streaming(*args, **kwargs):
             yield "Default response"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         messages = [{"role": "user", "content": "Test"}]
@@ -3453,6 +3458,7 @@ class TestStreamingMandatePreference:
 
         async def mock_streaming(*args, **kwargs):
             yield "Override response"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         messages = [{"role": "user", "content": "Test"}]
@@ -3555,7 +3561,7 @@ from tests.unit.test_deferred_tool_delivery import boundary as deferred_boundary
 @pytest.mark.parametrize('entry,delivery', [
     ('generate_with_messages', 'public'), ('generate_with_messages', 'codex-inline'),
     ('get_response', 'public'), ('get_response', 'codex-inline'),
-    ('stream_with_tool_detection', 'public'),
+    ('stream_with_tool_detection', 'codex-inline'),
 ])
 async def test_inline_audit_failure_never_rotates_to_another_route(
     llm_service, mock_adapter, deferred_boundary, entry, delivery,  # noqa: F811 - imported pytest fixture
@@ -3567,36 +3573,44 @@ async def test_inline_audit_failure_never_rotates_to_another_route(
     b.policy.release.set()
     await b.backend.execute('DROP TABLE a2a_tool_dispatches')
     attempts = []
-    async def respond(**kwargs):
-        attempts.append(kwargs['client'])
-        if len(attempts) == 1:
-            if delivery == 'public':
-                await b.host.execute_named_tool(b.binding.name, {}, session_id='deferred-owned-session')
-            else:
-                from kestrel_sovereign.llm.codex_adapter import CodexAdapter
-                handler = CodexAdapter()._make_tool_call_handler(
-                    kwargs['tool_executor'], 'owned', frozenset({b.binding.name}), terminal_errors=[],
-                )
-                await handler({'threadId': 'owned', 'name': b.binding.name, 'arguments': {}})
-        return _finished(LLMResponse(content='fallback must not run'))
-    mock_adapter.get_response = AsyncMock(side_effect=respond)
-    executor = b.host._make_inline_tool_executor('deferred-owned-session')
-    messages = [{'role': 'user', 'content': 'run once'}]
-    if entry == 'generate_with_messages':
-        call = llm_service.generate_with_messages(messages=messages, tool_executor=executor)
-    elif entry == 'get_response':
-        call = llm_service.get_response('system', 'run once', tool_executor=executor)
-    else:
-        llm_service._adapter_has_usage_stream = lambda adapter: False
-        async def stream():
-            return [chunk async for chunk in llm_service.stream_with_tool_detection(
-                messages=messages, tools=[{'type': 'function', 'function': {
-                    'name': b.binding.name, 'parameters': {'type': 'object', 'properties': {}},
-                }}], tool_executor=executor,
-            )]
-        call = stream()
+    from tests.utils.native_tool_effects import drive_native
+
+    async def operation():
+        async def respond(**kwargs):
+            attempts.append(kwargs['client'])
+            if len(attempts) == 1:
+                if delivery == 'public':
+                    await b.host.execute_named_tool(b.binding.name, {}, session_id='deferred-owned-session')
+                else:
+                    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+                    handler = CodexAdapter()._make_tool_call_handler(
+                        kwargs['tool_executor'], 'owned', frozenset({b.binding.name}), terminal_errors=[],
+                    )
+                    await handler({'threadId': 'owned', 'name': b.binding.name, 'arguments': {}})
+            return _finished(LLMResponse(content='fallback must not run'))
+        mock_adapter.get_response = AsyncMock(side_effect=respond)
+        executor = b.host._make_inline_tool_executor('deferred-owned-session')
+        messages = [{'role': 'user', 'content': 'run once'}]
+        if entry == 'generate_with_messages':
+            call = llm_service.generate_with_messages(messages=messages, tool_executor=executor)
+        elif entry == 'get_response':
+            call = llm_service.get_response('system', 'run once', tool_executor=executor)
+        else:
+            async def provider_stream(**kwargs):
+                yield await respond(**kwargs)
+
+            mock_adapter.get_streaming_response_with_tools = provider_stream
+            async def stream():
+                return [chunk async for chunk in llm_service.stream_with_tool_detection(
+                    messages=messages, tools=[{'type': 'function', 'function': {
+                        'name': b.binding.name, 'parameters': {'type': 'object', 'properties': {}},
+                    }}], tool_executor=executor,
+                )]
+            call = stream()
+        return await call
+
     with pytest.raises(Exception) as caught:
-        await call
+        await drive_native(b.host, operation)
     assert any(isinstance(error, ResourceOutcomeUnknown) for error in _explicit_control_chain(caught.value))
     assert len(attempts) == 1
     assert b.tool.executions == [{}] and b.tool.publications == []

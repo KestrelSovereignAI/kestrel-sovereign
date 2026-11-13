@@ -114,11 +114,14 @@ _JSDELIVR_NPM_SCRIPT = re.compile(
 # Version 0.45 adds the authenticated human-control and acquisition-custody
 # contracts. Version 0.46 adds the host-selected deferred-publication context.
 # Version 0.48 adds public argument coercion and the host control-error predicate.
+# Version 0.49 adds native completion evidence and the streaming EOF contract.
+# Version 0.51 requires explicit intent IDs on governed bindings and preserves
+# original uncertain tool exceptions. Core must require that exact contract.
 # A private development wheel does not satisfy the normal lock gate.
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.48.0"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.52.2"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -148,16 +151,21 @@ def _assert_requirement_floor(requirement: Requirement, floor: Version) -> None:
 
 
 def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
-    """Cloud Run requires the public registry and native Apps restore contract."""
+    """Public MCP must retain native intent, refusal and unknown-outcome receipts."""
     dependencies = _pyproject()["project"]["optional-dependencies"]["mcp-integration"]
     (requirement,) = [
         Requirement(raw)
         for raw in dependencies
         if Requirement(raw).name == "kestrel-feature-mcp"
     ]
-    floor = Version("0.12.0")
+    floor = Version("0.17.0")
     _assert_requirement_floor(requirement, floor)
     assert not requirement.specifier.contains("0.11.2")
+    assert not requirement.specifier.contains("0.12.0")
+    assert not requirement.specifier.contains("0.13.0")
+    assert not requirement.specifier.contains("0.14.1")
+    assert not requirement.specifier.contains("0.15.0")
+    assert not requirement.specifier.contains("0.16.0")
     assert requirement.specifier.contains(floor)
     (package,) = [
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
@@ -385,6 +393,27 @@ def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
     assert any(package["name"] == "tzdata" for package in _lock()["package"])
 
 
+def test_anyio_requires_native_cancellation_preserving_connection_completion():
+    """Every consumer must receive the real shutdown fix, including installs."""
+    direct = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "anyio"
+    ]
+    assert len(direct) == 1
+    _assert_requirement_floor(direct[0], Version("4.16.0"))
+    assert Version("4.15.1") not in direct[0].specifier
+    assert Version("4.16.0") in direct[0].specifier
+    assert Version("4.17.0") in direct[0].specifier
+    root = _locked_root_package(_lock())
+    assert [
+        requirement
+        for requirement in root["metadata"]["requires-dist"]
+        if requirement["name"] == "anyio"
+    ] == [{"name": "anyio", "specifier": ">=4.16.0"}]
+    _assert_locked_floors({"anyio": "4.16.0"})
+
+
 def test_asyncpg_runtime_probe_supports_current_minor_releases():
     """Require native retirement fixes without capping future minor releases."""
     direct = [
@@ -460,7 +489,15 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.45.0") not in specifier
         assert Version("0.46.0") not in specifier
         assert Version("0.47.0") not in specifier
-        assert Version("0.48.0") in specifier
+        assert Version("0.48.0") not in specifier
+        assert Version("0.49.0") not in specifier
+        assert Version("0.50.0") not in specifier
+        assert Version("0.51.0") not in specifier
+        assert Version("0.51.1") not in specifier
+        assert Version("0.51.2") not in specifier
+        assert Version("0.52.0") not in specifier
+        assert Version("0.52.1") not in specifier
+        assert Version("0.52.2") in specifier
         assert Version("1.0.0") not in specifier
 
 
@@ -496,5 +533,21 @@ def test_sdk_native_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.48.0") <= version < Version("1.0.0") for version in sdk_versions
+        Version("0.52.2") <= version < Version("1.0.0") for version in sdk_versions
     )
+
+
+def test_native_provider_completion_release_is_required():
+    dependencies = {
+        canonicalize_name(requirement.name): requirement
+        for requirement in map(Requirement, _pyproject()["project"]["dependencies"])
+    }
+    providers = dependencies["kestrel-llms"]
+    assert providers.extras == {"all"}
+    _assert_requirement_floor(providers, Version("0.2.0"))
+    assert Version("0.1.8") not in providers.specifier
+    assert Version("0.2.0") in providers.specifier
+    assert Version("0.2.99") in providers.specifier
+    assert Version("0.3.0") not in providers.specifier
+    for name, floor in (("openai", "3.46.0"), ("google-genai", "2.34.0")):
+        _assert_requirement_floor(dependencies[name], Version(floor))

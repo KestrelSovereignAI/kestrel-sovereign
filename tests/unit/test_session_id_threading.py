@@ -6,8 +6,7 @@ Two layers:
   This catches accidental rename / drop in future refactors.
 - Behavioral: ``OrchestratorEngineMixin._handle_orchestrator_response`` actually
   passes ``session_id`` to ``llm_service.generate_with_messages`` when it loops
-  on tool results. The mocking pattern follows ``test_denied_tools_dispatch.py``
-  — bind the mixin method to a MagicMock agent and stub the heavy collaborators.
+  on tool results, inside the real agent's native input lifetime.
 """
 
 import inspect
@@ -19,6 +18,8 @@ from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.streaming import StreamingMixin
+from tests.unit.test_orchestrator_engine import _base_agent
+from tests.utils.native_tool_effects import drive_native
 
 
 class TestSignatures:
@@ -55,7 +56,7 @@ class TestOrchestratorThreadsSessionId:
     def _bind_handler(self, agent):
         return OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
 
-    async def test_session_id_passed_to_generate_with_messages(self):
+    async def test_session_id_passed_to_generate_with_messages(self, native_tool_effect_agent):
         # Initial response has a tool call so the loop body runs at least once.
         initial = LLMResponse(
             content=None,
@@ -64,26 +65,12 @@ class TestOrchestratorThreadsSessionId:
         # Second LLM response has no tool calls → loop exits cleanly.
         terminating = LLMResponse(content="done", tool_calls=None)
 
-        agent = MagicMock()
+        agent = await _base_agent(native_tool_effect_agent)
         agent.llm_service = MagicMock()
         agent.llm_service.generate_with_messages = AsyncMock(return_value=terminating)
-        # Stub all collaborators that would otherwise need a full agent.
-        agent.features = {}
-        agent._direct_tools = {}
-        agent._build_tool_calls_msg = MagicMock(
-            return_value=[
-                {"id": "call_1", "type": "function", "function": {"name": "some_tool", "arguments": "{}"}}
-            ]
-        )
-        agent._execute_tool_batch = AsyncMock()  # no-op
-        agent._execute_tool_batch_at_stop_boundary = (
-            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
-        )
-        agent._build_all_tools = MagicMock(return_value=[])
-        agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
         handler = self._bind_handler(agent)
-        result = await handler(
+        result = await drive_native(agent, lambda: handler(
             response=initial,
             feature_tools=[],
             system_prompt="sys",
@@ -91,7 +78,7 @@ class TestOrchestratorThreadsSessionId:
             effective_model="gpt-5.4",
             user_message="hi",
             session_id="session-xyz",
-        )
+        ))
 
         assert result == "done"
         agent.llm_service.generate_with_messages.assert_awaited_once()

@@ -3,6 +3,8 @@
 import asyncio
 import json
 import secrets
+from contextlib import asynccontextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import openai
@@ -27,6 +29,38 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
 from tests.integration.test_storage_backend_parity import _incepted_assertion_identity
 
 
+def observe_native_transaction_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AsyncDatabase,
+    *,
+    selected: Callable[[], bool],
+    sources: list[BaseException],
+    make_carrier: Callable[[], BaseException] | None = None,
+) -> None:
+    """Observe the actual owned transaction exit after its SQL has returned.
+
+    Forward the original context, result and exception. Record the source once;
+    a requested typed carrier must wrap that same native original explicitly.
+    This supplements each test's selected SQL observer without inventing an
+    acknowledgement or swallowing an unrelated control error.
+    """
+    original = database.transaction
+
+    @asynccontextmanager
+    async def observe(*args, **kwargs):
+        try:
+            async with original(*args, **kwargs) as transaction:
+                yield transaction
+        except BaseException as error:
+            if selected() and not sources:
+                sources.append(error)
+                if make_carrier is not None:
+                    raise make_carrier() from error
+            raise
+
+    monkeypatch.setattr(database, "transaction", observe)
+
+
 @dataclass
 class NativeMemoryOwners:
     backend: object
@@ -48,7 +82,7 @@ class NativeMemoryOwners:
 
 
 @pytest.fixture
-async def native_memory_owners(native_pg, tmp_path, monkeypatch):
+async def native_memory_owners(native_pg, tmp_path, monkeypatch, request):
     from kestrel_sovereign.llm import service as service_module
 
     backend, observer, schema = native_pg
@@ -180,6 +214,15 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                     await writer.drain()
                     return
                 assert header.startswith(b"POST /v1/embeddings ")
+                embedding_reply = getattr(request, "param", "valid")
+                if embedding_reply == "unavailable":
+                    payload = b'{"error":{"message":"owned embedding peer unavailable","type":"server_error"}}'
+                    writer.write(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                        + str(len(payload)).encode() + b"\r\n\r\n" + payload
+                    )
+                    await writer.drain()
+                    return
                 payload = json.dumps(
                     {
                         "object": "list",
@@ -196,6 +239,9 @@ async def native_memory_owners(native_pg, tmp_path, monkeypatch):
                                 else [body["input"]]
                             )
                         ],
+                        "usage": {"prompt_tokens": 3, "total_tokens": 3},
+                    } if embedding_reply != "empty" else {
+                        "object": "list", "model": "local-test-embedding", "data": [],
                         "usage": {"prompt_tokens": 3, "total_tokens": 3},
                     }
                 ).encode()

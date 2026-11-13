@@ -23,7 +23,9 @@ from kestrel_sovereign.knowledge import (
     Literal,
     OntologyRef,
     SourceOccurrence,
+    SourceReferenceKind,
     XSD_STRING,
+    with_source_reference,
 )
 from kestrel_sovereign.knowledge.registry import get_knowledge_registry
 from kestrel_sovereign.agent.invocation import (
@@ -206,8 +208,14 @@ def _source_for_operation(
     owning_agent_id: str,
     *,
     received_at: str | None = None,
+    session_id: str | None = None,
 ) -> SourceOccurrence:
-    """Build provenance from the trusted turn context, never tool content."""
+    """Build provenance from the trusted turn context, never tool content.
+
+    ``session_id`` is the session the turn's conversation rows are filed
+    under, or ``None`` when the turn has none; the locator then names no
+    session.
+    """
     provenance = current_invocation_provenance()
     if provenance is None:
         source_kind = _SOURCE_KIND
@@ -227,7 +235,9 @@ def _source_for_operation(
     return SourceOccurrence(
         source_occurrence_id=f"source:{FACT_ADAPTER_VERSION}:{digest}",
         source_kind=source_kind,
-        locator=locator,
+        locator=with_source_reference(
+            locator, SourceReferenceKind.SESSION, session_id
+        ),
         received_at=observed_at,
         content_digest=f"sha256:{digest}",
         actor=actor,

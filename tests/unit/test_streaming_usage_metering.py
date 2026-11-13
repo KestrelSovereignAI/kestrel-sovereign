@@ -277,8 +277,13 @@ def test_stream_with_tool_detection_records_usage_exactly_once(monkeypatch):
 class _FakeStreamingAdapter:
     """Adapter exposing ``get_streaming_response`` (no-tools streaming path)."""
 
+    def __init__(self, *, terminal=True):
+        self.terminal = terminal
+
     async def get_streaming_response(self, *, client, model, messages, **kwargs):
         yield "ok"
+        if self.terminal:
+            yield LLMResponse()
 
 
 class _AutoRoutingService(_RoutingService):
@@ -393,7 +398,7 @@ def test_basic_stream_records_unknown_usage_without_zero_token_tracking(monkeypa
     monkeypatch.setattr(
         "kestrel_sovereign.llm.streaming.provider_cache_body", lambda provider: None
     )
-    svc = _RoutingService(_FakeStreamingAdapter())
+    svc = _RoutingService(_FakeStreamingAdapter(terminal=False))
 
     async def _run():
         return [
@@ -403,10 +408,17 @@ def test_basic_stream_records_unknown_usage_without_zero_token_tracking(monkeypa
             )
         ]
 
-    assert asyncio.run(_run()) == ["ok"]
+    from kestrel_sovereign.llm.streaming import LLMStreamingError
+    from kestrel_sovereign.llm.completion_protocol import GenerationProtocolError
+    from kestrel_sovereign.llm.output_ceiling import incomplete_generation
+
+    with pytest.raises(LLMStreamingError) as raised:
+        asyncio.run(_run())
+    assert isinstance(incomplete_generation(raised.value), GenerationProtocolError)
     svc._track_model_usage.assert_not_awaited()
     svc._log_llm_call.assert_awaited_once()
     logged = svc._log_llm_call.await_args.kwargs
+    assert logged["success"] is False
     assert logged["input_tokens"] is None
     assert logged["output_tokens"] is None
     assert logged["usage_available"] is False
@@ -456,6 +468,7 @@ def test_openai_text_only_stream_emits_terminal_llmresponse_with_usage(monkeypat
     content_chunk = SimpleNamespace(
         usage=None,
         choices=[SimpleNamespace(
+            index=0,
             delta=SimpleNamespace(content="hello world", tool_calls=None),
             finish_reason=None,
         )],
@@ -544,14 +557,15 @@ def test_vertex_text_stream_emits_terminal_llmresponse_with_usage(monkeypatch):
     assert terminals[0].total_tokens == 5
     assert terminals[0].cache_read_input_tokens == 3
 
-    # And the public text-only contract still drops the terminal response.
+    # Plain streaming retains the same terminal metadata as the tool-aware facade.
     text_items = _collect(VertexAIAdapter().get_streaming_response(
         client=fake_client,
         model="gemini-x",
         messages=[{"role": "user", "content": "hi"}],
     ))
-    assert all(isinstance(i, str) for i in text_items)
-    assert "".join(text_items) == "hello world"
+    assert isinstance(text_items[-1], LLMResponse)
+    assert (text_items[-1].input_tokens, text_items[-1].output_tokens) == (2, 3)
+    assert "".join(i for i in text_items if isinstance(i, str)) == "hello world"
 
 
 def test_vertex_nonstream_normalizes_cached_prompt_usage(monkeypatch):
@@ -652,8 +666,9 @@ def test_google_text_stream_emits_terminal_cache_usage():
         model="gemini-x",
         messages=[{"role": "user", "parts": [{"text": "hi"}]}],
     ))
-    assert all(isinstance(item, str) for item in text_items)
-    assert "".join(text_items) == "hello world"
+    assert isinstance(text_items[-1], LLMResponse)
+    assert text_items[-1].cache_read_input_tokens == 7
+    assert "".join(i for i in text_items if isinstance(i, str)) == "hello world"
 
 
 def test_google_tool_fallback_forwards_probe_cache_usage():

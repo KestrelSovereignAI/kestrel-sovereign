@@ -89,6 +89,14 @@ _KITE_EXPERIMENTAL_CAPABILITIES: dict[str, object] = {
         "version": "0.1.0",
     },
 }
+# Spelled here rather than imported: importing the corpus manifest module
+# would load the semantic storage stack into every harness import. A test pins
+# both to their owning modules' constants.
+_SOVEREIGN_TRUST_ROOT_ENV = "KESTREL_SOVEREIGN_TRUST_ROOT_PATH"
+_CORPUS_EXCLUSIONS_PATH_ENV = "KESTREL_CORPUS_EXCLUSIONS_PATH"
+#: The isolated test Sovereign. ``kite.invalid`` is the run's DID domain, so it
+#: names no real authority, and it can never be the kite agent's own DID.
+_KITE_SOVEREIGN_DID = "did:web:kite.invalid:sovereign"
 _CHILD_ENV_ALLOWLIST = frozenset(
     {
         "PATH",
@@ -207,6 +215,16 @@ class KiteIsolationConfig:
         return self.worktree / ".venv" / "bin" / "python"
 
     @property
+    def sovereign_trust_root_path(self) -> Path:
+        """The test-only Sovereign root ``prepare`` pins for this run."""
+        return self.home / "kite-sovereign-root.did.json"
+
+    @property
+    def corpus_exclusions_path(self) -> Path:
+        """The corpus exclusion manifest ``prepare`` signs for the kite agent."""
+        return self.home / "kite-corpus-exclusions.json"
+
+    @property
     def kestrel_path(self) -> Path:
         return self.worktree / ".venv" / "bin" / "kestrel"
 
@@ -231,6 +249,13 @@ class KiteIsolationConfig:
         # anchor.  It may safely be located beneath a system temporary root.
         env["KESTREL_KITE_RELEASE_EVIDENCE_ROOT"] = str(self.home)
         env["KESTREL_MULTI_AGENT_CONFIG"] = str(self.config_path)
+        # Every governed corpus build, the erasure drill's included, refuses
+        # without a Sovereign-signed exclusion manifest naming the building
+        # agent (#3893). Never the operator's: ``prepare`` pins a fresh,
+        # test-only Sovereign root in this home and signs a manifest that
+        # excludes nothing for kite.
+        env[_SOVEREIGN_TRUST_ROOT_ENV] = str(self.sovereign_trust_root_path)
+        env[_CORPUS_EXCLUSIONS_PATH_ENV] = str(self.corpus_exclusions_path)
         env["KESTREL_DEMO_SERVER"] = "1"
         env["KESTREL_KITE_RELEASE_EVIDENCE"] = "1"
         # The isolated test identity must not borrow a production DID domain.
@@ -359,6 +384,7 @@ class KiteHttpHarness:
             encoding="utf-8",
         )
         try:
+            sovereign_key = self._write_sovereign_trust_root()
             self._run(
                 [str(self.config.kestrel_path), "create", "kite", "--test", "--port", str(self.config.port)],
                 cwd=self.config.worktree,
@@ -368,11 +394,67 @@ class KiteHttpHarness:
                 capture_output=True,
             )
             self._write_profile_config()
+            self._write_corpus_exclusions(sovereign_key)
         except BaseException:
             # A partial test home is intentionally retained for manual forensic
             # inspection, but can never be used by a subsequent run because
             # prepare() requires freshness.
             raise
+
+    def _write_sovereign_trust_root(self):
+        """Pin a fresh test-only Sovereign root in the home; return its private key.
+
+        The key stays in this process and signs one manifest. No operator
+        root or key is read, and the kite agent never holds this one.
+        """
+        from kestrel_sovereign.constitution.amendment_artifact import (
+            did_document_from_legacy_public_key,
+        )
+        from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+
+        keypair = Secp256k1Suite().generate_keypair()
+        self._write_owned_file(
+            self.config.sovereign_trust_root_path,
+            _canonical_json(
+                did_document_from_legacy_public_key(_KITE_SOVEREIGN_DID, keypair.public_key)
+            ),
+        )
+        return keypair.private_key
+
+    def _write_corpus_exclusions(self, sovereign_key) -> None:
+        """Sign the run's corpus exclusion manifest: nothing held out for kite (#3893).
+
+        The section names the DID ``kestrel create`` just minted, read from
+        its local birth record, so the drill's corpus builds verify exactly as
+        a production host's do rather than skipping the manifest.
+        """
+        from kestrel_sovereign.identity.local_anchor import (
+            AgentDIDLookupMode,
+            read_anchor_agent_did_sync,
+        )
+        from kestrel_sovereign.knowledge.corpus_exclusions import (
+            build_legacy_signed_corpus_exclusions,
+        )
+
+        kite_did = read_anchor_agent_did_sync(
+            str(self.config.home / "agent_data" / self.config.agent_name),
+            mode=AgentDIDLookupMode.INSPECTION,
+        )
+        manifest = build_legacy_signed_corpus_exclusions(
+            signer_did=_KITE_SOVEREIGN_DID,
+            sequence=1,
+            agents={kite_did: {}},
+            private_key=sovereign_key,
+            reason="Kite release evidence: nothing held out",
+        )
+        self._write_owned_file(self.config.corpus_exclusions_path, _canonical_json(manifest))
+
+    @staticmethod
+    def _write_owned_file(path: Path, text: str) -> None:
+        """Create ``path`` as a new owner-only file; never replace one."""
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+            destination.write(text)
 
     async def seed_disposable_postgres_test_identity(self) -> None:
         """Copy only the freshly incepted test identity into the empty PG run.

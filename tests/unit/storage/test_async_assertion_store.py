@@ -1408,6 +1408,49 @@ async def test_legacy_request_key_tombstone_with_matching_fence_fails_closed() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_session", "retry_session"),
+    [
+        # Recorded before sources named a session (#3875), retried after.
+        (None, "session-on-retry"),
+        # A session-less turn's retry may resolve a different session.
+        ("first-session", "second-session"),
+    ],
+)
+async def test_explicit_fact_replay_ignores_the_session_a_retry_is_filed_under(
+    first_session, retry_session
+) -> None:
+    storage = await _storage()
+    try:
+        governed = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        teach = dict(
+            subject="user",
+            predicate="preferred_deploy_region",
+            value="replayed-region",
+            confidence=0.9,
+            invocation_id="retried-request",
+        )
+        original = await governed.save_explicit_fact(**teach, session_id=first_session)
+        recorded = await governed.list_assertion_revision_sources(original.revision_id)
+
+        replay = await governed.save_explicit_fact(**teach, session_id=retry_session)
+
+        assert replay.saved is True
+        assert replay.idempotent is True
+        assert (replay.assertion_id, replay.revision_id, replay.provenance_reference) == (
+            original.assertion_id,
+            original.revision_id,
+            original.provenance_reference,
+        )
+        # The retry records nothing: provenance stays the first delivery's.
+        assert await governed.list_assertion_revision_sources(
+            original.revision_id
+        ) == recorded
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_v3_post_erasure_upgrade_blocks_lost_save_and_append_replays(
     tmp_path,
 ) -> None:

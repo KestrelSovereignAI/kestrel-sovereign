@@ -3,7 +3,6 @@
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
@@ -21,6 +20,7 @@ from tests.unit.test_a2a_native_input_fencing import owner, private_event
 from tests.unit.test_a2a_native_task_manager import manager as manager
 from tests.unit.test_a2a_native_task_manager import request
 from tests.utils.native_a2a import manager_for
+from tests.utils.native_tool_effects import drive_native
 
 
 class LocalWakeFeature(Feature):
@@ -39,12 +39,12 @@ class LocalWakeFeature(Feature):
         return ToolResult.ok(confirmation="Local invocation finished")
 
 
-def provider(manager):
-    feature = LocalWakeFeature(
-        SimpleNamespace(did=manager.did, _execution_custody=None)
-    )
+def provider(case):
+    manager = case.manager
+    feature = LocalWakeFeature(case.agent)
     feature.name = "local-wake"
     feature.effects = 0
+    case.agent.features[feature.name] = feature
     feature.started = asyncio.Event()
     feature.release = asyncio.Event()
     manager.register_provider("local-wake", feature.get_agent_skills(), feature)
@@ -62,14 +62,16 @@ async def candidates(manager):
 
 @pytest.mark.parametrize("sync", [True, False])
 async def test_local_execution_recovery_only_owes_an_async_completion(
-    manager, native_a2a_backend_factory, sync
+    native_feature_case, native_a2a_backend_factory, sync
 ):
-    feature = provider(manager)
+    case = native_feature_case
+    manager = case.manager
+    feature = provider(case)
     submissions, completions = [], []
     manager._on_task_submitted = submissions.append
     manager._on_task_complete = completions.append
     execution = asyncio.create_task(
-        manager.execute_skill("local-wake", "hold_local", {}, sync=sync)
+        drive_native(case.agent, lambda: manager.execute_skill("local-wake", "hold_local", {}, sync=sync))
     )
     restarted = None
     try:
@@ -136,13 +138,15 @@ async def test_peer_metadata_cannot_disable_its_server_owned_wake_policy(manager
 
 
 async def test_interrupted_sync_command_is_terminal_and_absent_from_pending_inbox(
-    manager,
+    native_feature_case,
 ):
+    case = native_feature_case
+    manager = case.manager
     from google.protobuf.json_format import MessageToDict
 
-    feature = provider(manager)
+    feature = provider(case)
     execution = asyncio.create_task(
-        manager.execute_skill("local-wake", "hold_local", {}, sync=True)
+        drive_native(case.agent, lambda: manager.execute_skill("local-wake", "hold_local", {}, sync=True))
     )
     async with asyncio.timeout(3):
         await feature.started.wait()
@@ -163,10 +167,12 @@ async def test_interrupted_sync_command_is_terminal_and_absent_from_pending_inbo
     assert feature.effects == 1 and not feature.release.is_set()
 
 
-async def test_sync_interruption_keeps_an_independent_terminal_winner(manager):
-    feature = provider(manager)
+async def test_sync_interruption_keeps_an_independent_terminal_winner(native_feature_case):
+    case = native_feature_case
+    manager = case.manager
+    feature = provider(case)
     execution = asyncio.create_task(
-        manager.execute_skill("local-wake", "hold_local", {}, sync=True)
+        drive_native(case.agent, lambda: manager.execute_skill("local-wake", "hold_local", {}, sync=True))
     )
     async with asyncio.timeout(3):
         await feature.started.wait()
@@ -184,11 +190,21 @@ async def test_sync_interruption_keeps_an_independent_terminal_winner(manager):
 
 
 async def test_stale_input_wake_cannot_drive_or_mutate_a_local_async_invocation(
-    manager,
+    native_feature_case,
     monkeypatch,
 ):
-    feature = provider(manager)
-    task = await manager.execute_skill("local-wake", "hold_local", {}, sync=False)
+    case = native_feature_case
+    manager = case.manager
+    feature = provider(case)
+    accepted = asyncio.get_running_loop().create_future()
+
+    async def admit_original():
+        original = await manager.execute_skill("local-wake", "hold_local", {}, sync=False)
+        accepted.set_result(original)
+        return original
+
+    execution = asyncio.create_task(drive_native(case.agent, admit_original))
+    task = await accepted
     try:
         async with asyncio.timeout(3):
             await feature.started.wait()
@@ -252,15 +268,18 @@ async def test_stale_input_wake_cannot_drive_or_mutate_a_local_async_invocation(
             await manager.continue_task(followup, creator_agent_id=manager.did)
     finally:
         feature.release.set()
+        await execution
         await asyncio.gather(*tuple(manager._execution_tasks))
 
 
 async def test_old_sync_completion_is_withdrawn_before_private_or_public_cognition(
-    manager,
+    native_feature_case,
 ):
-    feature = provider(manager)
+    case = native_feature_case
+    manager = case.manager
+    feature = provider(case)
     feature.release.set()
-    task = await manager.execute_skill("local-wake", "hold_local", {}, sync=True)
+    task = await drive_native(case.agent, lambda: manager.execute_skill("local-wake", "hold_local", {}, sync=True))
     candidate = await manager.get_task_snapshot(task.id, recipient_agent_id=manager.did)
     stale = build_signal_for_completed_task(
         replace(candidate, cognition_wake_eligible=True), manager.did
@@ -278,8 +297,10 @@ async def test_old_sync_completion_is_withdrawn_before_private_or_public_cogniti
 
 @pytest.mark.parametrize("sync", [True, False])
 async def test_actual_signal_ledger_recovery_keeps_only_owed_local_completion(
-    manager, sync
+    native_feature_case, sync
 ):
+    case = native_feature_case
+    manager = case.manager
     from kestrel_sovereign.signals import DurableConsumerRegistration
     from kestrel_sovereign.signals.sources.a2a import (
         DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
@@ -303,9 +324,9 @@ async def test_actual_signal_ledger_recovery_keeps_only_owed_local_completion(
     )
     manager._on_task_submitted = agent._on_task_submitted
     manager._on_task_complete = agent._on_background_task_complete
-    feature = provider(manager)
+    feature = provider(case)
     execution = asyncio.create_task(
-        manager.execute_skill("local-wake", "hold_local", {}, sync=sync)
+        drive_native(case.agent, lambda: manager.execute_skill("local-wake", "hold_local", {}, sync=sync))
     )
     try:
         async with asyncio.timeout(5):
@@ -345,13 +366,15 @@ async def test_actual_signal_ledger_recovery_keeps_only_owed_local_completion(
 
 
 async def test_canceling_a_local_sync_invocation_does_not_emit_completion_cognition(
-    manager,
+    native_feature_case,
 ):
-    feature = provider(manager)
+    case = native_feature_case
+    manager = case.manager
+    feature = provider(case)
     completions = []
     manager._on_task_complete = completions.append
     execution = asyncio.create_task(
-        manager.execute_skill("local-wake", "hold_local", {}, sync=True)
+        drive_native(case.agent, lambda: manager.execute_skill("local-wake", "hold_local", {}, sync=True))
     )
     try:
         async with asyncio.timeout(3):

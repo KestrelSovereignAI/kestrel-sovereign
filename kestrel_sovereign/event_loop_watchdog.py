@@ -180,6 +180,8 @@ class EventLoopStallWatchdog:
         self._unseen_gap = 0.0
         # Owned by the watchdog thread.
         self._stall: Optional[_Stall] = None
+        self._agent_in_context: Any = None
+        self._agent_name_var: Any = None
 
     @property
     def running(self) -> bool:
@@ -195,6 +197,13 @@ class EventLoopStallWatchdog:
             raise RuntimeError("event-loop stall watchdog was already started")
         self._loop = loop
         self._loop_thread_id = threading.get_ident()
+        # Imported here, on the loop thread: an import from the watchdog
+        # thread would wait on the import lock a stalled import holds.
+        from kestrel_sovereign.agent.turn_lifecycle import turn_agent_in_context
+        from kestrel_sovereign.logging_config import agent_name_var
+
+        self._agent_in_context = turn_agent_in_context
+        self._agent_name_var = agent_name_var
         now = time.monotonic()
         with self._lock:
             self._last_beat = now
@@ -354,15 +363,55 @@ class EventLoopStallWatchdog:
             )
         logger.warning(
             "Event loop stalled: its heartbeat is %.2f s overdue, %.2f s since "
-            "the last one ran (threshold %.2f s, heartbeat every %.2f s).%s "
+            "the last one ran (threshold %.2f s, heartbeat every %.2f s).%s%s "
             "Loop thread stack, most recent call last:\n%s",
             overdue,
             since_last_beat,
             self._threshold,
             self._interval,
+            self._running_task_note(),
             delay_note,
             stack.rstrip("\n"),
         )
+
+    def _running_task_note(self) -> str:
+        """Name the task holding the loop and, where cheap, its agent (#3889).
+
+        A stall is reported, never acted on: the Distributed Stop owner lease
+        is renewed off this loop, so the agent named here is the one whose
+        turn delayed everyone else's, not one whose stall cancelled them.
+        """
+
+        try:
+            task = asyncio.current_task(self._loop)
+        except RuntimeError:
+            return ""
+        if task is None:
+            return " No task was running: a loop callback held it."
+        agent = None
+        get_context = getattr(task, "get_context", None)  # Python 3.12+
+        if get_context is not None:
+            agent = self._agent_label(get_context())
+        if agent is None:
+            return f" Running task: {task.get_name()!r}."
+        return f" Running task: {task.get_name()!r}, a turn of agent {agent}."
+
+    def _agent_label(self, context: Any) -> Optional[str]:
+        agent = self._agent_in_context(context)
+        if agent is not None:
+            # Plain attributes only: a property could run code on this thread.
+            fields = getattr(agent, "__dict__", {})
+            name = fields.get("agent_name")
+            identity = fields.get("did") or fields.get("agent_id")
+            parts = [
+                part for part in (name, identity) if isinstance(part, str) and part
+            ]
+            if len(parts) == 2:
+                return f"{parts[0]} ({parts[1]})"
+            if parts:
+                return parts[0]
+        name = context.get(self._agent_name_var)
+        return name if isinstance(name, str) and name else None
 
 
 @contextmanager

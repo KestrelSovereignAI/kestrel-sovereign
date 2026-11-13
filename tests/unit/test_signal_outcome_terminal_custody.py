@@ -2171,10 +2171,26 @@ async def test_handler_cannot_terminalize_through_scheduler_after_cutoff(dispatc
 
 @pytest.mark.parametrize('boundary', ['before_emit', 'emitter_denial', 'emitter_cancel'])
 async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_components, monkeypatch, boundary):
+    await _visible_journal_cutoff_case(dispatcher_components, monkeypatch, boundary)
+
+
+@pytest.mark.parametrize('publication', ['sdk', 'audit'])
+async def test_visible_journal_keeps_independent_tool_source_without_finite_core_denial(dispatcher_components, monkeypatch, publication):
+    await _visible_journal_cutoff_case(dispatcher_components, monkeypatch, 'before_emit', publication=publication)
+
+
+async def _visible_journal_cutoff_case(dispatcher_components, monkeypatch, boundary, *, publication=None):
     from dataclasses import replace
     from kestrel_sdk.signals import Visibility
     from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error, _explicit_control_chain
     from kestrel_sovereign._async_ownership import create_owned_task
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import (
+        ToolAuditUnconfirmedError, execution_observation_error, is_tool_execution_terminal_error,
+    )
+    publication_error = (ResourceOutcomeUnknown("independent original writer publication uncertainty")
+        if publication == "sdk" else ToolAuditUnconfirmedError("independent original writer audit uncertainty")
+        if publication == "audit" else None)
     c = dispatcher_components
     entered, release = asyncio.Event(), asyncio.Event()
     emitted = []
@@ -2192,7 +2208,12 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
     async def held_writer(*args, **kwargs):
         entered.set()
         await release.wait()
-        return await original(*args, **kwargs)
+        try:
+            return await original(*args, **kwargs)
+        except BaseException as error:
+            if publication_error is None:
+                raise
+            raise execution_observation_error(error, publication_error) from None
 
     c.agent.emit_event = emit
     monkeypatch.setattr(c.dispatcher, '_write_outcome_log', held_writer)
@@ -2217,7 +2238,15 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
                 assert any(error is original_denial for error in _explicit_control_chain(outcome.error))
         assert len(emitted) == (0 if boundary == 'before_emit' else 1)
         assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
-        if boundary in ('before_emit', 'emitter_cancel'):
+        if publication_error is not None:
+            latched = c.dispatcher._outcome_log_control_error
+            assert latched is publication_error, "Finite UI admission refusal contaminated original tool source latch"
+            assert not is_execution_control_error(latched)
+            with pytest.raises(BaseException) as blocked:
+                await c.dispatcher.dispatch_signal(_signal('visible.audit'))
+            assert publication_error in tuple(_explicit_control_chain(blocked.value))
+            assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 1
+        elif boundary in ('before_emit', 'emitter_cancel'):
             assert c.dispatcher._outcome_log_control_error is None
             assert (await c.dispatcher.dispatch_signal(_signal('visible.audit'))).action_result is not None
     finally:
@@ -2227,7 +2256,12 @@ async def test_visible_journal_does_not_admit_ui_work_after_cutoff(dispatcher_co
         try:
             await c.dispatcher.shutdown_durable_delivery()
         except BaseException as error:
-            assert is_execution_control_error(error)
+            if publication_error is not None:
+                assert is_tool_execution_terminal_error(error)
+                assert publication_error in tuple(_explicit_control_chain(error))
+                await c.dispatcher._stop_runtime_owner_heartbeat()
+            else:
+                assert is_execution_control_error(error)
 
 
 @pytest.mark.parametrize('registered_before_refusal', [False, True])

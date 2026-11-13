@@ -46,6 +46,25 @@ class ApiHTTPException(HTTPException):
         self.details = details
 
 
+def tool_effect_api_error(error: BaseException) -> ApiHTTPException | None:
+    """Classify known journal failures without reflecting exception content."""
+    from kestrel_sovereign.tools.effect_failures import tool_effect_failure
+
+    failure = tool_effect_failure(error)
+    return (ApiHTTPException(failure.status_code, code=failure.code,
+            message=failure.message, details=failure.details)
+        if failure is not None else None)
+
+
+def execution_control_api_error(error: BaseException) -> ApiHTTPException | None:
+    """Preserve native control evidence without exposing private exception text."""
+    if not is_execution_control_error(error):
+        return None
+    return ApiHTTPException(500, code="execution_control",
+        message="Execution stopped. Reconcile the operation before continuing.",
+        details=[{"commit_outcome": execution_commit_outcome(error)}])
+
+
 def rate_limited_until(
     declined: AdvisedWaitExceedsRetryBudget, *, now: datetime | None = None
 ) -> ApiHTTPException:
@@ -226,16 +245,12 @@ async def api_unhandled_exception_handler(
             exc_info=None if private_path else (type(exc), exc, exc.__traceback__),
             extra={"error_type": type(exc).__name__},
         )
+        control = execution_control_api_error(exc)
         return api_error_response(
             status_code=500,
-            code="execution_control" if is_execution_control_error(exc) else "internal_error",
-            details=([{ "commit_outcome": execution_commit_outcome(exc) }]
-                if is_execution_control_error(exc) else None),
-            message=(
-                "Execution stopped. Reconcile the operation before continuing."
-                if is_execution_control_error(exc)
-                else "An internal error occurred."
-            ),
+            code=control.code if control is not None else "internal_error",
+            details=control.details if control is not None else None,
+            message=control.message if control is not None else "An internal error occurred.",
             correlation_id=correlation_id,
         )
     finally:

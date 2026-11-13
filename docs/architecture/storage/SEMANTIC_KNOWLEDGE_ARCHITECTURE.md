@@ -659,10 +659,96 @@ so they change its digest and therefore the corpus manifest's `policy_pin`; an
 empty set is omitted from that value, so a policy without exclusions keeps its
 prior digest. A consumer that persists its policy restores it with
 `GovernedCorpusPolicy.from_mapping`, which refuses unknown fields rather than
-dropping them. No producer writes these segments yet (#3875): the existing
-`save_fact` and strategy-ledger sources name their request route and their own
-record, never the session, so material they recorded during an excluded session
-must be excluded by source-occurrence id.
+dropping them.
+
+A consumer's policy is not where held-out material is decided, though: a
+consumer that names no exclusions would train on it (#3893). The host corpus
+capability therefore reads the host's Sovereign-signed exclusion manifest
+(`kestrel_sovereign.knowledge.corpus_exclusions`) on every build and holds out
+the ids it names for the building agent, by the same rules and with the same
+`explicitly_excluded` reason, whatever the policy excludes. The policy and its
+digest stay the consumer's own; the snapshot and each incremental read carry
+the manifest's receipt (`exclusion_manifest`: signed-content digest, sequence,
+`issued_at`), which the snapshot hash covers, and an incremental read refuses a
+base built under another manifest (`corpus_exclusion_manifest_changed`). A
+build refuses rather than run without exclusions when the manifest is missing,
+unreadable or not signed by the operator-pinned trust root, when an id is
+malformed, shortened or of an unknown kind, when the agent has no section, when
+its section names saved items (no producer records them yet, so they would
+match nothing), and when the sequence is lower than the highest this agent's
+builds admitted (`corpus_exclusion_watermarks`). The manifest is read in a
+worker thread within the build's own `max_wall_time_seconds`, and anything but
+a regular file (a FIFO put in its place) is refused unread.
+
+A corpus also outlives its build on the consumer's disk, so consumption is
+where a changed manifest takes effect. Each `corpus_manifest` and
+`future_corpus_candidate` artifact records the receipt of the manifest it was
+built under (`exclusion_manifest_sha256`, `exclusion_manifest_sequence`), and
+`consume_governed_semantic_artifact` reads and admits the current manifest
+exactly as a build does, then serves the artifact only when its receipt equals
+the current manifest's, and that manifest is still the one the agent's
+watermark records, read in the same transaction as the artifact row. It
+refuses, naming the reason, while the manifest is missing, unverifiable or
+moved back, or once a newer one was admitted after it was read, and refuses an
+artifact built under
+another manifest (including one a build registered after the manifest it read
+was replaced) or recording none (built before manifests existed). A refusal
+leaves the corpus as it is: no build or consumption revokes a corpus over its
+manifest, so a reader holding an older manifest cannot withdraw a newer corpus;
+any manifest update leaves every existing corpus unusable until it is rebuilt.
+An export snapshot is not governed by the manifest and is served without one.
+The operator procedure is in
+[Corpus exclusion manifest](../security/SOVEREIGN_TRUST_ROOT.md#corpus-exclusion-manifest).
+
+Producers append the segment after their own locator with
+`with_source_reference`, so a stem a reader matches by prefix still leads it
+(#3875). `save_fact` and the strategy-ledger projection name the session of the
+turn that recorded them, read through the turn lifecycle
+(`get_turn_bound_session_id`) and never from tool arguments. The lifecycle
+reports the session key exactly as the turn was given it, never trimmed, and
+the producer canonicalizes it as the conversation store does before filing a
+row, so the source names the key the turn's rows are filed under; a trimmed
+copy would name a session no row belongs to and slip past its exclusion. Work outside a
+turn, and a turn with no session, names none: the store then derives each row's
+session as it writes it, so no single session is the turn's.
+
+`STRATEGY_LEDGER.yaml` is in the agent's own data directory, so nothing in it,
+neither a field naming a session nor a row's `id`, is provenance (#3990).
+Before a strategy-ledger tool writes a row, host code attests the row's exact
+content, as its section and content digest, with that session (or none) in the
+append-only `strategy_ledger_row_attestations` table; the ledger commit writes
+only a row whose digest the call attested, re-attesting when a file edited
+since it was read gives the row another id. An attestation is never replaced or
+removed, one digest may carry several sessions, and one whose row was never
+written matches nothing. A failed attestation refuses the write. Projection
+names every session attested for the row's current digest, never the
+projecting turn's: projection is best-effort, so a row whose first projection
+failed is projected by whichever turn reindexes next, in another session or in
+none. A row whose digest nothing attested (written before attestations
+existed, or edited by hand in its id or text) is marked
+`unattested-session:<digest>`. A corpus with session exclusions decides a
+ledger-derived revision from the attestations as they are when it is built
+(`assertion_session_attestations`), not from its stored locator alone: one
+attested in an excluded session is `explicitly_excluded`, and one with no
+attestation, or a source marked unattested, is `session_unattested`. A policy
+without session exclusions is unaffected. Attestations grow without any
+assertion change: identical content recorded again in another session attests
+that session for the same revision, and the change stream is empty. So an
+incremental read also governs again each example of its base snapshot that the
+stream left alone and that is still current, against the attestations as they
+stand. One now held out on its session, and any inference built on it, comes
+back as a tombstone with operation `session_attestation` and that reason, on
+every read against that base. Material newly attested only in admitted
+sessions is not added incrementally; a fresh snapshot admits it. A session key
+that a locator cannot carry, such as one containing a control character, is
+refused rather than dropped: `save_fact` writes nothing, and the ledger row's
+assertion fails to project while the rest of the pass proceeds. Any producer that reads a saved
+item must name it as `saved-item:<id>` the same way. The explicit-fact replay
+fingerprint ignores session and unattested segments, as it ignores delivery
+time, so a retry filed under another session, or of an operation recorded
+before sources named one, still replays idempotently. `save_fact` assertions
+recorded before #3875 name no session and can be held out only by
+source-occurrence id.
 
 The host admits only current,
 projection-eligible, conformant assertions. Derived assertions recursively

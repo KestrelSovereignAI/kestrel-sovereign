@@ -73,6 +73,11 @@ async def test_standalone_hold_physical_drain_keeps_original_shutdown_c(
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch)) if native_opening else None
     if source is not None:
         agent._remember_shutdown_control(source.error)
+    # Retire the fixture's unused LLM owner before targeting Hold close.
+    # Otherwise a degraded service stop may defer this context to completion.
+    await agent.llm_service.close()
+    await agent.llm_service.wait_for_close_completion()
+    agent.llm_service = None
     backend = SQLiteBackend(":memory:")
     await backend.connect()
     connection = backend._connection
@@ -97,8 +102,12 @@ async def test_standalone_hold_physical_drain_keeps_original_shutdown_c(
     monkeypatch.setattr(connection, "close", close)
     monkeypatch.setattr(context_module, "await_owned_task", join)
     owner = create_owned_task(agent.shutdown(), retain_originals=True)
+    entered_waiter = create_owned_task(entered.wait(), retain_originals=True)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        # Observe the owned close phase or an earlier shutdown failure. Its
+        # preceding cleanup and native close must not race a second deadline.
+        await asyncio.wait((owner, entered_waiter), return_when=asyncio.FIRST_COMPLETED)
+        assert entered.is_set(), "shutdown ended before standalone Hold close entry"
         owner.cancel("actual standalone Hold drain observer withdrew")
         await asyncio.sleep(0)
         release.set()
@@ -111,5 +120,8 @@ async def test_standalone_hold_physical_drain_keeps_original_shutdown_c(
         assert agent._standalone_hold_context is None
     finally:
         release.set()
+        if not entered_waiter.done():
+            entered_waiter.cancel()
+        await await_owned_task(entered_waiter)
         await await_owned_task(owner)
         await backend.close()

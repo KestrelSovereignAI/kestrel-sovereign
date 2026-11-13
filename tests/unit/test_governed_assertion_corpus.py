@@ -28,6 +28,7 @@ from kestrel_sovereign.knowledge import (
     Literal,
     OntologyRef,
     SemanticMaintenanceTrainingReadiness,
+    SessionAttestation,
     SourceOccurrence,
     SourceReferenceKind,
     ValidationState,
@@ -145,6 +146,9 @@ class _CorpusHost:
             if isinstance(item.lineage, DirectLineage)
         }
         self.derivation_inputs = {}
+        #: Revision id -> the host's session attestation, for material whose
+        #: session the host attests (#3990). Absent: the host keeps none.
+        self.session_attestations = {}
         self.validations = {
             item.assertion_id: CorpusValidationStatus(
                 ValidationState.CONFORMS, ValidationWriteAction.ACCEPT,
@@ -174,6 +178,13 @@ class _CorpusHost:
         return {
             revision_id: list(self.sources.get(revision_id, ()))
             for revision_id in revision_ids
+        }
+
+    async def assertion_session_attestations(self, revisions):
+        return {
+            assertion.revision_id: self.session_attestations[assertion.revision_id]
+            for assertion, _ in revisions
+            if assertion.revision_id in self.session_attestations
         }
 
     async def get_derivation_inputs(self, revision_id):
@@ -541,6 +552,109 @@ async def test_exclusion_precedes_class_rules_and_holds_out_derived_assertions()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attestation", "segments", "reason"),
+    [
+        (SessionAttestation(frozenset({EXAM_SESSION})), (), "explicitly_excluded"),
+        (SessionAttestation(attested=False), (), "session_unattested"),
+        (
+            None,
+            (source_reference_segment(SourceReferenceKind.UNATTESTED_SESSION, "c0ffee"),),
+            "session_unattested",
+        ),
+    ],
+    ids=["attested-in-excluded-session", "host-holds-no-record", "marked-unattested"],
+)
+async def test_material_whose_session_is_attested_or_unknown_is_held_out(
+    attestation, segments, reason
+) -> None:
+    """#3990: a host's session record decides; an unknown session is held out.
+
+    Only while some session is excluded. A policy with no session exclusions,
+    including one that excludes only saved items, admits the material.
+    """
+    exam = _assertion("exam-answer")
+    everyday = _assertion("everyday-note")
+    host = _CorpusHost([exam, everyday])
+    host.sources[exam.revision_id] = [_exam_source(exam, *segments)]
+    if attestation is not None:
+        host.session_attestations[exam.revision_id] = attestation
+    host.session_attestations[everyday.revision_id] = SessionAttestation(
+        frozenset({"everyday-session"})
+    )
+    service = GovernedAssertionCorpusService(host)
+
+    held_out = await service.snapshot(
+        policy=_policy(excluded_session_ids=(EXAM_SESSION,)), inference_profile=None
+    )
+    assert [item.assertion.revision_id for item in held_out.examples] == [
+        "everyday-note"
+    ]
+    assert held_out.observability.excluded == {reason: 1}
+    for policy in (_policy(), _policy(excluded_saved_item_ids=(EXAM_ITEM,))):
+        admitted = await service.snapshot(policy=policy, inference_profile=None)
+        assert {item.assertion.revision_id for item in admitted.examples} == {
+            "exam-answer", "everyday-note",
+        }
+
+
+@pytest.mark.asyncio
+async def test_an_inference_from_unattested_material_is_held_out_with_it() -> None:
+    exam = _assertion("exam-premise")
+    inference = _derived("exam-inference", exam)
+    host = _CorpusHost([inference])
+    host.sources[exam.revision_id] = [_exam_source(exam)]
+    host.session_attestations[exam.revision_id] = SessionAttestation(attested=False)
+    host.derivation_inputs[inference.revision_id] = [exam]
+    host.assertions.append(exam)
+    inferred = {
+        "accepted_epistemic_states": (EpistemicState.ASSERTED, EpistemicState.INFERRED),
+        "allow_inferred": True,
+        "accepted_derivation_profiles": ("rule-profile-1",),
+    }
+
+    snapshot = await GovernedAssertionCorpusService(host).snapshot(
+        policy=_policy(**inferred, excluded_session_ids=(EXAM_SESSION,)),
+        inference_profile=None,
+    )
+
+    assert snapshot.examples == ()
+    assert snapshot.observability.excluded == {"session_unattested": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "recorded",
+    [{"not-requested": SessionAttestation()}, {"exam-answer": frozenset({EXAM_SESSION})}],
+    ids=["unrequested-revision", "not-an-attestation"],
+)
+async def test_a_malformed_session_record_fails_the_corpus_closed(recorded) -> None:
+    exam = _assertion("exam-answer")
+    host = _CorpusHost([exam])
+
+    async def malformed(revisions):
+        return recorded
+
+    host.assertion_session_attestations = malformed
+    with pytest.raises(GovernedCorpusUnavailable, match="session_attestations_invalid"):
+        await GovernedAssertionCorpusService(host).snapshot(
+            policy=_policy(), inference_profile=None
+        )
+
+
+def test_a_session_attestation_names_only_session_keys() -> None:
+    assert SessionAttestation().sessions == frozenset()
+    for bad in (
+        {"sessions": frozenset({""})},
+        {"sessions": {EXAM_SESSION}},
+        {"sessions": frozenset({EXAM_SESSION}), "attested": False},
+        {"attested": 1},
+    ):
+        with pytest.raises(GovernedCorpusError):
+            SessionAttestation(**bad)
+
+
+@pytest.mark.asyncio
 async def test_incremental_additions_hold_out_excluded_material() -> None:
     policy = _policy(excluded_session_ids=(EXAM_SESSION,))
     host = _CorpusHost([_assertion("before-exam")])
@@ -566,6 +680,159 @@ async def test_incremental_additions_hold_out_excluded_material() -> None:
 
     assert delta.additions == ()
     assert delta.observability.excluded == {"explicitly_excluded": 1}
+
+
+_EVERYDAY = SessionAttestation(frozenset({"everyday-session"}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attestation", "reason"),
+    [
+        (SessionAttestation(frozenset({"everyday-session", EXAM_SESSION})), "explicitly_excluded"),
+        (SessionAttestation(attested=False), "session_unattested"),
+    ],
+    ids=["attested-in-excluded-session", "host-holds-no-record"],
+)
+async def test_incremental_read_withdraws_an_example_its_attestation_now_holds_out(
+    attestation, reason
+) -> None:
+    """#3990: attestations change with no assertion change; deltas still see it.
+
+    Identical content recorded again in an excluded session attests that
+    session for the same revision, so the change stream is empty. A fresh
+    snapshot holds the example out, and every incremental read against the
+    earlier snapshot withdraws it, with the same tombstone each time.
+    """
+    exam, everyday = _assertion("exam-answer"), _assertion("everyday-note")
+    host = _CorpusHost([exam, everyday])
+    host.session_attestations = {
+        exam.revision_id: _EVERYDAY, everyday.revision_id: _EVERYDAY,
+    }
+    policy = _policy(excluded_session_ids=(EXAM_SESSION,))
+    service = GovernedAssertionCorpusService(host)
+    base = await service.snapshot(policy=policy, inference_profile=None)
+    assert {item.assertion.revision_id for item in base.examples} == {
+        "exam-answer", "everyday-note",
+    }
+
+    host.session_attestations[exam.revision_id] = attestation
+    fresh = await service.snapshot(policy=policy, inference_profile=None)
+    delta = await service.changes_since(base, policy=policy, inference_profile=None)
+
+    assert [item.assertion.revision_id for item in fresh.examples] == ["everyday-note"]
+    assert delta.additions == ()
+    (tombstone,) = delta.tombstones
+    assert (tombstone.assertion_id, tombstone.revision_id) == (
+        exam.assertion_id, exam.revision_id,
+    )
+    assert tombstone.operation == "session_attestation"
+    assert tombstone.reason == reason
+    assert tombstone.generation == host.checkpoint.generation
+    assert tombstone.event_id.startswith("session-attestation:")
+    again = await service.changes_since(base, policy=policy, inference_profile=None)
+    assert again.tombstones == delta.tombstones
+    assert again.snapshot_hash == delta.snapshot_hash
+
+
+@pytest.mark.asyncio
+async def test_an_inference_on_a_withdrawn_premise_is_withdrawn_with_it() -> None:
+    exam = _assertion("exam-premise")
+    inference = _derived("exam-inference", exam)
+    host = _CorpusHost([exam, inference])
+    host.derivation_inputs[inference.revision_id] = [exam]
+    host.session_attestations[exam.revision_id] = _EVERYDAY
+    policy = _policy(
+        accepted_epistemic_states=(EpistemicState.ASSERTED, EpistemicState.INFERRED),
+        allow_inferred=True,
+        accepted_derivation_profiles=("rule-profile-1",),
+        excluded_session_ids=(EXAM_SESSION,),
+    )
+    service = GovernedAssertionCorpusService(host)
+    base = await service.snapshot(policy=policy, inference_profile=None)
+    assert len(base.examples) == 2
+
+    host.session_attestations[exam.revision_id] = SessionAttestation(
+        frozenset({EXAM_SESSION})
+    )
+    delta = await service.changes_since(base, policy=policy, inference_profile=None)
+
+    assert {
+        (item.revision_id, item.reason) for item in delta.tombstones
+    } == {
+        ("exam-premise", "explicitly_excluded"),
+        ("exam-inference", "explicitly_excluded"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_attestations_withdraw_nothing_from_a_corpus_excluding_no_session() -> None:
+    exam = _assertion("exam-answer")
+    host = _CorpusHost([exam])
+    host.session_attestations[exam.revision_id] = _EVERYDAY
+    for policy in (_policy(), _policy(excluded_saved_item_ids=(EXAM_ITEM,))):
+        service = GovernedAssertionCorpusService(host)
+        host.session_attestations[exam.revision_id] = _EVERYDAY
+        base = await service.snapshot(policy=policy, inference_profile=None)
+        host.session_attestations[exam.revision_id] = SessionAttestation(
+            frozenset({EXAM_SESSION})
+        )
+        delta = await service.changes_since(base, policy=policy, inference_profile=None)
+        assert delta.tombstones == ()
+
+
+@pytest.mark.asyncio
+async def test_a_base_larger_than_the_read_budget_is_refused_not_truncated() -> None:
+    notes = [_assertion(f"note-{index}") for index in range(3)]
+    host = _CorpusHost(notes)
+    host.session_attestations = {item.revision_id: _EVERYDAY for item in notes}
+    policy = _policy(excluded_session_ids=(EXAM_SESSION,))
+    service = GovernedAssertionCorpusService(host)
+    base = await service.snapshot(policy=policy, inference_profile=None)
+
+    with pytest.raises(GovernedCorpusBudgetExceeded, match="base snapshot"):
+        await service.changes_since(
+            base, policy=policy, inference_profile=None,
+            limits=GovernedCorpusLimits(max_assertions=2),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_changed_or_erased_example_is_left_to_the_change_stream() -> None:
+    """Only a base example still current and untouched by the stream is re-checked.
+
+    A superseded one already has its stream tombstone, and an erased one is no
+    current revision a delta could name; neither gets a second tombstone.
+    """
+    revised, erased = _assertion("revised-answer"), _assertion("erased-answer")
+    host = _CorpusHost([revised, erased])
+    host.session_attestations = {
+        revised.revision_id: _EVERYDAY, erased.revision_id: _EVERYDAY,
+    }
+    policy = _policy(excluded_session_ids=(EXAM_SESSION,))
+    service = GovernedAssertionCorpusService(host)
+    base = await service.snapshot(policy=policy, inference_profile=None)
+    assert len(base.examples) == 2
+
+    exam = SessionAttestation(frozenset({EXAM_SESSION}))
+    host.session_attestations = {
+        revised.revision_id: exam, erased.revision_id: exam,
+    }
+    host.assertions.remove(erased)
+    host.checkpoint = CorpusCheckpoint(TENANT, 8, "event:8")
+    host.changes = [
+        SimpleNamespace(
+            event_id="event:8", assertion_id=revised.assertion_id,
+            revision_id=revised.revision_id, operation="superseded",
+            generation=8, eligible=False,
+        )
+    ]
+
+    delta = await service.changes_since(base, policy=policy, inference_profile=None)
+
+    assert [(item.event_id, item.operation) for item in delta.tombstones] == [
+        ("event:8", "superseded")
+    ]
 
 
 @pytest.mark.asyncio

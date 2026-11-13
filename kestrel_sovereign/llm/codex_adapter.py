@@ -35,6 +35,8 @@ host actions only through Kestrel's hooked executor (#1965).
 """
 from __future__ import annotations
 
+from contextlib import aclosing
+
 import asyncio
 import base64
 import binascii
@@ -77,6 +79,7 @@ from kestrel_sovereign.execution_custody import (
     owned_execution_stream,
 )
 
+from .completion_protocol import decode_tool_arguments
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
@@ -108,7 +111,8 @@ logger = logging.getLogger(__name__)
 # wrapper returns the post-hook args alongside the result so the
 # adapter can record the *actually-executed* arguments into audit /
 # UI breadcrumbs — pre-hook args may carry values a PRE_TOOL_USE
-# redactor intentionally stripped.
+# redactor intentionally stripped. An ``InlineToolOutcome`` also names
+# the dispatch row the call is recorded under (#3778).
 ToolExecutor = Callable[
     [str, Dict[str, Any]],
     Awaitable[Tuple[Dict[str, Any], Any]],
@@ -2078,19 +2082,15 @@ class CodexAdapter(LLMAdapter):
             # tool's true ``mcp__...`` name (#2008).
             if tool_aliases:
                 name = tool_aliases.get(name, name)
-            args = params.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except ValueError:
-                    args = {"_raw": args}
+            raw_arguments = params.get("arguments")
+            args = decode_tool_arguments({} if raw_arguments is None else raw_arguments)
             call_id = params.get("callId") or params.get("id") or ""
             # The executor returns (effective_args, result) — effective
             # args are what actually ran after PRE_TOOL_USE hooks, so
             # the breadcrumb reflects the redacted/rewritten payload,
             # not the model's pre-hook arguments.
             effective_args: Dict[str, Any] = (
-                args if isinstance(args, dict) else {}
+                args
             )
             try:
                 ret = await executor(name, args)
@@ -2137,11 +2137,19 @@ class CodexAdapter(LLMAdapter):
             else:
                 result = ret
             if executed_log is not None:
-                executed_log.append({
+                executed_entry: Dict[str, Any] = {
                     "id": call_id, "name": name,
                     "arguments": effective_args,
                     "result": result,
-                })
+                }
+                # The dispatch row this call is recorded under, so the
+                # calls a feature subagent made inside it can name it (#3778).
+                from .adapter import inline_tool_dispatch_id
+
+                dispatch_id = inline_tool_dispatch_id(ret)
+                if dispatch_id is not None:
+                    executed_entry["dispatch_id"] = dispatch_id
+                executed_log.append(executed_entry)
             # Pass tool/feature scope + audit slice so the classifier
             # has the right evidence to classify a failure against
             # (#1563). For success results these are unused. The
@@ -2177,6 +2185,14 @@ class CodexAdapter(LLMAdapter):
 
         terminal_error: BaseException | None = None
 
+        def reply_delivery_failed(error):
+            nonlocal terminal_error
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            terminal_error = execution_observation_error(terminal_error, error)
+            if terminal_errors is not None:
+                terminal_errors.append(terminal_error)
+            return terminal_error
+
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
             nonlocal terminal_error
             task = asyncio.current_task()
@@ -2208,6 +2224,7 @@ class CodexAdapter(LLMAdapter):
         # close the create_task-before-first-timeslice Stop race by itself.
         if active_handlers is not None:
             setattr(handler, "_codex_active_tasks", active_handlers)
+        handler._codex_reply_delivery_failed = reply_delivery_failed
         return handler
 
     def _make_codex_approval_handler(
@@ -2915,6 +2932,8 @@ class CodexAdapter(LLMAdapter):
         active_inline_tool_handlers: set[asyncio.Task[Any]] = set()
         inline_terminal_errors: list[BaseException] = []
         unregisters: List[Callable[[], None]] = []
+        from kestrel_sovereign._async_ownership import OwnedCallbackScope
+        callback_scope = OwnedCallbackScope()
         if tool_executor is not None and dyn:
             # Only register an item/tool/call handler when tools were
             # actually advertised this turn. A handler on a text-only
@@ -2929,14 +2948,13 @@ class CodexAdapter(LLMAdapter):
             # the dispatcher routes by ``params.threadId``. Without
             # scoping, a second turn's registration would silently
             # overwrite an in-flight turn's handler.
+            inline_handler = self._make_tool_call_handler(
+                tool_executor, thread_id, allowed_tools, executed_log,
+                tool_aliases, active_inline_tool_handlers, inline_terminal_errors,
+            )
+            inline_handler._codex_native_callback_scope = callback_scope
             unregisters.append(app.register_server_request_handler(
-                "item/tool/call",
-                self._make_tool_call_handler(
-                    tool_executor, thread_id, allowed_tools, executed_log,
-                    tool_aliases, active_inline_tool_handlers,
-                    inline_terminal_errors,
-                ),
-                thread_id=thread_id,
+                "item/tool/call", inline_handler, thread_id=thread_id,
             ))
 
         # Defense in depth: explicit native approval handlers always decline,
@@ -2952,6 +2970,7 @@ class CodexAdapter(LLMAdapter):
         # does, a caller that abandons the turn leaves it running on the
         # thread (see below).
         turn_ended = False
+        turn_start_response = None
         try:
             # dynamicTools are registered at thread/start; turn/start carries
             # the user input plus per-turn overrides that mirror what
@@ -3027,7 +3046,8 @@ class CodexAdapter(LLMAdapter):
                 )
             from kestrel_sovereign.execution_custody import require_execution_work
             require_execution_work()
-            await app.request("turn/start", turn_params, timeout=60)
+            async with callback_scope.wait():
+                turn_start_response = await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
             final_text: Optional[str] = None
@@ -3073,7 +3093,12 @@ class CodexAdapter(LLMAdapter):
                 app, sink, est_payload_tokens, thread_id=thread_id,
                 cancel_token=cancel_token,
             )) as _owned_forwarder_2982:
-                async for ev in _owned_forwarder_2982:
+                while True:
+                    try:
+                        async with callback_scope.wait():
+                            ev = await anext(_owned_forwarder_2982)
+                    except StopAsyncIteration:
+                        break
                     raise_if_cancelled(cancel_token)
                     method = ev.get("method")
                     p = ev.get("params") or {}
@@ -3232,17 +3257,13 @@ class CodexAdapter(LLMAdapter):
                                     continue
                                 if iid:
                                     seen_tool_ids.add(iid)
-                                raw_args = item.get("arguments")
-                                if isinstance(raw_args, str):
-                                    try:
-                                        raw_args = json.loads(raw_args)
-                                    except ValueError:
-                                        raw_args = {"_raw": raw_args}
+                                native_args = item.get("arguments")
+                                raw_args = decode_tool_arguments({} if native_args is None else native_args)
                                 tc = ToolCall(
                                     id=iid,
                                     name=item.get("name") or item.get("tool") or "",
                                     arguments=(
-                                        raw_args if isinstance(raw_args, dict) else {}
+                                        raw_args
                                     ),
                                 )
                                 # Critical: the app-server has ALREADY executed
@@ -3359,7 +3380,7 @@ class CodexAdapter(LLMAdapter):
             if session_id and poisoned_turn:
                 self.reset_thread(session_id)
             raise
-        except (asyncio.CancelledError, GeneratorExit):
+        except BaseException as error:
             # The caller abandoned the turn before the app-server ended it:
             # the orchestrator's inactivity watchdog (#3552, which fires
             # before the transport's own idle timeout) or a Stop cancelled
@@ -3367,11 +3388,16 @@ class CodexAdapter(LLMAdapter):
             # be running, so the thread is poisoned exactly as by an idle
             # timeout. Invalidate it the same way, before ``finally``
             # releases the thread lock to a queued same-session call.
-            if session_id and not turn_ended:
+            from kestrel_sovereign.execution_custody import is_host_control_error
+            # Host control also ends consumption before provider completion.
+            # Retire its unfinished thread without revoking unrelated turns.
+            if session_id and not turn_ended and (
+                    isinstance(error, (asyncio.CancelledError, GeneratorExit)) or is_host_control_error(error)):
                 self.reset_thread(session_id)
             raise
         finally:
             unwind_error = sys.exception()
+            callback_scope.close()
             inline_terminal_errors.extend(_cleanup_app_server_data_images(
                 temp_image_paths, retirement_owner=image_retirement_owner,
             ))
@@ -3395,12 +3421,13 @@ class CodexAdapter(LLMAdapter):
                 # Retiring them must not depend on admitting another collector
                 # Task, or an allocator refusal releases the mutex underneath
                 # an accepted effect. Close admission above, then join originals.
-                while active_inline_tool_handlers:
-                    for handler_owner in tuple(active_inline_tool_handlers):
+                while active_inline_tool_handlers or callback_scope.tasks:
+                    for handler_owner in tuple(active_inline_tool_handlers | callback_scope.tasks):
                         outcome = await await_owned_task(handler_owner)
                         # Physical settlement, not deferred callback ordering,
                         # retires this original member of the closed cohort.
                         active_inline_tool_handlers.discard(handler_owner)
+                        callback_scope.tasks.discard(handler_owner)
                         if outcome.error is not None:
                             inline_terminal_errors.append(outcome.error)
                         if outcome.cancellation is not None:
@@ -3430,6 +3457,31 @@ class CodexAdapter(LLMAdapter):
                                 "_kestrel_completed_effect_checkpointed",
                                 True,
                             )
+                from kestrel_sovereign.tools.effect_journal import tool_input_suspension
+                if not turn_ended and tool_input_suspension(unwind_error) is not None:
+                    # Original callbacks have physically settled and admission
+                    # is closed. Stop remote inference through its native RPC,
+                    # without cancelling a still-running governed tool owner.
+                    started_turn = (turn_start_response.get('turn')
+                        if isinstance(turn_start_response, dict) else None)
+                    turn_id = started_turn.get('id') if isinstance(started_turn, dict) else None
+                    if not isinstance(turn_id, str) or not turn_id.strip():
+                        inline_terminal_errors.append(CodexAppServerError(
+                            'Codex input suspension has no original turn id for interruption'))
+                    else:
+                        from kestrel_sovereign._async_ownership import await_owned_operation
+                        interrupted = await await_owned_operation(
+                            app.request('turn/interrupt', {'threadId': thread_id, 'turnId': turn_id}),
+                            name='codex-input-suspension-interrupt',
+                            retirement_resource=app, retain_originals=True,
+                        )
+                        if interrupted.error is not None:
+                            inline_terminal_errors.append(interrupted.error)
+                        elif not isinstance(interrupted.result, dict):
+                            inline_terminal_errors.append(CodexAppServerError(
+                                'Codex input suspension interruption returned an invalid acknowledgement'))
+                        if interrupted.cancellation is not None:
+                            inline_terminal_errors.append(interrupted.cancellation)
             finally:
                 try:
                     app.close_turn_sink(thread_id)
@@ -3646,23 +3698,15 @@ class CodexAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs,
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        session_id = kwargs.get("session_id")
-        cancel_token = kwargs.get("cancel_token")
-        keep_trailing_system = bool(kwargs.get("keep_trailing_system"))
-        # Tools intentionally not passed: text-only streaming surface.
-        # Uses ``_run_turn_with_retry`` so a transient codex idle stall
-        # gets one chance to recover before the error surfaces. See #1411.
-        async with owned_execution_stream(self, self._run_turn_with_retry(
-            model, messages, None, session_id, None,
-            cancel_token=cancel_token,
-            keep_trailing_system=keep_trailing_system,
-        )) as _owned_forwarder_3542:
-            async for ev in _owned_forwarder_3542:
-                if "text" in ev:
-                    yield ev["text"]
-                elif "thinking" in ev:
-                    yield ThinkingDelta(ev["thinking"], provider="codex")
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        kwargs = {**kwargs, "tool_executor": None}
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
+        )) as stream:
+            async for item in stream:
+                yield item
 
     async def get_streaming_response_with_tools(
         self,

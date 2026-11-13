@@ -50,6 +50,8 @@ from .assertion import (
     lineage_from_mapping,
     normalize_iri,
     source_reference_segment,
+    with_source_reference,
+    without_source_references,
 )
 if TYPE_CHECKING:
     from .corpus import (
@@ -57,6 +59,7 @@ if TYPE_CHECKING:
         CorpusCheckpoint,
         CorpusEligibilityDecision,
         CorpusEligibilityReason,
+        CorpusExclusionReceipt,
         CorpusValidationStatus,
         GovernedAssertionCorpusService,
         GovernedCorpusBudgetExceeded,
@@ -70,6 +73,8 @@ if TYPE_CHECKING:
         GovernedCorpusStorage,
         GovernedCorpusTombstone,
         GovernedCorpusUnavailable,
+        HostCorpusExclusions,
+        SessionAttestation,
     )
     from .rdf_codec import (
         RdfAssertionCodec,
@@ -175,6 +180,7 @@ __all__ = [
     "CorpusCheckpoint",
     "CorpusEligibilityDecision",
     "CorpusEligibilityReason",
+    "CorpusExclusionReceipt",
     "CorpusValidationStatus",
     "DerivationExplanation",
     "IDENTITY_VERSION",
@@ -254,6 +260,8 @@ __all__ = [
     "GovernedCorpusStorage",
     "GovernedCorpusTombstone",
     "GovernedCorpusUnavailable",
+    "HostCorpusExclusions",
+    "SessionAttestation",
     "ShaclCapabilityUnavailable",
     "ShaclSnapshotMismatch",
     "ShaclValidationError",
@@ -302,6 +310,8 @@ __all__ = [
     "load_knowledge_registry",
     "normalize_iri",
     "source_reference_segment",
+    "with_source_reference",
+    "without_source_references",
     "maintenance_limits_from_config",
     "maintenance_allows_prior_verified_snapshot",
 ]
@@ -439,6 +449,7 @@ _CORPUS_EXPORTS = frozenset(
         "CorpusCheckpoint",
         "CorpusEligibilityDecision",
         "CorpusEligibilityReason",
+        "CorpusExclusionReceipt",
         "CorpusValidationStatus",
         "GovernedAssertionCorpusService",
         "GovernedCorpusBudgetExceeded",
@@ -452,6 +463,8 @@ _CORPUS_EXPORTS = frozenset(
         "GovernedCorpusStorage",
         "GovernedCorpusTombstone",
         "GovernedCorpusUnavailable",
+        "HostCorpusExclusions",
+        "SessionAttestation",
     }
 )
 

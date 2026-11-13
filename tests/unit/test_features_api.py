@@ -578,11 +578,12 @@ class TestEnableFeature:
         assert (await update)["config"] == {"mode": "patched"}
 
     @pytest.mark.asyncio
-    async def test_queued_cognition_rechecks_safe_mode_after_transition_lock(self):
+    async def test_queued_cognition_rechecks_safe_mode_after_transition_lock(self, native_tool_effect_agent):
         """A turn admitted before a quarantine latch cannot run afterward."""
 
-        agent = _lifecycle_agent()
-        agent.storage = object()
+        from tests.unit.test_non_streaming_turn_privacy_span import _turn_agent
+
+        agent = await _turn_agent("did:test:features", native_tool_effect_agent)
         agent.context_manager = object()
         agent.bootstrap_service = None
         agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
@@ -612,11 +613,12 @@ class TestEnableFeature:
         agent._process_input_traced_locked.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_queued_stream_rechecks_safe_mode_after_transition_lock(self):
+    async def test_queued_stream_rechecks_safe_mode_after_transition_lock(self, native_tool_effect_agent):
         """The streaming entry point shares the post-lock cognition guard."""
 
-        agent = _lifecycle_agent()
-        agent.storage = object()
+        from tests.unit.test_non_streaming_turn_privacy_span import _turn_agent
+
+        agent = await _turn_agent("did:test:features", native_tool_effect_agent)
         agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
         agent._maybe_audit = AsyncMock()
         model_started = False

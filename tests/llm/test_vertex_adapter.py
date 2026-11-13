@@ -8,6 +8,7 @@ Required environment variables:
 - GOOGLE_APPLICATION_CREDENTIALS or GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT
 """
 import pytest
+from kestrel_sdk.testing import drain_streaming_text_only
 import logging
 import os
 import base64
@@ -484,17 +485,13 @@ class TestStreaming:
             user_prompt="Count from 1 to 5, one number per line."
         )
 
-        chunks = []
-        async for chunk in adapter.get_streaming_response(
-            client=None,
-            model=LIVE_MODEL,
-            messages=messages
-        ):
-            chunks.append(chunk)
-            logger.info(f"Chunk: {repr(chunk)}")
-
-        assert len(chunks) > 0
-        full_response = "".join(chunks)
+        full_response = await drain_streaming_text_only(
+            adapter.get_streaming_response(
+                client=None,
+                model=LIVE_MODEL,
+                messages=messages
+            )
+        )
         assert len(full_response) > 0
         logger.info(f"Full streamed response: {full_response}")
 
@@ -505,15 +502,13 @@ class TestStreaming:
             user_prompt="What is Python? Answer in one sentence."
         )
 
-        chunks = []
-        async for chunk in adapter.get_streaming_response(
-            client=None,
-            model=LIVE_MODEL,
-            messages=messages
-        ):
-            chunks.append(chunk)
-
-        full_response = "".join(chunks)
+        full_response = await drain_streaming_text_only(
+            adapter.get_streaming_response(
+                client=None,
+                model=LIVE_MODEL,
+                messages=messages
+            )
+        )
         # Should be a coherent sentence
         assert "Python" in full_response or "python" in full_response.lower()
 

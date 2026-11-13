@@ -431,31 +431,48 @@ class _RecordingLLM:
         yield
 
 
-def _bare_agent(*, mode=PrivacyMode.NORMAL, preference=CLOUD, db=None):
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
+async def _component_agent(native_tool_effect_agent, *, mode=PrivacyMode.NORMAL, preference=CLOUD, db=None):
+    """Real primary storage and policy, with narrowly observed metadata I/O.
 
-    from kestrel_sovereign.features.privacy import PrivacyAgent
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
-
-    agent = KestrelAgent.__new__(KestrelAgent)
-    agent.did = "did:example:privacy"
+    The supplied recorder can refuse a privacy read/write, but successful
+    operations still reach the original SQLite database. Journal access never
+    goes through that fault seam.
+    """
+    agent = await native_tool_effect_agent(did="did:test:privacy-durability")
     agent._privacy_mode = mode
-    agent._raw_storage = SimpleNamespace(db=db)
-    agent.storage = PrivacyEnforcingStorage(MagicMock(), mode)
-    agent.privacy_agent = PrivacyAgent(MagicMock(), mode)
-    agent.features = {}
+    agent.storage.set_privacy_mode(mode)
+    agent.privacy_agent.set_mode(mode)
     agent.llm_service = _RecordingLLM(preference)
+    if db is not None:
+        database = agent._raw_storage.db
+        execute = database.execute
+        fetchall = database.fetchall
+        keys = {PRIVACY_STATE_KEY, PRIVACY_SAVED_PROVENANCE_KEY, "model_preference"}
+
+        def privacy_metadata(sql, params):
+            return "agent_metadata" in sql and len(params) >= 2 and params[1] in keys
+
+        async def observed_execute(sql, params=()):
+            if privacy_metadata(sql, params):
+                await db.execute(sql, params)
+            return await execute(sql, params)
+
+        async def observed_fetchall(sql, params=()):
+            if privacy_metadata(sql, params):
+                await db.fetchall(sql, params)
+            return await fetchall(sql, params)
+
+        database.execute = observed_execute
+        database.fetchall = observed_fetchall
     return agent
 
 
 @pytest.mark.asyncio
-async def test_transition_that_cannot_be_recorded_is_refused():
+async def test_transition_that_cannot_be_recorded_is_refused(native_tool_effect_agent):
     """A local-only mode that would not survive a restart is not entered:
     nothing flips and the model preference is untouched."""
     db = _UnwritableDatabase()
-    agent = _bare_agent(db=db)
+    agent = await _component_agent(native_tool_effect_agent, db=db)
 
     result = await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
 
@@ -470,22 +487,22 @@ async def test_transition_that_cannot_be_recorded_is_refused():
 
 
 @pytest.mark.asyncio
-async def test_endpoint_reports_an_unrecorded_transition_as_not_applied():
+async def test_endpoint_reports_an_unrecorded_transition_as_not_applied(native_tool_effect_agent):
     from unittest.mock import patch
 
-    from fastapi.testclient import TestClient
+    import httpx
 
     from tests.unit.test_privacy_mode_model_restore_contracts import (
         _prepare_app,
         _restore_app,
     )
 
-    agent = _bare_agent(db=_UnwritableDatabase())
+    agent = await _component_agent(native_tool_effect_agent, db=_UnwritableDatabase())
     app, original = _prepare_app(agent)
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.post(
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://owned-privacy.invalid") as client:
+                response = await client.post(
                     "/api/agent/privacy-mode",
                     headers={
                         "X-API-Key": "test-key",
@@ -503,10 +520,10 @@ async def test_endpoint_reports_an_unrecorded_transition_as_not_applied():
 
 
 @pytest.mark.asyncio
-async def test_leaving_with_nothing_saved_keeps_the_current_preference_and_warns(caplog):
+async def test_leaving_with_nothing_saved_keeps_the_current_preference_and_warns(native_tool_effect_agent, caplog):
     """No saved mandate: the current preference stays, and the forced local
     model is not reported as a restored mandate."""
-    agent = _bare_agent(mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL)
+    agent = await _component_agent(native_tool_effect_agent, mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL)
     caplog.set_level(logging.WARNING)
 
     result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
@@ -657,12 +674,12 @@ async def test_write_binds_the_agent_and_key():
 
 
 @pytest.mark.asyncio
-async def test_transition_refused_by_a_fact_lease_records_the_mode_still_in_force():
+async def test_transition_refused_by_a_fact_lease_records_the_mode_still_in_force(native_tool_effect_agent):
     """The transition is recorded before anything flips; when the storage
     wrapper then refuses it, the mandate and the record go back to the state
     still in force."""
     db = _StoredRows()
-    agent = _bare_agent(db=db)
+    agent = await _component_agent(native_tool_effect_agent, db=db)
     agent.storage._acquire_explicit_fact_lease()
     try:
         result = await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
@@ -703,14 +720,14 @@ class _OriginUnwritableRows(_StoredRows):
 
 
 @pytest.mark.asyncio
-async def test_guard_refused_exit_never_leaves_normal_on_the_local_route():
+async def test_guard_refused_exit_never_leaves_normal_on_the_local_route(native_tool_effect_agent):
     """The exit is recorded (settled NORMAL, mandate restored), then the
     storage wrapper refuses it, and the record it started from cannot be put
     back. The pending record is written again before the local route is, so
     a restart resumes DEIDENTIFIED with the saved mandate, never NORMAL on
     the local route with the saved mandate gone."""
     db = _OriginUnwritableRows(PrivacyMode.DEIDENTIFIED)
-    agent = _bare_agent(mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=db)
+    agent = await _component_agent(native_tool_effect_agent, mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=db)
     saved = SavedModelPreference(**CLOUD)
     agent._privacy_saved_preference = saved
     # DEIDENTIFIED storage refuses explicit facts; an in-flight session
@@ -735,25 +752,25 @@ async def test_guard_refused_exit_never_leaves_normal_on_the_local_route():
 
 
 @pytest.mark.asyncio
-async def test_endpoint_conflict_says_where_a_restart_resumes():
+async def test_endpoint_conflict_says_where_a_restart_resumes(native_tool_effect_agent):
     """An entry the storage wrapper refused, whose record could not be put
     back: the 409 says a restart resumes in the mode the pending record names."""
     from unittest.mock import patch
 
-    from fastapi.testclient import TestClient
+    import httpx
 
     from tests.unit.test_privacy_mode_model_restore_contracts import (
         _prepare_app,
         _restore_app,
     )
 
-    agent = _bare_agent(db=_OriginUnwritableRows(PrivacyMode.NORMAL))
+    agent = await _component_agent(native_tool_effect_agent, db=_OriginUnwritableRows(PrivacyMode.NORMAL))
     agent.storage._acquire_explicit_fact_lease()
     app, original = _prepare_app(agent)
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.post(
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://owned-privacy.invalid") as client:
+                response = await client.post(
                     "/api/agent/privacy-mode",
                     headers={
                         "X-API-Key": "test-key",
@@ -771,7 +788,7 @@ async def test_endpoint_conflict_says_where_a_restart_resumes():
 
 
 @pytest.mark.asyncio
-async def test_nothing_changes_until_the_transition_is_recorded():
+async def test_nothing_changes_until_the_transition_is_recorded(native_tool_effect_agent):
     """Persist before mutating: at every write a transition makes, the live
     mode, every state holder, the saved mandate and the model preference are
     still those it started from."""
@@ -790,7 +807,7 @@ async def test_nothing_changes_until_the_transition_is_recorded():
             )
             await super().execute(sql, params)
 
-    agent = _bare_agent(db=_Watching())
+    agent = await _component_agent(native_tool_effect_agent, db=_Watching())
     saved = SavedModelPreference(**CLOUD)
 
     await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
@@ -806,9 +823,9 @@ async def test_nothing_changes_until_the_transition_is_recorded():
 
 
 @pytest.mark.asyncio
-async def test_applied_transition_is_recorded_before_and_after_it_flips():
+async def test_applied_transition_is_recorded_before_and_after_it_flips(native_tool_effect_agent):
     db = _StoredRows()
-    agent = _bare_agent(db=db)
+    agent = await _component_agent(native_tool_effect_agent, db=db)
 
     await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
     await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
@@ -829,7 +846,7 @@ async def test_applied_transition_is_recorded_before_and_after_it_flips():
 
 
 @pytest.mark.asyncio
-async def test_mandate_is_persisted_before_the_transition_is_recorded_as_applied():
+async def test_mandate_is_persisted_before_the_transition_is_recorded_as_applied(native_tool_effect_agent):
     """The applied record is the commit point: a restart that reads it must
     find the mandate it implies already persisted, never the one it replaced."""
     events: list[str] = []
@@ -843,7 +860,7 @@ async def test_mandate_is_persisted_before_the_transition_is_recorded_as_applied
                 events.append("mandate written")
             await super().execute(sql, params)
 
-    agent = _bare_agent(db=_OrderedRows())
+    agent = await _component_agent(native_tool_effect_agent, db=_OrderedRows())
 
     @asynccontextmanager
     async def mandate_change():
@@ -1023,13 +1040,13 @@ async def test_fail_closed_boot_that_cannot_record_does_not_persist_the_forced_r
 
 
 @pytest.mark.asyncio
-async def test_exit_whose_saved_mandate_no_longer_resolves_keeps_the_current_one():
+async def test_exit_whose_saved_mandate_no_longer_resolves_keeps_the_current_one(native_tool_effect_agent):
     """A saved mandate the LLM service now refuses is neither installed nor
     persisted. As when nothing was saved, the current preference stays and
     the saved copy is cleared, but the user is told: holding it instead would
     let a later transition replay it over a mandate set since."""
     db = _StoredRows()
-    agent = _bare_agent(mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=db)
+    agent = await _component_agent(native_tool_effect_agent, mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=db)
     agent._privacy_saved_preference = SavedModelPreference(**CLOUD)
 
     def refuse(model, vendor=None, route=None, *, validate=True):
@@ -1050,14 +1067,14 @@ async def test_exit_whose_saved_mandate_no_longer_resolves_keeps_the_current_one
 
 
 @pytest.mark.asyncio
-async def test_entering_from_a_cloud_mode_saves_the_mandate_in_force_not_a_stale_one():
+async def test_entering_from_a_cloud_mode_saves_the_mandate_in_force_not_a_stale_one(native_tool_effect_agent):
     """NORMAL still holds a saved mandate (boot restored it but could not
     record that), and the operator has since set another model. Entering a
     local-only mode saves the model in force, the operator's, not the stale
     saved copy that leaving would otherwise replay over it."""
     db = _StoredRows()
     chosen = {"vendor": "openai", "route": "api", "model": "gpt-5-mini"}
-    agent = _bare_agent(mode=PrivacyMode.NORMAL, preference=chosen, db=db)
+    agent = await _component_agent(native_tool_effect_agent, mode=PrivacyMode.NORMAL, preference=chosen, db=db)
     agent._privacy_saved_preference = SavedModelPreference(**CLOUD)
 
     await agent.set_privacy_mode_with_effects(PrivacyMode.ISOLATED)
@@ -1068,16 +1085,16 @@ async def test_entering_from_a_cloud_mode_saves_the_mandate_in_force_not_a_stale
 
 
 @pytest.mark.asyncio
-async def test_a_diverged_record_does_not_replace_the_operators_mandate():
+async def test_a_diverged_record_does_not_replace_the_operators_mandate(native_tool_effect_agent):
     """A refused entry left the record DEIDENTIFIED, holding the mandate then
     in force, while the agent stayed NORMAL; the operator then set another
     model. Moving to PUBLIC records from DEIDENTIFIED (fail closed) but keeps
     the operator's model: in NORMAL nothing was displaced to restore."""
     db = _StoredRows()
     chosen = {"vendor": "openai", "route": "api", "model": "gpt-5-mini"}
-    agent = _bare_agent(mode=PrivacyMode.NORMAL, preference=chosen, db=db)
+    agent = await _component_agent(native_tool_effect_agent, mode=PrivacyMode.NORMAL, preference=chosen, db=db)
     await write_privacy_state(
-        db,
+        agent._raw_storage.db,
         agent.agent_id,
         PrivacyState(PrivacyMode.DEIDENTIFIED, SavedModelPreference(**CLOUD)),
     )
@@ -1096,11 +1113,11 @@ async def test_a_diverged_record_does_not_replace_the_operators_mandate():
 
 
 @pytest.mark.asyncio
-async def test_without_an_llm_service_the_saved_mandate_is_carried_as_it_is():
+async def test_without_an_llm_service_the_saved_mandate_is_carried_as_it_is(native_tool_effect_agent):
     """With no LLM service there is nothing to restore the saved mandate into,
     so no transition drops it: a later boot with one restores it."""
     db = _StoredRows()
-    agent = _bare_agent(mode=PrivacyMode.DEIDENTIFIED, db=db)
+    agent = await _component_agent(native_tool_effect_agent, mode=PrivacyMode.DEIDENTIFIED, db=db)
     agent.llm_service = None
     saved = SavedModelPreference(**CLOUD)
     agent._privacy_saved_preference = saved
@@ -1503,17 +1520,18 @@ class _MandateUnwritableRows(_StoredRows):
         await super().execute(sql, params)
 
 
-def _deidentified_bare_agent_with_saved_mandate():
-    agent = _bare_agent(
-        mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=_MandateUnwritableRows()
+async def _deidentified_component_agent_with_saved_mandate(native_tool_effect_agent):
+    rows = _MandateUnwritableRows()
+    agent = await _component_agent(native_tool_effect_agent,
+        mode=PrivacyMode.DEIDENTIFIED, preference=LOCAL, db=rows
     )
     agent._privacy_saved_preference = SavedModelPreference(**CLOUD)
-    return agent
+    return agent, rows
 
 
 @pytest.mark.asyncio
-async def test_transition_whose_mandate_cannot_be_written_is_refused():
-    agent = _deidentified_bare_agent_with_saved_mandate()
+async def test_transition_whose_mandate_cannot_be_written_is_refused(native_tool_effect_agent):
+    agent, rows = await _deidentified_component_agent_with_saved_mandate(native_tool_effect_agent)
 
     result = await agent.set_privacy_mode_with_effects(PrivacyMode.NORMAL)
 
@@ -1529,26 +1547,26 @@ async def test_transition_whose_mandate_cannot_be_written_is_refused():
         SavedModelPreference(**CLOUD),
         transition_from=PrivacyMode.DEIDENTIFIED,
     )
-    assert agent._raw_storage.db.records() == [pending, pending]
+    assert rows.records() == [pending, pending]
 
 
 @pytest.mark.asyncio
-async def test_endpoint_reports_a_transition_whose_mandate_was_not_written_as_refused():
+async def test_endpoint_reports_a_transition_whose_mandate_was_not_written_as_refused(native_tool_effect_agent):
     from unittest.mock import patch
 
-    from fastapi.testclient import TestClient
+    import httpx
 
     from tests.unit.test_privacy_mode_model_restore_contracts import (
         _prepare_app,
         _restore_app,
     )
 
-    agent = _deidentified_bare_agent_with_saved_mandate()
+    agent, rows = await _deidentified_component_agent_with_saved_mandate(native_tool_effect_agent)
     app, original = _prepare_app(agent)
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-            with TestClient(app) as client:
-                response = client.post(
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://owned-privacy.invalid") as client:
+                response = await client.post(
                     "/api/agent/privacy-mode",
                     headers={
                         "X-API-Key": "test-key",
@@ -1631,13 +1649,13 @@ def test_transition_starts_from_the_more_restrictive_of_live_and_recorded(
 
 
 @pytest.mark.asyncio
-async def test_transition_is_refused_when_the_record_cannot_be_read():
+async def test_transition_is_refused_when_the_record_cannot_be_read(native_tool_effect_agent):
     """The record is where a transition starts from; one it cannot read is
     refused before anything is written."""
     import sqlite3
 
     db = _StoredRows(error=sqlite3.OperationalError("database is locked"))
-    agent = _bare_agent(db=db)
+    agent = await _component_agent(native_tool_effect_agent, db=db)
 
     result = await agent.set_privacy_mode_with_effects(PrivacyMode.DEIDENTIFIED)
 

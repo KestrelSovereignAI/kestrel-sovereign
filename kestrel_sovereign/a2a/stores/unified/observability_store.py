@@ -11,7 +11,6 @@ Works with both SQLite and PostgreSQL backends.
 """
 
 import logging
-import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,9 +21,11 @@ from pydantic import BaseModel
 from kestrel_sovereign.a2a.stores.base import generate_id, json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.logging_config import exception_log_summary
 from kestrel_sovereign.security.access_log import (
     private_capability_tool_name, redact_private_capability_tool_calls,
 )
+from kestrel_sovereign.storage.db.after_commit import call_after_backend_commit
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,14 @@ class LLMCallEvent(BaseModel):
 
 @dataclass(frozen=True)
 class ToolDispatchEntry:
-    """Structured row for a model-requested tool/subagent dispatch."""
+    """Structured row for a model-requested tool/subagent dispatch.
+
+    ``dispatch_id`` names the row; the writer assigns a fresh one when the
+    caller has none. ``parent_dispatch_id`` is the ``dispatch_id`` of the
+    dispatch this call ran inside: a feature subagent's own tool calls name
+    the envelope that delegated to it (#3778), so "what did this agent call?"
+    includes what it called through a subagent.
+    """
 
     agent_did: str
     session_id: Optional[str]
@@ -179,9 +187,30 @@ class ToolDispatchEntry:
     error_message: Optional[str]
     latency_ms: int
     result_size_bytes: Optional[int]
+    dispatch_id: Optional[str] = None
+    parent_dispatch_id: Optional[str] = None
 
 
 ToolCallLogEntry = ToolDispatchEntry
+
+
+@dataclass(frozen=True)
+class ToolDispatchAuditHealth:
+    """This process's own ``a2a_tool_dispatches`` writes, for the health surface.
+
+    Every audit write failed silently for three days once (#4002): a best-effort
+    writer caught the error, and nothing an operator looks at counted it.
+    ``last_success_at`` is when the last row committed: a row written inside
+    a caller's transaction counts only once that transaction commits, and
+    never if it rolls back. ``failures`` counts every write that raised since
+    the store was built and never resets: a row lost earlier is still lost
+    when a later one lands.
+    """
+
+    last_success_at: Optional[datetime]
+    failures: int
+    last_failure_at: Optional[datetime]
+    last_error: Optional[str]
 
 
 class ObservabilityStore(UnifiedStoreBase):
@@ -207,6 +236,20 @@ class ObservabilityStore(UnifiedStoreBase):
         # (tests, standalone use) means "no gating" — payloads persist as-is,
         # preserving the legacy behaviour.
         self._privacy_config_provider: Optional[Callable[[], Any]] = None
+        self._dispatch_audit_last_success_at: Optional[datetime] = None
+        self._dispatch_audit_failures = 0
+        self._dispatch_audit_last_failure_at: Optional[datetime] = None
+        self._dispatch_audit_last_error: Optional[str] = None
+
+    @property
+    def tool_dispatch_audit_health(self) -> ToolDispatchAuditHealth:
+        """When a dispatch row last landed, and how many writes failed (#4002)."""
+        return ToolDispatchAuditHealth(
+            last_success_at=self._dispatch_audit_last_success_at,
+            failures=self._dispatch_audit_failures,
+            last_failure_at=self._dispatch_audit_last_failure_at,
+            last_error=self._dispatch_audit_last_error,
+        )
 
     def set_privacy_config_provider(
         self, provider: Optional[Callable[[], Any]]
@@ -415,12 +458,26 @@ class ObservabilityStore(UnifiedStoreBase):
                 error_class TEXT,
                 error_message TEXT,
                 latency_ms INTEGER NOT NULL,
-                result_size_bytes INTEGER
+                result_size_bytes INTEGER,
+                dispatch_id TEXT,
+                parent_dispatch_id TEXT
             )
         """)
+        await self.add_column_if_missing("a2a_tool_dispatches", "dispatch_id", "TEXT")
+        await self.add_column_if_missing(
+            "a2a_tool_dispatches", "parent_dispatch_id", "TEXT"
+        )
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_agent_turn "
             "ON a2a_tool_dispatches(agent_did, turn_id, id)"
+        )
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_dispatch "
+            "ON a2a_tool_dispatches(agent_did, dispatch_id)"
+        )
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_parent "
+            "ON a2a_tool_dispatches(agent_did, parent_dispatch_id)"
         )
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_agent_ts "
@@ -444,9 +501,10 @@ class ObservabilityStore(UnifiedStoreBase):
                 INSERT INTO a2a_tool_dispatches (
                     agent_did, session_id, turn_id, ts, tool_name, adapter,
                     args_redacted, result_status, error_class, error_message,
-                    latency_ms, result_size_bytes
+                    latency_ms, result_size_bytes, dispatch_id,
+                    parent_dispatch_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.agent_did,
@@ -466,12 +524,27 @@ class ObservabilityStore(UnifiedStoreBase):
                     ),
                     int(entry.latency_ms),
                     entry.result_size_bytes,
+                    entry.dispatch_id or generate_id(),
+                    entry.parent_dispatch_id,
                 ),
             )
         except Exception as exc:
+            self._dispatch_audit_failures += 1
+            self._dispatch_audit_last_failure_at = datetime.now(timezone.utc)
+            self._dispatch_audit_last_error = exception_log_summary(exc)
             if required:
                 raise
-            print(f"a2a_tool_dispatches write failed: {exc}", file=sys.stderr)
+            logger.warning(
+                "a2a_tool_dispatches write failed for %s: %s",
+                entry.tool_name, self._dispatch_audit_last_error,
+            )
+        else:
+            # A write inside the caller's transaction is not a landed row until
+            # that transaction commits; a rollback must not report one (#4002).
+            call_after_backend_commit(self._backend, self._record_dispatch_audit_landed)
+
+    def _record_dispatch_audit_landed(self) -> None:
+        self._dispatch_audit_last_success_at = datetime.now(timezone.utc)
 
     async def log_structured_tool_call(self, entry: ToolDispatchEntry) -> None:
         """Compatibility alias for callers/tests using the original #1239 name."""
@@ -560,7 +633,7 @@ class ObservabilityStore(UnifiedStoreBase):
             SELECT
                 id, agent_did, session_id, turn_id, ts, tool_name, adapter,
                 args_redacted, result_status, error_class, error_message,
-                latency_ms, result_size_bytes
+                latency_ms, result_size_bytes, dispatch_id, parent_dispatch_id
             FROM a2a_tool_dispatches
             WHERE agent_did = ? AND result_status != 'success'
             ORDER BY id DESC
@@ -583,6 +656,8 @@ class ObservabilityStore(UnifiedStoreBase):
                 "error_message": row[10],
                 "latency_ms": row[11],
                 "result_size_bytes": row[12],
+                "dispatch_id": row[13],
+                "parent_dispatch_id": row[14],
             }
             for row in rows
         ]

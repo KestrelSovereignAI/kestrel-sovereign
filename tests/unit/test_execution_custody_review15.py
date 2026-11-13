@@ -22,7 +22,11 @@ from tests.unit.test_execution_custody import Authority
 
 
 def control_error(control, carrier="direct"):
-    evidence = (ExecutionAuthorityError("original authority denied")
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
+    evidence = (ResourceOutcomeUnknown("original SDK effect uncertain") if control == "sdk"
+                else ToolAuditUnconfirmedError("original audit uncertain") if control == "audit"
+                else ExecutionAuthorityError("original authority denied")
                 if control == "denied" else ExecutionCommitOutcomeError(control))
     if carrier == "direct":
         return evidence
@@ -44,6 +48,37 @@ def test_normal_generator_close_does_not_consume_late_caller_cancellation():
         assert execution_terminal_error(GeneratorExit(), cancellation, evidence) is evidence
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", [None, "sdk", "audit"])
+@pytest.mark.parametrize("carrier", ["stop", "self-fence"])
+async def test_actual_cognition_dispatch_preserves_tool_uncertainty_before_stop(tmp_path, control, carrier):
+    import time
+    from kestrel_sdk.signals import Status
+    from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _channel_signal, _close
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / "original-stop-evidence.db", "did:agent:original-stop")
+    error = (control_error(control, carrier) if control is not None
+        else InvocationCancelledError("actual ordinary Stop") if carrier == "stop"
+        else InvocationSelfFencedError("actual ordinary owner loss"))
+    effect = tmp_path / "actual-original-cognition-entry"
+    async def process_input(*args, **kwargs):
+        effect.write_text("original cognition entered once")
+        raise error
+    agent.process_input = process_input
+    signal = _channel_signal(agent.did, "original-stop-evidence")
+    try:
+        if control is None:
+            result = await dispatcher._dispatch_cognition(signal, dispatcher._registry.get(signal.source), time.monotonic())
+            assert result.status is (Status.COALESCED if carrier == "stop" else Status.FAILED)
+        else:
+            with pytest.raises(type(error)) as caught:
+                await dispatcher._dispatch_cognition(signal, dispatcher._registry.get(signal.source), time.monotonic())
+            assert caught.value is error, "Cognition dispatch replaced original tool uncertainty with Stop"
+        assert effect.read_text() == "original cognition entered once"
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
 def dispatcher_fixture(error):
     import contextvars
     from kestrel_sovereign.signals.dispatcher import SignalDispatcher
@@ -54,12 +89,16 @@ def dispatcher_fixture(error):
     dispatcher._discard_transient_durable_handoff = Mock()
     dispatcher._retained_cognition_control_debt = {}
     dispatcher._retained_durable_cognition_tasks = set()
-    dispatcher._runtime_owner_fence_lock = asyncio.Lock()
     dispatcher._durable_shutdown_owner_fenced = False
-    dispatcher._durable_store = SimpleNamespace(_failed_retry_release_receipts=set(), backend=SimpleNamespace(
-        backend_type="postgres", fail_cognition_delivery=AsyncMock(return_value=False),
-        retain_cognition_cleanup_owner=AsyncMock(return_value=False),
-    ))
+    dispatcher._durable_shutdown = False
+    dispatcher._durable_runtime_owner_registration_started = True
+    dispatcher._durable_store = SimpleNamespace(
+        _failed_retry_release_receipts=set(),
+        retain_unretired_runtime_owner=AsyncMock(return_value=False),
+        backend=SimpleNamespace(
+            backend_type="postgres", fail_cognition_delivery=AsyncMock(return_value=False),
+        ),
+    )
     delivery = ReceiptDelivery(delivery_id="delivery", consumer_id="consumer", lease_token="original-token")
     return dispatcher, delivery
 
@@ -141,14 +180,18 @@ async def test_source_close_error_cannot_replace_original_scope_control(control,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("control", ["denied", "unknown", "committed"])
-@pytest.mark.parametrize("carrier", ["direct", "wrapped", "cancel", "stop", "self-fence"])
+@pytest.mark.parametrize("control,carrier", [
+    (control, carrier) for control in ("denied", "unknown", "committed")
+    for carrier in ("direct", "wrapped", "cancel", "stop", "self-fence")
+] + [(control, carrier) for control in ("sdk", "audit") for carrier in ("stop", "self-fence")])
 @pytest.mark.parametrize("transport", ["stream", "invoke"])
 async def test_actual_http_stream_does_not_acknowledge_or_recommend_control_retry(control, carrier, transport):
     from fastapi import FastAPI
     from starlette.requests import Request
     from kestrel_sovereign.endpoints.agent import stream_agent_response, invoke_agent
     from kestrel_sovereign.streams.tap import AgentStreamTap
+    from kestrel_sovereign.api_errors import ApiHTTPException
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
 
     AgentStreamTap.reset()
     error = control_error(control, carrier)
@@ -183,17 +226,23 @@ async def test_actual_http_stream_does_not_acknowledge_or_recommend_control_retr
     endpoint = getattr(function, "__wrapped__", function)
     response = None
     try:
-        with pytest.raises(type(error)) as caught:
+        with pytest.raises((type(error), ApiHTTPException)) as caught:
             if transport == "stream":
                 response = await endpoint(request)
                 await anext(response.body_iterator)
             else:
                 from starlette.responses import Response
                 await endpoint(request, Response())
-        assert caught.value is error
+        if isinstance(caught.value, ApiHTTPException):
+            assert control in {"sdk", "audit"} and transport == "invoke" and carrier == "stop"
+            assert caught.value.status_code == 502, "Uncertain tool outcome became Stop or retry advice"
+            assert error in tuple(_explicit_control_chain(caught.value))
+        else:
+            assert caught.value is error
         if transport == "stream":
             assert finalized.is_set()
-        assert is_execution_control_error(caught.value)
+        from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+        assert is_tool_execution_terminal_error(caught.value)
         agent._cleanup_cancelled_request.assert_called_once_with(
             "original-http", disposition=RequestCompletionDisposition.ABANDONED,
         )
@@ -228,7 +277,7 @@ async def test_actual_first_admission_control_preserves_durable_unresolved_gener
 
     store.register = capture_register
     error = control_error(control, carrier)
-    store.poll_owner = AsyncMock(side_effect=error)
+    store.read_owner = AsyncMock(side_effect=error)
     registry = DistributedInvocationRegistry(store)
     agent = Agent("original-agent")
     registry.attach(agent)
@@ -256,8 +305,10 @@ async def test_actual_first_admission_control_preserves_durable_unresolved_gener
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("control", ["denied", "unknown", "committed"])
-@pytest.mark.parametrize("carrier", ["direct", "wrapped", "cancel", "stop", "self-fence"])
+@pytest.mark.parametrize("control,carrier", [
+    (control, carrier) for control in ("denied", "unknown", "committed")
+    for carrier in ("direct", "wrapped", "cancel", "stop", "self-fence")
+] + [(control, carrier) for control in ("sdk", "audit") for carrier in ("stop", "self-fence")])
 @pytest.mark.parametrize("transport", ["stream", "invoke"])
 async def test_actual_bridge_stream_retains_control_and_abandoned_lifecycle(control, carrier, transport):
     from fastapi import FastAPI

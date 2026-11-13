@@ -33,6 +33,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
     owned_task_error,
+    wait_owned_tasks_until,
 )
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.execution_custody import (
@@ -110,6 +111,36 @@ _QUARANTINED_SHUTDOWN_HISTORY_LIMIT = 128
 _UNSAFE_QUARANTINED_FAILURE_LIMIT = 128
 _UNSAFE_REMOVAL_BUDGET_RELEASE_FAILURE_LIMIT = 128
 _QUARANTINED_METADATA_TEXT_LIMIT = 256
+#: Why the terminal drain cancels a quarantined shutdown's remote work; the
+#: sync service logs each cancelled upload as "snapshot to <target>
+#: cancelled at shutdown budget" (#4028).
+SHUTDOWN_BUDGET_CANCELLATION_REASON = "shutdown budget"
+
+
+def cancel_remote_work_at_shutdown_budget(
+    cancel_remote_work: Optional[Callable[[str], List[str]]], owner: str,
+) -> List[str]:
+    """Call one agent's remote-work canceller; describe what it cancelled.
+
+    A canceller that fails is logged and reported as cancelling nothing:
+    the caller must still join every stopping agent's local cleanup, which
+    an escaping error would skip. Process-control evidence propagates.
+    """
+    if cancel_remote_work is None:
+        return []
+    try:
+        return list(cancel_remote_work(SHUTDOWN_BUDGET_CANCELLATION_REASON))
+    except Exception as failure:
+        if is_execution_control_error(failure):
+            raise
+        logger.warning(
+            "Could not cancel the retained remote work of %s at the shutdown "
+            "budget: %s",
+            owner,
+            failure,
+            exc_info=True,
+        )
+        return []
 _RUNTIME_OFFBOARD_TIMEOUT_ENV = "KESTREL_RUNTIME_OFFBOARD_TIMEOUT_S"
 _DEFAULT_RUNTIME_OFFBOARD_TIMEOUT_S = 30.0
 StartupAuthorityChain = tuple[tuple[str, str], ...]
@@ -627,6 +658,11 @@ class QuarantinedShutdownReaper:
     completed_monotonic: Optional[float] = None
     failure: Optional[str] = None
     publication_error: Optional[BaseException] = None
+    #: Cancels the remote work (an upload in flight) this cleanup waits on,
+    #: returning a description of each piece cancelled. The terminal drain
+    #: calls it once the host shutdown budget is spent (#4028).
+    cancel_remote_work: Optional[Callable[[str], List[str]]] = None
+    remote_work_cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -1553,6 +1589,10 @@ class AgentManager:
         # Retain those tasks independently of ``_agents`` so removal/restart
         # has a finite control-plane bound without abandoning durable state.
         self._quarantined_shutdown_reapers: dict[str, QuarantinedShutdownReaper] = {}
+        # The loop time after which the terminal drain cancels the remote
+        # work a quarantined shutdown still waits on (#4028). The server arms
+        # it from the host shutdown budget; None waits without a budget.
+        self._shutdown_remote_work_deadline: Optional[float] = None
         # One strongest native receipt survives bounded metadata eviction and
         # task-graph retirement; it is not an operator-facing error string.
         self._quarantined_shutdown_control: BaseException | None = None
@@ -9024,11 +9064,15 @@ class AgentManager:
             ),
         )
 
+        cancel_remote_work = getattr(agent, "cancel_retained_remote_work", None)
         self._retain_quarantined_cleanup(
             name=name,
             agent_id=_loaded_agent_did(agent) or "<unknown>",
             task=reaper_task,
             runtime_outcome_required=offboard_runtime,
+            cancel_remote_work=(
+                cancel_remote_work if callable(cancel_remote_work) else None
+            ),
         )
         logger.warning(
             "Handed agent %r to quarantined shutdown cleanup; routing is "
@@ -9385,6 +9429,7 @@ class AgentManager:
         agent_id: str,
         task: "asyncio.Future[object]",
         runtime_outcome_required: bool = False,
+        cancel_remote_work: Optional[Callable[[str], List[str]]] = None,
     ) -> str:
         """Keep one live cleanup task, then collapse it to bounded metadata."""
 
@@ -9414,6 +9459,7 @@ class AgentManager:
             task=task,
             started_monotonic=time.monotonic(),
             runtime_outcome_required=runtime_outcome_required,
+            cancel_remote_work=cancel_remote_work,
         )
         self._quarantined_shutdown_reapers[reaper_id] = record
 
@@ -9782,6 +9828,73 @@ class AgentManager:
                 self._reopen_agent_registration_after_shutdown_all()
                 self._quarantined_shutdown_drain_lock.release()
 
+    def arm_shutdown_remote_work_deadline(self, deadline: Optional[float]) -> None:
+        """Set the loop time past which the terminal drain cancels remote work.
+
+        The server arms it from the host shutdown budget before the fleet
+        shutdown (#4028), so a quarantined shutdown waiting on an upload that
+        takes many minutes cannot hold the lifespan until SIGKILL. ``None``
+        restores the unbudgeted drain.
+        """
+        if deadline is not None and (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+        ):
+            raise ValueError("shutdown remote-work deadline must be finite")
+        self._shutdown_remote_work_deadline = deadline
+
+    async def _observe_reaper_within_shutdown_budget(
+        self,
+        record: QuarantinedShutdownReaper,
+        *,
+        withdrawals: list[BaseException],
+    ) -> bool:
+        """Wait for a reaper until the remote-work deadline; True if withdrawn.
+
+        Past the deadline the remote work every quarantined shutdown still
+        waits on is cancelled, and the caller then joins the reaper as before:
+        its local cleanup (storage close) is never abandoned. Without an armed
+        deadline this returns at once.
+        """
+        deadline = self._shutdown_remote_work_deadline
+        if deadline is None or record.task.done():
+            return False
+        observation = await wait_owned_tasks_until({record.task}, deadline=deadline)
+        withdrawal = observation.cancellation
+        if withdrawal is not None and all(
+            withdrawal is not prior for prior in withdrawals
+        ):
+            withdrawals.append(withdrawal)
+        if not record.task.done():
+            self._cancel_remote_work_at_shutdown_budget()
+        return withdrawal is not None
+
+    def _cancel_remote_work_at_shutdown_budget(self) -> None:
+        """Cancel the remote work of every quarantined shutdown still running."""
+        pending = [
+            record
+            for record in self._quarantined_shutdown_reapers.values()
+            if not record.task.done() and not record.remote_work_cancelled
+        ]
+        if not pending:
+            return
+        cancelled: list[str] = []
+        for record in pending:
+            record.remote_work_cancelled = True
+            cancelled.extend(
+                cancel_remote_work_at_shutdown_budget(
+                    record.cancel_remote_work, repr(record.agent_name)
+                )
+            )
+        logger.warning(
+            "Host shutdown budget spent while the shutdown of %s was still "
+            "running; cancelled its retained remote work (%s) and joining its "
+            "local cleanup",
+            ", ".join(repr(record.agent_name) for record in pending),
+            "; ".join(cancelled) if cancelled else "none was running",
+        )
+
     async def _drain_quarantined_shutdowns_while_locked(
         self,
         *,
@@ -9873,6 +9986,11 @@ class AgentManager:
                         continue
                     observed_reapers.add(record.reaper_id)
                     observed_cleanup_tasks.add(id(record.task))
+                    cancelled = (
+                        await self._observe_reaper_within_shutdown_budget(
+                            record, withdrawals=refund_withdrawals,
+                        )
+                    ) or cancelled
                     join_cancelled, failure = await _collect_lifecycle_task_completion(
                         record.task, withdrawals=refund_withdrawals,
                     )
@@ -15189,6 +15307,9 @@ class AgentManager:
                 )
             raise
         finally:
+            # Armed for this one fleet shutdown; a later drain is unbudgeted
+            # unless the server arms it again (#4028).
+            self._shutdown_remote_work_deadline = None
             if acquired:
                 self._reopen_agent_registration_after_shutdown_all()
                 self._quarantined_shutdown_drain_lock.release()

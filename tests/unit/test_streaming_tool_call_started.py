@@ -12,10 +12,8 @@ Wave 4B of kestrel-sovereign #1048. Pins:
 * Multiple concurrent tool calls preserve index order.
 * Text chunks may interleave with ``ToolCallStarted`` events
   (text-before-tool and text-during-tool).
-* Malformed JSON in tool arguments at end-of-stream falls back to
-  the SDK 0.7.0 ``{"_raw": "<accumulated>"}`` sentinel in the final
-  ``LLMResponse``, rather than raising — so a bad model output
-  surfaces as a tool-result error rather than crashing the turn.
+* Malformed JSON in tool arguments raises ``LLMProtocolError`` without
+  a terminal response containing fabricated argument data.
 
 These tests use mock provider streams. End-to-end propagation through
 the framework's streaming pipeline lives in Wave 5.
@@ -30,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kestrel_sdk.llm import LLMResponse, ToolCall, ToolCallStarted
+from kestrel_sdk.llm import LLMProtocolError, LLMResponse, ToolCall, ToolCallStarted
 from tests.utils.anthropic_client import models_api
 
 
@@ -109,7 +107,7 @@ class TestAnthropicEmitsToolCallStarted:
                 "content_block_start",
                 index=0,
                 content_block=SimpleNamespace(
-                    type="tool_use", id="toolu_abc", name="lookup"
+                    type="tool_use", id="toolu_abc", name="lookup", input={}
                 ),
             ),
             _anthropic_event(
@@ -161,7 +159,7 @@ class TestAnthropicEmitsToolCallStarted:
                 "content_block_start",
                 index=1,
                 content_block=SimpleNamespace(
-                    type="tool_use", id="toolu_x", name="check"
+                    type="tool_use", id="toolu_x", name="check", input={}
                 ),
             ),
             _anthropic_event(
@@ -197,7 +195,7 @@ class TestAnthropicEmitsToolCallStarted:
                     "content_block_start",
                     index=idx,
                     content_block=SimpleNamespace(
-                        type="tool_use", id=tid, name=name
+                        type="tool_use", id=tid, name=name, input={}
                     ),
                 ),
                 _anthropic_event(
@@ -221,11 +219,8 @@ class TestAnthropicEmitsToolCallStarted:
             assert starts[i].index == i
             assert starts[i].id == tc.id
 
-    def test_malformed_json_falls_back_to_underscore_raw(self):
-        """Codex finding #1: malformed argument JSON yields
-        {"_raw": "<accumulated>"} in the final LLMResponse, not an
-        exception. Renamed from "raw" to "_raw" in SDK 0.7.0 to
-        signal "sentinel, not real data"."""
+    def test_malformed_json_is_refused_without_a_terminal(self):
+        """An incomplete argument object is never presented as a tool call."""
         from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 
         events = [
@@ -233,7 +228,7 @@ class TestAnthropicEmitsToolCallStarted:
                 "content_block_start",
                 index=0,
                 content_block=SimpleNamespace(
-                    type="tool_use", id="toolu_x", name="lookup"
+                    type="tool_use", id="toolu_x", name="lookup", input={}
                 ),
             ),
             _anthropic_event(
@@ -246,10 +241,8 @@ class TestAnthropicEmitsToolCallStarted:
             _anthropic_event("content_block_stop", index=0),
         ]
 
-        items = _drive(AnthropicAdapter(), events)
-        final = next(i for i in items if isinstance(i, LLMResponse))
-        assert final.tool_calls is not None
-        assert final.tool_calls[0].arguments == {"_raw": '{"q": "hi'}
+        with pytest.raises(LLMProtocolError, match="invalid generation protocol"):
+            _drive(AnthropicAdapter(), events)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +256,7 @@ def _openai_chunk(*, content=None, tool_calls=None, usage=None):
         content=content,
         tool_calls=tool_calls,
     )
-    choices = [SimpleNamespace(delta=delta)]
+    choices = [SimpleNamespace(index=0, delta=delta, finish_reason=None)]
     return SimpleNamespace(choices=choices, usage=usage)
 
 
@@ -497,8 +490,8 @@ class TestOpenAIEmitsToolCallStarted:
         final = next(i for i in items if isinstance(i, LLMResponse))
         assert [tc.id for tc in (final.tool_calls or [])] == ["c0", "c1"]
 
-    def test_malformed_json_falls_back_to_underscore_raw(self):
-        """Codex finding #1: same fallback contract as Anthropic."""
+    def test_malformed_json_is_refused_without_a_terminal(self):
+        """The canonical decoder refuses incomplete arguments on every route."""
         from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 
         chunks = [
@@ -514,9 +507,8 @@ class TestOpenAIEmitsToolCallStarted:
             ),
             # Stream ends mid-JSON — final accumulated args are invalid.
         ]
-        items = _drive_openai(OpenAIAdapter(), chunks)
-        final = next(i for i in items if isinstance(i, LLMResponse))
-        assert final.tool_calls[0].arguments == {"_raw": '{"q": "h'}
+        with pytest.raises(LLMProtocolError, match="invalid generation protocol"):
+            _drive_openai(OpenAIAdapter(), chunks)
 
 
 # ---------------------------------------------------------------------------

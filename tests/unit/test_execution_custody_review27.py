@@ -28,7 +28,7 @@ async def test_actual_shutdown_joins_every_store_without_losing_native_cancel_re
         entered.set()
         await asyncio.Event().wait()
 
-    running = manager._track_execution_task(worker(), task.id, "did:test:recipient")
+    running = manager._track_execution_task(worker, task.id, "did:test:recipient")
     await entered.wait()
     original_cancel = manager.task_store.cancel_if_authorized
 
@@ -125,13 +125,20 @@ async def test_public_task_tools_preserve_native_control_receipts(tmp_path, monk
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["skill", "workflow", "background", "background_cancel"])
 @pytest.mark.parametrize("control", ["denied", "unknown"])
-async def test_registered_feature_and_actual_workflow_never_publish_or_retry_control(tmp_path, monkeypatch, route, control):
+async def test_registered_feature_and_actual_workflow_never_publish_or_retry_control(tmp_path, monkeypatch, route, control, native_tool_effect_agent):
     from kestrel_sovereign.features.base import Feature, tool
     from kestrel_sovereign.features.tasks.feature import TaskFeature
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    manager = await create_task_manager(str(tmp_path / "registered.db"), scope=NativeRecipientScope("did:test:recipient"))
-    effects = await AsyncDatabase.sqlite(str(tmp_path / "effects.db"))
+    from kestrel_sovereign.a2a.task_manager import TaskManager
+    from kestrel_sovereign.tools.effect_journal import admit_tool_effect_turn, bind_tool_effect_turn
+
+    host = await native_tool_effect_agent(did="did:test:recipient")
+    effects = host.tool_effect_store.database
+    manager = TaskManager.from_backend(effects.backend, scope=NativeRecipientScope(host.did), owns_backend=False)
+    await manager.initialize()
+    host.task_manager = manager
+    host.observability_store = manager.observability_store
     await effects.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
     marker = ExecutionCommitOutcomeError("unknown") if control == "unknown" else ExecutionAuthorityError("narrower child authority lost")
     calls, submitted = [], []
@@ -160,12 +167,14 @@ async def test_registered_feature_and_actual_workflow_never_publish_or_retry_con
                 raise asyncio.CancelledError("original child cancellation carrier") from marker
             raise QueryError("child custody wrapper after durable effect") from marker
 
-    feature = Effects(SimpleNamespace(did=manager.did, task_manager=manager))
+    feature = Effects(host)
     manager.register_provider(feature.tool_name, feature.get_agent_skills(), feature)
-    workflow = TaskFeature(SimpleNamespace(did=manager.did, task_manager=manager))
+    workflow = TaskFeature(host)
     workflow.set_task_manager(manager)
+    turn = await admit_tool_effect_turn(host, namespace=["review27"], client_key=route,
+        request={"route": route, "control": control}, invocation_id=route)
     try:
-        with pytest.raises(BaseException) as caught:
+        with bind_tool_effect_turn((turn, None)), pytest.raises(BaseException) as caught:
             if route == "skill":
                 await manager.execute_skill(feature.tool_name, "effect", {})
             elif route == "workflow":
@@ -177,6 +186,9 @@ async def test_registered_feature_and_actual_workflow_never_publish_or_retry_con
                 assert not manager._execution_tasks
                 await manager.drain_execution_tasks()
         assert is_execution_control_error(caught.value)
+        with pytest.raises(BaseException) as retired:
+            await turn.close(caught.value)
+        assert is_execution_control_error(retired.value)
         assert calls == [True], "workflow retried a narrower child's unresolved effect"
         assert await effects.fetchval("SELECT COUNT(*) FROM effects") == 1
         assert len(submitted) == 1
@@ -187,7 +199,6 @@ async def test_registered_feature_and_actual_workflow_never_publish_or_retry_con
             await manager.close()
         except BaseException as retirement:
             assert is_execution_control_error(retirement)
-        await effects.close()
 
 
 @pytest.mark.asyncio
@@ -265,7 +276,13 @@ async def test_actual_feature_config_does_not_treat_control_as_missing_or_best_e
 @pytest.mark.parametrize("source", ["task_manager", "host", "storage", "feature"])
 @pytest.mark.parametrize("carrier", ["error", "cancel", "group"])
 async def test_actual_agent_shutdown_retains_control_through_prefix_and_native_tail(tmp_path, monkeypatch, source, carrier):
+    from kestrel_sovereign import kestrel_agent as agent_module
     from kestrel_sovereign.kestrel_agent import KestrelAgent
+    # This test measures receipt preservation across actual closers. Give
+    # their declared SQLite close windows room within the original deadline;
+    # exhausted-budget behavior has its own shutdown allocation tests.
+    monkeypatch.setattr(agent_module, "SHUTDOWN_TIMEOUT", 30)
+    monkeypatch.setattr(agent_module, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", 30)
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.async_storage import AsyncStorage
 

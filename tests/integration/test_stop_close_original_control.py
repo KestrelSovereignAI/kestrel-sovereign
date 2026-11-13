@@ -1,6 +1,6 @@
 """Original PostgreSQL control survives direct distributed close interruption."""
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import asyncio
 import inspect
@@ -45,6 +45,8 @@ async def test_direct_stop_close_retains_original_commit_and_accepted_children(
     agent, agent_db = await _partial_native_agent(tmp_path, monkeypatch)
     registry = DistributedInvocationRegistry(store)
     registry.attach(agent)
+    # Re-establishment adopts the identity the owner heartbeat renewed.
+    registry.start()
     assert await registry.register(agent, "original-fenced-row", 1)
     registry._fail_closed_owner("native owner epoch retired for review")
     async with registry._registration_lock:

@@ -23,6 +23,7 @@ from typing import Any, List
 from unittest.mock import MagicMock
 
 import pytest
+from kestrel_sdk.testing import drain_streaming_text_only
 
 from kestrel_sovereign.llm import codex_adapter as codex_adapter_module
 from kestrel_sovereign.llm.codex_adapter import CodexAdapter
@@ -602,7 +603,7 @@ async def test_text_only_public_entry_point_retries_idle_timeout(entry_point):
         response = await call
         assert response.content == "ok"
     else:
-        assert await _collect(call) == ["ok"]
+        assert await drain_streaming_text_only(call) == "ok"
     assert call_count == 2
 
 

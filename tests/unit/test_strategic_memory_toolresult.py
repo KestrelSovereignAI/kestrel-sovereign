@@ -30,6 +30,7 @@ from kestrel_sovereign.features.strategic_memory.ledger import (
     PATTERNS_KEY,
     StrategyLedger,
 )
+from tests.utils.ledger_storage import without_row_attestations
 
 
 def _make_feature(
@@ -39,7 +40,10 @@ def _make_feature(
     blockers: list | None = None,
     patterns: list | None = None,
 ) -> StrategicMemoryFeature:
-    feat = StrategicMemoryFeature(agent=agent if agent is not None else MagicMock())
+    if agent is None:
+        agent = MagicMock()
+        without_row_attestations(agent.storage)
+    feat = StrategicMemoryFeature(agent=agent)
     feat._data = data if data is not None else {}
     # A strategy path IS configured; ``_save`` is stubbed to report a
     # successful persist so happy-path mutating tools return OK. Tests
