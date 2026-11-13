@@ -4,7 +4,9 @@ import math
 from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
-from kestrel_sdk.native_a2a.server.routes.agent_card_routes import create_agent_card_routes
+from kestrel_sdk.native_a2a.server.routes.agent_card_routes import (
+    create_agent_card_routes,
+)
 from kestrel_sdk.native_a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
 from kestrel_sdk.native_a2a.server.routes.rest_routes import create_rest_routes
 from kestrel_sdk.native_a2a.types import AgentCard, AgentInterface
@@ -20,6 +22,7 @@ from kestrel_sovereign.a2a.native_context import (
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
+from kestrel_sovereign.native_http import NativeHTTPRegistry
 
 
 def native_route_prefix(routing_key: str) -> str:
@@ -186,80 +189,12 @@ class NativeA2AHTTP:
         )
 
 
-class NativeA2AHTTPRegistry:
-    """Publish the same route objects consumed by host transport admission.
-
-    The host owns publication under its A2A lifecycle writer. Withdrawal uses
-    the exact registration object so retiring an older generation cannot
-    remove its replacement. A stale handler also retains its policy guard.
-    """
+class NativeA2AHTTPRegistry(NativeHTTPRegistry[NativeA2AHTTP]):
+    """A2A route publication shares the host's native HTTP ownership contract."""
 
     def __init__(self, app: Starlette):
-        self._app = app
-        self._registrations: dict[str, NativeA2AHTTP] = {}
-
-    def publish(self, binding: NativeA2AHTTP) -> None:
-        """Synchronously publish or replace one manager routing key."""
-        previous = self._registrations.get(binding.routing_key)
-        previous_ids = {id(route) for route in previous.routes} if previous else set()
-        if previous is not None:
-            self._require_routes(previous)
-        paths = {route.path for route in binding.routes}
-        if any(
-            id(route) not in previous_ids and getattr(route, "path", None) in paths
-            for route in self._app.routes
-        ):
-            raise RuntimeError(
-                "Native A2A mount is already owned by another registration"
-            )
-        # Validate every collision and every old route before mutating the app.
-        self._app.routes[:] = [
-            route for route in self._app.routes if id(route) not in previous_ids
-        ]
-        self._app.routes[0:0] = binding.routes
-        self._registrations[binding.routing_key] = binding
-
-    def _require_routes(self, binding: NativeA2AHTTP) -> None:
-        if any(
-            sum(route is owned for route in self._app.routes) != 1
-            for owned in binding.routes
-        ):
-            raise RuntimeError("Native A2A registry lost its published route")
-
-    def is_current(self, binding: NativeA2AHTTP) -> bool:
-        if self._registrations.get(binding.routing_key) is not binding:
-            return False
-        self._require_routes(binding)
-        return True
-
-    def withdraw(self, binding: NativeA2AHTTP) -> bool:
-        """Withdraw this generation only; a later publication remains intact."""
-        if not self.is_current(binding):
-            return False
-        owned_ids = {id(route) for route in binding.routes}
-        self._app.routes[:] = [
-            route for route in self._app.routes if id(route) not in owned_ids
-        ]
-        del self._registrations[binding.routing_key]
-        return True
-
-    def admits(self, scope: Scope) -> bool:
-        """Fail clearly on corrupt publication, and match the installed SDK routes."""
-        self.require_application(scope.get("app"))
-        for binding in self._registrations.values():
-            self._require_routes(binding)
-            if binding.admits(scope):
-                return True
-        return False
-
-    def require_application(self, app: Starlette) -> None:
-        if app is not self._app:
-            raise ValueError("Native A2A registry belongs to a different application")
+        super().__init__(app, protocol="A2A")
 
     def admits_public_card(self, scope: Scope) -> bool:
         self.require_application(scope.get("app"))
-        for binding in self._registrations.values():
-            self._require_routes(binding)
-            if binding.admits_public_card(scope):
-                return True
-        return False
+        return any(binding.admits_public_card(scope) for binding in self._current_bindings())

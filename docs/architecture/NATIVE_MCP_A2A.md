@@ -1621,6 +1621,13 @@ metadata route, and RFC 8414 discovery for the pathful per-agent issuer.
 It does not introduce a second MCP wire protocol. The routes remain private
 implementation work until the host publication and governed tools are wired.
 
+`NativeMCPHTTP` retains those original SDK/OAuth route objects. Its registry and
+A2A share `native_http.NativeHTTPRegistry`: publication checks collisions before
+mutation, records an exact route snapshot, and withdraws only the current
+generation. Routing classification uses those same installed objects; it grants
+no credentials. The embedding host must own the native runtime's lifespan and
+current agent authority before publishing it.
+
 `mcp_server.oauth.NativeMCPAuthorizationServer` uses Authlib's registered client
 authentication methods and native MCP token models. The optional MCP SDK 2.3
 OAuth server handlers are unsuitable for this authorization server. Actual
@@ -1635,6 +1642,9 @@ registered callback string, including its query, and returns the original state
 and issuer. Request values are never rewritten to satisfy SDK handlers. The MCP
 SDK is neither patched nor vendored. Authlib's dependency floor covers the tested request-payload
 contract; the published official MCP SDK remains unchanged.
+Malformed Basic authentication is normalized only around Authlib's header
+decoder, before host-owned client lookup. Decoding errors cannot consume a code
+or revoke a grant, and unrelated host/SQL controls remain outside that catch.
 
 Only explicit registered clients may authorize. Code exchange requires S256
 PKCE, the exact original redirect and resource, and the client's registered

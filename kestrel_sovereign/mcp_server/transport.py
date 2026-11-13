@@ -20,7 +20,11 @@ from mcp.shared.auth import OAuthMetadata
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
-from starlette.routing import Route, request_response
+from starlette.routing import Match, Route, request_response
+from starlette.types import Scope
+
+from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
+from kestrel_sovereign.native_http import NativeHTTPRegistry
 
 from .grants import MCPAuthorizationGrants
 from .oauth import NativeMCPAuthorizationServer
@@ -89,3 +93,22 @@ class NativeMCPServer:
         self.authorization.grants.consent_authority.require_current_host()
         async with self._transport.router.lifespan_context(self._transport):
             yield
+
+
+class NativeMCPHTTP:
+    """Publish and classify the runtime's exact SDK and OAuth route objects."""
+
+    def __init__(self, routing_key: str, runtime: NativeMCPServer):
+        encode_agent_route_name(routing_key)
+        self.routing_key, self.runtime = routing_key, runtime
+        self.routes = tuple(runtime.app.routes)
+
+    def admits(self, scope: Scope) -> bool:
+        return any(route.matches(scope)[0] is Match.FULL for route in self.routes)
+
+
+class NativeMCPHTTPRegistry(NativeHTTPRegistry[NativeMCPHTTP]):
+    """The MCP host retains one published generation per manager routing key."""
+
+    def __init__(self, app: Starlette):
+        super().__init__(app, protocol="MCP")

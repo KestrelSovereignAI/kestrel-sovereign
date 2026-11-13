@@ -6,8 +6,13 @@ import httpx2
 import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from starlette.applications import Starlette
 
-from kestrel_sovereign.mcp_server.transport import NativeMCPServer
+from kestrel_sovereign.mcp_server.transport import (
+    NativeMCPHTTP,
+    NativeMCPHTTPRegistry,
+    NativeMCPServer,
+)
 from tests.integration.test_native_mcp_consent import RESOURCE
 from tests.integration.test_native_mcp_consent import consent_http as _consent_http
 from tests.integration.test_native_mcp_consent import native_pg as _native_pg
@@ -75,3 +80,31 @@ async def test_native_oauth_body_limit_refuses_before_code_consumption(consent_h
         assert response.status_code == 413
         response = await client.post(RESOURCE + "/oauth/token", data=code_request(code))
         assert response.status_code == 200, response.text
+
+
+async def test_host_mount_and_classification_share_original_native_routes(consent_http):
+    native = runtime(consent_http)
+    host = Starlette()
+    registry = NativeMCPHTTPRegistry(host)
+    original = NativeMCPHTTP("owned", native)
+    registry.publish(original)
+    path = urlsplit(RESOURCE).path
+    scope = {"type": "http", "path": path, "root_path": "", "method": "POST", "app": host}
+    assert registry.admits(scope)
+    assert not registry.admits({**scope, "path": path + "/another-agent"})
+    async with (native.app.router.lifespan_context(native.app),
+        httpx2.AsyncClient(transport=httpx2.ASGITransport(app=host),
+            base_url="https://kestrel.example") as http):
+        denied = await http.post(RESOURCE, headers={"x-api-key": "owned-mcp-consent-sovereign-key"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        assert denied.status_code == 401, "Host API credentials became native MCP authority"
+        metadata = await http.get("/.well-known/oauth-protected-resource" + path)
+        assert metadata.status_code == 200 and metadata.json()["resource"] == RESOURCE
+        replacement = NativeMCPHTTP("owned", native)
+        registry.publish(replacement)
+        assert not registry.withdraw(original)
+        assert registry.is_current(replacement)
+        assert registry.withdraw(replacement)
+        withdrawn = await http.post(RESOURCE, json={"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        assert withdrawn.status_code == 404
+        assert not registry.admits(scope)
