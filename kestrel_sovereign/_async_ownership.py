@@ -19,6 +19,7 @@ from functools import wraps
 from typing import Generic, TypeVar, cast
 from weakref import WeakKeyDictionary
 
+from kestrel_sdk.native_a2a.utils.source_lifetime import SourceFactory
 from kestrel_sdk.native_a2a.utils.source_ownership import (
     CallbackSource as OwnedCallbackSource,
     SourceAcquisition,
@@ -1115,19 +1116,40 @@ class OwnedAsyncIterator(Generic[_T]):
     iteration, and closure in one task while its consumer receives items over a
     one-item handshake. ``aclose`` remains cancellation-safe by joining that
     owner with :func:`await_owned_task`.
+
+    Exactly one factory is required. ``source_factory`` receives the shared
+    acquisition record before its first fallible acquisition. That explicit
+    profile cooperatively withdraws demand, never cancels an unknown active
+    finally, and retains terminal failure even after it was read. Existing
+    zero-argument ``iterator_factory`` callers keep their legacy disposition.
     """
 
     def __init__(
         self,
-        iterator_factory: Callable[[], AsyncIterable[_T] | OwnedCallbackSource[_T]],
+        iterator_factory: Callable[[], AsyncIterable[_T] | OwnedCallbackSource[_T]] | None = None,
         *,
         operation: str,
+        source_factory: SourceFactory[_T] | None = None,
         cleanup_requested: Callable[[], bool] | None = None,
         owner_context: contextvars.Context | None = None,
         owner_factory: Callable | None = None,
         owner_started: Callable | None = None,
     ) -> None:
-        self._iterator_factory = iterator_factory
+        if (iterator_factory is None) == (source_factory is None):
+            raise TypeError("Provide exactly one iterator_factory or source_factory")
+        self._cooperative_source = source_factory is not None
+        if source_factory is None:
+            if not callable(iterator_factory):
+                raise TypeError("iterator_factory must be callable")
+
+            def acquire_legacy(_resources: SourceAcquisition) -> AsyncIterable[_T] | OwnedCallbackSource[_T]:
+                return iterator_factory()
+
+            self._acquire_source = acquire_legacy
+        else:
+            if not callable(source_factory):
+                raise TypeError("source_factory must be callable")
+            self._acquire_source = source_factory
         self._operation = operation
         self._cleanup_requested = cleanup_requested
         self._handoff = _CoreSourceHandoff[_T](
@@ -1215,6 +1237,10 @@ class OwnedAsyncIterator(Generic[_T]):
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
         return self
+
+    def request_stop(self) -> None:
+        """Withdraw demand without claiming original-owner retirement."""
+        self._handoff.request_stop()
 
     def _publish_owner_completion(self, _owner: asyncio.Task[None]) -> None:
         # A native owner can terminate while waiting for privacy admission,
@@ -1391,10 +1417,12 @@ class OwnedAsyncIterator(Generic[_T]):
                     self._cancel_owner_if_running()
 
     def _cancel_owner_if_running(self) -> bool:
-        if self._callback_source:
+        if self._cooperative_source or self._callback_source:
             # A callback owns its body AND finally. Its existing false-emission
             # protocol requests retirement without injecting Task.cancel into
             # an unknown active phase and turning aborted cleanup into an ACK.
+            # The explicit resource-aware profile has the same obligation for
+            # opaque iterator bodies/finalizers; it is not a fake CallbackSource.
             self._handoff.request_stop()
             return False
         if not self._owner.done() and not self._owner.cancelling():
@@ -1432,20 +1460,33 @@ class OwnedAsyncIterator(Generic[_T]):
     async def _run(self) -> None:
         from kestrel_sovereign.execution_custody import execution_observation_error
 
-        def acquire(_resources: SourceAcquisition) -> AsyncIterable[_T] | OwnedCallbackSource[_T]:
-            source = self._iterator_factory()
-            self._callback_source = isinstance(source, OwnedCallbackSource)
+        def acquire(resources: SourceAcquisition) -> AsyncIterable[_T] | OwnedCallbackSource[_T]:
+            source = self._acquire_source(resources)
+            self._callback_source = issubclass(type(source), OwnedCallbackSource)
             return source
 
         try:
+            if self._cooperative_source and self._handoff.stopped:
+                # Known withdrawn demand must not enter a newly admitted
+                # factory merely because its original Task is now scheduled.
+                return
             outcome = await run_source_body(
                 acquire, self._handoff, on_body_error=self._classify_source_failure,
             )
-            if outcome.retirement_errors:
+            retirement_errors = outcome.retirement_errors
+            if retirement_errors:
                 # Ordinary physical errors are originals too. The finite
                 # composer retains them in a fresh carrier instead of adding
                 # the other failures to an original exception's cause graph.
-                self._cleanup_error = execution_observation_error(*outcome.retirement_errors)
+                if self._cooperative_source:
+                    # The ORIGINAL producer performed these close attempts.
+                    # Task completion does not certify that its resources
+                    # retired. Retain that exact failed owner/resource pair,
+                    # not an auxiliary observer or a fabricated close receipt.
+                    debt = RuntimeError("original native source retirement failed")
+                    debt._kestrel_native_retirement_debts = ((self, self._owner),)
+                    retirement_errors = (*retirement_errors, debt)
+                self._cleanup_error = execution_observation_error(*retirement_errors)
             # Acknowledge only the authenticated, causeless private producer
             # interrupt, as before delegation. It is not the request reader's
             # withdrawal; those remain in their actual join. Late retirement
@@ -1457,7 +1498,7 @@ class OwnedAsyncIterator(Generic[_T]):
                     and is_owned_task_cancellation(self._owner, body_error)):
                 body_error = None
             errors = tuple(error for error in (
-                body_error, *outcome.retirement_errors, *outcome.observation_errors,
+                body_error, *retirement_errors, *outcome.observation_errors,
             ) if error is not None)
             if errors:
                 self._terminal_error = execution_observation_error(*errors)
@@ -1468,7 +1509,7 @@ class OwnedAsyncIterator(Generic[_T]):
     async def aclose(self) -> None:
         """Stop producing and join the source iterator's owner task."""
 
-        if (self._closed and not self._active_close_calls and self._owner.done()
+        if (not self._cooperative_source and self._closed and not self._active_close_calls and self._owner.done()
                 and (self._cancellation_owner is None or self._cancellation_owner.done())):
             return
         # These are lexical observers, not physical-retirement evidence. An
@@ -1501,7 +1542,7 @@ class OwnedAsyncIterator(Generic[_T]):
             self._active_close_calls -= 1
 
 
-async def create_owned_iterator(iterator_factory, **options):
+async def create_owned_iterator(iterator_factory=None, **options):
     """Construct a stream and join any accepted partial owner before failure.
 
     Public async handoffs must use this boundary, not infer that a failed
@@ -1518,6 +1559,64 @@ async def create_owned_iterator(iterator_factory, **options):
                 from kestrel_sovereign.execution_custody import execution_observation_error
                 raise execution_observation_error(opening, cleanup)
         raise
+
+
+class _NativeSourceDemand(AsyncIterator[_T]):
+    """Borrow demand, not Core's original producer or its close authority."""
+
+    def __init__(self, source: OwnedAsyncIterator[_T]) -> None:
+        self._source = source
+
+    def __aiter__(self) -> "_NativeSourceDemand[_T]":
+        return self
+
+    async def __anext__(self) -> _T:
+        return await anext(self._source)
+
+    def request_stop(self) -> None:
+        self._source.request_stop()
+
+    def raise_if_retirement_failed(self) -> None:
+        if self._source.producer_task.done() and self._source.cleanup_error is not None:
+            error = self._source.terminal_error
+            if error is None:
+                raise RuntimeError("Failed native source retirement has no original error")
+            raise error
+
+
+@asynccontextmanager
+async def native_source_lifetime(acquire: SourceFactory[_T]) -> AsyncIterator[_NativeSourceDemand[_T]]:
+    """Keep request acquisition/body/close in the admitted original Core owner.
+
+    This selects Core's actual admission and completion machinery, never an
+    AnyIO producer fallback. A stopped demand does not cancel an unknown
+    original finally. The root remains pending until the original owners join;
+    an enclosing finite host observer retains those real pending owners/debts.
+    Every original failure remains fatal even after protocol projection.
+    """
+    import anyio
+    from kestrel_sovereign.execution_custody import execution_observation_error
+
+    source = await create_owned_iterator(source_factory=acquire, operation="native-a2a-request-source")
+    failures: list[BaseException] = []
+    try:
+        yield _NativeSourceDemand(source)
+    except BaseException as observer:
+        failures.append(observer)
+    finally:
+        try:
+            # Shield scoped observer withdrawal, not native admission. Raw
+            # asyncio cancellations are retained by the SAME native join.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await source.aclose()
+                except BaseException as retirement:
+                    failures.append(retirement)
+        except BaseException as backend:
+            failures.append(backend)
+    terminal = execution_observation_error(*failures)
+    if terminal is not None:
+        raise terminal
 
 
 def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:

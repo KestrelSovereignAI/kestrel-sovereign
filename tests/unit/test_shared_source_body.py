@@ -5,21 +5,311 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import errno
+import inspect
 import os
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import Path
 
 import pytest
 
-from kestrel_sdk.native_a2a.utils.source_ownership import CallbackSource
+from kestrel_sdk.native_a2a.utils.source_ownership import CallbackSource, SourceAcquisition
+from kestrel_sovereign import _async_ownership as ownership
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator, OwnedCallbackSource, await_owned_task, cancel_owned_task,
+    create_owned_task,
 )
-from kestrel_sovereign.execution_custody import execution_evidence_carriers
+from kestrel_sovereign.execution_custody import (
+    execution_cleanup_debts, execution_evidence_carriers, execution_stream, is_execution_control_error,
+)
+from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 
 
 def test_callback_source_is_the_shared_sdk_contract() -> None:
     assert OwnedCallbackSource is CallbackSource
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ["neither", "both", "bad-legacy", "bad-source"])
+async def test_source_factory_choice_is_validated_before_native_task_admission(choice: str) -> None:
+    original_tasks = asyncio.all_tasks()
+
+    def forbidden() -> AsyncIterable[bytes]:
+        pytest.fail("Invalid factory selection must not dispatch any source work")
+
+    options = {
+        "neither": {},
+        "both": {"iterator_factory": forbidden, "source_factory": lambda resources: forbidden()},
+        "bad-legacy": {"iterator_factory": object()},
+        "bad-source": {"source_factory": object()},
+    }[choice]
+    with pytest.raises(TypeError):
+        OwnedAsyncIterator(operation="refused source factory", **options)
+    assert asyncio.all_tasks() == original_tasks
+
+
+@pytest.mark.asyncio
+async def test_unread_native_root_does_not_dispatch_a_withdrawn_factory() -> None:
+    acquired: list[SourceAcquisition] = []
+
+    def acquire(resources: SourceAcquisition) -> AsyncIterable[bytes]:
+        acquired.append(resources)
+        pytest.fail("A known stopped root must not acquire a source")
+
+    coordinator = ReentrantTransitionLock()
+    async with coordinator:
+        scope = coordinator.current_native_scope()
+        assert scope is not None
+        async with ownership.native_source_lifetime(acquire) as reader:
+            assert not hasattr(reader, "aclose")
+            originals = tuple(scope.admissions)
+            assert len(originals) == 2
+        for task in originals:
+            assert task.done()
+            assert inspect.getcoroutinestate(task.get_coro()) == inspect.CORO_CLOSED
+    assert acquired == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["factory", "aiter"])
+@pytest.mark.parametrize("fail_close", [False, True])
+@pytest.mark.parametrize("request_root", [False, True])
+async def test_resource_aware_factory_retains_partial_acquisition_in_original_owner(
+    tmp_path: Path, failure_phase: str, fail_close: bool, request_root: bool,
+) -> None:
+    original = ValueError("original partial acquisition")
+    cause = LookupError("original acquisition cause")
+    marker = contextvars.ContextVar("partial native acquisition", default="outside")
+    descriptors: list[int] = []
+    phases: list[tuple[str, asyncio.Task | None]] = []
+    close_errors: list[OSError] = []
+    records: list[SourceAcquisition] = []
+
+    def acquire(resources: SourceAcquisition) -> AsyncIterable[bytes]:
+        records.append(resources)
+        phases.append(("factory", asyncio.current_task()))
+        token = marker.set("original")
+        descriptor = os.open(tmp_path / "partial", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        descriptors.append(descriptor)
+
+        class Source:
+            def __aiter__(self) -> AsyncIterator[bytes]:
+                assert marker.get() == "original"
+                phases.append(("aiter", asyncio.current_task()))
+                raise original from cause
+
+            async def aclose(self) -> None:
+                assert marker.get() == "original"
+                phases.append(("close", asyncio.current_task()))
+                os.close(descriptor)
+                marker.reset(token)
+                if fail_close:
+                    try:
+                        os.fstat(descriptor)
+                    except OSError as error:
+                        close_errors.append(error)
+                        raise
+
+        resource = Source()
+        resources.retain(resource, resource.aclose)
+        if failure_phase == "factory":
+            raise original from cause
+        return resource
+
+    async def consume(reader: AsyncIterator[bytes]) -> BaseException:
+        with pytest.raises(BaseException) as demand:
+            await anext(reader)
+        return demand.value
+
+    source = None
+    try:
+        if request_root:
+            lifetime = ownership.native_source_lifetime
+            with pytest.raises(BaseException) as root:
+                async with lifetime(acquire) as reader:
+                    assert not hasattr(reader, "aclose")
+                    delivered = await consume(reader)
+            observed = root.value
+        else:
+            source = OwnedAsyncIterator(source_factory=acquire, operation="partial source factory")
+            delivered = await consume(source)
+            with pytest.raises(BaseException) as close:
+                await source.aclose()
+            observed = close.value
+        evidence = execution_evidence_carriers(observed)
+        assert any(error is original for error in evidence)
+        assert any(error is original for error in execution_evidence_carriers(delivered))
+        assert original.__cause__ is cause
+        assert len(records) == 1
+        assert [phase for phase, _ in phases] == (
+            ["factory", "close"] if failure_phase == "factory" else ["factory", "aiter", "close"]
+        )
+        actual = phases[0][1]
+        assert actual is not None
+        assert all(task is actual for _, task in phases)
+        assert actual.done()
+        assert inspect.getcoroutinestate(actual.get_coro()) == inspect.CORO_CLOSED
+        if source is not None:
+            assert actual is source.producer_task and source.owner_task.done()
+        assert marker.get() == "outside"
+        if fail_close:
+            assert len(close_errors) == 1 and close_errors[0].errno == errno.EBADF
+            assert any(error is close_errors[0] for error in evidence)
+        else:
+            assert close_errors == []
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        if source is not None and not source.producer_task.done():
+            await source.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_close", [False, True])
+@pytest.mark.parametrize("forwarded", [False, True])
+async def test_resource_aware_opaque_finally_is_not_aborted_by_close(
+    tmp_path: Path, fail_close: bool, forwarded: bool,
+) -> None:
+    closing, release = asyncio.Event(), asyncio.Event()
+    marker = contextvars.ContextVar("opaque original finally", default="outside")
+    descriptors: list[int] = []
+    owners: list[asyncio.Task | None] = []
+    retired: list[asyncio.Task | None] = []
+    errors: list[OSError] = []
+
+    async def generate() -> AsyncIterator[str]:
+        descriptor = os.open(tmp_path / "opaque-finally", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        descriptors.append(descriptor)
+        owners.append(asyncio.current_task())
+        token = marker.set("original")
+        try:
+            yield "first"
+        finally:
+            try:
+                closing.set()
+                await release.wait()
+                assert marker.get() == "original"
+                os.close(descriptor)
+                retired.append(asyncio.current_task())
+                if fail_close:
+                    try:
+                        os.fstat(descriptor)
+                    except OSError as error:
+                        errors.append(error)
+                        raise
+            finally:
+                marker.reset(token)
+
+    source = OwnedAsyncIterator(
+        source_factory=lambda resources: execution_stream(None, generate()) if forwarded else generate(),
+        operation="opaque original finally",
+    )
+    reader = closer = None
+    try:
+        assert await anext(source) == "first"
+        reader = create_owned_task(anext(source), retain_originals=True)
+        await closing.wait()
+        closer = create_owned_task(source.aclose(), retain_originals=True)
+        completed, _ = await asyncio.wait((closer,), timeout=.01)
+        assert not completed
+        assert not source.producer_task.done()
+        assert source.producer_task.cancelling() == 0
+        assert retired == []
+        os.fstat(descriptors[0])
+        release.set()
+        close_outcome, read_outcome = await await_owned_task(closer), await await_owned_task(reader)
+        if fail_close:
+            assert len(errors) == 1 and errors[0].errno == errno.EBADF
+            assert close_outcome.error is read_outcome.error is errors[0]
+        else:
+            assert close_outcome.error is close_outcome.cancellation is None
+            assert isinstance(read_outcome.error, StopAsyncIteration)
+        assert len(owners) == 1 and owners == retired
+        original = owners[0]
+        assert original is not None and original.done()
+        assert (original is source.producer_task) is not forwarded
+        assert inspect.getcoroutinestate(original.get_coro()) == inspect.CORO_CLOSED
+        assert source.producer_task.done() and source.owner_task.done()
+        assert inspect.getcoroutinestate(source.producer_task.get_coro()) == inspect.CORO_CLOSED
+        assert marker.get() == "outside"
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        release.set()
+        if reader is not None:
+            await await_owned_task(reader)
+        if closer is not None:
+            await await_owned_task(closer)
+        else:
+            await source.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_root", [False, True])
+async def test_failed_resource_close_retains_actual_owner_debt_not_task_done_ack(
+    tmp_path: Path, request_root: bool,
+) -> None:
+    path = tmp_path / "unretired-source"
+    path.write_bytes(b"real source")
+    descriptors: list[int] = []
+    owners: list[asyncio.Task | None] = []
+    failures: list[OSError] = []
+
+    def acquire(resources: SourceAcquisition) -> AsyncIterable[bytes]:
+        descriptor = os.open(path, os.O_RDONLY)
+        descriptors.append(descriptor)
+        owners.append(asyncio.current_task())
+
+        class Source:
+            def __aiter__(self) -> Source:
+                return self
+
+            async def __anext__(self) -> bytes:
+                raise StopAsyncIteration
+
+            async def aclose(self) -> None:
+                try:
+                    os.write(descriptor, b"cannot write to the real read-only FD")
+                except OSError as error:
+                    failures.append(error)
+                    raise
+
+        return Source()
+
+    source = None
+    try:
+        if request_root:
+            with pytest.raises(BaseException) as root:
+                async with ownership.native_source_lifetime(acquire) as reader:
+                    with pytest.raises(BaseException):
+                        await anext(reader)
+            terminal = root.value
+        else:
+            source = OwnedAsyncIterator(source_factory=acquire, operation="real unretired source")
+            with pytest.raises(BaseException) as delivered:
+                await anext(source)
+            terminal = delivered.value
+        assert len(failures) == 1 and failures[0].errno == errno.EBADF
+        assert any(error is failures[0] for error in execution_evidence_carriers(terminal))
+        assert is_execution_control_error(terminal), "A failed original close is native retirement control"
+        debts = execution_cleanup_debts(terminal)
+        assert len(debts) == 1
+        resource, actual = debts[0]
+        assert type(resource) is OwnedAsyncIterator
+        assert resource.producer_task is actual is owners[0]
+        assert actual.done()
+        assert inspect.getcoroutinestate(actual.get_coro()) == inspect.CORO_CLOSED
+        assert failures[0].__cause__ is None
+        # A physically finished Task is NOT a successful resource-close ACK.
+        assert os.fstat(descriptors[0]).st_size == len(b"real source")
+    finally:
+        # Explicit test recovery of the deliberately failed closer. This is
+        # neither its original retirement receipt nor a second aclose attempt.
+        for descriptor in descriptors:
+            os.close(descriptor)
+        if source is not None and not source.producer_task.done():
+            await source.aclose()
 
 
 @pytest.mark.asyncio

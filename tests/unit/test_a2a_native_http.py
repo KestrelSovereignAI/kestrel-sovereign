@@ -1,6 +1,8 @@
 """Actual SDK clients and HTTP bindings over native proof, policy and storage."""
 
 import asyncio
+import contextvars
+import inspect
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -41,6 +43,7 @@ from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
 from kestrel_sovereign.a2a.native_client import NativeSenderInterceptor
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission
 from kestrel_sovereign.a2a.native_routes import (
     NativeA2AHTTP,
     NativeA2AHTTPRegistry,
@@ -52,6 +55,8 @@ from kestrel_sovereign.a2a.native_sender import (
 )
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.execution_custody import bind_native_execution_admission
+from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 from tests.utils.native_a2a import manager_for
 from tests.utils.native_a2a_security import (
     EXTENSIONS,
@@ -790,6 +795,47 @@ async def test_streaming_sdk_send_preserves_task_artifacts_and_terminal_event(wi
         if not pending.done():
             pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+async def test_native_http_stream_uses_actual_admitted_core_source_owner(wire):
+    coordinator = ReentrantTransitionLock()
+    root = asyncio.current_task()
+    observed = []
+
+    async def complete_original():
+        await wire.submitted.wait()
+        await wire.manager.complete_task(
+            wire.submissions[0].task.id, "original native snapshot",
+            recipient_agent_id=wire.admission.scope.recipient_id,
+        )
+
+    completion = asyncio.create_task(complete_original(), context=contextvars.Context())
+    try:
+        async with coordinator:
+            scope = coordinator.current_native_scope()
+            assert scope is not None
+
+            async def require_original_membership():
+                coordinator.require_native_scope(scope, retained_owners=(root,))
+                observed.append(asyncio.current_task())
+
+            with bind_native_execution_admission(require_original_membership):
+                events = [
+                    event async for event in wire.client(streaming=True).send_message(send(wire.admission))
+                ]
+            assert events and events[0].task.id == wire.submissions[0].task.id
+            originals = set(observed) - {root}
+            assert originals, "The HTTP source must execute in an actual admitted child"
+            for task in originals:
+                receipt = getattr(task, "_kestrel_owned_admission", None)
+                assert type(receipt) is OwnedTaskAdmission and receipt.task is task
+                assert task.done()
+                assert inspect.getcoroutinestate(task.get_coro()) == inspect.CORO_CLOSED
+        await completion
+    finally:
+        if not completion.done():
+            completion.cancel()
+        await asyncio.gather(completion, return_exceptions=True)
 
 
 async def test_missing_proof_and_recipient_denial_keep_http_401_and_403(wire):
