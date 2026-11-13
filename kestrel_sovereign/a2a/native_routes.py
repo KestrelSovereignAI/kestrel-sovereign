@@ -15,6 +15,7 @@ from starlette.datastructures import URLPath
 from starlette.routing import BaseRoute, Match, Mount
 from starlette.types import Receive, Scope, Send
 
+from kestrel_sovereign._async_ownership import native_source_lifetime
 from kestrel_sovereign.a2a.native_context import (
     NativeRecipientBinding,
     NativeServerCallContextBuilder,
@@ -150,6 +151,7 @@ class NativeA2AHTTP:
             context_builder=builder("JSONRPC"),
             enable_v0_3_compat=False,
             shutdown_grace_period=shutdown_grace_period,
+            source_lifetime_factory=native_source_lifetime,
         )
         routes.extend(
             _AdvertisedTenantRoute(route, guard.scope.tenant)
@@ -158,6 +160,7 @@ class NativeA2AHTTP:
                 context_builder=builder("HTTP+JSON"),
                 enable_v0_3_compat=False,
                 shutdown_grace_period=shutdown_grace_period,
+                source_lifetime_factory=native_source_lifetime,
             )
         )
         self.route = Mount(self.prefix, routes=routes)
