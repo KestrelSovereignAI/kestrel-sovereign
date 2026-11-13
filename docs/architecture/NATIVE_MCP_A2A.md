@@ -1679,8 +1679,13 @@ hint before I/O. An uncertain response is never replayed automatically.
 `NativeMCPPublication` prepares its original borrowed SQL stores and official SDK
 lifespan privately, then publishes the exact route generation at Core's normal
 registration commit. The SDK lifespan enters and exits in one retained resident
-Task. Standalone publication is independent of A2A configuration. AgentManager
-withdrawal revokes MCP admission before asynchronous cleanup; agent shutdown
+Task under the original agent runtime context, without inheriting the publishing
+Console credential or invocation. Both SDK startup and physical close retain the
+canonical `OwnedOperation`, including uncertain admission debt; a missing task
+handle never permits a fresh retry or a successful custody release. Standalone
+publication is independent of A2A configuration. AgentManager fences every public
+routing view before fallible protocol withdrawal, retaining the original private
+lifecycle owner. Withdrawal revokes MCP admission before asynchronous cleanup; agent shutdown
 joins the original SDK task and HTTP/private-response readers before primary
 storage may close. Failed native retirement retains its original owner and
 storage custody. Native MCP routes select a transport-only caller lane before

@@ -7,8 +7,7 @@ from kestrel_sdk.security.encryption import get_agent_key
 from starlette.routing import Route
 
 from kestrel_sovereign._async_ownership import (
-    await_owned_task,
-    create_owned_task,
+    OwnedOperation,
     raise_owned_outcome,
 )
 from kestrel_sovereign.agent.custody import ReleaseOutcome
@@ -54,11 +53,19 @@ class NativeMCPPublication:
         self.registry = native_mcp_registry(app)
         self._preparer = asyncio.current_task()
         self._preparing, self._prepared, self._published, self._retired = True, False, False, False
-        self._resident = self._close_task = None
+        self._resident_operation = self._close_operation = None
         self._stop = asyncio.Event()
         self._requests = AsyncReaderWriterLock()
         self.runtime = self.controller = self.binding = None
         self.resource = policy.console_origin + "/api/agent-routes/" + encode_agent_route_name(routing_key) + "/mcp"
+
+    @property
+    def _resident(self):
+        return self._resident_operation.task if self._resident_operation is not None else None
+
+    @property
+    def _close_task(self):
+        return self._close_operation.task if self._close_operation is not None else None
 
     def _runtime_current(self):
         if (self.agent.did != self._did or self.agent.identity is not self._identity
@@ -125,11 +132,16 @@ class NativeMCPPublication:
                     ready.set_result(None)
                     await publication._stop.wait()
 
-            publication._resident = create_owned_task(resident(), name="native-mcp-server:" + routing_key,
-                retain_originals=True, retirement_resource=publication)
+            resident_context = agent._runtime_owner_context()
+            publication._resident_operation = OwnedOperation(resident(), name="native-mcp-server:" + routing_key,
+                context=resident_context, retain_originals=True, retirement_resource=publication)
+            if publication._resident is None:
+                outcome = await publication._resident_operation.observe()
+                raise_owned_outcome(outcome, operation="native MCP SDK admission", retain_originals=True)
+                raise RuntimeError("Original native MCP SDK admission did not retain its task")
             await asyncio.wait({ready, publication._resident}, return_when=asyncio.FIRST_COMPLETED)
             if publication._resident.done():
-                outcome = await await_owned_task(publication._resident)
+                outcome = await publication._resident_operation.observe()
                 raise_owned_outcome(outcome, operation="native MCP SDK startup", retain_originals=True)
                 raise RuntimeError("The original native MCP SDK runtime ended during preparation")
             publication._runtime_current()
@@ -178,15 +190,15 @@ class NativeMCPPublication:
             self.withdraw()
         except BaseException as error:  # noqa: BLE001 - drain original readers and SDK before surfacing withdrawal
             failure = error
-        if self._close_task is None:
+        if self._close_operation is None:
             async def drain():
                 async with self._requests:
                     if self.controller is not None:
                         async with self.controller._gate:
                             pass
                 resident_failure = None
-                if self._resident is not None:
-                    outcome = await await_owned_task(self._resident)
+                if self._resident_operation is not None:
+                    outcome = await self._resident_operation.observe()
                     try:
                         raise_owned_outcome(outcome, operation="native MCP SDK retirement", retain_originals=True)
                     except BaseException as error:  # noqa: BLE001 - preserve the joined original SDK completion receipt
@@ -198,7 +210,7 @@ class NativeMCPPublication:
                 if vars(self.agent).get("_native_mcp_publication") is self:
                     self.agent._native_mcp_publication = None
                 return ReleaseOutcome.RELEASED
-            self._close_task = create_owned_task(drain(), name="native-mcp-server-close:" + self.routing_key,
+            self._close_operation = OwnedOperation(drain(), name="native-mcp-server-close:" + self.routing_key,
                 retain_originals=True, retirement_resource=self)
-        outcome = await await_owned_task(self._close_task)
+        outcome = await self._close_operation.observe()
         return raise_owned_outcome(outcome, operation="native MCP publication close", retain_originals=True)

@@ -1,19 +1,29 @@
 """Publish an actual initialized Core agent through the original native SDK."""
 
 import asyncio
+import inspect
 import json
+from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from kestrel_sovereign import server
-from kestrel_sovereign.auth import AuthMethod, CallerContext
+from kestrel_sovereign._async_ownership import OwnedOperation
+from kestrel_sovereign.auth import (
+    AuthMethod,
+    CallerContext,
+    caller_context_scope,
+    current_caller_context,
+)
 from kestrel_sovereign.endpoints.mcp_server import router
+from kestrel_sovereign.execution_custody import execution_cleanup_debts
 from kestrel_sovereign.mcp_server.http import NativeMCPHostMiddleware
 from kestrel_sovereign.mcp_server.policy import MCPServerPolicy
 from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+from kestrel_sovereign.mcp_server.transport import NativeMCPServer
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from kestrel_sovereign.security.request_auth import (
@@ -296,8 +306,164 @@ async def test_failed_mcp_owner_check_still_revokes_a2a_authority(publication, t
                 manager._withdraw_initialized_agent("OwnedNativeMCP", p.agent)
         assert vars(p.agent)["_agent_manager_published"] is False
         assert manager.a2a_hosted_policy_for(p.agent) is None, "A failed MCP owner check left original A2A authority active"
+        assert manager.get_agent("OwnedNativeMCP") is None, "Failed protocol retirement left ordinary tenant routing published"
+        assert p.agent not in manager.list_agents().values(), "Failed protocol retirement remained publicly discoverable"
+        assert manager._get_agent_for_lifecycle("OwnedNativeMCP") is p.agent, "Public fencing discarded original cleanup ownership"
     finally:
         p.agent._native_mcp_publication = prepared
         async with manager.a2a_lifecycle_lease():
             manager._withdraw_initialized_agent("OwnedNativeMCP", p.agent)
             await rollback()
+
+
+async def test_invalid_mcp_shutdown_owner_does_not_skip_other_original_resources(publication, monkeypatch):
+    p, _client = publication
+    p.publish()
+    original_manager = p.agent.task_manager
+    original_close = p.agent._close_native_task_manager
+    closed = []
+
+    async def close(manager):
+        result = await original_close(manager)
+        closed.append(manager)
+        return result
+
+    monkeypatch.setattr(p.agent, "_close_native_task_manager", close)
+    p.agent._native_mcp_publication = object()
+    try:
+        try:
+            await p.agent.shutdown()
+        except (AttributeError, TypeError):
+            pass  # The original failed owner must not skip independent retirement.
+        first_attempt_closed = original_manager in closed
+    finally:
+        p.agent._native_mcp_publication = p
+        await p.close()
+        await p.agent.shutdown()
+    assert first_attempt_closed, "An invalid MCP owner skipped original TaskManager retirement before recovery"
+
+
+async def test_original_sdk_resident_admission_is_retained_before_publication(publication):
+    p, _client = publication
+    admission = getattr(p, "_resident_operation", None)
+    assert admission is not None and admission.task is p._resident, "Original SDK resident admission was not retained by its publication"
+
+
+async def test_unresolved_native_mcp_close_admission_cannot_be_retried_as_absence(native_tool_effect_agent):
+    # This is a private component allocation test. No READY, SDK lifespan,
+    # protocol publication, or successful cleanup ACK is fabricated.
+    agent = await native_tool_effect_agent(did="did:owned:mcp-close-admission")
+    assert not agent._runtime_publication_ready.is_set()
+    app = FastAPI()
+    app.state.agent = agent
+    policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
+        "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
+            "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}))
+    owner = NativeMCPPublication(app, agent, "OwnedAdmission", policy, sovereign_key=lambda: KEY)
+    agent._native_mcp_publication = owner
+    agent._resource_custody().acquire("native_mcp_server")
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = []
+    original_error = RuntimeError("owned native MCP closer factory acceptance unknown")
+
+    def factory(loop, coroutine, **kwargs):
+        frame = getattr(coroutine, "cr_frame", None)
+        inner = frame.f_locals.get("operation") if frame is not None else None
+        candidate = inner if inspect.iscoroutine(inner) else coroutine
+        code = getattr(candidate, "cr_code", None)
+        if code is not None and code.co_qualname == "NativeMCPPublication.close.<locals>.drain":
+            refused.append((coroutine, candidate))
+            raise original_error
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    try:
+        loop.set_task_factory(factory)
+        with pytest.raises(RuntimeError) as opening:
+            await owner.close()
+    finally:
+        loop.set_task_factory(previous)
+    assert len(refused) == 1 and execution_cleanup_debts(opening.value)
+    assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
+    repeated = None
+    try:
+        await owner.close()
+    except RuntimeError as error:
+        repeated = error
+    assert repeated is not None and execution_cleanup_debts(repeated), "Unresolved original MCP close admission was replaced by a successful fresh retry"
+    assert agent._resource_custody().is_held("native_mcp_server"), "Unresolved MCP admission released primary storage custody"
+    assert agent._native_mcp_publication is owner
+
+
+async def test_missing_resident_task_with_real_admission_debt_retains_primary_custody(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:owned:mcp-resident-admission")
+    assert not agent._runtime_publication_ready.is_set()
+    app = FastAPI()
+    app.state.agent = agent
+    policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
+        "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
+            "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}))
+    owner = NativeMCPPublication(app, agent, "OwnedResidentAdmission", policy, sovereign_key=lambda: KEY)
+    agent._native_mcp_publication = owner
+    agent._resource_custody().acquire("native_mcp_server")
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = []
+
+    async def unadmitted():
+        raise AssertionError("Original unadmitted resident entered its body")
+
+    operation = unadmitted()
+
+    def factory(loop, coroutine, **kwargs):
+        frame = getattr(coroutine, "cr_frame", None)
+        inner = frame.f_locals.get("operation") if frame is not None else None
+        if inner is operation:
+            refused.append(coroutine)
+            raise RuntimeError("Owned resident task-factory acceptance is unknown")
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    try:
+        loop.set_task_factory(factory)
+        owner._resident_operation = OwnedOperation(operation, retirement_resource=owner, retain_originals=True)
+    finally:
+        loop.set_task_factory(previous)
+    assert len(refused) == 1 and owner._resident is None
+    assert execution_cleanup_debts(owner._resident_operation.admission_error)
+    assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED
+    with pytest.raises(RuntimeError) as failure:
+        await owner.close()
+    assert execution_cleanup_debts(failure.value)
+    assert agent._resource_custody().is_held("native_mcp_server"), "Missing resident task erased its actual admission debt"
+    assert agent._native_mcp_publication is owner
+
+
+async def test_sdk_resident_keeps_original_agent_runtime_without_borrowing_console_owner(publication, monkeypatch):
+    p, client = publication
+    await p.close()
+    original = NativeMCPServer._lifespan
+    witnesses, prepared = [], []
+
+    @asynccontextmanager
+    async def observe(runtime, app):
+        witnesses.append((current_caller_context(), current_request_authentication()))
+        async with original(runtime, app):
+            yield
+
+    monkeypatch.setattr(NativeMCPServer, "_lifespan", observe)
+
+    @p.app.post("/api/owned-native-mcp-runtime")
+    async def prepare_from_console(request: Request):
+        service = p.app.state.request_authentication
+        with service.bind(request) as authentication, caller_context_scope(authentication.caller):
+            assert authentication.caller.is_sovereign
+            owner = await NativeMCPPublication.prepare(p.app, p.agent, "OwnedRuntime", p.policy,
+                sovereign_key=lambda: KEY)
+            prepared.append(owner)
+        return {"prepared": True}
+
+    try:
+        response = await client.post("/api/owned-native-mcp-runtime", headers={"x-api-key": KEY})
+        assert response.status_code == 200, response.text
+        assert witnesses == [(None, None)], "Original SDK resident borrowed its publishing Console credential lifetime"
+    finally:
+        for owner in prepared:
+            await owner.close()

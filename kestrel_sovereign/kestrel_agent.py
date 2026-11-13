@@ -4965,18 +4965,29 @@ class KestrelAgent(
                 return ReleaseOutcome.RETAINED
         return ReleaseOutcome.RELEASED
 
-    async def _close_native_mcp_publication(self):
-        """Join the host's original SDK lifetime before releasing borrowed SQL."""
+    def _native_mcp_publication_owner(self):
+        """Resolve one original server owner without manufacturing retirement ACKs."""
         publication = vars(self).get("_native_mcp_publication")
         if publication is None:
             if self._resource_custody().is_held("native_mcp_server"):
                 raise RuntimeError("Original native MCP retirement owner is unavailable")
-            return ReleaseOutcome.RELEASED
+            return None
         from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
 
         if not isinstance(publication, NativeMCPPublication) or publication.agent is not self:
             raise TypeError("Original native MCP publication owner required")
-        return await publication.close()
+        return publication
+
+    def _withdraw_native_mcp_publication(self):
+        """The guarded shutdown step resolves and fences its original owner."""
+        publication = self._native_mcp_publication_owner()
+        if publication is not None:
+            publication.withdraw()
+
+    async def _close_native_mcp_publication(self):
+        """Join the host's original SDK lifetime before releasing borrowed SQL."""
+        publication = self._native_mcp_publication_owner()
+        return (await publication.close()) if publication is not None else ReleaseOutcome.RELEASED
 
     async def _close_native_task_manager(self, manager):
         """Join standalone publication readers before releasing their primary store."""
@@ -10720,7 +10731,7 @@ Expected Duration: {expected_duration}
             if has_native_mcp:
                 await _release_within("native_mcp_server", "Native MCP server",
                     self._close_native_mcp_publication, _step_budget(),
-                    request=native_mcp.withdraw if native_mcp is not None else None)
+                    request=self._withdraw_native_mcp_publication)
 
             # EPHEMERAL hard-purge defense-in-depth (#767 / #2673). If the agent
             # process is exiting while still in EPHEMERAL, the session is

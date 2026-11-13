@@ -2306,7 +2306,7 @@ async def test_expired_published_candidate_keeps_one_readiness_rollback_owner(
         manager._expire_host_authority_candidate("ExpiredPublished", child)
         await asyncio.sleep(0)
 
-        assert manager._spawn_route_is_fenced("ExpiredPublished", child)
+        assert manager._agent_route_is_fenced("ExpiredPublished", child)
         assert vars(child).get("_host_authority_expiry_cleanup_task") is None
         manager._discard_unpublished_initialized_agent.assert_not_awaited()
     finally:
@@ -2462,7 +2462,7 @@ async def test_already_expired_host_deadline_does_not_cancel_admission_owner(
         True,
     )
     assert expired_candidates == [child]
-    assert manager._spawn_route_is_fenced(name, child)
+    assert manager._agent_route_is_fenced(name, child)
 
 
 @pytest.mark.asyncio

@@ -1568,11 +1568,10 @@ class AgentManager:
         # private window so control features see the same spawn depth ceiling
         # they will have after ``_register_agent`` commits.
         self._prepared_agent_names: dict[str, tuple[str, KestrelAgent]] = {}
-        # A signed child is synchronously removed from every public routing
-        # view at its admission deadline, before cancellation-resistant ready
-        # work is joined.  The exact object remains in the private topology
-        # maps until the normal receipt/runtime rollback owner removes it.
-        self._expired_spawn_authority_routes: dict[str, KestrelAgent] = {}
+        # Fence public routing before expiry or fallible protocol retirement.
+        # Original instances remain privately owned in the topology maps and
+        # are reachable through _get_agent_for_lifecycle until cleanup settles.
+        self._fenced_agent_routes: dict[str, KestrelAgent] = {}
         # A deadline may have to abandon the *wait*, never the work owner. Keep
         # cancellation-resistant admission tasks strongly owned until they
         # actually settle, then consume their terminal outcome.
@@ -2255,7 +2254,7 @@ class AgentManager:
             not isinstance(recipient_id, str)
             or not recipient_id
             or not isinstance(name, str)
-            or self._spawn_route_is_fenced(name, recipient)
+            or self._agent_route_is_fenced(name, recipient)
             or (
                 self._agents.get(name) is not recipient
                 and self._onboarding_agents.get(name) is not recipient
@@ -2310,7 +2309,7 @@ class AgentManager:
         if (
             not isinstance(recipient_id, str)
             or not isinstance(name, str)
-            or self._spawn_route_is_fenced(name, recipient)
+            or self._agent_route_is_fenced(name, recipient)
             or self._agents.get(name) is not recipient
         ):
             return None
@@ -3539,6 +3538,11 @@ class AgentManager:
         observable.
         """
 
+        # The same exact-object fence serves expiry and failed withdrawal.
+        # Never overwrite a replacement generation's fence with a stale owner.
+        if self._get_agent_for_lifecycle(name) is agent:
+            self._fenced_agent_routes[self._canonical_agent_name(name)] = agent
+
         # Wake any concurrently initializing descendants before withdrawing
         # this private candidate.  The false marker makes the wake a failure,
         # never evidence that the parent was verified.
@@ -3628,8 +3632,8 @@ class AgentManager:
         if vars(agent).get("_agent_manager") is self:
             agent._agent_manager = None
         canonical_name = self._canonical_agent_name(name)
-        if self._expired_spawn_authority_routes.get(canonical_name) is agent:
-            self._expired_spawn_authority_routes.pop(canonical_name, None)
+        if self._fenced_agent_routes.get(canonical_name) is agent:
+            self._fenced_agent_routes.pop(canonical_name, None)
         disarm_host_authority_deadline(agent)
 
     async def _discard_unpublished_initialized_agent(
@@ -5247,7 +5251,7 @@ class AgentManager:
             or (prepared is not None and prepared == (name, agent))
             or (admission is not None and admission.child is agent)
         ):
-            self._expired_spawn_authority_routes[canonical_name] = agent
+            self._fenced_agent_routes[canonical_name] = agent
 
     def fence_expired_spawn_routes(
         self,
@@ -5275,9 +5279,9 @@ class AgentManager:
         for child_name, agent in resolved:
             self._fence_expired_spawn_route(child_name, agent)
 
-    def _spawn_route_is_fenced(self, name: str, agent: object) -> bool:
+    def _agent_route_is_fenced(self, name: str, agent: object) -> bool:
         return (
-            self._expired_spawn_authority_routes.get(
+            self._fenced_agent_routes.get(
                 self._canonical_agent_name(name)
             )
             is agent
@@ -5297,7 +5301,7 @@ class AgentManager:
         """
 
         self._fence_expired_spawn_route(name, agent)
-        if not self._spawn_route_is_fenced(name, agent):
+        if not self._agent_route_is_fenced(name, agent):
             # Ignore a stale timer from an earlier occupant after this routing
             # name has completed release and become eligible for reuse.
             return
@@ -8014,14 +8018,14 @@ class AgentManager:
         """Get an agent by name (case-insensitive)."""
         # Try exact match first
         agent = self._agents.get(name)
-        if agent and not self._spawn_route_is_fenced(name, agent):
+        if agent and not self._agent_route_is_fenced(name, agent):
             return agent
         # Try case-insensitive
         name_lower = name.lower()
         for key, agent in self._agents.items():
             if (
                 key.lower() == name_lower
-                and not self._spawn_route_is_fenced(key, agent)
+                and not self._agent_route_is_fenced(key, agent)
             ):
                 return agent
         return None
@@ -8101,7 +8105,7 @@ class AgentManager:
         return {
             name: agent
             for name, agent in self._agents.items()
-            if not self._spawn_route_is_fenced(name, agent)
+            if not self._agent_route_is_fenced(name, agent)
         }
 
     def validate_host_context_clause_registry(self, registry) -> None:
@@ -8378,7 +8382,7 @@ class AgentManager:
         if name is None:
             return None
         agent = self._agents.get(name)
-        if agent is not None and self._spawn_route_is_fenced(name, agent):
+        if agent is not None and self._agent_route_is_fenced(name, agent):
             return None
         return name
 
@@ -12547,7 +12551,7 @@ class AgentManager:
         return (
             self._operation_is_admitted(admission)
             and self._agents.get(admission.name) is child
-            and not self._spawn_route_is_fenced(admission.name, child)
+            and not self._agent_route_is_fenced(admission.name, child)
             and isinstance(child_id, str)
             and self._agent_names.get(child_id) == admission.name
         )
