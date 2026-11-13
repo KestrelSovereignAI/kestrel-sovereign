@@ -24,6 +24,7 @@ from kestrel_sdk.operator import OperatorAuthorizationError, OperatorContext
 from kestrel_sdk.resources import ResourceError
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock as AsyncReaderWriterLock
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 
@@ -35,6 +36,7 @@ __all__ = [
     "HostCapabilityAuthority",
     "require_raw_capability_disclosure",
     "require_current_feature_host",
+    "require_current_http_agent",
 ]
 
 
@@ -122,7 +124,9 @@ class HostCapabilityAuthority:
             context.require_boundary(boundary_id)
             if binding.check_current(context, action, target) is not None:
                 raise TypeError("host authority checker must return None or raise")
-        except Exception:
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
             # Current-check diagnostics may contain credentials or private data.
             # An unavailable checker must never become an admission fallback.
             raise self.access_denied(f"{self.label} authority is unavailable") from None
@@ -185,8 +189,12 @@ def require_current_feature_host(agent, feature, agent_id: str, *,
             or runtime is None or runtime.is_active(feature) is not True
             or getattr(feature, "enabled", True) is not True or is_current() is not True):
         raise HostCapabilityAccessDenied(f"original {label} feature is unavailable")
-    if request is None:
-        return
+    if request is not None:
+        require_current_http_agent(agent, request, label=label)
+
+
+def require_current_http_agent(agent, request, *, label: str) -> None:
+    """Check actual host membership and the original routed agent identity."""
     routed = getattr(request.state, "agent", None)
     if routed is not None and routed is not agent:
         raise HostCapabilityAccessDenied(f"original {label} agent does not match route")

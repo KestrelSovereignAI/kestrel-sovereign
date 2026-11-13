@@ -31,6 +31,7 @@ from kestrel_sovereign.security.capability_authority import (
     require_current_feature_host, require_raw_capability_disclosure,
 )
 from kestrel_sovereign.security.csrf import CSRFError
+from kestrel_sovereign.security.request_body import read_json_model
 from kestrel_sovereign.security.private_delivery import AuthorizedCapabilityResponse
 from kestrel_sovereign.security.request_auth import RequestAuthenticationService, current_request_authentication
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
@@ -358,14 +359,7 @@ class MCPInputHost:
                 reader.check = None
 
     async def _body(self, request):
-        if request.headers.get('content-type', '').split(';', 1)[0].strip() != 'application/json':
-            raise ValueError('JSON response required')
-        body = bytearray()
-        async for chunk in request.stream():
-            if len(body) + len(chunk) > self.policy.max_request_bytes:
-                raise ValueError('MCP input response exceeded its byte limit')
-            body.extend(chunk)
-        return _Response.model_validate_json(bytes(body))
+        return await read_json_model(request, _Response, max_bytes=self.policy.max_request_bytes)
 
     @staticmethod
     def router_for(resolve_host):

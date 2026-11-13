@@ -1568,11 +1568,10 @@ class AgentManager:
         # private window so control features see the same spawn depth ceiling
         # they will have after ``_register_agent`` commits.
         self._prepared_agent_names: dict[str, tuple[str, KestrelAgent]] = {}
-        # A signed child is synchronously removed from every public routing
-        # view at its admission deadline, before cancellation-resistant ready
-        # work is joined.  The exact object remains in the private topology
-        # maps until the normal receipt/runtime rollback owner removes it.
-        self._expired_spawn_authority_routes: dict[str, KestrelAgent] = {}
+        # Fence public routing before expiry or fallible protocol retirement.
+        # Original instances remain privately owned in the topology maps and
+        # are reachable through _get_agent_for_lifecycle until cleanup settles.
+        self._fenced_agent_routes: dict[str, KestrelAgent] = {}
         # A deadline may have to abandon the *wait*, never the work owner. Keep
         # cancellation-resistant admission tasks strongly owned until they
         # actually settle, then consume their terminal outcome.
@@ -2255,7 +2254,7 @@ class AgentManager:
             not isinstance(recipient_id, str)
             or not recipient_id
             or not isinstance(name, str)
-            or self._spawn_route_is_fenced(name, recipient)
+            or self._agent_route_is_fenced(name, recipient)
             or (
                 self._agents.get(name) is not recipient
                 and self._onboarding_agents.get(name) is not recipient
@@ -2310,7 +2309,7 @@ class AgentManager:
         if (
             not isinstance(recipient_id, str)
             or not isinstance(name, str)
-            or self._spawn_route_is_fenced(name, recipient)
+            or self._agent_route_is_fenced(name, recipient)
             or self._agents.get(name) is not recipient
         ):
             return None
@@ -2821,7 +2820,7 @@ class AgentManager:
                     deadline=deadline,
                     phase="agent readiness",
                     agent=agent,
-                    on_expiry=lambda: self._fence_expired_spawn_route(
+                    on_expiry=lambda: self._fence_agent_route(
                         route_name,
                         agent,
                     ),
@@ -3539,6 +3538,8 @@ class AgentManager:
         observable.
         """
 
+        self._fence_agent_route(name, agent)
+
         # Wake any concurrently initializing descendants before withdrawing
         # this private candidate.  The false marker makes the wake a failure,
         # never evidence that the parent was verified.
@@ -3547,13 +3548,30 @@ class AgentManager:
         )
         if isinstance(authority_evidence_event, asyncio.Event):
             authority_evidence_event.set()
+        agent._agent_manager_published = False
         publication_event = vars(agent).get("_agent_manager_publication_event")
         if isinstance(publication_event, asyncio.Event):
             # Wake descendants on failure too.  The false publication marker
             # below makes the wake a refusal, never counterfeit authority.
-            agent._agent_manager_published = False
             publication_event.set()
-        self._revoke_a2a_hosted_policy(agent)
+        mcp = vars(agent).get("_native_mcp_publication")
+        failures = []
+        if mcp is not None:
+            from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+
+            if not isinstance(mcp, NativeMCPPublication) or mcp.agent is not agent:
+                failures.append(TypeError("Native MCP retirement requires its original host publication"))
+            else:
+                try:
+                    mcp.withdraw()
+                except BaseException as error:  # noqa: BLE001 - revoke both protocols before preserving original failures
+                    failures.append(error)
+        try:
+            self._revoke_a2a_hosted_policy(agent)
+        except BaseException as error:  # noqa: BLE001 - retain original A2A and MCP retirement failures together
+            failures.append(error)
+        if failures:
+            raise execution_finite_error(*failures, retain_originals=True)
         if self._onboarding_agents.get(name) is agent:
             self._onboarding_agents.pop(name, None)
         if self._initializing_agents.get(name) is agent:
@@ -3610,9 +3628,7 @@ class AgentManager:
             agent._agent_manager_authority_prepared = None
         if vars(agent).get("_agent_manager") is self:
             agent._agent_manager = None
-        canonical_name = self._canonical_agent_name(name)
-        if self._expired_spawn_authority_routes.get(canonical_name) is agent:
-            self._expired_spawn_authority_routes.pop(canonical_name, None)
+        self._clear_withdrawn_agent_route_fence(name, agent)
         disarm_host_authority_deadline(agent)
 
     async def _discard_unpublished_initialized_agent(
@@ -5212,7 +5228,7 @@ class AgentManager:
 
         task.add_done_callback(retire)
 
-    def _fence_expired_spawn_route(
+    def _fence_agent_route(
         self, name: str, agent: KestrelAgent
     ) -> None:
         """Synchronously revoke one exact child's public routing authority."""
@@ -5230,7 +5246,15 @@ class AgentManager:
             or (prepared is not None and prepared == (name, agent))
             or (admission is not None and admission.child is agent)
         ):
-            self._expired_spawn_authority_routes[canonical_name] = agent
+            self._fenced_agent_routes[canonical_name] = agent
+
+    def _clear_withdrawn_agent_route_fence(self, name: str, agent: KestrelAgent) -> None:
+        """Drop only the removed routing owner's fence, never cleanup custody."""
+        if self._published_agent_binding(name)[1] is agent:
+            raise RuntimeError("Withdraw original public routing before clearing its fence")
+        canonical_name = self._canonical_agent_name(name)
+        if self._fenced_agent_routes.get(canonical_name) is agent:
+            self._fenced_agent_routes.pop(canonical_name, None)
 
     def fence_expired_spawn_routes(
         self,
@@ -5256,11 +5280,11 @@ class AgentManager:
                 raise RuntimeError("Refusing to fence a different spawned child")
             resolved.append((child_name, agent))
         for child_name, agent in resolved:
-            self._fence_expired_spawn_route(child_name, agent)
+            self._fence_agent_route(child_name, agent)
 
-    def _spawn_route_is_fenced(self, name: str, agent: object) -> bool:
+    def _agent_route_is_fenced(self, name: str, agent: object) -> bool:
         return (
-            self._expired_spawn_authority_routes.get(
+            self._fenced_agent_routes.get(
                 self._canonical_agent_name(name)
             )
             is agent
@@ -5279,8 +5303,8 @@ class AgentManager:
         rollback, so it is never cancelled here.
         """
 
-        self._fence_expired_spawn_route(name, agent)
-        if not self._spawn_route_is_fenced(name, agent):
+        self._fence_agent_route(name, agent)
+        if not self._agent_route_is_fenced(name, agent):
             # Ignore a stale timer from an earlier occupant after this routing
             # name has completed release and become eligible for reuse.
             return
@@ -5412,7 +5436,7 @@ class AgentManager:
             deadline=deadline,
             phase="agent readiness",
             agent=agent,
-            on_expiry=lambda: self._fence_expired_spawn_route(name, agent),
+            on_expiry=lambda: self._fence_agent_route(name, agent),
             admission=admission,
         )
 
@@ -5559,7 +5583,7 @@ class AgentManager:
                     deadline=deadline,
                     phase="agent readiness publication verification",
                     agent=agent,
-                    on_expiry=lambda: self._fence_expired_spawn_route(
+                    on_expiry=lambda: self._fence_agent_route(
                         name, agent
                     ),
                     admission=admission,
@@ -6279,6 +6303,17 @@ class AgentManager:
             except BaseException:
                 self._withdraw_initialized_agent(name, agent)
                 raise
+        mcp = vars(agent).get("_native_mcp_publication")
+        if mcp is not None:
+            from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+
+            try:
+                if not isinstance(mcp, NativeMCPPublication) or mcp.agent is not agent:
+                    raise TypeError("Native MCP publication must be owned by the host")
+                mcp.publish()
+            except BaseException:
+                self._withdraw_initialized_agent(name, agent)
+                raise
         # Fleet-idleness (#F235): give EVERY agent — including ones created or
         # spawned after startup — a live view of all co-hosted agents, so
         # RestartCoordinator can gate a whole-host restart on the whole fleet
@@ -6288,9 +6323,9 @@ class AgentManager:
         agent._cohosted_agents_provider = lambda: list(self._agents.values())
         if self._initializing_agents.get(name) is agent:
             self._initializing_agents.pop(name, None)
+        agent._agent_manager_published = True
         publication_event = vars(agent).get("_agent_manager_publication_event")
         if isinstance(publication_event, asyncio.Event):
-            agent._agent_manager_published = True
             publication_event.set()
         logger.info(f"Loaded agent '{name}' (DID: {agent.agent_id[:30]}...)")
 
@@ -7986,14 +8021,14 @@ class AgentManager:
         """Get an agent by name (case-insensitive)."""
         # Try exact match first
         agent = self._agents.get(name)
-        if agent and not self._spawn_route_is_fenced(name, agent):
+        if agent and not self._agent_route_is_fenced(name, agent):
             return agent
         # Try case-insensitive
         name_lower = name.lower()
         for key, agent in self._agents.items():
             if (
                 key.lower() == name_lower
-                and not self._spawn_route_is_fenced(key, agent)
+                and not self._agent_route_is_fenced(key, agent)
             ):
                 return agent
         return None
@@ -8073,7 +8108,7 @@ class AgentManager:
         return {
             name: agent
             for name, agent in self._agents.items()
-            if not self._spawn_route_is_fenced(name, agent)
+            if not self._agent_route_is_fenced(name, agent)
         }
 
     def validate_host_context_clause_registry(self, registry) -> None:
@@ -8350,7 +8385,7 @@ class AgentManager:
         if name is None:
             return None
         agent = self._agents.get(name)
-        if agent is not None and self._spawn_route_is_fenced(name, agent):
+        if agent is not None and self._agent_route_is_fenced(name, agent):
             return None
         return name
 
@@ -10373,6 +10408,12 @@ class AgentManager:
                 if agent is None:
                     return False
 
+                # Retirement begins before task admission or arbitrary cleanup.
+                # Public routing and hosted protocol authority must stay denied
+                # even if shutdown cannot admit its original closer. Private
+                # lifecycle maps retain this exact owner for cleanup.
+                self._fence_agent_route(name, agent)
+
                 # ``wait_for(agent.shutdown())`` loses the actual task on timeout
                 # and on cancellation.  KestrelAgent deliberately runs its
                 # cancellation tail before re-raising, so that task is the primary
@@ -10579,6 +10620,7 @@ class AgentManager:
                 # republishing a process whose shutdown already completed.
                 self._agents.pop(name, None)
                 self._agent_names.pop(agent.agent_id, None)
+                self._clear_withdrawn_agent_route_fence(name, agent)
                 self._non_governing_spawn_lineage.difference_update(
                     _loaded_agent_bound_dids(agent)
                 )
@@ -12080,7 +12122,7 @@ class AgentManager:
                 deadline=signed_deadline,
                 phase="signed receipt persistence",
                 agent=candidate,
-                on_expiry=lambda: self._fence_expired_spawn_route(name, candidate),
+                on_expiry=lambda: self._fence_agent_route(name, candidate),
                 admission=admission,
             )
             # Ready hooks are wake-capable and the child becomes routable
@@ -12098,7 +12140,7 @@ class AgentManager:
                 deadline=signed_deadline,
                 phase="delegated budget custody",
                 agent=candidate,
-                on_expiry=lambda: self._fence_expired_spawn_route(name, candidate),
+                on_expiry=lambda: self._fence_agent_route(name, candidate),
                 admission=admission,
             )
 
@@ -12340,7 +12382,7 @@ class AgentManager:
                     mandate.ttl_seconds,
                 )
                 if remaining_ttl <= 0:
-                    self._fence_expired_spawn_route(admission.name, child)
+                    self._fence_agent_route(admission.name, child)
                     raise RuntimeError(
                         "Spawn mandate expired before governance commit"
                     )
@@ -12350,7 +12392,7 @@ class AgentManager:
                         timeout=remaining_ttl,
                     )
                 except TimeoutError:
-                    self._fence_expired_spawn_route(admission.name, child)
+                    self._fence_agent_route(admission.name, child)
                     raise RuntimeError(
                         "Spawn mandate expired before governance commit"
                     ) from None
@@ -12489,7 +12531,7 @@ class AgentManager:
             deadline=self._spawn_admission_deadline(child),
             phase="final signed receipt persistence",
             agent=child,
-            on_expiry=lambda: self._fence_expired_spawn_route(
+            on_expiry=lambda: self._fence_agent_route(
                 admission.name,
                 child,
             ),
@@ -12519,7 +12561,7 @@ class AgentManager:
         return (
             self._operation_is_admitted(admission)
             and self._agents.get(admission.name) is child
-            and not self._spawn_route_is_fenced(admission.name, child)
+            and not self._agent_route_is_fenced(admission.name, child)
             and isinstance(child_id, str)
             and self._agent_names.get(child_id) == admission.name
         )

@@ -32,6 +32,7 @@ from kestrel_sovereign.security.capability_authority import (
     require_raw_capability_disclosure, require_current_feature_host,
 )
 from kestrel_sovereign.security.csrf import CSRFError
+from kestrel_sovereign.security.request_body import read_json_model
 from kestrel_sovereign.security.private_delivery import (
     AuthorizedCapabilityResponse, PrivateTransportBorrow,
 )
@@ -351,14 +352,7 @@ class MCPAppsHost:
         return physical
 
     async def _body(self, request, model):
-        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/json":
-            raise ValueError("JSON request required")
-        content = bytearray()
-        async for chunk in request.stream():
-            if len(content) + len(chunk) > self._policy.max_request_bytes:
-                raise ValueError("MCP Apps request exceeds byte limit")
-            content.extend(chunk)
-        return model.model_validate_json(bytes(content))
+        return await read_json_model(request, model, max_bytes=self._policy.max_request_bytes)
 
     def attach(self, publications):
         if self._publications is not None:
