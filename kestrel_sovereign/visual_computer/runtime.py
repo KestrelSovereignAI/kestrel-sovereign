@@ -366,7 +366,10 @@ class VisualComputerRuntime:
                         await self.repository.save(self.scope(context), record, check)
                     return await self._acquire_open(context, record, check)
                 except BaseException as original:
-                    if original_setup is not None and not original_setup._handed_off:
+                    # Issuance alone is not a failed physical setup. An unused
+                    # setup follows the existing no-acquisition CAS below,
+                    # which independently validates its exact durable facts.
+                    if original_setup is not None and original_setup._used and not original_setup._handed_off:
                         try:
                             async with self._lock(record.session_id):
                                 await self._settle_failed_local_setup(self.scope(context), record, check)
