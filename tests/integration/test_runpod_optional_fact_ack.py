@@ -1,7 +1,8 @@
 """Known native create IDs survive optional validation and late payload changes.
 
-Only the owned local TLS peer replies are controlled. The original Core
-custody, encrypted SQLite, native HTTP and client/socket joins all execute.
+The owned local TLS peer replies and retained private continuation payload
+are controlled. Original Core custody, encrypted SQLite, native HTTP and
+client/socket joins all execute.
 """
 import json
 
@@ -88,6 +89,16 @@ async def test_successful_original_create_persists_known_id_before_rejecting_opt
         assert native_error is None
         assert phase is receipt.phase and phase.id == expected_id and phase.name == expected_name
         captured_facts = phase.facts
+        native_bytes = durable.acquisition.native_result.get_secret_value()
+        native_snapshot = json.loads(native_bytes)
+        assert native_snapshot == {
+            "schema_version": 1, "id": expected_id, "name": expected_name,
+            "status": phase.status, "gpu_id": phase.gpu_id,
+            "gpu_count": phase.gpu_count, "facts": json.loads(json.dumps(captured_facts)),
+        }
+        # Decoding the committed bytes gives an independent content snapshot;
+        # phase identity alone cannot detect a nested mutable payload alias.
+        frozen_facts_snapshot = native_snapshot["facts"]
         if optional_fact.startswith("optional_"):
             assert captured_facts is None, "over-budget facts must remain permanently unavailable"
         else:
@@ -100,27 +111,37 @@ async def test_successful_original_create_persists_known_id_before_rejecting_opt
             payload = producer._cost_payload
             assert type(payload) is dict
             if optional_fact == "env_integer":
-                payload["env"] = {"OPTIONAL_FACT": "valid"}
+                original_env = payload["env"]
+                original_env["OPTIONAL_FACT"] = "valid"
+                assert payload["env"] is original_env
             elif optional_fact == "malformed_created_at":
                 payload["createdAt"] = "2026-11-13T00:00:00Z"
             elif optional_fact == "empty_status":
                 payload["status"] = "RUNNING"
             elif optional_fact == "optional_text_over64k":
-                payload["env"] = {"OPTIONAL_TEXT": "valid"}
+                original_env = payload["env"]
+                original_env["OPTIONAL_TEXT"] = "valid"
+                assert payload["env"] is original_env
             else:
-                payload["args"] = []
+                original_args = payload["args"]
+                original_args.clear()
+                assert payload["args"] is original_args
             assert payload["id"] == expected_id and payload["name"] == expected_name
         assert phase.facts is captured_facts and not producer._finished
+        assert json.loads(json.dumps(phase.facts)) == frozen_facts_snapshot
         with pytest.raises(RunPodAmbiguousResultError) as invalid:
             producer.finish_optional_cost(phase)
         assert invalid.value.status_code == 201
         assert invalid.value.title == "Unverified Pod creation response"
         assert producer._finished and producer._public_result is None
         assert phase.facts is captured_facts
+        assert json.loads(json.dumps(phase.facts)) == frozen_facts_snapshot
         after = await original.store.get(
             SCOPE, request_id=original.request.request_id, guard=original.check,
         )
         assert after == durable
+        assert after.acquisition.native_result.get_secret_value() == native_bytes
+        assert json.loads(after.acquisition.native_result.get_secret_value()) == native_snapshot
         saved = EnvironmentAcquisitionStorage.deserialize_private(after.acquisition.storage)
         assert saved.checkpoint == checkpoint and saved.checkpoint.state == "unknown"
         assert after.lease.provider_resource_id == expected_id
