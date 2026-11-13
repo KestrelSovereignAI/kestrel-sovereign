@@ -43,7 +43,7 @@ from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from tests.utils.scheduler_ticks import tick_and_settle
+from tests.utils.scheduler_ticks import settle_occurrences, tick_and_settle
 
 
 async def _database(path):
@@ -1363,19 +1363,21 @@ async def test_overdue_builtin_one_shot_waits_for_agent_ready_before_dispatch(
                 "RestartOwner", "restart_coordinator", PermissionLevel.ALLOW,
             )
             await scheduler.on_agent_ready(agent)
-            await asyncio.wait_for(executed.wait(), timeout=1)
-            terminal_row = None
-            for _ in range(100):
-                terminal_row = await db.fetchone(
-                    """
-                    SELECT enabled, terminal_status
-                    FROM scheduled_tasks WHERE id = ?
-                    """,
-                    (added.data["task_id"],),
-                )
-                if terminal_row == (0, "success"):
-                    break
-                await asyncio.sleep(0.01)
+            assert scheduler._runner._task is not None
+            await asyncio.wait_for(executed.wait(), timeout=_HANG_GUARD_SECONDS)
+            # The callback signals dispatch, before the original occurrence
+            # commits its terminal row. Join that owner rather than polling
+            # SQLite under an unrelated one-second performance assumption.
+            await asyncio.wait_for(
+                settle_occurrences(scheduler._runner), timeout=_HANG_GUARD_SECONDS,
+            )
+            terminal_row = await db.fetchone(
+                """
+                SELECT enabled, terminal_status
+                FROM scheduled_tasks WHERE id = ?
+                """,
+                (added.data["task_id"],),
+            )
             assert terminal_row == (0, "success")
             assert await db.fetchone(
                 """
