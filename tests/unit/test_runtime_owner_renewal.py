@@ -567,3 +567,55 @@ async def test_a_tick_that_loses_the_race_to_retirement_neither_fails_it_nor_wri
         if not retired:
             dispatcher._runtime_owner_retiring = False
         await close_input_dispatcher(agent, dispatcher)
+
+
+@pytest.mark.parametrize("native_a2a_backend_factory", ["sqlite"], indirect=True)
+async def test_an_owner_whose_renewal_keeps_failing_is_reported_loudly_once(
+    manager, native_a2a_backend_factory, caplog  # noqa: F811 - the imported fixture
+):
+    """Operator P3 on PR #4050: an unretired owner whose backend has closed
+    fails to renew on every tick, and each failure was logged at ERROR, twice
+    with the heartbeat that joined it. The first renewal failure for an owner
+    and connection is logged at ERROR, later ones at DEBUG, and every one is
+    counted. Once a renewal succeeds, a later failure is loud again."""
+    import logging
+
+    agent, dispatcher, _ = await input_dispatcher(manager)
+    backend = dispatcher._durable_store.backend
+    loop = asyncio.get_running_loop()
+
+    async def failures_reach(count):
+        deadline = loop.time() + 15
+        while dispatcher.runtime_owner_renewal_failure_count < count:
+            assert loop.time() < deadline, "renewal stopped failing or stopped running"
+            await asyncio.sleep(0.02)
+
+    def reports(fragment):
+        return [
+            record.levelno for record in caplog.records
+            if fragment in record.getMessage()
+        ]
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="kestrel_sovereign.signals.dispatcher"):
+            assert dispatcher.runtime_owner_renewal_failure_count == 0
+            await backend.close()
+            await failures_reach(3)
+            assert reports("runtime-owner renewal failed").count(logging.ERROR) == 1
+            assert len(reports("runtime-owner renewal failed")) >= 3
+            assert logging.ERROR not in reports("runtime-owner heartbeat failed")
+
+            await backend.connect()
+            deadline = loop.time() + 15
+            while dispatcher._runtime_owner_renewal_failure_reported is not None:
+                assert loop.time() < deadline, "renewal never recovered"
+                await asyncio.sleep(0.02)
+            recovered = dispatcher.runtime_owner_renewal_failure_count
+            caplog.clear()
+            await backend.close()
+            await failures_reach(recovered + 2)
+            assert reports("runtime-owner renewal failed").count(logging.ERROR) == 1
+    finally:
+        if not backend.is_connected:
+            await backend.connect()
+        await close_input_dispatcher(agent, dispatcher)

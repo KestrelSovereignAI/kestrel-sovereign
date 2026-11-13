@@ -4497,10 +4497,11 @@ class DurableSignalStore(UnifiedStoreBase):
         requested_now = _as_utc(now) if now is not None else None
         async with self._backend.transaction():
             # Acquire the delivery's write/row serialization point before
-            # observing time.  SQLite transactions begin deferred, so the
-            # targeted no-op update reserves the actual writer slot; PostgreSQL
-            # locks this row with ``FOR UPDATE``.  Sampling first can publish a
-            # worker lease that has already expired while waiting here.
+            # observing time.  A SQLite transaction already holds the writer
+            # slot from ``BEGIN IMMEDIATE`` (#4040), and the targeted no-op
+            # update reserves it explicitly too; PostgreSQL locks this row
+            # with ``FOR UPDATE``.  Sampling first can publish a worker lease
+            # that has already expired while waiting here.
             initial = await self._lock_delivery_lease_row(
                 agent_id=agent_id,
                 consumer_id=consumer_id,
@@ -5818,11 +5819,11 @@ class DurableSignalStore(UnifiedStoreBase):
         registration could backfill before a concurrent event commits, while
         that event's consumer query runs before the registration commits.
         ``pg_advisory_xact_lock`` keeps those two atomic handoff paths in one
-        order and releases automatically on commit or rollback.  SQLite
-        transactions begin deferred, so a no-op write reserves its one writer
-        slot before either handoff path can read stale state.  This matters
-        across backend instances: each instance's in-memory write lock is
-        local to that instance.
+        order and releases automatically on commit or rollback.  On SQLite a
+        no-op write reserves its one writer slot before either handoff path
+        can read stale state, which ``BEGIN IMMEDIATE`` already holds since
+        #4040.  This matters across backend instances: each instance's
+        in-memory write lock is local to that instance.
         """
         if self.is_postgres:
             await self._backend.fetch_val(
@@ -6148,9 +6149,10 @@ class DurableSignalStore(UnifiedStoreBase):
                 params,
             )
         if self._backend.backend_type == "sqlite":
-            # ``BEGIN`` is deferred in SQLite. Updating the exact delivery to
-            # its current value claims the writer slot before the following
-            # read/time sample, while preserving every persisted field.
+            # Updating the exact delivery to its current value claims SQLite's
+            # writer slot before the following read/time sample, while
+            # preserving every persisted field. ``BEGIN IMMEDIATE`` already
+            # holds it since #4040.
             await self._backend.execute(
                 f"""
                 UPDATE {self.DELIVERIES}

@@ -1052,10 +1052,10 @@ class AsyncConversationStore:
                     "LOCK TABLE conversation_history IN ACCESS SHARE MODE"
                 )
             else:
-                # SQLite's default BEGIN is deferred.  Reserve the writer slot
-                # before reading the audit snapshot so another connection
-                # cannot replace a selected row's bytes while the external
-                # audit sink is appending their hash.
+                # Reserve SQLite's writer slot (already held from ``BEGIN
+                # IMMEDIATE`` since #4040) before reading the audit snapshot,
+                # so another connection cannot replace a selected row's bytes
+                # while the external audit sink is appending their hash.
                 await self.db.execute(
                     "UPDATE conversation_history SET id = id WHERE 0"
                 )

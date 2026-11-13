@@ -525,8 +525,9 @@ class AsyncStorage:
         ``immediate`` is forwarded to SQLite so a composed read-then-write unit
         can acquire the writer slot before its first read. This is required for
         nesting conditional graph mutations: SQLite cannot upgrade a deferred
-        snapshot after another connection has committed. Other backends ignore
-        the hint and use their normal row-locking primitives.
+        snapshot after another connection has committed. The native SQLite
+        backend now begins every transaction IMMEDIATE (#4040). Other backends
+        ignore the hint and use their normal row-locking primitives.
         """
         if not self._initialized:
             await self.initialize()

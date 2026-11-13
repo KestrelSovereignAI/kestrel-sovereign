@@ -15,6 +15,7 @@ import kestrel_sovereign
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
     OwnedTaskAdmission,
+    acquire_lock_keeping_cancellation,
     await_owned_task,
     create_owned_task,
     owned_task_error,
@@ -1185,3 +1186,33 @@ async def test_native_completion_retains_independent_observer_io_failure(tmp_pat
         assert observed is None and value == "original physical success"
     assert owner.done() and handle.closed
     assert effect.read_text() == "original native source physically completed"
+
+
+@pytest.mark.asyncio
+async def test_acquire_lock_keeping_cancellation_returns_every_cancellation_once_held():
+    """#4040: a closer cancelled while it waits for a lock still gets the
+    lock, and the cancellation is handed back rather than raised."""
+    lock = asyncio.Lock()
+    await lock.acquire()
+    acquiring = asyncio.create_task(acquire_lock_keeping_cancellation(lock))
+    try:
+        for _ in range(2):
+            while not lock._waiters:
+                await asyncio.sleep(0)
+            acquiring.cancel()
+            await asyncio.sleep(0)
+            assert not acquiring.done()
+    finally:
+        lock.release()
+    cancellation = await asyncio.wait_for(acquiring, 5)
+    assert isinstance(cancellation, asyncio.CancelledError)
+    assert lock.locked(), "the waiter does not hold the lock it was granted"
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_acquire_lock_keeping_cancellation_without_cancellation_returns_none():
+    lock = asyncio.Lock()
+    assert await acquire_lock_keeping_cancellation(lock) is None
+    assert lock.locked()
+    lock.release()

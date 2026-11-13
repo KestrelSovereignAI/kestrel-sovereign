@@ -1005,6 +1005,12 @@ class SignalDispatcher:
         # The one write that renews this owner, in a task of its own so that
         # nothing else a heartbeat does can hold it back (#4001).
         self._runtime_owner_renewal_task: Optional[asyncio.Task] = None
+        # Every renewal that failed, and the failure last reported at ERROR,
+        # with the (owner, connection generation) it was reported for: one
+        # unretired owner on a closed backend fails every tick (#4040).
+        self._runtime_owner_renewal_failures = 0
+        self._runtime_owner_renewal_failure_reported: Optional[tuple] = None
+        self._runtime_owner_renewal_last_failure: Optional[BaseException] = None
         # A transient ledger outage must not silently orphan this runtime's
         # ownership heartbeat.  Backoff is capped so repeated errors retain a
         # bounded future retry rather than either hot-looping or giving up.
@@ -3789,17 +3795,48 @@ class SignalDispatcher:
         self._runtime_owner_renewal_task = None
         from kestrel_sovereign._async_ownership import owned_task_error
         error = owned_task_error(task)
-        if error is None or isinstance(error, _DurableDeliveryShuttingDownError):
+        if error is None:
+            # A failure after a renewal succeeded is a new fault, reported
+            # at ERROR again.
+            self._runtime_owner_renewal_failure_reported = None
+            return
+        if isinstance(error, _DurableDeliveryShuttingDownError):
             return
         self._retain_durable_writer_control(error)
-        logger.error(
-            "Durable signal runtime-owner renewal failed (%s); retrying",
-            type(error).__name__,
-        )
+        self._report_runtime_owner_renewal_failure(error)
         if self._runtime_owner_liveness_required():
             # A heartbeat that joined this renewal counts the failure; this
             # only brings the next tick forward.
             self._rearm_cleanup_runtime_owner_heartbeat()
+
+    def _report_runtime_owner_renewal_failure(self, error: BaseException) -> None:
+        """Count a failed renewal and log it, loudly once (#4040).
+
+        An unretired owner whose backend has closed fails to renew on every
+        tick. The first failure for an (owner, connection generation) is
+        logged at ERROR, later ones at DEBUG, until a renewal succeeds. Every
+        one is counted in :attr:`runtime_owner_renewal_failure_count`.
+        """
+        self._runtime_owner_renewal_failures = (
+            getattr(self, "_runtime_owner_renewal_failures", 0) + 1
+        )
+        self._runtime_owner_renewal_last_failure = error
+        generation = getattr(
+            getattr(self._durable_store, "backend", None), "connection_generation", None,
+        )
+        key = (
+            self._durable_delivery_owner,
+            generation if isinstance(generation, str) else None,
+        )
+        repeated = key == getattr(self, "_runtime_owner_renewal_failure_reported", None)
+        self._runtime_owner_renewal_failure_reported = key
+        logger.log(
+            logging.DEBUG if repeated else logging.ERROR,
+            "Durable signal runtime-owner renewal failed (%s); retrying "
+            "(%d renewal failures so far)",
+            type(error).__name__,
+            self._runtime_owner_renewal_failures,
+        )
 
     async def _renew_runtime_owner(self, task: Optional[asyncio.Task] = None) -> None:
         """Renew this owner, joining ``task`` or a renewal already running.
@@ -3951,7 +3988,15 @@ class SignalDispatcher:
             self._schedule_runtime_owner_heartbeat()
             return
         if error is not None:
-            logger.error("Durable signal runtime-owner heartbeat failed (%s)", type(error).__name__)
+            # A heartbeat fails with the renewal it joined; that failure was
+            # already reported, and at most once loudly (#4040).
+            logger.log(
+                logging.DEBUG
+                if error is getattr(self, "_runtime_owner_renewal_last_failure", None)
+                else logging.ERROR,
+                "Durable signal runtime-owner heartbeat failed (%s)",
+                type(error).__name__,
+            )
             if self._runtime_owner_liveness_required():
                 self._runtime_owner_heartbeat_failures += 1
                 self._schedule_runtime_owner_heartbeat(retry=True)
@@ -8652,6 +8697,16 @@ class SignalDispatcher:
         that is the point of surfacing it.
         """
         return self._log_write_failures
+
+    @property
+    def runtime_owner_renewal_failure_count(self) -> int:
+        """Number of this owner's renewals that failed since it was built.
+
+        Monotonic. Only the first failure for an owner and connection
+        generation is logged at ERROR, until a renewal succeeds (#4040), so
+        this is where a failure that repeats every tick stays visible.
+        """
+        return getattr(self, "_runtime_owner_renewal_failures", 0)
 
     @property
     def lock_manager(self) -> OrderedLockManager:

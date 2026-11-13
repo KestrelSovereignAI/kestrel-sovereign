@@ -279,3 +279,64 @@ async def test_closing_the_backend_joins_a_renewal_in_flight(native_pg_url, monk
                 await asyncio.wait({pending}, timeout=5)
         if closing is None or not closing.done() or closing.exception() is not None:
             await backend.close()
+
+
+async def test_cancelling_close_while_it_joins_a_renewal_still_closes_every_pool(
+    native_pg_url, monkeypatch
+):
+    """Self-review of #4040: close joins a renewal in flight by taking
+    renewal's lock, and that wait was cancellable. A close cancelled during
+    it raised before any pool closer ran, leaving renewal's pool, the
+    advisory pool and the operational pool open and attached. Close now
+    keeps the cancellation, lets the renewal commit, closes every pool, then
+    raises it."""
+    schema_url = native_pg_url
+    backend = PostgresBackend(schema_url, min_pool_size=1, max_pool_size=1)
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    owner = {"agent_id": "did:kestrel:cancel-4040", "owner_id": "dispatcher:cancel-4040"}
+    renewing = closing = None
+    release = asyncio.Event()
+    try:
+        await store.initialize()
+        await store.register_runtime_owner(**owner)
+        await backend._ensure_advisory_pool()
+        attributes = ("_runtime_owner_renewal_pool", "_advisory_pool", "_pool")
+        pools = {attribute: getattr(backend, attribute) for attribute in attributes}
+        assert all(pool is not None for pool in pools.values())
+        entered = asyncio.Event()
+        renewal_pool = backend._runtime_owner_renewal_pool_locked
+
+        async def paused_renewal_pool():
+            entered.set()
+            await release.wait()
+            return await renewal_pool()
+
+        monkeypatch.setattr(backend, "_runtime_owner_renewal_pool_locked", paused_renewal_pool)
+        renewing = asyncio.create_task(store.retain_unretired_runtime_owner(**owner))
+        await asyncio.wait_for(entered.wait(), 5)
+        closing = asyncio.create_task(backend.close())
+        await asyncio.sleep(0.2)
+        assert not closing.done(), "close did not wait for the renewal in flight"
+        closing.cancel()
+        await asyncio.sleep(0.2)
+        assert not closing.done(), "a cancelled close stopped joining the renewal"
+        assert not any(pool.is_closing() for pool in pools.values())
+
+        release.set()
+        assert await asyncio.wait_for(renewing, 5) is True
+        done, _ = await asyncio.wait({closing}, timeout=10)
+        assert closing in done, "close never finished once the renewal had"
+        assert closing.cancelled(), "close did not deliver the caller's cancellation"
+        for attribute, pool in pools.items():
+            assert pool.is_closing(), f"close left {attribute} open"
+            assert getattr(backend, attribute) is None, f"close left {attribute} attached"
+    finally:
+        release.set()
+        for pending in (renewing, closing):
+            if pending is not None and not pending.done():
+                await asyncio.wait({pending}, timeout=5)
+        if any(getattr(backend, attribute, None) is not None for attribute in (
+            "_runtime_owner_renewal_pool", "_advisory_pool", "_pool",
+        )):
+            await backend.close()

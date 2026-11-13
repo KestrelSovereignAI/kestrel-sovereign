@@ -219,8 +219,9 @@ class ConversationLexicalIndex:
                         (lock_id,),
                     )
             elif self.db.backend_type == "sqlite":
-                # SQLite transactions begin deferred. Promote an otherwise
-                # standalone cleanup scope to the one serialized writer slot.
+                # Hold an otherwise standalone cleanup scope to the one
+                # serialized writer slot, which ``BEGIN IMMEDIATE`` already
+                # takes since #4040.
                 await self.db.execute(
                     "DELETE FROM conversation_lexical_tokens WHERE 0"
                 )

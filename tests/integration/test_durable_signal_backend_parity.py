@@ -175,6 +175,27 @@ async def _independent_postgres_schema_backend(db_backend):
         await db_backend.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
+def _note_sqlite_writer_slot_request(backend, reached: asyncio.Event) -> None:
+    """Set ``reached`` once a SQLite ``backend``'s transaction asks for the slot.
+
+    Every SQLite transaction takes the writer slot at ``BEGIN IMMEDIATE``
+    (#4040), so one contending with another connection waits there, before its
+    scope handoff or any other statement runs. PostgreSQL waits inside the
+    handoff itself. A no-op on PostgreSQL.
+    """
+    if backend.backend_type != "sqlite":
+        return
+    connection = backend._connection
+    execute = connection.execute
+
+    def watching_execute(sql, *args, **kwargs):
+        if sql == "BEGIN IMMEDIATE":
+            reached.set()
+        return execute(sql, *args, **kwargs)
+
+    connection.execute = watching_execute
+
+
 def _is_scope_handoff_lock(query: str) -> bool:
     return (
         "pg_advisory_xact_lock" in query
@@ -686,6 +707,7 @@ async def test_implicit_claim_clock_follows_contended_scope_handoff_on_both_back
         await original_handoff(**kwargs)
 
     monkeypatch.setattr(store, "_lock_scope_handoff", observe_handoff)
+    _note_sqlite_writer_slot_request(db_backend, entered_handoff)
 
     async def hold_peer_scope() -> None:
         async with peer_backend.transaction():
@@ -768,6 +790,7 @@ async def test_registration_backfill_clock_follows_contended_scope_handoff_on_bo
         await original_handoff(**kwargs)
 
     monkeypatch.setattr(store, "_lock_scope_handoff", observe_handoff)
+    _note_sqlite_writer_slot_request(db_backend, entered_handoff)
 
     async def hold_peer_scope() -> None:
         async with peer_backend.transaction():
@@ -841,6 +864,7 @@ async def test_source_boundary_and_ingress_share_one_cross_connection_order(
             monkeypatch.setattr(
                 peer_store, "_lock_scope_handoff", observe_contending_persistence
             )
+            _note_sqlite_writer_slot_request(peer_backend, contender_entered)
             persistence_task = asyncio.create_task(
                 peer_store.persist_signal(
                     _signal(agent_id),
@@ -880,6 +904,7 @@ async def test_source_boundary_and_ingress_share_one_cross_connection_order(
             monkeypatch.setattr(
                 peer_store, "_lock_scope_handoff", observe_contending_capture
             )
+            _note_sqlite_writer_slot_request(peer_backend, contender_entered)
             capture_task = asyncio.create_task(
                 peer_store.capture_source_boundary(agent_id=agent_id, source=source)
             )
@@ -955,6 +980,7 @@ async def test_boundary_samples_sequence_after_waiting_for_source_writer(
             await original_handoff(**kwargs)
 
         monkeypatch.setattr(store, "_lock_scope_handoff", observe_capture_handoff)
+        _note_sqlite_writer_slot_request(db_backend, capture_entered)
         capture_task = asyncio.create_task(
             store.capture_source_boundary(agent_id=agent_id, source=source)
         )
@@ -5105,6 +5131,7 @@ async def test_initial_worker_transfer_does_not_publish_an_expired_lease_after_c
                 return await original_execute(query, params)
 
             db_backend.execute = observe_transfer_lock
+        _note_sqlite_writer_slot_request(db_backend, transfer_waiting)
 
         try:
             transfer_task = asyncio.create_task(
@@ -5218,6 +5245,7 @@ async def test_durable_registration_persistence_handoff_is_atomic_across_instanc
                 persistence_backend.fetch_val = note_persistence_handoff
             else:
                 persistence_backend.execute = note_persistence_handoff
+            _note_sqlite_writer_slot_request(persistence_backend, persistence_started)
             persistence_task = asyncio.create_task(
                 persistence_store.persist_signal(
                     event,
@@ -5273,6 +5301,7 @@ async def test_durable_registration_persistence_handoff_is_atomic_across_instanc
                 registration_backend.fetch_val = note_registration_handoff
             else:
                 registration_backend.execute = note_registration_handoff
+            _note_sqlite_writer_slot_request(registration_backend, registration_started)
             registration_task = asyncio.create_task(
                 registration_store.register_consumer(registration)
             )

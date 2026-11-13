@@ -171,6 +171,26 @@ def _registration(agent: _Agent, source: str = "provider.message") -> SourceRegi
     )
 
 
+def _observe_writer_slot_request(backend: SQLiteBackend) -> asyncio.Event:
+    """An event set once ``backend``'s next transaction asks for the writer slot.
+
+    Every SQLite transaction takes the slot at ``BEGIN IMMEDIATE`` (#4040), so
+    one contending with another connection's writer waits there, before its
+    scope handoff or any other statement runs.
+    """
+    requested = asyncio.Event()
+    connection = backend._connection
+    execute = connection.execute
+
+    def watching_execute(sql, *args, **kwargs):
+        if sql == "BEGIN IMMEDIATE":
+            requested.set()
+        return execute(sql, *args, **kwargs)
+
+    connection.execute = watching_execute
+    return requested
+
+
 def _signal(*, agent_id: str, source: str = "provider.message", message: str = " hello ", workflow: str = "wf-1") -> Signal:
     return Signal(
         source=source,
@@ -6968,16 +6988,9 @@ async def test_implicit_claim_clock_is_sampled_after_contended_scope_handoff(
         source_event_id="provider:contended-claim",
         retention_days=7,
     )
-    entered_handoff = asyncio.Event()
+    entered_handoff = _observe_writer_slot_request(backend)
     writer_acquired = asyncio.Event()
     release_writer = asyncio.Event()
-    original_handoff = store._lock_scope_handoff
-
-    async def observe_handoff(**kwargs):
-        entered_handoff.set()
-        await original_handoff(**kwargs)
-
-    store._lock_scope_handoff = observe_handoff  # type: ignore[method-assign]
 
     async def hold_peer_writer():
         async with peer.transaction():
@@ -7007,7 +7020,8 @@ async def test_implicit_claim_clock_is_sampled_after_contended_scope_handoff(
             )
         await asyncio.wait_for(entered_handoff.wait(), timeout=1)
         # The method is now blocked at the database handoff, after its caller
-        # began but before it owns the serialization point.
+        # began but before it owns the serialization point: the writer slot
+        # its transaction takes at ``BEGIN IMMEDIATE`` (#4040).
         clock["now"] = base + timedelta(seconds=2)
         release_writer.set()
         claimed = await asyncio.wait_for(claim_task, timeout=1)
@@ -7151,16 +7165,9 @@ async def test_registration_backfill_clock_is_sampled_after_contended_scope_hand
         source="provider.message",
         agent_id=agent_id,
     )
-    entered_handoff = asyncio.Event()
+    entered_handoff = _observe_writer_slot_request(backend)
     writer_acquired = asyncio.Event()
     release_writer = asyncio.Event()
-    original_handoff = store._lock_scope_handoff
-
-    async def observe_handoff(**kwargs):
-        entered_handoff.set()
-        await original_handoff(**kwargs)
-
-    store._lock_scope_handoff = observe_handoff  # type: ignore[method-assign]
 
     async def hold_peer_writer():
         async with peer.transaction():

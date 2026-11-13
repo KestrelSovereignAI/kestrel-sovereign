@@ -83,12 +83,17 @@ _AIOSQLITE_WORKER_SHUTDOWN_POLL_S = 0.01
 # return control to SQLite.
 _SQLITE_BUSY_TIMEOUT_S = 30.0
 _CANCELLED_OPERATION_DRAIN_TIMEOUT_S = _SQLITE_BUSY_TIMEOUT_S
-# How long a runtime-owner renewal waits for SQLite's writer slot before it
-# fails and a heartbeat retries it: the bound PostgreSQL's renewal puts on
-# its whole transaction (#4001), so a renewal waiting behind another writer
-# is retried within a heartbeat interval rather than holding its slot for
-# the shared busy timeout.
-_SQLITE_OWNER_RENEWAL_BUSY_TIMEOUT_S = 5.0
+# A runtime-owner renewal waits for SQLite's writer slot in attempts of at most
+# this long, and between attempts ends, having written nothing, once close has
+# retired it (#4040). Close therefore joins only a renewal that already holds
+# the slot, and the slice is part of its reservation (``minimum_close_timeout_s``).
+_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S = 0.1
+# How long one renewal keeps trying for the writer slot before it fails and a
+# heartbeat retries it: the bound PostgreSQL's renewal puts on its whole
+# transaction (#4001), so a renewal waiting behind another writer is retried
+# within a heartbeat interval rather than holding its slot for the shared busy
+# timeout.
+_SQLITE_OWNER_RENEWAL_DEADLINE_S = 5.0
 
 # Backoff between attempts of a cancellation-drain rollback that the drain's
 # own interrupt aborted. Attempts stop at the drain deadline above.
@@ -1137,8 +1142,13 @@ class SQLiteBackend(DatabaseBackend):
         keeps the primary-backend reservation equal to the single-connection
         lifecycle contract also used by SQLAlchemy factories, without
         shrinking the rest of whole-agent shutdown.
+
+        Close first joins a runtime-owner renewal that already holds SQLite's
+        writer slot, which is bounded by one renewal attempt
+        (``_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S``); its connections' deadline is
+        taken after that join, so the join never consumes it (#4040).
         """
-        return _minimum_close_timeout_s()
+        return _SQLITE_OWNER_RENEWAL_BUSY_SLICE_S + _minimum_close_timeout_s()
     
     def _wal_sidecars(self) -> tuple[Path, ...]:
         """The files SQLite creates beside a WAL database while it is in use."""
@@ -1365,12 +1375,15 @@ class SQLiteBackend(DatabaseBackend):
         from .original_result_custody import _drain_original_results
         await _drain_original_results(self)
         loop = asyncio.get_running_loop()
-        close_deadline = loop.time() + self.minimum_close_timeout_s
-        # Renewal's own connection first, once a renewal in flight has ended,
-        # within the same budget: it is idle by then (#4001).
-        renewal_failure = await self._retire_runtime_owner_renewal(
-            deadline=close_deadline,
-        )
+        # A renewal still waiting for SQLite's writer slot sees this between
+        # attempts and ends having written nothing, so the join below waits
+        # only for one that already holds the slot (#4040).
+        self._runtime_owner_renewal_retired = True
+        # Renewal's own connection first (#4001). Every connection's close
+        # shares the deadline taken after that join, which never consumes it.
+        (
+            close_deadline, renewal_failure, pending_cancellation,
+        ) = await self._retire_runtime_owner_renewal()
         conn = self._connection
         failure = (
             self._cancelled_write_drain_error
@@ -1384,15 +1397,24 @@ class SQLiteBackend(DatabaseBackend):
                 retain_originals=True, isolate_control_originals=True,
             )
         if conn is None:
-            self._raise_if_connection_retirement_pending()
+            try:
+                self._raise_if_connection_retirement_pending()
+            except BaseException as error:
+                raise execution_terminal_error(
+                    failure, error, pending_cancellation, retain_originals=True,
+                    isolate_control_originals=True,
+                )
             self._cancelled_write_drain = None
             self._cancelled_write_drain_started_at = None
             self._cancelled_write_drain_error = None
-            if failure is not None:
-                raise failure
+            terminal = execution_terminal_error(
+                failure, pending_cancellation, retain_originals=True,
+                isolate_control_originals=True,
+            )
+            if terminal is not None:
+                raise terminal
             return
 
-        pending_cancellation: Optional[BaseException] = None
         diagnostics = self._close_diagnostics()
         # Fence new cancellation handoffs before sampling the retained drain.
         # A write cancelled from this point onward is retired by connection
@@ -1671,12 +1693,16 @@ class SQLiteBackend(DatabaseBackend):
         connection cannot commit that work. Were
         renewal held back by that fence, a peer reaching the file through its
         own connection would find the owner stale and reclaim leases it still
-        holds. Only SQLite's writer slot is shared: while the abandoned
-        transaction still holds it this waits for it, bounded by
-        ``_SQLITE_OWNER_RENEWAL_BUSY_TIMEOUT_S``, then fails and is retried.
-        An in-memory database has no second connection, and none for a peer
-        either: every writer to it, a peer's recovery included, passes the
-        same fence, so it is renewed on the shared connection.
+        holds. Only SQLite's writer slot is shared. While another connection
+        holds it, renewal tries for it in attempts of
+        ``_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S`` until
+        ``_SQLITE_OWNER_RENEWAL_DEADLINE_S`` has passed, then fails and a
+        later heartbeat retries it. Between attempts it ends, having written
+        nothing, once :meth:`close` has retired it (#4040): close then waits
+        only for a renewal that already holds the slot. An in-memory database
+        has no second connection, and none for a peer either: every writer to
+        it, a peer's recovery included, passes the same fence, so it is
+        renewed on the shared connection.
 
         Renewal's connection stays open between renewals, as PostgreSQL's
         renewal pool does, and :meth:`close` retires it. A connection opened
@@ -1686,7 +1712,7 @@ class SQLiteBackend(DatabaseBackend):
         every one. A renewal that fails, or is interrupted, may leave its
         transaction holding the writer slot, so its connection is retired
         then too, which rolls that transaction back; the next renewal opens
-        another.
+        another. Once close has retired renewal, close retires it instead.
         """
         from kestrel_sovereign.signals.durable import DurableSignalStore
 
@@ -1708,25 +1734,57 @@ class SQLiteBackend(DatabaseBackend):
                 )
             return updated == 1
         self._require_execution_backend()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SQLITE_OWNER_RENEWAL_DEADLINE_S
         async with self._runtime_owner_renewal_lock():
             conn = await self._runtime_owner_renewal_connection_locked()
+            retired = False
             try:
                 try:
-                    await conn.execute("BEGIN IMMEDIATE")
-                    now = timestamp()
-                    cursor = await conn.execute(
-                        sql, (now, now, now, now, agent_id, owner_id)
-                    )
-                    updated = cursor.rowcount
-                    await cursor.close()
-                    await conn.commit()
+                    while True:
+                        if getattr(self, "_runtime_owner_renewal_retired", False):
+                            retired = True
+                            break
+                        # Opening the connection checked the file it reached;
+                        # the pathname may have been replaced since (#4040).
+                        self.assert_connected_file_still_valid()
+                        try:
+                            await conn.execute("BEGIN IMMEDIATE")
+                            break
+                        except sqlite3.OperationalError as error:
+                            code = getattr(error, "sqlite_errorcode", None)
+                            if not (
+                                isinstance(code, int)
+                                and code & 0xFF == sqlite3.SQLITE_BUSY
+                            ) or loop.time() >= deadline:
+                                raise
+                    if not retired:
+                        now = timestamp()
+                        cursor = await conn.execute(
+                            sql, (now, now, now, now, agent_id, owner_id)
+                        )
+                        updated = cursor.rowcount
+                        await cursor.close()
+                        # Nothing commits on a file this backend no longer
+                        # reaches by its path: the cleanup below rolls back.
+                        self.assert_connected_file_still_valid()
+                        await conn.commit()
                 except sqlite3.Error as error:
                     raise QueryError(f"SQLite owner renewal failed: {error}") from error
             except BaseException as error:
+                if getattr(self, "_runtime_owner_renewal_retired", False):
+                    # Close retires this connection, rolling back whatever
+                    # this renewal left open, once it has joined it.
+                    raise
                 cleanup_error = await self._retire_runtime_owner_renewal_connection_locked()
                 if cleanup_error is not None:
-                    raise execution_terminal_error(error, cleanup_error)
+                    raise execution_terminal_error(
+                        error, cleanup_error, retain_originals=True,
+                        prefer_cancellation=True, isolate_control_originals=True,
+                    )
                 raise
+        if retired:
+            raise ConnectionError("owner renewal requires the original backend")
         return updated == 1
 
     def _runtime_owner_renewal_lock(self) -> asyncio.Lock:
@@ -1751,7 +1809,7 @@ class SQLiteBackend(DatabaseBackend):
         if getattr(self, "_runtime_owner_renewal_retired", False):
             raise ConnectionError("owner renewal requires the original backend")
         conn = await self._open_sibling_connection(
-            busy_timeout_s=_SQLITE_OWNER_RENEWAL_BUSY_TIMEOUT_S, query_only=False,
+            busy_timeout_s=_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S, query_only=False,
         )
         self._runtime_owner_renewal_connection = conn
         return conn
@@ -1782,19 +1840,42 @@ class SQLiteBackend(DatabaseBackend):
         return None
 
     async def _retire_runtime_owner_renewal(
-        self, *, deadline: Optional[float] = None,
-    ) -> BaseException | None:
-        """Retire renewal's connection once the renewal using it has ended.
+        self,
+    ) -> tuple[float, BaseException | None, BaseException | None]:
+        """Join a renewal in flight, then retire renewal's connection (#4040).
 
-        Taking the renewal lock joins a renewal in flight, whose write is
-        bounded by its busy timeout; closing its connection under it would
-        end that renewal, and retirement is the only thing that may.
+        Call once :meth:`close` has marked renewal retired: a renewal still
+        waiting for SQLite's writer slot then ends at its next attempt having
+        written nothing, so the join waits for at most one attempt
+        (``_SQLITE_OWNER_RENEWAL_BUSY_SLICE_S``) and one UPDATE and COMMIT.
+        Closing renewal's connection under a renewal would end it, so the
+        join comes first. A cancellation of the caller during either is kept
+        rather than raised, so close still retires every connection, and is
+        returned for close to deliver after that.
+
+        Returns the deadline every connection's close shares, taken after the
+        join so that the join never consumes it; the failure retiring
+        renewal's connection; and the caller's cancellation.
         """
-        async with self._runtime_owner_renewal_lock():
+        from kestrel_sovereign._async_ownership import acquire_lock_keeping_cancellation
+
+        lock = self._runtime_owner_renewal_lock()
+        cancellation = await acquire_lock_keeping_cancellation(lock)
+        try:
             self._runtime_owner_renewal_retired = True
-            return await self._retire_runtime_owner_renewal_connection_locked(
+            deadline = asyncio.get_running_loop().time() + _minimum_close_timeout_s()
+            failure = await self._retire_runtime_owner_renewal_connection_locked(
                 deadline=deadline,
             )
+        finally:
+            lock.release()
+        if isinstance(failure, asyncio.CancelledError) and not is_execution_control_error(failure):
+            cancellation = execution_terminal_error(
+                cancellation, failure, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+            failure = None
+        return deadline, failure, cancellation
 
     @asynccontextmanager
     async def _read_connection(
@@ -2984,10 +3065,19 @@ class SQLiteBackend(DatabaseBackend):
     async def transaction(self, *, immediate: bool = False, savepoint: bool = False) -> AsyncIterator[None]:
         """Transaction context manager.
 
-        ``BEGIN IMMEDIATE`` is reserved for one-time schema migrations that
-        must acquire SQLite's writer slot before inspecting a migration marker.
-        Normal data mutations retain deferred ``BEGIN`` so read-first flows do
-        not unnecessarily block one another.
+        Every transaction begins ``BEGIN IMMEDIATE``, taking SQLite's writer
+        slot before its first statement, so none has to upgrade a read
+        snapshot into a write (#4040). A deferred transaction that read, then
+        wrote after another connection committed, failed at once with
+        ``database is locked``: WAL refuses to upgrade a stale snapshot, and
+        the busy timeout does not apply. Runtime-owner renewal commits on a
+        connection of its own every heartbeat, so a deferred read-then-write
+        failed intermittently; taking the slot first, a transaction only
+        waits for it, within the busy timeout. Transactions on this
+        connection are already serialized by its write guard, so this costs
+        them nothing among themselves; a transaction that only reads holds
+        the slot for as long as it runs, as a writing one does.
+        ``immediate`` is accepted for compatibility and has no further effect.
         """
         conn = self._ensure_connected()
 
@@ -3034,7 +3124,7 @@ class SQLiteBackend(DatabaseBackend):
                 self._txn_owner = asyncio.current_task()
                 self._after_commit = AfterCommitCallbacks()
                 try:
-                    await conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                    await conn.execute("BEGIN IMMEDIATE")
                     yield
                     self._require_native_transaction()
                     await self._commit_write(conn)

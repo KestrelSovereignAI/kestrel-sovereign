@@ -695,6 +695,31 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
     return OwnedTaskOutcome((originals - pending, pending), None, withdrawal)
 
 
+async def acquire_lock_keeping_cancellation(lock: asyncio.Lock) -> BaseException | None:
+    """Acquire ``lock`` however often the caller is cancelled meanwhile.
+
+    For a closer that must still release what it owns after the lock's
+    holder finishes, such as a backend close joining a runtime-owner renewal
+    (#4040). A cancellation while waiting is kept rather than raised, and
+    returned once the lock is held, for the caller to deliver after its
+    cleanup. A grant that a cancellation overtook is passed on by
+    ``asyncio.Lock`` itself, so the lock is never left held by this waiter.
+    """
+    from kestrel_sovereign.execution_custody import execution_terminal_error
+
+    cancellation: BaseException | None = None
+    while True:
+        try:
+            await lock.acquire()
+        except asyncio.CancelledError as error:
+            cancellation = execution_terminal_error(
+                cancellation, error, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+            continue
+        return cancellation
+
+
 async def gather_owned(operations, *, cancel_siblings_on_error=True,
                        retirement_resource=None, retain_originals=False,
                        name_prefix: str | None = None,

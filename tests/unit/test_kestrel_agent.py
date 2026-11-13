@@ -3382,8 +3382,10 @@ class TestLifecycle:
                 storage_close + ka.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S
             )
 
-        assert storage_close == pytest.approx(1.01)
-        assert (prefix, reserve) == pytest.approx((3.49, 1.51))
+        # One renewal attempt the close joins (#4040), then one worker
+        # shutdown window and its poll interval.
+        assert storage_close == pytest.approx(1.11)
+        assert (prefix, reserve) == pytest.approx((3.39, 1.61))
 
 
 # =============================================================================

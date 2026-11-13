@@ -34,6 +34,7 @@ from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskAdmission,
+    acquire_lock_keeping_cancellation,
     await_owned_task,
     create_owned_task,
 )
@@ -973,14 +974,26 @@ class PostgresBackend(DatabaseBackend):
 
         Taking the renewal lock joins a renewal in flight, whose write is
         bounded; closing the pool under it would end that renewal, and
-        retirement is the only thing that may.
+        retirement is the only thing that may. A cancellation of the caller
+        while it joins is kept rather than raised, so this pool still closes
+        and :meth:`close` still retires the others, and is returned with this
+        pool's close failure for close to raise after them (#4040).
         """
-        async with self._runtime_owner_renewal_lock():
+        lock = self._runtime_owner_renewal_lock()
+        cancellation = await acquire_lock_keeping_cancellation(lock)
+        try:
             self._runtime_owner_renewal_retired = True
             pool = getattr(self, "_runtime_owner_renewal_pool", None)
-            if pool is None:
-                return None
-            return await self._retire_owned_pool("_runtime_owner_renewal_pool", pool)
+            failure = (
+                None if pool is None
+                else await self._retire_owned_pool("_runtime_owner_renewal_pool", pool)
+            )
+        finally:
+            lock.release()
+        return execution_terminal_error(
+            failure, cancellation, retain_originals=True, prefer_cancellation=True,
+            isolate_control_originals=True,
+        )
 
     async def _retire_owned_pool(self, attribute: str, pool: Any) -> BaseException | None:
         """One exact pool closer for backend exit and refused new allocation."""

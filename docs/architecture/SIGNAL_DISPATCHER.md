@@ -509,13 +509,25 @@ when the owner registers and checked out by nothing else, so ordinary work
 holding every connection of the operational or advisory pool cannot hold it
 back; it shares only the owner-scope advisory key, the transaction lock that
 serializes it with recovery. It never falls back to another pool, and closing
-the backend waits for a renewal in flight before closing that pool. This costs
-one PostgreSQL connection per backend that hosts an owner. On a SQLite file it runs on a one-shot
-connection of its own, never the shared work connection. After a cancelled
+the backend waits for a renewal in flight before closing that pool. A close
+cancelled during that wait keeps the cancellation, closes every pool, then
+raises it. This costs
+one PostgreSQL connection per backend that hosts an owner. On a SQLite file it runs on a
+connection of its own, kept between renewals and retired by the backend's
+close, never the shared work connection. Each renewal checks that the
+database's path still names the file the backend connected to, before it
+waits for the writer slot and again before it commits, and refuses otherwise.
+After a cancelled
 write's rollback cannot be confirmed, that connection's cleanup fence refuses
 every later write on it until it is replaced; renewal is not one of them, and
 it leaves the fence and the error it retains as they are. Only SQLite's writer
-slot is shared, and renewal waits at most 5 s for it before a retry. An
+slot is shared. Renewal tries for it in attempts of 0.1 s for at most 5 s
+before a retry, and between attempts ends, having written nothing, once the
+backend's close has begun. Close therefore waits only for a renewal that
+already holds the slot, and its reservation covers that one attempt. Because
+renewal commits from a second connection, every SQLite `transaction()` begins
+`BEGIN IMMEDIATE`: a deferred transaction that read before such a commit could
+not then write. An
 in-memory SQLite database has one connection for every writer, a peer's
 recovery included, so it renews there. On both backends each tick starts it
 in a task of its own (`_start_runtime_owner_renewal`), in an empty context.
