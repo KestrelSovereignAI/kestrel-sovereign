@@ -213,3 +213,44 @@ async def test_duplicate_token_parameters_do_not_consume_original_code(consent_h
         assert response.status_code == 400 and response.json()["error"] == "invalid_request"
         response = await client.post("/token", data=request)
     assert response.status_code == 200, response.text
+
+
+async def test_authorization_preserves_original_host_lease_control_after_body_receive(consent_http):
+    from kestrel_sovereign.execution_custody import (
+        ConfirmedLeaseDeadline,
+        ExecutionAuthorityError,
+    )
+    from kestrel_sovereign.mcp_server.consent import MCPConsentAuthority
+    from kestrel_sovereign.mcp_server.grants import MCPAuthorizationGrants
+
+    pending = consent_http[1]
+    lease, originals = ConfirmedLeaseDeadline(), []
+
+    def require_current():
+        try:
+            lease.require_work()
+        except ExecutionAuthorityError as error:
+            originals.append(error)
+            raise
+
+    authority = MCPConsentAuthority(pending.agent_id, RESOURCE, pending.policy,
+        require_current=require_current, sovereign_key=lambda: API_KEY, clock=pending.clock)
+    grants = MCPAuthorizationGrants(pending, consent_http[6].issuer, consent_authority=authority)
+    native = NativeMCPOAuthProvider(grants, "https://kestrel.example/console/mcp/consent")
+    app = oauth_app(native)
+
+    async def retire_during_body(scope, receive, send):
+        async def original_receive():
+            message = await receive()
+            if message["type"] == "http.request":
+                lease.mark_lost()
+            return message
+        await app(scope, original_receive, send)
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=retire_during_body),
+            base_url="https://kestrel.example") as client:
+        with pytest.raises(ExecutionAuthorityError) as escaped:
+            await client.post("/authorize", data={"response_type": "code", "client_id": "owned-provider",
+                "redirect_uri": CALLBACK, "scope": "memory:read", "state": "original-http-state",
+                "code_challenge": CHALLENGE, "code_challenge_method": "S256", "resource": RESOURCE})
+    assert originals and escaped.value is originals[0], "The original host callback control was replaced"

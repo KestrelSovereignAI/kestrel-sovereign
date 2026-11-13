@@ -39,6 +39,7 @@ from starlette.responses import JSONResponse, Response
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
+    execution_observation_error,
     is_execution_control_error,
 )
 from kestrel_sovereign.storage.db.interface import TransactionError
@@ -79,10 +80,26 @@ class NativeMCPOAuthProvider:
         if not consent_url.startswith(origin + "/") or "?" in consent_url or "#" in consent_url:
             raise ValueError("MCP consent must use the configured first-party Console")
         self.grants, self.pending, self.consent_url = grants, grants.pending, consent_url
-        self._require_current = grants.consent_authority.require_current_host
         self._request: ContextVar[_OAuthRequest | None] = ContextVar("mcp_oauth_request", default=None)
         self._authorization = AuthorizationHandler(self)
         self._authenticate_client = ClientAuthentication(self.pending.policy.registered_client)
+
+    def _retain_original_control(self, error: BaseException) -> None:
+        owner = self._request.get()
+        if (owner is not None and owner.active and owner.task is asyncio.current_task()
+                and is_execution_control_error(error)):
+            owner.control = execution_observation_error(owner.control, error)
+
+    def _require_current(self) -> None:
+        owner = self._request.get()
+        if (owner is not None and owner.active and owner.task is asyncio.current_task()
+                and owner.control is not None):
+            raise owner.control
+        try:
+            self.grants.consent_authority.require_current_host()
+        except (ExecutionAuthorityError, TransactionError, BaseExceptionGroup) as error:
+            self._retain_original_control(error)
+            raise
 
     @contextmanager
     def _own_request(self, request: Request, purpose: Literal["authorize", "token", "revoke"]) -> Iterator[_OAuthRequest]:
@@ -126,8 +143,7 @@ class NativeMCPOAuthProvider:
             # The official authorization handler catches Exception. Retain a
             # classified native receipt so the original HTTP owner can raise
             # it before publishing the handler's ordinary error response.
-            if is_execution_control_error(error):
-                owner.control = error
+            self._retain_original_control(error)
             raise
         return self.consent_url + "?" + urlencode({"request": handle})
 
