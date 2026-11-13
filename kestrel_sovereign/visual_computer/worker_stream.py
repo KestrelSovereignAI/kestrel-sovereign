@@ -55,4 +55,3 @@ async def join_original_writer_close(writer):
             raise
         return error
     return None
-

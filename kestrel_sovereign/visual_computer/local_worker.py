@@ -470,6 +470,7 @@ class _LocalWorkerResources:
         self._container_waits = {}
         self._volume_identity = None
         self._network_identity = None
+        self._pending_creates = set()
         self._broker_endpoints = None
         self._mount_sources = {}
         self._close_admission = OwnedTaskAdmission()
@@ -535,6 +536,19 @@ class _LocalWorkerResources:
             return
         raise ResourceConflict("preexisting_local_worker_resource_requires_reconciliation")
 
+    async def _create_named(self, kind, name, arguments):
+        # Retain the original create before its first possible native effect.
+        # CLI retirement and a subsequent absent-name inspection cannot unsend
+        # this request or prove that the daemon will never finish creating it.
+        key = (kind, name)
+        self._pending_creates.add(key)
+        output = await self._command(arguments)
+        identity = output.decode().strip()
+        if (identity != name if kind == "volume" else TOKEN.fullmatch(identity) is None):
+            raise ResourceOutcomeUnknown("original_" + kind + "_create_ack_unknown")
+        self._pending_creates.remove(key)
+        return identity
+
     async def create(self):
         info = json.loads(await self._command(["info", "--format", "{{json .}}"]))
         if (info.get("ServerVersion") != "29.8.2" or info.get("OSType") != "linux"
@@ -560,7 +574,7 @@ class _LocalWorkerResources:
             self.original._record, self.original._check_original)
         self.original._check_original()
         self.volume = self.names["volume"]
-        await self._command(["volume", "create", "--driver", "local", "--opt", "type=tmpfs",
+        await self._create_named("volume", self.volume, ["volume", "create", "--driver", "local", "--opt", "type=tmpfs",
             "--opt", "device=tmpfs", "--opt", "o=size=1048576,uid=10002,gid=10003,mode=0710",
             "--label", LABEL + "=" + self.identity, self.volume])
         volume = json.loads(await self._command(["volume", "inspect", self.volume]))[0]
@@ -572,11 +586,8 @@ class _LocalWorkerResources:
         self._volume_identity = self._volume_facts(volume)
         await self._require_absent("network", self.names["network"])
         self.network = self.names["network"]  # Bounded unknown-create discovery only.
-        raw = await self._command(["network", "create", "--driver", "bridge", "--ipv6=false",
+        native_id = await self._create_named("network", self.network, ["network", "create", "--driver", "bridge", "--ipv6=false",
             "--label", LABEL + "=" + self.identity, self.network])
-        native_id = raw.decode().strip()
-        if TOKEN.fullmatch(native_id) is None:
-            raise ResourceOutcomeUnknown("original_network_create_ack_unknown")
         self.network = self._network_identity = native_id
         network = json.loads(await self._command(["network", "inspect", native_id]))[0]
         if network.get("Id") != native_id or network.get("Name") != self.names["network"]:
@@ -587,10 +598,8 @@ class _LocalWorkerResources:
             # inspection. Never delete an arbitrary same-named object.
             await self._require_absent("container", self.names[role])
             self.containers[role] = self.names[role]
-            output = await self._command(container_arguments(self.profile, role, self.identity))
-            cid = output.decode().strip()
-            if TOKEN.fullmatch(cid) is None:
-                raise ResourceOutcomeUnknown("worker_create_ack_unknown")
+            cid = await self._create_named("container", self.names[role],
+                container_arguments(self.profile, role, self.identity))
             self.containers[role] = cid
             record = json.loads(await self._command(["container", "inspect", cid]))[0]
             verify_container(record, self.images[role], self.profile, role, self.identity)
@@ -709,6 +718,7 @@ class _LocalWorkerResources:
             return
         errors = []
         for role, target in reversed(tuple(self.containers.items())):
+            create_key = ("container", target)
             known_original = role in self._native_instances or TOKEN.fullmatch(target) is not None
             signal_error = None
             try:
@@ -718,6 +728,14 @@ class _LocalWorkerResources:
                         or (known_original and record.get("Id") != target)):
                     raise ResourceConflict("original_cleanup_container_identity_differs")
                 cid = record["Id"]
+                if create_key in self._pending_creates:
+                    if TOKEN.fullmatch(cid) is None:
+                        raise ResourceOutcomeUnknown("original_created_container_identity_unknown")
+                    # Exact owned inspection can discover a committed create.
+                    # Retain that immutable ID before any fallible cleanup.
+                    self.containers[role] = target = cid
+                    known_original = True
+                    self._pending_creates.remove(create_key)
                 state = record.get("State", {})
                 if state.get("Running"):
                     # The exact fixed programs interpret SIGTERM as lifecycle
@@ -783,6 +801,10 @@ class _LocalWorkerResources:
                     unknown = ResourceOutcomeUnknown("original_worker_disappeared_without_native_wait")
                     unknown.__cause__ = missing
                     errors.append(unknown)
+                elif create_key in self._pending_creates:
+                    unknown = ResourceOutcomeUnknown("original_container_create_outcome_unknown")
+                    unknown.__cause__ = missing
+                    errors.append(unknown)
             except BaseException as error:
                 errors.append(execution_terminal_error(signal_error, error, retain_originals=True)
                     if signal_error is not None and error is not signal_error else error)
@@ -794,10 +816,22 @@ class _LocalWorkerResources:
             if target is None:
                 continue
             try:
+                create_key = (kind, target)
                 raw = await self.boundary.invoke([kind, "inspect", target])
                 record = json.loads(raw)[0]
                 if record.get("Labels", {}).get(LABEL) != self.identity:
                     raise ResourceConflict("original_cleanup_resource_identity_differs")
+                if create_key in self._pending_creates:
+                    if record.get("Name") != target:
+                        raise ResourceConflict("original_created_resource_name_differs")
+                    if kind == "network":
+                        native_id = record.get("Id")
+                        if not isinstance(native_id, str) or TOKEN.fullmatch(native_id) is None:
+                            raise ResourceOutcomeUnknown("original_created_network_identity_unknown")
+                        self.network = self._network_identity = target = native_id
+                    else:
+                        self._volume_identity = self._volume_facts(record)
+                    self._pending_creates.remove(create_key)
                 if ((kind == "network" and self._network_identity is not None and record.get("Id") != self._network_identity)
                         or (kind == "volume" and self._volume_identity is not None and self._volume_facts(record) != self._volume_identity)):
                     raise ResourceConflict("original_cleanup_instance_identity_differs")
@@ -807,8 +841,11 @@ class _LocalWorkerResources:
                 except ResourceNotFound:
                     continue
                 raise ResourceOutcomeUnknown("original_resource_retirement_unknown")
-            except ResourceNotFound:
-                continue
+            except ResourceNotFound as missing:
+                if create_key in self._pending_creates:
+                    unknown = ResourceOutcomeUnknown("original_" + kind + "_create_outcome_unknown")
+                    unknown.__cause__ = missing
+                    errors.append(unknown)
             except BaseException as error:
                 errors.append(error)
         if errors:

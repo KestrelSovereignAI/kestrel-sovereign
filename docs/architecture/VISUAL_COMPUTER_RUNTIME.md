@@ -389,7 +389,10 @@ actual native joins.
 
 ### Worker build dependencies and validation scope
 
-The public SDK dependency is >=0.48.0; the worker build input pins SDK 0.48.0.
+The public SDK dependency is declared in `pyproject.toml` and resolved in
+`uv.lock`. The separate two-domain worker input pins its SDK version in
+`docker/visual-browser/requirements-two-domain.in`; its target lock records
+the corresponding complete package hashes.
 The Core pin in both worker requirements files must match the project version.
 Build the ordinary Core wheel and regenerate the target dependency lock with
 that wheel's exact hash before building worker images. The version test checks

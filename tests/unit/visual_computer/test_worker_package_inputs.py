@@ -13,4 +13,3 @@ def test_worker_build_pin_matches_core_project_version(suffix):
     requirements = root/"docker/visual-browser"/("requirements-two-domain"+suffix)
     pins = re.findall(r"^kestrel-sovereign==([^\s;\\]+)", requirements.read_text(), re.MULTILINE)
     assert pins == [version], "worker build input and generated lock must use this Core project version"
-

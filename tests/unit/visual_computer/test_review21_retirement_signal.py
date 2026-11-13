@@ -82,6 +82,7 @@ async def original_closer_signal_case(kind, tmp_path):
     resource._container_waits = {}
     resource.network = resource.volume = None
     resource._network_identity = resource._volume_identity = None
+    resource._pending_creates = set()
     resource._closed = resource._closing = False
     resource._binding = resource
     resource.original = SimpleNamespace(_resources=resource)
@@ -216,6 +217,7 @@ async def test_stopped_signal_does_not_erase_other_original_failures(tmp_path, f
     resource._container_waits = {}
     resource.network = resource.volume = None
     resource._network_identity = resource._volume_identity = None
+    resource._pending_creates = set()
     resource._closed = resource._closing = False
     resource._binding = resource
     resource.original = SimpleNamespace(_resources=resource)

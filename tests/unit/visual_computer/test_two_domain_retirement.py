@@ -49,6 +49,7 @@ async def test_original_container_wait_precedes_nonforce_removal_and_dependent_c
     resource._container_waits = {}
     resource.network, resource.volume, resource._closed = "original-net", "original-volume", False
     resource._network_identity = resource._volume_identity = None
+    resource._pending_creates = set()
     if exit_code == 0:
         await resource._retire()
         assert resource._closed
@@ -89,6 +90,7 @@ async def test_recorded_original_instance_requires_its_exact_native_wait(failure
     resource.network = resource.volume = None
     resource._closed = False
     resource._network_identity = resource._volume_identity = None
+    resource._pending_creates = set()
     with pytest.raises(ResourceConflict if failure == "different-id" else ResourceOutcomeUnknown):
         await resource._retire()
     assert not resource._closed
