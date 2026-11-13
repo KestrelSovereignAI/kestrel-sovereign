@@ -457,6 +457,10 @@ def bind_async_invocation(
     inventory boundary for every transport that calls it. This avoids a Stop
     implementation that works only for endpoints which remembered to install
     their own lifecycle wrapper.
+
+    A caller_binding argument borrows the original revocable endpoint lifetime.
+    A caller argument owns a new endpoint lifetime. They cannot both confer
+    authority on the same invocation.
     """
     def decorate(function: Callable[..., Awaitable[_T]]) -> Callable[..., Awaitable[_T]]:
         signature = inspect.signature(function)
@@ -464,12 +468,16 @@ def bind_async_invocation(
         @wraps(function)
         async def wrapped(*args: Any, **kwargs: Any) -> _T:
             bound = signature.bind_partial(*args, **kwargs)
+            if "caller_binding" in bound.arguments:
+                if bound.arguments.get("caller") is not None:
+                    raise TypeError("An invocation requires one original caller binding or caller, not both")
+                caller_scope = caller_context_binding_scope(bound.arguments["caller_binding"])
+            else:
+                caller_scope = caller_context_scope(bound.arguments.get("caller"))
             with invocation_scope(
                 bound.arguments.get(parameter),
                 provenance=bound.arguments.get("invocation_provenance"),
-            ) as invocation_id, caller_context_scope(
-                bound.arguments.get("caller")
-            ), bind_execution_runtime(args[0] if args else None):
+            ) as invocation_id, caller_scope, bind_execution_runtime(args[0] if args else None):
                 bound.arguments[parameter] = invocation_id
                 lifecycle_owner = args[0] if args else None
 

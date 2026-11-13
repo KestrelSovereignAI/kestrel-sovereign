@@ -1,8 +1,10 @@
 """Durable native OAuth credentials with atomic consumption and family revocation."""
 
+import asyncio
 import hashlib
 import hmac
 import json
+from contextlib import asynccontextmanager
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -11,6 +13,8 @@ from mcp.server.auth.provider import (
     TokenError,
 )
 from mcp.shared.auth import OAuthToken
+
+from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 
 from .consent import MCPConsentApproval, MCPConsentAuthority
 from .pending import PendingMCPAuthorization, PendingMCPAuthorizations
@@ -234,10 +238,39 @@ class MCPAuthorizationGrants:
             raise ValueError("Only native OAuth credentials may be loaded")
         async with self.pending.serialized():
             row = await self._resolve_credential(kind, secret, client_id)
+        return self._usable_credential(kind, secret, row)
+
+    def _usable_credential(self, kind, secret, row):
         self._require_current()
         if row is None or row[2] <= self.pending.now() or not self._current_grant(*row[5]):
             return None
         return self._native_credential(kind, secret, row[1])
+
+    @asynccontextmanager
+    async def access_lifetime(self, secret: str, *, resource: str, client_id: str):
+        """Retain the original SQL authorization lock through physical delivery."""
+        self._require_top_level()
+        self._resource(resource)
+        owner = asyncio.current_task()
+        async with self.pending.serialized():
+            row = await self._resolve_credential(MCPRecordKind.ACCESS, secret, client_id)
+            active = True
+
+            def current_access():
+                if (not active or asyncio.current_task() is not owner
+                        or self.backend.owns_open_transaction is not True):
+                    raise HostCapabilityAccessDenied("Original native MCP access lifetime is unavailable")
+                token = self._usable_credential(MCPRecordKind.ACCESS, secret, row)
+                if token is None:
+                    raise HostCapabilityAccessDenied("Original native MCP access grant is unavailable")
+                return token
+
+            try:
+                current_access()
+                yield current_access
+                current_access()
+            finally:
+                active = False
 
     def _native_credential(self, kind: MCPRecordKind, secret: str, stored: dict):
         value = {key: value for key, value in stored.items() if key != "grant_hash"}

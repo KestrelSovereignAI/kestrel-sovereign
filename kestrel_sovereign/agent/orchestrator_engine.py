@@ -41,6 +41,7 @@ from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
 from kestrel_sdk.tools import DeferredToolResult
+from kestrel_sdk.tools.base import ToolSchema
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskHandoff,
@@ -1927,6 +1928,7 @@ class OrchestratorEngineMixin:
         session_id: str,
         source: str = "external",
         operation_id: str | None = None,
+        argument_guard: Callable[[dict, ToolSchema], Awaitable[None]] | None = None,
         _capture: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Transport-agnostic governed tool dispatch.
@@ -1962,6 +1964,10 @@ class OrchestratorEngineMixin:
             operation_id: Stable intention key required for an external call
                 outside a governed turn. Redelivery must retain it; a new
                 intention must use a new key. Inner calls reuse their turn.
+            argument_guard: Trusted host guard for a directly registered tool's
+                owned effective arguments and selected tool schema after hook
+                rewrites, including that schema's defaults. Raise to refuse.
+                Subagent and receipt-only paths refuse this direct-tool guard.
 
         Returns:
             On execution: whatever the tool returns (typically a
@@ -1985,6 +1991,8 @@ class OrchestratorEngineMixin:
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
         )
+        if tool_name == PHANTOM_RECEIPT_TOOL_NAME and argument_guard is not None:
+            raise ResourceUnsupported("Direct-tool argument guard cannot govern receipt-only dispatch")
 
         if operation_id is not None:
             from kestrel_sovereign.agent.invocation import validate_invocation_id
@@ -1995,7 +2003,7 @@ class OrchestratorEngineMixin:
                 owned_args = deepcopy(args)
                 outcome = await self._execute_tool_operation_at_stop_boundary(
                     lambda: self.execute_named_tool(tool_name, owned_args, session_id=session_id,
-                        source=source, _capture=_capture),
+                        source=source, argument_guard=argument_guard, _capture=_capture),
                     name='named-tool-invocation', cancel_on_caller_cancellation=True,
                     tool_operation=ToolEffectOperation('named_tool', operation_id,
                         'named-registry', tool_name, owned_args, session_id))
@@ -2034,6 +2042,7 @@ class OrchestratorEngineMixin:
                 tool_name, args, session_id=session_id, source=source,
                 _capture=_capture, call_context=call_context,
                 execution=execution, dispatch_meta=dispatch_meta,
+                argument_guard=argument_guard,
             )
 
             if _capture is None and not dispatch_meta.get("audit_recorded"):
@@ -2114,6 +2123,7 @@ class OrchestratorEngineMixin:
         call_context: ToolCallContext,
         execution,
         dispatch_meta,
+        argument_guard: Callable[[dict, ToolSchema], Awaitable[None]] | None = None,
     ) -> Any:
         """Resolve and run one :meth:`execute_named_tool` call.
 
@@ -2163,6 +2173,8 @@ class OrchestratorEngineMixin:
             # direct invocation via the inline executor failed.
             subagent_feature = self._resolve_named_subagent(tool_name)
             if subagent_feature is not None:
+                if argument_guard is not None:
+                    raise ResourceUnsupported("Direct-tool argument guard cannot govern subagent dispatch")
                 return await self._execute_named_subagent(
                     subagent_feature, tool_name=tool_name, args=args,
                     session_id=session_id, source=source, _capture=_capture,
@@ -2312,6 +2324,8 @@ class OrchestratorEngineMixin:
         # carries the real HookManager's MODIFY accumulation across a
         # multi-hook chain (and defaults to ``args`` when no MODIFY ran).
         effective_args = post_hook_args
+        if argument_guard is not None:
+            await argument_guard(effective_args, found_tool.schema)
 
         # --- Execute the tool ---
         # Deliberately no span here (#2639): the observability hook's
@@ -4044,17 +4058,18 @@ class OrchestratorEngineMixin:
             return await join_original_operation()
 
         from kestrel_sovereign.agent.invocation import bind_async_invocation
-        from kestrel_sovereign.auth import current_caller_context
+        from kestrel_sovereign.auth import capture_caller_context_binding
         from kestrel_sovereign.tools.effect_invocation import journal_tool_operation
 
         @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-        async def invoke_external(agent, *, invocation_id, caller, session_id):
+        async def invoke_external(agent, *, invocation_id, caller_binding, session_id):
             async with journal_tool_operation(agent, tool_operation):
                 outcome = await join_original_operation()
                 return raise_owned_outcome(outcome, operation=name, retain_originals=True)
 
+        caller_binding = capture_caller_context_binding()
         external = start_privacy_work(lambda: invoke_external(self,
-            invocation_id=tool_operation.operation_id, caller=current_caller_context(),
+            invocation_id=tool_operation.operation_id, caller_binding=caller_binding,
             session_id=tool_operation.session_id), name=name + "-lifecycle")
         return await await_owned_task(external,
             cancel_on_caller_cancellation=cancel_on_caller_cancellation)

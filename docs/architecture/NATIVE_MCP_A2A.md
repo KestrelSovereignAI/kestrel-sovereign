@@ -1692,19 +1692,68 @@ storage custody. Native MCP routes select a transport-only caller lane before
 Console credentials; an additional owner API key cannot bypass the official SDK's
 Bearer verifier or authorize private Console consent.
 
-These source checks do not establish governed memory tools, atomic external
-`log_turn`, a real browser consent flow, actual Claude/ChatGPT installation, or
-subsequent reflection/consolidation. Those remain acceptance gates of #1990 and
-the original epic.
+The native server exposes `search_memory` and `recall_recent` through the same
+`Agent.execute_named_tool` entry point used by other governed transports. It
+does not call MemoryFeature or its storage directly. The original official SDK
+request and freshly verified SQL grant bind a non-sovereign `MCP_OAUTH` caller;
+an owner API key added to the request does not promote it. The principal binds
+resource, issuer, client and subject, surviving access-token refresh and SDK
+publication restart while separating different registered clients.
+Canonical external invocation borrows that original caller binding instead of
+creating a second lifetime from its immutable caller value. HTTP retirement
+therefore revokes copied hook tasks even when the SDK retains their original
+governed work while its outcome settles.
+
+Every call requires a stable `operation_id` and a client `conversation_id`.
+The former enters Core's canonical durable intention journal; redelivery does
+not authorize another execution, including after refresh. Retain it for
+reconciliation after an unconfirmed result. A new intention requires a new ID.
+The latter is namespaced with the verified principal before it becomes a Core
+audit session. An optional search `session_id` filters the memory being read;
+it confers no caller identity or authority.
+
+Raw memory requires `memory:read` and the canonical NORMAL/PUBLIC full-storage
+privacy policy. The original policy epoch covers execution and physical HTTP
+delivery. The request acquires the existing persistence gate only after
+canonical execution has completed, then retains it through the original body
+send. It also retains the original native SQL authorization lock used by
+revocation and refresh. Revocation cannot commit or acknowledge while that
+authorized body remains deliverable, including from a different database
+connection. The access reader belongs only to the original request task and
+cannot reactivate after its transaction ends. Expiry or a policy-epoch change
+withholds the result.
+The finite `operation_seconds` budget covers execution and delivery; token
+expiry may shorten it, using validated full-resolution clock time rather than
+the whole seconds used for stored authorization records. Each original HTTP
+message checks that deadline before forwarding; an inter-message delay cannot
+escape the budget even when the next send completes without yielding. Host policy also
+bounds `max_memory_records`, `max_query_bytes` and `max_result_bytes`. The same
+argument guard checks initial input and the canonical owned arguments after
+hook rewrites, before direct tool execution. The dispatcher supplies the selected
+tool's original schema, so an omitted optional count uses that tool's default
+and still must fit the host's bound. It cannot silently bypass a
+subagent or receipt-only execution path; those refuse a direct-tool guard.
+Exceeding a bound refuses the call or
+its result rather than silently returning truncated memory. Native tool
+result admission counts both text and structured content, and the original
+physical send also counts actual protocol-envelope bytes against the result
+budget. Native tool annotations remain conservative because governed reads write audit/intention
+records. Actual SDK/source tests cover these paths; they are not installed
+external-client acceptance.
+
+Atomic external `log_turn`, a real browser consent flow, actual Claude/ChatGPT
+installation and subsequent reflection/consolidation remain acceptance gates
+of #1990 and the original epic.
 
 ## Review, verification and release order
 
 1. Review this design in its worktree; complete dependency/import and three
    real-vendor OAuth spikes. Record capability advertisement separately from
    successful authorization, refresh and tool calls.
-2. Complete the MCP feature transport change and publish its 0.5 release
-   admitting `mcp>=2.3,<3` before releasing the host dependency update. Published
-   feature 0.4.1's `mcp<2` cannot resolve with Phoenix 20's FastMCP dependency.
+2. Complete the MCP feature transport change and publish it with a tested
+   `mcp>=2.3.0` floor before releasing the host dependency update. Do not retain
+   an old upper cap as a substitute for updating consumers. Historical feature
+   0.4.1's `mcp<2` cannot resolve with Phoenix 20's FastMCP dependency.
    Stage and test both changes together from worktrees, then release feature
    before host. Resolve the full host feature manifest before host release.
    Docker gateway 0.44.1 works via the official SDK's standard negotiation at

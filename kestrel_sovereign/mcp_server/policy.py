@@ -119,6 +119,10 @@ class MCPServerPolicy(BaseModel):
     access_token_seconds: int = Field(default=900, gt=0, le=3600)
     refresh_token_seconds: int = Field(default=604800, gt=0, le=2592000)
     max_request_bytes: int = Field(default=65536, gt=0, le=1048576)
+    operation_seconds: float = Field(default=30.0, gt=0, le=300)
+    max_memory_records: int = Field(default=100, gt=0, le=1000)
+    max_query_bytes: int = Field(default=4096, gt=0, le=65536)
+    max_result_bytes: int = Field(default=65536, gt=0, le=1048576)
 
     @field_validator("console_origin")
     @classmethod
