@@ -1611,6 +1611,92 @@ effect, terminal receipt, owner-release ordering and restart recovery. This
 does not eliminate the existing at-least-once crash window between a business
 effect and its durable terminal record.
 
+## Inbound MCP server
+
+The server direction in #1990 has one standard OAuth authorization server and
+uses the published MCP SDK for its authenticated Streamable HTTP resource
+server. `mcp_server.transport.NativeMCPServer` composes the official server,
+its original authentication middleware and lifespan, exact protected-resource
+metadata route, and RFC 8414 discovery for the pathful per-agent issuer.
+It does not introduce a second MCP wire protocol. Inbound publication is opt-in
+through `KESTREL_MCP_SERVER`; ordinary Core startup does not load the optional
+SDK. Production hosts enabling it install the `mcp-server` extra. The current
+implementation remains worktree source until its review and release gates pass.
+
+`NativeMCPHTTP` retains those original SDK/OAuth route objects. Its registry and
+A2A share `native_http.NativeHTTPRegistry`: publication checks collisions before
+mutation, records an exact route snapshot, and withdraws only the current
+generation. Routing classification uses those same installed objects; it grants
+no credentials. The embedding host must own the native runtime's lifespan and
+current agent authority before publishing it.
+
+`mcp_server.oauth.NativeMCPAuthorizationServer` uses Authlib's registered client
+authentication methods and native MCP token models. The optional MCP SDK 2.3
+OAuth server handlers are unsuitable for this authorization server. Actual
+SQLite/PostgreSQL HTTP tests reproduce refusal of Basic authentication without
+a redundant body client ID, refusal of public-client revocation without a
+nonexistent secret, and acceptance of normalized redirect identities and
+repeated authorization parameters. Error redirects also discarded an empty
+registered query parameter. The common boundary is the optional OAuth server
+implementation, so Kestrel implements all three standard OAuth endpoints with
+Authlib authentication and native grant storage. It preserves the original
+registered callback string, including its query, and returns the original state
+and issuer. Request values are never rewritten to satisfy SDK handlers. The MCP
+SDK is neither patched nor vendored. Authlib's dependency floor covers the tested request-payload
+contract; the published official MCP SDK remains unchanged.
+Malformed Basic authentication is normalized only around Authlib's header
+decoder, before host-owned client lookup. Decoding errors cannot consume a code
+or revoke a grant, and unrelated host/SQL controls remain outside that catch.
+Pending admission also uses typed record-budget and expiration refusals. A
+caller-supplied oversized state returns the standard OAuth request error before
+SQL admission. A pending request that expires while original SQL waits settle
+returns a temporary-unavailability error. Host, cipher integrity and SQL errors
+are not converted into these caller-input refusals.
+
+Only explicit registered clients may authorize. Code exchange requires S256
+PKCE, the exact original redirect and resource, and the client's registered
+authentication method. Repeated parameters and multiple client authentication
+methods fail before token consumption. Opaque credentials remain encrypted,
+agent-bound SQL records; consumption, rotation and family revocation belong to
+the original top-level transaction. An authenticated revocation proves stored
+ownership even while current grant use is denied by a temporary key change.
+Token verification always checks current grant authority and audience.
+
+The first-party consent authority requires its original live, durable sovereign
+HTTP request for approval, request details and denial. Signed-in users are not
+promoted into this lane. Request reads require the original top-level SQL
+boundary; denial atomically consumes the same pending request at its original
+COMMIT and never creates a grant. The store returns an explicit
+`MCPAuthorizationCommitRequired` refusal for an enclosing transaction.
+An authorization redirect only creates pending consent; it does
+not mint a grant. The first-party Console shell uses one opaque, per-tab pending
+hint, removes it from browser history before loading credentials, and renders
+connector strings as text. The private API reauthenticates the original durable
+owner credential, applies canonical CSRF policy, and retains the agent's current
+privacy authority through actual HTTP delivery. A decision consumes its local
+hint before I/O. An uncertain response is never replayed automatically.
+
+`NativeMCPPublication` prepares its original borrowed SQL stores and official SDK
+lifespan privately, then publishes the exact route generation at Core's normal
+registration commit. The SDK lifespan enters and exits in one retained resident
+Task under the original agent runtime context, without inheriting the publishing
+Console credential or invocation. Both SDK startup and physical close retain the
+canonical `OwnedOperation`, including uncertain admission debt; a missing task
+handle never permits a fresh retry or a successful custody release. Standalone
+publication is independent of A2A configuration. AgentManager fences every public
+routing view before fallible protocol withdrawal, retaining the original private
+lifecycle owner. Withdrawal revokes MCP admission before asynchronous cleanup; agent shutdown
+joins the original SDK task and HTTP/private-response readers before primary
+storage may close. Failed native retirement retains its original owner and
+storage custody. Native MCP routes select a transport-only caller lane before
+Console credentials; an additional owner API key cannot bypass the official SDK's
+Bearer verifier or authorize private Console consent.
+
+These source checks do not establish governed memory tools, atomic external
+`log_turn`, a real browser consent flow, actual Claude/ChatGPT installation, or
+subsequent reflection/consolidation. Those remain acceptance gates of #1990 and
+the original epic.
+
 ## Review, verification and release order
 
 1. Review this design in its worktree; complete dependency/import and three

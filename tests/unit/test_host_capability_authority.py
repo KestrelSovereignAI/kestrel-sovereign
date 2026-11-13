@@ -9,6 +9,7 @@ import pytest
 from kestrel_sdk.operator import OperatorContext
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
+from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.security.capability_authority import (
     HostCapabilityAccessDenied,
@@ -89,6 +90,20 @@ async def test_exact_original_binding_and_lifetime_required():
             check()
     with pytest.raises(HostCapabilityAccessDenied):
         check()
+
+
+@pytest.mark.asyncio
+async def test_current_checker_preserves_original_execution_control_and_commit_evidence():
+    a = Admission()
+    original = ExecutionCommitOutcomeError("unknown")
+
+    def denied(_context, _action, _target):
+        raise original
+
+    with a.bind(check=denied), pytest.raises(ExecutionCommitOutcomeError) as caught:
+        async with a.operation():
+            pytest.fail("Execution-control denial admitted a private operation")
+    assert caught.value is original and caught.value.commit_outcome == "unknown"
 
 
 @pytest.mark.asyncio

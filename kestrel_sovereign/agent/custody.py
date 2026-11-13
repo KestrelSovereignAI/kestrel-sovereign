@@ -31,14 +31,15 @@ from typing import Awaitable, Callable, Collection, Dict, Optional, Tuple
 #: record until its process exits. An owner joins only once its own close
 #: stops swallowing failures; that it returned without raising never makes it
 #: truthful. ``task_manager`` joined with #3558; ``host_key_database`` also
-#: has an audited native close. #3559 (``llm_service``) and #3560 (``feature``)
+#: has an audited native close. ``native_mcp_server`` retains its original SDK
+#: resident Task and HTTP/private response readers through physical joining. #3559 (``llm_service``) and #3560 (``feature``)
 #: were intentionally closed as not planned: those owners remain held.
 #: Closed issue status does not certify cleanup. Every other owner a
 #: boot acquires (``storage``, ``signal_dispatcher``, ``memory_system``,
 #: ``sync_service``, ``heartbeat_runner``, ``resume_monitor``,
 #: ``salvage_worker``, ``background_tasks``) needs its close shown truthful
 #: the same way first.
-TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset({"task_manager", "host_key_database"})
+TRUTHFUL_CLOSE_OWNERS: frozenset[str] = frozenset({"task_manager", "host_key_database", "native_mcp_server"})
 
 #: The owner of every per-feature resource.
 FEATURE_OWNER = "feature"

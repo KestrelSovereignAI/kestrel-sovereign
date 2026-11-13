@@ -1408,7 +1408,11 @@ async def test_refused_child_offboarding_restores_spawn_startup_row(tmp_path):
 
     persisted = MultiAgentConfig.from_file(config_path)
     assert persisted.agents[child_name] == child_config
-    assert manager.get_agent(child_name) is child
+    # Compensation preserves desired startup state and private cleanup owner,
+    # but a retirement that entered shutdown cannot resume serving requests.
+    assert manager.get_agent(child_name) is None
+    assert manager._get_agent_for_lifecycle(child_name) is child
+    assert child not in manager.list_agents().values()
 
 
 @pytest.mark.asyncio
@@ -2189,7 +2193,7 @@ async def test_expired_admission_fences_route_before_joining_stubborn_work(
             deadline=deadline,
             phase="stubborn readiness",
             agent=child,
-            on_expiry=lambda: manager._fence_expired_spawn_route(
+            on_expiry=lambda: manager._fence_agent_route(
                 "StubbornChild", child
             ),
         )
@@ -2306,7 +2310,7 @@ async def test_expired_published_candidate_keeps_one_readiness_rollback_owner(
         manager._expire_host_authority_candidate("ExpiredPublished", child)
         await asyncio.sleep(0)
 
-        assert manager._spawn_route_is_fenced("ExpiredPublished", child)
+        assert manager._agent_route_is_fenced("ExpiredPublished", child)
         assert vars(child).get("_host_authority_expiry_cleanup_task") is None
         manager._discard_unpublished_initialized_agent.assert_not_awaited()
     finally:
@@ -2462,7 +2466,7 @@ async def test_already_expired_host_deadline_does_not_cancel_admission_owner(
         True,
     )
     assert expired_candidates == [child]
-    assert manager._spawn_route_is_fenced(name, child)
+    assert manager._agent_route_is_fenced(name, child)
 
 
 @pytest.mark.asyncio
@@ -17131,7 +17135,9 @@ class TestSpawnAgent:
         assert witness.state == (
             "retiring" if preexisting_retirement else "active"
         )
-        assert manager.get_agent(child_name) is child
+        assert manager.get_agent(child_name) is None
+        assert manager._get_agent_for_lifecycle(child_name) is child
+        assert child not in manager.list_agents().values()
 
     def test_host_spawn_witness_preserves_operator_config_edits(self, tmp_path):
         config_path = tmp_path / "multi_agent.toml"

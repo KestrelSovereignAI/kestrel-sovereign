@@ -4,18 +4,13 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import HTMLResponse, JSONResponse
 
 from kestrel_sovereign.mcp_oauth import (
-    MCP_OAUTH_CALLBACK_PATH, MCP_OAUTH_CLIENT_METADATA_PATH, MCPOAuthHostPolicy,
+    MCP_OAUTH_CALLBACK_PATH,
+    MCP_OAUTH_CLIENT_METADATA_PATH,
+    MCPOAuthHostPolicy,
 )
-
+from kestrel_sovereign.security.browser_shell import OAUTH_BROWSER_HEADERS
 
 router = APIRouter(tags=["mcp-oauth"])
-_PUBLIC_HEADERS = {
-    "Cache-Control": "no-store",
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "default-src 'none'; script-src 'self'; connect-src 'self'; "
-        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-}
 _CALLBACK_HTML = """<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Kestrel MCP authorization</title>
@@ -33,10 +28,10 @@ def _policy(request: Request) -> MCPOAuthHostPolicy:
 
 @router.get(MCP_OAUTH_CLIENT_METADATA_PATH)
 async def client_metadata(request: Request):
-    return JSONResponse(_policy(request).client_document(), headers=_PUBLIC_HEADERS)
+    return JSONResponse(_policy(request).client_document(), headers=OAUTH_BROWSER_HEADERS)
 
 
 @router.get(MCP_OAUTH_CALLBACK_PATH, response_class=HTMLResponse)
 async def callback_page(request: Request):
     _policy(request)
-    return HTMLResponse(_CALLBACK_HTML, headers=_PUBLIC_HEADERS)
+    return HTMLResponse(_CALLBACK_HTML, headers=OAUTH_BROWSER_HEADERS)
