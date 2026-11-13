@@ -1,6 +1,6 @@
 # Build context: canonical source archive plus an independently pinned wheelhouse.
 # The wheelhouse requirements.txt is the complete normal target dependency lock,
-# including the exact newly built Core wheel, public SDK 0.48.0 and Playwright.
+# including the exact newly built Core wheel, public SDK 0.52.2 and Playwright.
 FROM mcr.microsoft.com/playwright/python:v1.63.0-noble@sha256:72bd171a9ffc2b4b59532aaa6210e21014d07093120dc25528870c0b840da1f0
 LABEL io.kestrel.local-two-domain.contract="core-sdk046-two-domain-v2"
 COPY wheelhouse/ /opt/kestrel-wheelhouse/
@@ -11,7 +11,7 @@ RUN cd /opt/kestrel-wheelhouse && sha256sum --strict -c SHA256SUMS \
        -r /opt/kestrel-wheelhouse/requirements-two-domain.txt \
     && python -m pip check \
     && python -B -c "from pathlib import Path; from kestrel_sovereign.visual_computer import worker_entry; Path('/opt/kestrel-worker-entry.py').symlink_to(Path(worker_entry.__file__).resolve(strict=True))" \
-    && python -B -c "from importlib.metadata import version; assert version('kestrel-sovereign-sdk') == '0.48.0'; assert version('playwright') == '1.63.0'; from importlib.resources import files; assert files('kestrel_sovereign.visual_computer').joinpath('_worker_programs','two_domain_worker.py').is_file()" \
+    && python -B -c "from importlib.metadata import version; assert version('kestrel-sovereign-sdk') == '0.52.2'; assert version('playwright') == '1.63.0'; from importlib.resources import files; assert files('kestrel_sovereign.visual_computer').joinpath('_worker_programs','two_domain_worker.py').is_file()" \
     && groupadd --gid 10003 kestrel-ipc && useradd --uid 10002 --gid 10003 --no-create-home --shell /usr/sbin/nologin kestrel-browser \
     && mkdir -p /run/kestrel-worker-ipc && chown 10002:10003 /run/kestrel-worker-ipc && chmod 0710 /run/kestrel-worker-ipc
 USER 10002:10003
