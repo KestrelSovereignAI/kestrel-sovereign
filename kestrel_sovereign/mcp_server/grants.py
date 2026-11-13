@@ -119,9 +119,13 @@ class MCPAuthorizationGrants:
             return None
         return digest, value, row[1], bool(row[2]), row[3]
 
-    async def _credential(self, kind: MCPRecordKind, secret: str, client_id: str | None):
+    async def _resolve_credential(self, kind: MCPRecordKind, secret: str, client_id: str | None):
+        """Within serialized SQL, settle authenticated replay before checking use."""
         row = await self._stored_credential(kind, secret, client_id)
         if row is None:
+            return None
+        if row[3]:
+            await self._revoke(row[4])
             return None
         grant = await self._grant(row[4])
         if grant is None:
@@ -198,10 +202,7 @@ class MCPAuthorizationGrants:
         if kind not in (MCPRecordKind.CODE, MCPRecordKind.ACCESS, MCPRecordKind.REFRESH):
             raise ValueError("Only native OAuth credentials may be loaded")
         async with self.pending.serialized():
-            row = await self._credential(kind, secret, client_id)
-            if row is not None and row[3]:
-                await self._revoke(row[4])
-                row = None
+            row = await self._resolve_credential(kind, secret, client_id)
         self._require_current()
         if row is None or row[2] <= self.pending.now() or not self._current_grant(*row[5]):
             return None
@@ -235,12 +236,12 @@ class MCPAuthorizationGrants:
             raise ValueError("Only codes and refresh tokens may be exchanged")
         secret = credential.code if kind is MCPRecordKind.CODE else credential.token
         async with self.pending.serialized():
-            row = await self._credential(kind, secret, credential.client_id)
+            row = await self._resolve_credential(kind, secret, credential.client_id)
             refused = row is None
             if row is not None:
                 count = await self.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_credentials WHERE agent_id = ? AND grant_hash = ?",
                     (self.agent_id, row[4]))
-                refused = row[3] or row[2] <= self.pending.now() or count[0] + 2 > self.policy.max_credentials_per_grant
+                refused = row[2] <= self.pending.now() or count[0] + 2 > self.policy.max_credentials_per_grant
                 if refused:
                     await self._revoke(row[4])
                 else:

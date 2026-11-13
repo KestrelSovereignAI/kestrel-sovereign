@@ -38,6 +38,15 @@ async def pair(boundary):
     return code, token
 
 
+def store_with_policy(pending, keys, original, policy, *, issuer=None):
+    selected_pending = type(pending)(pending.backend, pending.agent_id, pending.resource_url, policy,
+        clock=pending.clock)
+    authority = MCPConsentAuthority(pending.agent_id, RESOURCE, policy,
+        require_current=original.consent_authority.require_current_host,
+        sovereign_key=lambda: keys[0], clock=pending.clock)
+    return MCPAuthorizationGrants(selected_pending, issuer or original.issuer, consent_authority=authority)
+
+
 async def test_original_consent_commits_only_hashes_and_encrypted_native_models(consent_http):
     _client, pending, handle, _retained, _keys, _clock, grants, _app = consent_http
     code, token = await pair(consent_http)
@@ -119,12 +128,8 @@ async def test_current_sovereign_key_and_client_registration_control_durable_rea
     elif change == "scope":
         config["clients"][0]["scopes"] = ["memory:write"]
     policy = MCPServerPolicy.model_validate_json(json.dumps(config))
-    other_pending = type(pending)(pending.backend, pending.agent_id, pending.resource_url, policy, clock=pending.clock)
-    authority = MCPConsentAuthority(pending.agent_id, RESOURCE, policy,
-        require_current=grants.consent_authority.require_current_host,
-        sovereign_key=lambda: keys[0], clock=pending.clock)
-    other = MCPAuthorizationGrants(other_pending, grants.issuer + ("/other" if change == "issuer" else ""),
-        consent_authority=authority)
+    other = store_with_policy(pending, keys, grants, policy,
+        issuer=grants.issuer + ("/other" if change == "issuer" else ""))
     assert await other.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE) is None
 
 
@@ -252,14 +257,66 @@ async def test_revocation_tombstone_survives_temporary_credential_configuration_
         config = json.loads(pending.policy.model_dump_json())
         config["clients"][0]["client_secret"] = "owned-rotated-client-secret"
         policy = MCPServerPolicy.model_validate_json(json.dumps(config))
-        other_pending = type(pending)(pending.backend, pending.agent_id, pending.resource_url, policy,
-            clock=pending.clock)
-        authority = MCPConsentAuthority(pending.agent_id, RESOURCE, policy,
-            require_current=grants.consent_authority.require_current_host,
-            sovereign_key=lambda: keys[0], clock=pending.clock)
-        revoker = MCPAuthorizationGrants(other_pending, grants.issuer, consent_authority=authority)
+        revoker = store_with_policy(pending, keys, grants, policy)
+    ownership = await revoker.load_for_revocation(MCPRecordKind.ACCESS, token.access_token,
+        resource=RESOURCE, client_id=code.client_id)
+    assert ownership is not None and ownership.client_id == code.client_id
+    assert await revoker.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE) is None
     await revoker.revoke(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE, client_id=code.client_id)
     keys[0] = API_KEY
     assert await grants.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE) is None, (
         "An acknowledged revocation revived after restoring earlier credential configuration")
+    assert await grants.backend.fetch_one("SELECT revoked FROM mcp_server_oauth_grants") == (1,)
+
+
+async def test_expired_access_ownership_can_revoke_its_still_live_refresh_family(consent_http):
+    clock, grants = consent_http[5], consent_http[6]
+    code, token = await pair(consent_http)
+    original = await grants.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE)
+    clock[0] = original.expires_at + 1
+    assert await grants.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE) is None
+    ownership = await grants.load_for_revocation(MCPRecordKind.ACCESS, token.access_token,
+        resource=RESOURCE, client_id=code.client_id)
+    assert ownership is not None and ownership.expires_at < clock[0]
+    await grants.revoke(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE, client_id=code.client_id)
+    assert await grants.load(MCPRecordKind.REFRESH, token.refresh_token,
+        resource=RESOURCE, client_id=code.client_id) is None
+
+
+async def test_stored_revocation_never_accepts_another_clients_ownership(consent_http):
+    grants = consent_http[6]
+    _code, token = await pair(consent_http)
+    assert await grants.load_for_revocation(MCPRecordKind.ACCESS, token.access_token,
+        resource=RESOURCE, client_id="other-provider") is None
+    await grants.revoke(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE, client_id="other-provider")
+    assert await grants.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE) is not None
+
+
+@pytest.mark.parametrize("kind", [MCPRecordKind.CODE, MCPRecordKind.REFRESH])
+@pytest.mark.parametrize("operation", ["load", "exchange"])
+@pytest.mark.parametrize("change", ["sovereign", "client-secret"])
+async def test_authenticated_replay_commits_revocation_before_current_grant_checks(
+        consent_http, kind, operation, change):
+    pending, keys, grants = consent_http[1], consent_http[4], consent_http[6]
+    code, surviving = await pair(consent_http)
+    credential = code
+    if kind is MCPRecordKind.REFRESH:
+        credential = await grants.load(kind, surviving.refresh_token, resource=RESOURCE, client_id=code.client_id)
+        surviving = await grants.exchange(kind, credential, resource=RESOURCE)
+    selected = grants
+    if change == "sovereign":
+        keys[0] = "owned-rotated-sovereign-key"
+    else:
+        config = json.loads(pending.policy.model_dump_json())
+        config["clients"][0]["client_secret"] = "owned-rotated-client-secret"
+        selected = store_with_policy(pending, keys, grants, MCPServerPolicy.model_validate_json(json.dumps(config)))
+    if operation == "load":
+        secret = credential.code if kind is MCPRecordKind.CODE else credential.token
+        assert await selected.load(kind, secret, resource=RESOURCE, client_id=code.client_id) is None
+    else:
+        with pytest.raises(TokenError):
+            await selected.exchange(kind, credential, resource=RESOURCE)
+    keys[0] = API_KEY
+    assert await grants.load(MCPRecordKind.ACCESS, surviving.access_token, resource=RESOURCE) is None, (
+        "Authenticated replay did not commit revocation before checking current grant usability")
     assert await grants.backend.fetch_one("SELECT revoked FROM mcp_server_oauth_grants") == (1,)
