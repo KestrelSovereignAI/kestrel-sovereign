@@ -10,6 +10,7 @@ import asyncpg
 import pytest
 from kestrel_sdk.native_a2a.types import SubscribeToTaskRequest, Task, TaskState
 from kestrel_sdk.native_a2a.utils.errors import UnsupportedOperationError
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
@@ -76,7 +77,11 @@ async def test_native_handler_retires_original_subscription(peer_session, monkey
         if route == "terminal":
             await p.admission.manager.update_status(task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=p.admission.scope.recipient_id)
             await p.admission.manager.complete_task(task.id, "done", recipient_agent_id=p.admission.scope.recipient_id)
-            with pytest.raises(UnsupportedOperationError):
+            refusal = await anext(stream)
+            assert isinstance(refusal, StreamRefusal)
+            assert isinstance(refusal.error, UnsupportedOperationError)
+            assert not p.admission.lock.locked()
+            with pytest.raises(StopAsyncIteration):
                 await anext(stream)
         else:
             initial = await asyncio.wait_for(anext(stream), 5)

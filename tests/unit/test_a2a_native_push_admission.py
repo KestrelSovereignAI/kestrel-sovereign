@@ -9,6 +9,7 @@ import pytest
 from kestrel_sdk.native_a2a.client.errors import A2AClientError
 from kestrel_sdk.native_a2a.types import GetTaskRequest
 from kestrel_sdk.native_a2a.utils.errors import InternalError
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.security import outbound
 
 from tests.unit.test_a2a_native_http import submit
@@ -19,6 +20,7 @@ from tests.unit.test_a2a_native_push_http import (
 )
 from tests.utils.native_a2a_security import SENDER, send, signed_context
 from tests.utils.native_push import intercept_push_commit_ack
+from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
 
 
 async def _invoke_callback(wire, operation, task, config):
@@ -38,9 +40,16 @@ async def _invoke_callback(wire, operation, task, config):
             signed_context(wire.admission, params, operation="SendStreamingMessage"),
         )
         try:
-            return await anext(stream)
+            item = await anext(stream)
+            if isinstance(item, StreamRefusal):
+                # This direct handler caller consumes the new data contract,
+                # not a transport normalizer. It still demands actual EOF.
+                with pytest.raises(StopAsyncIteration):
+                    await anext(stream)
         finally:
             await stream.aclose()
+        assert stream.ag_frame is None
+        return item
     return [event async for event in wire.client().send_message(params)]
 
 
@@ -104,8 +113,14 @@ async def test_callback_dns_releases_host_lease_and_rechecks_original_authority(
             assert await sending is not None
         else:
             if policy_change == "service-stop":
-                with pytest.raises(InternalError):
-                    await sending
+                if operation == "stream":
+                    refusal = await sending
+                    assert isinstance(refusal, StreamRefusal)
+                    assert isinstance(refusal.error, InternalError)
+                    assert isinstance(refusal.error.__cause__, PushServiceUnavailable)
+                else:
+                    with pytest.raises(InternalError):
+                        await sending
             elif operation == "stream":
                 from starlette.exceptions import HTTPException
 
@@ -135,6 +150,24 @@ async def test_callback_dns_releases_host_lease_and_rechecks_original_authority(
             *(task for task in (sending, writer) if task is not None),
             return_exceptions=True,
         )
+
+
+async def test_stopped_push_stream_keeps_standard_wire_error_before_business_admission(
+    wire,
+):
+    original_task = await submit(wire)
+    params = send(wire.admission)
+    params.configuration.task_push_notification_config.CopyFrom(callback(wire, ""))
+    await wire.manager.push_service.close()
+    with pytest.raises(InternalError):
+        async for _ in wire.client(streaming=True).send_message(params):
+            pytest.fail("A stopped callback service admitted streaming task work")
+    assert (
+        len(wire.submissions) == 1 and wire.submissions[0].task.id == original_task.id
+    )
+    assert await wire.admission.backend.fetch_one(
+        "SELECT COUNT(*) FROM a2a_push_configs"
+    ) == (0,)
 
 
 @pytest.mark.parametrize("operation", ["send", "continue", "config"])
@@ -197,7 +230,9 @@ async def test_unauthorized_callback_does_not_resolve_peer_supplied_dns(
     await wire.admission.backend.execute("DELETE FROM native_test_principals")
     params = send(wire.admission)
     params.configuration.task_push_notification_config.CopyFrom(callback(wire, ""))
-    params.configuration.task_push_notification_config.url = "https://unauthorized.test/"
+    params.configuration.task_push_notification_config.url = (
+        "https://unauthorized.test/"
+    )
     with pytest.raises(A2AClientError) as refused:
         _ = [event async for event in wire.client().send_message(params)]
     assert isinstance(refused.value.__cause__, httpx.HTTPStatusError)

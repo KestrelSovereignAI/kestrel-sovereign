@@ -4,7 +4,7 @@ import asyncio
 import base64
 import binascii
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
 from uuid import uuid4
 
@@ -32,6 +32,7 @@ from kestrel_sdk.native_a2a.types import (
 )
 from kestrel_sdk.native_a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
 from kestrel_sdk.native_a2a.utils.errors import (
+    A2AError,
     ContentTypeNotSupportedError,
     InternalError,
     InvalidAgentResponseError,
@@ -42,6 +43,7 @@ from kestrel_sdk.native_a2a.utils.errors import (
     UnsupportedOperationError,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.native_a2a.utils.task import (
     apply_history_length,
     validate_history_length,
@@ -51,8 +53,9 @@ from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.security.exceptions import SSRFError
 from starlette.exceptions import HTTPException
 
-from kestrel_sovereign._async_ownership import gather_owned
+from kestrel_sovereign._async_ownership import OriginalContextExit, gather_owned
 from kestrel_sovereign.a2a.extensions import (
+    NativeMessageMetadata,
     PEER_STOP_URI,
     parse_message_metadata,
     require_metadata_extensions,
@@ -90,27 +93,32 @@ from kestrel_sovereign.execution_custody import (
 )
 
 
+def _push_protocol_error(
+    error: PushConfigConflict | SSRFError | PushServiceUnavailable,
+) -> A2AError:
+    """One callback-domain mapping; original execution control is never data."""
+    if is_execution_control_error(error):
+        raise error
+    if isinstance(error, PushServiceUnavailable):
+        return InternalError(message="Native push delivery service is unavailable")
+    if isinstance(error, PushTaskNotFound):
+        return TaskNotFoundError()
+    if isinstance(error, PushRetirementPending):
+        return InternalError(
+            message="Push deletion is waiting for original HTTP retirement"
+        )
+    return InvalidParamsError(
+        message="Push notification configuration was not accepted"
+    )
+
+
 @contextmanager
 def _push_errors():
     """Translate callback domain refusals, retaining original execution control."""
     try:
         yield
     except (PushConfigConflict, SSRFError, PushServiceUnavailable) as error:
-        if is_execution_control_error(error):
-            raise
-        if isinstance(error, PushServiceUnavailable):
-            raise InternalError(
-                message="Native push delivery service is unavailable"
-            ) from error
-        if isinstance(error, PushTaskNotFound):
-            raise TaskNotFoundError() from error
-        if isinstance(error, PushRetirementPending):
-            raise InternalError(
-                message="Push deletion is waiting for original HTTP retirement"
-            ) from error
-        raise InvalidParamsError(
-            message="Push notification configuration was not accepted"
-        ) from error
+        raise _push_protocol_error(error) from error
 
 
 def _push_cursor(scope, principal_id, task_id, config_id):
@@ -285,15 +293,18 @@ class NativeA2ARequestHandler(RequestHandler):
                     raise TaskNotCancelableError() from error
                 raise
 
-    async def _submit(
+    def _submission_claims(
         self, admitted: AuthorizedNativeRequest[SendMessageRequest]
-    ) -> Task | Message:
-        params, principal_id = admitted.request, admitted.principal_id
-        validate_history_length(params.configuration)
-        if params.configuration.HasField("task_push_notification_config"):
-            with _push_errors():
-                self._require_push()
+    ) -> NativeMessageMetadata | StreamRefusal:
+        """Validate protocol input without an async/resource lifetime boundary.
+
+        Only these pure validators produce logical refusals here. Exceptions
+        from manager I/O, original close or authority exit are not intercepted
+        by a catch-all around the streaming source.
+        """
+        params = admitted.request
         try:
+            validate_history_length(params.configuration)
             metadata = MessageToDict(params.metadata)
             require_metadata_extensions(metadata, admitted.activated_extensions)
             claims = parse_message_metadata(metadata)
@@ -302,21 +313,33 @@ class NativeA2ARequestHandler(RequestHandler):
                 self.manager.get_agent_skills(),
                 claims.skill_hint,
             )
+            validate_input_parts(params.message.parts, modes)
+        except (InvalidParamsError, ContentTypeNotSupportedError) as error:
+            if is_execution_control_error(error):
+                raise
+            return StreamRefusal(error)
         except ValueError as error:
-            raise InvalidParamsError(message=str(error)) from error
-        validate_input_parts(params.message.parts, modes)
+            if is_execution_control_error(error):
+                raise
+            refusal = InvalidParamsError(message=str(error))
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
         output_modes = params.configuration.accepted_output_modes
         if output_modes and not set(output_modes).intersection(
             self._card.default_output_modes
         ):
-            raise ContentTypeNotSupportedError()
+            return StreamRefusal(ContentTypeNotSupportedError())
         if claims.peer_stop is not None:
             if params.configuration.HasField("task_push_notification_config"):
-                raise InvalidParamsError(
-                    message="Peer Stop returns a Message and cannot register task push"
+                return StreamRefusal(
+                    InvalidParamsError(
+                        message="Peer Stop returns a Message and cannot register task push"
+                    )
                 )
             if self._peer_stop_target is None:
-                raise UnsupportedOperationError(message="Peer Stop is not advertised")
+                return StreamRefusal(
+                    UnsupportedOperationError(message="Peer Stop is not advertised")
+                )
             if (
                 params.message.task_id
                 or params.message.role != Role.ROLE_USER
@@ -324,13 +347,39 @@ class NativeA2ARequestHandler(RequestHandler):
                 or params.message.parts[0].WhichOneof("content") != "text"
                 or params.message.parts[0].text != (claims.peer_stop["reason"] or "")
             ):
-                raise InvalidParamsError(
-                    message="Peer Stop requires its own user message and reason"
+                return StreamRefusal(
+                    InvalidParamsError(
+                        message="Peer Stop requires its own user message and reason"
+                    )
                 )
             if output_modes:
-                validate_input_parts(
-                    [Part(raw=b"{}", media_type="application/json")], output_modes
-                )
+                try:
+                    validate_input_parts(
+                        [Part(raw=b"{}", media_type="application/json")], output_modes
+                    )
+                except (InvalidParamsError, ContentTypeNotSupportedError) as error:
+                    if is_execution_control_error(error):
+                        raise
+                    return StreamRefusal(error)
+        return claims
+
+    async def _submit(
+        self, admitted: AuthorizedNativeRequest[SendMessageRequest]
+    ) -> Task | Message | StreamRefusal:
+        params, principal_id = admitted.request, admitted.principal_id
+        if params.configuration.HasField("task_push_notification_config"):
+            if self._push_service is None:
+                return StreamRefusal(PushNotificationNotSupportedError())
+            try:
+                self._require_push()
+            except (PushConfigConflict, SSRFError, PushServiceUnavailable) as error:
+                refusal = _push_protocol_error(error)
+                refusal.__cause__ = error
+                return StreamRefusal(refusal)
+        claims = self._submission_claims(admitted)
+        if isinstance(claims, StreamRefusal):
+            return claims
+        if claims.peer_stop is not None:
             from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
 
             async with self.guard.hold_authority(admitted):
@@ -348,28 +397,41 @@ class NativeA2ARequestHandler(RequestHandler):
                     Part(raw=encode_inline_json(receipt), media_type="application/json")
                 ],
             )
+
+        def admission_fence() -> OriginalContextExit[None]:
+            return OriginalContextExit(self.guard.hold_authority(admitted))
+
         try:
             if params.message.task_id:
                 task = await self.manager.continue_task(
                     params,
                     creator_agent_id=principal_id,
-                    admission_fence=lambda: self.guard.hold_authority(admitted),
+                    admission_fence=admission_fence,
                 )
                 if task is None:
-                    raise TaskNotFoundError()
+                    return StreamRefusal(TaskNotFoundError())
                 return task
             return await self.manager.create_task(
                 params,
                 creator_agent_id=principal_id,
-                admission_fence=lambda: self.guard.hold_authority(admitted),
+                admission_fence=admission_fence,
             )
         except TaskInputUnsupportedError as error:
-            raise UnsupportedOperationError(message=str(error)) from error
-        except TaskInputConflictError as error:
-            raise InvalidParamsError(message=str(error)) from error
-        except (PushConfigConflict, SSRFError, PushServiceUnavailable):
-            with _push_errors():
+            if is_execution_control_error(error):
                 raise
+            refusal = UnsupportedOperationError(message=str(error))
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
+        except TaskInputConflictError as error:
+            if is_execution_control_error(error):
+                raise
+            refusal = InvalidParamsError(message=str(error))
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
+        except (PushConfigConflict, SSRFError, PushServiceUnavailable) as error:
+            refusal = _push_protocol_error(error)
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
         except ContextOwnershipError as error:
             if is_execution_control_error(error):
                 raise
@@ -377,7 +439,9 @@ class NativeA2ARequestHandler(RequestHandler):
                 status_code=403, detail="A2A context is not available to this principal"
             ) from error
 
-    async def _open_stream(self, task_id: str, principal_id: str):
+    async def _open_stream(
+        self, task_id: str, principal_id: str
+    ) -> tuple[AsyncIterator[Event], Task] | StreamRefusal:
         stream = self.manager.subscribe(
             task_id,
             creator_agent_id=principal_id,
@@ -387,7 +451,11 @@ class NativeA2ARequestHandler(RequestHandler):
             initial = await anext(stream)
         except StopAsyncIteration as error:
             await close_native_execution_stream(stream, self)
-            raise TaskNotFoundError() from error
+            if is_execution_control_error(error):
+                raise
+            refusal = TaskNotFoundError()
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
         except BaseException:
             await close_native_execution_stream(stream, self)
             raise
@@ -418,12 +486,17 @@ class NativeA2ARequestHandler(RequestHandler):
         async with self.guard.admit(params, "SendMessage", context) as admitted:
             pass
         task = await self._submit(admitted)
+        if isinstance(task, StreamRefusal):
+            raise task.error
         async with self.guard.hold_authority(admitted):
             if isinstance(task, Message):
                 return task
             if admitted.request.configuration.return_immediately:
                 return apply_history_length(task, admitted.request.configuration)
-            stream, initial = await self._open_stream(task.id, admitted.principal_id)
+            opened = await self._open_stream(task.id, admitted.principal_id)
+        if isinstance(opened, StreamRefusal):
+            raise opened.error
+        stream, initial = opened
         async with owned_execution_stream(
             self, self._events(stream, initial, admitted)
         ) as events:
@@ -455,20 +528,35 @@ class NativeA2ARequestHandler(RequestHandler):
 
     async def on_message_send_stream(
         self, params: SendMessageRequest, context: ServerCallContext
-    ) -> AsyncGenerator[Event]:
+    ) -> AsyncGenerator[Event | StreamRefusal]:
         async with self.guard.admit(
             params, "SendStreamingMessage", context
         ) as admitted:
-            if not self._card.capabilities.streaming:
-                raise UnsupportedOperationError(
+            streaming = self._card.capabilities.streaming
+        if not streaming:
+            yield StreamRefusal(
+                UnsupportedOperationError(
                     message="Streaming is not advertised by this agent"
                 )
+            )
+            return
         task = await self._submit(admitted)
+        if isinstance(task, StreamRefusal):
+            yield task
+            return
+        if isinstance(task, Message):
+            # Revalidate authority, but do not suspend the source while the
+            # lifecycle reader lease is still held.
+            async with self.guard.hold_authority(admitted):
+                pass
+            yield task
+            return
         async with self.guard.hold_authority(admitted):
-            if isinstance(task, Message):
-                yield task
-                return
-            stream, initial = await self._open_stream(task.id, admitted.principal_id)
+            opened = await self._open_stream(task.id, admitted.principal_id)
+        if isinstance(opened, StreamRefusal):
+            yield opened
+            return
+        stream, initial = opened
         async with owned_execution_stream(
             self, self._events(stream, initial, admitted)
         ) as events:
@@ -477,20 +565,33 @@ class NativeA2ARequestHandler(RequestHandler):
 
     async def on_subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext
-    ) -> AsyncGenerator[Event]:
+    ) -> AsyncGenerator[Event | StreamRefusal]:
         async with self.guard.admit(params, "SubscribeToTask", context) as admitted:
             if not self._card.capabilities.streaming:
-                raise UnsupportedOperationError(
-                    message="Streaming is not advertised by this agent"
+                opened = StreamRefusal(
+                    UnsupportedOperationError(
+                        message="Streaming is not advertised by this agent"
+                    )
                 )
-            stream, initial = await self._open_stream(
-                admitted.request.id, admitted.principal_id
-            )
-            if initial.status.state in TERMINAL_STATES:
-                await close_native_execution_stream(stream, self)
-                raise UnsupportedOperationError(
-                    message="Cannot subscribe to a terminal task"
+            else:
+                opened = await self._open_stream(
+                    admitted.request.id, admitted.principal_id
                 )
+                if not isinstance(opened, StreamRefusal):
+                    stream, initial = opened
+                    if initial.status.state in TERMINAL_STATES:
+                        await close_native_execution_stream(stream, self)
+                        opened = StreamRefusal(
+                            UnsupportedOperationError(
+                                message="Cannot subscribe to a terminal task"
+                            )
+                        )
+        if isinstance(opened, StreamRefusal):
+            # Only explicit semantic decisions become values. An exception
+            # from original close or authority exit never reaches this yield.
+            yield opened
+            return
+        stream, initial = opened
         async with owned_execution_stream(
             self, self._events(stream, initial, admitted)
         ) as events:

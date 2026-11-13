@@ -7,6 +7,7 @@ import contextvars
 import errno
 import inspect
 import os
+import sys
 from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import Path
 
@@ -19,13 +20,339 @@ from kestrel_sovereign._async_ownership import (
     create_owned_task,
 )
 from kestrel_sovereign.execution_custody import (
-    execution_cleanup_debts, execution_evidence_carriers, execution_stream, is_execution_control_error,
+    execution_cleanup_debts, execution_evidence_carriers, execution_native_source_error,
+    execution_stream, is_execution_control_error,
 )
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 
 
 def test_callback_source_is_the_shared_sdk_contract() -> None:
     assert OwnedCallbackSource is CallbackSource
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("phase", ["owner-allocation", "owner-admission", "owner-publication",
+                                  "watcher-allocation", "watcher-admission", "watcher-publication"])
+async def test_resource_aware_constructor_refusal_joins_actual_accepted_tasks_before_dispatch(
+    tmp_path: Path, phase: str, eager: bool,
+) -> None:
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("native eager Task requires Python 3.12")
+    refusal = OSError("actual resource-aware constructor refused: " + phase)
+    accepted, refused, descriptors = [], [], []
+    path = tmp_path / "must-not-acquire"
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+
+    class PublicationTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            callback_name = getattr(callback, "__name__", "")
+            if ((phase == self.role + "-admission" and callback_name == "close_unstarted")
+                    or (phase == "owner-publication" and self.role == "owner"
+                        and callback_name == "_publish_owner_completion")
+                    or (phase == "watcher-publication" and self.role == "watcher"
+                        and callback_name == "_interrupt_if_watch_never_started")):
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+
+    def native_factory(loop, coroutine, **options):
+        operation = coroutine.cr_frame.f_locals.get("operation") if coroutine.cr_frame else None
+        name = getattr(getattr(operation, "cr_code", None), "co_name", "")
+        role = {"run_owned": "owner", "_watch_owner_cancellation": "watcher"}.get(name)
+        if role is not None:
+            if phase == role + "-allocation":
+                refused.append(coroutine)
+                raise refusal
+            if eager:
+                options["eager_start"] = True
+            task = PublicationTask(coroutine, loop=loop, **options)
+            task.role = role
+            accepted.append(task)
+            return task
+        return asyncio.Task(coroutine, loop=loop, **options)
+
+    def acquire(resources: SourceAcquisition) -> AsyncIterable[bytes]:
+        descriptors.append(os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600))
+        pytest.fail("A refused resource-aware constructor crossed source dispatch")
+
+    try:
+        loop.set_task_factory(native_factory)
+        with pytest.raises(BaseException) as caught:
+            await ownership.create_owned_iterator(source_factory=acquire, operation="resource-aware admission")
+        assert any(error is refusal for error in execution_evidence_carriers(caught.value))
+        assert not descriptors and not path.exists()
+        assert all(task.done() and inspect.getcoroutinestate(task.get_coro()) == inspect.CORO_CLOSED
+                   for task in accepted)
+        assert all(inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED for coroutine in refused)
+        debts = execution_cleanup_debts(caught.value)
+        if phase.endswith("-allocation"):
+            # Our adversarial factory's private ledger is NOT an admission
+            # receipt available to production. Opaque allocation refusal must
+            # conservatively retain unknown acceptance, even with zero matches.
+            assert any(type(resource) is ownership.OwnedTaskAdmission
+                       and resource.task is task is None for resource, task in debts)
+        elif phase.endswith("-admission"):
+            # A failed original completion-capture registration is not repaired
+            # merely by this test seeing Task.done()/a closed Python coroutine.
+            assert any(type(resource) is OwnedAsyncIterator and resource.producer_task is task
+                       and task in accepted for resource, task in debts)
+        else:
+            assert not debts, "Post-admission original constructor owners were not reconciled"
+    finally:
+        loop.set_task_factory(previous)
+        # Negative-run recovery never substitutes for the assertions above.
+        for task in accepted:
+            if not task.done():
+                task.cancel()
+            await await_owned_task(task)
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("natural_finally", [False, True])
+async def test_native_source_projection_keeps_original_failed_finalizer_and_actual_debt(
+    tmp_path: Path, natural_finally: bool,
+) -> None:
+    path = tmp_path / "original-unretired-finalizer"
+    path.write_bytes(b"still owned")
+    descriptors, owners, failures = [], [], []
+    delivered = guarded = source_guarded = terminal = scoped = None
+    value = None
+    coordinator = ReentrantTransitionLock()
+
+    def fail_original_close() -> None:
+        try:
+            os.write(descriptors[0], b"real write to a read-only original FD")
+        except OSError as error:
+            failures.append(error)
+            raise
+
+    async def generate() -> AsyncIterator[bytes]:
+        try:
+            yield b"first"
+        finally:
+            fail_original_close()
+
+    class Source:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            fail_original_close()
+
+    def acquire(resources: SourceAcquisition) -> AsyncIterable[bytes]:
+        descriptors.append(os.open(path, os.O_RDONLY))
+        owners.append(asyncio.current_task())
+        return generate() if natural_finally else Source()
+
+    try:
+        async with coordinator:
+            scope = coordinator.current_native_scope()
+            root = asyncio.current_task()
+            try:
+                async with ownership.native_source_lifetime(acquire) as reader:
+                    if natural_finally:
+                        value = await anext(reader)
+                    try:
+                        await anext(reader)
+                    except BaseException as error:
+                        delivered = error
+                    try:
+                        reader.raise_if_retirement_failed()
+                    except BaseException as error:
+                        guarded = error
+                    try:
+                        reader.raise_if_source_failed()
+                    except BaseException as error:
+                        source_guarded = error
+            except BaseException as error:
+                terminal = error
+            scoped = coordinator.native_scope_control(scope, root=root)
+        assert not natural_finally or value == b"first"
+        assert len(failures) == 1 and failures[0].errno == errno.EBADF
+        actual, = owners
+        assert actual.done() and inspect.getcoroutinestate(actual.get_coro()) == inspect.CORO_CLOSED
+        for label, error in (
+            ("delivered", delivered), ("pre-response guard", guarded), ("request root", terminal),
+            ("original source guard", source_guarded),
+            ("native projection", execution_native_source_error(terminal)), ("native scope", scoped),
+        ):
+            assert error is not None, label
+            assert is_execution_control_error(error), label
+            assert any(item is failures[0] for item in execution_evidence_carriers(error)), label
+            debt, = execution_cleanup_debts(error)
+            resource, producer = debt
+            assert type(resource) is OwnedAsyncIterator and resource.producer_task is producer is actual
+        assert failures[0].__cause__ is None
+        assert os.fstat(descriptors[0]).st_size == len(b"still owned")
+    finally:
+        # Recover deliberately failed test cleanup, not an original-close ACK.
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+@pytest.mark.asyncio
+async def test_native_request_join_retains_every_delivered_withdrawal_without_rewriting_originals(
+    tmp_path: Path,
+) -> None:
+    closing, release = asyncio.Event(), asyncio.Event()
+    delivered_events = [asyncio.Event(), asyncio.Event()]
+    delivered, originals, retired, descriptors = [], [], [], []
+    request_task = None
+    join_code = ownership.await_owned_task.__wrapped__.__code__
+    previous_trace = sys.gettrace()
+    marker = contextvars.ContextVar("native-withdrawal-finalizer", default="outside")
+
+    async def generate():
+        descriptor = os.open(tmp_path / "withdrawal-source", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        descriptors.append(descriptor)
+        originals.append(asyncio.current_task())
+        token = marker.set("original")
+        try:
+            yield b"first"
+        finally:
+            try:
+                closing.set()
+                await release.wait()
+                assert marker.get() == "original"
+                os.close(descriptor)
+                retired.append(asyncio.current_task())
+            finally:
+                marker.reset(token)
+
+    async def request():
+        coordinator = ReentrantTransitionLock()
+        try:
+            async with coordinator:
+                async with ownership.native_source_lifetime(lambda resources: generate()) as reader:
+                    assert await anext(reader) == b"first"
+        except BaseException as error:
+            return error
+
+    def trace(frame, event, arguments):
+        if frame.f_code is not join_code:
+            return None
+        if event == "exception" and asyncio.current_task() is request_task:
+            error = arguments[1]
+            if type(error) is asyncio.CancelledError and error.args in [("withdrawal-one",), ("withdrawal-two",)]:
+                delivered.append(error)
+                delivered_events[len(delivered) - 1].set()
+        return trace
+
+    try:
+        sys.settrace(trace)
+        request_task = asyncio.create_task(request())
+        await closing.wait()
+        request_task.cancel("withdrawal-one")
+        await delivered_events[0].wait()
+        request_task.cancel("withdrawal-two")
+        await delivered_events[1].wait()
+        release.set()
+        terminal = await request_task
+        evidence = execution_evidence_carriers(terminal)
+        assert len(delivered) == 2 and delivered[0] is not delivered[1]
+        assert all(any(error is item for item in evidence) for error in delivered)
+        assert all(error.__cause__ is None for error in delivered)
+        assert originals == retired and len(originals) == 1
+        actual, = originals
+        assert actual.done() and actual.cancelling() == 0
+        assert inspect.getcoroutinestate(actual.get_coro()) == inspect.CORO_CLOSED
+        assert marker.get() == "outside" and execution_native_source_error(terminal) is None
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        release.set()
+        sys.settrace(previous_trace)
+        if request_task is not None:
+            await request_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_finally", [False, True])
+async def test_finite_host_observation_retains_actual_native_request_source_until_physical_join(
+    tmp_path: Path, fail_finally: bool,
+) -> None:
+    closing, release = asyncio.Event(), asyncio.Event()
+    descriptors, original_tasks, retired_tasks, failures, sources, admissions = [], [], [], [], [], []
+    marker = contextvars.ContextVar("finite-native-source", default="outside")
+
+    async def generate():
+        descriptor = os.open(tmp_path / "finite-source", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        descriptors.append(descriptor)
+        original_tasks.append(asyncio.current_task())
+        token = marker.set("original")
+        try:
+            yield b"first"
+        finally:
+            try:
+                closing.set()
+                await release.wait()
+                assert marker.get() == "original"
+                os.close(descriptor)
+                retired_tasks.append(asyncio.current_task())
+                if fail_finally:
+                    try:
+                        os.fstat(descriptor)
+                    except OSError as error:
+                        failures.append(error)
+                        raise
+            finally:
+                marker.reset(token)
+
+    async def request():
+        coordinator = ReentrantTransitionLock()
+        async with coordinator:
+            async with ownership.native_source_lifetime(lambda resources: generate()) as reader:
+                assert await anext(reader) == b"first"
+                sources.append(reader._source)
+                admissions.extend(coordinator.current_native_scope().admissions)
+
+    request_task = asyncio.create_task(request())
+    try:
+        async with asyncio.timeout(5):
+            await closing.wait()
+        source, = sources
+        physical = (source.producer_task, source.owner_task)
+        assert original_tasks == [source.producer_task]
+        assert all(task in admissions for task in physical)
+        observed = await ownership.wait_owned_tasks_until(
+            (request_task, *physical), deadline=asyncio.get_running_loop().time() + .01,
+        )
+        assert observed.result == (set(), {request_task, *physical})
+        assert observed.error is observed.cancellation is None
+        debt = ownership.pending_owned_retirement_error(
+            source, physical, message="original native request source remains physically pending",
+        )
+        assert execution_cleanup_debts(debt) == tuple((source, task) for task in physical)
+        assert retired_tasks == [] and marker.get() == "outside"
+        assert all(not task.done() and task.cancelling() == 0 for task in (request_task, *physical))
+        os.fstat(descriptors[0])
+        release.set()
+        outcome = await await_owned_task(request_task)
+        assert original_tasks == retired_tasks
+        assert all(task.done() and inspect.getcoroutinestate(task.get_coro()) == inspect.CORO_CLOSED
+                   for task in (request_task, *physical))
+        assert execution_cleanup_debts(debt) == tuple((source, task) for task in physical)
+        if fail_finally:
+            assert len(failures) == 1 and failures[0].errno == errno.EBADF
+            assert any(error is failures[0] for error in execution_evidence_carriers(outcome.error))
+            assert any(error is failures[0]
+                       for error in execution_evidence_carriers(execution_native_source_error(outcome.error)))
+            assert is_execution_control_error(outcome.error)
+        else:
+            assert outcome.error is outcome.cancellation is None
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        release.set()
+        await await_owned_task(request_task)
 
 
 @pytest.mark.asyncio
@@ -61,6 +388,7 @@ async def test_unread_native_root_does_not_dispatch_a_withdrawn_factory() -> Non
         assert scope is not None
         async with ownership.native_source_lifetime(acquire) as reader:
             assert not hasattr(reader, "aclose")
+            reader.raise_if_source_failed()
             originals = tuple(scope.admissions)
             assert len(originals) == 2
         for task in originals:
@@ -220,7 +548,9 @@ async def test_resource_aware_opaque_finally_is_not_aborted_by_close(
         close_outcome, read_outcome = await await_owned_task(closer), await await_owned_task(reader)
         if fail_close:
             assert len(errors) == 1 and errors[0].errno == errno.EBADF
-            assert close_outcome.error is read_outcome.error is errors[0]
+            assert close_outcome.error is read_outcome.error is source.terminal_error
+            assert any(error is errors[0] for error in execution_evidence_carriers(close_outcome.error))
+            assert is_execution_control_error(close_outcome.error)
         else:
             assert close_outcome.error is close_outcome.cancellation is None
             assert isinstance(read_outcome.error, StopAsyncIteration)
