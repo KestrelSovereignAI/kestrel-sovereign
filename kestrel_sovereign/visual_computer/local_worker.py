@@ -920,6 +920,28 @@ class LocalTwoDomainProvider:
     async def release(self, scope, lease):
         resources = self._setup_host._driver._resources_for_lease(scope, lease)
         await resources.close()
+        return await self._original_release_receipt(scope, resources.original._record, lease)
+
+    async def _original_release_receipt(self, scope, record, lease):
+        """Observe an already issued original closer; never start retirement.
+
+        Runtime supplies its freshly checked releasing row after a failed
+        observation. The ordinary provider path supplies the original setup
+        record. Both retain the same lease/container/connection identities and
+        join the same original setup Future and admitted retirement Task.
+        """
+        resources = self._setup_host._driver._resources_for_lease(scope, lease)
+        admission = resources._close_admission
+        task = admission.task
+        if (record.request.scope != scope or record.lease is None
+                or record.lease.lease_id != lease.lease_id
+                or record.lease.provider_resource_id != lease.provider_resource_id
+                or admission is not resources._original_close_admission or task is None
+                or getattr(task, "_kestrel_owned_admission", None) is not admission):
+            raise ResourceOutcomeUnknown("original_local_worker_retirement_not_issued")
+        await resources.original._join_retirement(record, failed=False)
+        if resources._close_admission is not admission or admission.task is not task:
+            raise ResourceOutcomeUnknown("original_local_worker_retirement_changed")
         return lease.model_copy(update={"state": "released", "released_at": _now(), "actual_cost_usd": Decimal(0)})
 
 

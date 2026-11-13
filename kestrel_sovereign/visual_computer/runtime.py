@@ -852,6 +852,53 @@ class VisualComputerRuntime:
         self._verified_sessions.discard(self._key(scope, record.session_id))
         await self.egress.revoke_session(scope, record.session_id)
 
+    async def _release_and_settle(self, scope, record, check, *, context=None):
+        """Keep caller withdrawal separate from an original local release fact.
+
+        Both callers hold the existing session lock. Only the eligible sweep
+        passes no user grant; foreground recovery retains its same checker.
+        A failed observation may settle only an already issued exact local
+        closer, through the provider's canonical original receipt boundary.
+        """
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+        from .local_worker import LocalTwoDomainProvider
+        provider = self._provider(record)
+        failure = None
+        try:
+            if context is not None:
+                lease = await self._call(context, check, provider.release, scope, record.lease)
+            else:
+                async with asyncio.timeout(self.policy.operation_seconds):
+                    lease = await provider.release(scope, record.lease)
+        except BaseException as error:
+            if type(provider) is not LocalTwoDomainProvider:
+                raise
+            failure = error
+            try:
+                current = await self.repository.get(scope, session_id=record.session_id, guard=check)
+                if (current.phase != "releasing" or current.revision != record.revision
+                        or current.request != record.request or current.quote != record.quote
+                        or current.lease != record.lease or current.connection != record.connection
+                        or current.session != record.session):
+                    raise ResourceConflict("original local releasing custody changed")
+                lease = await provider._original_release_receipt(scope, current, current.lease)
+                if check is not None:
+                    check()
+                record = current
+            except BaseException as settlement:
+                raise execution_terminal_error(error, settlement, retain_originals=True)
+        try:
+            self._lease(record, lease, releasing=True)
+            record.lease = lease
+            if lease.state == "released":
+                record.phase, record.connection = "released", None
+            await self.repository.save(scope, record, check)
+            if record.phase == "released":
+                await self._discard_released_local_connection(record, check)
+        except BaseException as settlement:
+            raise execution_terminal_error(failure, settlement, retain_originals=True)
+        return record, failure
+
     async def release(self, context, session_id):
         async with self.operation(context, VisualAction.RELEASE) as check:
             scope = self.scope(context)
@@ -895,15 +942,10 @@ class VisualComputerRuntime:
                 await self._begin_release(scope, record, check)
                 # Physical destruction has its own verb and outcome. A timeout
                 # does not erase the original lease/connection or claim release.
-                lease = await self._call(context, check, self._provider(record).release, scope, record.lease)
-                self._lease(record, lease, releasing=True)
-                record.lease = lease
-                if lease.state == "released":
-                    record.phase, record.connection = "released", None
-                await self.repository.save(scope, record, check)
-                if record.phase == "released":
-                    await self._discard_released_local_connection(record, check)
-                return {"session_id": session_id, "released": lease.state == "released"}
+                record, failure = await self._release_and_settle(scope, record, check, context=context)
+                if failure is not None:
+                    raise failure
+                return {"session_id": session_id, "released": record.lease.state == "released"}
 
     async def fence_owned_sessions(self, scope):
         """Host lifecycle safety, without minting a user/delegated grant.
@@ -1041,17 +1083,11 @@ class VisualComputerRuntime:
                     if await self._settle_failed_local_setup(scope, record, None) is not None:
                         continue
                     await self._begin_release(scope, record)
-                    async with asyncio.timeout(self.policy.operation_seconds):
-                        lease = await self._provider(record).release(scope, record.lease)
-                    self._lease(record, lease, releasing=True)
-                    record.lease = lease
-                    if lease.state == "released":
-                        record.phase, record.connection = "released", None
-                    else:
+                    record, failure = await self._release_and_settle(scope, record, None)
+                    if failure is not None and not isinstance(failure, (ResourceError, TimeoutError, OSError)):
+                        raise failure
+                    if record.phase != "released":
                         uncertain.append(record.session_id)
-                    await self.repository.save(scope, record)
-                    if record.phase == "released":
-                        await self._discard_released_local_connection(record)
             except (ResourceError, TimeoutError, OSError):
                 uncertain.append(record.session_id)
         return uncertain
