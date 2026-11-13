@@ -3,7 +3,6 @@
 import hashlib
 import hmac
 import json
-from collections.abc import Callable
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -13,7 +12,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthToken
 
-from .consent import MCPConsentApproval
+from .consent import MCPConsentApproval, MCPConsentAuthority
 from .pending import PendingMCPAuthorizations
 from .records import (
     MCPAuthorizationRecords,
@@ -32,13 +31,21 @@ class MCPAuthorizationGrants:
     """
 
     def __init__(self, pending: PendingMCPAuthorizations, issuer: str, *,
-                 require_current: Callable[[], None], sovereign_fingerprint: Callable[[], str | None]):
+                 consent_authority: MCPConsentAuthority):
         if not issuer.startswith(pending.policy.console_origin + "/") or "#" in issuer or "?" in issuer:
             raise ValueError("The MCP authorization issuer must belong to its configured host")
         self.pending, self.issuer = pending, issuer
         self.backend, self.policy, self.agent_id = pending.backend, pending.policy, pending.agent_id
-        self._require_current, self._sovereign_fingerprint = require_current, sovereign_fingerprint
+        if (consent_authority.agent_id != pending.agent_id or consent_authority.policy is not pending.policy
+                or consent_authority.resource_url != pending.resource_url):
+            raise ValueError("The original target agent's MCP consent authority is required")
+        self._consent_authority = consent_authority
+        self._require_current = consent_authority.require_current_host
         self._records = MCPAuthorizationRecords(self.agent_id, self.policy.max_request_bytes)
+
+    @property
+    def consent_authority(self) -> MCPConsentAuthority:
+        return self._consent_authority
 
     def _require_top_level(self) -> None:
         self._require_current()
@@ -80,7 +87,7 @@ class MCPAuthorizationGrants:
     def _current_grant(self, value: dict, expires_at: int) -> bool:
         self._require_current()
         registration = self._registration(value["client_id"])
-        fingerprint = self._sovereign_fingerprint()
+        fingerprint = self.consent_authority.current_sovereign_fingerprint()
         return (expires_at > self.pending.now() and registration is not None
             and hmac.compare_digest(registration, value["registration"])
             and fingerprint is not None and hmac.compare_digest(fingerprint, value["credential_fingerprint"])
@@ -96,7 +103,7 @@ class MCPAuthorizationGrants:
         value = self._records.open(MCPRecordKind.GRANT, grant_hash, row[1], row[0])
         return (value, row[1]) if self._current_grant(value, row[1]) else None
 
-    async def _credential(self, kind: MCPRecordKind, secret: str, client_id: str | None):
+    async def _stored_credential(self, kind: MCPRecordKind, secret: str, client_id: str | None):
         try:
             digest = hash_mcp_secret(secret)
         except ValueError:
@@ -110,10 +117,16 @@ class MCPAuthorizationGrants:
         value = self._records.open(kind, digest, row[1], row[0])
         if value["grant_hash"] != row[3] or (client_id is not None and value["client_id"] != client_id):
             return None
-        grant = await self._grant(row[3])
+        return digest, value, row[1], bool(row[2]), row[3]
+
+    async def _credential(self, kind: MCPRecordKind, secret: str, client_id: str | None):
+        row = await self._stored_credential(kind, secret, client_id)
+        if row is None:
+            return None
+        grant = await self._grant(row[4])
         if grant is None:
             return None
-        return digest, value, row[1], bool(row[2]), row[3], grant
+        return (*row, grant)
 
     async def _revoke(self, grant_hash: str) -> None:
         await self.backend.execute("UPDATE mcp_server_oauth_grants SET revoked = 1 WHERE agent_id = ? AND grant_hash = ?",
@@ -123,7 +136,7 @@ class MCPAuthorizationGrants:
     async def issue_code(self, handle: str, approval: MCPConsentApproval) -> AuthorizationCode:
         """Consume the original pending request and mint its code in one commit."""
         self._require_top_level()
-        approval.require_current()
+        self.consent_authority.require_approval(approval)
         async with self.pending.serialized():
             self._require_current()
             now = self.pending.now()
@@ -137,12 +150,12 @@ class MCPAuthorizationGrants:
             full = count[0] >= self.policy.max_grants_per_agent
             pending = None if full else await self.pending.read(handle)
             if pending is not None:
-                approval.require_pending(handle, pending)
+                self.consent_authority.require_approval(approval, handle=handle, pending=pending)
                 claimed = await self.pending.claim(handle)
                 if claimed is None:
                     pending = None
             if pending is not None:
-                approval.require_pending(handle, claimed)
+                self.consent_authority.require_approval(approval, handle=handle, pending=claimed)
                 grant_hash = hash_mcp_secret(new_mcp_secret())
                 expires = now + self.policy.refresh_token_seconds
                 value = {"client_id": approval.client_id, "resource": approval.resource,
@@ -159,13 +172,13 @@ class MCPAuthorizationGrants:
                     resource=approval.resource, subject=approval.subject)
                 await self._insert(MCPRecordKind.CODE, code.code, grant_hash, int(code.expires_at),
                     code.model_dump(mode="json", exclude={"code"}))
-            approval.require_current()
+            self.consent_authority.require_approval(approval)
             self._require_current()
         if full:
             raise ValueError("The agent's MCP authorization grant quota is full")
         if pending is None:
             raise ValueError("The original pending MCP request is unavailable")
-        approval.require_current()
+        self.consent_authority.require_approval(approval)
         if code.expires_at <= self.pending.now():
             raise ValueError("The MCP authorization code expired before publication")
         return code
@@ -192,7 +205,10 @@ class MCPAuthorizationGrants:
         self._require_current()
         if row is None or row[2] <= self.pending.now() or not self._current_grant(*row[5]):
             return None
-        value = {key: value for key, value in row[1].items() if key != "grant_hash"}
+        return self._native_credential(kind, secret, row[1])
+
+    def _native_credential(self, kind: MCPRecordKind, secret: str, stored: dict):
+        value = {key: value for key, value in stored.items() if key != "grant_hash"}
         if kind is MCPRecordKind.CODE:
             client = self.policy.registered_client(value["client_id"])
             redirect = next(uri for uri in client.oauth_information().redirect_uris
@@ -200,6 +216,16 @@ class MCPAuthorizationGrants:
             return AuthorizationCode.model_validate({**value, "code": secret, "redirect_uri": redirect})
         model = AccessToken if kind is MCPRecordKind.ACCESS else RefreshToken
         return model.model_validate({**value, "token": secret})
+
+    async def load_for_revocation(self, kind: MCPRecordKind, secret: str, *, resource: str,
+                                  client_id: str | None = None) -> AccessToken | RefreshToken | None:
+        """Authenticate stored ownership without granting current token usability."""
+        self._require_top_level()
+        self._resource(resource)
+        if kind not in (MCPRecordKind.ACCESS, MCPRecordKind.REFRESH):
+            raise ValueError("Only access and refresh tokens may be revoked")
+        row = await self._stored_credential(kind, secret, client_id)
+        return self._native_credential(kind, secret, row[1]) if row is not None else None
 
     async def exchange(self, kind: MCPRecordKind, credential: AuthorizationCode | RefreshToken, *,
                        resource: str, scopes: list[str] | None = None) -> OAuthToken:
@@ -249,8 +275,10 @@ class MCPAuthorizationGrants:
     async def revoke(self, kind: MCPRecordKind, secret: str, *, resource: str, client_id: str) -> None:
         self._require_top_level()
         self._resource(resource)
+        if kind not in (MCPRecordKind.ACCESS, MCPRecordKind.REFRESH):
+            raise ValueError("Only access and refresh tokens may be revoked")
         async with self.pending.serialized():
-            row = await self._credential(kind, secret, client_id)
+            row = await self._stored_credential(kind, secret, client_id)
             if row is not None:
                 await self._revoke(row[4])
         self._require_current()

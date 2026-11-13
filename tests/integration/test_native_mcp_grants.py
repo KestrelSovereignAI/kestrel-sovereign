@@ -11,6 +11,7 @@ from mcp.server.auth.provider import (
     principal_components,
 )
 
+from kestrel_sovereign.mcp_server.consent import MCPConsentAuthority
 from kestrel_sovereign.mcp_server.grants import MCPAuthorizationGrants
 from kestrel_sovereign.mcp_server.policy import MCPServerPolicy
 from kestrel_sovereign.mcp_server.records import MCPRecordKind
@@ -119,8 +120,11 @@ async def test_current_sovereign_key_and_client_registration_control_durable_rea
         config["clients"][0]["scopes"] = ["memory:write"]
     policy = MCPServerPolicy.model_validate_json(json.dumps(config))
     other_pending = type(pending)(pending.backend, pending.agent_id, pending.resource_url, policy, clock=pending.clock)
-    other = MCPAuthorizationGrants(other_pending, grants.issuer + ("/other" if change == "issuer" else ""), require_current=grants._require_current,
-        sovereign_fingerprint=grants._sovereign_fingerprint)
+    authority = MCPConsentAuthority(pending.agent_id, RESOURCE, policy,
+        require_current=grants.consent_authority.require_current_host,
+        sovereign_key=lambda: keys[0], clock=pending.clock)
+    other = MCPAuthorizationGrants(other_pending, grants.issuer + ("/other" if change == "issuer" else ""),
+        consent_authority=authority)
     assert await other.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE) is None
 
 
@@ -225,3 +229,37 @@ async def test_refresh_cannot_request_scopes_outside_its_original_native_token(c
     with pytest.raises(TokenError):
         await grants.exchange(MCPRecordKind.REFRESH, refresh, resource=RESOURCE, scopes=["memory:write"])
     assert await grants.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_credentials") == (3,)
+
+
+@pytest.mark.parametrize("change", ["scopes", "client", "resource", "subject", "credential", "copy"])
+async def test_only_the_original_human_approval_can_consume_pending_consent(consent_http, change):
+    client, pending, handle, _retained, _keys, _clock, grants, _app = consent_http
+    response = await client.post("/api/owned-mcp-consent?mode=substitute-approval&change=" + change,
+        headers={"x-api-key": API_KEY})
+    assert response.status_code == 403, "A copied approval substituted the original human decision"
+    assert await pending.read(handle) is not None
+    assert await grants.backend.fetch_one("SELECT COUNT(*) FROM mcp_server_oauth_grants") == (0,)
+
+
+@pytest.mark.parametrize("change", ["sovereign", "client-secret"])
+async def test_revocation_tombstone_survives_temporary_credential_configuration_changes(consent_http, change):
+    pending, keys, grants = consent_http[1], consent_http[4], consent_http[6]
+    code, token = await pair(consent_http)
+    revoker = grants
+    if change == "sovereign":
+        keys[0] = "owned-rotated-sovereign-key"
+    else:
+        config = json.loads(pending.policy.model_dump_json())
+        config["clients"][0]["client_secret"] = "owned-rotated-client-secret"
+        policy = MCPServerPolicy.model_validate_json(json.dumps(config))
+        other_pending = type(pending)(pending.backend, pending.agent_id, pending.resource_url, policy,
+            clock=pending.clock)
+        authority = MCPConsentAuthority(pending.agent_id, RESOURCE, policy,
+            require_current=grants.consent_authority.require_current_host,
+            sovereign_key=lambda: keys[0], clock=pending.clock)
+        revoker = MCPAuthorizationGrants(other_pending, grants.issuer, consent_authority=authority)
+    await revoker.revoke(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE, client_id=code.client_id)
+    keys[0] = API_KEY
+    assert await grants.load(MCPRecordKind.ACCESS, token.access_token, resource=RESOURCE) is None, (
+        "An acknowledged revocation revived after restoring earlier credential configuration")
+    assert await grants.backend.fetch_one("SELECT revoked FROM mcp_server_oauth_grants") == (1,)

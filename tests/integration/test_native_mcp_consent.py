@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from contextvars import copy_context
+from dataclasses import replace
 
 import httpx2
 import pytest
@@ -13,7 +14,7 @@ from mcp.server.auth.provider import AuthorizationParams
 
 from kestrel_sovereign import server
 from kestrel_sovereign.endpoints.auth_oauth import _create_jwt
-from kestrel_sovereign.mcp_server.consent import approve_pending_request
+from kestrel_sovereign.mcp_server.consent import MCPConsentAuthority
 from kestrel_sovereign.mcp_server.grants import MCPAuthorizationGrants
 from kestrel_sovereign.mcp_server.pending import PendingMCPAuthorizations
 from kestrel_sovereign.mcp_server.policy import MCPServerPolicy
@@ -69,8 +70,9 @@ async def consent_http(request, native_pg, tmp_path, monkeypatch):
             if not live[0]:
                 raise HostCapabilityAccessDenied("Original target authority retired")
 
-        grants = MCPAuthorizationGrants(pending, RESOURCE + "/oauth", require_current=current,
-            sovereign_fingerprint=lambda: sovereign_key_fingerprint(keys[0]))
+        authority = MCPConsentAuthority(pending.agent_id, RESOURCE, policy, require_current=current,
+            sovereign_key=lambda: keys[0], clock=lambda: clock[0])
+        grants = MCPAuthorizationGrants(pending, RESOURCE + "/oauth", consent_authority=authority)
         await grants.initialize()
 
         @app.post("/api/owned-mcp-consent")
@@ -81,12 +83,25 @@ async def consent_http(request, native_pg, tmp_path, monkeypatch):
                 return JSONResponse({"error": "Original pending request unavailable"}, status_code=404)
             requested = (request.query_params.get("scope", "memory:read"),)
             target = request.query_params.get("resource", RESOURCE)
+            selected_authority = authority if target == RESOURCE else MCPConsentAuthority(
+                pending.agent_id, target, policy, require_current=current,
+                sovereign_key=lambda: keys[0], clock=lambda: clock[0])
             try:
-                with approve_pending_request(selected_handle, value, requested, policy,
-                        resource_url=target, require_current=current,
-                        sovereign_key=lambda: keys[0], clock=lambda: clock[0]) as approval:
+                with selected_authority.approve(selected_handle, value, requested) as approval:
                     retained.append((approval, copy_context()))
                     mode = request.query_params.get("mode")
+                    if mode == "substitute-approval":
+                        changes = {
+                            "scopes": {"scopes": ("memory:write",)},
+                            "client": {"client_id": "other-provider"},
+                            "resource": {"resource": RESOURCE + "/other"},
+                            "subject": {"subject": "forged-subject"},
+                            "credential": {"credential_fingerprint": "f" * 64},
+                            "copy": {},
+                        }
+                        altered = replace(approval, **changes[request.query_params["change"]])
+                        code = await grants.issue_code(selected_handle, altered)
+                        return code.model_dump(mode="json")
                     if mode in ("issue-code", "nested-issue-code"):
                         if mode == "nested-issue-code":
                             async with backend.transaction():
