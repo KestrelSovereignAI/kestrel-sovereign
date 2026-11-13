@@ -3,13 +3,19 @@
 import math
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from kestrel_sdk.storage.database import DatabaseBackend
 from mcp.server.auth.provider import AuthorizationParams
 
 from .policy import MCPServerClient, MCPServerPolicy
-from .records import MCPAuthorizationRecords, MCPRecordKind, hash_mcp_secret, new_mcp_secret
+from .records import (
+    MCPAuthorizationRecords,
+    MCPRecordKind,
+    hash_mcp_secret,
+    new_mcp_secret,
+)
 
 
 class PendingMCPQuotaExceeded(ValueError):
@@ -42,7 +48,8 @@ class PendingMCPAuthorizations:
         self.backend, self.agent_id = backend, agent_id
         self.resource_url, self.policy, self.clock = resource_url, policy, clock
 
-    def _now(self) -> int:
+    def now(self) -> int:
+        """Read the shared finite authorization clock after the last native wait."""
         value = self.clock()
         if not math.isfinite(value) or value < 0:
             raise ValueError("MCP authorization clock must supply a finite Unix time")
@@ -79,20 +86,24 @@ class PendingMCPAuthorizations:
         if capacity is None:
             raise RuntimeError("The original MCP authorization capacity record is unavailable")
 
+    @asynccontextmanager
+    async def serialized(self):
+        """Retain the original transaction and per-agent OAuth state lock."""
+        async with self.backend.transaction():
+            await self._lock_capacity()
+            yield
+
     async def create(self, client_id: str, parameters: AuthorizationParams) -> str:
         if not self._currently_registered(client_id, parameters):
             raise ValueError("Pending MCP authorization requires a registered client, redirect, scopes and resource")
         handle = new_mcp_secret()
         handle_hash = hash_mcp_secret(handle)
-        now = self._now()
+        now = self.now()
         expires = now + math.ceil(self.policy.authorization_seconds)
         ciphertext = self._records.seal(MCPRecordKind.PENDING, handle_hash, expires,
             {"client_id": client_id, "parameters": parameters.model_dump(mode="json")})
-        async with self.backend.transaction():
-            # UPDATE takes the original native row lock until this transaction
-            # exits; a COUNT followed by INSERT alone races on PostgreSQL.
-            await self._lock_capacity()
-            now = self._now()
+        async with self.serialized():
+            now = self.now()
             expired = expires <= now
             await self.backend.execute("DELETE FROM mcp_server_oauth_pending WHERE agent_id = ? AND (expires_at <= ? OR consumed = 1)",
                 (self.agent_id, now))
@@ -105,7 +116,7 @@ class PendingMCPAuthorizations:
                     (self.agent_id, handle_hash, ciphertext, expires))
         # Publication follows the original COMMIT, which may itself wait.
         # No successful handle may outlive its deadline while SQL settles.
-        if expired or expires <= self._now():
+        if expired or expires <= self.now():
             raise ValueError("The pending MCP authorization request expired during admission")
         if quota_full:
             raise PendingMCPQuotaExceeded("The agent's pending MCP authorization quota is full")
@@ -126,7 +137,7 @@ class PendingMCPAuthorizations:
         if redirect is None:
             return None
         parameters = AuthorizationParams.model_validate({**value["parameters"], "redirect_uri": redirect})
-        if not self._currently_registered(value["client_id"], parameters) or expires <= self._now():
+        if not self._currently_registered(value["client_id"], parameters) or expires <= self.now():
             return None
         return PendingMCPAuthorization(value["client_id"], expires, parameters)
 
@@ -134,22 +145,21 @@ class PendingMCPAuthorizations:
         handle_hash = hash_mcp_secret(handle)
         row = await self.backend.fetch_one("""SELECT ciphertext, expires_at FROM mcp_server_oauth_pending
             WHERE agent_id = ? AND handle_hash = ? AND consumed = 0 AND expires_at > ?""",
-            (self.agent_id, handle_hash, self._now()))
+            (self.agent_id, handle_hash, self.now()))
         return None if row is None else self._decode(handle_hash, row)
 
     async def claim(self, handle: str) -> PendingMCPAuthorization | None:
         """Consume once inside the consent owner's transaction; this mints no grant."""
         handle_hash = hash_mcp_secret(handle)
-        async with self.backend.transaction():
-            await self._lock_capacity()
+        async with self.serialized():
             row = await self.backend.fetch_one("""SELECT ciphertext, expires_at FROM mcp_server_oauth_pending
                 WHERE agent_id = ? AND handle_hash = ? AND consumed = 0 AND expires_at > ?""",
-                (self.agent_id, handle_hash, self._now()))
+                (self.agent_id, handle_hash, self.now()))
             pending = None if row is None else self._decode(handle_hash, row)
             if pending is not None:
                 claimed = await self.backend.fetch_one("""UPDATE mcp_server_oauth_pending SET consumed = 1
                 WHERE agent_id = ? AND handle_hash = ? AND consumed = 0 AND expires_at > ?
-                RETURNING ciphertext, expires_at""", (self.agent_id, handle_hash, self._now()))
-                if claimed is None or pending.expires_at <= self._now():
+                RETURNING ciphertext, expires_at""", (self.agent_id, handle_hash, self.now()))
+                if claimed is None or pending.expires_at <= self.now():
                     pending = None
-        return pending if pending is not None and pending.expires_at > self._now() else None
+        return pending if pending is not None and pending.expires_at > self.now() else None

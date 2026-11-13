@@ -95,6 +95,8 @@ class MCPServerPolicy(BaseModel):
     console_origin: str
     clients: tuple[MCPServerClient, ...] = Field(min_length=1, max_length=64)
     max_pending_per_agent: int = Field(default=32, gt=0, le=256)
+    max_grants_per_agent: int = Field(default=128, gt=0, le=1024)
+    max_credentials_per_grant: int = Field(default=256, ge=3, le=4096)
     authorization_seconds: float = Field(default=600.0, gt=0, le=1800)
     access_token_seconds: int = Field(default=900, gt=0, le=3600)
     refresh_token_seconds: int = Field(default=604800, gt=0, le=2592000)
