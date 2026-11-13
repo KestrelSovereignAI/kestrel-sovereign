@@ -20,6 +20,7 @@ from authlib.oauth2.rfc6749.errors import (
     UnsupportedResponseTypeError,
 )
 from authlib.oauth2.rfc6749.requests import BasicOAuth2Payload
+from authlib.oauth2.rfc6749.util import extract_basic_authorization
 from authlib.oauth2.rfc7636.challenge import (
     CODE_CHALLENGE_PATTERN,
     CODE_VERIFIER_PATTERN,
@@ -221,6 +222,12 @@ class NativeMCPAuthorizationServer:
             raise InvalidRequestError(description="Only one client authentication method is permitted")
         header = request.headers.get("authorization")
         if header:
+            # Validate external bytes at Authlib's parser boundary. Do not
+            # catch errors from the host-owned client lookup/authentication.
+            try:
+                extract_basic_authorization(request.headers)
+            except ValueError as error:
+                raise InvalidClientError(description="Malformed client authentication", status_code=401) from error
             if "client_secret" in form:
                 raise InvalidRequestError(description="Only one client authentication method is permitted")
             methods = ["client_secret_basic"]

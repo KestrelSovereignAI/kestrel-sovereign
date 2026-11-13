@@ -318,3 +318,38 @@ async def test_token_endpoint_requires_the_standard_form_media_type(consent_http
         assert response.status_code == 400 and response.json()["error"] == "invalid_request"
         response = await client.post("/token", data=request)
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("consent_http", [client_settings(backend, "client_secret_basic")
+    for backend in ("sqlite", "postgres")], indirect=True)
+@pytest.mark.parametrize("endpoint", ["token", "revoke"])
+@pytest.mark.parametrize("authorization", [b"Basic /w==", b"Basic ", b"Basic \xff"])
+async def test_malformed_basic_authentication_refuses_without_consuming_credentials(
+        consent_http, endpoint, authorization):
+    native = provider(consent_http)
+    code = await approved_code(consent_http)
+    request = code_request(code)
+    request.pop("client_id")
+    request.pop("client_secret")
+    encoded = base64.b64encode(b"owned-provider:owned-secret")
+    good = [(b"authorization", b"Basic " + encoded)]
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=oauth_app(native),
+            raise_app_exceptions=False), base_url="https://kestrel.example") as client:
+        if endpoint == "revoke":
+            issued = await client.post("/token", data=request, headers=good)
+            assert issued.status_code == 200, issued.text
+            access = issued.json()["access_token"]
+            request = {"token": access}
+        refused = await client.post("/" + endpoint, data=request,
+            headers=[(b"authorization", authorization)])
+        assert refused.status_code == 401, "Malformed Basic credentials escaped client authentication"
+        assert refused.json()["error"] == "invalid_client"
+        assert refused.headers["www-authenticate"].startswith("Basic")
+        if endpoint == "revoke":
+            assert await native.verify_token(access) is not None, "Malformed authentication revoked the original grant"
+        accepted = await client.post("/" + endpoint, data=request, headers=good)
+        assert accepted.status_code == 200, accepted.text
+        if endpoint == "token":
+            assert await native.verify_token(accepted.json()["access_token"]) is not None
+        else:
+            assert await native.verify_token(access) is None
