@@ -1618,8 +1618,10 @@ uses the published MCP SDK for its authenticated Streamable HTTP resource
 server. `mcp_server.transport.NativeMCPServer` composes the official server,
 its original authentication middleware and lifespan, exact protected-resource
 metadata route, and RFC 8414 discovery for the pathful per-agent issuer.
-It does not introduce a second MCP wire protocol. The routes remain private
-implementation work until the host publication and governed tools are wired.
+It does not introduce a second MCP wire protocol. Inbound publication is opt-in
+through `KESTREL_MCP_SERVER`; ordinary Core startup does not load the optional
+SDK. Production hosts enabling it install the `mcp-server` extra. The current
+implementation remains worktree source until its review and release gates pass.
 
 `NativeMCPHTTP` retains those original SDK/OAuth route objects. Its registry and
 A2A share `native_http.NativeHTTPRegistry`: publication checks collisions before
@@ -1667,10 +1669,28 @@ boundary; denial atomically consumes the same pending request at its original
 COMMIT and never creates a grant. The store returns an explicit
 `MCPAuthorizationCommitRequired` refusal for an enclosing transaction.
 An authorization redirect only creates pending consent; it does
-not mint a grant. This foundation does not yet establish the Console consent
-UI, Core route publication, governed memory tools, atomic external `log_turn`,
-actual Claude/ChatGPT installation, or subsequent reflection/consolidation.
-Those remain acceptance gates of #1990 and the original epic.
+not mint a grant. The first-party Console shell uses one opaque, per-tab pending
+hint, removes it from browser history before loading credentials, and renders
+connector strings as text. The private API reauthenticates the original durable
+owner credential, applies canonical CSRF policy, and retains the agent's current
+privacy authority through actual HTTP delivery. A decision consumes its local
+hint before I/O. An uncertain response is never replayed automatically.
+
+`NativeMCPPublication` prepares its original borrowed SQL stores and official SDK
+lifespan privately, then publishes the exact route generation at Core's normal
+registration commit. The SDK lifespan enters and exits in one retained resident
+Task. Standalone publication is independent of A2A configuration. AgentManager
+withdrawal revokes MCP admission before asynchronous cleanup; agent shutdown
+joins the original SDK task and HTTP/private-response readers before primary
+storage may close. Failed native retirement retains its original owner and
+storage custody. Native MCP routes select a transport-only caller lane before
+Console credentials; an additional owner API key cannot bypass the official SDK's
+Bearer verifier or authorize private Console consent.
+
+These source checks do not establish governed memory tools, atomic external
+`log_turn`, a real browser consent flow, actual Claude/ChatGPT installation, or
+subsequent reflection/consolidation. Those remain acceptance gates of #1990 and
+the original epic.
 
 ## Review, verification and release order
 

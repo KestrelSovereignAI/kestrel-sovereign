@@ -273,6 +273,8 @@ Documentation = "https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/ma
 Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussions"
 
 [project.optional-dependencies]
+# Native inbound MCP publication without requiring the outbound feature package.
+mcp-server = ["mcp>=2.3.0"]
 # Installed native MCP seam tests remain separate from core-only boot tests.
 mcp-integration = ["kestrel-feature-mcp>=0.17.0,<1"]
 # Test dependencies (not needed in production)

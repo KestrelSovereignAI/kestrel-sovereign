@@ -88,9 +88,13 @@ class NativeHTTPRegistry(Generic[_Binding]):
             self._require_routes(registration)
             yield registration.binding
 
-    def admits(self, scope: Scope) -> bool:
+    def resolve(self, scope: Scope) -> _Binding | None:
+        """Resolve the exact installed native generation without authenticating it."""
         self.require_application(scope.get("app"))
-        return any(binding.admits(scope) for binding in self._current_bindings())
+        return next((binding for binding in self._current_bindings() if binding.admits(scope)), None)
+
+    def admits(self, scope: Scope) -> bool:
+        return self.resolve(scope) is not None
 
     def require_application(self, app: Starlette) -> None:
         if app is not self._app:

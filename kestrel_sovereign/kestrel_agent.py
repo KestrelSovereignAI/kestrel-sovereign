@@ -4892,6 +4892,9 @@ class KestrelAgent(
 
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
+        if self._resource_custody().is_held("native_mcp_server"):
+            logging.getLogger(__name__).error("boot rollback: retaining storage until native MCP retirement completes")
+            return ReleaseOutcome.RETAINED
         if self._resource_custody().is_held("task_manager"):
             # Native stores and executions borrow this primary connection.
             # A failed manager close must retain both handles until its retry
@@ -4961,6 +4964,19 @@ class KestrelAgent(
                 )
                 return ReleaseOutcome.RETAINED
         return ReleaseOutcome.RELEASED
+
+    async def _close_native_mcp_publication(self):
+        """Join the host's original SDK lifetime before releasing borrowed SQL."""
+        publication = vars(self).get("_native_mcp_publication")
+        if publication is None:
+            if self._resource_custody().is_held("native_mcp_server"):
+                raise RuntimeError("Original native MCP retirement owner is unavailable")
+            return ReleaseOutcome.RELEASED
+        from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+
+        if not isinstance(publication, NativeMCPPublication) or publication.agent is not self:
+            raise TypeError("Original native MCP publication owner required")
+        return await publication.close()
 
     async def _close_native_task_manager(self, manager):
         """Join standalone publication readers before releasing their primary store."""
@@ -10437,6 +10453,8 @@ Expected Duration: {expected_duration}
         has_llm = bool(self.llm_service and hasattr(self.llm_service, "close"))
         has_task_mgr = bool(self.task_manager and hasattr(self.task_manager, "close"))
         has_host_db = vars(self).get("_resolved_local_host_db") is not None
+        native_mcp = vars(self).get("_native_mcp_publication")
+        has_native_mcp = native_mcp is not None or self._resource_custody().is_held("native_mcp_server")
 
         pending_ops = (
             int(has_ephemeral)
@@ -10449,6 +10467,7 @@ Expected Duration: {expected_duration}
             + int(has_llm)
             + int(has_task_mgr)
             + int(has_host_db)
+            + int(has_native_mcp)
         )
 
         def _step_budget() -> float:
@@ -10698,6 +10717,11 @@ Expected Duration: {expected_duration}
             return worker.request_stop if callable(request) else None
 
         try:
+            if has_native_mcp:
+                await _release_within("native_mcp_server", "Native MCP server",
+                    self._close_native_mcp_publication, _step_budget(),
+                    request=native_mcp.withdraw if native_mcp is not None else None)
+
             # EPHEMERAL hard-purge defense-in-depth (#767 / #2673). If the agent
             # process is exiting while still in EPHEMERAL, the session is
             # closing — fire the hard-purge so any leak doesn't survive the
@@ -11448,6 +11472,10 @@ Expected Duration: {expected_duration}
             # join. Neither SQLAlchemy nor primary storage may close early.
             return tail_result(True)
         await self._join_llm_storage_dependents()
+
+        if custody.is_held("native_mcp_server"):
+            logging.getLogger(__name__).warning("Retaining primary storage until native MCP retirement completes")
+            return tail_result(True)
 
         if custody.is_held("task_manager"):
             # The finite prefix could not join the native manager. Keep its

@@ -1500,6 +1500,35 @@ def _hosted_peer_directory_context(
     )
 
 
+async def _prepare_native_mcp(app: FastAPI, agent, routing_key: str, environment=None, *, manager=None):
+    """Opt in explicitly; ordinary Core startup does not import the optional SDK."""
+    from kestrel_sovereign.mcp_server.policy import MCPServerPolicy
+
+    environment = dict(os.environ if environment is None else environment)
+    policy = MCPServerPolicy.from_environment(environment)
+    if policy is None:
+        return None
+    from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+
+    return await NativeMCPPublication.prepare(app, agent, routing_key, policy,
+        sovereign_key=lambda: get_api_key(generate_if_missing=False), manager=manager)
+
+
+async def _onboard_single_agent_mcp(app: FastAPI, agent, environment=None):
+    publication = await _prepare_native_mcp(app, agent, agent.did, environment)
+    if publication is None:
+        return None
+    try:
+        publication.publish()
+        return publication
+    except BaseException as original:
+        try:
+            await publication.close()
+        except BaseException as retirement:  # noqa: BLE001 - retain original publication and physical retirement failures
+            raise execution_finite_error(original, retirement, retain_originals=True) from None
+        raise
+
+
 async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
     """Bind the same native contract to one ready standalone/process runtime."""
     from kestrel_sovereign.a2a.inbound_authorization import (
@@ -1636,6 +1665,7 @@ async def _onboard_host_registered_agent(
         "a2a_did_resolver",
         "a2a_inbound_sender_authorizer",
         "_native_a2a_publication",
+        "_native_mcp_publication",
     )
     prior_agent_state = {
         field: vars(agent).get(field, missing)
@@ -1644,6 +1674,11 @@ async def _onboard_host_registered_agent(
 
     async def rollback_host_onboarding() -> None:
         """Remove only app/agent state introduced by this private candidate."""
+        current_mcp = vars(agent).get("_native_mcp_publication")
+        if current_mcp is not None and current_mcp is not prior_agent_state["_native_mcp_publication"]:
+            # Preparation can retain an original failed close before this hook
+            # receives its return value. Never erase that still-owned handle.
+            await agent._close_native_mcp_publication()
         if native_publication is not None:
             native_publication.withdraw()
 
@@ -1839,6 +1874,7 @@ async def _onboard_host_registered_agent(
     )
     if native_publication is not None:
         agent._native_a2a_publication = native_publication
+    await _prepare_native_mcp(app, agent, name, manager=manager)
     _attach_stop_runtime(app, agent)
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
@@ -4102,6 +4138,7 @@ async def _lifespan_startup(app: FastAPI):
             # the multi-agent AgentManager path above — gets the same check.
             await app.state.agent.initialize()
             await _onboard_single_agent_native(app, app.state.agent)
+            await _onboard_single_agent_mcp(app, app.state.agent)
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
         except BaseException as e:
             from kestrel_sovereign.execution_custody import (
@@ -4466,16 +4503,23 @@ def _native_route_kind(scope) -> str | None:
     """Classify the installed SDK objects once for auth and prefix routing."""
     application = scope.get("app")
     native = getattr(getattr(application, "state", None), "native_a2a_http", None)
-    if native is None:
-        return None
-    from kestrel_sovereign.a2a.native_routes import NativeA2AHTTPRegistry
+    if native is not None:
+        from kestrel_sovereign.a2a.native_routes import NativeA2AHTTPRegistry
 
-    if not isinstance(native, NativeA2AHTTPRegistry):
-        raise TypeError("Host native A2A routes require their published registry")
-    if native.admits_public_card(scope):
-        return "card"
-    if native.admits(scope):
-        return "peer"
+        if not isinstance(native, NativeA2AHTTPRegistry):
+            raise TypeError("Host native A2A routes require their published registry")
+        if native.admits_public_card(scope):
+            return "card"
+        if native.admits(scope):
+            return "peer"
+    mcp = getattr(getattr(application, "state", None), "native_mcp_http", None)
+    if mcp is not None:
+        from kestrel_sovereign.mcp_server.transport import NativeMCPHTTPRegistry
+
+        if not isinstance(mcp, NativeMCPHTTPRegistry):
+            raise TypeError("Host native MCP routes require their published registry")
+        if mcp.admits(scope):
+            return "mcp"
     return None
 
 
@@ -4606,6 +4650,7 @@ from kestrel_sovereign.endpoints import (
     hold_router,
     host_stop_router,
     mcp_oauth_public_router,
+    mcp_server_consent_router,
     memories_router,
     metrics_router,
     models_router,
@@ -4645,6 +4690,7 @@ app.include_router(rasa_shim_router)
 app.include_router(github_router)
 app.include_router(host_stop_router)
 app.include_router(mcp_oauth_public_router)
+app.include_router(mcp_server_consent_router)
 app.include_router(hold_router)
 
 
@@ -4787,6 +4833,13 @@ async def auth_middleware(request: Request, call_next):
         from kestrel_sovereign.auth import CallerContext
 
         request.state.caller = CallerContext.a2a_transport()
+        return await call_next(request)
+    if native_kind == "mcp":
+        from kestrel_sovereign.auth import CallerContext
+
+        if transport_only_process:
+            return api_error_response(status_code=404, code="not_found", message="Not found")
+        request.state.caller = CallerContext.mcp_transport()
         return await call_next(request)
     if request.url.path in public_paths:
         return await call_next(request)
@@ -5133,8 +5186,10 @@ app.add_middleware(SensitiveQueryStringRedactionMiddleware)
 
 # Keep private capability authority through the real send, outside all of the
 # BaseHTTPMiddleware queues above. Feature routers alone cannot own delivery.
+from kestrel_sovereign.mcp_server.http import NativeMCPHostMiddleware
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 
+app.add_middleware(NativeMCPHostMiddleware)
 app.add_middleware(PrivateDeliveryMiddleware)
 
 

@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import Request
 from kestrel_sdk.operator import OperatorContext
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from starlette.responses import HTMLResponse, JSONResponse
 
 from kestrel_sovereign.api_errors import api_error_response, execution_control_api_error
 from kestrel_sovereign.auth import caller_context_scope
+from kestrel_sovereign.endpoints.mcp_server import create_consent_router
 from kestrel_sovereign.multi_agent.route_name import decode_agent_route_name
 from kestrel_sovereign.security.browser_shell import OAUTH_BROWSER_HEADERS
 from kestrel_sovereign.security.capability_authority import (
@@ -90,7 +91,7 @@ class MCPConsentController:
         # Consent still retains the original durable privacy gate and epoch.
         self.authority = HostCapabilityAuthority(capability="mcp-server-consent", label="MCP consent",
             non_disclosing_actions=frozenset(action.value for action in _Action))
-        self.router = self._router()
+        self.router = create_consent_router(lambda _request: self)
 
     def _current(self, request):
         self._require_current()
@@ -163,53 +164,46 @@ class MCPConsentController:
         if not re.fullmatch(r"[A-Za-z0-9_-]{43}", handle):
             raise MCPAuthorizationDecisionUnavailable("Original pending request unavailable")
 
-    def _router(self):
-        router = APIRouter(prefix="/api/mcp/server/consent", tags=["mcp-server-consent"])
+    def _respond(self, request, action, build, *, prepare=None):
+        return AuthorizedCapabilityResponse(request, authority=self.authority,
+            resolve_context=self._resolve_context,
+            operation=lambda context, _value: self.authority.operation(context, action, self.agent.did),
+            build=build, error_response=lambda error, prepared: self._error(
+                error, prepared and action is _Action.DECIDE), prepare=prepare,
+            timeout_seconds=self.grants.policy.authorization_seconds)
 
-        def respond(request, action, build, *, prepare=None):
-            return AuthorizedCapabilityResponse(request, authority=self.authority,
-                resolve_context=self._resolve_context,
-                operation=lambda context, _value: self.authority.operation(context, action, self.agent.did),
-                build=build, error_response=lambda error, prepared: self._error(
-                    error, prepared and action is _Action.DECIDE), prepare=prepare,
-                timeout_seconds=self.grants.policy.authorization_seconds)
+    def describe_response(self, handle: str, request: Request):
+        async def build(_context):
+            self._handle(handle)
+            pending = await self.grants.read_authorization_request(handle)
+            if pending is None:
+                raise MCPAuthorizationDecisionUnavailable("Original pending request unavailable")
+            client = self.grants.policy.registered_client(pending.client_id)
+            return JSONResponse({"client_name": client.client_name, "agent_name": self.agent.agent_name,
+                "resource": self.grants.pending.resource_url,
+                "redirect_uri": str(pending.parameters.redirect_uri),
+                "expires_at": pending.expires_at, "scopes": pending.parameters.scopes})
+        return self._respond(request, _Action.READ, build)
 
-        @router.get("/requests/{handle}")
-        async def describe(handle: str, request: Request):
-            async def build(_context):
-                self._handle(handle)
+    def decision_response(self, handle: str, request: Request):
+        async def build(_context, value):
+            self._handle(handle)
+            values = {}
+            if value.decision == "deny":
+                pending = await self.grants.deny_authorization_request(handle)
+                if pending is None:
+                    raise MCPAuthorizationDecisionUnavailable("Original pending request unavailable")
+                values["error"] = "access_denied"
+            else:
                 pending = await self.grants.read_authorization_request(handle)
                 if pending is None:
                     raise MCPAuthorizationDecisionUnavailable("Original pending request unavailable")
-                client = self.grants.policy.registered_client(pending.client_id)
-                return JSONResponse({"client_name": client.client_name, "agent_name": self.agent.agent_name,
-                    "resource": self.grants.pending.resource_url,
-                    "redirect_uri": str(pending.parameters.redirect_uri),
-                    "expires_at": pending.expires_at, "scopes": pending.parameters.scopes})
-            return respond(request, _Action.READ, build)
-
-        @router.post("/requests/{handle}/decision")
-        async def decide(handle: str, request: Request):
-            async def build(_context, value):
-                self._handle(handle)
-                values = {}
-                if value.decision == "deny":
-                    pending = await self.grants.deny_authorization_request(handle)
-                    if pending is None:
-                        raise MCPAuthorizationDecisionUnavailable("Original pending request unavailable")
-                    values["error"] = "access_denied"
-                else:
-                    pending = await self.grants.read_authorization_request(handle)
-                    if pending is None:
-                        raise MCPAuthorizationDecisionUnavailable("Original pending request unavailable")
-                    with self.grants.consent_authority.approve(handle, pending, tuple(value.scopes)) as approval:
-                        code = await self.grants.issue_code(handle, approval)
-                    values["code"] = code.code
-                if pending.parameters.state is not None:
-                    values["state"] = pending.parameters.state
-                # The same native authorization server owns callback encoding and iss.
-                redirect = self.authorization.authorization_response(str(pending.parameters.redirect_uri), values)
-                return JSONResponse({"redirect_url": redirect.headers["location"]})
-            return respond(request, _Action.DECIDE, build, prepare=lambda: self._body(request))
-
-        return router
+                with self.grants.consent_authority.approve(handle, pending, tuple(value.scopes)) as approval:
+                    code = await self.grants.issue_code(handle, approval)
+                values["code"] = code.code
+            if pending.parameters.state is not None:
+                values["state"] = pending.parameters.state
+            # The same native authorization server owns callback encoding and iss.
+            redirect = self.authorization.authorization_response(str(pending.parameters.redirect_uri), values)
+            return JSONResponse({"redirect_url": redirect.headers["location"]})
+        return self._respond(request, _Action.DECIDE, build, prepare=lambda: self._body(request))

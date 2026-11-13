@@ -98,9 +98,10 @@ class NativeMCPServer:
 class NativeMCPHTTP:
     """Publish and classify the runtime's exact SDK and OAuth route objects."""
 
-    def __init__(self, routing_key: str, runtime: NativeMCPServer):
+    def __init__(self, routing_key: str, runtime: NativeMCPServer, *, request_lifetime=None):
         encode_agent_route_name(routing_key)
         self.routing_key, self.runtime = routing_key, runtime
+        self.request_lifetime = request_lifetime
         self.routes = tuple(runtime.app.routes)
 
     def admits(self, scope: Scope) -> bool:

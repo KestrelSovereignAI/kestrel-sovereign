@@ -3286,6 +3286,9 @@ local = [
 mcp-integration = [
     { name = "kestrel-feature-mcp" },
 ]
+mcp-server = [
+    { name = "mcp" },
+]
 ml = [
     { name = "accelerate" },
     { name = "diffusers" },
@@ -3393,6 +3396,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.52.2,<1" },
     { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'observability'" },
+    { name = "mcp", marker = "extra == 'mcp-server'", specifier = ">=2.3.0" },
     { name = "mcp", marker = "extra == 'test'", specifier = ">=2.3.0" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
@@ -3459,7 +3463,7 @@ requires-dist = [
     { name = "uvicorn", specifier = "==0.48.0" },
     { name = "web3", marker = "extra == 'wallet'", specifier = ">=7.15.0" },
 ]
-provides-extras = ["mcp-integration", "test", "ml", "local", "observability", "phoenix", "cloud", "wallet", "delivery", "search", "all-features", "full"]
+provides-extras = ["mcp-server", "mcp-integration", "test", "ml", "local", "observability", "phoenix", "cloud", "wallet", "delivery", "search", "all-features", "full"]
 
 [package.metadata.requires-dev]
 dev = [

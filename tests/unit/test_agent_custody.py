@@ -24,7 +24,7 @@ def _step(outcome, calls=None):
 
 def test_only_converted_close_owners_are_trusted_to_report_their_release():
     """Local host-store close joins native retirement rather than swallowing it."""
-    assert TRUTHFUL_CLOSE_OWNERS == frozenset({"task_manager", "host_key_database"})
+    assert TRUTHFUL_CLOSE_OWNERS == frozenset({"task_manager", "host_key_database", "native_mcp_server"})
 
 
 @pytest.mark.asyncio

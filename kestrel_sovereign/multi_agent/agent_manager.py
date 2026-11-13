@@ -3547,13 +3547,30 @@ class AgentManager:
         )
         if isinstance(authority_evidence_event, asyncio.Event):
             authority_evidence_event.set()
+        agent._agent_manager_published = False
         publication_event = vars(agent).get("_agent_manager_publication_event")
         if isinstance(publication_event, asyncio.Event):
             # Wake descendants on failure too.  The false publication marker
             # below makes the wake a refusal, never counterfeit authority.
-            agent._agent_manager_published = False
             publication_event.set()
-        self._revoke_a2a_hosted_policy(agent)
+        mcp = vars(agent).get("_native_mcp_publication")
+        failures = []
+        if mcp is not None:
+            from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+
+            if not isinstance(mcp, NativeMCPPublication) or mcp.agent is not agent:
+                failures.append(TypeError("Native MCP retirement requires its original host publication"))
+            else:
+                try:
+                    mcp.withdraw()
+                except BaseException as error:  # noqa: BLE001 - revoke both protocols before preserving original failures
+                    failures.append(error)
+        try:
+            self._revoke_a2a_hosted_policy(agent)
+        except BaseException as error:  # noqa: BLE001 - retain original A2A and MCP retirement failures together
+            failures.append(error)
+        if failures:
+            raise execution_finite_error(*failures, retain_originals=True)
         if self._onboarding_agents.get(name) is agent:
             self._onboarding_agents.pop(name, None)
         if self._initializing_agents.get(name) is agent:
@@ -6279,6 +6296,17 @@ class AgentManager:
             except BaseException:
                 self._withdraw_initialized_agent(name, agent)
                 raise
+        mcp = vars(agent).get("_native_mcp_publication")
+        if mcp is not None:
+            from kestrel_sovereign.mcp_server.publication import NativeMCPPublication
+
+            try:
+                if not isinstance(mcp, NativeMCPPublication) or mcp.agent is not agent:
+                    raise TypeError("Native MCP publication must be owned by the host")
+                mcp.publish()
+            except BaseException:
+                self._withdraw_initialized_agent(name, agent)
+                raise
         # Fleet-idleness (#F235): give EVERY agent — including ones created or
         # spawned after startup — a live view of all co-hosted agents, so
         # RestartCoordinator can gate a whole-host restart on the whole fleet
@@ -6288,9 +6316,9 @@ class AgentManager:
         agent._cohosted_agents_provider = lambda: list(self._agents.values())
         if self._initializing_agents.get(name) is agent:
             self._initializing_agents.pop(name, None)
+        agent._agent_manager_published = True
         publication_event = vars(agent).get("_agent_manager_publication_event")
         if isinstance(publication_event, asyncio.Event):
-            agent._agent_manager_published = True
             publication_event.set()
         logger.info(f"Loaded agent '{name}' (DID: {agent.agent_id[:30]}...)")
 
