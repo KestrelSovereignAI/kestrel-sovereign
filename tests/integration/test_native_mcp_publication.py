@@ -63,9 +63,11 @@ async def publication(assistant_agent, monkeypatch):
     app.include_router(router)
     app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
     app.middleware("http")(server.auth_middleware)
-    app.add_middleware(SensitiveQueryStringRedactionMiddleware)
-    app.add_middleware(NativeMCPHostMiddleware)
-    app.add_middleware(PrivateDeliveryMiddleware)
+    # Exercise the actual Core boundary order, including admission failures.
+    boundaries = {SensitiveQueryStringRedactionMiddleware, NativeMCPHostMiddleware, PrivateDeliveryMiddleware}
+    for middleware in reversed(server.app.user_middleware):
+        if middleware.cls in boundaries:
+            app.add_middleware(middleware.cls, *middleware.args, **middleware.kwargs)
     policy = MCPServerPolicy.model_validate_json(json.dumps({"console_origin": "https://kestrel.example",
         "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
             "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}))
@@ -852,3 +854,37 @@ async def test_actual_stalled_oauth_body_does_not_block_independent_shutdown(pub
     assert finite_returned, "A stalled native OAuth body blocked the finite agent shutdown caller"
     assert backend_retained and sdk_retained, "Finite shutdown acknowledged unfinished original MCP/SQL retirement"
     assert continuation is not None, "Finite MCP shutdown did not retain its explicit original completion owner"
+
+
+@pytest.mark.parametrize("endpoint,marker", [
+    ("/consent", "/mcp/consent"),
+    ("/oauth/authorize", "/mcp/oauth"),
+])
+async def test_retired_native_admission_redacts_outer_error_access_target(publication, monkeypatch, endpoint, marker):
+    from uvicorn.protocols.utils import get_path_with_query_string
+
+    async with _publication_with_owned_process_custody(publication, monkeypatch) as (owner, client, custody):
+        response = await client.get(owner.resource + "/oauth/authorize", params=_authorization_parameters(owner))
+        assert response.status_code == 302, response.text
+        handle = parse_qs(urlsplit(response.headers["location"]).query)["request"][0]
+        observed, refused = [], []
+
+        async def original_error_delivery(scope, receive, send):
+            async def actual_send(message):
+                if message["type"] == "http.response.start":
+                    observed.append((message["status"], get_path_with_query_string(scope)))
+                await send(message)
+
+            try:
+                await owner.app(scope, receive, actual_send)
+            except ExecutionAuthorityError as error:
+                refused.append(error)
+                raise
+
+        retire_process_runtime_custody(custody)
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(
+                app=original_error_delivery, raise_app_exceptions=False), base_url=owner.policy.console_origin) as denied:
+            response = await denied.get(owner.resource + endpoint,
+                params={"request": handle, "state": "original-private-oauth-state"})
+        assert response.status_code == 500 and len(refused) == 1, "Original retired authority did not refuse admission"
+        assert observed == [(500, marker)], "Native MCP admission failure leaked its private access-log target"
