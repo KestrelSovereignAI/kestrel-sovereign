@@ -370,6 +370,10 @@ class VisualComputerRuntime:
                     # setup follows the existing no-acquisition CAS below,
                     # which independently validates its exact durable facts.
                     if original_setup is not None and original_setup._used and not original_setup._handed_off:
+                        # A final active save can precede a refused handoff.
+                        # Failed settlement must never leave that worker ready.
+                        self._fence(record.request.scope, record.session_id)
+                        self._verified_sessions.discard(self._key(record.request.scope, record.session_id))
                         try:
                             async with self._lock(record.session_id):
                                 await self._settle_failed_local_setup(self.scope(context), record, check)

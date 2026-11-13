@@ -132,6 +132,57 @@ async def test_invalid_status_or_missing_active_ack_settles_after_original_clean
         assert state["exchanges"] == before == ["status"]
 
 
+@pytest.mark.asyncio
+async def test_refusal_after_active_save_fences_failed_setup_before_settlement(scripted_native, monkeypatch):
+    from tests.unit.visual_computer.test_setup_cleanup_sweeps import leaves
+
+    setup, state = scripted_native
+    save = setup.runtime.repository.save
+    committed = []
+
+    async def withdraw_after_active_save(scope, record, guard=None):
+        result = await save(scope, record, guard)
+        if record.phase == "active":
+            committed.append(record.revision)
+            setup.feature._cfg["granted_actions"].remove(VisualAction.ADMIT.value)
+        return result
+
+    monkeypatch.setattr(setup.runtime.repository, "save", withdraw_after_active_save)
+    async with setup.bound() as context:
+        request = setup.request(context)
+        error = None
+        try:
+            await setup.runtime.admit(context, request)
+        except BaseException as original:
+            error = original
+        assert error is not None
+        assert any(isinstance(leaf, OperatorAuthorizationError) for leaf in leaves(error))
+    assert len(committed) == 1 and len(state["closed"]) == 1
+    assert state["closed"][0]._closed
+    try:
+        async with setup.bound() as fresh:
+            saved = await setup.runtime.repository.get(request.scope, request_id=request.request_id)
+            # The refused original ADMIT check cannot acknowledge settlement.
+            # Custody stays charged, but the retired worker is never ready.
+            assert saved.phase == "active" and saved.revision == committed[0]
+            status = await setup.runtime.status(fresh, saved.session_id)
+            assert status["requires_reconciliation"] is True
+            key = setup.runtime._key(request.scope, saved.session_id)
+            assert key not in setup.runtime._verified_sessions
+            assert key in setup.runtime._fences
+            before = list(state["exchanges"])
+            with pytest.raises(ResourceConflict, match="fenced or requires reconciliation"):
+                await setup.runtime.observe(fresh, saved.session_id)
+            assert state["exchanges"] == before == ["status"]
+    finally:
+        # Also retire custody on a deliberately failing BEFORE run. This uses
+        # a fresh genuine RELEASE grant, never the refused ADMIT checker.
+        async with setup.bound() as fresh:
+            result = await setup.runtime.release(fresh, saved.session_id)
+            assert result["released"] is True
+    assert len(state["closed"]) == 1
+
+
 # Reuse independent measured HostConfig vectors; only Docker command results,
 # cleanup IO and daemon identity fields are SCRIPTED. Host ADMIT/check/SQL and
 # the canonical create/bootstrap/live methods execute normally. No native

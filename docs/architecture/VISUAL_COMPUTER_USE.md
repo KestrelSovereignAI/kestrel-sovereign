@@ -257,13 +257,16 @@ request reconciliation and expired-request maintenance expose these separate
 retirement semantics; exact-ID reopen cannot restore quota or acquire again.
 
 Failed local worker setup has a separate settlement path. It joins the original
-setup and physical close, reloads the durable row under the session lock, and
-requires a current Host grant. A narrow revision CAS may retire an acquiring row
+setup and physical close, and reloads the durable row under the session lock.
+Foreground settlement requires its current Host grant. A narrow revision CAS may retire an acquiring row
 with no accepted lease only when that exact original setup proves physical
 retirement. Its response uses `acquired: null` and
 `setup_cleanup: "verified_original_physical_retirement"`; it makes no claim that
 acquisition had no effect. If a lease was accepted before setup failed, normal
-verified release settles that same lease. Unknown cleanup, stale authority or a
+verified release settles that same lease. Eligible maintenance of an already
+accepted fixed lease uses its existing cleanup authority without minting a new
+foreground grant; maintenance does not retire failed setups with no accepted
+lease. Unknown cleanup, stale foreground authority or a
 failed storage acknowledgement retains charged custody and the original setup
 for a fresh permitted release or request reconciliation. Original setup and
 credential-bearing driver maps are pruned only after durable settlement.
