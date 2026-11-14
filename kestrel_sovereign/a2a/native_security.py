@@ -262,8 +262,8 @@ class NativeDIDRequestGuard:
 
     @asynccontextmanager
     async def hold_authority(
-        self, admitted: AuthorizedNativeRequest[_Request]
-    ) -> AsyncIterator[None]:
+        self, admitted: AuthorizedNativeRequest[_Request], *, refusal_values: bool = False
+    ) -> AsyncIterator[StreamRefusal | None]:
         """Recheck a waiting request before its next authorized read or event.
 
         The handler retains this value within the admitted request. It is not
@@ -276,15 +276,31 @@ class NativeDIDRequestGuard:
             or admitted.scope != self.scope
             or admitted.routing_key != self.routing_key
         ):
-            raise HTTPException(
-                status_code=403,
-                detail="Native request belongs to a different recipient registration",
-            )
-        async with _native_persistence_errors(), self.lifecycle_lease():
-            principal = await self._authorize(admitted.authority, admitted.sender)
-            if principal != admitted.principal_id:
-                raise HTTPException(
+            refused = StreamRefusal(
+                HTTPException(
                     status_code=403,
-                    detail="Native request principal changed while waiting",
+                    detail="Native request belongs to a different recipient registration",
                 )
-            yield
+            )
+        else:
+            refused = None
+            async with _native_persistence_errors(), OriginalContextExit(self.lifecycle_lease()):
+                principal = await self._authorization_decision(admitted.authority, admitted.sender)
+                if isinstance(principal, StreamRefusal):
+                    refused = principal
+                elif principal != admitted.principal_id:
+                    refused = StreamRefusal(
+                        HTTPException(
+                            status_code=403,
+                            detail="Native request principal changed while waiting",
+                        )
+                    )
+                else:
+                    yield None
+        if refused is not None:
+            # Publish a known pre-effect decision only AFTER the actual lease
+            # exits. Actual exit/I/O/body failures never become refusal values.
+            if refusal_values:
+                yield refused
+            else:
+                raise refused.error

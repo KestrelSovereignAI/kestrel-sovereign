@@ -124,9 +124,10 @@ async def test_callback_dns_releases_host_lease_and_rechecks_original_authority(
             elif operation == "stream":
                 from starlette.exceptions import HTTPException
 
-                with pytest.raises(HTTPException) as refused:
-                    await sending
-                assert refused.value.status_code == 403
+                refusal = await sending
+                assert isinstance(refusal, StreamRefusal)
+                assert isinstance(refusal.error, HTTPException)
+                assert refusal.error.status_code == 403
             else:
                 with pytest.raises(A2AClientError) as refused:
                     await sending
