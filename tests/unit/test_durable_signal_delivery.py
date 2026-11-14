@@ -10457,8 +10457,9 @@ async def test_release_of_expired_first_lease_wakes_an_idle_drainer(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("observe_after_retry", [False, True], ids=["before-retry", "after-retry"])
 async def test_committed_then_raised_release_still_wakes_the_idle_drainer(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, observe_after_retry
 ):
     """#3372: the expired first lease's release committed its RETRY update
     and then raised. The started drainer must be woken rather than leaving
@@ -10485,11 +10486,25 @@ async def test_committed_then_raised_release_still_wakes_the_idle_drainer(
     store = dispatcher._durable_store
     real_abandon = store.abandon_initial_reservation
     outcomes = []
+    retry_entered, allow_retry, first_fault = (asyncio.Event() for _ in range(3))
+    attempts = 0
+    if observe_after_retry:
+        allow_retry.set()
 
     async def commit_then_raise_once(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        first = attempts == 1
+        if not first:
+            await first_fault.wait()
+            retry_entered.set()
+            # Hold only the later native CAS, before it runs. Both observation
+            # orders keep the original commit, error and actual retry result.
+            await allow_retry.wait()
         abandoned = await real_abandon(**kwargs)
         outcomes.append(abandoned)
-        if len(outcomes) == 1:
+        if first:
+            first_fault.set()
             raise RuntimeError("connection lost after commit")
         return abandoned
 
@@ -10518,9 +10533,19 @@ async def test_committed_then_raised_release_still_wakes_the_idle_drainer(
         _expire_handoff(dispatcher, reserved.delivery_id)
 
         await dispatcher._heartbeat_runtime_owner()
-        assert outcomes == [True]
-        assert reserved.delivery_id in dispatcher._expired_initial_handoffs
-        assert reserved.delivery_id in dispatcher._faulted_initial_handoff_releases
+        if observe_after_retry:
+            await asyncio.wait_for(retry_entered.wait(), timeout=1.0)
+            drainer = dispatcher._durable_cognition_drainers.get(consumer.consumer_id)
+            if drainer is not None:
+                await asyncio.wait_for(drainer, timeout=1.0)
+            assert outcomes == [True, False]
+            assert reserved.delivery_id not in dispatcher._expired_initial_handoffs
+            assert reserved.delivery_id not in dispatcher._faulted_initial_handoff_releases
+        else:
+            assert outcomes == [True]
+            assert reserved.delivery_id in dispatcher._expired_initial_handoffs
+            assert reserved.delivery_id in dispatcher._faulted_initial_handoff_releases
+            allow_retry.set()
 
         for _ in range(200):
             (delivery,) = await dispatcher.list_durable_deliveries()
@@ -10535,6 +10560,8 @@ async def test_committed_then_raised_release_still_wakes_the_idle_drainer(
         assert dispatcher._expired_initial_handoffs == {}
         assert dispatcher._faulted_initial_handoff_releases == set()
     finally:
+        first_fault.set()
+        allow_retry.set()
         monkeypatch.setattr(store, "abandon_initial_reservation", real_abandon)
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
