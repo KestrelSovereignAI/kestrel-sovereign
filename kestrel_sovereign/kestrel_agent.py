@@ -8910,6 +8910,8 @@ Expected Duration: {expected_duration}
                 if reflection_guidance:
                     logging.info(f"Reflection: {len(reflection_guidance)} active guidance items for prompt")
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logging.warning(f"Failed to fetch reflection guidance: {e}")
 
         # Resolve the exact schemas before planning so wrapper/tool accounting

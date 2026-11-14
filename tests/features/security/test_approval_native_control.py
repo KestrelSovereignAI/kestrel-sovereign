@@ -412,3 +412,96 @@ async def test_disconnected_waiter_leaves_claimed_ui_decision_with_its_original_
             if task is not None and not task.done():
                 task.cancel()
         await asyncio.gather(*[t for t in [waiter, deciding] if t is not None], return_exceptions=True)
+
+
+async def test_completed_decision_is_delivered_before_submitter_cancellation(tmp_path, monkeypatch):
+    import asyncio
+    store = PermissionStore(str(tmp_path / "completed-observer-cancellation.db"))
+    await store.initialize()
+    original = store.log_decision
+    queued, entered, release, completed = (asyncio.Event() for _ in range(4))
+    async def original_audit_then_wait(*args, **kwargs):
+        await original(*args, **kwargs)
+        entered.set()
+        await release.wait()
+    async def notify(request):
+        queued.set()
+    monkeypatch.setattr(store, "log_decision", original_audit_then_wait)
+    queue = ApprovalQueue(permission_store=store, on_request_added=notify)
+    waiter = asyncio.create_task(queue.request_approval(
+        feature_name="ReflectionFeature", tool_name="self_modify", tool_args={}))
+    waiter.add_done_callback(lambda _task: completed.set())
+    deciding = None
+    try:
+        async with asyncio.timeout(5):
+            await queued.wait()
+            request = queue.pending_requests[0]
+            deciding = asyncio.create_task(queue.submit_decision(request.id, True))
+            await entered.wait()
+        operation = request.decision_operation
+        # Canonical observation's completion callback is already registered.
+        # Cancel the observer after real persistence finishes, before it resumes.
+        operation.task.add_done_callback(lambda _task: deciding.cancel())
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await deciding
+        assert operation.task.done() and operation.task.exception() is None
+        try:
+            async with asyncio.timeout(1):
+                await completed.wait()
+        except TimeoutError:
+            pytest.fail("Completed persistence plus submitter cancellation stranded the original waiter")
+        assert await waiter == (True, "once"), "Completed original decision was lost with its observer"
+        assert not queue.pending_requests
+    finally:
+        release.set()
+        for task in [waiter, deciding]:
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in [waiter, deciding] if t is not None], return_exceptions=True)
+
+
+async def test_disconnected_waiter_cannot_reopen_an_already_claimed_decision(tmp_path, monkeypatch):
+    import asyncio
+    store = PermissionStore(str(tmp_path / "single-decision-owner.db"))
+    await store.initialize()
+    original = store.log_decision
+    queued, entered, release = (asyncio.Event() for _ in range(3))
+    audits = 0
+    async def original_audit_then_wait(*args, **kwargs):
+        nonlocal audits
+        await original(*args, **kwargs)
+        audits += 1
+        if audits == 1:
+            entered.set()
+            await release.wait()
+    async def notify(request):
+        queued.set()
+    monkeypatch.setattr(store, "log_decision", original_audit_then_wait)
+    queue = ApprovalQueue(permission_store=store, on_request_added=notify)
+    waiter = asyncio.create_task(queue.request_approval(
+        feature_name="ReflectionFeature", tool_name="self_modify", tool_args={}))
+    deciding = None
+    try:
+        async with asyncio.timeout(5):
+            await queued.wait()
+            request = queue.pending_requests[0]
+            deciding = asyncio.create_task(queue.submit_decision(request.id, True))
+            await entered.wait()
+        operation = request.decision_operation
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        second = await queue.submit_decision(request.id, False)
+        release.set()
+        first = await deciding
+        assert not second.in_memory, "Disconnected waiter reopened an already claimed decision"
+        assert request.decision_operation is operation, "Second submission replaced the original decision owner"
+        assert first.awaiter_gone and audits == 1
+        assert not queue.pending_requests
+    finally:
+        release.set()
+        for task in [waiter, deciding]:
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in [waiter, deciding] if t is not None], return_exceptions=True)
