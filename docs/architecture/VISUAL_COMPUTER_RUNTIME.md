@@ -122,8 +122,9 @@ before the first partial stdin write. A partial send or lost acknowledgement
 stays unknown. When the complete original RPC reaches the worker after Stop or
 handback, the worker authenticates its originally issued consumer lease before
 journaling a pre-effect denied receipt; current lease eligibility is still
-checked before any input or repeated act delivery. The manual composition uses
-published SDK 0.45 with normal-index host and worker locks. Core successor
+checked before any input or repeated act delivery. The host uses the published
+SDK required by `pyproject.toml` and pinned in `uv.lock`; each worker image has
+its own normal-index dependency input and hash lock. Core successor
 review, CI and actual merged-base host/worker acceptance remain release gates;
 SDK installability does not establish Core product readiness.
 
@@ -373,10 +374,37 @@ observations cannot refund capacity, prove no cloud effect, or authorize another
 create. This is a conservative recovery limitation, not a new sent=false field or
 automatic cleanup permission.
 
-The same immutable Acquisition acceptance also restricts the logical Runtime
-provider invocation through context inherited by joined child tasks. Changing
-the request row or forwarding the guard cannot create a second acquisition in
-that invocation. The context value only restricts issuance; it grants no host,
-native, or persistence authority. Independently admitted tasks retain their own
-original checks. Physical close and outer retirement still use the same original
-owner, backend hold, and actual native joins.
+The same immutable Acquisition acceptance also restricts the Runtime facade and
+the invocation context inherited by child tasks, including a child that resumes
+after the parent invocation returns. Within that inherited lineage, changing
+the request row or forwarding the guard does not permit fresh issuance. The
+context value only restricts issuance; it grants no host, native, or persistence
+authority. The trusted direct repository/source issuer accepts a caller-supplied
+synchronous checker. A task created before the invocation can use that API with
+another quoted row and a forwarded checker outside the inherited restriction;
+this does not establish an independent authenticated host admission. Physical
+close and outer retirement still use the same original owner, backend hold, and
+actual native joins.
+
+
+### Worker build dependencies and validation scope
+
+The public SDK dependency is declared in `pyproject.toml` and resolved in
+`uv.lock`. The separate two-domain worker input pins its SDK version in
+`docker/visual-browser/requirements-two-domain.in`; its target lock records
+the corresponding complete package hashes.
+The Core pin in both worker requirements files must match the project version.
+Build the ordinary Core wheel and regenerate the target dependency lock with
+that wheel's exact hash before building worker images. The version test checks
+both requirements files so a Core release cannot silently keep an older wheel.
+
+The closed v2 profile and `core-sdk046-two-domain-v2` schema identity refer to
+its original contracts. They do not negotiate an installed SDK version or
+provide a compatibility fallback. Dependency installation requires full package
+namespace and RECORD verification; current and minimum Python versions and the
+native worker must be tested against the same candidate. Earlier validation
+retains its original source, package and environment identities.
+
+A dependency declaration or successful installation does not register the
+worker or establish cgroup-zero, broker outbound isolation, cognitive, cloud or
+end-to-end product readiness.

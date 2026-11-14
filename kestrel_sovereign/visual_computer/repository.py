@@ -88,7 +88,7 @@ class CustodyRecord(BaseModel):
     last_control: ControlRequest | None = None
     control_receipt: ComputerSession | None = None
     retired_at: datetime | None = None
-    retired_from: Literal["admitted", "quoted"] | None = None
+    retired_from: Literal["admitted", "quoted", "acquiring"] | None = None
     human_private: bool = False
     human_control_id: str | None = None
     human_control_epoch: int | None = None
@@ -177,7 +177,7 @@ class VisualCustodyRepository:
                         for owner, identity, payload in await self.db.fetchall("SELECT owner, request_id, payload FROM visual_computer_requests"):
                             original = self._open(owner, identity, payload, CustodyRecord, key=key)
                             if original.phase == "retired":
-                                if not self._retired(original):
+                                if not (self._retired(original) or self._retired_local_setup(original)):
                                     raise CustodyIntegrityError("invalid original acquisition retirement")
                                 await self.db.execute("UPDATE visual_computer_requests SET retired = 1 WHERE owner = ? AND request_id = ?", (owner, identity))
                     # The original encrypted extension records remain forever. A
@@ -479,6 +479,52 @@ class VisualCustodyRepository:
             and not record.human_private and record.human_control_id is None and record.human_control_epoch is None
             and all(value is None for value in (record.lease, record.connection, record.session,
                 record.frame, record.pending_control, record.last_control, record.control_receipt)))
+
+    @staticmethod
+    def _retired_local_setup(record):
+        return (record.phase == "retired" and record.retired_from == "acquiring"
+            and record.retired_at is not None and record.retired_at.tzinfo is not None
+            and record.acquisition is None and record.remote_environment is None
+            and not record.human_private and record.human_control_id is None and record.human_control_epoch is None
+            and all(value is None for value in (record.lease, record.connection, record.session,
+                record.frame, record.pending_control, record.last_control, record.control_receipt)))
+
+    async def _retire_failed_local_setup(self, scope, record, original, *, at, guard):
+        """CAS verified original post-effect cleanup without fabricating a lease.
+
+        This differs from never-acquired retirement. The current Runtime has
+        joined the original Future and physical closer. Same-map custody stays
+        retained until this exact transaction acknowledges.
+        """
+        from .local_worker import _OriginalLocalWorkerSetup
+        if guard is None or type(original) is not _OriginalLocalWorkerSetup or original._host._runtime.repository is not self:
+            raise ResourceConflict("original local setup retirement owner required")
+        original._require_retirement(record, failed=True)
+        if at.tzinfo is None or at.utcoffset() is None:
+            raise ValueError("retirement time must be aware")
+        async with self._transaction(guard):
+            owner = self._owner(scope)
+            await self._lock_owner(owner)
+            row = await self.db.fetchone("SELECT payload FROM visual_computer_requests WHERE owner = ? AND request_id = ?", (owner, record.request.request_id))
+            if row is None:
+                raise ResourceNotFound("original visual custody not found")
+            current = self._open(owner, record.request.request_id, row[0], CustodyRecord)
+            original._require_retirement(current, failed=True)
+            if current != record or current.request.scope != scope or current.phase != "acquiring":
+                raise ResourceConflict("original local setup retirement changed concurrently")
+            if (current.lease is not None or current.connection is not None or current.session is not None
+                    or current.frame is not None or current.pending_control is not None
+                    or current.last_control is not None or current.control_receipt is not None
+                    or current.human_private or current.human_control_id is not None
+                    or current.human_control_epoch is not None
+                    or await self.db.fetchone("SELECT 1 FROM visual_computer_actions WHERE owner = ? AND session_key = ? LIMIT 1", (owner, self._address("session", record.session_id)))):
+                raise ResourceConflict("original local setup has other durable custody")
+            retired = current.model_copy(update={"phase": "retired", "retired_from": "acquiring",
+                "retired_at": at, "revision": current.revision + 1})
+            count = await self.db.execute("UPDATE visual_computer_requests SET payload = ?, revision = revision + 1, retired = 1 WHERE owner = ? AND request_id = ? AND revision = ? AND released = 0 AND retired = 0", (self._seal(owner, record.request.request_id, retired), owner, record.request.request_id, current.revision))
+            if count != 1:
+                raise ResourceConflict("original local setup retirement changed concurrently")
+        return retired
 
     async def retire_unacquired(self, scope, record, *, at, guard=None):
         """CAS exact original pre-acquisition facts; never claim physical release.
