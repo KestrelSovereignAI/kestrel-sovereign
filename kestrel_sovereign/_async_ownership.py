@@ -1844,8 +1844,9 @@ async def await_owned_task(
         # Observation admission is fallible too. Its allocation refusal must
         # use the SAME positive-interval, original-task must-join path as
         # callback publication refusal, not unwind an accepted native owner.
-        completion = asyncio.get_running_loop().create_future()
-        task.add_done_callback(mark_complete)
+        if not task.done():
+            completion = asyncio.get_running_loop().create_future()
+            task.add_done_callback(mark_complete)
     except BaseException as error:
         retain_publication_failure(error)
     try:
