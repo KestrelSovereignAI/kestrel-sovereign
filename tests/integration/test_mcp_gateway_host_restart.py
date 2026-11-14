@@ -105,6 +105,7 @@ async def test_parent_retires_original_gateway_after_forced_host_exit(
         generation = 2
         # Block only the test-owned readiness file, after real native restore.
         os.mkfifo(c.home / 'host-2-ready.starting', mode=0o600)
+    admissions = c.home / f'host-{generation}-ready.gateway-admissions'
     released, active = asyncio.Event(), asyncio.Event()
     state = {}
 
@@ -127,7 +128,6 @@ async def test_parent_retires_original_gateway_after_forced_host_exit(
             async with asyncio.timeout(30):
                 while original is None:
                     assert not task.done(), 'Host failed before actual Gateway admission'
-                    admissions = c.home / 'host-2-ready.gateway-admissions'
                     for receipt in admissions.glob('kestrel-*.json'):
                         record = json.loads(receipt.read_text())
                         if 'pid' not in record:
@@ -184,9 +184,12 @@ async def test_parent_retires_original_gateway_after_forced_host_exit(
         assert isinstance(error, AssertionError), repr(error)
         assert not original.is_running(), (
             'Host fixture abandoned its original admitted native Gateway', repr(error))
-        if deferred_reader and configuration.exists():
+        if configuration.exists():
             assert str(error) == 'Retain native profile until its owned peers retire', repr(error)
-            assert reader.done() and await asyncio.to_thread(finished_reader.wait, 10)
+            database = c.peer.gateway_home / '.docker/mcp/mcp-toolkit.db'
+            assert native_cli_profile_present(database, profile)
+            if deferred_reader:
+                assert reader.done() and await asyncio.to_thread(finished_reader.wait, 10)
             # A deferred native container is not a truthful first-pass ACK.
             # Physically finish that original, then resume the retained receipt.
             await _remove_owned_gateway_containers(c.peer)
