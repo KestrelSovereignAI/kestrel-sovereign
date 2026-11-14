@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 
-from kestrel_sovereign._async_ownership import OwnedOperation
+from kestrel_sovereign._async_ownership import OwnedOperation, await_owned_task
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 
 
@@ -58,3 +58,44 @@ async def test_original_completed_operation_survives_source_loop_closure(native_
         assert final.error is error
     else:
         assert isinstance(final.error, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_pending_original_cancellation_keeps_actual_observer_removal_failure():
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    published, release = asyncio.Event(), asyncio.Event()
+    cancellation = asyncio.CancelledError("Original pending source cancellation")
+    refusal = RuntimeError("Original pending completion observer removal refused")
+
+    class RefuseRemoval(asyncio.Task):
+        def add_done_callback(self, callback, *args, **kwargs):
+            result = super().add_done_callback(callback, *args, **kwargs)
+            if getattr(callback, "__name__", "") == "mark_complete":
+                published.set()
+            return result
+
+        def remove_done_callback(self, callback):
+            result = super().remove_done_callback(callback)
+            if getattr(callback, "__name__", "") == "mark_complete":
+                raise refusal
+            return result
+
+    async def physical_operation():
+        await release.wait()
+        raise cancellation
+
+    source = RefuseRemoval(physical_operation())
+    observer = asyncio.create_task(await_owned_task(source))
+    try:
+        await published.wait()
+        assert not source.done(), "Pending-source control did not publish an actual observer"
+        release.set()
+        outcome = await observer
+        assert source.done() and source.cancelled()
+        errors = tuple(_explicit_control_chain(outcome.error))
+        assert cancellation in errors, "Observer cleanup erased the original source cancellation"
+        assert refusal in errors, "Pending-source observation discarded its actual removal failure"
+    finally:
+        release.set()
+        await asyncio.gather(observer, source, return_exceptions=True)
