@@ -1746,10 +1746,11 @@ consolidation. An isolated native-MCP acceptance test closes the original SDK
 and agent, starts a fresh Python process on the same identity and SQLite
 database, and runs the existing canonical consolidator over the exact imported
 rows. It verifies one episode, repeat-pass deduplication and privacy refusal
-after restart. A second acceptance test preserves the original auto-seeded
-`sleep` cron (`0 4 * * *`) and advances only its owned due instant. Two fresh
+after restart. With MemoryFeature and SchedulerFeature enabled, a second
+acceptance test preserves the original auto-seeded `sleep` cron (`0 4 * * *`)
+and advances only its owned due instant. Two fresh
 processes run the actual boot-armed scheduler, claim, signal dispatcher and
-sleep handler; native terminal journals, claim release, exact source rows,
+sleep handler; native terminal journals, claim release, exact source rows after processing,
 privacy refusal and episode deduplication are observed before original cleanup.
 MemoryFeature prepares the hook's attestation tables during initialization, so
 the first sleep cannot change schema after its signal journal has pinned the

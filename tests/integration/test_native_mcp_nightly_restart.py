@@ -8,7 +8,7 @@ disabled, so these are scheduling/persistence tests, not LLM reflection proof.
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -24,7 +24,9 @@ from tests.integration.test_native_mcp_memory_restart import (
     restart_request,
     retire_original_publication,
 )
-from tests.integration.test_native_mcp_publication import assistant_agent as _assistant_agent
+from tests.integration.test_native_mcp_publication import (
+    assistant_agent as _assistant_agent,
+)
 from tests.integration.test_native_mcp_publication import publication as _publication
 
 assistant_agent = _assistant_agent
@@ -67,7 +69,7 @@ async def test_boot_armed_nightly_sleep_consumes_original_native_rows(publicatio
             while canonical_created_at((await db.fetchone("SELECT CURRENT_TIMESTAMP"))[0]) <= latest:
                 await asyncio.sleep(0.01)
     await original.set_privacy_mode(mode)
-    due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    due = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     await db.execute("UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ? AND agent_id = ?",
         (due, schedule_id, original.did))
     await retire_original_publication(owner)
