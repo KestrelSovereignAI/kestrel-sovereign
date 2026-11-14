@@ -521,6 +521,21 @@ class NativeA2ARequestHandler(RequestHandler):
                 self._raise_response_failure(result, refused.error)
             yield
 
+    @asynccontextmanager
+    async def _response_outcome(self, result: Task | Message):
+        """Retain the same operation outcome across every response layer."""
+        try:
+            yield
+        except (asyncio.CancelledError, GeneratorExit):
+            # Preserve raw caller withdrawal/normal async-generator close.
+            # Opaque source failures carry their original native body/retirement
+            # evidence from the canonical kernel and are handled below.
+            raise
+        except BaseException as error:
+            if execution_commit_outcome(error) is not None:
+                raise
+            self._raise_response_failure(result, error)
+
     async def _send_task_events(
         self, task: Task, admitted: AuthorizedNativeRequest, withdrawal: SourceWithdrawal
     ) -> AsyncGenerator[Event]:
@@ -549,18 +564,8 @@ class NativeA2ARequestHandler(RequestHandler):
         task = await self._submit(admitted)
         if isinstance(task, StreamRefusal):
             raise task.error
-        # Bind outcome to the whole post-admission response, not selected
-        # rechecks. Physical source/retirement errors can precede the explicit
-        # disconnect branch; they must retain BOTH their original evidence and
-        # the already-committed operation. Raw caller cancellation stays raw.
-        try:
+        async with self._response_outcome(task):
             return await self._message_response(task, admitted, context)
-        except asyncio.CancelledError:
-            raise
-        except BaseException as error:
-            if execution_commit_outcome(error) is not None:
-                raise
-            self._raise_response_failure(task, error)
 
     async def _message_response(
         self, task: Task | Message, admitted: AuthorizedNativeRequest[SendMessageRequest], context: ServerCallContext
@@ -636,18 +641,19 @@ class NativeA2ARequestHandler(RequestHandler):
         if isinstance(task, StreamRefusal):
             yield task
             return
-        if isinstance(task, Message):
-            # Revalidate authority, but do not suspend the source while the
-            # lifecycle reader lease is still held.
-            async with self._response_authority(admitted, task):
-                pass
-            yield task
-            return
-        async with owned_execution_stream(
-            self, self._send_task_events(task, admitted, withdrawal), withdrawal=withdrawal
-        ) as events:
-            async for event in events:
-                yield event
+        async with self._response_outcome(task):
+            if isinstance(task, Message):
+                # Revalidate authority, but do not suspend the source while the
+                # lifecycle reader lease is still held.
+                async with self._response_authority(admitted, task):
+                    pass
+                yield task
+                return
+            async with owned_execution_stream(
+                self, self._send_task_events(task, admitted, withdrawal), withdrawal=withdrawal
+            ) as events:
+                async for event in events:
+                    yield event
 
     def on_subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext

@@ -98,11 +98,15 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     without_reserved_cancellation_receipt,
 )
 from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    execution_commit_outcome,
+    execution_observation_error,
     execution_terminal_error,
     is_execution_control_error,
     is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.db.after_commit import call_after_backend_commit
 
 if TYPE_CHECKING:
     from kestrel_sovereign.hooks import HooksManager
@@ -317,20 +321,42 @@ class TaskManager:
         Internal callers already own their admission. HTTP callers retain the
         original verified receipt and supply its finite policy/topology fence.
         Neither callback DNS nor post-commit projections hold that fence.
+        The backend's actual outer-COMMIT observation, not a joined context
+        exit, binds both outcome evidence and submission notifications.
         """
-        async with (admission_fence() if admission_fence is not None else nullcontext()) as decision:
-            if isinstance(decision, StreamRefusal):
-                yield decision
-                return
-            if self._push_service is not None:
-                self._push_service.require_execution_safe()
-            if outbox is not None and (
-                self._push_service is None
-                or self._push_service.require_ready().outbox is not outbox
-            ):
-                raise RuntimeError("Task admission lost its original push service")
-            async with self.task_store.write_transaction():
-                yield
+        committed = False
+
+        def acknowledged():
+            nonlocal committed
+            committed = True
+
+        try:
+            async with (admission_fence() if admission_fence is not None else nullcontext()) as decision:
+                if isinstance(decision, StreamRefusal):
+                    yield decision
+                    return
+                if self._push_service is not None:
+                    self._push_service.require_execution_safe()
+                if outbox is not None and (
+                    self._push_service is None
+                    or self._push_service.require_ready().outbox is not outbox
+                ):
+                    raise RuntimeError("Task admission lost its original push service")
+                async with self.task_store.write_transaction():
+                    self._after_input_commit(acknowledged)
+                    yield
+                if admission_fence is not None and not committed:
+                    # HTTP admission cannot claim a durable result from an
+                    # inner joined scope while its caller owns the real COMMIT.
+                    raise ExecutionCommitOutcomeError("unknown")
+        except BaseException as error:
+            if not committed or execution_commit_outcome(error) is not None:
+                raise
+            raise execution_observation_error(ExecutionCommitOutcomeError("committed"), error)
+
+    def _after_input_commit(self, callback: Callable[[], None]) -> None:
+        if not call_after_backend_commit(self.task_store.backend, callback):
+            raise RuntimeError("Native task admission requires actual backend commit observation")
 
     @property
     def did(self) -> str:
@@ -1561,22 +1587,27 @@ class TaskManager:
     def _announce_submitted_input(self, candidate: NativeTaskSnapshot) -> None:
         """Publish a committed input snapshot through the canonical owner hook."""
         candidate.require_recipient(self.did)
+        callback = self._on_task_submitted
         if (
             not candidate.cognition_wake_eligible
             or not candidate.input_wake_eligible
-            or self._on_task_submitted is None
+            or callback is None
         ):
             return
-        try:
-            self._on_task_submitted(candidate)
-        except Exception as error:
-            if is_execution_control_error(error):
-                raise
-            logger.warning(
-                "Task input admission callback failed for %s",
-                candidate.task.id,
-                exc_info=True,
-            )
+
+        def announce():
+            try:
+                callback(candidate)
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
+                logger.warning(
+                    "Task input admission callback failed for %s",
+                    candidate.task.id,
+                    exc_info=True,
+                )
+
+        self._after_input_commit(announce)
 
     async def continue_task(
         self,
@@ -1607,10 +1638,11 @@ class TaskManager:
                     creator_id=creator_agent_id,
                     task_id=candidate.task.id,
                 )
+            if appended:
+                self._announce_submitted_input(candidate)
         if candidate is None:
             return None
         if appended:
-            self._announce_submitted_input(candidate)
             try:
                 await self._notify_status_update(candidate.task, final=False)
             except Exception as error:
@@ -1713,18 +1745,19 @@ class TaskManager:
                 )
                 if admitted_snapshot is None:
                     raise RuntimeError("New task has no canonical input snapshot")
+                if notify_submitted:
+                    self._announce_submitted_input(admitted_snapshot)
         if ownership_refusal is not None:
             raise ownership_refusal
         projection_id = self.session_id_for_context(task.context_id)
         # Admission is complete only when the durable reservation can wake its
-        # recipient.  Fire the synchronous bridge immediately after commit,
-        # before any cancellable session/observability await.  The bridge owns
+        # recipient. The synchronous bridge was registered inside the SAME
+        # transaction and fires on actual COMMIT, even if the later admission
+        # lease exit fails. It never fires for an uncommitted joined scope or
+        # rollback, and precedes cancellable projection awaits. The bridge owns
         # its asynchronous delivery through the agent's background-task
         # tracker, so cancellation of this transport coroutine cannot strand a
         # durably SUBMITTED row with no cognition wake.
-        if notify_submitted:
-            self._announce_submitted_input(admitted_snapshot)
-
         # The insert-only task reservation is deliberately first: a duplicate
         # caller-supplied ID must be rejected before it can append another user
         # message to the existing session. Session and observability projections

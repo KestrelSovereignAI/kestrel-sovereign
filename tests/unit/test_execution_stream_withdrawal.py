@@ -113,8 +113,12 @@ async def test_explicit_withdrawal_preserves_actual_finalizer_task_context_and_f
 
 
 @pytest.mark.asyncio
-async def test_bad_withdrawal_refuses_before_iterator_acquisition():
+@pytest.mark.parametrize("kind", ["plain", "derived"])
+async def test_bad_withdrawal_refuses_before_iterator_acquisition(kind):
     acquired = []
+
+    class DerivedWithdrawal(SourceWithdrawal):
+        pass
 
     class Source:
         def __aiter__(self):
@@ -125,6 +129,6 @@ async def test_bad_withdrawal_refuses_before_iterator_acquisition():
             raise StopAsyncIteration
 
     with pytest.raises(TypeError, match="SourceWithdrawal"):
-        async with owned_execution_stream(object(), Source(), withdrawal=object()):
+        async with owned_execution_stream(object(), Source(), withdrawal=object() if kind == "plain" else DerivedWithdrawal()):
             pytest.fail("Invalid withdrawal entered an execution source")
     assert not acquired

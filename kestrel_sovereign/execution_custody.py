@@ -1860,7 +1860,7 @@ class _ExecutionForwarder:
     """
 
     def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = (), *, lifecycle: ExecutionStreamLifecycle | None = None, withdrawal: SourceWithdrawal | None = None):
-        if withdrawal is not None and not isinstance(withdrawal, SourceWithdrawal):
+        if withdrawal is not None and type(withdrawal) is not SourceWithdrawal:
             raise TypeError("execution withdrawal must be a SourceWithdrawal")
         self._withdrawal = withdrawal
         self._runtime_owner = owner
