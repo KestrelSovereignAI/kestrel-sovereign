@@ -1479,6 +1479,106 @@ async def test_actual_lease_exit_after_commit_retains_outcome_and_submission(
     assert not wire.manager._subscribers and not wire.admission.lock.locked()
 
 
+@pytest.mark.parametrize("phase", ["session", "observability", "readback", "owner-admission", "continuation"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_post_commit_original_projection_failure_retains_actual_outcome(
+    wire, monkeypatch, phase, streaming
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionAuthorityError,
+        execution_commit_outcome,
+        execution_error_with_cause,
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+
+    manager = wire.manager
+    params = send(wire.admission)
+    params.configuration.return_immediately = True
+    if phase == "continuation":
+        task = await manager.create_task(send(wire.admission), creator_agent_id=PRINCIPAL)
+        params.message.task_id = task.id
+        params.message.context_id = task.context_id
+    before = len(wire.submissions)
+    submitted = manager._on_task_submitted
+    armed, physical = False, []
+    refused = []
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    target, method = {
+        "session": (manager.session_service, "get_session"),
+        "observability": (manager.observability_store, "log_tool_call"),
+        "readback": (manager.task_store, "_get_unscoped"),
+        "owner-admission": (manager.task_store, "_get_unscoped"),
+        "continuation": (manager, "_notify_status_update"),
+    }[phase]
+    original = getattr(target, method)
+
+    def acknowledge(snapshot):
+        nonlocal armed
+        submitted(snapshot)
+        armed = True
+
+    def fail_original_io():
+        nonlocal armed
+        armed = False
+        descriptor = os.open(os.devnull, os.O_WRONLY)
+        try:
+            try:
+                os.read(descriptor, 1)
+            except OSError as error:
+                physical.append(error)
+                raise execution_error_with_cause(
+                    ExecutionAuthorityError("Actual post-commit projection I/O failed"), error
+                )
+        finally:
+            os.close(descriptor)
+
+    async def original_then_failed_io(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if armed:
+            fail_original_io()
+        return result
+
+    def factory(loop, coroutine, **options):
+        operation = _actual_operation(coroutine)
+        code = getattr(operation, "cr_code", None)
+        if armed and code is not None and code.co_qualname == "TaskStore._get_unscoped":
+            refused.append(operation)
+            fail_original_io()
+        return previous(loop, coroutine, **options) if previous else asyncio.Task(coroutine, loop=loop, **options)
+
+    monkeypatch.setattr(manager, "_on_task_submitted", acknowledge)
+    if phase != "owner-admission":
+        monkeypatch.setattr(target, method, original_then_failed_io)
+    try:
+        if phase == "owner-admission":
+            loop.set_task_factory(factory)
+        async with observed_native_http(wire) as observed:
+            with pytest.raises(A2AClientError, match="500"):
+                async for _ in wire.client(streaming=streaming, polling=False, http_client=observed.http).send_message(params):
+                    pytest.fail("A failed post-commit original operation returned normally")
+    finally:
+        loop.set_task_factory(previous)
+    assert observed.statuses == [500] and not armed
+    assert len(observed.failures) == len(physical) == 1
+    assert len(wire.submissions) == before + 1
+    assert is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == "committed"
+    assert any(carrier is physical[0] for carrier in execution_evidence_carriers(observed.failures[0]))
+    assert len(refused) == (1 if phase == "owner-admission" else 0)
+    unretired = [operation for operation in refused if inspect.getcoroutinestate(operation) != inspect.CORO_CLOSED]
+    # Recover only actually UNSTARTED recipes after the negative snapshot.
+    # This test cleanup is not a product ownership/retirement acknowledgement.
+    for operation in unretired:
+        if inspect.getcoroutinestate(operation) == inspect.CORO_CREATED:
+            operation.close()
+    assert not unretired, "Refused canonical readback owner abandoned its original recipe"
+    rows = await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks")
+    assert len(rows) == 1 and rows[0][0] == wire.submissions[-1].task.id
+    assert not manager._subscribers and not wire.admission.lock.locked()
+
+
 @pytest.mark.parametrize("rollback", [False, True])
 @pytest.mark.parametrize("mutate_result", [False, True])
 async def test_continuation_notification_follows_actual_outer_commit(native_request_admission, monkeypatch, rollback, mutate_result):
@@ -1630,14 +1730,45 @@ async def test_fenced_admission_never_treats_joined_transaction_as_commit(native
 
     async with a.backend.transaction():
         with pytest.raises(ExecutionCommitOutcomeError) as pending:
-            async with a.manager._task_input_admission(None, original_admission):
-                await a.backend.execute(
-                    "INSERT INTO native_test_principals VALUES (?, ?)", ("did:staged-input", PRINCIPAL)
-                )
+            async with a.manager._task_input_admission(
+                None, original_admission, admitted_input=lambda: True,
+            ) as transaction:
+                async with transaction:
+                    await a.backend.execute(
+                        "INSERT INTO native_test_principals VALUES (?, ?)", ("did:staged-input", PRINCIPAL)
+                    )
         assert execution_commit_outcome(pending.value) == "unknown"
     assert await a.backend.fetch_one(
         "SELECT principal FROM native_test_principals WHERE signing_did = ?", ("did:staged-input",)
     ) == (PRINCIPAL,)
+
+
+async def test_empty_transaction_commit_never_claims_an_admitted_input(native_request_admission):
+    from kestrel_sovereign._async_ownership import OriginalContextExit
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome, execution_evidence_carriers, is_execution_control_error,
+    )
+
+    a = native_request_admission
+    physical = HTTPException(403, detail="Original empty admission lease exit failed")
+
+    @asynccontextmanager
+    async def original_lease():
+        async with a.lock:
+            yield
+        raise physical
+
+    with pytest.raises(Exception) as failed:
+        async with a.manager._task_input_admission(
+            None, lambda: OriginalContextExit(original_lease()), admitted_input=lambda: False,
+        ) as transaction:
+            async with transaction:
+                pass
+    assert is_execution_control_error(failed.value)
+    assert execution_commit_outcome(failed.value) is None
+    assert any(error is physical for error in execution_evidence_carriers(failed.value))
+    assert await a.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not a.lock.locked()
 
 
 @pytest.mark.parametrize("streaming", [False, True])

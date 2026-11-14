@@ -30,8 +30,17 @@ async def test_actual_connection_creation_is_joined_before_caller_withdrawal(tmp
         target = path.as_uri() + "?mode=rw" if route == "snapshot" else str(tmp_path / "original-backup.db")
     native_connect, async_connect = sqlite3.connect, aiosqlite.connect
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
-    actual, wrappers = [], []
+    actual, wrappers, delivered, terminal = [], [], [], []
     observed = {"abandoned": False, "test_reconciled": False}
+    original_wait = asyncio.wait
+
+    async def observe_original_wait(*args, **kwargs):
+        try:
+            return await original_wait(*args, **kwargs)
+        except asyncio.CancelledError as error:
+            if asyncio.current_task() is pending:
+                delivered.append(error)
+            raise
 
     def original_native_connect(database, *args, **kwargs):
         connection = native_connect(database, *args, **kwargs)
@@ -60,17 +69,22 @@ async def test_actual_connection_creation_is_joined_before_caller_withdrawal(tmp
         return connection
 
     async def acquire():
-        if route in {"primary", "cold"}:
-            return await backend.connect()
-        if route == "backup":
-            return await backend.backup_to(target)
-        return await backend._open_snapshot_read_connection()
+        try:
+            if route in {"primary", "cold"}:
+                return await backend.connect()
+            if route == "backup":
+                return await backend.backup_to(target)
+            return await backend._open_snapshot_read_connection()
+        except asyncio.CancelledError as error:
+            terminal.append(error)
+            raise
 
     pending = None
     try:
         with monkeypatch.context() as fault:
             fault.setattr(sqlite3, "connect", original_native_connect)
             fault.setattr(aiosqlite, "connect", original_async_connect)
+            fault.setattr(asyncio, "wait", observe_original_wait)
             pending = asyncio.create_task(acquire())
             await wait_for_thread_event(entered, step="the actual original SQLite creator holding its open handle")
             pending.cancel("Caller withdrew during original SQLite creation")
@@ -93,6 +107,9 @@ async def test_actual_connection_creation_is_joined_before_caller_withdrawal(tmp
                 await result.close()  # explicit test recovery of a lost cancellation
             assert not premature, ("Caller escaped while its original SQLite creator still owned the handle", observed)
             assert isinstance(result, asyncio.CancelledError)
+            assert len(delivered) == (2 if repeated else 1) and len(terminal) == 1
+            graph = tuple(execution_evidence_carriers(terminal[0]))
+            assert all(any(original is carrier for carrier in graph) for original in delivered)
             assert len(actual) == len(wrappers) == 1 and not observed["test_reconciled"]
             assert not aiosqlite_worker(wrappers[0]).is_alive()
             # SQL execute checks thread affinity BEFORE closed state. This
