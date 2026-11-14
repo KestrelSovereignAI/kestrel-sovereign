@@ -1023,9 +1023,12 @@ class AsyncAssertionStore:
         transaction in ``TransactionError``.  Assertion contract violations
         are expected, caller-actionable rejections, so preserve those domain
         errors after the backend has rolled back the complete mutation.
+        A caller may own a larger transaction and catch this domain refusal.
+        Its independently rollback-safe savepoint prevents that caller from
+        committing a partial assertion mutation after handling the error.
         """
         try:
-            async with self._database.transaction():
+            async with self._database.transaction(savepoint=True):
                 if revoke_maintenance_lease:
                     if _MAINTENANCE_FENCE.get() is not None:
                         raise AssertionStoreError(

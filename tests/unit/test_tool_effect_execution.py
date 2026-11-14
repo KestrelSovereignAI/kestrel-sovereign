@@ -5,6 +5,7 @@ execution component, not model cognition or the four dispatch producers.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
@@ -14,6 +15,7 @@ from kestrel_sovereign._async_ownership import create_owned_task
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.features.privacy.feature import PrivacyAgent
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.db.interface import TransactionError
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectReconciliationRequired, ToolEffectStore,
 )
@@ -450,3 +452,101 @@ async def test_prepared_native_registration_keeps_its_original_generation(owner,
     assert not witness.exists(), 'Prepared native registration refreshed its original generation'
     assert await owner.tool_effect_store.database.fetchone(
         'SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
+
+
+@pytest.mark.asyncio
+async def test_handler_lifetime_preserves_separate_durable_claim_and_settlement(owner):
+    db = owner.tool_effect_store.database
+    await db.execute("CREATE TABLE owned_handler_lifetime (value INTEGER NOT NULL)")
+    turn = await admit(owner, "owned-native-lifetime")
+    events = []
+
+    @asynccontextmanager
+    async def lifetime():
+        assert db.owns_open_transaction is False
+        assert await db.fetchone("SELECT state FROM tool_effect_claims") == ("STARTED",)
+        async with db.transaction():
+            events.append("enter")
+            yield
+            events.append("commit")
+        assert db.owns_open_transaction is False
+
+    async def effect():
+        assert db.owns_open_transaction is True
+        events.append("effect")
+        await db.execute("INSERT INTO owned_handler_lifetime VALUES (1)")
+        return {"success": True}
+
+    try:
+        with bind_tool_effect_turn((turn, None)):
+            assert await execute_tool_effect(owner, registration="owned-lifetime", arguments={},
+                execute=effect, execution_lifetime=lifetime) == {"success": True}
+        assert events == ["enter", "effect", "commit"]
+        assert await db.fetchone("SELECT value FROM owned_handler_lifetime") == (1,)
+        assert await db.fetchone("SELECT state FROM tool_effect_claims") == ("RETURNED_OK",)
+    finally:
+        await turn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["entry", "registration", "commit"])
+async def test_original_handler_lifetime_refusal_never_publishes_success(owner, refusal):
+    db = owner.tool_effect_store.database
+    await db.execute("CREATE TABLE owned_handler_lifetime (value INTEGER NOT NULL)")
+    turn = await admit(owner, "owned-native-lifetime-refusal-" + refusal)
+    original_error = ResourceConflict("Owned handler lifetime refused")
+    registration_live = True
+    effects = []
+
+    @asynccontextmanager
+    async def lifetime():
+        nonlocal registration_live
+        assert db.owns_open_transaction is False
+        if refusal == "entry":
+            raise original_error
+        async with db.transaction():
+            if refusal == "registration":
+                registration_live = False
+            yield
+            if refusal == "commit":
+                raise original_error
+
+    def validate_registration():
+        if not registration_live:
+            raise original_error
+
+    async def effect():
+        effects.append("original-effect")
+        await db.execute("INSERT INTO owned_handler_lifetime VALUES (1)")
+        return {"success": True}
+
+    try:
+        with bind_tool_effect_turn((turn, None)):
+            expected = {"entry": ResourceConflict, "registration": TransactionError,
+                "commit": ResourceOutcomeUnknown}[refusal]
+            with pytest.raises(expected) as failed:
+                await execute_tool_effect(owner, registration="owned-lifetime-refusal", arguments={},
+                    execute=effect, execution_lifetime=lifetime, validate_registration=validate_registration)
+            if refusal == "entry":
+                assert failed.value is original_error
+            elif refusal == "registration":
+                assert failed.value.__cause__ is original_error
+            else:
+                assert failed.value.__cause__.__cause__ is original_error
+        assert effects == (["original-effect"] if refusal == "commit" else [])
+        assert await db.fetchone("SELECT COUNT(*) FROM owned_handler_lifetime") == (0,), (
+            "A refused original handler lifetime committed its provisional native write")
+        assert await db.fetchone("SELECT state FROM tool_effect_claims") == (
+            "UNCONFIRMED" if refusal == "commit" else "NOT_EXECUTED",)
+    finally:
+        if refusal == "commit":
+            with pytest.raises(ToolEffectOutcomeUnconfirmed) as terminal:
+                await turn.close()
+            from kestrel_sovereign.execution_custody import execution_evidence_carriers
+            evidence = execution_evidence_carriers(terminal.value)
+            assert any(error is failed.value for error in evidence), (
+                "Turn close discarded the original unconfirmed effect")
+            assert any(error is original_error for error in evidence), (
+                "Turn close discarded the original handler refusal")
+        else:
+            await turn.close()

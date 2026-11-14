@@ -74,22 +74,27 @@ class MCPToolCaller:
     def __call__(self):
         self.require_current()
 
-    def _check_disclosure(self):
+    def _check_operation(self):
         self.require_current()
         if (self._delivery_deadline is not None
                 and asyncio.get_running_loop().time() >= self._delivery_deadline):
             raise HostCapabilityAccessDenied("Original native MCP disclosure deadline elapsed")
-        if (self._disclosing or self._disclosure_failed
+        if (self._disclosure_failed
                 or self.publication.agent._get_privacy_policy_epoch() != self._privacy_epoch):
             raise HostCapabilityAccessDenied("Original native MCP disclosure policy changed")
         require_raw_capability_disclosure(self.publication.agent, "MCP memory")
 
+    def _check_disclosure(self):
+        self._check_operation()
+        if self._disclosing:
+            raise HostCapabilityAccessDenied("Original native MCP disclosure is still executing")
+
     @asynccontextmanager
-    async def disclosure(self):
+    async def disclosure(self, required_scope):
         """Capture policy across canonical execution without inverting its locks."""
         self.require_current()
         if (self._binding is None or capture_caller_context_binding() is not self._binding
-                or self._verified_access is None or "memory:read" not in self._verified_access.scopes):
+                or self._verified_access is None or required_scope not in self._verified_access.scopes):
             raise HostCapabilityAccessDenied("Original verified MCP memory-read scope is required for disclosure")
         require_raw_capability_disclosure(self.publication.agent, "MCP memory")
         epoch = self.publication.agent._get_privacy_policy_epoch()
@@ -114,6 +119,29 @@ class MCPToolCaller:
         finally:
             self._disclosing = False
         self._check_disclosure()
+
+    @asynccontextmanager
+    async def mutation(self, required_scope):
+        """Commit the canonical handler under the original OAuth SQL lock.
+
+        The caller enters only after canonical journal admission. The handler
+        joins this actual primary transaction; neither credentials nor its
+        durable receipt can escape before the top-level commit completes.
+        """
+        self._check_operation()
+        original = self._verified_access
+        if original is None or required_scope not in original.scopes:
+            raise HostCapabilityAccessDenied("Original verified MCP write scope is required")
+        async with self.publication.runtime.authorization.grants.access_lifetime(
+                original.token, resource=self.publication.resource, client_id=original.client_id) as current:
+            if current().model_dump() != original.model_dump():
+                raise HostCapabilityAccessDenied("Original native MCP write grant changed")
+            self._check_operation()
+            yield
+            self._check_operation()
+            if current().model_dump() != original.model_dump():
+                raise HostCapabilityAccessDenied("Original native MCP write grant changed")
+        self._check_operation()
 
     async def _check_current_grant(self):
         original = self._verified_access
@@ -188,15 +216,44 @@ class MCPToolCaller:
 @asynccontextmanager
 async def bind_native_mcp_tool_caller(publication, context, required_scope, *, disclose=False):
     """Use the SDK's original Request and token, never tool-supplied identity."""
+    owner = _native_mcp_owner(publication, context)
+    async with owner.bind(context, required_scope) as caller:
+        if disclose:
+            async with owner.disclosure(required_scope):
+                yield caller
+        else:
+            yield caller
+
+
+def _native_mcp_owner(publication, context):
     request = context.request_context.request
     if not isinstance(request, Request):
         raise HostCapabilityAccessDenied("Original native MCP SDK request is required")
     owner = request.scope.get(_REQUEST_KEY)
-    if type(owner) is not MCPToolCaller or owner.publication is not publication:
+    if (type(owner) is not MCPToolCaller or owner.publication is not publication
+            or request.scope is not owner.scope):
         raise HostCapabilityAccessDenied("Original native MCP tool request is required")
-    async with owner.bind(context, required_scope) as caller:
-        if disclose:
-            async with owner.disclosure():
-                yield caller
-        else:
-            yield caller
+    owner.require_current()
+    return owner
+
+
+def native_mcp_write_lifetime(publication, context, required_scope):
+    """Capture the original SDK request before awaited hooks or admission."""
+    owner = _native_mcp_owner(publication, context)
+    original_request = context.request_context.request
+
+    def require_original_request():
+        owner.require_current()
+        if (context.request_context.request is not original_request
+                or original_request.scope is not owner.scope):
+            raise HostCapabilityAccessDenied("Original native MCP SDK write request changed")
+
+    @asynccontextmanager
+    async def lifetime():
+        require_original_request()
+        async with owner.mutation(required_scope):
+            require_original_request()
+            yield
+            require_original_request()
+
+    return lifetime

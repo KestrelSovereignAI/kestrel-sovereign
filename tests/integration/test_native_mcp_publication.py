@@ -71,9 +71,11 @@ async def publication(assistant_agent, monkeypatch, request):
     configuration = {"console_origin": "https://kestrel.example",
         "clients": [{"client_id": "owned-provider", "client_name": "Owned provider",
             "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret"}]}
-    configuration.update(getattr(request, "param", {}))
+    settings = getattr(request, "param", {})
+    routing_key = settings.get("routing_key", "OwnedNativeMCP")
+    configuration.update({key: value for key, value in settings.items() if key != "routing_key"})
     policy = MCPServerPolicy.model_validate_json(json.dumps(configuration))
-    p = await NativeMCPPublication.prepare(app, agent, "OwnedNativeMCP", policy, sovereign_key=lambda: KEY)
+    p = await NativeMCPPublication.prepare(app, agent, routing_key, policy, sovereign_key=lambda: KEY)
     async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),
             base_url=policy.console_origin, follow_redirects=False) as client:
         try:

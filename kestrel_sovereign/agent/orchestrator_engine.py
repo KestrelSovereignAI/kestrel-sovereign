@@ -19,7 +19,7 @@ import re
 import sys
 import time
 import uuid
-from contextlib import aclosing, contextmanager, nullcontext
+from contextlib import AbstractAsyncContextManager, aclosing, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
@@ -1929,6 +1929,7 @@ class OrchestratorEngineMixin:
         source: str = "external",
         operation_id: str | None = None,
         argument_guard: Callable[[dict, ToolSchema], Awaitable[None]] | None = None,
+        execution_lifetime: Callable[[], AbstractAsyncContextManager] | None = None,
         _capture: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Transport-agnostic governed tool dispatch.
@@ -1968,6 +1969,10 @@ class OrchestratorEngineMixin:
                 owned effective arguments and selected tool schema after hook
                 rewrites, including that schema's defaults. Raise to refuse.
                 Subagent and receipt-only paths refuse this direct-tool guard.
+            execution_lifetime: Trusted host context retained across the selected
+                direct handler and its commit, after journal admission. It does
+                not enclose journal claim/settlement or hook execution. Subagent
+                and receipt-only paths refuse this context.
 
         Returns:
             On execution: whatever the tool returns (typically a
@@ -1991,8 +1996,8 @@ class OrchestratorEngineMixin:
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
         )
-        if tool_name == PHANTOM_RECEIPT_TOOL_NAME and argument_guard is not None:
-            raise ResourceUnsupported("Direct-tool argument guard cannot govern receipt-only dispatch")
+        if tool_name == PHANTOM_RECEIPT_TOOL_NAME and (argument_guard is not None or execution_lifetime is not None):
+            raise ResourceUnsupported("Direct-tool guards cannot govern receipt-only dispatch")
 
         if operation_id is not None:
             from kestrel_sovereign.agent.invocation import validate_invocation_id
@@ -2003,7 +2008,7 @@ class OrchestratorEngineMixin:
                 owned_args = deepcopy(args)
                 outcome = await self._execute_tool_operation_at_stop_boundary(
                     lambda: self.execute_named_tool(tool_name, owned_args, session_id=session_id,
-                        source=source, argument_guard=argument_guard, _capture=_capture),
+                        source=source, argument_guard=argument_guard, execution_lifetime=execution_lifetime, _capture=_capture),
                     name='named-tool-invocation', cancel_on_caller_cancellation=True,
                     tool_operation=ToolEffectOperation('named_tool', operation_id,
                         'named-registry', tool_name, owned_args, session_id))
@@ -2042,7 +2047,7 @@ class OrchestratorEngineMixin:
                 tool_name, args, session_id=session_id, source=source,
                 _capture=_capture, call_context=call_context,
                 execution=execution, dispatch_meta=dispatch_meta,
-                argument_guard=argument_guard,
+                argument_guard=argument_guard, execution_lifetime=execution_lifetime,
             )
 
             if _capture is None and not dispatch_meta.get("audit_recorded"):
@@ -2124,6 +2129,7 @@ class OrchestratorEngineMixin:
         execution,
         dispatch_meta,
         argument_guard: Callable[[dict, ToolSchema], Awaitable[None]] | None = None,
+        execution_lifetime: Callable[[], AbstractAsyncContextManager] | None = None,
     ) -> Any:
         """Resolve and run one :meth:`execute_named_tool` call.
 
@@ -2173,8 +2179,8 @@ class OrchestratorEngineMixin:
             # direct invocation via the inline executor failed.
             subagent_feature = self._resolve_named_subagent(tool_name)
             if subagent_feature is not None:
-                if argument_guard is not None:
-                    raise ResourceUnsupported("Direct-tool argument guard cannot govern subagent dispatch")
+                if argument_guard is not None or execution_lifetime is not None:
+                    raise ResourceUnsupported("Direct-tool guards cannot govern subagent dispatch")
                 return await self._execute_named_subagent(
                     subagent_feature, tool_name=tool_name, args=args,
                     session_id=session_id, source=source, _capture=_capture,
@@ -2342,7 +2348,8 @@ class OrchestratorEngineMixin:
 
         result = await execute_tool_effect(self, registration=[feature_name, tool_name],
             arguments=effective_args, execute=execute_registered,
-            expected_generation=selected_generation, validate_registration=registration_validator)
+            expected_generation=selected_generation, validate_registration=registration_validator,
+            execution_lifetime=execution_lifetime)
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
