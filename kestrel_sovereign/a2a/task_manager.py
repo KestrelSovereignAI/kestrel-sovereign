@@ -44,12 +44,14 @@ from kestrel_sdk.native_a2a.utils.errors import (
     PushNotificationNotSupportedError,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.source_ownership import SourceWithdrawal
 from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
+    gather_owned,
     raise_owned_outcome,
 )
 from kestrel_sovereign.a2a.extensions import (
@@ -2529,6 +2531,7 @@ class TaskManager:
         *,
         creator_agent_id: str | None = None,
         recipient_agent_id: str | None = None,
+        withdrawal: SourceWithdrawal | None = None,
     ) -> AsyncGenerator[Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent, None]:
         """Yield a native task snapshot followed by native SDK event values."""
         if recipient_agent_id is None:
@@ -2559,7 +2562,22 @@ class TaskManager:
             if task.status.state in STREAM_STOP_STATES:
                 return
             while True:
-                event = await queue.get()
+                if withdrawal is None:
+                    event = await queue.get()
+                else:
+                    if withdrawal.requested:
+                        return
+                    # ONLY these known, resource-free waits may be cancelled.
+                    # The original subscription/finally stays in its original
+                    # owner and retires normally; durable Task work is separate.
+                    event, _ = await gather_owned(
+                        (factory() for factory in (queue.get, withdrawal.wait)),
+                        return_when=asyncio.FIRST_COMPLETED,
+                        retain_originals=True,
+                        name_prefix="native-a2a-subscription-wait",
+                    )
+                    if withdrawal.requested:
+                        return
                 yield event
                 if (
                     isinstance(event, TaskStatusUpdateEvent)

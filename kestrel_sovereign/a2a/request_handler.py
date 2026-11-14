@@ -43,6 +43,7 @@ from kestrel_sdk.native_a2a.utils.errors import (
     UnsupportedOperationError,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.source_ownership import SourceWithdrawal, WakeableSource
 from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.native_a2a.utils.task import (
     apply_history_length,
@@ -449,12 +450,13 @@ class NativeA2ARequestHandler(RequestHandler):
             return StreamRefusal(refusal)
 
     async def _open_stream(
-        self, task_id: str, principal_id: str
+        self, task_id: str, principal_id: str, *, withdrawal: SourceWithdrawal | None = None
     ) -> tuple[AsyncIterator[Event], Task] | StreamRefusal:
         stream = self.manager.subscribe(
             task_id,
             creator_agent_id=principal_id,
             recipient_agent_id=self.guard.scope.recipient_id,
+            withdrawal=withdrawal,
         )
         try:
             initial = await anext(stream)
@@ -535,8 +537,14 @@ class NativeA2ARequestHandler(RequestHandler):
             task = await self._task(task.id, admitted.principal_id)
             return apply_history_length(task, admitted.request.configuration)
 
-    async def on_message_send_stream(
+    def on_message_send_stream(
         self, params: SendMessageRequest, context: ServerCallContext
+    ) -> WakeableSource[Event | StreamRefusal]:
+        withdrawal = SourceWithdrawal()
+        return WakeableSource(self._message_send_stream(params, context, withdrawal), withdrawal)
+
+    async def _message_send_stream(
+        self, params: SendMessageRequest, context: ServerCallContext, withdrawal: SourceWithdrawal
     ) -> AsyncGenerator[Event | StreamRefusal]:
         async with self.guard.admit(
             params, "SendStreamingMessage", context, refusal_values=True
@@ -568,7 +576,7 @@ class NativeA2ARequestHandler(RequestHandler):
             yield task
             return
         async with self.guard.hold_authority(admitted):
-            opened = await self._open_stream(task.id, admitted.principal_id)
+            opened = await self._open_stream(task.id, admitted.principal_id, withdrawal=withdrawal)
         if isinstance(opened, StreamRefusal):
             yield opened
             return
@@ -579,8 +587,14 @@ class NativeA2ARequestHandler(RequestHandler):
             async for event in events:
                 yield event
 
-    async def on_subscribe_to_task(
+    def on_subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext
+    ) -> WakeableSource[Event | StreamRefusal]:
+        withdrawal = SourceWithdrawal()
+        return WakeableSource(self._subscribe_to_task(params, context, withdrawal), withdrawal)
+
+    async def _subscribe_to_task(
+        self, params: SubscribeToTaskRequest, context: ServerCallContext, withdrawal: SourceWithdrawal
     ) -> AsyncGenerator[Event | StreamRefusal]:
         async with self.guard.admit(
             params, "SubscribeToTask", context, refusal_values=True
@@ -595,7 +609,7 @@ class NativeA2ARequestHandler(RequestHandler):
                 )
             else:
                 opened = await self._open_stream(
-                    admitted.request.id, admitted.principal_id
+                    admitted.request.id, admitted.principal_id, withdrawal=withdrawal
                 )
                 if not isinstance(opened, StreamRefusal):
                     stream, initial = opened

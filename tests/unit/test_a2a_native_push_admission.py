@@ -48,7 +48,7 @@ async def _invoke_callback(wire, operation, task, config):
                     await anext(stream)
         finally:
             await stream.aclose()
-        assert stream.ag_frame is None
+        assert stream.original.ag_frame is None
         return item
     return [event async for event in wire.client().send_message(params)]
 
