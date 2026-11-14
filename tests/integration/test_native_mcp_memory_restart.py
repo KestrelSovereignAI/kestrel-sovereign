@@ -42,11 +42,16 @@ def restart_request(agent, receipt_path, *, receipts=(), mode=PrivacyMode.NORMAL
 
 @asynccontextmanager
 async def native_restart_process(*, observation_seconds=20, retain_storage=False):
-    source_paths = [str(Path(__file__).resolve().parents[2])]
+    # Reopen the same runtime imported by the parent, including wheel-only
+    # acceptance. The test checkout supplies the child driver, not Core.
+    source_paths = list(dict.fromkeys([
+        str(Path(memory_consolidator.__file__).resolve().parents[2]),
+        str(Path(__file__).resolve().parents[2]),
+    ]))
     if os.environ.get("PYTHONPATH"):
         source_paths.append(os.environ["PYTHONPATH"])
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join(source_paths)}
-    arguments = [sys.executable, "-B", "-m", "tests.utils.native_memory_restart_process"]
+    arguments = [sys.executable, "-P", "-B", "-m", "tests.utils.native_memory_restart_process"]
     if retain_storage:
         arguments.append("--retain-storage")
     process = await asyncio.create_subprocess_exec(*arguments, stdin=asyncio.subprocess.PIPE,
@@ -61,8 +66,10 @@ async def native_restart_process(*, observation_seconds=20, retain_storage=False
 
 @pytest.mark.parametrize("mode", [PrivacyMode.NORMAL, PrivacyMode.EPHEMERAL])
 async def test_original_external_rows_reach_privacy_governed_consolidation_after_restart(
-    publication, mode,
+    publication, mode, monkeypatch,
 ):
+    # A normal source-checkout CWD must not shadow the installed parent Core.
+    monkeypatch.chdir(Path(__file__).resolve().parents[2])
     owner, http = publication
     owner.publish()
     original = owner.agent
