@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import socket
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
@@ -47,6 +48,10 @@ async def native_consent_https(publication, tmp_path, monkeypatch):
     assert not Path('/var/run/docker.sock').exists() and not os.environ.get('DOCKER_HOST')
     owner, _http = publication
     monkeypatch.setattr(core_server, 'SERVE_UI', True)
+    from kestrel_sovereign.security.request_auth import AuthenticatedSessionMiddleware
+
+    owner.app.add_middleware(AuthenticatedSessionMiddleware,
+        secret_key=base64.urlsafe_b64encode(os.urandom(32)).decode())
     static = Path(kestrel_sovereign.__file__).parent / 'static'
     owner.app.mount('/js', StaticFiles(directory=static / 'js'))
     owner.app.mount('/shared', StaticFiles(directory=static / 'shared'))
@@ -193,3 +198,121 @@ try {
             'conversation_id': 'owned-native-browser'}, discover_first=True)
     assert result is not None and not result.is_error and failure is None
     assert any(private.encode() in body for _status, body in responses)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize('assistant_agent', [{'features': ['MemoryAgencyFeature']}], indirect=True)
+@pytest.mark.parametrize('publication', [{'clients': [{
+    'client_id': 'owned-provider', 'client_name': 'Owned provider',
+    'redirect_uris': ['https://provider.example/callback'], 'client_secret': 'owned-secret',
+    'scopes': ['memory:read', 'memory:write'],
+}]}], indirect=True)
+async def test_external_assistant_origin_survives_real_console_history_reload(
+    publication, native_consent_https, tmp_path,
+):
+    from kestrel_sovereign.endpoints.conversations import router as conversations_router
+    from tests.integration.test_native_mcp_tool_context import issue_native_tokens
+
+    owner, http = publication
+    owner.app.include_router(conversations_router)
+
+    class ConsoleScriptAssets(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.sources = []
+
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            source = attributes.get('src', '')
+            if (tag == 'script' and source.startswith(('js/', 'shared/'))
+                    and attributes.get('type') != 'module'):
+                self.sources.append(source)
+
+    assets = ConsoleScriptAssets()
+    assets.feed((Path(kestrel_sovereign.__file__).parent / 'static/index.html').read_text())
+    assert 'js/icons.js' in assets.sources
+
+    async def owned_history_shell():
+        # The component host uses the Console's canonical local classic assets.
+        # All modules, API calls and DOM rendering below are the actual product.
+        scripts = ''.join('<script src="/' + source + '"></script>' for source in assets.sources)
+        return HTMLResponse('<!doctype html><title>Owned external transcript</title>' + scripts
+            + '<input id="owned-key" type="password" aria-label="Owner key">'
+            '<div id="chat-container"></div><div id="direct-message"></div>')
+
+    owner.app.add_api_route('/', owned_history_shell)
+    owner.publish()
+    token = (await issue_native_tokens(owner, http, scope='memory:write'))['access_token']
+    supplied = '<img src=x onerror="window.externalTranscriptExecuted=true"> I performed an external action.'
+    result, failure, _ = await observe_native_call(owner, token, 'log_turn', {
+        'user_content': 'Please retain this externally supplied exchange.',
+        'assistant_content': supplied, 'operation_id': 'owned-browser-external-pair',
+        'conversation_id': 'owned-browser-external-conversation'})
+    assert failure is None and not result.is_error, result
+    receipt = result.structured_content['data']
+    script = tmp_path / 'owned-external-history.mjs'
+    script.write_text("""import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+const require = createRequire(process.env.MCP_TEST_BROWSER_SUPPORT + '/web/package.json');
+const { chromium } = require('playwright');
+let raw = ''; for await (const chunk of process.stdin) raw += chunk;
+const config = JSON.parse(raw);
+const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--no-proxy-server',
+  '--host-resolver-rules=MAP kestrel.example 127.0.0.1,MAP provider.example 127.0.0.2'] });
+try {
+  const page = await browser.newPage({ ignoreHTTPSErrors: true });
+  const failures = []; page.on('pageerror', error => failures.push(error.message));
+  const shell = await page.goto(config.origin + '/');
+  assert.equal(shell.status(), 200, 'Owned Console entry shell was not public');
+  await page.locator('#owned-key').fill(config.key);
+  await page.evaluate(async config => {
+    globalThis.KESTREL_UI_CONFIG = { bearerToken: {
+      getToken: async () => document.getElementById('owned-key').value,
+      headerName: 'X-API-Key', tokenPrefix: '' } };
+    const API = (await import('/js/api.js')).default;
+    const { state } = await import('/js/ui.js');
+    const chat = await import('/js/chat.js');
+    await import('/js/identity.js');
+    // publication is the real single-agent host; null is its supported UI key.
+    API.setHostAgent(null);
+    state.currentAgent = null;
+    chat.mountChatPane(null);
+    const stored = await API.getConversation(config.session);
+    if (!stored.messages.some(message => message.role === 'external_assistant')) {
+      throw new Error('Canonical conversation API lost the external assistant speaker');
+    }
+    await window.loadConversation(config.session);
+    await chat.addMessage('external_assistant', config.supplied,
+      document.getElementById('direct-message'), null,
+      { model: 'falsely-claimed-kestrel-model', provider: 'falsely-claimed-provider' });
+  }, config);
+  const history = page.locator('#chat-container [data-speaker-role="external_assistant"]');
+  assert.equal(await history.count(), 1, 'Console history dropped external assistant attribution');
+  assert.match(await history.textContent(), /External assistant.*supplied transcript/s);
+  assert.ok((await history.textContent()).includes(config.supplied));
+  const direct = page.locator('#direct-message [data-speaker-role="external_assistant"]');
+  assert.equal(await direct.count(), 1, 'Chat component dropped external assistant attribution');
+  assert.match(await direct.textContent(), /External assistant.*supplied transcript/s);
+  assert.ok((await direct.textContent()).includes(config.supplied), 'Chat component did not preserve literal external transcript bytes');
+  assert.equal(await direct.locator('.message-model-footer').count(), 0);
+  assert.equal(await page.locator('#chat-container img, #direct-message img').count(), 0);
+  assert.equal(await page.evaluate(() => !!window.externalTranscriptExecuted), false);
+  assert.deepEqual(failures, []);
+  await page.screenshot({ path: config.screenshot, fullPage: true });
+  process.stdout.write(JSON.stringify({ externalOrigin: true, canonicalHistoryReload: true }));
+} finally { await browser.close(); }
+""")
+    process = await asyncio.create_subprocess_exec('node', str(script), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        output, errors = await asyncio.wait_for(process.communicate(json.dumps({
+            'origin': owner.policy.console_origin, 'key': KEY, 'agent': owner.agent.agent_name,
+            'session': receipt['session_id'], 'supplied': supplied,
+            'screenshot': '/owned/external-assistant-history.png',
+        }).encode()), 30)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+    assert process.returncode == 0, errors.decode()
+    assert json.loads(output) == {'externalOrigin': True, 'canonicalHistoryReload': True}

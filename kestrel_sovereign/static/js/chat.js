@@ -4766,15 +4766,26 @@ export function messageAttachmentsHtml(atts) {
     return `<div class="message-attachments">${items}</div>`;
 }
 
+export function appendExternalAssistantLabel(messageDiv, role) {
+    if (role !== 'external_assistant') return false;
+    messageDiv.dataset.speakerRole = role;
+    const label = document.createElement('div');
+    label.className = 'message-origin-label';
+    label.textContent = 'External assistant · supplied transcript';
+    messageDiv.appendChild(label);
+    return true;
+}
+
 export async function addMessage(role, content, paneElement = null, attachments = null, metadata = null) {
     const target = resolvePaneElement(paneElement);
     const div = document.createElement('div');
     div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
 
+    const externalAssistant = appendExternalAssistantLabel(div, role);
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
 
-    if (role === 'user') {
+    if (role === 'user' || externalAssistant) {
         // User messages: just escape HTML and convert newlines to <br>
         const escaped = content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         contentDiv.innerHTML = escaped.replace(/\n/g, '<br>');
@@ -4791,7 +4802,7 @@ export async function addMessage(role, content, paneElement = null, attachments 
         strip.innerHTML = messageAttachmentsHtml(attachments);
         if (strip.firstChild) div.appendChild(strip.firstChild);
     }
-    if (role !== 'user') {
+    if (role !== 'user' && !externalAssistant) {
         appendModelFooter(div, metadata);
     }
     if (target) target.appendChild(div);

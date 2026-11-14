@@ -7,18 +7,22 @@ Extracted from ContextManager to improve modularity and maintainability.
 
 import html
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from typing import List, Dict, Any, Optional, TYPE_CHECKING
-import uuid
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from kestrel_sovereign.conversation_speakers import (
+    EXTERNAL_ASSISTANT_ROLE,
+    is_untrusted_conversation_speaker,
+)
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
-from kestrel_sovereign.execution_custody import is_execution_control_error
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage import AsyncStorage
@@ -244,15 +248,16 @@ class MemoryManager:
                 # in a chat turn that later gets recalled, breaking out
                 # of the boundary and forging a live-input block.
                 # HTML-escape every ``<`` / ``>`` / ``&`` in recalled
-                # user content so the raw delimiters can't close the
-                # outer context. Assistant content is NOT escaped — it
+                # user and externally supplied content so raw delimiters
+                # cannot close the outer context. Kestrel assistant content is
+                # NOT escaped — it
                 # was produced by our own LLM under our system prompt
                 # and may legitimately contain code-block delimiters.
-                if role == "user" and content:
-                    content = html.escape(
-                        extract_raw_user_content(content),
-                        quote=False,
-                    )
+                if is_untrusted_conversation_speaker(role) and content:
+                    # Imported assistant text has no canonical user transport
+                    # wrapper: preserve all its supplied bytes as quoted data.
+                    raw = content if role == EXTERNAL_ASSISTANT_ROLE else extract_raw_user_content(content)
+                    content = html.escape(raw, quote=False)
 
                 # Format timestamp to be human readable
                 if created_at and created_at != "unknown":
@@ -279,7 +284,8 @@ class MemoryManager:
                 # to no prefix only if the row is missing the role field
                 # entirely (legacy data shouldn't be — conversation_history
                 # has had a NOT NULL role since the initial schema).
-                role_prefix = f"{role.capitalize()}: " if role else ""
+                role_prefix = ("External assistant: " if role == EXTERNAL_ASSISTANT_ROLE
+                    else f"{role.capitalize()}: " if role else "")
 
                 display_index = len(parts) - len(header) + 1
                 rendered = (
@@ -734,7 +740,9 @@ class MemoryManager:
         # Get SavedItemsStore
         try:
             from kestrel_sovereign.storage.saved_items_store import (
-                SavedItemsStore, SavedItemType, SourceType
+                SavedItemsStore,
+                SavedItemType,
+                SourceType,
             )
 
             db = resolve_feature_database(SimpleNamespace(storage=self.storage))

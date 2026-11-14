@@ -487,6 +487,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `forget_fact` | `!memory-forget-fact` | `memory` | `subject`, `predicate` | 67 | `enabled` |
+| `log_turn` |  | `memory` | `user_content`, `assistant_content`, `session_id` | 101 | `enabled` |
 | `memory_admin_unpin_all` | `!memory-admin-unpin-all` | `system` |  | 32 | `enabled` |
 | `memory_admin_unpin_oldest` | `!memory-admin-unpin-oldest` | `system` | `count` | 55 | `enabled` |
 | `memory_pin` | `!memory-pin` | `memory` | `message_id`, `reason` | 100 | `enabled` |

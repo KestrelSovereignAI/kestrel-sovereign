@@ -35,7 +35,7 @@ async def test_native_memory_tools_use_actual_cold_core_feature_and_durable_admi
     http.headers.update({"authorization": "Bearer " + token, "x-api-key": KEY})
     async with Client(streamable_http_client(owner.resource, http_client=http), mode="2026-07-28") as client:
         tools = await client.list_tools()
-        assert {tool.name for tool in tools.tools} == {"search_memory", "recall_recent", "save_fact"}
+        assert {tool.name for tool in tools.tools} == {"search_memory", "recall_recent", "save_fact", "log_turn"}
         for name, arguments in [
             ("search_memory", {"query": content, "session_id": "owned-core-conversation"}),
             ("recall_recent", {}),

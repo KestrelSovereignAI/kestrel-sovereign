@@ -61,7 +61,7 @@ class NativeMCPMemoryTools:
         if len(encoded) > self.publication.policy.max_request_bytes:
             raise ToolError("Memory write arguments exceed the configured server byte limit")
 
-    async def _invoke(self, context, name, arguments, operation_id, conversation_id, *, write=False):
+    async def _invoke(self, context, name, arguments, operation_id, conversation_id, *, write=False, bind_conversation=False):
         policy = self.publication.policy
         try:
             operation_id = validate_invocation_id(operation_id)
@@ -75,13 +75,24 @@ class NativeMCPMemoryTools:
             async with bind_native_mcp_tool_caller(self.publication, context, required_scope,
                     disclose=True) as caller:
                 session = _principal_key(caller.identity, conversation_id)
+                owned_arguments = dict(arguments)
+                effective_guard = guard
+                if bind_conversation:
+                    owned_arguments["session_id"] = session
+
+                    async def effective_guard(effective, schema=None):
+                        await guard(effective, schema)
+                        if effective.get("session_id") != session:
+                            raise ToolError("Original external conversation namespace changed")
+
+                    await effective_guard(owned_arguments)
                 if write:
                     operation_id = _principal_key(caller.identity, operation_id)
                 provenance = request_provenance(actor=caller.identity, source_kind="http_request",
                     source_locator=self.publication.resource, source_locator_max_bytes=policy.max_request_bytes)
                 with invocation_scope(operation_id, provenance=provenance):
-                    result = await self.publication.agent.execute_named_tool(name, arguments,
-                        session_id=session, source="mcp", operation_id=operation_id, argument_guard=guard,
+                    result = await self.publication.agent.execute_named_tool(name, owned_arguments,
+                        session_id=session, source="mcp", operation_id=operation_id, argument_guard=effective_guard,
                         execution_lifetime=native_mcp_write_lifetime(
                             self.publication, context, required_scope) if write else None)
                 payload = _serialize_tool_result(result)
@@ -122,9 +133,19 @@ class NativeMCPMemoryTools:
             {"subject": subject, "predicate": predicate, "value": value, "confidence": confidence},
             operation_id, conversation_id, write=True)
 
+    async def log_turn(self, context: Context, user_content: str, assistant_content: str,
+            operation_id: str, conversation_id: str) -> Annotated[CallToolResult, dict[str, Any]]:
+        """Store a supplied external exchange. Retain operation_id on uncertain outcomes.
+
+        Exact row IDs attest persistence; later memory processing is reported separately.
+        """
+        return await self._invoke(context, "log_turn",
+            {"user_content": user_content, "assistant_content": assistant_content},
+            operation_id, conversation_id, write=True, bind_conversation=True)
+
     def register(self):
-        for callback in (self.search_memory, self.recall_recent, self.save_fact):
+        for callback in (self.search_memory, self.recall_recent, self.save_fact, self.log_turn):
             annotations = ToolAnnotations(read_only_hint=False,
-                destructive_hint=callback.__name__ == "save_fact",
+                destructive_hint=callback.__name__ in {"save_fact", "log_turn"},
                 idempotent_hint=False, open_world_hint=False)
             self.publication.runtime.server.add_tool(callback, annotations=annotations)

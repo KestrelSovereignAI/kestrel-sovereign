@@ -154,8 +154,7 @@ def run_acceptance(client, owner, image_id, output, *, suite='input'):
         receipt.update(tests=len(cases), results=counts)
         if suite == 'consent' and receipt['test_wait']['StatusCode'] == 0 and not any(counts.values()):
             receipt['screenshots'] = {}
-            for decision in ('approve', 'deny'):
-                name = 'consent-' + decision + '.png'
+            for name in ('consent-approve.png', 'consent-deny.png', 'external-assistant-history.png'):
                 body = owner.container_file(client, cid, '/owned/' + name)
                 (output / name).write_bytes(body)
                 receipt['screenshots'][name] = hashlib.sha256(body).hexdigest()

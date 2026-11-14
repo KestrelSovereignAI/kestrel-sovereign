@@ -7,6 +7,7 @@ Allows the agent to actively participate in its own memory by:
 - Listing currently pinned memories
 - Viewing pin statistics
 - Teaching explicitly approved facts through canonical assertions
+- Persisting explicitly supplied external exchanges with native row receipts
 - Administrative bulk-unpin for sovereign/admin control
 
 Pinned memories get ``decay_protected = True`` in their metadata,
@@ -27,13 +28,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
-from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -738,6 +740,58 @@ class MemoryAgencyFeature(Feature):
                 data=data,
             )
         return ToolResult.ok(confirmation=confirmation, data=data)
+
+    @tool(
+        name="log_turn",
+        description=(
+            "Persist a supplied external user/assistant exchange atomically. "
+            "Requires a verified connected-client caller. Exact stored row IDs "
+            "are persistence receipts, not proof of later reflection."
+        ),
+        category=ToolCategory.MEMORY,
+    )
+    async def log_turn(self, user_content: str, assistant_content: str,
+            session_id: str) -> ToolResult:
+        """Compose the existing privacy-aware writers in one rollback-safe unit."""
+        from kestrel_sovereign.agent.invocation import (
+            current_invocation_id,
+            current_invocation_provenance,
+            validate_invocation_id,
+        )
+        from kestrel_sovereign.auth import AuthMethod, current_caller_context
+        from kestrel_sovereign.conversation_speakers import EXTERNAL_ASSISTANT_ROLE
+        from kestrel_sovereign.storage.turn_provenance import turn_opener_metadata
+
+        caller = current_caller_context()
+        provenance = current_invocation_provenance()
+        if (caller is None or caller.auth_method != AuthMethod.MCP_OAUTH
+                or not caller.identity or provenance is None
+                or provenance.actor != caller.identity or provenance.source_kind != "http_request"):
+            return ToolResult.failed("An original verified external client invocation is required")
+        if self._persistent_memory_hidden():
+            return ToolResult.failed("External exchanges require durable privacy-aware storage")
+        if any(not isinstance(content, str) or not content.strip()
+                for content in (user_content, assistant_content)):
+            return ToolResult.failed("A complete nonempty external user/assistant exchange is required")
+        session_id = validate_invocation_id(session_id)
+        operation_id = validate_invocation_id(current_invocation_id())
+        db = await self._ensure_persistent_db()
+        if db is None:
+            raise RuntimeError("External exchanges require canonical primary storage")
+        metadata = {"external_exchange": {
+            "principal": caller.identity, "operation_id": operation_id,
+        }}
+        async with db.transaction(savepoint=True):
+            user_id = await self.agent.privacy_agent.add_conversation(
+                "user", user_content, {**metadata, **turn_opener_metadata(None)}, session_id=session_id)
+            assistant_id = await self.agent.privacy_agent.add_conversation(
+                EXTERNAL_ASSISTANT_ROLE, assistant_content, metadata, session_id=session_id)
+            if (type(user_id) is not int or user_id <= 0
+                    or type(assistant_id) is not int or assistant_id <= 0 or user_id == assistant_id):
+                raise RuntimeError("Canonical exchange writers did not return distinct positive native row IDs")
+        return ToolResult.ok(confirmation="Stored the supplied external exchange",
+            data={"user_message_id": user_id, "assistant_message_id": assistant_id,
+                "session_id": session_id, "memory_processing": "not_scheduled"})
 
     # ------------------------------------------------------------------
     # Canonical semantic assertions -- explicit facts

@@ -6,7 +6,7 @@
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands, renderTextError } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, setPaneAwaitingNewSession, refreshAgentThinkingDot, stopAgentDetailed, prepareHostStop, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, setPaneAwaitingNewSession, refreshAgentThinkingDot, stopAgentDetailed, prepareHostStop, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml, appendExternalAssistantLabel } from './chat.js';
 import { forceScrollToBottom } from './chat_scroll.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
@@ -2037,6 +2037,7 @@ window.loadConversation = async function(sessionId, options = {}) {
 
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${msg.role === 'user' ? 'user-message' : 'agent-message'}`;
+            appendExternalAssistantLabel(messageDiv, msg.role);
 
             // Hover-reveal kebab (⋯) menu.  Shares the builder (message_kebab.js)
             // and the window.deleteMessage/purgeMessage handlers with history.js
