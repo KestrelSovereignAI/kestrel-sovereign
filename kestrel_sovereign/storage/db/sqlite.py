@@ -13,6 +13,7 @@ import time
 import uuid
 import weakref
 from contextlib import asynccontextmanager, contextmanager
+from concurrent.futures import Future as ThreadFuture
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -170,8 +171,23 @@ def _owned_script_statements(script: str) -> list[str]:
 
 
 @dataclass
+class _SQLiteAcquisition:
+    """Original native result, published BEFORE the cancellable async handoff.
+
+    A plain thread-safe Future is not cancelled with an asyncio observer. It
+    keeps the actual C connection reachable even when aiosqlite discards its
+    handshake result. SQL stays on its original worker; after that worker exits,
+    the same retained closer may retire an unpublished native connection.
+    """
+
+    native: ThreadFuture[sqlite3.Connection] = field(default_factory=ThreadFuture)
+    published: bool = False
+    retirement_confirmed: bool = False
+
+
+@dataclass
 class _RetainedAiosqliteClose:
-    """Strong ownership of one close until its worker terminates.
+    """Strong ownership through original worker AND native-handle retirement.
 
     ``worker_exit_hooks`` run once, when the record is released because its
     worker has exited: whatever was waiting on work that only the worker's
@@ -183,6 +199,7 @@ class _RetainedAiosqliteClose:
     control_error: Optional[BaseException] = None
     control_reported: bool = False
     worker_exit_hooks: list[Callable[[], None]] = field(default_factory=list)
+    acquisition: Optional[_SQLiteAcquisition] = None
 
 
 def _capture_retained_close(retained: _RetainedAiosqliteClose) -> None:
@@ -339,7 +356,7 @@ def _close_overrun_error(
 async def _wait_for_aiosqlite_worker_shutdown(
     connection: aiosqlite.Connection,
     *,
-    timeout_s: float = AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S,
+    timeout_s: Optional[float] = AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S,
     diagnostics: Optional[_SQLiteCloseDiagnostics] = None,
 ) -> None:
     """Wait until ``connection``'s worker has actually terminated.
@@ -360,6 +377,8 @@ async def _wait_for_aiosqlite_worker_shutdown(
             while is_alive():
                 await asyncio.sleep(_AIOSQLITE_WORKER_SHUTDOWN_POLL_S)
     except TimeoutError as exc:
+        if timeout_s is None:
+            raise  # No local timer owns this original failure.
         # Avoid a false failure if the worker exits as the timeout fires.
         if not is_alive():
             return
@@ -399,6 +418,8 @@ def _release_retained_aiosqlite_close(
         except BaseException as error:
             retained.control_error = execution_terminal_error(retained.control_error, error, retain_originals=True, isolate_control_originals=True)
             retained.control_reported = False
+    if retained.acquisition is not None and not retained.acquisition.retirement_confirmed:
+        return  # Worker exit alone is not native-connection retirement.
     if not preserve_control_outcomes or retained.control_error is None or retained.control_reported:
         retained_closes.pop(connection)
 
@@ -408,9 +429,12 @@ def _retain_aiosqlite_close(
     close_task: Optional[asyncio.Task[None]],
     retained_closes: _RetainedAiosqliteCloses,
     *, control_error: Optional[BaseException] = None,
+    acquisition: Optional[_SQLiteAcquisition] = None,
 ) -> None:
     """Own an in-flight close until its non-daemon worker really exits."""
     existing = retained_closes.get(connection)
+    if existing is not None and acquisition is not None:
+        existing.acquisition = acquisition
     if existing is not None and control_error is not None:
         existing.control_error = execution_terminal_error(existing.control_error,
             control_error, retain_originals=True, isolate_control_originals=True)
@@ -425,7 +449,9 @@ def _retain_aiosqlite_close(
         if connection in retained_closes:
             return  # An unreported original control must never be replaced.
 
-    retained = _RetainedAiosqliteClose(close_task=close_task, control_error=control_error)
+    retained = _RetainedAiosqliteClose(
+        close_task=close_task, control_error=control_error, acquisition=acquisition,
+    )
     # Root custody BEFORE any fallible observer/reaper admission. No Task
     # means an unstarted closer, never a fabricated completed close receipt.
     retained_closes[connection] = retained
@@ -529,6 +555,7 @@ async def _close_aiosqlite_connection(
     close_task: Optional[asyncio.Task[None]] = None,
     cancel_close_task_on_timeout: bool = True,
     diagnostics: Optional[_SQLiteCloseDiagnostics] = None,
+    acquisition: Optional[_SQLiteAcquisition] = None,
 ) -> None:
     """Close an owned aiosqlite connection through its full lifecycle.
 
@@ -565,13 +592,14 @@ async def _close_aiosqlite_connection(
             from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
             receipt = OwnedTaskAdmission()
             try:
-                close_task = create_owned_task(connection.close(), retain_originals=True,
+                closer = connection.close() if acquisition is None else _close_acquired_sqlite_connection(connection, acquisition)
+                close_task = create_owned_task(closer, retain_originals=True,
                     admission=receipt, retirement_resource=connection)
             except BaseException as error:
                 close_task = receipt.task
                 opening = error
                 _retain_aiosqlite_close(connection, close_task, retained_closes,
-                                       control_error=error)
+                                       control_error=error, acquisition=acquisition)
                 if close_task is None:
                     raise
         await _finish_aiosqlite_connection_close(
@@ -581,20 +609,31 @@ async def _close_aiosqlite_connection(
             retained_closes=retained_closes,
             cancel_close_task_on_timeout=cancel_close_task_on_timeout,
             diagnostics=diagnostics,
+            acquisition=acquisition,
         )
         if opening is not None:
             raise opening
     except BaseException as error:
         # Repeated cancellation can interrupt either bounded retry. Never let
         # an exit shed ownership of a still-live non-daemon worker.
-        if _aiosqlite_worker_is_alive(connection) or (close_task is not None and not close_task.done()):
+        if (_aiosqlite_worker_is_alive(connection) or (close_task is not None and not close_task.done())
+                or acquisition is not None and not acquisition.retirement_confirmed):
             _retain_aiosqlite_close(
-                connection, close_task, retained_closes, control_error=opening
+                connection, close_task, retained_closes, control_error=opening,
+                acquisition=acquisition,
             )
         from kestrel_sovereign._async_ownership import owned_task_error
         close_error = owned_task_error(close_task) if close_task is not None and close_task.done() else None
         terminal = execution_terminal_error(opening, close_error, error, retain_originals=True, isolate_control_originals=True)
         retained = retained_closes.get(connection)
+        if acquisition is not None and not acquisition.retirement_confirmed:
+            resource = acquisition.native.result() if acquisition.native.done() else connection
+            debt = RuntimeError("original acquired SQLite connection retirement remains unresolved")
+            debt._kestrel_native_retirement_debts = ((resource, close_task),)
+            terminal = execution_terminal_error(terminal, debt, retain_originals=True, isolate_control_originals=True)
+            if retained is not None:
+                retained.control_error = execution_terminal_error(retained.control_error, terminal, retain_originals=True, isolate_control_originals=True)
+                retained.control_reported = False
         if retained is not None:
             # The exact accepted closer (or None) remains private while its
             # worker is alive, including a refused unstarted close recipe.
@@ -615,6 +654,42 @@ async def _close_aiosqlite_connection(
         raise terminal
 
 
+async def _close_acquired_sqlite_connection(
+    connection: aiosqlite.Connection, acquisition: _SQLiteAcquisition,
+) -> None:
+    """One original close recipe, retained beyond a finite caller's deadline."""
+    from kestrel_sovereign._async_ownership import await_owned_operation, raise_owned_outcome
+
+    try:
+        await connection.close()
+        if not acquisition.published:
+            # A cancelled handshake cannot close its discarded native result.
+            # Join the ORIGINAL worker before the first close of that SAME C
+            # connection. The enclosing finite guard retains this exact Task.
+            await _wait_for_aiosqlite_worker_shutdown(connection, timeout_s=None)
+            if acquisition.native.done():
+                native = acquisition.native.result()
+                outcome = await await_owned_operation(
+                    asyncio.to_thread(native.close), retirement_resource=native,
+                    retain_originals=True, retain_cancellations=True,
+                )
+                if outcome.error is None:
+                    acquisition.retirement_confirmed = True
+                raise_owned_outcome(
+                    outcome, operation="original unpublished SQLite native close",
+                    retain_originals=True, retain_observer_cancellations=True,
+                )
+        acquisition.retirement_confirmed = True
+    except BaseException as error:
+        if acquisition.retirement_confirmed:
+            raise  # Preserve observer withdrawal, not false native close debt.
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        resource = acquisition.native.result() if acquisition.native.done() else connection
+        debt = RuntimeError("original acquired SQLite connection retirement is unconfirmed")
+        debt._kestrel_native_retirement_debts = ((resource, asyncio.current_task()),)
+        raise execution_observation_error(error, debt)
+
+
 async def _finish_aiosqlite_connection_close(
     connection: aiosqlite.Connection,
     *,
@@ -623,6 +698,7 @@ async def _finish_aiosqlite_connection_close(
     retained_closes: _RetainedAiosqliteCloses,
     cancel_close_task_on_timeout: bool,
     diagnostics: _SQLiteCloseDiagnostics,
+    acquisition: Optional[_SQLiteAcquisition] = None,
 ) -> None:
     """Complete one bounded close under the caller's retention guard."""
     loop = asyncio.get_running_loop()
@@ -659,7 +735,7 @@ async def _finish_aiosqlite_connection_close(
         if cancel_close_task_on_timeout:
             close_task.cancel()
         _retain_aiosqlite_close(
-            connection, close_task, retained_closes
+            connection, close_task, retained_closes, acquisition=acquisition,
         )
         if interrupt_error is not None and is_execution_control_error(interrupt_error):
             raise execution_terminal_error(interrupt_error, pending_cancellation, retain_originals=True, isolate_control_originals=True)
@@ -687,7 +763,7 @@ async def _finish_aiosqlite_connection_close(
             )
         except ConnectionError as exc:
             _retain_aiosqlite_close(
-                connection, close_task, retained_closes
+                connection, close_task, retained_closes, acquisition=acquisition,
             )
             raise execution_terminal_error(close_error, pending_cancellation, exc, retain_originals=True, isolate_control_originals=True)
     except asyncio.CancelledError as exc:
@@ -702,7 +778,7 @@ async def _finish_aiosqlite_connection_close(
             )
         except ConnectionError as exc:
             _retain_aiosqlite_close(
-                connection, close_task, retained_closes
+                connection, close_task, retained_closes, acquisition=acquisition,
             )
             raise execution_terminal_error(close_error, pending_cancellation, exc, retain_originals=True, isolate_control_originals=True)
         except BaseException as error:
@@ -1103,20 +1179,22 @@ class SQLiteBackend(DatabaseBackend):
 
     @property
     def connection_retirement_pending(self) -> bool:
-        """Whether a timed-out close still owns a live aiosqlite worker."""
+        """Whether original worker or native-connection retirement is unresolved."""
         _prune_retained_aiosqlite_closes(
             self._retired_connection_closes, preserve_control_outcomes=True
         )
         return any(_aiosqlite_worker_is_alive(connection) or (record.close_task is not None and not record.close_task.done())
+                   or record.acquisition is not None and not record.acquisition.retirement_confirmed
                    for connection, record in self._retired_connection_closes.items())
 
     def _raise_if_connection_retirement_pending(self) -> None:
-        """Fail close while any backend-owned worker is still retiring."""
+        """Fail closed while any original backend-owned retirement is unresolved."""
         pending = self.connection_retirement_pending
         control = None
         for connection, retained in self._retired_connection_closes.items():
             _capture_retained_close(retained)
             if (not retained.control_reported or _aiosqlite_worker_is_alive(connection)
+                    or retained.acquisition is not None and not retained.acquisition.retirement_confirmed
                     or (retained.close_task is not None and not retained.close_task.done())):
                 control = execution_terminal_error(control, retained.control_error, retain_originals=True, isolate_control_originals=True)
         if control is not None:
@@ -1279,19 +1357,37 @@ class SQLiteBackend(DatabaseBackend):
     ) -> aiosqlite.Connection:
         """Own the actual constructor before the first cancellable observation.
 
-        Cancelling aiosqlite's handshake Future can discard an open native
-        connection produced later by its worker. The canonical original owner
-        must finish that handshake before caller withdrawal can escape. Any
-        failed/withdrawn acquisition then joins the SAME connection's close and
-        worker, not a no-op close of a cancelled handshake or a substitute open.
+        The synchronous factory retains the actual native result BEFORE its
+        cancellable async handoff. Caller withdrawal joins the original owner;
+        cancellation of that owner cannot discard the actual C connection.
+        Failed/withdrawn acquisition retains ONE close recipe through original
+        worker exit and first physical close, including an unpublished result.
+        The finite caller deadline is unchanged; pending close remains owned.
         """
         from kestrel_sovereign._async_ownership import OwnedOperation, raise_owned_outcome
         from kestrel_sovereign.execution_custody import execution_observation_error
 
-        connection = aiosqlite.connect(database, **options)
+        self._raise_if_connection_retirement_pending()
+        if options.get("check_same_thread", False) is not False:
+            raise ValueError("SQLite acquisition requires retirement after its original worker exits")
+        acquisition = _SQLiteAcquisition()
+        factory = options.pop("factory", sqlite3.Connection)
+
+        def create_native(*args, **kwargs):
+            native = factory(*args, **kwargs)
+            acquisition.native.set_result(native)
+            return native
+
+        # All SQL is still serialized by the original worker. This public
+        # SQLite option permits physical retirement AFTER that worker exits if
+        # its cancellable handshake never published the original native result.
+        options["check_same_thread"] = False
+        connection = aiosqlite.connect(database, factory=create_native, **options)
 
         async def connect_original():
-            return await connection
+            result = await connection
+            acquisition.published = True
+            return result
 
         original = OwnedOperation(
             connect_original(), retirement_resource=connection, retain_originals=True,
@@ -1305,6 +1401,7 @@ class SQLiteBackend(DatabaseBackend):
                 await _close_aiosqlite_connection(
                     connection, retained_closes=self._retired_connection_closes,
                     diagnostics=close_diagnostics or self._close_diagnostics(),
+                    acquisition=acquisition, cancel_close_task_on_timeout=False,
                 )
             except BaseException as cleanup_error:
                 raise execution_observation_error(outcome.error, outcome.cancellation, cleanup_error)
