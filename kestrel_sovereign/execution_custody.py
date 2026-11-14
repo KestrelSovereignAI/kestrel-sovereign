@@ -2072,7 +2072,9 @@ class _ExecutionForwarder:
         with bind_execution_cleanup(self._runtime_owner, self._scopes):
             self._reserve_close_owner()
             self._close_requested.set()
-            outcome = await self._close_operation.observe()
+            outcome = await self._close_operation.observe(
+                retain_cancellations=self._withdrawal is not None,
+            )
             error = execution_observation_error(outcome.error, outcome.cancellation)
             if error is not None:
                 raise error
@@ -2083,7 +2085,10 @@ class _ExecutionForwarder:
             if self._iterator is None:
                 await self._close_unstarted_source()
             else:
-                await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
+                await close_execution_stream(
+                    self._runtime_owner, self._iterator, self._scopes,
+                    retain_cancellations=self._withdrawal is not None,
+                )
         except BaseException as caught:
             error = caught
         if (self._iterator is not None and (error is None or self._iterator._closed
@@ -2113,12 +2118,16 @@ class _ExecutionForwarder:
 
     async def _close_unstarted_source(self):
         if not self._source_closed:
-            await close_execution_stream(self._runtime_owner, self._source, self._scopes)
+            await close_execution_stream(
+                self._runtime_owner, self._source, self._scopes,
+                retain_cancellations=self._withdrawal is not None,
+            )
             self._source_closed = True
 
 
 async def close_execution_stream(
     owner: Any, stream: Any, captured: tuple[ExecutionCustody, ...] = (),
+    *, retain_cancellations: bool = False,
 ) -> None:
     """Join an owned source's close despite repeated caller cancellation."""
     from kestrel_sovereign._async_ownership import await_owned_operation
@@ -2126,7 +2135,10 @@ async def close_execution_stream(
     close = getattr(stream, "aclose", None)
     if callable(close):
         with bind_execution_cleanup(owner, captured):
-            outcome = await await_owned_operation(close(), retirement_resource=stream, retain_originals=True)
+            outcome = await await_owned_operation(
+                close(), retirement_resource=stream, retain_originals=True,
+                retain_cancellations=retain_cancellations,
+            )
             error = execution_observation_error(outcome.error, outcome.cancellation)
             if error is not None:
                 raise error

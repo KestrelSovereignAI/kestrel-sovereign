@@ -4,11 +4,288 @@ import asyncio
 import errno
 import os
 from contextvars import ContextVar
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.native_a2a.utils.source_ownership import SourceWithdrawal
 
 from kestrel_sovereign.execution_custody import execution_evidence_carriers, owned_execution_stream
+from kestrel_sovereign import _async_ownership as ownership
+
+
+@pytest.fixture
+def original_withdrawals(monkeypatch):
+    """Observe actual delivered errors without replacing their native owner."""
+    state = SimpleNamespace(task=None, errors=[], arrived=[asyncio.Event(), asyncio.Event()])
+    original = asyncio.wait
+
+    async def observe(*args, **kwargs):
+        try:
+            return await original(*args, **kwargs)
+        except asyncio.CancelledError as error:
+            if asyncio.current_task() is state.task and error.args in [("withdraw-one",), ("withdraw-two",)]:
+                state.errors.append(error)
+                state.arrived[len(state.errors) - 1].set()
+            raise
+
+    monkeypatch.setattr(asyncio, "wait", observe)
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["request", "forwarder", "iterator", "callback"])
+async def test_cancelled_original_finally_is_not_a_private_stop_ack(route):
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts, is_execution_control_error
+
+    closing, release = asyncio.Event(), asyncio.Event()
+    signal = SourceWithdrawal()
+    descriptors, owners, cancelled, retired, readers = [], [], [], [], []
+    task = None
+
+    async def original():
+        owners.append(asyncio.current_task())
+        descriptors.extend(os.pipe())
+        try:
+            yield "first"
+        finally:
+            closing.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError as error:
+                cancelled.append(error)
+                raise
+            for descriptor in descriptors:
+                os.close(descriptor)
+            retired.append(asyncio.current_task())
+
+    async def callback(emit):
+        async for value in original():
+            await emit(value)
+
+    @asynccontextmanager
+    async def iterator_lifetime():
+        source = ownership.OwnedAsyncIterator(
+            source_factory=lambda resources: ownership.OwnedCallbackSource(callback) if route == "callback" else original(),
+            operation="actual-original-finally-cancellation",
+        )
+        try:
+            yield source
+        finally:
+            await source.aclose()
+
+    async def request():
+        lifetime = (
+            ownership.native_source_lifetime(lambda resources: original()) if route == "request"
+            else owned_execution_stream(object(), original(), withdrawal=signal) if route == "forwarder"
+            else iterator_lifetime()
+        )
+        try:
+            async with lifetime as reader:
+                readers.append(reader)
+                assert await anext(reader) == "first"
+                try:
+                    await anext(reader)
+                except StopAsyncIteration:
+                    pass
+        except BaseException as error:
+            return error
+
+    try:
+        async with asyncio.timeout(5):
+            task = asyncio.create_task(request())
+            await closing.wait()
+            signal.request_stop() if route == "forwarder" else readers[0].request_stop()
+            assert ownership.cancel_owned_task(owners[0])
+            terminal = await task
+            assert isinstance(terminal, BaseException), "Failed original finally was acknowledged as successful retirement"
+            assert is_execution_control_error(terminal) and execution_cleanup_debts(terminal)
+            assert len(cancelled) == 1 and not retired
+            assert any(error is cancelled[0] for error in execution_evidence_carriers(terminal))
+            assert len(owners) == 1 and owners[0].done() and owners[0].cancelling() == 1
+            # A later no-op close cannot certify the failed original finally.
+            for descriptor in descriptors:
+                os.fstat(descriptor)
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        # Recover exact test descriptors AFTER failed-retirement evidence. This
+        # is not an original physical close ACK and cannot satisfy assertions.
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["observer", "retirement", "unstarted"])
+@pytest.mark.parametrize("fail", [False, True])
+async def test_stream_close_retains_every_actual_withdrawal(original_withdrawals, phase, fail):
+    state = original_withdrawals
+    signal = SourceWithdrawal()
+    closing, release = asyncio.Event(), asyncio.Event()
+    descriptors, owners, retired, physical = [], [], [], []
+    closer = None
+    assertions_finished = False
+
+    async def retire_original():
+        closing.set()
+        await release.wait()
+        for descriptor in descriptors:
+            os.close(descriptor)
+        retired.append(asyncio.current_task())
+        if fail:
+            try:
+                os.fstat(descriptors[0])
+            except OSError as error:
+                physical.append(error)
+                raise
+
+    async def original():
+        owners.append(asyncio.current_task())
+        descriptors.extend(os.pipe())
+        try:
+            yield "first"
+            await signal.wait()
+        finally:
+            await retire_original()
+
+    class AcquiredOriginal:
+        def __init__(self):
+            descriptors.extend(os.pipe())
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            pytest.fail("Unstarted original source was advanced during close")
+
+        async def aclose(self):
+            owners.append(asyncio.current_task())
+            await retire_original()
+
+    try:
+        source = AcquiredOriginal() if phase == "unstarted" else original()
+        async with owned_execution_stream(object(), source, withdrawal=signal) as events:
+            async def close():
+                try:
+                    await events.aclose()
+                except BaseException as error:
+                    return error
+
+            try:
+                async with asyncio.timeout(5):
+                    if phase != "unstarted":
+                        assert await anext(events) == "first"
+                    closer = asyncio.create_task(close())
+                    await closing.wait()
+                    state.task = closer if phase == "observer" else events.retirement_task
+                    state.task.cancel("withdraw-one")
+                    await state.arrived[0].wait()
+                    state.task.cancel("withdraw-two")
+                    await state.arrived[1].wait()
+                    assert not closer.done() and owners[0].cancelling() == 0
+                    release.set()
+                    terminal = await closer
+                    graph = tuple(execution_evidence_carriers(terminal))
+                    assert len(state.errors) == 2 and state.errors[0] is not state.errors[1]
+                    assert all(any(error is node for node in graph) for error in state.errors)
+                    assert all(error.__cause__ is None for error in state.errors)
+                    assert owners == retired and owners[0].done() and owners[0].cancelling() == 0
+                    if fail:
+                        assert len(physical) == 1 and any(node is physical[0] for node in graph)
+                    for descriptor in descriptors:
+                        with pytest.raises(OSError) as closed:
+                            os.fstat(descriptor)
+                        assert closed.value.errno == errno.EBADF
+                    fresh = None
+                    try:
+                        await events.aclose()
+                    except BaseException as error:
+                        fresh = error
+                    fresh_graph = tuple(execution_evidence_carriers(fresh))
+                    assert all(any(error is node for node in fresh_graph) == (phase != "observer") for error in state.errors)
+                    assertions_finished = True
+            finally:
+                release.set()
+    except BaseException as error:
+        if not assertions_finished or phase == "observer" and not fail:
+            raise
+        graph = tuple(execution_evidence_carriers(error))
+        if phase != "observer":
+            assert all(any(original is node for node in graph) for original in state.errors)
+        else:
+            assert any(node is physical[0] for node in graph)
+    finally:
+        release.set()
+        if closer is not None:
+            await asyncio.gather(closer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain", [False, True])
+async def test_failed_owner_publication_preserves_explicit_withdrawal_policy(original_withdrawals, retain):
+    state = original_withdrawals
+    entered, release = asyncio.Event(), asyncio.Event()
+    descriptors, owners, retired, physical = [], [], [], []
+    observer = None
+
+    async def original():
+        owners.append(asyncio.current_task())
+        descriptors.extend(os.pipe())
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            retired.append(asyncio.current_task())
+
+    def publish(operation, context, admission, resource):
+        ownership.create_owned_task(operation, context=context, admission=admission, retirement_resource=resource, retain_originals=True)
+        descriptor = os.open(os.devnull, os.O_WRONLY)
+        try:
+            try:
+                os.read(descriptor, 1)
+            except OSError as error:
+                physical.append(error)
+                raise
+        finally:
+            os.close(descriptor)
+
+    operation = ownership.OwnedOperation(original(), retirement_resource=object(), retain_originals=True, owner_factory=publish)
+    try:
+        async with asyncio.timeout(5):
+            observer = asyncio.create_task(operation.observe(retain_cancellations=retain))
+            state.task = observer
+            await entered.wait()
+            observer.cancel("withdraw-one")
+            await state.arrived[0].wait()
+            observer.cancel("withdraw-two")
+            await state.arrived[1].wait()
+            assert not observer.done() and operation.task.cancelling() == 0
+            release.set()
+            outcome = await observer
+            assert owners == retired == [operation.task] and operation.task.done()
+            assert any(node is physical[0] for node in execution_evidence_carriers(outcome.error))
+            graph = tuple(execution_evidence_carriers(outcome.cancellation))
+            assert [any(error is node for node in graph) for error in state.errors] == [True, retain]
+            assert all(error.__cause__ is None for error in state.errors)
+            later = await operation.observe(retain_cancellations=retain)
+            assert later.cancellation is None
+            assert not any(error is node for error in state.errors for node in execution_evidence_carriers(later.error))
+            for descriptor in descriptors:
+                with pytest.raises(OSError) as closed:
+                    os.fstat(descriptor)
+                assert closed.value.errno == errno.EBADF
+    finally:
+        release.set()
+        if observer is not None:
+            await asyncio.gather(observer, return_exceptions=True)
+        if operation.task is not None:
+            await ownership.await_owned_task(operation.task)
 
 
 @pytest.mark.asyncio
