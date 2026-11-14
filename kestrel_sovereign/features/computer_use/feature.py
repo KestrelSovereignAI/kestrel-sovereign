@@ -1165,18 +1165,11 @@ class ComputerUseFeature(Feature):
                 duration_ms=duration_ms,
             )
             content_str = data.decode("utf-8", errors="replace")
-            # Render the file contents inside the confirmation so the
-            # !fs-read CLI surface still shows what the user came for —
-            # the command-handler envelope formatter suppresses scalar
-            # ``data`` (no list/nested-dict values triggers the
-            # structural-payload heuristic), so anything the user is
-            # expected to see has to live in ``confirmation``.
-            confirmation = (
-                f"Read {len(data)} bytes from {resolved}:\n"
-                + (content_str if content_str else "(empty file)")
-            )
+            # The content travels once, in ``data.content``; the command
+            # surface renders it from there (#4069). A copy here doubles
+            # every model-facing read.
             return ToolResult.ok(
-                confirmation,
+                f"Read {len(data)} bytes from {resolved}.",
                 data={
                     "path": str(resolved),
                     "bytes": len(data),
