@@ -3,7 +3,7 @@ name = "kestrel_sovereign"
 version = "0.65.6"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.11.5,<3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "UncleSaurus" }]
@@ -208,8 +208,9 @@ dependencies = [
     "beautifulsoup4==4.14.3",
     # soupsieve is BeautifulSoup's CSS selector engine; pin a floor so a lock
     # refresh cannot resolve back into the selector ReDoS / memory-exhaustion
-    # range.
-    "soupsieve>=2.8.4",
+    # range. 4.0 also closes GHSA-mmhr-3c5m-f64f and GHSA-6655-6qjp-jx7x;
+    # its Python 3.11.5 minimum is reflected in requires-python above.
+    "soupsieve>=4.0.0",
     # PDF text extraction for the read_attachment tool (#1662, pure-python)
     # >=6.13.3 bounds FlateDecode decompression work on malicious PDFs;
     # >=6.21.4 fixes unbounded memory, runtime and infinite loops when parsing
