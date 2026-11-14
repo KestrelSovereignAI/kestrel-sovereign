@@ -1,6 +1,6 @@
 """Streaming response handling for Kestrel Agent."""
 import asyncio
-from kestrel_sovereign.execution_custody import owned_execution_stream
+from kestrel_sovereign.execution_custody import is_execution_control_error, owned_execution_stream
 import inspect
 import json
 import logging
@@ -1470,8 +1470,10 @@ class StreamingMixin:
         if reflection_feature:
             try:
                 reflection_guidance = await reflection_feature.get_active_guidance()
-            except Exception:
-                pass  # Non-critical — log already handled in feature
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
+                logging.warning("Failed to fetch reflection guidance: %s", error)
 
         # Snapshot tool schemas before planning so dry/live accounting and the
         # eventual provider payload use identical registry bytes.
