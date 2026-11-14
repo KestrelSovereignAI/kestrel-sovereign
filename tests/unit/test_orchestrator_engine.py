@@ -18,7 +18,10 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from tests.utils.native_tool_effects import drive_native
 
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+from kestrel_sovereign.agent.orchestrator_engine import (
+    PRUNED_TOOL_RESULT_PREFIX,
+    OrchestratorEngineMixin,
+)
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
 
@@ -587,7 +590,7 @@ class TestPruneThreadsTheTurnModel:
         spy.assert_called_once_with(agent.llm_service, "some-route/some-model")
         # The resolved (tiny) window must actually drive pruning — the 131072
         # default would have waved this payload straight through.
-        assert "truncated" in result[-1]["content"].lower()
+        assert result[-1]["content"].startswith(PRUNED_TOOL_RESULT_PREFIX)
 
 
 @pytest.mark.asyncio

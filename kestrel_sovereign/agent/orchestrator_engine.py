@@ -710,6 +710,55 @@ def _build_persisted_preview(result_json: str, tool_name: str, original_len: int
     return "\n".join(parts)
 
 
+PRUNED_TOOL_RESULT_PREFIX = "[Tool result dropped for context pressure"
+
+
+def _recorded_tool_result_status(content: str) -> str:
+    """The outcome a tool message's content recorded about the call.
+
+    Read through ``summarize_tool_result_for_audit``, the slim envelope the
+    narration check reads, so the pruning stub and the honesty layer agree on
+    which fields record an outcome. A ToolResult ``status`` is reported as
+    written; a legacy ``success`` flag is ``ok`` or ``error``; a bare
+    ``error`` is ``error``. Anything else, including content that is not a
+    JSON object (a raw value, or the head/tail preview of an oversized
+    result), recorded nothing readable here and is ``unknown``.
+    """
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_sovereign.security.narration_check import (
+        summarize_tool_result_for_audit,
+    )
+
+    try:
+        envelope = summarize_tool_result_for_audit(json.loads(content))
+    except (ValueError, RecursionError):
+        return "unknown"
+    status = envelope.get("status")
+    if isinstance(status, str) and status in {m.value for m in ToolResultStatus}:
+        return status
+    success = envelope.get("success")
+    if success is True:
+        return ToolResultStatus.OK.value
+    if success is False or envelope.get("error"):
+        return ToolResultStatus.ERROR.value
+    return "unknown"
+
+
+def _pruned_tool_result_stub(content: str) -> str:
+    """What replaces a tool result pruned for context pressure (#4076).
+
+    It states the size that was dropped and that nothing was kept, and claims
+    no outcome beyond the one the result recorded. The old stub said "Tool
+    completed successfully", so a dropped read looked like a complete one
+    (#3016).
+    """
+    return (
+        f"{PRUNED_TOOL_RESULT_PREFIX}: was {len(content):,} chars. "
+        "The content is not retained and cannot be reread. "
+        f"Recorded status: {_recorded_tool_result_status(content)}.]"
+    )
+
+
 class ContextStats:
     """
     Incremental accumulator for context analysis.
@@ -4601,8 +4650,9 @@ class OrchestratorEngineMixin:
         Strategy, cheapest-to-lose first:
 
         1. Shed the OLDEST replayed prior-turn messages.
-        2. Only if that is not enough, truncate oversized tool results
-           (replacing them with a summary marker).
+        2. Only if that is not enough, drop oversized tool results, replacing
+           each with ``_pruned_tool_result_stub``: its size, that its content
+           is not retained, and the status it recorded.
 
         Stale history before live tool output: the synthesis call exists to
         report what the tool returned, so destroying that result while an old
@@ -4704,11 +4754,10 @@ class OrchestratorEngineMixin:
             if _total_chars(protected + middle) <= max_message_chars:
                 break
             if msg.get("role") == "tool" and len(msg.get("content", "")) > 200:
-                original_len = len(msg["content"])
                 middle[i] = {
                     "role": "tool",
                     "tool_call_id": msg.get("tool_call_id", ""),
-                    "content": f"[Result truncated: was {original_len} chars. Tool completed successfully.]"
+                    "content": _pruned_tool_result_stub(msg["content"]),
                 }
 
         result = protected + middle
