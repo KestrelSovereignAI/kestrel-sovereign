@@ -666,7 +666,7 @@ class ApprovalQueue:
                             f"Failed to notify UI of approval withdrawal: {e}",
                             exc_info=True,
                         )
-            except BaseException as error:
+            except BaseException as error:  # noqa: BLE001 - compose original cleanup cancellation/control below
                 cleanup_error = error
             decision_error = decision_cancellation = None
             # A disconnected caller leaves the UI submission as its independent
