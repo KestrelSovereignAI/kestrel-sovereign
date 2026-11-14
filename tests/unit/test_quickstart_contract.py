@@ -33,16 +33,23 @@ def test_supported_python_display_tracks_package_metadata():
         requires_python = tomllib.load(file)["project"]["requires-python"]
 
     specifier = SpecifierSet(requires_python)
+    minimum = max(
+        Version(bound.version) for bound in specifier if bound.operator == ">="
+    )
+    # The patched selector dependency requires this interpreter patch floor.
+    assert minimum >= Version("3.11.5")
     supported = [
         minor
         for minor in range(8, 21)
-        if Version(f"3.{minor}") in specifier
+        if (candidate := max(Version(f"3.{minor}"), minimum)) in specifier
+        and candidate.release[:2] == (3, minor)
     ]
     assert supported
     assert supported == list(range(supported[0], supported[-1] + 1))
 
-    displayed_range = f"Python 3.{supported[0]}–3.{supported[-1]}"
+    displayed_range = f"Python {minimum}–3.{supported[-1]}"
     assert displayed_range in _quickstart_text()
+    assert displayed_range in (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
 
 def test_happy_path_uses_host_start_and_documents_named_start_alternative():

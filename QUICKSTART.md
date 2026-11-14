@@ -6,7 +6,7 @@ constitutional governance, and an LLM route. What Kestrel retains depends on
 the active privacy mode, and application-layer encryption does not cover every
 database column; the exact boundaries are summarized below.
 
-**Prerequisites:** Python 3.11–3.14, an internet connection for installation,
+**Prerequisites:** Python 3.11.5–3.14, an internet connection for installation,
 and either Ollama or a supported cloud-provider API key.
 
 ## Step 1 — Install uv

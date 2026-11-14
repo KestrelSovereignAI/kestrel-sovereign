@@ -52,6 +52,8 @@ SECURITY_FLOORS = {
     # before importing a local model directory's custom code; 6.0 refuses it.
     "sentence-transformers": "6.0.0",
     "setuptools": "83.0.0",
+    # GHSA-mmhr-3c5m-f64f and GHSA-6655-6qjp-jx7x (2026-11-13).
+    "soupsieve": "4.0.0",
     "torch": "2.13.0",
     "transformers": "5.5.0",
     "web3": "7.15.0",
