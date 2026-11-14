@@ -7,13 +7,17 @@ the agent to stack requests while waiting for user decisions.
 
 import asyncio
 import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    execution_terminal_error,
+    is_execution_control_error,
+)
 
 from .args_summary import summarize_args
 
@@ -81,6 +85,8 @@ class ApprovalRequest:
     # that excludes dispatch envelopes is only correct if EVERY door labels
     # them.
     audit_action: str = "tool_execution"
+    # Terminal decision failure belongs to the original waiter. Never serialized.
+    awaiter_error: BaseException | None = field(default=None, repr=False)
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -557,6 +563,9 @@ class ApprovalQueue:
                 timeout=timeout
             )
 
+            if request.awaiter_error is not None:
+                raise request.awaiter_error
+
             approved = request.status == ApprovalStatus.APPROVED
             scope = request.user_decision or "once"
 
@@ -611,45 +620,61 @@ class ApprovalQueue:
             )
             raise
 
-        except Exception as error:
-            if is_execution_control_error(error):
-                request.status = ApprovalStatus.AWAITER_GONE
+        except BaseException:
+            request.status = ApprovalStatus.AWAITER_GONE
             raise
 
         finally:
-            # Only remove the request on a true success (resume_event
-            # fired) or timeout. Cancellation leaves it for the user.
-            if request.resume_event.is_set() or timed_out:
-                popped = self._pending.pop(request.id, None)
-            else:
-                popped = None
-            # Notify UI ONLY when we genuinely abandon the request via
-            # timeout. Successful user-submit closes its own modal;
-            # cancellation no longer triggers withdrawal at all.
-            if popped is not None and timed_out and self._on_request_withdrawn:
-                try:
-                    await self._on_request_withdrawn(popped, "timeout")
-                except (ConnectionError, TimeoutError) as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(
-                        f"Failed to notify UI of approval withdrawal (network error): {e}",
-                        exc_info=True,
-                    )
-                except (TypeError, AttributeError) as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(
-                        f"Failed to notify UI of approval withdrawal (callback error): {e}",
-                        exc_info=True,
-                    )
-                except Exception as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(
-                        f"Failed to notify UI of approval withdrawal: {e}",
-                        exc_info=True,
-                    )
+            original_error = sys.exception()
+            if request.awaiter_error is not None:
+                original_error = execution_terminal_error(
+                    original_error, request.awaiter_error,
+                    retain_originals=True, isolate_control_originals=True,
+                )
+                request.awaiter_error = None
+            try:
+                # Only remove the request on a true success (resume_event
+                # fired) or timeout. Cancellation leaves it for the user.
+                if request.resume_event.is_set() or timed_out:
+                    popped = self._pending.pop(request.id, None)
+                else:
+                    popped = None
+                # Notify UI ONLY when we genuinely abandon the request via
+                # timeout. Successful user-submit closes its own modal;
+                # cancellation no longer triggers withdrawal at all.
+                if popped is not None and timed_out and self._on_request_withdrawn:
+                    try:
+                        await self._on_request_withdrawn(popped, "timeout")
+                    except (ConnectionError, TimeoutError) as e:
+                        if is_execution_control_error(e):
+                            raise
+                        logger.warning(
+                            f"Failed to notify UI of approval withdrawal (network error): {e}",
+                            exc_info=True,
+                        )
+                    except (TypeError, AttributeError) as e:
+                        if is_execution_control_error(e):
+                            raise
+                        logger.warning(
+                            f"Failed to notify UI of approval withdrawal (callback error): {e}",
+                            exc_info=True,
+                        )
+                    except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
+                        logger.warning(
+                            f"Failed to notify UI of approval withdrawal: {e}",
+                            exc_info=True,
+                        )
+            except BaseException as cleanup_error:
+                if is_execution_control_error(original_error):
+                    raise execution_terminal_error(
+                        original_error, cleanup_error,
+                        retain_originals=True, isolate_control_originals=True,
+                    ) from None
+                raise
+            if is_execution_control_error(original_error):
+                raise original_error
 
     async def _persist_decision(
         self,
@@ -804,14 +829,22 @@ class ApprovalQueue:
             oldest = next(iter(self._resolved))
             self._resolved.pop(oldest, None)
 
-        persist_error = await self._persist_decision(
-            feature_name=request.feature_name,
-            tool_name=request.tool_name,
-            tool_args=request.tool_args,
-            approved=approved,
-            scope=scope,
-            audit_action=request.audit_action,
-        )
+        try:
+            persist_error = await self._persist_decision(
+                feature_name=request.feature_name,
+                tool_name=request.tool_name,
+                tool_args=request.tool_args,
+                approved=approved,
+                scope=scope,
+                audit_action=request.audit_action,
+            )
+
+        except BaseException as error:
+            request.awaiter_error = error
+            request.status = ApprovalStatus.AWAITER_GONE
+            request.resume_event.set()
+            self._pending.pop(request_id, None)
+            raise
 
         # Re-read status after the persist await: a concurrent awaiter
         # cancellation may have flipped PENDING → AWAITER_GONE while we
@@ -924,6 +957,8 @@ class ApprovalQueue:
                 reaped.append(req)
                 self._pending.pop(rid, None)
                 req.status = ApprovalStatus.TIMEOUT
+                req.user_decision = "timeout"
+                req.resume_event.set()
 
         for req in reaped:
             logger.info(
