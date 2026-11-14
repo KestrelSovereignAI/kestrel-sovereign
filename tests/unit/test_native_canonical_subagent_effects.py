@@ -442,16 +442,22 @@ async def test_text_only_completion_cannot_promote_a_withdrawn_original_feature(
 
 @pytest.mark.parametrize('inline', [False, True], ids=['loop', 'owned-reader'])
 async def test_a_continuation_failure_after_a_native_file_effect_cannot_be_a_normal_reply(canonical_subagent, inline):
+    """The leaf's effect was confirmed, so the model call that failed after it
+    acted on nothing: a known failure the parent model sees, not a successful
+    reply and not an uncertain effect (#4036). The original input still
+    cannot run the effect again."""
     host, feature, witness, model, _, _, invoke = canonical_subagent
     original = RuntimeError('private-original-provider-continuation')
     model.inline = inline
     model.continuation_error = original
-    with pytest.raises(ResourceOutcomeUnknown) as caught:
-        await invoke('chat')
-    assert any(carrier is original for carrier in execution_evidence_carriers(caught.value))
-    assert 'private-original-provider-continuation' not in str(caught.value)
+    result = await invoke('chat')
+    assert result['success'] is False
+    assert 'private-original-provider-continuation' in result['error']
     assert witness.read_text().splitlines() == ['original']
     assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    assert await host.tool_effect_store.database.fetchone(
+        'SELECT state, latched FROM tool_effect_operations') == ('CLOSED', 0), (
+        'A known model failure latched the operation as an uncertain effect')
     assert await host.tool_effect_store.database.fetchone(
         'SELECT result_status FROM a2a_tool_dispatches WHERE tool_name=?', (feature.tool_name,)) == ('error',)
     with pytest.raises(ToolEffectReconciliationRequired):
@@ -590,8 +596,16 @@ async def test_canonical_leaf_completion_stays_inside_original_execution_boundar
         assert attempts == ['native_leaf'] and len(sql_errors) == 1
 
 
-@pytest.mark.parametrize('completion', ['parent-delivery', 'model-continuation'])
-@pytest.mark.parametrize('failure', ['ordinary', 'conflict', 'unknown'])
+@pytest.mark.parametrize('completion,failure', [
+    ('parent-delivery', 'ordinary'),
+    ('parent-delivery', 'conflict'),
+    ('parent-delivery', 'unknown'),
+    # An ordinary failure of the subagent's own model call after a confirmed
+    # leaf is a known failure, not uncertainty (#4036): see
+    # test_a_continuation_failure_after_a_native_file_effect_cannot_be_a_normal_reply.
+    ('model-continuation', 'conflict'),
+    ('model-continuation', 'unknown'),
+])
 @pytest.mark.parametrize('route', ['chat', 'named-inline'])
 async def test_canonical_parent_completion_retains_returned_leaf_evidence(
     canonical_subagent, monkeypatch, completion, failure, route,

@@ -167,6 +167,55 @@ class SubagentContextBudgetExceeded(RuntimeError):
     audit, the two surfaces an operator would check.
     """
 
+
+class _SubagentDispatchJournal:
+    """The child dispatches one feature-subagent invocation made (#4036).
+
+    ``execute_as_subagent`` classifies its own failure from this record. A
+    failure is an uncertain tool effect only when uncertainty was observed,
+    and a child without a confirmed outcome is one place it is observed. That
+    a child started says nothing about a failure that came after it: a
+    refusal or a rejected request from the subagent's own model call, once
+    every child it ran was confirmed, acted on nothing.
+
+    Every child dispatch passes ``_execute_subagent_tool``, from the tool
+    loop and from the inline executor alike, and is recorded there. A child
+    is confirmed once that call delivers its result, by which point the
+    effect journal has settled it and its dispatch row is written. A child
+    that raised is confirmed only if its error carries no reconciliation debt
+    and either its body never started or the effect journal settled it as a
+    known conflict. Every other child, including one still running, is
+    unconfirmed.
+    """
+
+    def __init__(self) -> None:
+        self._opened = 0
+        self._confirmed = 0
+
+    @contextlib.contextmanager
+    def child(self, execution: Any):
+        """Record one child dispatch, whose execution facts are ``execution``."""
+        from kestrel_sovereign.tools.effect_journal import (
+            is_known_tool_conflict, requires_tool_effect_reconciliation,
+        )
+
+        self._opened += 1
+        try:
+            yield
+        except BaseException as error:
+            if not requires_tool_effect_reconciliation(error) and (
+                not execution.started
+                or (not execution.returned and is_known_tool_conflict(error))
+            ):
+                self._confirmed += 1
+            raise
+        self._confirmed += 1
+
+    def all_confirmed(self) -> bool:
+        """Whether every child dispatch recorded so far has a confirmed outcome."""
+        return self._confirmed == self._opened
+
+
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("
     r"let me|i(?:'ll| will| am going to)|"
@@ -1822,10 +1871,10 @@ class Feature(_SdkFeature):
         # their parts here, and the envelope carries them back to the
         # dispatching orchestrator by contract instead of ContextVar
         # happenstance.
-        from kestrel_sovereign.agent.tool_registry import _ToolExecution
-        if _dispatch_execution is None:
-            _dispatch_execution = _ToolExecution()
         subagent_parts: List[dict] = []
+        # This invocation's own record of the child dispatches it makes, which
+        # decides whether a failure of the run is an uncertain effect (#4036).
+        dispatch_journal = _SubagentDispatchJournal()
         if _validate_registration is not None:
             _validate_registration()
         try:
@@ -1917,6 +1966,7 @@ class Feature(_SdkFeature):
                     parent_dispatch_id=parent_dispatch_id,
                     _validate_registration=_validate_registration,
                     _dispatch_execution=_dispatch_execution,
+                    _dispatch_journal=dispatch_journal,
                     _dispatch_host=host,
                 )
                 if feature_tools else None
@@ -1966,6 +2016,7 @@ class Feature(_SdkFeature):
                 parent_dispatch_id=parent_dispatch_id,
                 _validate_registration=_validate_registration,
                 _dispatch_execution=_dispatch_execution,
+                _dispatch_journal=dispatch_journal,
                 _dispatch_host=host,
             )
 
@@ -1986,7 +2037,16 @@ class Feature(_SdkFeature):
         except Exception as e:
             if is_tool_execution_terminal_error(e) or issubclass(type(e), ResourceError):
                 raise
-            if _dispatch_execution.started:
+            # An uncertain effect only where uncertainty was observed (#4036):
+            # an unknown outcome in the cause graph (raised above), commit or
+            # cleanup debt, or a child dispatch without a confirmed outcome.
+            # Anything else, such as a refusal, a rejected request or the
+            # budget refusal from the subagent's own model call after every
+            # child was confirmed, is a known failure the parent model sees.
+            from kestrel_sovereign.tools.effect_journal import (
+                requires_tool_effect_reconciliation,
+            )
+            if requires_tool_effect_reconciliation(e) or not dispatch_journal.all_confirmed():
                 from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
                 raise ResourceOutcomeUnknown(TOOL_OUTCOME_UNCONFIRMED) from e
             logger.error(
@@ -2010,6 +2070,7 @@ class Feature(_SdkFeature):
         parent_dispatch_id: Optional[str] = None,
         _validate_registration: Optional[Callable[[], None]] = None,
         _dispatch_execution: Optional[Any] = None,
+        _dispatch_journal: Optional[_SubagentDispatchJournal] = None,
         _dispatch_host: Optional[Any] = None,
     ):
         """Build an inline ``(name, args) -> result_dict`` async callable
@@ -2093,6 +2154,7 @@ class Feature(_SdkFeature):
                         parent_dispatch_id=parent_dispatch_id,
                         _validate_registration=_validate_registration,
                         _dispatch_execution=_dispatch_execution,
+                        _dispatch_journal=_dispatch_journal,
                         _dispatch_host=host,
                     )
                 except Exception as error:
@@ -2118,6 +2180,7 @@ class Feature(_SdkFeature):
         parent_dispatch_id: Optional[str] = None,
         _validate_registration: Optional[Callable[[], None]] = None,
         _dispatch_execution: Optional[Any] = None,
+        _dispatch_journal: Optional[_SubagentDispatchJournal] = None,
         _dispatch_host: Optional[Any] = None,
     ) -> Any:
         """Execute one of this feature's tools inside the PRE_TOOL_USE /
@@ -2149,6 +2212,11 @@ class Feature(_SdkFeature):
         A terminal failure retains its original execution and audit evidence.
         Each native dispatch attempts its required row once; an unconfirmed
         write propagates its original uncertainty and cannot invite replay.
+
+        ``_dispatch_journal`` is the invoking subagent's own record of its
+        child dispatches (``_SubagentDispatchJournal``, #4036). The call is
+        recorded there whatever its outcome, so ``execute_as_subagent`` can
+        tell a known failure of its own model call from an uncertain effect.
 
         ``return_with_effective_args`` controls the return shape:
 
@@ -2464,14 +2532,19 @@ class Feature(_SdkFeature):
         async def failed(error, unknown):
             raise error
 
-        return await _run_tool_execution(host, operation,
-            execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
-            on_failure=failed,
-            on_terminal=lambda error: _record_terminal_tool_dispatch(
-                host, error, execution, dispatch_meta, tool_name=tool_name,
-                adapter=dispatch_adapter, args=effective_args, session_id=session_id,
-                dispatch_start=dispatch_start, dispatch_id=dispatch_id,
-                parent_dispatch_id=parent_dispatch_id))
+        journal_scope = (
+            contextlib.nullcontext() if _dispatch_journal is None
+            else _dispatch_journal.child(execution)
+        )
+        with journal_scope:
+            return await _run_tool_execution(host, operation,
+                execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
+                on_failure=failed,
+                on_terminal=lambda error: _record_terminal_tool_dispatch(
+                    host, error, execution, dispatch_meta, tool_name=tool_name,
+                    adapter=dispatch_adapter, args=effective_args, session_id=session_id,
+                    dispatch_start=dispatch_start, dispatch_id=dispatch_id,
+                    parent_dispatch_id=parent_dispatch_id))
 
     def _compose_subagent_runtime_tools(
         self, denied_tools: Optional[Any] = None
@@ -2663,6 +2736,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         parent_dispatch_id: Optional[str] = None,
         _validate_registration: Optional[Callable[[], None]] = None,
         _dispatch_execution: Optional[Any] = None,
+        _dispatch_journal: Optional[_SubagentDispatchJournal] = None,
         _dispatch_host: Optional[Any] = None,
     ) -> str:
         """
@@ -2787,6 +2861,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     parent_dispatch_id=parent_dispatch_id,
                     _validate_registration=_validate_registration,
                     _dispatch_execution=_dispatch_execution,
+                    _dispatch_journal=_dispatch_journal,
                     _dispatch_host=host,
                 )
                 call_ms = int((time.monotonic() - call_start) * 1000)
