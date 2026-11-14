@@ -4,13 +4,14 @@ import asyncio
 import json
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
 
 from fastapi.encoders import jsonable_encoder
 from kestrel_sdk.payer_policy import PayerPolicy
 
 from kestrel_sovereign.agent.custody import ReleaseOutcome
+from kestrel_sovereign.features.scheduler import runner as scheduler_runner
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     agent_shutdown_completion_owners,
@@ -18,7 +19,6 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import memory_consolidator
-from kestrel_sovereign.features.scheduler import runner as scheduler_runner
 from kestrel_sovereign.storage.db.sqlite import _aiosqlite_worker_is_alive
 from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
@@ -54,7 +54,6 @@ async def main():
         payer_policy=PayerPolicy.model_validate(request["payer_policy"]))
     try:
         await agent.initialize()
-        rows = await agent._raw_storage.conversation.get_messages_by_ids(request["receipts"])
         if processing == "scheduled_sleep":
             if agent.privacy_mode != PrivacyMode(request["mode"]):
                 raise RuntimeError("Scheduled restart did not restore its original privacy mode")
@@ -67,6 +66,7 @@ async def main():
             repeat_episodes = [episode.to_dict() for episode in await agent.memory_system.get_episodes()]
             processing_result = {"report": report, "episodes": episodes,
                 "repeat_report": repeat_report, "repeat_episodes": repeat_episodes}
+        rows = await agent._raw_storage.conversation.get_messages_by_ids(request["receipts"])
         stored_episode_ids = await agent._raw_storage.db.fetchall(
             "SELECT id FROM memory_episodes WHERE agent_id = ?", (agent.did,))
         result = {"pid": os.getpid(), "did": agent.did,
@@ -110,7 +110,7 @@ async def observe_original_scheduled_sleep(agent, request):
         "signals": signals,
         "scheduler_source": str(Path(scheduler_runner.__file__).resolve())}
     if request.get("prepare_repeat", False):
-        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        due = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
         await db.execute("UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ? AND agent_id = ?",
             (due, schedule_id, agent.did))
         result["repeat_occurrence_at"] = due
