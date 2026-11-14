@@ -1296,7 +1296,7 @@ class SQLiteBackend(DatabaseBackend):
         original = OwnedOperation(
             connect_original(), retirement_resource=connection, retain_originals=True,
         )
-        outcome = await original.observe()
+        outcome = await original.observe(retain_cancellations=True)
         if (outcome.error is not None or outcome.cancellation is not None) and original.task is not None:
             # observe() joined this exact admitted constructor. A failed open
             # still owns a worker; a successful but withdrawn open owns a live

@@ -316,8 +316,10 @@ class TaskManager:
         self,
         outbox: NativePushOutbox | None,
         admission_fence: Callable[[], AbstractAsyncContextManager[object]] | None,
-    ) -> AsyncIterator[StreamRefusal | None]:
-        """Recheck native authority after preparation, holding it only for commit.
+        *,
+        admitted_input: Callable[[], bool],
+    ) -> AsyncIterator[AbstractAsyncContextManager[StreamRefusal | None]]:
+        """Retain the actual COMMIT witness through the entire input handoff.
 
         Internal callers already own their admission. HTTP callers retain the
         original verified receipt and supply its finite policy/topology fence.
@@ -329,9 +331,13 @@ class TaskManager:
 
         def acknowledged():
             nonlocal committed
-            committed = True
+            # An empty transaction after a pure context-ownership refusal is
+            # not a committed task input. The caller identifies the canonical
+            # input it actually staged before this real COMMIT observation.
+            committed = admitted_input() is True
 
-        try:
+        @asynccontextmanager
+        async def transaction() -> AsyncIterator[StreamRefusal | None]:
             async with (admission_fence() if admission_fence is not None else nullcontext()) as decision:
                 if isinstance(decision, StreamRefusal):
                     yield decision
@@ -346,10 +352,15 @@ class TaskManager:
                 async with self.task_store.write_transaction():
                     self._after_input_commit(acknowledged)
                     yield
-                if admission_fence is not None and not committed:
+                if admission_fence is not None and admitted_input() is True and not committed:
                     # HTTP admission cannot claim a durable result from an
                     # inner joined scope while its caller owns the real COMMIT.
                     raise ExecutionCommitOutcomeError("unknown")
+        try:
+            # The caller enters this one transaction for writes, then retains
+            # this SAME acknowledged outcome while post-commit projections run.
+            # Neither topology authority nor the SQL transaction is extended.
+            yield transaction()
         except BaseException as error:
             if not committed or execution_commit_outcome(error) is not None:
                 raise
@@ -1629,36 +1640,40 @@ class TaskManager:
         parse_message_metadata(MessageToDict(params.metadata))
         prepared_input = prepare_native_task_input(params)
         push_outbox, push_config = await self._prepare_task_push(prepared_input)
-        async with self._task_input_admission(push_outbox, admission_fence) as decision:
-            if isinstance(decision, StreamRefusal):
-                if refusal_values:
-                    return decision
-                raise decision.error
-            candidate, appended = await self.task_store.append_creator_input(
-                prepared_input, creator_agent_id=creator_agent_id
-            )
-            if appended and push_config is not None:
-                await push_outbox.register_prepared(
-                    push_config,
-                    creator_id=creator_agent_id,
-                    task_id=candidate.task.id,
+        candidate = None
+        async with self._task_input_admission(
+            push_outbox, admission_fence, admitted_input=lambda: candidate is not None,
+        ) as transaction:
+            async with transaction as decision:
+                if isinstance(decision, StreamRefusal):
+                    if refusal_values:
+                        return decision
+                    raise decision.error
+                candidate, appended = await self.task_store.append_creator_input(
+                    prepared_input, creator_agent_id=creator_agent_id
                 )
+                if appended and push_config is not None:
+                    await push_outbox.register_prepared(
+                        push_config,
+                        creator_id=creator_agent_id,
+                        task_id=candidate.task.id,
+                    )
+                if appended:
+                    self._announce_submitted_input(candidate)
+            if candidate is None:
+                return None
             if appended:
-                self._announce_submitted_input(candidate)
-        if candidate is None:
-            return None
-        if appended:
-            try:
-                await self._notify_status_update(candidate.task, final=False)
-            except Exception as error:
-                if is_execution_control_error(error):
-                    raise
-                logger.warning(
-                    "Admitted task input subscriber projection failed for %s",
-                    candidate.task.id,
-                    exc_info=True,
-                )
-        return candidate.task
+                try:
+                    await self._notify_status_update(candidate.task, final=False)
+                except Exception as error:
+                    if is_execution_control_error(error):
+                        raise
+                    logger.warning(
+                        "Admitted task input subscriber projection failed for %s",
+                        candidate.task.id,
+                        exc_info=True,
+                    )
+            return candidate.task
 
     async def create_task(
         self,
@@ -1707,151 +1722,154 @@ class TaskManager:
         )
         # Reserve ownership and task in ONE backend transaction. A failed insert
         # cannot strand a context reservation or authorize another creator.
-        transaction = self._task_input_admission(push_outbox, admission_fence)
         ownership_refusal = None
         admitted_snapshot = None
-        async with transaction as decision:
-            if isinstance(decision, StreamRefusal):
-                if refusal_values:
-                    return decision
-                raise decision.error
-            try:
-                await self.context_store.reserve(
-                    task.context_id,
-                    self.task_store.scope,
-                    creator_agent_id=creator_agent_id,
-                )
-            except ContextOwnershipError as error:
-                # A conflicting reservation changes no row. Raise the domain
-                # refusal outside the backend's infrastructure-error wrapper.
-                if is_execution_control_error(error):
-                    raise
-                ownership_refusal = error
-            else:
-                await self.task_store.create(
-                    task,
-                    creator_agent_id=creator_agent_id,
-                    recipient_agent_id=self.task_store.scope.recipient_id,
-                    cognition_wake_eligible=cognition_wake_eligible,
-                    input_wake_eligible=input_wake_eligible,
-                )
-                await self.task_store.record_initial_input(
-                    task,
-                    prepared_input,
-                    creator_agent_id=creator_agent_id,
-                )
-                if push_config is not None:
-                    await push_outbox.register_prepared(
-                        push_config, creator_id=creator_agent_id, task_id=task.id
+        async with self._task_input_admission(
+            push_outbox, admission_fence, admitted_input=lambda: admitted_snapshot is not None,
+        ) as transaction:
+            async with transaction as decision:
+                if isinstance(decision, StreamRefusal):
+                    if refusal_values:
+                        return decision
+                    raise decision.error
+                try:
+                    await self.context_store.reserve(
+                        task.context_id,
+                        self.task_store.scope,
+                        creator_agent_id=creator_agent_id,
                     )
-                admitted_snapshot = await self.task_store.get_task_snapshot(
-                    task.id,
-                    recipient_agent_id=self.did,
-                )
-                if admitted_snapshot is None:
-                    raise RuntimeError("New task has no canonical input snapshot")
-                if notify_submitted:
-                    self._announce_submitted_input(admitted_snapshot)
-        if ownership_refusal is not None:
-            raise ownership_refusal
-        projection_id = self.session_id_for_context(task.context_id)
-        # Admission is complete only when the durable reservation can wake its
-        # recipient. The synchronous bridge was registered inside the SAME
-        # transaction and fires on actual COMMIT, even if the later admission
-        # lease exit fails. It never fires for an uncommitted joined scope or
-        # rollback, and precedes cancellable projection awaits. The bridge owns
-        # its asynchronous delivery through the agent's background-task
-        # tracker, so cancellation of this transport coroutine cannot strand a
-        # durably SUBMITTED row with no cognition wake.
-        # The insert-only task reservation is deliberately first: a duplicate
-        # caller-supplied ID must be rejected before it can append another user
-        # message to the existing session. Session and observability projections
-        # are best-effort after the durable task commit; their failure cannot
-        # turn an accepted task into a 500 that a retry experiences as a 409.
-        try:
-            session = await self.session_service.get_session(projection_id)
-            if not session:
-                await self.session_service.create_session(
+                except ContextOwnershipError as error:
+                    # A conflicting reservation changes no row. Raise the domain
+                    # refusal outside the backend's infrastructure-error wrapper.
+                    if is_execution_control_error(error):
+                        raise
+                    ownership_refusal = error
+                else:
+                    await self.task_store.create(
+                        task,
+                        creator_agent_id=creator_agent_id,
+                        recipient_agent_id=self.task_store.scope.recipient_id,
+                        cognition_wake_eligible=cognition_wake_eligible,
+                        input_wake_eligible=input_wake_eligible,
+                    )
+                    await self.task_store.record_initial_input(
+                        task,
+                        prepared_input,
+                        creator_agent_id=creator_agent_id,
+                    )
+                    if push_config is not None:
+                        await push_outbox.register_prepared(
+                            push_config, creator_id=creator_agent_id, task_id=task.id
+                        )
+                    admitted_snapshot = await self.task_store.get_task_snapshot(
+                        task.id,
+                        recipient_agent_id=self.did,
+                    )
+                    if admitted_snapshot is None:
+                        raise RuntimeError("New task has no canonical input snapshot")
+                    if notify_submitted:
+                        self._announce_submitted_input(admitted_snapshot)
+            if ownership_refusal is not None:
+                raise ownership_refusal
+            projection_id = self.session_id_for_context(task.context_id)
+            # Admission is complete only when the durable reservation can wake its
+            # recipient. The synchronous bridge was registered inside the SAME
+            # transaction and fires on actual COMMIT, even if the later admission
+            # lease exit fails. It never fires for an uncommitted joined scope or
+            # rollback, and precedes cancellable projection awaits. The bridge owns
+            # its asynchronous delivery through the agent's background-task
+            # tracker, so cancellation of this transport coroutine cannot strand a
+            # durably SUBMITTED row with no cognition wake.
+            # The insert-only task reservation is deliberately first: a duplicate
+            # caller-supplied ID must be rejected before it can append another user
+            # message to the existing session. Session and observability projections
+            # are best-effort after the durable task commit; their failure cannot
+            # turn an accepted task into a 500 that a retry experiences as a 409.
+            try:
+                session = await self.session_service.get_session(projection_id)
+                if not session:
+                    await self.session_service.create_session(
+                        session_id=projection_id,
+                        agent_name=self.did,
+                        metadata={"a2a_context_id": task.context_id},
+                    )
+                await self.session_service.append_event(
                     session_id=projection_id,
-                    agent_name=self.did,
-                    metadata={"a2a_context_id": task.context_id},
+                    event_type="user_message",
+                    data=MessageToDict(params.message),
                 )
-            await self.session_service.append_event(
-                session_id=projection_id,
-                event_type="user_message",
-                data=MessageToDict(params.message),
-            )
-        except Exception as execution_error:
-            if is_execution_control_error(execution_error):
-                raise
-            logger.warning(
-                "Task %s was created but its session projection failed",
-                task.id,
-                exc_info=True,
-            )
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
+                logger.warning(
+                    "Task %s was created but its session projection failed",
+                    task.id,
+                    exc_info=True,
+                )
 
-        try:
-            await self.observability_store.log_tool_call(
-                agent_name=self.did,
-                tool_name="task_create",
-                session_id=projection_id,
-                metadata={"task_id": task.id},
-            )
-        except Exception as execution_error:
-            if is_execution_control_error(execution_error):
-                raise
-            logger.warning(
-                "Task %s was created but observability logging failed",
-                task.id,
-                exc_info=True,
-            )
+            try:
+                await self.observability_store.log_tool_call(
+                    agent_name=self.did,
+                    tool_name="task_create",
+                    session_id=projection_id,
+                    metadata={"task_id": task.id},
+                )
+            except Exception as execution_error:
+                if is_execution_control_error(execution_error):
+                    raise
+                logger.warning(
+                    "Task %s was created but observability logging failed",
+                    task.id,
+                    exc_info=True,
+                )
 
-        # A recipient wake can race these best-effort projections and move the
-        # canonical row before create_task returns. Never publish an older
-        # SUBMITTED snapshot after a terminal transition already committed.
-        canonical_read_succeeded = False
-        canonical_read = asyncio.create_task(
-            self.task_store._get_unscoped(task.id),
-            name=f"a2a-task-create-readback:{task.id}",
-        )
-        readback_outcome = await await_owned_task(canonical_read)
-        if readback_outcome.cancellation is not None:
-            raise_owned_outcome(
-                readback_outcome,
-                operation="A2A task creation canonical readback",
+            # A recipient wake can race these best-effort projections and move the
+            # canonical row before create_task returns. Never publish an older
+            # SUBMITTED snapshot after a terminal transition already committed.
+            canonical_read_succeeded = False
+            canonical_read = create_owned_task(
+                self.task_store._get_unscoped(task.id),
+                name=f"a2a-task-create-readback:{task.id}",
+                retain_originals=True,
             )
-        try:
-            canonical = raise_owned_outcome(
-                readback_outcome,
-                operation="A2A task creation canonical readback",
-            )
-            canonical_read_succeeded = canonical is not None
-        except (Exception, asyncio.CancelledError) as readback_error:
-            if is_execution_control_error(readback_error):
-                raise
-            canonical = None
-            logger.warning(
-                "Task %s was accepted but its canonical readback failed",
-                task.id,
-                exc_info=True,
-            )
-        if canonical is None:
-            # The insert-only durable reservation and recipient wake already
-            # committed. Return the accepted snapshot so a transient read
-            # outage cannot make the sender abandon work the recipient owns.
-            # Suppress the SUBMITTED SSE projection because a raced recipient
-            # may already have moved the unreadable canonical row terminal.
-            canonical = task
-        if (
-            canonical_read_succeeded
-            and canonical.status.state == TaskState.TASK_STATE_SUBMITTED
-        ):
-            await self._notify_status_update(canonical, final=False)
+            readback_outcome = await await_owned_task(canonical_read)
+            if readback_outcome.cancellation is not None:
+                raise_owned_outcome(
+                    readback_outcome,
+                    operation="A2A task creation canonical readback",
+                )
+            try:
+                canonical = raise_owned_outcome(
+                    readback_outcome,
+                    operation="A2A task creation canonical readback",
+                )
+                canonical_read_succeeded = canonical is not None
+            except (Exception, asyncio.CancelledError) as readback_error:
+                if is_execution_control_error(readback_error):
+                    raise
+                canonical = None
+                logger.warning(
+                    "Task %s was accepted but its canonical readback failed",
+                    task.id,
+                    exc_info=True,
+                )
+            if canonical is None:
+                # The insert-only durable reservation and recipient wake already
+                # committed. Return the accepted snapshot so a transient read
+                # outage cannot make the sender abandon work the recipient owns.
+                # Suppress the SUBMITTED SSE projection because a raced recipient
+                # may already have moved the unreadable canonical row terminal.
+                canonical = task
+            if (
+                canonical_read_succeeded
+                and canonical.status.state == TaskState.TASK_STATE_SUBMITTED
+            ):
+                await self._notify_status_update(canonical, final=False)
 
-        logger.info(
-            "Native A2A task created: %s in context %s", task.id, task.context_id
-        )
-        return canonical
+            logger.info(
+                "Native A2A task created: %s in context %s", task.id, task.context_id
+            )
+            return canonical
 
     async def update_status(
         self,

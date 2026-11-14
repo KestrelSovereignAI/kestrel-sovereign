@@ -10,13 +10,13 @@ import pytest
 import pytest_asyncio
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
 from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
-from kestrel_sdk.native_a2a.utils.errors import InternalError
 
 from kestrel_sovereign.a2a.did_registry import HostA2ADidResolver
 from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
 from kestrel_sovereign.a2a.native_host import create_hosted_native_guard
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import TaskManager, create_task_manager
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import signing_identity
 from tests.utils.native_a2a_security import (
@@ -643,12 +643,14 @@ async def test_local_sender_requires_the_hosts_exact_verification_document(hoste
 async def test_host_directory_storage_failure_is_not_a_policy_denial(hosted):
     await hosted.backend.execute("DROP TABLE native_test_principals")
     params = send(hosted)
-    with pytest.raises(InternalError, match="persistence is unavailable") as failed:
+    with pytest.raises(ExecutionAuthorityError, match="authentication I/O failed") as failed:
         async with hosted.guard.admit(
             params, "SendMessage", signed_context(hosted, params)
         ):
             pytest.fail("A broken directory admitted a request")
     assert isinstance(failed.value.__cause__, QueryError)
+    assert is_execution_control_error(failed.value)
+    assert await hosted.backend.fetch_all("SELECT id FROM a2a_tasks") == []
 
 
 @pytest.mark.parametrize(
