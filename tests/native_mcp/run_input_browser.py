@@ -26,6 +26,9 @@ def tracked_files(repository):
 
 def wheel_inventory(wheel, repository):
     """Refuse a candidate whose packaged Core bytes differ from this checkout."""
+    build = tomllib.loads((repository / 'pyproject.toml').read_text())['tool']['hatch']['build']
+    included = build.get('targets', {}).get('wheel', {}).get('force-include', {})
+    source_paths = {target: source for source, target in included.items()}
     with zipfile.ZipFile(wheel) as archive:
         names = [name for name in archive.namelist()
                  if name.startswith('kestrel_sovereign/') and not name.endswith('/')]
@@ -34,7 +37,7 @@ def wheel_inventory(wheel, repository):
         result = {}
         for name in names:
             body = archive.read(name)
-            if body != (repository / name).read_bytes():
+            if body != (repository / source_paths.get(name, name)).read_bytes():
                 raise RuntimeError(f'Core wheel differs from source: {name}')
             result[name] = hashlib.sha256(body).hexdigest()
         return result

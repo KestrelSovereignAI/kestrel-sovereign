@@ -72,6 +72,25 @@ uv run pytest tests/unit/test_docs_verify.py --cov=kestrel_sovereign \
   --cov-report=term --cov-fail-under=0
 ```
 
+### Optional installed-worker regression tests
+
+The ordinary `uv sync` source-CI unit job does not install the independently
+owned Runpod transport or Playwright. The canonical controller is a Core wheel
+resource, not source-tree test DATA. Tests that need one of these components
+skip only when it is absent; broken transitive imports still fail. Source skips
+are not coverage of the installed worker.
+
+An installed-worker regression job must set
+`KESTREL_REQUIRE_INSTALLED_WORKER_TESTS=1`. It must install a normal Core wheel,
+the actual canonical `kestrel_cloud_runpod.remote_worker_tls` transport, and
+Playwright, then run the canonical local-worker and browser-ownership tests.
+Under this flag, an absent transport, Playwright module, or installed controller
+resource fails clearly rather than skipping. The flag does not install anything
+or replace the job's whole-wheel/RECORD and installed-origin provenance checks.
+Do not run that job through editable source or add the external provider to
+Core's runtime dependencies to make a source fixture pass. These controlled
+regressions do not establish Docker, browser or end-to-end worker readiness.
+
 ### The `run_tests.py` Script
 
 The project includes a comprehensive test runner with smart features:

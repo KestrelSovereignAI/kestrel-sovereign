@@ -17,6 +17,7 @@
 # Reviewed Docker admission policies are installed package resources.
 !kestrel_sovereign/visual_computer/docker_profile/seccomp.json
 !kestrel_sovereign/visual_computer/docker_profile/host-config.json
+!kestrel_sovereign/visual_computer/worker_profile_data/*.json
 !package.json
 !package-lock.json
 !docs/generated/RENDER_MANIFEST.json

@@ -35,7 +35,7 @@ canonical ownership contract and live in-tree inventory are in
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.11-3.14
+- Python 3.11.5–3.14
 - [uv](https://docs.astral.sh/uv/) (for package management)
 - [Ollama](https://ollama.ai) (optional - for local LLM inference without API keys)
 - **Linux: glibc 2.34 or newer** (Ubuntu 22.04+, Debian 12+, RHEL 9+). The

@@ -162,3 +162,47 @@ def native_dispatch(session, request, driver_id):
 
 def native_trace():
     return _TRACE.get()
+
+
+def raise_driver_borrow_outcome(outcome, *, operation, retain_originals=False):
+    """A revoked native borrower is UNKNOWN, not cancellation of its caller.
+
+    Preserve original caller cancellation and all native control/commit facts.
+    This is the single result boundary shared by the Docker and worker drivers.
+    """
+    import asyncio
+    from kestrel_sdk.operator import OperatorAuthorizationError
+    from kestrel_sovereign._async_ownership import raise_owned_outcome
+    error = outcome.error
+    from types import TracebackType
+
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
+    def descriptive_fields_only(node):
+        # Absence of a recognized control predicate is not proof that an
+        # original carrier has no other admission/native-source facts.
+        fields = vars(node)
+        if any(type(key) is not str or key not in {
+                "__notes__", "_kestrel_retained_traceback"} for key in fields):
+            return False
+        notes = fields.get("__notes__", [])
+        trace = fields.get("_kestrel_retained_traceback")
+        return (type(notes) is list and all(type(note) is str for note in notes)
+                and (trace is None or type(trace) is TracebackType))
+    if (outcome.cancellation is None and type(error) is asyncio.CancelledError
+            and all(type(carrier) in (asyncio.CancelledError, OperatorAuthorizationError,
+                                     ResourceOutcomeUnknown)
+                    and descriptive_fields_only(carrier)
+                    for carrier in execution_evidence_carriers(error))
+            and not is_execution_control_error(error)
+            and execution_commit_outcome(error) is None):
+        # Native launch/reap joins retain nested cancellations and an original
+        # egress expiry as explicit causes. Classify the complete canonical
+        # graph; an unfamiliar type, group or fact-bearing carrier stays intact.
+        # No receipt or no-effect claim follows from an interrupted driver.
+        # The original ledger/native dispatch owner still decides custody.
+        raise ResourceOutcomeUnknown("original_visual_operation_interrupted") from error
+    return raise_owned_outcome(outcome, operation=operation, retain_originals=retain_originals)

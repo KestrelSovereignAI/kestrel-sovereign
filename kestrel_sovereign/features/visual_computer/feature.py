@@ -76,6 +76,8 @@ class VisualComputerFeature(Feature):
         drivers = {name:dict(settings) for name,settings in self._cfg.get("drivers", {}).items()}
         egress = ActiveCallEgress()
         for name,settings in drivers.items():
+            if name == "remote-pinned-browser-v1":
+                settings["egress_guard"] = egress.operation
             if name == "local-docker-browser":
                 settings["egress_guard"] = egress.operation
                 settings["workspace_guard"] = egress.transfer_operation
@@ -84,6 +86,8 @@ class VisualComputerFeature(Feature):
         if not providers or not drivers:
             raise ValueError("visual provider and driver factories must be explicitly configured")
         for name, settings in providers.items():
+            if name == "local-two-domain-worker":
+                settings["credential_key"] = hmac.new(key, b"kestrel-two-domain-worker-v1", hashlib.sha256).digest()
             if name == "local-docker-browser":
                 settings["credential_key"] = hmac.new(key, b"kestrel-visual-worker-v1", hashlib.sha256).digest()
         providers, drivers = construct_adapters(providers=providers, drivers=drivers)

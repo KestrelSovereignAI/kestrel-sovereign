@@ -60,7 +60,7 @@ async def test_possible_native_stdin_write_cannot_become_a_negative_receipt(tmp_
     async def bound(*args,**kwargs):return {'container_id':'c'*64}
     monkeypatch.setattr(driver,'_bound',bound)
     program=tmp_path/'owned-native';received=tmp_path/'received'
-    program.write_text(f'#!{sys.executable}\nimport sys\nfrom pathlib import Path\npayload=sys.stdin.buffer.read();Path({str(received)!r}).write_bytes(payload)\nprint(\'{{"id":"wrong"}}\')\n')
+    program.write_text(f'#!{sys.executable} -B\nimport sys\nfrom pathlib import Path\npayload=sys.stdin.buffer.read();Path({str(received)!r}).write_bytes(payload)\nprint(\'{{"id":"wrong"}}\')\n')
     program.chmod(0o700);driver.boundary.executable=str(program)
     with original_dispatch(session,request) as origin:
         with pytest.raises(ResourceOutcomeUnknown):await driver.act(session,request)
