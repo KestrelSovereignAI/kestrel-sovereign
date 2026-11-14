@@ -15,6 +15,7 @@ from kestrel_sdk.native_a2a.utils.errors import (
     InvalidParamsError,
 )
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 
 from kestrel_sovereign.a2a.extensions import (
     PEER_STOP_URI,
@@ -291,6 +292,44 @@ async def test_post_effect_stop_policy_loss_is_unknown_not_ordinary_refusal(
     assert not c.wire.submissions
     assert await c.wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
     assert not c.wire.admission.lock.locked()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("exit_index", [2, 3])
+async def test_actual_stop_lease_exit_retains_taskless_operation_outcome(control, monkeypatch, streaming, exit_index):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers, is_execution_control_error
+
+    c = control
+    c.rail.agent._active_request_ids.add("turn-1")
+    original = c.handler.guard.lifecycle_lease
+    physical = HTTPException(403, detail="Actual taskless Stop original lease exit failed")
+    exits = []
+
+    @asynccontextmanager
+    async def original_lease():
+        async with original():
+            yield
+        exits.append(True)
+        if len(exits) == exit_index:
+            raise physical
+
+    monkeypatch.setattr(c.handler, "guard", replace(c.handler.guard, lifecycle_lease=original_lease))
+    params = request()
+    params.tenant = c.wire.admission.scope.tenant
+    async with test_a2a_native_http.observed_native_http(c.wire, binding=c.binding) as observed:
+        with pytest.raises(A2AClientError, match="500"):
+            async for _ in c.client(streaming=streaming, http_client=observed.http).send_message(params):
+                pytest.fail("Failed original Stop lease exit delivered a normal reply")
+    assert len(exits) == exit_index and observed.statuses == [500]
+    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == "unknown"
+    assert any(error is physical for error in execution_evidence_carriers(observed.failures[0]))
+    assert c.rail.agent.cancelled == ["turn-1"]
+    page = await c.rail.receipts.list_receipts(limit=10)
+    assert len(page.receipts) == 1
+    assert [outcome.disposition for outcome in page.receipts[0].outcomes] == ["stopped"]
+    assert not c.wire.submissions and not c.wire.manager._subscribers and not c.wire.admission.lock.locked()
+    assert await c.wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
 
 
 async def test_native_stop_preserves_signed_causation_cycle_policy(control):

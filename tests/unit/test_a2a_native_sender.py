@@ -336,8 +336,9 @@ async def test_proof_tampering_and_canonical_structure_are_rejected(
     [OSError("storage unavailable"), asyncio.CancelledError("owner canceled")],
 )
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refusal_values", [False, True])
 async def test_replay_storage_failure_and_cancellation_propagate(
-    identity, request_message, failure
+    identity, request_message, failure, refusal_values
 ):
     header = _sign(identity, request_message)
 
@@ -346,7 +347,7 @@ async def test_replay_storage_failure_and_cancellation_propagate(
             raise failure
 
     with pytest.raises(type(failure)) as raised:
-        await _verify(identity, request_message, [header], FailedStore())
+        await _verify(identity, request_message, [header], FailedStore(), refusal_values=refusal_values)
     assert raised.value is failure
 
 
@@ -524,8 +525,9 @@ async def test_signed_invalid_nonce_cannot_reach_shared_store(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refusal_values", [False, True])
 async def test_async_resolver_and_resolver_failure_are_preserved(
-    identity, request_message, tmp_path
+    identity, request_message, tmp_path, refusal_values
 ):
     db = await AsyncDatabase.sqlite(str(tmp_path / "async-resolver.db"))
     try:
@@ -542,6 +544,7 @@ async def test_async_resolver_and_resolver_failure_are_preserved(
                 [header],
                 SharedReplayNonceStore(db),
                 resolver=resolver,
+                refusal_values=refusal_values,
             )
         ).sender == SENDER
         failure = OSError("DID resolver unavailable")
@@ -556,6 +559,7 @@ async def test_async_resolver_and_resolver_failure_are_preserved(
                 [header],
                 _ForbiddenStore(),
                 resolver=failed_resolver,
+                refusal_values=refusal_values,
             )
         assert raised.value is failure
     finally:
@@ -605,3 +609,49 @@ def test_producer_rejects_invalid_claims_with_typed_proof_error(
 ):
     with pytest.raises(NativeSenderProofError, match="claims"):
         _sign(identity, request_message, nonce=nonce)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal_values", [False, True])
+@pytest.mark.parametrize("decision", ["header", "document", "signature", "fingerprint", "replay"])
+async def test_only_settled_proof_decisions_select_explicit_refusal_data(
+    identity, request_message, tmp_path, decision, refusal_values
+):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    database = await AsyncDatabase.sqlite(str(tmp_path / "settled-proof-decisions.db"))
+    try:
+        header = _sign(identity, request_message)
+        resolver = lambda did: identity[1]
+        store = _ForbiddenStore()
+        if decision == "header":
+            header = "malformed-proof"
+        elif decision == "document":
+            resolver = lambda did: None
+        elif decision == "signature":
+            segments = header.split(".")
+            signature = _decode(segments[1])
+            segments[1] = _encode(bytes([signature[0] ^ 1]) + signature[1:])
+            header = ".".join(segments)
+        elif decision == "fingerprint":
+            document = {**identity[1], "verificationMethod": [
+                {**method, "non_json_external_field": object()} for method in identity[1]["verificationMethod"]
+            ]}
+            resolver = lambda did: document
+        else:
+            store = SharedReplayNonceStore(database)
+            await _verify(identity, request_message, [header], store)
+        if refusal_values:
+            refused = await _verify(identity, request_message, [header], store,
+                resolver=resolver, refusal_values=True)
+            assert isinstance(refused, NativeSenderProofError)
+            error = refused
+            assert not is_execution_control_error(error)
+        else:
+            with pytest.raises(NativeSenderProofError) as caught:
+                await _verify(identity, request_message, [header], store, resolver=resolver)
+            error = caught.value
+        if decision == "fingerprint":
+            assert "cannot be fingerprinted" in str(error)
+    finally:
+        await database.close()

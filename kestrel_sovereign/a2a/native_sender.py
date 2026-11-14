@@ -209,24 +209,17 @@ def sign_native_request(
     return header
 
 
-async def verify_native_request(
+def _parse_native_request_proof(
     headers: list[str],
     params: ProtoMessage,
     *,
     recipient: str,
     operation: str,
     extensions: Iterable[str],
-    resolver: Resolver,
-    replay_store: ReplayNonceStore,
     policy: NativeProofPolicy,
     now_ts: int,
-) -> NativeVerifiedSender:
-    """Authenticate, then spend the nonce in the mandatory shared store.
-
-    There is no unsigned or process-local degradation. Storage/resolver control
-    errors propagate; an uncertain reservation is never released or retried by
-    this function. A lost response does not authorize replaying the operation.
-    """
+) -> tuple[_Claims, bytes, bytes, bytes]:
+    """Pure proof-byte/request decisions, with no resolver or storage I/O."""
     if len(headers) != 1:
         raise NativeSenderProofError("Exactly one sender proof header is required")
     header = headers[0]
@@ -259,11 +252,53 @@ async def verify_native_request(
         )
     if [item.alg for item in claims.signers] != [ALG_ED25519, ALG_ML_DSA_65]:
         raise NativeSenderProofError("Unsupported sender proof signature algorithms")
+    return claims, encoded, classical, pq
+
+
+def _proof_refusal(error: NativeSenderProofError, refusal_values: bool) -> NativeSenderProofError:
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    if not refusal_values or is_execution_control_error(error):
+        raise error
+    # Domain decision data, not a transport error. The HTTP guard alone maps
+    # this explicit value to the canonical SDK StreamRefusal(HTTPException).
+    return error
+
+
+async def verify_native_request(
+    headers: list[str],
+    params: ProtoMessage,
+    *,
+    recipient: str,
+    operation: str,
+    extensions: Iterable[str],
+    resolver: Resolver,
+    replay_store: ReplayNonceStore,
+    policy: NativeProofPolicy,
+    now_ts: int,
+    refusal_values: bool = False,
+) -> NativeVerifiedSender | NativeSenderProofError:
+    """Authenticate, then spend the nonce in the mandatory shared store.
+
+    Only explicit pure proof decisions may return refusal data. BOTH the
+    resolver call/await and the actual replay reservation remain outside any
+    conversion catch, including errors using the same domain exception class.
+    Default callers retain the raising contract. No unsigned/local fallback,
+    uncertain-reservation release, or automatic replay is permitted.
+    """
+    try:
+        claims, encoded, classical, pq = _parse_native_request_proof(
+            headers, params, recipient=recipient, operation=operation,
+            extensions=extensions, policy=policy, now_ts=now_ts,
+        )
+    except NativeSenderProofError as error:
+        return _proof_refusal(error, refusal_values)
+
     document = resolver(claims.sender)
     if inspect.isawaitable(document):
         document = await document
     if not isinstance(document, Mapping) or document.get("id") != claims.sender:
-        raise NativeSenderProofError("Sender DID document is unavailable or mismatched")
+        return _proof_refusal(NativeSenderProofError("Sender DID document is unavailable or mismatched"), refusal_values)
     signatures = [
         {"alg": signer.alg, "kid": signer.kid, "sig": signature.hex()}
         for signer, signature in zip(claims.signers, (classical, pq), strict=True)
@@ -275,13 +310,17 @@ async def verify_native_request(
         policy=policy.verify_policy,
     )
     if not verdict.ok:
-        raise NativeSenderProofError("Sender proof signature verification failed")
+        return _proof_refusal(NativeSenderProofError("Sender proof signature verification failed"), refusal_values)
     try:
         fingerprint = verification_document_fingerprint(document)
     except (TypeError, ValueError, UnicodeEncodeError) as error:
-        raise NativeSenderProofError(
-            "Sender DID document cannot be fingerprinted"
-        ) from error
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+
+        if isinstance(error, NativeSenderProofError) or is_execution_control_error(error):
+            raise
+        denied = NativeSenderProofError("Sender DID document cannot be fingerprinted")
+        denied.__cause__ = error
+        return _proof_refusal(denied, refusal_values)
     reserved = await replay_store.reserve(
         claims.sender,
         claims.nonce,
@@ -289,5 +328,5 @@ async def verify_native_request(
         ttl_seconds=2 * policy.max_age_seconds,
     )
     if reserved is not True:
-        raise NativeSenderProofError("Sender proof nonce was already consumed")
+        return _proof_refusal(NativeSenderProofError("Sender proof nonce was already consumed"), refusal_values)
     return NativeVerifiedSender(claims.sender, claims.nonce, fingerprint)

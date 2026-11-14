@@ -31,10 +31,32 @@ from kestrel_sovereign.a2a.native_sender import (
     verify_native_request,
 )
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
-from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    execution_error_with_cause,
+    is_execution_control_error,
+)
 from kestrel_sovereign.storage.db.interface import DatabaseError
 
 _Request = TypeVar("_Request", bound=ProtoMessage)
+
+
+@asynccontextmanager
+async def _original_authentication_io() -> AsyncIterator[None]:
+    """Opaque original I/O failures are control, never proof/refusal data.
+
+    Same caller Task and exact original graph; no resource-close or commit ACK
+    is invented. Only explicit decision values outside this boundary can be
+    translated by the HTTP layer. Already-classified native evidence stays exact.
+    """
+    try:
+        yield
+    except BaseException as error:
+        if is_execution_control_error(error):
+            raise
+        raise execution_error_with_cause(
+            ExecutionAuthorityError("Original native authentication I/O failed"), error
+        )
 
 
 @asynccontextmanager
@@ -168,7 +190,7 @@ class NativeDIDRequestGuard:
                 authority = self._new_authority()
                 refusal = self._current_decision(authority, None)
                 if refusal is None:
-                    try:
+                    async with _original_authentication_io():
                         sender = await verify_native_request(
                             native_header_values(context, SENDER_PROOF_HEADER),
                             request,
@@ -179,10 +201,9 @@ class NativeDIDRequestGuard:
                             replay_store=self.replay_store,
                             policy=self.proof_policy,
                             now_ts=int(self.clock()),
+                            refusal_values=True,
                         )
-                    except NativeSenderProofError as error:
-                        if is_execution_control_error(error):
-                            raise
+                    if isinstance(sender, NativeSenderProofError):
                         denied = HTTPException(
                             status_code=401,
                             detail="A2A sender proof was not accepted",
@@ -190,7 +211,7 @@ class NativeDIDRequestGuard:
                                 "WWW-Authenticate": 'Kestrel-A2A-Sender-Proof realm="a2a"'
                             },
                         )
-                        denied.__cause__ = error
+                        denied.__cause__ = sender
                         refusal = StreamRefusal(denied)
                     else:
                         principal = await self._authorization_decision(
@@ -239,7 +260,8 @@ class NativeDIDRequestGuard:
         refused = self._current_decision(authority, sender)
         if refused is not None:
             return refused
-        principal = await authority.authorize_sender(sender.sender)
+        async with _original_authentication_io():
+            principal = await authority.authorize_sender(sender.sender)
         refused = self._current_decision(authority, sender)
         if refused is not None:
             return refused

@@ -389,23 +389,29 @@ class NativeA2ARequestHandler(RequestHandler):
         if claims.peer_stop is not None:
             from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
 
-            async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
-                if isinstance(refused, StreamRefusal):
-                    return refused
-                receipt = await dispatch_peer_stop(
-                    self._peer_stop_target,
-                    actor_id=principal_id,
-                    intent=claims.peer_stop,
-                    causation_chain=claims.causation_chain,
+            async with AsyncExitStack() as outcome:
+                async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+                    if isinstance(refused, StreamRefusal):
+                        return refused
+                    # The taskless operation starts here. Register the SAME
+                    # outcome scope outside its original authority exit, so a
+                    # later lease failure cannot conceal an actual Stop effect.
+                    # Pre-effect refusal above still carries no effect outcome.
+                    await outcome.enter_async_context(self._response_outcome(None))
+                    receipt = await dispatch_peer_stop(
+                        self._peer_stop_target,
+                        actor_id=principal_id,
+                        intent=claims.peer_stop,
+                        causation_chain=claims.causation_chain,
+                    )
+                return Message(
+                    message_id=uuid4().hex,
+                    context_id=params.message.context_id or uuid4().hex,
+                    role=Role.ROLE_AGENT,
+                    parts=[
+                        Part(raw=encode_inline_json(receipt), media_type="application/json")
+                    ],
                 )
-            return Message(
-                message_id=uuid4().hex,
-                context_id=params.message.context_id or uuid4().hex,
-                role=Role.ROLE_AGENT,
-                parts=[
-                    Part(raw=encode_inline_json(receipt), media_type="application/json")
-                ],
-            )
 
         def admission_fence() -> OriginalContextExit[StreamRefusal | None]:
             return OriginalContextExit(self.guard.hold_authority(admitted, refusal_values=True))
@@ -506,10 +512,11 @@ class NativeA2ARequestHandler(RequestHandler):
                 return
 
     @staticmethod
-    def _raise_response_failure(result: Task | Message, error: BaseException) -> NoReturn:
+    def _raise_response_failure(result: Task | Message | None, error: BaseException) -> NoReturn:
         # A returned Task proves canonical durable admission. A taskless
         # control Message may describe another effect, not a Task transaction;
         # retain that uncertainty instead of manufacturing a commit receipt.
+        # None is the admitted taskless operation before its Message is built.
         outcome = "committed" if isinstance(result, Task) else "unknown"
         raise execution_observation_error(ExecutionCommitOutcomeError(outcome), error)
 
@@ -522,7 +529,7 @@ class NativeA2ARequestHandler(RequestHandler):
             yield
 
     @asynccontextmanager
-    async def _response_outcome(self, result: Task | Message):
+    async def _response_outcome(self, result: Task | Message | None):
         """Retain the same operation outcome across every response layer."""
         try:
             yield

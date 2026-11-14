@@ -7,7 +7,6 @@ import pytest
 from kestrel_sdk.native_a2a.types import GetTaskRequest
 from kestrel_sdk.native_a2a.utils.errors import (
     ExtensionSupportRequiredError,
-    InternalError,
     InvalidParamsError,
 )
 from starlette.exceptions import HTTPException
@@ -386,7 +385,7 @@ async def test_replay_storage_failure_stays_an_infrastructure_failure(
             "ALTER TABLE a2a_replay_nonces ADD CONSTRAINT refuse_native_test_nonce CHECK (sender <> 'did:web:sender.test:agent')"
         )
     params = send(native_request_admission)
-    with pytest.raises(InternalError, match="persistence is unavailable") as failed:
+    with pytest.raises(ExecutionAuthorityError, match="authentication I/O failed") as failed:
         async with native_request_admission.guard.admit(
             params, "SendMessage", signed_context(native_request_admission, params)
         ):
@@ -537,7 +536,7 @@ async def test_sender_proof_error_retains_its_execution_control_cause(
     assert failed.value is refusal and failed.value.__cause__ is control
 
 
-async def test_waiting_policy_read_failure_remains_an_internal_error(
+async def test_waiting_policy_read_failure_remains_original_control(
     native_request_admission,
 ):
     guard = native_request_admission.guard
@@ -547,7 +546,7 @@ async def test_waiting_policy_read_failure_remains_an_internal_error(
     ) as admitted:
         pass
     await native_request_admission.backend.execute("DROP TABLE native_test_principals")
-    with pytest.raises(InternalError, match="persistence is unavailable") as failed:
+    with pytest.raises(ExecutionAuthorityError, match="authentication I/O failed") as failed:
         async with guard.hold_authority(admitted):
             pytest.fail("An unavailable policy store retained request authority")
     assert isinstance(failed.value.__cause__, QueryError)
