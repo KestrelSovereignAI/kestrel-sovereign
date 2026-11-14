@@ -5,7 +5,7 @@ import base64
 import binascii
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from uuid import uuid4
 
 from kestrel_sdk.native_a2a.server.context import ServerCallContext
@@ -89,7 +89,6 @@ from kestrel_sovereign.a2a.task_manager import (
     TaskManager,
 )
 from kestrel_sovereign.execution_custody import (
-    close_native_execution_stream,
     is_execution_control_error,
     owned_execution_stream,
 )
@@ -449,47 +448,51 @@ class NativeA2ARequestHandler(RequestHandler):
             refusal.__cause__ = error
             return StreamRefusal(refusal)
 
+    @asynccontextmanager
     async def _open_stream(
         self, task_id: str, principal_id: str, *, withdrawal: SourceWithdrawal | None = None
-    ) -> tuple[AsyncIterator[Event], Task] | StreamRefusal:
-        stream = self.manager.subscribe(
+    ) -> AsyncIterator[tuple[AsyncIterator[Event], Task] | StreamRefusal]:
+        original = self.manager.subscribe(
             task_id,
             creator_agent_id=principal_id,
             recipient_agent_id=self.guard.scope.recipient_id,
             withdrawal=withdrawal,
         )
-        try:
-            initial = await anext(stream)
-        except StopAsyncIteration as error:
-            await close_native_execution_stream(stream, self)
-            if is_execution_control_error(error):
-                raise
-            refusal = TaskNotFoundError()
-            refusal.__cause__ = error
-            return StreamRefusal(refusal)
-        except BaseException:
-            await close_native_execution_stream(stream, self)
-            raise
-        if not isinstance(initial, Task):
-            await close_native_execution_stream(stream, self)
-            raise InvalidAgentResponseError(
-                message="The initial native stream event must be a Task"
-            )
-        return stream, initial
+        # Ownership precedes the FIRST read, not just later event forwarding.
+        # The caller registers this scope before leaving its acquisition lease,
+        # so an actual lease-exit failure still joins this same source owner.
+        async with owned_execution_stream(self, original) as stream:
+            try:
+                initial = await anext(stream)
+            except StopAsyncIteration as error:
+                if is_execution_control_error(error):
+                    raise
+                refusal = TaskNotFoundError()
+                refusal.__cause__ = error
+            else:
+                if not isinstance(initial, Task):
+                    raise InvalidAgentResponseError(
+                        message="The initial native stream event must be a Task"
+                    )
+                yield stream, initial
+                return
+        # A not-found decision is data only AFTER actual original retirement.
+        yield StreamRefusal(refusal)
 
     async def _events(
         self, stream, initial: Task, admitted: AuthorizedNativeRequest
     ) -> AsyncGenerator[Event]:
-        async with owned_execution_stream(self, stream) as events:
-            event = initial
-            while True:
-                async with self.guard.hold_authority(admitted):
-                    await self._task(initial.id, admitted.principal_id)
-                yield event
-                try:
-                    event = await anext(events)
-                except StopAsyncIteration:
-                    return
+        # Borrow the already-owned subscription. _open_stream retains its
+        # original owner across acquisition, every read, and physical close.
+        event = initial
+        while True:
+            async with self.guard.hold_authority(admitted):
+                await self._task(initial.id, admitted.principal_id)
+            yield event
+            try:
+                event = await anext(stream)
+            except StopAsyncIteration:
+                return
 
     async def on_message_send(
         self, params: SendMessageRequest, context: ServerCallContext
@@ -499,40 +502,43 @@ class NativeA2ARequestHandler(RequestHandler):
         task = await self._submit(admitted)
         if isinstance(task, StreamRefusal):
             raise task.error
-        async with self.guard.hold_authority(admitted):
-            if isinstance(task, Message):
-                return task
-            if admitted.request.configuration.return_immediately:
-                return apply_history_length(task, admitted.request.configuration)
-            opened = await self._open_stream(task.id, admitted.principal_id)
-        if isinstance(opened, StreamRefusal):
-            raise opened.error
-        stream, initial = opened
-        async with owned_execution_stream(
-            self, self._events(stream, initial, admitted)
-        ) as events:
-
-            async def wait_events():
-                async for _ in events:
-                    pass
-                return True
-
-            completed, _ = await gather_owned(
-                (
-                    factory()
-                    for factory in (
-                        wait_events,
-                        lambda: wait_native_disconnect(context),
-                    )
-                ),
-                return_when=asyncio.FIRST_COMPLETED,
-                retain_originals=True,
-                name_prefix="native-a2a-blocking-response",
-            )
-            if completed is not True:
-                raise HTTPException(
-                    status_code=499, detail="A2A HTTP client disconnected"
+        async with AsyncExitStack() as streams:
+            async with self.guard.hold_authority(admitted):
+                if isinstance(task, Message):
+                    return task
+                if admitted.request.configuration.return_immediately:
+                    return apply_history_length(task, admitted.request.configuration)
+                opened = await streams.enter_async_context(
+                    self._open_stream(task.id, admitted.principal_id)
                 )
+            if isinstance(opened, StreamRefusal):
+                raise opened.error
+            stream, initial = opened
+            async with owned_execution_stream(
+                self, self._events(stream, initial, admitted)
+            ) as events:
+
+                async def wait_events():
+                    async for _ in events:
+                        pass
+                    return True
+
+                completed, _ = await gather_owned(
+                    (
+                        factory()
+                        for factory in (
+                            wait_events,
+                            lambda: wait_native_disconnect(context),
+                        )
+                    ),
+                    return_when=asyncio.FIRST_COMPLETED,
+                    retain_originals=True,
+                    name_prefix="native-a2a-blocking-response",
+                )
+                if completed is not True:
+                    raise HTTPException(
+                        status_code=499, detail="A2A HTTP client disconnected"
+                    )
         async with self.guard.hold_authority(admitted):
             task = await self._task(task.id, admitted.principal_id)
             return apply_history_length(task, admitted.request.configuration)
@@ -575,17 +581,20 @@ class NativeA2ARequestHandler(RequestHandler):
                 pass
             yield task
             return
-        async with self.guard.hold_authority(admitted):
-            opened = await self._open_stream(task.id, admitted.principal_id, withdrawal=withdrawal)
-        if isinstance(opened, StreamRefusal):
-            yield opened
-            return
-        stream, initial = opened
-        async with owned_execution_stream(
-            self, self._events(stream, initial, admitted)
-        ) as events:
-            async for event in events:
-                yield event
+        async with AsyncExitStack() as streams:
+            async with self.guard.hold_authority(admitted):
+                opened = await streams.enter_async_context(
+                    self._open_stream(task.id, admitted.principal_id, withdrawal=withdrawal)
+                )
+            if not isinstance(opened, StreamRefusal):
+                stream, initial = opened
+                async with owned_execution_stream(
+                    self, self._events(stream, initial, admitted)
+                ) as events:
+                    async for event in events:
+                        yield event
+                return
+        yield opened
 
     def on_subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext
@@ -596,41 +605,43 @@ class NativeA2ARequestHandler(RequestHandler):
     async def _subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext, withdrawal: SourceWithdrawal
     ) -> AsyncGenerator[Event | StreamRefusal]:
-        async with self.guard.admit(
-            params, "SubscribeToTask", context, refusal_values=True
-        ) as admitted:
-            if isinstance(admitted, StreamRefusal):
-                opened = admitted
-            elif not self._card.capabilities.streaming:
-                opened = StreamRefusal(
-                    UnsupportedOperationError(
-                        message="Streaming is not advertised by this agent"
-                    )
-                )
-            else:
-                opened = await self._open_stream(
-                    admitted.request.id, admitted.principal_id, withdrawal=withdrawal
-                )
-                if not isinstance(opened, StreamRefusal):
-                    stream, initial = opened
-                    if initial.status.state in TERMINAL_STATES:
-                        await close_native_execution_stream(stream, self)
-                        opened = StreamRefusal(
-                            UnsupportedOperationError(
-                                message="Cannot subscribe to a terminal task"
-                            )
+        async with AsyncExitStack() as streams:
+            async with self.guard.admit(
+                params, "SubscribeToTask", context, refusal_values=True
+            ) as admitted:
+                if isinstance(admitted, StreamRefusal):
+                    opened = admitted
+                elif not self._card.capabilities.streaming:
+                    opened = StreamRefusal(
+                        UnsupportedOperationError(
+                            message="Streaming is not advertised by this agent"
                         )
-        if isinstance(opened, StreamRefusal):
-            # Only explicit semantic decisions become values. An exception
-            # from original close or authority exit never reaches this yield.
-            yield opened
-            return
-        stream, initial = opened
-        async with owned_execution_stream(
-            self, self._events(stream, initial, admitted)
-        ) as events:
-            async for event in events:
-                yield event
+                    )
+                else:
+                    opened = await streams.enter_async_context(
+                        self._open_stream(
+                            admitted.request.id, admitted.principal_id, withdrawal=withdrawal
+                        )
+                    )
+                    if not isinstance(opened, StreamRefusal):
+                        stream, initial = opened
+                        if initial.status.state in TERMINAL_STATES:
+                            opened = StreamRefusal(
+                                UnsupportedOperationError(
+                                    message="Cannot subscribe to a terminal task"
+                                )
+                            )
+            if not isinstance(opened, StreamRefusal):
+                stream, initial = opened
+                async with owned_execution_stream(
+                    self, self._events(stream, initial, admitted)
+                ) as events:
+                    async for event in events:
+                        yield event
+                return
+        # Only explicit semantic decisions become values. An exception from
+        # actual original close or authority exit never reaches this yield.
+        yield opened
 
     @asynccontextmanager
     async def _admit_push(self, params, operation, context):
