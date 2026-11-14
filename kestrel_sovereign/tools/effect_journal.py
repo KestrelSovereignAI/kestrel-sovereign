@@ -105,6 +105,16 @@ def requires_tool_effect_reconciliation(error: BaseException | None) -> bool:
         or execution_commit_outcome(error) is not None or execution_cleanup_debts(error))
 
 
+def is_known_tool_conflict(error: BaseException | None) -> bool:
+    """A conflict a started tool raised instead of returning: a known refusal.
+
+    The effect journal settles it ``RETURNED_ERROR``, not ``UNCONFIRMED``. A
+    terminal conflict is excluded: it carries its own uncertainty or control.
+    """
+    return (error is not None and issubclass(type(error), ResourceConflict)
+        and not is_tool_execution_terminal_error(error))
+
+
 def _requires_original_terminal_error(error: BaseException | None) -> bool:
     return ((error is not None and not isinstance(error, Exception))
         or is_tool_execution_terminal_error(error)
@@ -487,8 +497,7 @@ async def execute_tool_effect(
                 error = execution_error
             finally:
                 _current_claim.reset(token)
-            known_conflict = (not returned and issubclass(type(error), ResourceConflict)
-                and not is_tool_execution_terminal_error(error))
+            known_conflict = not returned and is_known_tool_conflict(error)
             state = (
                 "NOT_EXECUTED" if not started else
                 "RETURNED_ERROR" if known_conflict else
