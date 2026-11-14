@@ -1082,7 +1082,8 @@ class OwnedOperation:
             return await await_owned_task(self._task, **observation)
         # Do not cancel a failed start gate into a substitute CancelledError.
         outcome = await await_owned_task(
-            self._task, pending_cancellation=observation.get("pending_cancellation"))
+            self._task, pending_cancellation=observation.get("pending_cancellation"),
+            retain_cancellations=observation.get("retain_cancellations", False))
         return OwnedTaskOutcome(
             outcome.result,
             execution_observation_error(self._opening, outcome.error),
@@ -1514,7 +1515,10 @@ class OwnedAsyncIterator(Generic[_T]):
         cancellation_requested = close_requested or (
             self._cleanup_requested is not None and self._cleanup_requested() is True
         )
-        if cancellation_requested and is_owned_task_cancellation(self._owner, error):
+        # Cooperative Stop never injects producer cancellation. Even this
+        # native Task's token cannot ACK an interrupted opaque body/finally;
+        # its original cancellation remains failed-retirement evidence.
+        if not self._cooperative_source and cancellation_requested and is_owned_task_cancellation(self._owner, error):
             self._interrupted_by_cleanup = True
             # End demand promptly, but do NOT claim the original finally or
             # registered resources are physically retired. aclose owns that join.
