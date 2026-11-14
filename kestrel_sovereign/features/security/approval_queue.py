@@ -7,7 +7,6 @@ the agent to stack requests while waiting for user decisions.
 
 import asyncio
 import logging
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -22,6 +21,7 @@ from kestrel_sovereign.execution_custody import (
 from .args_summary import summarize_args
 
 if TYPE_CHECKING:
+    from kestrel_sovereign._async_ownership import OwnedOperation
     from kestrel_sovereign.security.auto_approve import AutoApprovePolicy
 
     from .permissions import PermissionStore
@@ -87,6 +87,7 @@ class ApprovalRequest:
     audit_action: str = "tool_execution"
     # Terminal decision failure belongs to the original waiter. Never serialized.
     awaiter_error: BaseException | None = field(default=None, repr=False)
+    decision_operation: Optional["OwnedOperation"] = field(default=None, repr=False)
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -540,98 +541,97 @@ class ApprovalQueue:
         # reaped by ``sweep_stale`` (called from a periodic
         # background task or directly by tests).
         timed_out = False
+        local_error: BaseException | None = None
         try:
-            # Notify UI via SSE
-            if self._on_request_added:
-                try:
-                    await self._on_request_added(request)
-                except (ConnectionError, TimeoutError) as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(f"Failed to notify UI of approval request (network error): {e}", exc_info=True)
-                except (TypeError, AttributeError) as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(f"Failed to notify UI of approval request (callback error): {e}", exc_info=True)
-                except Exception as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
+            try:
+                # Notify UI via SSE
+                if self._on_request_added:
+                    try:
+                        await self._on_request_added(request)
+                    except (ConnectionError, TimeoutError) as e:
+                        if is_execution_control_error(e):
+                            raise
+                        logger.warning(f"Failed to notify UI of approval request (network error): {e}", exc_info=True)
+                    except (TypeError, AttributeError) as e:
+                        if is_execution_control_error(e):
+                            raise
+                        logger.warning(f"Failed to notify UI of approval request (callback error): {e}", exc_info=True)
+                    except Exception as e:
+                        if is_execution_control_error(e):
+                            raise
+                        logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
 
-            await asyncio.wait_for(
-                request.resume_event.wait(),
-                timeout=timeout
-            )
+                await asyncio.wait_for(
+                    request.resume_event.wait(),
+                    timeout=timeout
+                )
 
-            if request.awaiter_error is not None:
-                raise request.awaiter_error
+                if request.awaiter_error is not None:
+                    raise request.awaiter_error
 
-            approved = request.status == ApprovalStatus.APPROVED
-            scope = request.user_decision or "once"
+                approved = request.status == ApprovalStatus.APPROVED
+                scope = request.user_decision or "once"
 
-            logger.info(
-                f"Approval request {request.id[:8]} resolved: "
-                f"{'approved' if approved else 'denied'} ({scope})"
-            )
+                logger.info(
+                    f"Approval request {request.id[:8]} resolved: "
+                    f"{'approved' if approved else 'denied'} ({scope})"
+                )
 
-            return (approved, scope)
+                return (approved, scope)
 
-        except asyncio.TimeoutError as error:
-            if is_execution_control_error(error):
+            except asyncio.TimeoutError as error:
+                if is_execution_control_error(error):
+                    request.status = ApprovalStatus.AWAITER_GONE
+                    raise
+                request.status = ApprovalStatus.TIMEOUT
+                timed_out = True
+                logger.warning(
+                    f"Approval request {request.id[:8]} timed out after {timeout}s"
+                )
+                await self._persist_decision(
+                    feature_name=feature_name,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    approved=False,
+                    scope="timeout",
+                    audit_action=audit_action,
+                )
+                return (False, "timeout")
+
+            except asyncio.CancelledError:
+                # Calling task cancelled (HTTP stream dropped, browser
+                # closed, user switched to a different agent in the
+                # multi_agent). The user has not yet decided. Leave the
+                # request in ``_pending`` so the modal stays interactive,
+                # and re-raise without firing withdrawal — the modal must
+                # NOT auto-close on us. Mark the request AWAITER_GONE so a
+                # late ``submit_decision`` can tell the caller its click did
+                # nothing for the orphaned in-flight call (#2558).
+                # Clobber unconditionally: if a concurrent ``submit_decision``
+                # already flipped to APPROVED/DENIED and is mid-persist, the
+                # tool call itself is STILL dead — the persisted scope rule
+                # benefits future calls, but this call is orphaned regardless
+                # of who won the state-write race. ``submit_decision``'s
+                # re-check-after-persist reads AWAITER_GONE and reports
+                # ``awaiter_gone=True`` to the caller so the frontend prompts
+                # a retry.
+                request.status = ApprovalStatus.AWAITER_GONE
+                logger.info(
+                    f"Approval request {request.id[:8]} await cancelled; "
+                    "request marked AWAITER_GONE — decision will still be "
+                    "recorded but the tool call is orphaned"
+                )
+                raise
+
+            except BaseException:
                 request.status = ApprovalStatus.AWAITER_GONE
                 raise
-            request.status = ApprovalStatus.TIMEOUT
-            timed_out = True
-            logger.warning(
-                f"Approval request {request.id[:8]} timed out after {timeout}s"
-            )
-            await self._persist_decision(
-                feature_name=feature_name,
-                tool_name=tool_name,
-                tool_args=tool_args,
-                approved=False,
-                scope="timeout",
-                audit_action=audit_action,
-            )
-            return (False, "timeout")
 
-        except asyncio.CancelledError:
-            # Calling task cancelled (HTTP stream dropped, browser
-            # closed, user switched to a different agent in the
-            # multi_agent). The user has not yet decided. Leave the
-            # request in ``_pending`` so the modal stays interactive,
-            # and re-raise without firing withdrawal — the modal must
-            # NOT auto-close on us. Mark the request AWAITER_GONE so a
-            # late ``submit_decision`` can tell the caller its click did
-            # nothing for the orphaned in-flight call (#2558).
-            # Clobber unconditionally: if a concurrent ``submit_decision``
-            # already flipped to APPROVED/DENIED and is mid-persist, the
-            # tool call itself is STILL dead — the persisted scope rule
-            # benefits future calls, but this call is orphaned regardless
-            # of who won the state-write race. ``submit_decision``'s
-            # re-check-after-persist reads AWAITER_GONE and reports
-            # ``awaiter_gone=True`` to the caller so the frontend prompts
-            # a retry.
-            request.status = ApprovalStatus.AWAITER_GONE
-            logger.info(
-                f"Approval request {request.id[:8]} await cancelled; "
-                "request marked AWAITER_GONE — decision will still be "
-                "recorded but the tool call is orphaned"
-            )
+        except BaseException as error:
+            local_error = error
             raise
-
-        except BaseException:
-            request.status = ApprovalStatus.AWAITER_GONE
-            raise
-
         finally:
-            original_error = sys.exception()
-            if request.awaiter_error is not None:
-                original_error = execution_terminal_error(
-                    original_error, request.awaiter_error,
-                    retain_originals=True, isolate_control_originals=True,
-                )
-                request.awaiter_error = None
+            cleanup_error = None
             try:
                 # Only remove the request on a true success (resume_event
                 # fired) or timeout. Cancellation leaves it for the user.
@@ -666,15 +666,24 @@ class ApprovalQueue:
                             f"Failed to notify UI of approval withdrawal: {e}",
                             exc_info=True,
                         )
-            except BaseException as cleanup_error:
-                if is_execution_control_error(original_error):
-                    raise execution_terminal_error(
-                        original_error, cleanup_error,
-                        retain_originals=True, isolate_control_originals=True,
-                    ) from None
-                raise
-            if is_execution_control_error(original_error):
-                raise original_error
+            except BaseException as error:
+                cleanup_error = error
+            decision_error = decision_cancellation = None
+            # A disconnected caller leaves the UI submission as its independent
+            # owner (#2558). Completed/expired callers must join a claimed
+            # decision so its late native failure cannot escape their result.
+            caller_withdrew = (isinstance(local_error, asyncio.CancelledError)
+                               and not is_execution_control_error(local_error))
+            if request.decision_operation is not None and not caller_withdrew:
+                outcome = await request.decision_operation.observe(retain_cancellations=True)
+                decision_error, decision_cancellation = outcome.error, outcome.cancellation
+            terminal = execution_terminal_error(
+                local_error, cleanup_error, decision_error, decision_cancellation,
+                request.awaiter_error, retain_originals=True, isolate_control_originals=True,
+            )
+            request.awaiter_error = None
+            if terminal is not None:
+                raise terminal
 
     async def _persist_decision(
         self,
@@ -829,22 +838,29 @@ class ApprovalQueue:
             oldest = next(iter(self._resolved))
             self._resolved.pop(oldest, None)
 
-        try:
-            persist_error = await self._persist_decision(
-                feature_name=request.feature_name,
-                tool_name=request.tool_name,
-                tool_args=request.tool_args,
-                approved=approved,
-                scope=scope,
-                audit_action=request.audit_action,
-            )
+        from kestrel_sovereign._async_ownership import (
+            OwnedOperation,
+            raise_owned_outcome,
+        )
 
-        except BaseException as error:
-            request.awaiter_error = error
+        request.decision_operation = OwnedOperation(
+            self._persist_decision(
+                feature_name=request.feature_name, tool_name=request.tool_name,
+                tool_args=request.tool_args, approved=approved, scope=scope,
+                audit_action=request.audit_action,
+            ), retain_originals=True, name="approval-decision-persistence",
+        )
+        outcome = await request.decision_operation.observe(
+            cancel_on_caller_cancellation=True, retain_cancellations=True,
+        )
+        if outcome.error is not None:
+            request.awaiter_error = outcome.error
             request.status = ApprovalStatus.AWAITER_GONE
             request.resume_event.set()
             self._pending.pop(request_id, None)
-            raise
+        persist_error = raise_owned_outcome(
+            outcome, operation="approval decision persistence", retain_originals=True,
+        )
 
         # Re-read status after the persist await: a concurrent awaiter
         # cancellation may have flipped PENDING → AWAITER_GONE while we
@@ -853,7 +869,7 @@ class ApprovalQueue:
         # the caller (frontend never prompts a retry) and the request
         # stranded in ``_pending`` because the AWAITER_GONE pop branch
         # was skipped.
-        if not awaiter_gone and request.status == ApprovalStatus.AWAITER_GONE:
+        if not awaiter_gone and request.status in (ApprovalStatus.AWAITER_GONE, ApprovalStatus.TIMEOUT):
             awaiter_gone = True
 
         if not awaiter_gone:

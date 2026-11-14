@@ -11,7 +11,6 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from kestrel_sovereign.security.tool_audit import ACTION_TOOL_RESOLUTION, ACTION_TOOL_VALIDATION
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.security.permissions import (
@@ -22,7 +21,10 @@ from kestrel_sovereign.features.security.permissions import (
     assert_sdk_permission_level_parity,
     compose_restrictive_permission,
 )
-
+from kestrel_sovereign.security.tool_audit import (
+    ACTION_TOOL_RESOLUTION,
+    ACTION_TOOL_VALIDATION,
+)
 
 #: Decisions that mean "this call was permitted to execute". Deliberately an
 #: allowlist: see the inversion note in ``security_audit_search``. Anything not
@@ -240,11 +242,16 @@ def default_permission_for_tool(
     weaken it.
     """
     return _DEFAULT_PERMISSION_BY_TOOL.get(feature_name, {}).get(tool_name)
-from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
-from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+
+from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.features.security.approval_queue import (
+    ApprovalQueue,
+    ApprovalRequest,
+)
+from kestrel_sovereign.features.security.hooks import SecurityHook
 
 logger = logging.getLogger(__name__)
 
@@ -769,6 +776,8 @@ class SecurityFeature(Feature):
         try:
             tree = await self.permission_store.get_permission_tree()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"list_permissions failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
