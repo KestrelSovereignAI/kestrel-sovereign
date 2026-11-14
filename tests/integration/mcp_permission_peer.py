@@ -325,12 +325,18 @@ def main():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         ready = Path(args.ready)
-        temporary = ready.with_suffix(".starting")
-        temporary.write_text(json.dumps({"port": listener.getsockname()[1]}))
-        temporary.replace(ready)
         config = uvicorn.Config(app, ssl_certfile=args.tls_cert, ssl_keyfile=args.tls_key,
                                 log_level="error")
-        uvicorn.Server(config).run(sockets=[listener])
+
+        class ReadyServer(uvicorn.Server):
+            async def startup(self, sockets=None):
+                await super().startup(sockets=sockets)
+                if self.started:
+                    temporary = ready.with_suffix(".starting")
+                    temporary.write_text(json.dumps({"port": listener.getsockname()[1]}))
+                    temporary.replace(ready)
+
+        ReadyServer(config).run(sockets=[listener])
 
 
 if __name__ == "__main__":
