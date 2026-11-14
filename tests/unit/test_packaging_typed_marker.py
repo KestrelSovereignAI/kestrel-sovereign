@@ -54,13 +54,20 @@ def _isolated_environment() -> dict[str, str]:
 @pytest.fixture(scope="module", params=[True, False], ids=["checkout", "source-archive"])
 def built_distributions(tmp_path_factory, request):
     project_dir = tmp_path_factory.mktemp("distribution-source")
+    with (REPOSITORY / "pyproject.toml").open("rb") as handle:
+        targets = tomllib.load(handle)["tool"]["hatch"]["build"]["targets"]
+    wheel_resources = targets["wheel"].get("force-include", {})
+    sdist_resources = targets["sdist"].get("force-include", {})
+    resource_inputs = sorted(set(wheel_resources) | set(sdist_resources))
     tracked = subprocess.check_output(
         [
-            "git", "ls-files", "-z", "--", "kestrel_sovereign", ".gitignore",
+            "git", "--no-optional-locks", "ls-files", "-z", "--", "kestrel_sovereign", ".gitignore",
             "pyproject.toml", "README.md", "LICENSE", "uv.lock",
+            *resource_inputs,
         ],
         cwd=REPOSITORY,
     ).decode().split("\0")
+    assert set(resource_inputs) <= set(tracked)
     package_files = set()
     for name in filter(None, tracked):
         target = project_dir / name
@@ -88,7 +95,8 @@ def built_distributions(tmp_path_factory, request):
     assert len(sdists) == 1, f"expected one Kestrel sdist, found {sdists}"
     return {
         "wheel": wheels[0], "sdist": sdists[0], "source": project_dir,
-        "package_files": package_files,
+        "package_files": package_files, "wheel_resources": wheel_resources,
+        "sdist_resources": sdist_resources,
     }
 
 
@@ -107,11 +115,19 @@ def test_distributions_ship_only_canonical_package_files(built_distributions, tm
         sdist = {
             member.name.split("/", 1)[1]: archive.extractfile(member).read()
             for member in archive.getmembers()
-            if member.isfile() and "/kestrel_sovereign/" in member.name
+            if member.isfile()
         }
-    assert set(wheel) == set(sdist) == built_distributions["package_files"]
-    for name in wheel:
-        assert wheel[name] == sdist[name] == (built_distributions["source"] / name).read_bytes()
+    package_files = built_distributions["package_files"]
+    wheel_sources = {name: name for name in package_files}
+    wheel_sources.update({target: source for source, target in built_distributions["wheel_resources"].items()})
+    assert set(wheel) == set(wheel_sources)
+    assert {name for name in sdist if name.startswith("kestrel_sovereign/")} == package_files
+    for name, source in wheel_sources.items():
+        assert wheel[name] == (built_distributions["source"] / source).read_bytes()
+    for name in package_files:
+        assert sdist[name] == (built_distributions["source"] / name).read_bytes()
+    for source, target in built_distributions["sdist_resources"].items():
+        assert sdist[target] == (built_distributions["source"] / source).read_bytes()
     rebuilt_dir = tmp_path / "rebuilt"
     subprocess.run(
         ["uv", "build", str(built_distributions["sdist"]), "--wheel", "--out-dir", str(rebuilt_dir)],

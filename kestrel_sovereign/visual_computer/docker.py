@@ -25,9 +25,9 @@ from uuid import uuid4
 
 from pydantic import SecretBytes, SecretStr, ValidationError
 from kestrel_sdk.computer_use import (
-    ActionReceipt, ActionRequest, ComputerSession, ControlRequest, DriverConnection,
-    EnvironmentCapabilities, EnvironmentLease, EnvironmentQuote, EnvironmentRequest,
-    ScreenObservation, ScreenFrame, SessionRequest,
+    ActionReceipt, ComputerSession, DriverConnection,
+    EnvironmentCapabilities, EnvironmentLease, EnvironmentQuote,
+    ScreenObservation, ScreenFrame,
 )
 from kestrel_sdk.resources import (
     ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown,
@@ -35,9 +35,11 @@ from kestrel_sdk.resources import (
 )
 from .dispatch import native_dispatch, native_trace
 from kestrel_sovereign._async_ownership import (
-    create_owned_task, await_owned_task, await_owned_operation, gather_owned, raise_owned_outcome,
+    await_owned_task, await_owned_operation, gather_owned, raise_owned_outcome,
 )
-from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_terminal_error
+from kestrel_sovereign.execution_custody import (
+    execution_cleanup_debts, execution_error_with_cause, execution_terminal_error,
+)
 from .docker_policy import container_arguments, verify_container
 from .docker_egress import DockerEgressPolicy, HTTPGateway, EgressDenied, EgressUnknown
 
@@ -132,6 +134,26 @@ class DockerCommandError(ResourceOutcomeUnknown):
         super().__init__(reason)
 
 
+def _docker_resource_absent(arguments, returncode, output, error):
+    """Recognize only supported, target-bound native inspection refusals."""
+    if (not returncode or arguments[:2] not in
+            (["container", "inspect"], ["image", "inspect"], ["network", "inspect"], ["volume", "inspect"])):
+        return False
+    target = arguments[-1]
+    absent = re.compile(rb"(?:Error: |Error response from daemon: )No such (?:object|image|container|network|volume): "
+                        + re.escape(target.encode()) + rb"\s*")
+    if absent.fullmatch(error):
+        return True  # Preserve the original supported daemon formats.
+    # Docker29.8.2's volume/network APIs use these other literal forms.
+    # No different status/output or partial/wrong-target diagnostic proves absence.
+    if type(returncode) is not int or returncode != 1 or output != b"[]\n":
+        return False
+    if arguments == ["volume", "inspect", target]:
+        return error == b"Error response from daemon: get " + target.encode() + b": no such volume\n"
+    return (arguments == ["network", "inspect", target]
+            and error == b"Error response from daemon: network " + target.encode() + b" not found\n")
+
+
 class DockerBoundary:
     """Local Unix daemon only; no inherited Docker context, proxy or credentials."""
 
@@ -182,6 +204,8 @@ class DockerBoundary:
                 cwd = Path(__file__).parent
                 async def launch_process():
                     nonlocal process, launch_started, exec_refused
+                    if current is not None:
+                        current()
                     launch_started = True
                     try:
                         # Retain the actual Process INSIDE the accepted native
@@ -238,21 +262,20 @@ class DockerBoundary:
                         reaped = True
                         if current is not None:
                             current()
-                except (TimeoutError, asyncio.CancelledError, OSError, DockerCommandError):
+                except (TimeoutError, asyncio.CancelledError, OSError, DockerCommandError) as error:
                     # Killing the CLI cannot unsend an accepted Docker/browser call.
-                    raise ResourceOutcomeUnknown("docker_transport_outcome_unknown") from None
-                except BaseException:
+                    raise execution_error_with_cause(
+                        ResourceOutcomeUnknown("docker_transport_outcome_unknown"), error)
+                except BaseException as error:
                     # Authority can revoke during process launch or output delivery.
                     # Join this owned process even when its check rejects the call.
                     if dispatched:
-                        raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
+                        raise execution_error_with_cause(
+                            ResourceOutcomeUnknown("driver_effect_outcome_unknown"), error)
                     raise
                 if process.returncode:
                     # Only this exact daemon response establishes current absence.
-                    target = arguments[-1]
-                    absent = re.compile(rb"(?:Error: |Error response from daemon: )No such (?:object|image|container): "
-                                        + re.escape(target.encode()) + rb"\s*")
-                    if arguments[:2] in (["container", "inspect"], ["image", "inspect"]) and absent.fullmatch(error):
+                    if _docker_resource_absent(arguments, process.returncode, output, error):
                         raise ResourceNotFound("docker_resource_absent")
                     raise DockerCommandError("docker_operation_outcome_unknown", diagnostics=output + error)
                 return output
@@ -612,10 +635,11 @@ class DockerComputerDriver:
         if current is not None:
             try:
                 current()
-            except Exception:
+            except Exception as error:
                 # The accepted native RPC may already have installed bytes or
                 # delivered input. Revoked private delivery is never no-effect.
-                raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
+                raise execution_error_with_cause(
+                    ResourceOutcomeUnknown("driver_effect_outcome_unknown"), error)
         if type(response) is not dict:
             raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
         if response.get("id") != identifier:
@@ -721,35 +745,8 @@ class DockerComputerDriver:
                 self._workspace_borrowers.pop(session.session_id,None)
         else:
             self._borrowers.pop(session.session_id, None)
-        error = outcome.error
-        from types import TracebackType
-
-        from kestrel_sovereign.execution_custody import (
-            execution_commit_outcome,
-            is_execution_control_error,
-        )
-        def descriptive_fields_only(node):
-            # Absence of a recognized control predicate is not proof that an
-            # original carrier has no other admission/native-source facts.
-            fields = vars(node)
-            if any(type(key) is not str or key not in {
-                    "__notes__", "_kestrel_retained_traceback"} for key in fields):
-                return False
-            notes = fields.get("__notes__", [])
-            trace = fields.get("_kestrel_retained_traceback")
-            return (type(notes) is list and all(type(note) is str for note in notes)
-                    and (trace is None or type(trace) is TracebackType))
-        cause = error.__cause__ if type(error) is asyncio.CancelledError else None
-        ordinary_cause = (cause is None or (type(cause) is ResourceOutcomeUnknown
-                          and cause.__cause__ is None and descriptive_fields_only(cause)))
-        if (outcome.cancellation is None and type(error) is asyncio.CancelledError
-                and ordinary_cause and descriptive_fields_only(error)
-                and not is_execution_control_error(error)
-                and execution_commit_outcome(error) is None):
-            # No receipt or no-effect claim follows from an interrupted driver.
-            # The original ledger/native dispatch owner still decides custody.
-            raise ResourceOutcomeUnknown("original_visual_operation_interrupted") from error
-        return raise_owned_outcome(outcome, operation="original visual driver borrow")
+        from .dispatch import raise_driver_borrow_outcome
+        return raise_driver_borrow_outcome(outcome, operation="original visual driver borrow")
 
     async def _perform_act(self, session, request, *, current=None):
         if session.session_id in self._pumps:

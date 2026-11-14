@@ -169,12 +169,15 @@ class ActiveCallEgress:
         """Authenticate one finite original same-map cleanup owner; grant no IO."""
         from .runpod_environment import _OriginalRunpodQuote
         from .runpod_lifecycle import _OriginalRunpodInspect, _OriginalRunpodRelease
+        from .local_worker import _OriginalLocalWorkerSetup
 
-        if (type(call) not in (_OriginalRunpodQuote, _OriginalRunpodInspect, _OriginalRunpodRelease)
+        if (type(call) not in (_OriginalRunpodQuote, _OriginalRunpodInspect, _OriginalRunpodRelease, _OriginalLocalWorkerSetup)
                 or call._host._runtime.egress is not self
                 or self._calls.get(call._key) is not call
                 or call._loop is not asyncio.get_running_loop()):
             raise OperatorAuthorizationError("Original environment cleanup owner differs")
+        if type(call) is _OriginalLocalWorkerSetup:
+            call._require_cleanup_original()
 
     def _require_environment_closer(self, call):
         self._require_environment_call(call)
@@ -196,6 +199,31 @@ class ActiveCallEgress:
                 outcome = await await_owned_task(finished)
                 raise_owned_outcome(outcome, operation="original environment invocation", retain_originals=True)
         return join_original()
+
+    @asynccontextmanager
+    async def _activate_local_worker_setup(self, call):
+        from .local_worker import _OriginalLocalWorkerSetup
+        if (type(call) is not _OriginalLocalWorkerSetup or call._host._runtime.egress is not self
+                or call._owner_task is not asyncio.current_task() or call._key in self._calls):
+            raise OperatorAuthorizationError("original local setup owner required")
+        self._calls[call._key] = call
+        original_error = None
+        try:
+            call._require_origin()
+            yield
+        except BaseException as error:
+            original_error = error
+            raise
+        finally:
+            try:
+                await self._close_environment_call(call)
+            except BaseException as cleanup:
+                from kestrel_sovereign.execution_custody import execution_terminal_error
+                raise execution_terminal_error(original_error, cleanup, retain_originals=True)
+            # Failed setup retains its completion/closer until the current
+            # Runtime acknowledges durable settlement of the original row.
+            if (not call._used or call._handed_off) and self._calls.get(call._key) is call:
+                self._calls.pop(call._key)
 
     @asynccontextmanager
     async def _activate_environment_quote(self, call):
