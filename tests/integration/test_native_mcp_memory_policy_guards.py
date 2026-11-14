@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+from contextlib import asynccontextmanager
 
 import pytest
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
@@ -199,7 +200,8 @@ async def test_native_authorization_clock_keeps_fractional_deadline_precision(pu
 
 @pytest.mark.parametrize("assistant_agent", [{"features": ["MemoryFeature"]}], indirect=True)
 @pytest.mark.parametrize("dispatch", ["subagent", "receipt"])
-async def test_direct_argument_guards_refuse_other_execution_paths(assistant_agent, dispatch):
+@pytest.mark.parametrize("guard_kind", ["arguments", "lifetime"])
+async def test_direct_argument_guards_refuse_other_execution_paths(assistant_agent, dispatch, guard_kind):
     from kestrel_sovereign.signals.constitution_canary import PHANTOM_RECEIPT_TOOL_NAME
 
     guards = []
@@ -207,9 +209,15 @@ async def test_direct_argument_guards_refuse_other_execution_paths(assistant_age
     async def original_guard(arguments, schema):
         guards.append(arguments)
 
+    @asynccontextmanager
+    async def original_lifetime():
+        guards.append("entered-unsupported-lifetime")
+        yield
+
     tool = "memory_feature" if dispatch == "subagent" else PHANTOM_RECEIPT_TOOL_NAME
-    with pytest.raises(ResourceUnsupported, match="Direct-tool argument guard cannot govern"):
+    with pytest.raises(ResourceUnsupported, match="Direct-tool guards cannot govern"):
         await assistant_agent.execute_named_tool(tool, {}, session_id="owned-direct-argument-policy",
             source="owned-direct-policy", operation_id="owned-unsupported-" + dispatch,
-            argument_guard=original_guard)
+            **({"argument_guard": original_guard} if guard_kind == "arguments"
+                else {"execution_lifetime": original_lifetime}))
     assert not guards, "A direct-tool policy was applied to an unsupported execution shape"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractAsyncContextManager, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hashlib
@@ -409,6 +409,7 @@ async def execute_tool_effect(
     execute: Callable[[], Awaitable[Any]],
     validate_registration: Callable[[], None] | None = None,
     expected_generation: int | None = None,
+    execution_lifetime: Callable[[], AbstractAsyncContextManager] | None = None,
 ) -> Any:
     """Claim durably and revalidate the registration selected before hooks.
 
@@ -461,28 +462,32 @@ async def execute_tool_effect(
             returned_error = False
             token = _current_claim.set(claim)
             try:
-                require_execution_work(owner)
-                turn.require_confirmed()
-                if registry_generation(owner) != generation:
-                    raise ResourceConflict('Tool registration changed during effect admission')
-                validators = ([prepared.validate] if prepared is not None else [])
-                if validate_registration is not None:
-                    validators.append(validate_registration)
-                for validate in validators:
-                    validation = validate()
-                    if validation is not None:
-                        if inspect.iscoroutine(validation):
-                            validation.close()
-                        raise TypeError('Tool registration validation must complete synchronously')
-                started = True
-                result = await execute()
-                returned = True
-                returned_error = (
-                    isinstance(result, ToolResult) and result.status == ToolResultStatus.ERROR
-                ) or (
-                    isinstance(result, dict)
-                    and (result.get("success") is False or result.get("status") == "error")
-                )
+                # Retain host permission across actual handler execution and
+                # its commit; journal claim and settlement stay independent.
+                # Registration checks run AFTER awaited permission acquisition.
+                async with execution_lifetime() if execution_lifetime is not None else nullcontext():
+                    require_execution_work(owner)
+                    turn.require_confirmed()
+                    if registry_generation(owner) != generation:
+                        raise ResourceConflict('Tool registration changed during effect admission')
+                    validators = ([prepared.validate] if prepared is not None else [])
+                    if validate_registration is not None:
+                        validators.append(validate_registration)
+                    for validate in validators:
+                        validation = validate()
+                        if validation is not None:
+                            if inspect.iscoroutine(validation):
+                                validation.close()
+                            raise TypeError('Tool registration validation must complete synchronously')
+                    started = True
+                    result = await execute()
+                    returned = True
+                    returned_error = (
+                        isinstance(result, ToolResult) and result.status == ToolResultStatus.ERROR
+                    ) or (
+                        isinstance(result, dict)
+                        and (result.get("success") is False or result.get("status") == "error")
+                    )
             except BaseException as execution_error:
                 error = execution_error
             finally:

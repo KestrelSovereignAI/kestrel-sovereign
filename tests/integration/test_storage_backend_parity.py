@@ -9,9 +9,15 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
-from kestrel_sdk.native_a2a.types import Artifact, Part, Role, SendMessageRequest, TaskState
 from google.protobuf.json_format import MessageToDict
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import (
+    Artifact,
+    Part,
+    Role,
+    SendMessageRequest,
+    TaskState,
+)
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified import ObservabilityStore
@@ -2153,7 +2159,9 @@ async def test_corpus_exclusion_manifest_holds_out_and_never_moves_back_on_eithe
         GovernedCorpusPolicy,
         Visibility,
     )
-    from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
+    from kestrel_sovereign.knowledge.corpus_exclusions import (
+        CorpusExclusionManifestError,
+    )
 
     tenant, identity = await _incepted_assertion_identity(tmp_path, "corpus-exclusions")
     authority = ExclusionAuthority(tmp_path / "sovereign", monkeypatch)
@@ -5335,3 +5343,51 @@ async def test_metric_summary_is_backend_neutral(db_backend):
     missing = await store.get_metric_summary("never_emitted")
     assert missing["count"] == 0
     assert missing["samples"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_caught_semantic_conflict_preserves_predecessor_in_outer_transaction(
+    db_backend, tmp_path, monkeypatch,
+):
+    """A caller may commit after catching a failed semantic sub-operation."""
+    from kestrel_sovereign.features.memory_agency.semantic_facts import (
+        FactLifecycleError,
+    )
+    from kestrel_sovereign.knowledge import AssertionStatus
+    from tests.utils.semantic_mutation_faults import immutable_revision_conflict
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "caught-semantic-conflict")
+    raw = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    # Direct storage receives a trusted server invocation identity, not a raw
+    # per-client retry key. Each new fixture is a new intention; the native
+    # MCP test separately exercises reused client keys across principals.
+    invocation = uuid4().hex
+    first = storage = None
+    try:
+        storage = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        first = await storage.save_explicit_fact(subject="user", predicate="preferred_deploy_region",
+            value="us-central1", confidence=1.0, invocation_id="owned-first-fact-" + invocation)
+        assert first.saved
+        caught = False
+        with immutable_revision_conflict(monkeypatch, raw._assertion_store(), object_value="europe-west4") as conflicts:
+            async with raw.db.transaction():
+                try:
+                    await storage.save_explicit_fact(subject="user", predicate="preferred_deploy_region",
+                        value="europe-west4", confidence=1.0, invocation_id="owned-conflicting-fact-" + invocation)
+                except FactLifecycleError:
+                    caught = True
+                assert raw.db.owns_open_transaction is True
+        assert conflicts and caught, "The actual caught canonical revision refusal was not reached"
+        held = await storage.get_assertion(first.assertion_id, include_inactive=True)
+        assert held.status is AssertionStatus.ACTIVE and held.revision_id == first.revision_id, (
+            "A caught semantic conflict committed its partial predecessor mutation")
+    finally:
+        try:
+            if storage is not None and first is not None and first.saved:
+                await storage.erase_assertion(first.assertion_id,
+                    operation_id="owned-parity-fact-cleanup-" + invocation)
+                assert await storage.get_assertion(first.assertion_id, include_inactive=True) is None, (
+                    "Parity fixture left its owned canonical seed behind")
+        finally:
+            await raw.close()

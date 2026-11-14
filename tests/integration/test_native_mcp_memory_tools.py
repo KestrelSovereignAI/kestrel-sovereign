@@ -35,7 +35,7 @@ async def test_native_memory_tools_use_actual_cold_core_feature_and_durable_admi
     http.headers.update({"authorization": "Bearer " + token, "x-api-key": KEY})
     async with Client(streamable_http_client(owner.resource, http_client=http), mode="2026-07-28") as client:
         tools = await client.list_tools()
-        assert {tool.name for tool in tools.tools} == {"search_memory", "recall_recent"}
+        assert {tool.name for tool in tools.tools} == {"search_memory", "recall_recent", "save_fact"}
         for name, arguments in [
             ("search_memory", {"query": content, "session_id": "owned-core-conversation"}),
             ("recall_recent", {}),
@@ -217,3 +217,78 @@ async def test_native_memory_budget_covers_original_governed_execution(publicati
     assert original_hook_retired and caller_retired, "Expired native execution retained original hook or caller authority"
     assert not claims, "Expired native memory executed after its original governance deadline"
     assert result is None and failure is not None and any(status == 500 for status, _body in responses)
+
+
+@pytest.mark.parametrize("assistant_agent", [{"features": ["MemoryFeature"]}], indirect=True)
+@pytest.mark.parametrize("prior_outcome", ["returned", "unconfirmed"])
+async def test_native_read_upgrade_preserves_prior_raw_intention_fence(publication, monkeypatch, prior_outcome):
+    from functools import wraps
+
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from mcp.server.mcpserver import Context
+
+    from kestrel_sovereign.features.base import _serialize_tool_result
+    from kestrel_sovereign.features.memory.feature import MemoryFeature
+    from kestrel_sovereign.mcp_server.memory_tools import _principal_key
+    from kestrel_sovereign.mcp_server.tool_caller import bind_native_mcp_tool_caller
+
+    owner, http = publication
+    feature = next(feature for feature in owner.agent.features.values() if isinstance(feature, MemoryFeature))
+    original = type(feature).recall_recent
+    reads = []
+    arguments = {"limit": 5, "operation_id": "owned-prior-read-intention", "conversation_id": "owned-prior-client"}
+
+    @wraps(original)
+    async def counted_read(self, *args, **kwargs):
+        if self is feature:
+            reads.append("original-read")
+        result = await original(self, *args, **kwargs)
+        if self is feature and prior_outcome == "unconfirmed" and len(reads) == 1:
+            raise ResourceOutcomeUnknown("Owned prior-version read result was lost")
+        return result
+
+    async def prior_read(context: Context) -> dict:
+        # The previous read entry point used this raw journal key. Seed it
+        # through the SAME verified caller and canonical dispatcher, not SQL
+        # rows or a second journal implementation.
+        async with bind_native_mcp_tool_caller(owner, context, "memory:read", disclose=True) as caller:
+            result = await owner.agent.execute_named_tool("recall_recent", {"limit": 5},
+                session_id=_principal_key(caller.identity, arguments["conversation_id"]), source="mcp",
+                operation_id=arguments["operation_id"])
+            return _serialize_tool_result(result)
+
+    monkeypatch.setattr(type(feature), "recall_recent", counted_read)
+    owner.runtime.server.add_tool(prior_read, name="owned_prior_read")
+    owner.publish()
+    token = (await issue_native_tokens(owner, http))["access_token"]
+    await observe_native_call(owner, token, "owned_prior_read", {}, discover_first=True)
+    before = await owner.agent._raw_storage.db.fetchall("SELECT state FROM tool_effect_claims")
+    assert reads == ["original-read"] and before == [(
+        "UNCONFIRMED" if prior_outcome == "unconfirmed" else "RETURNED_OK",)], before
+    result, failure, _responses = await observe_native_call(owner, token, "recall_recent", arguments, discover_first=True)
+    assert reads == ["original-read"], "Upgrade readmitted an existing native read intention"
+    assert failure is not None or result.is_error
+    assert await owner.agent._raw_storage.db.fetchall("SELECT state FROM tool_effect_claims") == before
+
+
+@pytest.mark.parametrize("assistant_agent", [{"features": ["MemoryFeature", "MemoryAgencyFeature"]}], indirect=True)
+@pytest.mark.parametrize("publication", [{"routing_key": "r" * 160, "clients": [{
+    "client_id": "owned-provider", "client_name": "Owned provider",
+    "redirect_uris": ["https://provider.example/callback"], "client_secret": "owned-secret",
+    "scopes": ["memory:read", "memory:write"],
+}]}], indirect=True)
+@pytest.mark.parametrize("name", ["search_memory", "recall_recent", "save_fact"])
+async def test_accepted_long_native_resource_executes_original_memory_callbacks(publication, name):
+    from kestrel_sovereign.agent.invocation import MAX_INVOCATION_ID_LENGTH
+
+    owner, http = publication
+    assert len(owner.resource) > MAX_INVOCATION_ID_LENGTH
+    owner.publish()
+    token = (await issue_native_tokens(owner, http,
+        scope="memory:write" if name == "save_fact" else "memory:read"))["access_token"]
+    arguments = {"operation_id": uuid4().hex, "conversation_id": "owned-long-resource"}
+    arguments.update({"save_fact": {"subject": "user", "predicate": "preferred_deploy_region", "value": "us-central1"},
+        "search_memory": {"query": "owned-long-resource", "limit": 5}, "recall_recent": {"limit": 5}}[name])
+    result, failure, _responses = await observe_native_call(owner, token, name, arguments, discover_first=True)
+    assert failure is None and result is not None and not result.is_error, (
+        "Accepted long MCP resource could not execute its canonical tool", name, result, failure)

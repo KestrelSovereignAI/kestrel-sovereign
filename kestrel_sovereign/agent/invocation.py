@@ -9,34 +9,39 @@ operation identity with the task that is actually executing the turn.
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from contextvars import ContextVar, copy_context
-from functools import wraps
 import hashlib
 import inspect
 import sys
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, TypeVar
 from urllib.parse import quote, unquote_to_bytes
-import uuid
 
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.execution_custody import (
-    bind_execution_cleanup, bind_execution_runtime, bind_execution_custody_snapshot,
-    current_execution_custody, require_execution_work,
-    execution_terminal_error, is_execution_control_error, execution_commit_outcome,
-    is_tool_execution_terminal_error,
-)
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
     caller_context_lifetime,
     caller_context_scope,
 )
+from kestrel_sovereign.execution_custody import (
+    bind_execution_cleanup,
+    bind_execution_custody_snapshot,
+    bind_execution_runtime,
+    current_execution_custody,
+    execution_commit_outcome,
+    execution_terminal_error,
+    is_execution_control_error,
+    is_tool_execution_terminal_error,
+    require_execution_work,
+)
 from kestrel_sovereign.turn_scope import turn_scoped
 
-
 MAX_INVOCATION_ID_LENGTH = 256
+MAX_PROVENANCE_LOCATOR_BYTES = 8192
 _HEADER_UNRESERVED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
@@ -122,18 +127,26 @@ class InvocationSelfFencedError(Exception):
     """
 
 
+def _bounded_text(value: object, field: str, maximum: int, *, utf8_bytes: bool = False) -> str:
+    """Share Unicode validation while keeping each field's own size contract."""
+    if type(maximum) is not int or maximum <= 0:
+        raise ValueError(f"{field} limit must be a positive integer")
+    unit = "bytes" if utf8_bytes else "characters"
+    message = f"{field} must be a non-empty string no longer than {maximum} {unit}"
+    if not isinstance(value, str) or not value or (not utf8_bytes and len(value) > maximum):
+        raise ValueError(message)
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{field} must be valid Unicode text") from error
+    if utf8_bytes and len(encoded) > maximum:
+        raise ValueError(message)
+    return value
+
+
 def validate_invocation_id(value: object) -> str:
     """Return a bounded opaque invocation id or reject an invalid one."""
-    if not isinstance(value, str) or not (1 <= len(value) <= MAX_INVOCATION_ID_LENGTH):
-        raise ValueError(
-            "invocation id must be a non-empty string no longer than "
-            f"{MAX_INVOCATION_ID_LENGTH} characters"
-        )
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise ValueError("invocation id must be valid Unicode text") from error
-    return value
+    return _bounded_text(value, "invocation id", MAX_INVOCATION_ID_LENGTH)
 
 
 def register_request_delivery(
@@ -165,6 +178,7 @@ async def admit_request_operation(
     at that caller, never a successful delivery.
     """
     from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
+
     from .request_lifecycle import bind_request_operation_if_supported
     admission = OwnedTaskAdmission()
     try:
@@ -331,6 +345,7 @@ def request_provenance(
     actor: object = None,
     source_kind: str,
     source_locator: str,
+    source_locator_max_bytes: int = MAX_PROVENANCE_LOCATOR_BYTES,
     received_at: str | None = None,
     input_digest: str | None = None,
     operation_key: str | None = None,
@@ -340,14 +355,17 @@ def request_provenance(
     ``actor`` is optional because a token-authenticated webhook can identify a
     trusted transport without claiming that an untrusted payload sender is the
     actor.  Endpoint code supplies the authenticated ``CallerContext``
-    identity when one exists.
+    identity when one exists. Source locators have their own UTF-8 byte budget;
+    a trusted host may supply the same declared budget as its HTTP resource.
+    They are not invocation IDs and do not inherit that field's character cap.
     """
     if actor is not None and not isinstance(actor, str):
         raise ValueError("provenance actor must be text when supplied")
     if actor is not None and not actor:
         actor = None
     source_kind = validate_invocation_id(source_kind)
-    source_locator = validate_invocation_id(source_locator)
+    source_locator = _bounded_text(source_locator, "provenance source locator",
+        source_locator_max_bytes, utf8_bytes=True)
     received_at = received_at or datetime.now(timezone.utc).isoformat()
     return InvocationProvenance(
         actor=actor,
@@ -668,7 +686,10 @@ def bind_async_invocation(
                             cleanup_abandoned = True
                             raise
                         try:
-                            from kestrel_sovereign._async_ownership import owned_native_completion, owned_native_wait
+                            from kestrel_sovereign._async_ownership import (
+                                owned_native_completion,
+                                owned_native_wait,
+                            )
                             with owned_native_completion(isolated_operation):
                                 async with owned_native_wait((isolated_operation,)):
                                     result = await isolated_operation

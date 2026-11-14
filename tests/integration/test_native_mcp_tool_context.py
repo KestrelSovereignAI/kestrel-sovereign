@@ -250,7 +250,7 @@ async def test_native_raw_result_holds_privacy_until_actual_body_delivery(public
     async def raw_result(context: Context) -> dict[str, str]:
         async with bind_native_mcp_tool_caller(owner, context, "memory:read"):
             request = context.request_context.request.scope[_REQUEST_KEY]
-            async with request.disclosure():
+            async with request.disclosure("memory:read"):
                 assert not gate.locked(), "Native disclosure inverted the leaf gate before canonical execution"
                 callback_finished.append(request)
                 return {"memory": private}
@@ -314,7 +314,7 @@ async def test_native_raw_result_is_refused_after_original_privacy_epoch_changes
     async def raw_result(context: Context) -> dict[str, str]:
         async with bind_native_mcp_tool_caller(owner, context, "memory:read"):
             request = context.request_context.request.scope[_REQUEST_KEY]
-            async with request.disclosure():
+            async with request.disclosure("memory:read"):
                 produced.append(request)
         if withdrawal in {"privacy", "privacy-round-trip"}:
             await owner.agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
@@ -372,7 +372,7 @@ async def test_write_only_native_grant_cannot_disclose_memory(publication):
     async def raw_result(context: Context) -> dict[str, str]:
         async with bind_native_mcp_tool_caller(owner, context, "conversation:write"):
             request = context.request_context.request.scope[_REQUEST_KEY]
-            async with request.disclosure():
+            async with request.disclosure("memory:read"):
                 produced.append(request)
                 return {"memory": private}
 
@@ -414,7 +414,7 @@ async def test_native_private_delivery_expires_without_abandoning_its_original_o
     async def raw_result(context: Context) -> dict[str, str]:
         async with bind_native_mcp_tool_caller(owner, context, "memory:read"):
             request = context.request_context.request.scope[_REQUEST_KEY]
-            async with request.disclosure():
+            async with request.disclosure("memory:read"):
                 requests.append(request)
                 return {"memory": private}
 

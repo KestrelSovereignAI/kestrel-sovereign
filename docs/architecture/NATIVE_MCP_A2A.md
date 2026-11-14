@@ -1692,7 +1692,7 @@ storage custody. Native MCP routes select a transport-only caller lane before
 Console credentials; an additional owner API key cannot bypass the official SDK's
 Bearer verifier or authorize private Console consent.
 
-The native server exposes `search_memory` and `recall_recent` through the same
+The native server exposes `search_memory`, `recall_recent` and `save_fact` through the same
 `Agent.execute_named_tool` entry point used by other governed transports. It
 does not call MemoryFeature or its storage directly. The original official SDK
 request and freshly verified SQL grant bind a non-sovereign `MCP_OAUTH` caller;
@@ -1700,12 +1700,40 @@ an owner API key added to the request does not promote it. The principal binds
 resource, issuer, client and subject, surviving access-token refresh and SDK
 publication restart while separating different registered clients.
 Canonical external invocation borrows that original caller binding instead of
-creating a second lifetime from its immutable caller value. HTTP retirement
+creating a second lifetime from its immutable caller value. Trusted HTTP
+provenance retains the full resource URL under the host's `max_request_bytes`
+UTF-8 budget; it does not apply the unrelated invocation-ID character limit.
+HTTP retirement
 therefore revokes copied hook tasks even when the SDK retains their original
 governed work while its outcome settles.
 
+`save_fact` requires explicit `memory:write` consent and the same full-storage
+privacy policy. It uses the existing MemoryAgencyFeature and governed semantic
+writer, including its closed `user.preferred_deploy_region` mapping. Unsupported
+terms are refused; this is not an arbitrary `remember` surface. Trusted request
+provenance names the verified MCP principal and actual HTTP resource, rather
+than attributing the external teaching to Kestrel.
+
+The canonical effect journal commits its original claim before acquiring the
+write lifetime, then revalidates registration after that awaited acquisition.
+Only the selected handler runs inside the original grant's serialized primary
+transaction. The existing semantic writer joins that transaction; its receipt
+remains provisional until the top-level COMMIT returns. Each canonical semantic
+mutation retains its own rollback-safe savepoint inside that transaction, so a
+caught domain error cannot commit a partial predecessor update. Expiry or refusal before
+commit rolls back the fact. Revocation shares the original authorization lock.
+The journal settles independently after releasing that transaction; uncertainty
+stays visible and fences replay instead of authorizing another write. Write
+arguments are bounded by `max_request_bytes` both initially and after hook
+rewrites. Fact replacement is declared destructive in the official tool hint.
+
 Every call requires a stable `operation_id` and a client `conversation_id`.
-The former enters Core's canonical durable intention journal; redelivery does
+The former is scoped to the verified resource/client/subject principal before
+entering both Core's canonical durable intention journal and semantic persistence.
+Independent clients may reuse their own opaque IDs without colliding. Existing
+read operations retain the raw key inside the already caller-namespaced journal;
+an upgrade must preserve confirmed and unconfirmed read replay fences. New fact
+writes additionally scope the semantic invocation identity. Redelivery does
 not authorize another execution, including after refresh. Retain it for
 reconciliation after an unconfirmed result. A new intention requires a new ID.
 The latter is namespaced with the verified principal before it becomes a Core

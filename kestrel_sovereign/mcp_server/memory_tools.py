@@ -11,12 +11,22 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
-from kestrel_sovereign.agent.invocation import validate_invocation_id
+from kestrel_sovereign.agent.invocation import (
+    invocation_scope,
+    request_provenance,
+    validate_invocation_id,
+)
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.features.base import _serialize_tool_result
 
-from .tool_caller import bind_native_mcp_tool_caller
+from .tool_caller import bind_native_mcp_tool_caller, native_mcp_write_lifetime
+
+
+def _principal_key(identity, client_key):
+    """One stable native identity namespace for caller-supplied opaque keys."""
+    return "mcp:" + hashlib.sha256(json.dumps([identity, client_key],
+        separators=(",", ":")).encode()).hexdigest()
 
 
 class NativeMCPMemoryTools:
@@ -42,22 +52,38 @@ class NativeMCPMemoryTools:
                 or len(arguments["query"].encode("utf-8")) > policy.max_query_bytes):
             raise ToolError("Memory query is empty or exceeds the configured server limit")
 
-    async def _invoke(self, context, name, arguments, operation_id, conversation_id):
+    async def _validate_write_arguments(self, arguments, schema=None):
+        try:
+            encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False,
+                separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError) as error:
+            raise ToolError("Memory write arguments must be finite JSON values") from error
+        if len(encoded) > self.publication.policy.max_request_bytes:
+            raise ToolError("Memory write arguments exceed the configured server byte limit")
+
+    async def _invoke(self, context, name, arguments, operation_id, conversation_id, *, write=False):
         policy = self.publication.policy
         try:
             operation_id = validate_invocation_id(operation_id)
             conversation_id = validate_invocation_id(conversation_id)
         except ValueError as error:
             raise ToolError("A bounded operation_id and conversation_id are required") from error
-        await self._validate_arguments(arguments)
+        guard = self._validate_write_arguments if write else self._validate_arguments
+        await guard(arguments)
+        required_scope = "memory:write" if write else "memory:read"
         try:
-            async with bind_native_mcp_tool_caller(self.publication, context, "memory:read",
+            async with bind_native_mcp_tool_caller(self.publication, context, required_scope,
                     disclose=True) as caller:
-                session = "mcp:" + hashlib.sha256(json.dumps([caller.identity, conversation_id],
-                    separators=(",", ":")).encode()).hexdigest()
-                result = await self.publication.agent.execute_named_tool(name, arguments,
-                    session_id=session, source="mcp", operation_id=operation_id,
-                    argument_guard=self._validate_arguments)
+                session = _principal_key(caller.identity, conversation_id)
+                if write:
+                    operation_id = _principal_key(caller.identity, operation_id)
+                provenance = request_provenance(actor=caller.identity, source_kind="http_request",
+                    source_locator=self.publication.resource, source_locator_max_bytes=policy.max_request_bytes)
+                with invocation_scope(operation_id, provenance=provenance):
+                    result = await self.publication.agent.execute_named_tool(name, arguments,
+                        session_id=session, source="mcp", operation_id=operation_id, argument_guard=guard,
+                        execution_lifetime=native_mcp_write_lifetime(
+                            self.publication, context, required_scope) if write else None)
                 payload = _serialize_tool_result(result)
                 if not isinstance(payload, dict):
                     raise ToolError("Canonical memory tool returned an invalid result envelope")
@@ -84,8 +110,21 @@ class NativeMCPMemoryTools:
         """Recall recent Kestrel messages. Retain operation_id on retries; use a new ID for a new intention."""
         return await self._invoke(context, "recall_recent", {"limit": limit}, operation_id, conversation_id)
 
+    async def save_fact(self, context: Context, subject: str, predicate: str, value: str,
+            operation_id: str, conversation_id: str,
+            confidence: float = 1.0) -> Annotated[CallToolResult, dict[str, Any]]:
+        """Teach the canonical user.preferred_deploy_region fact; unsupported terms are refused.
+
+        This requires memory:write consent. Retain operation_id for reconciliation;
+        an unconfirmed result is not permission to repeat the write.
+        """
+        return await self._invoke(context, "save_fact",
+            {"subject": subject, "predicate": predicate, "value": value, "confidence": confidence},
+            operation_id, conversation_id, write=True)
+
     def register(self):
-        annotations = ToolAnnotations(read_only_hint=False, destructive_hint=False,
-            idempotent_hint=False, open_world_hint=False)
-        for callback in (self.search_memory, self.recall_recent):
+        for callback in (self.search_memory, self.recall_recent, self.save_fact):
+            annotations = ToolAnnotations(read_only_hint=False,
+                destructive_hint=callback.__name__ == "save_fact",
+                idempotent_hint=False, open_world_hint=False)
             self.publication.runtime.server.add_tool(callback, annotations=annotations)
