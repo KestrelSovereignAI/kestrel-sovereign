@@ -1,4 +1,4 @@
-"""Run Core's operator forms with published MCP in its original Docker namespace."""
+"""Run Core's native browser paths with published MCP in an owned namespace."""
 
 import argparse
 from contextlib import closing
@@ -47,7 +47,13 @@ def runtime_install_command(python, mcp_version, core_wheel):
             f'kestrel-feature-mcp=={mcp_version}', str(core_wheel)]
 
 
-def build_input_image(client, owner, core, mcp, output):
+def build_input_image(client, owner, core, mcp, output, *, suite='input'):
+    selected_tests = {
+        'input': 'tests/integration/test_mcp_input_host_browser.py',
+        'consent': 'tests/integration/test_native_mcp_consent_browser.py',
+    }
+    if suite not in selected_tests:
+        raise ValueError('Unknown native MCP browser suite')
     # The MCP project owns one browser/runtime build and namespace owner.
     # Its checkout supplies test support; runtime imports below must come from
     # the public MCP wheel and the candidate Core wheel in site-packages.
@@ -82,13 +88,14 @@ for label,package,distribution in [('core','kestrel_sovereign','kestrel-sovereig
 sys.path.insert(0,'/core-tests')
 runpy.run_path('/owned/verify.py')
 try:
- result=pytest.main(['tests/integration/test_mcp_input_host_browser.py','-q',
+ result=pytest.main([SELECTED_TESTS,'-q',
   '-p','pytest_asyncio.plugin','-p','pytest_timeout','-p','kestrel_sovereign.testing.fixtures',
   '--confcutdir=tests/integration','-o','addopts=','-o','asyncio_mode=auto','--timeout=60',
   '--junitxml=/input-browser.xml','--basetemp=/owned-input-browser-tests'])
 finally: runpy.run_path('/owned/verify.py')
 raise SystemExit(result)
 '''
+    run = run.replace('SELECTED_TESTS', repr(selected_tests[suite]))
     context = io.BytesIO()
     with tarfile.open(fileobj=context, mode='w') as archive:
         def add(name, body):
@@ -129,11 +136,12 @@ CMD ["/work/.venv/bin/python", "-I", "-B", "/owned/run.py"]
     if not image_id:
         raise RuntimeError('Input browser build returned no immutable image ID')
     owner.save_receipt(output / 'input-build.json', dict(image_id=image_id, runtime=manifest,
-        core_wheel_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(), base_image=base))
+        core_wheel_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(), base_image=base,
+        suite=suite, selected_tests=selected_tests[suite]))
     return image_id
 
 
-def run_acceptance(client, owner, image_id, output):
+def run_acceptance(client, owner, image_id, output, *, suite='input'):
     with owner.original_container(client, image_id, output / 'container.json') as (cid, receipt):
         client.api.start(cid)
         receipt['test_wait'] = client.api.wait(cid, timeout=300)
@@ -144,9 +152,16 @@ def run_acceptance(client, owner, image_id, output):
         counts = {kind: sum(case.find(kind) is not None for case in cases)
                   for kind in ('failure', 'error', 'skipped')}
         receipt.update(tests=len(cases), results=counts)
+        if suite == 'consent' and receipt['test_wait']['StatusCode'] == 0 and not any(counts.values()):
+            receipt['screenshots'] = {}
+            for decision in ('approve', 'deny'):
+                name = 'consent-' + decision + '.png'
+                body = owner.container_file(client, cid, '/owned/' + name)
+                (output / name).write_bytes(body)
+                receipt['screenshots'][name] = hashlib.sha256(body).hexdigest()
         owner.save_receipt(output / 'container.json', receipt)
         if receipt['test_wait']['StatusCode'] or not cases or any(counts.values()):
-            raise RuntimeError(f'Native input browser acceptance failed: {output / "browser.log"}')
+            raise RuntimeError(f'Native MCP browser acceptance failed: {output / "browser.log"}')
 
 
 def main():
@@ -156,6 +171,7 @@ def main():
     parser.add_argument('--mcp-source', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--cleanup', action='store_true')
+    parser.add_argument('--suite', choices=('input', 'consent'), default='input')
     args = parser.parse_args()
     mcp = args.mcp_source.resolve(strict=True)
     core = Path(__file__).resolve().parents[2]
@@ -170,8 +186,8 @@ def main():
                 owner.retire_container(client, receipt['container_id'], receipt, path)
             return
         args.output.mkdir(parents=True, exist_ok=False)
-        image_id = build_input_image(client, owner, core, mcp, args.output)
-        run_acceptance(client, owner, image_id, args.output)
+        image_id = build_input_image(client, owner, core, mcp, args.output, suite=args.suite)
+        run_acceptance(client, owner, image_id, args.output, suite=args.suite)
 
 
 if __name__ == '__main__':

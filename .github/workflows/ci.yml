@@ -513,17 +513,30 @@ jobs:
           uv run --no-sync python tests/native_mcp/run_input_browser.py
           --mcp-source native-mcp-browser-support
           --output "${{ runner.temp }}/mcp-input-browser"
+      - name: Exercise native server consent with an owned HTTPS connector
+        run: >-
+          uv run --no-sync python tests/native_mcp/run_input_browser.py
+          --mcp-source native-mcp-browser-support --suite consent
+          --output "${{ runner.temp }}/mcp-consent-browser"
       - name: Retire the original browser namespace
         if: always()
         run: >-
           uv run --no-sync python tests/native_mcp/run_input_browser.py
           --mcp-source native-mcp-browser-support
           --output "${{ runner.temp }}/mcp-input-browser" --cleanup
+      - name: Retire the original consent browser namespace
+        if: always()
+        run: >-
+          uv run --no-sync python tests/native_mcp/run_input_browser.py
+          --mcp-source native-mcp-browser-support --suite consent
+          --output "${{ runner.temp }}/mcp-consent-browser" --cleanup
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: mcp-input-browser-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/mcp-input-browser/
+          path: |
+            ${{ runner.temp }}/mcp-input-browser/
+            ${{ runner.temp }}/mcp-consent-browser/
           if-no-files-found: error
 
   mcp-gateway-seam:
