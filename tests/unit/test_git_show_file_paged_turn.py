@@ -176,7 +176,7 @@ class _PagingModel:
             assert not content.startswith("[Large tool output"), (
                 "the orchestrator replaced the tool result with its preview"
             )
-            if content.startswith("[Result truncated"):
+            if content.startswith(oe.PRUNED_TOOL_RESULT_PREFIX):
                 raise PrunedBeforeRead(
                     "the orchestrator pruned a result before the model read it"
                 )
