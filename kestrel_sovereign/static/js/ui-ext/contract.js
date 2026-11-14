@@ -153,7 +153,7 @@
  *
  * @typedef {Object} ChatMessageActionsContext
  * @property {string}   messageId  - the message's persisted id.
- * @property {string}  [role]      - `'user'` | `'assistant'` (message role).
+ * @property {string}  [role]      - `'user'` | `'assistant'` | `'external_assistant'` (stored speaker).
  * @property {object}  [metadata]  - the message's metadata payload, if any.
  * @property {string}  [agent]     - the owning agent name (bubble's pane), if resolvable.
  * @property {object}   api        - the API client, same handle render-based slot

@@ -13,9 +13,9 @@ finalization boundary. Every section reports content/messages, token
 cost, item count, provenance, and any required persistence. The
 coordinator applies budget/slack policy; the section *definitions* live here.
 
-Deliberately dependency-light: this module imports only the standard
-library so both ``context_manager`` and ``context_builder`` can import it
-without an import cycle. It never imports either of them back.
+Deliberately dependency-light: this module uses the standard library and the
+standalone conversation-speaker projection so both ``context_manager`` and
+``context_builder`` can import it without an import cycle. It never imports either of them back.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from kestrel_sovereign.conversation_speakers import project_conversation_message
 
 logger = logging.getLogger(__name__)
 
@@ -462,27 +464,8 @@ def emit_content_for_msg(
     msg: Dict[str, Any],
     wrap_user_input: Callable[[str], str],
 ) -> str:
-    """Select the bytes a message will emit in ``format_conversation_history``.
-
-    Mirrors the emit-byte selection in
-    ``ContextBuilder.format_conversation_history`` so the lumpy anchor
-    counts the SAME bytes the LLM will see. Without this, the anchor can
-    over-estimate fit for ``sent_form`` user/system rows (whose
-    ``rendered_content`` may be larger than raw ``content``) and let the
-    formatter fall into its just-enough skip path — recreating the
-    per-turn cache churn the anchor is supposed to prevent.
-    """
-    role = msg.get("role", "user")
-    if role not in ("user", "assistant", "system"):
-        role = "user" if role == "human" else "assistant"
-    raw = msg.get("content", "") or ""
-    rendered = msg.get("rendered_content")
-    meta = msg.get("metadata") or {}
-    if role in ("user", "system") and meta.get("sent_form") and rendered is not None:
-        return rendered
-    if role == "user" and not meta.get("sent_form"):
-        return wrap_user_input(raw)
-    return rendered if rendered is not None else raw
+    """Use the exact canonical projection the provider-history formatter uses."""
+    return project_conversation_message(msg, wrap_user_input)[1]
 
 
 def compute_lumpy_anchor(

@@ -17,6 +17,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from kestrel_sovereign.conversation_speakers import project_conversation_message
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.logging_config import content_log_summary
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
@@ -26,7 +27,6 @@ from .system_prompt_assembler import (
     legacy_bootstrap_audit_name,
 )
 from .token_counter import TokenCounter, get_token_counter
-
 
 # Per-message overhead used by format_conversation_history and the
 # effective-history estimator.
@@ -87,9 +87,11 @@ from kestrel_sovereign.security.input_guardrails import (  # noqa: E402
     extract_raw_user_content as extract_raw_user_content,
 )
 
-
 if TYPE_CHECKING:
-    from kestrel_sovereign.llm.constitutional_profile import PromptAdaptation, StateOfMind
+    from kestrel_sovereign.llm.constitutional_profile import (
+        PromptAdaptation,
+        StateOfMind,
+    )
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
 
@@ -105,10 +107,14 @@ logger = logging.getLogger(__name__)
 # here — and an unused-import sweep must not strip them.
 from kestrel_sovereign.features.bootstrap.loader import (
     DEFAULT_BOOTSTRAP_FILES as BOOTSTRAP_FILE_ORDER,  # noqa: F401
+)
+from kestrel_sovereign.features.bootstrap.loader import (
     DEFAULT_MAX_CHARS_PER_FILE,
     DEFAULT_MAX_TOTAL_CHARS,
-    truncate_content as truncate_bootstrap_content,  # noqa: F401
     BootstrapLoader,
+)
+from kestrel_sovereign.features.bootstrap.loader import (
+    truncate_content as truncate_bootstrap_content,  # noqa: F401
 )
 
 
@@ -409,7 +415,10 @@ class ContextBuilder:
 
         # The semantic boundary is opt-in. Disabled and empty results preserve
         # the legacy RAG bytes exactly, including ordering and cache behavior.
-        from kestrel_sovereign.agent.semantic_recall import coerce_config, render_hybrid_context
+        from kestrel_sovereign.agent.semantic_recall import (
+            coerce_config,
+            render_hybrid_context,
+        )
         try:
             from kestrel_sovereign.config import load_section
             recall_values = load_section("retrieval") or {}
@@ -530,7 +539,11 @@ class ContextBuilder:
         if not candidates:
             return {}
         from kestrel_sovereign.agent.semantic_recall import _claim_text
-        from kestrel_sovereign.llm.embedding_service import aembed_retrieval_query, cosine_similarity, get_provider_embedding_service
+        from kestrel_sovereign.llm.embedding_service import (
+            aembed_retrieval_query,
+            cosine_similarity,
+            get_provider_embedding_service,
+        )
         service = get_provider_embedding_service(self._llm_service)
         if service is None:
             raise RuntimeError("semantic_embedding_capability_unavailable")
@@ -561,7 +574,9 @@ class ContextBuilder:
             # The judge sees only the bounded, already-ranked top-K projection.
             # It runs before provenance hydration, so rejected or failed claims
             # cannot be published through a later storage read.
-            from kestrel_sovereign.storage.memory_answerability import AnswerabilityCandidate
+            from kestrel_sovereign.storage.memory_answerability import (
+                AnswerabilityCandidate,
+            )
             ranked = sorted(
                 (item for item in candidates if item.assertion.assertion_id in scores),
                 key=lambda item: (-scores[item.assertion.assertion_id], item.assertion.assertion_id),
@@ -721,54 +736,8 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
 
         # Iterate in reverse (newest first) to prioritize recent messages
         for msg in reversed(recent):
-            role = msg.get('role', 'user')
-            raw_content = msg.get('content', '')
-            rendered_content = msg.get('rendered_content')
             msg_id = msg.get('id')
-            meta = msg.get('metadata') or {}
-
-            # Normalize role names FIRST so the wrap-decision below treats
-            # legacy ``human`` rows as user turns (codex round-1 P2).
-            # Without this, ``human`` falls through the user-branch and
-            # the anti-injection ``<user_input>`` wrapper is silently
-            # dropped on replay.
-            if role not in ('user', 'assistant', 'system'):
-                role = 'user' if role == 'human' else 'assistant'
-
-            # Select the bytes to emit (#1402). For user/system turns flagged
-            # ``sent_form`` we replay the rendered transport form verbatim
-            # — this is the byte-identical prefix the LLM saw at write
-            # time, which is the prerequisite for Anthropic's cache_control
-            # marker at messages[-2] + llama.cpp KV + OpenAI prefix
-            # caching to compound across turns. For legacy unwrapped user
-            # turns (no sent_form flag) we wrap with the anti-injection
-            # <user_input> markers so the system prompt contract still
-            # holds. Assistant/system messages pass through unchanged.
-            # The safety fallback at the bottom handles a sent_form row
-            # whose rendered_content is missing (should not happen post
-            # #1402 — get_conversation_history splits in-memory even when
-            # the DB write is disabled).
-            if (
-                role in ('user', 'system')
-                and meta.get('sent_form')
-                and rendered_content is not None
-            ):
-                content = rendered_content
-            elif role == 'user' and not meta.get('sent_form'):
-                content = wrap_user_input(raw_content)
-            else:
-                content = rendered_content if (rendered_content is not None) else raw_content
-
-            if role == 'assistant' and meta.get('pre_tool_reasoning'):
-                pre_tool = meta.get('pre_tool_reasoning') or {}
-                if isinstance(pre_tool, dict):
-                    pre_text = pre_tool.get('content') or ''
-                    seam = pre_tool.get('seam') or ''
-                else:
-                    pre_text = str(pre_tool)
-                    seam = "\n\n" if pre_text and content else ""
-                if pre_text:
-                    content = f"{pre_text}{seam}{content}"
+            role, content = project_conversation_message(msg, wrap_user_input)
 
             # Per-message hard cap (against the emit bytes — what actually
             # goes to the LLM) before budget accounting.
@@ -828,8 +797,8 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 'messages_total': int,    # input history length
             }
         """
-        from .token_counter import get_token_counter
         from .token_budget import create_budget
+        from .token_counter import get_token_counter
 
         counter = get_token_counter(model_name)
         context_limit = counter.get_context_limit()

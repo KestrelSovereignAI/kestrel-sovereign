@@ -1692,7 +1692,7 @@ storage custody. Native MCP routes select a transport-only caller lane before
 Console credentials; an additional owner API key cannot bypass the official SDK's
 Bearer verifier or authorize private Console consent.
 
-The native server exposes `search_memory`, `recall_recent` and `save_fact` through the same
+The native server exposes `search_memory`, `recall_recent`, `save_fact` and `log_turn` through the same
 `Agent.execute_named_tool` entry point used by other governed transports. It
 does not call MemoryFeature or its storage directly. The original official SDK
 request and freshly verified SQL grant bind a non-sovereign `MCP_OAUTH` caller;
@@ -1714,6 +1714,37 @@ terms are refused; this is not an arbitrary `remember` surface. Trusted request
 provenance names the verified MCP principal and actual HTTP resource, rather
 than attributing the external teaching to Kestrel.
 
+`log_turn` accepts an explicitly supplied user/assistant exchange under
+`memory:write` and the same NORMAL/PUBLIC policy. Its canonical
+MemoryAgencyFeature operation composes the existing PrivacyAgent conversation
+writers in one independently rollback-safe transaction. Both exact positive row
+IDs stay provisional until the original outer grant transaction commits; no
+content lookup or second INSERT recovers an uncertain receipt. The canonical
+journal fences repeated intentions. The conversation namespace is derived from
+the verified principal, then checked again on the actual hook-rewritten tool
+arguments. A hook cannot redirect the pair into another client's namespace or
+escape the host's byte budget.
+
+The imported reply is stored with role `external_assistant`, with no Kestrel
+model/provider stamp. Both rows carry the verified external principal and
+operation in `external_exchange` metadata. Context replay presents imported
+output as attributed untrusted user input, disregarding any sent-form or
+pre-tool-reasoning fields that could impersonate a prior Kestrel response.
+Memory recall uses that same untrusted-speaker classification and escapes
+retrieved delimiters before context assembly, including the legacy `human`
+user alias. Imported output cannot forge a fresh live-input block by closing
+the retrieved-memory envelope.
+The shared chat component and real Console history loader display an explicit
+external-assistant label; imported HTML remains text and cannot manufacture a
+Kestrel model footer or tool-execution card. The supplied exchange is evidence
+of what that authenticated client submitted, not proof that Kestrel generated
+its reply or performed its described actions.
+
+A successful pair receipt currently reports `memory_processing=not_scheduled`.
+Persistence alone does not claim emotional tagging, later reflection or
+consolidation. Restart-safe processing and real native-provider installation
+remain separate acceptance work.
+
 The canonical effect journal commits its original claim before acquiring the
 write lifetime, then revalidates registration after that awaited acquisition.
 Only the selected handler runs inside the original grant's serialized primary
@@ -1732,8 +1763,8 @@ The former is scoped to the verified resource/client/subject principal before
 entering both Core's canonical durable intention journal and semantic persistence.
 Independent clients may reuse their own opaque IDs without colliding. Existing
 read operations retain the raw key inside the already caller-namespaced journal;
-an upgrade must preserve confirmed and unconfirmed read replay fences. New fact
-writes additionally scope the semantic invocation identity. Redelivery does
+an upgrade must preserve confirmed and unconfirmed read replay fences. New memory
+writes additionally scope their canonical invocation identity. Redelivery does
 not authorize another execution, including after refresh. Retain it for
 reconciliation after an unconfirmed result. A new intention requires a new ID.
 The latter is namespaced with the verified principal before it becomes a Core
@@ -1778,9 +1809,16 @@ from the callback. The approved grant also completes native PKCE exchange and
 a governed memory read. The existing browser CI lane runs both its operator
 input and server consent suites and retires each original container.
 
-This is owned-connector acceptance. Atomic external `log_turn`, actual
-Claude/ChatGPT installation and subsequent reflection/consolidation remain
-acceptance gates of #1990 and the original epic.
+A third Chromium case persists an exchange through the native MCP callback,
+loads its exact session through the real conversation API and Console history
+renderer, and exercises the shared chat component. It verifies the external
+speaker label, literal handling of supplied HTML and absence of a claimed
+Kestrel generator footer. Its single-agent component host uses the Console's
+canonical local classic assets and original authentication/session middleware.
+
+This is owned-connector acceptance. Actual Claude/ChatGPT installation and
+restart-safe subsequent reflection/consolidation remain acceptance gates of
+#1990 and the original epic.
 
 ## Review, verification and release order
 
