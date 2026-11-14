@@ -1273,6 +1273,46 @@ class SQLiteBackend(DatabaseBackend):
                 "Stop the agent and retry."
             )
 
+    async def _acquire_connection(
+        self, database: str, *, close_diagnostics: _SQLiteCloseDiagnostics | None = None,
+        **options: Any,
+    ) -> aiosqlite.Connection:
+        """Own the actual constructor before the first cancellable observation.
+
+        Cancelling aiosqlite's handshake Future can discard an open native
+        connection produced later by its worker. The canonical original owner
+        must finish that handshake before caller withdrawal can escape. Any
+        failed/withdrawn acquisition then joins the SAME connection's close and
+        worker, not a no-op close of a cancelled handshake or a substitute open.
+        """
+        from kestrel_sovereign._async_ownership import OwnedOperation, raise_owned_outcome
+        from kestrel_sovereign.execution_custody import execution_observation_error
+
+        connection = aiosqlite.connect(database, **options)
+
+        async def connect_original():
+            return await connection
+
+        original = OwnedOperation(
+            connect_original(), retirement_resource=connection, retain_originals=True,
+        )
+        outcome = await original.observe()
+        if (outcome.error is not None or outcome.cancellation is not None) and original.task is not None:
+            # observe() joined this exact admitted constructor. A failed open
+            # still owns a worker; a successful but withdrawn open owns a live
+            # native connection. Both require actual physical retirement.
+            try:
+                await _close_aiosqlite_connection(
+                    connection, retained_closes=self._retired_connection_closes,
+                    diagnostics=close_diagnostics or self._close_diagnostics(),
+                )
+            except BaseException as cleanup_error:
+                raise execution_observation_error(outcome.error, outcome.cancellation, cleanup_error)
+        return raise_owned_outcome(
+            outcome, operation="original SQLite connection acquisition",
+            retain_originals=True, retain_observer_cancellations=True,
+        )
+
     async def connect(self) -> None:
         """Connect to SQLite database."""
         self._require_execution_backend()
@@ -1304,14 +1344,14 @@ class SQLiteBackend(DatabaseBackend):
                     before_identity = (before.st_dev, before.st_ino)
 
             if self.cold_read:
-                self._connection = await aiosqlite.connect(
+                self._connection = await self._acquire_connection(
                     self._cold_read_uri(),
                     uri=True,
                     timeout=_SQLITE_BUSY_TIMEOUT_S,
                     factory=_NativeJournalSQLiteConnection,
                 )
             else:
-                self._connection = await aiosqlite.connect(
+                self._connection = await self._acquire_connection(
                     str(self._resolved_path) if self._resolved_path is not None else ":memory:",
                     timeout=_SQLITE_BUSY_TIMEOUT_S,
                     factory=_NativeJournalSQLiteConnection,
@@ -1594,8 +1634,9 @@ class SQLiteBackend(DatabaseBackend):
             raise ValueError("Cannot back up an in-memory database")
         conn = self._ensure_connected()
         async with self._write_guard():
-            dest = await aiosqlite.connect(
-                dest_path, timeout=_SQLITE_BUSY_TIMEOUT_S
+            dest = await self._acquire_connection(
+                dest_path, timeout=_SQLITE_BUSY_TIMEOUT_S,
+                close_diagnostics=_capture_close_diagnostics(dest_path, None),
             )
             body_error = None
             try:
@@ -1650,7 +1691,7 @@ class SQLiteBackend(DatabaseBackend):
         connected to; a replaced pathname is refused.
         """
         self.assert_connected_file_still_valid()
-        conn = await aiosqlite.connect(
+        conn = await self._acquire_connection(
             self._resolved_path.as_uri() + "?mode=rw",
             uri=True,
             timeout=busy_timeout_s,
