@@ -6,6 +6,7 @@ import binascii
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from typing import NoReturn
 from uuid import uuid4
 
 from kestrel_sdk.native_a2a.server.context import ServerCallContext
@@ -89,6 +90,7 @@ from kestrel_sovereign.a2a.task_manager import (
     TaskManager,
 )
 from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
     is_execution_control_error,
     owned_execution_stream,
 )
@@ -494,6 +496,22 @@ class NativeA2ARequestHandler(RequestHandler):
             except StopAsyncIteration:
                 return
 
+    @staticmethod
+    def _raise_response_refusal(result: Task | Message, refusal: StreamRefusal) -> NoReturn:
+        # A returned Task proves canonical durable admission. A taskless
+        # control Message may describe another effect, not a Task transaction;
+        # retain that uncertainty instead of manufacturing a commit receipt.
+        outcome = "committed" if isinstance(result, Task) else "unknown"
+        raise ExecutionCommitOutcomeError(outcome) from refusal.error
+
+    @asynccontextmanager
+    async def _response_authority(self, admitted: AuthorizedNativeRequest, result: Task | Message):
+        """A later denial cannot retroactively turn an effect into refusal."""
+        async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+            if isinstance(refused, StreamRefusal):
+                self._raise_response_refusal(result, refused)
+            yield
+
     async def on_message_send(
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> Task | Message:
@@ -503,7 +521,7 @@ class NativeA2ARequestHandler(RequestHandler):
         if isinstance(task, StreamRefusal):
             raise task.error
         async with AsyncExitStack() as streams:
-            async with self.guard.hold_authority(admitted):
+            async with self._response_authority(admitted, task):
                 if isinstance(task, Message):
                     return task
                 if admitted.request.configuration.return_immediately:
@@ -512,7 +530,7 @@ class NativeA2ARequestHandler(RequestHandler):
                     self._open_stream(task.id, admitted.principal_id)
                 )
             if isinstance(opened, StreamRefusal):
-                raise opened.error
+                self._raise_response_refusal(task, opened)
             stream, initial = opened
             async with owned_execution_stream(
                 self, self._events(stream, initial, admitted)
@@ -539,7 +557,7 @@ class NativeA2ARequestHandler(RequestHandler):
                     raise HTTPException(
                         status_code=499, detail="A2A HTTP client disconnected"
                     )
-        async with self.guard.hold_authority(admitted):
+        async with self._response_authority(admitted, task):
             task = await self._task(task.id, admitted.principal_id)
             return apply_history_length(task, admitted.request.configuration)
 
@@ -577,12 +595,12 @@ class NativeA2ARequestHandler(RequestHandler):
         if isinstance(task, Message):
             # Revalidate authority, but do not suspend the source while the
             # lifecycle reader lease is still held.
-            async with self.guard.hold_authority(admitted):
+            async with self._response_authority(admitted, task):
                 pass
             yield task
             return
         async with AsyncExitStack() as streams:
-            async with self.guard.hold_authority(admitted):
+            async with self._response_authority(admitted, task):
                 opened = await streams.enter_async_context(
                     self._open_stream(task.id, admitted.principal_id, withdrawal=withdrawal)
                 )
@@ -594,7 +612,7 @@ class NativeA2ARequestHandler(RequestHandler):
                     async for event in events:
                         yield event
                 return
-        yield opened
+        self._raise_response_refusal(task, opened)
 
     def on_subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext

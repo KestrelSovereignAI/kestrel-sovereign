@@ -66,12 +66,12 @@ async def control(wire, rail, recipient_identity):
         headers={"A2A-Version": "1.0"},
     ) as http:
 
-        def client(*, streaming=False, activated=True):
+        def client(*, streaming=False, activated=True, http_client=None):
             return wire.client(
                 streaming=streaming,
                 polling=False,
                 selected_card=card,
-                http_client=http,
+                http_client=http if http_client is None else http_client,
                 sender_interceptor=replace(
                     wire.interceptor,
                     extensions=frozenset(
@@ -82,7 +82,8 @@ async def control(wire, rail, recipient_identity):
             )
 
         yield SimpleNamespace(
-            wire=wire, rail=rail, card=card, handler=handler, client=client, http=http
+            wire=wire, rail=rail, card=card, handler=handler, client=client, http=http,
+            binding=binding,
         )
 
 
@@ -256,6 +257,40 @@ async def test_native_stop_requires_current_recipient_authorization(control):
         await receipt(control)
     assert control.rail.agent.cancelled == []
     assert not (await control.rail.receipts.list_receipts(limit=10)).receipts
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_post_effect_stop_policy_loss_is_unknown_not_ordinary_refusal(
+    control, monkeypatch, streaming
+):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+
+    c = control
+    c.rail.agent._active_request_ids.add("turn-1")
+    cancel = c.rail.agent.cancel_current_request
+
+    def cancel_and_revoke(*args, **kwargs):
+        result = cancel(*args, **kwargs)
+        c.wire.admission.state.current = False
+        return result
+
+    monkeypatch.setattr(c.rail.agent, "cancel_current_request", cancel_and_revoke)
+    params = request()
+    params.tenant = c.wire.admission.scope.tenant
+    async with test_a2a_native_http.observed_native_http(c.wire, binding=c.binding) as observed:
+        with pytest.raises(A2AClientError, match="500"):
+            async for _ in c.client(streaming=streaming, http_client=observed.http).send_message(params):
+                pytest.fail("Post-effect Stop authority loss delivered a normal response")
+    assert observed.statuses == [500]
+    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == "unknown"
+    assert c.rail.agent.cancelled == ["turn-1"]
+    page = await c.rail.receipts.list_receipts(limit=10)
+    assert len(page.receipts) == 1
+    assert [outcome.disposition for outcome in page.receipts[0].outcomes] == ["stopped"]
+    assert not c.wire.submissions
+    assert await c.wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not c.wire.admission.lock.locked()
 
 
 async def test_native_stop_preserves_signed_causation_cycle_policy(control):
