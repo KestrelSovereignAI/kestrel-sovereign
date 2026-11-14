@@ -4893,8 +4893,26 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         # Measure the real timer's requested interval in one synchronous
         # clock domain. A host pause is not a different scheduling policy.
         with pinned_loop_clock() as clock:
+            previous_timer = dispatcher_a._runtime_owner_heartbeat_timer
+            previous_timer_live = previous_timer is not None and not previous_timer.cancelled()
+            if previous_timer_live and previous_timer.when() - clock.time() < (
+                dispatcher_a._runtime_owner_stale_after.total_seconds()
+            ):
+                # A host pause can leave a bounded original timer already due.
+                # Advance synchronously; no real callback or I/O is replaced.
+                clock.advance(max(0.0, previous_timer.when() - clock.time()) + 0.01)
+            previous_timer_due = previous_timer_live and previous_timer.when() <= clock.time()
             original_owner_schedule(retry=retry)
             timer = dispatcher_a._runtime_owner_heartbeat_timer
+            if previous_timer_due:
+                assert timer is previous_timer and not timer.cancelled(), (
+                    "an already-due owner heartbeat was postponed"
+                )
+            else:
+                assert timer is not None and not timer.cancelled()
+                assert 0 < timer.when() - clock.time() < (
+                    dispatcher_a._runtime_owner_stale_after.total_seconds()
+                ), "a new owner heartbeat needs a bounded future timer"
             fenced_heartbeat_delays.append(
                 None if timer is None else timer.when() - clock.time()
             )
@@ -4961,10 +4979,14 @@ async def test_shutdown_keeps_repeatedly_cancelled_cognition_owner_live_until_pe
         assert recovery_now - fenced_heartbeat_times[0] >= (
             2 * dispatcher_a._runtime_owner_stale_after
         )
-        assert fenced_heartbeat_delays
+        assert any(delay is not None and delay <= 0 for delay in fenced_heartbeat_delays), (
+            "the original already-due timer must be exercised"
+        )
         assert all(
+            # A retained timer may already be due; scheduling must never
+            # postpone it. New timers were checked above in the pinned clock.
             delay is not None
-            and 0 < delay < dispatcher_a._runtime_owner_stale_after.total_seconds()
+            and delay < dispatcher_a._runtime_owner_stale_after.total_seconds()
             for delay in fenced_heartbeat_delays
         ), "the original owner heartbeat timer exceeds its stale-owner window"
         assert await dispatcher_b._durable_store.recover_abandoned_leases(
