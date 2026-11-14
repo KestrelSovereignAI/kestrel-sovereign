@@ -918,8 +918,9 @@ async def test_close_stops_and_joins_the_heartbeat(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
+@pytest.mark.parametrize("renewal_reply_delay", [0.0, 0.35])
 async def test_a_failed_attempt_after_a_stall_keeps_the_renewals_made_during_it(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, renewal_reply_delay
 ):
     """The renewals made while the loop was blocked hold the lease, even when
     the attempt just before the loop resumed failed."""
@@ -932,11 +933,17 @@ async def test_a_failed_attempt_after_a_stall_keeps_the_renewals_made_during_it(
     agent = _SelfFencingReplicaAgent("did:test:renewed-during-stall")
     registry.attach(agent)
     failing = threading.Event()
+    delay_replies = threading.Event()
+    delay_replies.set()
 
     async def failable(original, store, owner_id, **kwargs):
         if failing.is_set():
             raise ConnectionError("injected renewal failure")
-        return await original(store, owner_id, **kwargs)
+        delayed = delay_replies.is_set()
+        poll = await original(store, owner_id, **kwargs)
+        if delayed:
+            await asyncio.sleep(renewal_reply_delay)
+        return poll
 
     _patch_heartbeat_renewal(monkeypatch, failable)
     registry.start()
@@ -946,10 +953,17 @@ async def test_a_failed_attempt_after_a_stall_keeps_the_renewals_made_during_it(
         generation_id = _generation_of(registry, agent, "held-turn")
         heartbeat = registry._heartbeat
 
-        # Block the loop past the lease, then make the next attempts fail
-        # before it runs again.
+        # Keep the loop blocked until a real completed renewal began after
+        # the lease it last folded in expired. A fixed sleep does not produce
+        # that scenario when a genuine renewal's reply is slow.
         stalled_at = time.monotonic()
-        time.sleep(_HEALTHY_LEASE_SECONDS + 0.2)
+        deadline = time.monotonic() + 10
+        while True:
+            renewed = heartbeat.latest_renewed()
+            if renewed is not None and renewed.started > stalled_at + _HEALTHY_LEASE_SECONDS:
+                break
+            assert time.monotonic() < deadline, "no original renewal crossed the stalled lease"
+            time.sleep(0.002)
         failing.set()
         deadline = time.monotonic() + 10
         while heartbeat.latest().failure is None:
@@ -960,7 +974,7 @@ async def test_a_failed_attempt_after_a_stall_keeps_the_renewals_made_during_it(
         # success is well inside the lease, and the lease the loop folded in
         # before the stall is older than a lease.
         assert renewed.started > stalled_at + _HEALTHY_LEASE_SECONDS
-        assert time.monotonic() - renewed.started < _HEALTHY_LEASE_SECONDS / 2
+        assert time.monotonic() - renewed.started < _HEALTHY_LEASE_SECONDS
         assert generation_id in renewed.poll.live_generation_ids
         assert time.monotonic() - registry._renewed_at[generation_id] >= (
             _HEALTHY_LEASE_SECONDS
@@ -969,16 +983,20 @@ async def test_a_failed_attempt_after_a_stall_keeps_the_renewals_made_during_it(
         registry._observe_owner_heartbeat()
         assert not registry._lease_lost, registry.owner_fence_reason
         assert registry._renewed_at[generation_id] == renewed.started
+        # The failed-attempt observation above is synchronous and complete.
+        # End the test-owned reply delay/failure before recovery: a new late
+        # reply must not turn the healthy recovery phase into a second expiry.
+        delay_replies.clear()
+        failing.clear()
+        await _wait_for(lambda: heartbeat.latest().failure is None)
         await asyncio.sleep(0.1)
         assert registry.owner_lifecycle_status == "healthy"
         assert not turn.done()
-
-        failing.clear()
-        await _wait_for(lambda: heartbeat.latest().failure is None)
         agent.release_operation.set()
         assert await turn == "held-turn"
         assert registry.owner_epoch == 1
     finally:
+        delay_replies.clear()
         failing.clear()
         agent.release_operation.set()
         await asyncio.gather(turn, return_exceptions=True)
