@@ -110,9 +110,9 @@ dependencies = [
     # 0.45 adds authenticated human control and acquisition custody; the
     # normal lock must resolve this published contract before host delivery.
     # 0.48 adds public argument coercion and the host control-error predicate.
-    # 0.53.1 owns explicit source lifetimes, retained original failures and
+    # 0.54.0 owns explicit source lifetimes, known-wait withdrawal and
     # terminal protocol/HTTP refusal values consumed by native admission.
-    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.53.1,<1",
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.54.0,<1",
     # Native A2A implementation is owned by the shared SDK [a2a] extra.
     # Core and feature skill producers use the same reviewed vendored types.
     "protobuf>=5.29.5",
