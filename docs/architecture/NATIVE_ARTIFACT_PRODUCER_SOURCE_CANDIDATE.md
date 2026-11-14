@@ -1,7 +1,7 @@
 ---
 type: Architecture Spec
 title: Native artifact producer source successor
-description: Explicit finite signed-run output admission through the canonical artifact authority; unpublished Core 0.57.0 source candidate.
+description: Explicit finite signed-run output admission through the canonical artifact authority; bounded native producer source contract.
 resource: /docs/architecture/NATIVE_ARTIFACT_PRODUCER_SOURCE_CANDIDATE.md
 tags:
 - docs
@@ -15,14 +15,16 @@ generated: false
 privacy: public
 ---
 
-# Native artifact producer: unpublished source candidate
+# Native artifact producer: bounded source contract
 
-This implementation is an unpublished Core 0.57.0 source successor. Its normal
-source metadata neither reserves a release nor makes the producer capability
-publicly installable. Foundation Core 0.56 does not contain native producer API1
-or host discovery identity API1. Delivery still requires the approved foundation
-merge, whole-source review, CI, explicit release approval, actual immutable
-publication, and the consumer normal-index floor/lock and installed acceptance.
+This bounded implementation originated as a Core 0.57.0 source successor and is
+now present in merged Core source. Merged source or release metadata alone does
+not establish the native producer capability on a consuming host. Verify the
+actual immutable publication, consumer normal-index floor/lock, installed native
+producer API1 and host discovery identity API1, host registration and required
+acceptance independently. Whole-source review, CI and required release approval
+remain separate delivery gates.
+
 The original operator service operation API remains version 1;
 the additional discovery identity advertisement is separately versioned.
 
@@ -66,10 +68,46 @@ foreground reconciliation retains independent run.attach and artifact policy
 through relation COMMIT and final private response delivery. Status GETs do not
 reconcile, activate or mutate either store.
 
-Admissions are not restored or renewed across process restart. Missing live
-admission refuses new effects; parking additionally requires the physically
-joined exact original native owner and its still-valid claim/control CAS. An
-expired, replaced or foreign native claim is never revived to force PAUSED.
+## Lifetime proposal bound
+
+The [admission owner](../../kestrel_sovereign/features/artifacts/producer_admission.py)
+stores at most **128 proposal records for the lifetime of its owning
+`ArtifactsFeature` instance**. This is not a count of currently active approvals
+or publications. All stored states count: `proposed`, `approval_pending`,
+`approved`, `denied`, `expired`, `revoked` and `retired`. Denial, expiry,
+supersession, revocation and `retire()` change state without removing a record
+or making room for another proposal.
+
+After 128 records have been stored, further insertions fail closed, even if no
+approval is currently active. At the bound check, the in-process admission
+methods raise `ArtifactAccessDenied("native output proposal bound reached")`.
+The [HTTP proposal route](../../kestrel_sovereign/features/artifacts/producer_http.py)
+maps that denial to HTTP 403 with `{"error":{"code":"artifact_access_denied"}}`;
+it does not deliver the exception message. That generic code alone cannot
+distinguish capacity exhaustion from other authorization denials. Earlier policy
+or native-source checks may refuse a proposal before the bound is checked.
+Repeated attempts do not replenish capacity. The
+[feature lifecycle](../../kestrel_sovereign/features/artifacts/feature.py)
+creates the admission owner once; disabling and re-enabling the feature retires
+the same owner's records and does not replenish proposal capacity.
+
+Core exposes no remaining-capacity count. A failed or unknown proposal response
+may already have consumed a stored record, so counting successful responses is
+not a reliable capacity measure. Plan long-lived instances around this finite
+lifetime bound and the ambiguity of a generic denial. Any newly constructed
+`ArtifactsFeature` instance starts with an empty live admission owner, including
+when a host unloads and reloads an agent without restarting the process. The
+replacement does not preserve or renew the old owner's live approvals, replay
+old admissions, or prove physical native/publication cleanup. Do not remove
+approval or tombstone records, renew authority or replay a run to bypass the
+bound. Any future retirement, pruning or renewal design needs its own
+original-custody proof.
+
+Admissions are not restored or renewed when the feature instance is replaced,
+including a process restart or agent reload. Missing live admission refuses new
+effects; parking additionally requires the physically joined exact original
+native owner and its still-valid claim/control CAS. An expired, replaced or
+foreign native claim is never revived to force PAUSED.
 
 Current proofs and their limits, failed runs, semantic mutations and exact
 resource ownership are recorded outside the checkout. The source is not a

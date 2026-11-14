@@ -503,7 +503,11 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/features/artifacts/feature.py",
+        "kestrel_sovereign/features/artifacts/producer_admission.py",
+        "kestrel_sovereign/features/artifacts/producer_http.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
