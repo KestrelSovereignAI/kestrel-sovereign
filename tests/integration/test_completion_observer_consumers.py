@@ -171,7 +171,7 @@ async def test_health_shutdown_keeps_observation_of_original_pre_ready_resident(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("remove", [False, True])
 @pytest.mark.parametrize("surface", ["next", "close"])
-async def test_iterator_terminal_projection_keeps_independent_join_control(native_pg, onboarding_owner, monkeypatch, remove, surface):
+async def test_iterator_terminal_projection_distinguishes_completed_and_pending_joins(native_pg, onboarding_owner, monkeypatch, remove, surface):
     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch))
     physical = OriginalFailure.capture(OSError("actual iterator source failed after native write"))
@@ -205,9 +205,16 @@ async def test_iterator_terminal_projection_keeps_independent_join_control(nativ
         observed = await await_owned_task(create_owned_task(
             stream.aclose() if surface == "close" else anext(stream), retain_originals=True,
         ))
-        source.assert_retained(observed.error)
-        physical.assert_retained(observed.error)
         assert accepted and all(task.done() for task in accepted)
+        if surface == "close":
+            assert any(task.refused for task in accepted), "Pending iterator close did not reach its real observer fault"
+            source.assert_retained(observed.error)
+        else:
+            # EOF publishes the source failure before the reader joins the
+            # completed producer. No new observer means no injected refusal.
+            assert not any(task.refused for task in accepted), "Completed iterator source attempted a new observer"
+            assert source.error not in tuple(_explicit_control_chain(observed.error))
+        physical.assert_retained(observed.error)
         assert await database.fetchval("SELECT count(*) FROM host_rollback_effects WHERE id=12") == 1
     finally:
         loop.set_task_factory(previous)
@@ -337,7 +344,7 @@ async def test_native_inventory_keeps_join_error_after_successful_physical_commi
 @pytest.mark.parametrize("surface", ["feature", "scheduler"])
 @pytest.mark.parametrize("remove", [False, True])
 @pytest.mark.parametrize("after", [False, True])
-async def test_real_resident_owner_keeps_join_control_after_worker_success(native_pg, onboarding_owner, monkeypatch, surface, remove, after):
+async def test_real_resident_join_distinguishes_completed_and_pending_workers(native_pg, onboarding_owner, monkeypatch, surface, remove, after):
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch))
     _manager, agent, database = onboarding_owner
     entered, release, tasks = asyncio.Event(), asyncio.Event(), []
@@ -384,8 +391,15 @@ async def test_real_resident_owner_keeps_join_control_after_worker_success(nativ
         await asyncio.sleep(0)
         release.set()
         result = await await_owned_task(owner)
-        source.assert_retained(result.error)
         assert len(tasks) == 1 and tasks[0].done()
+        if surface == "feature":
+            assert tasks[0].refused, "Pending feature retirement did not reach its real observer fault"
+            source.assert_retained(result.error)
+        else:
+            # The scheduler's asyncio.wait already joined this publisher.
+            # Retrieving its successful result needs no fallible observer.
+            assert not tasks[0].refused, "Completed scheduler publisher attempted a new observer"
+            assert result.error is None and runner.readiness_failure is None
         assert await database.fetchval("SELECT count(*) FROM host_rollback_effects WHERE id=11") == 1
         assert (not feature._owned_background_tasks) if surface == "feature" else runner._runtime_status_publish_task is None
     finally:
