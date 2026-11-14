@@ -494,7 +494,7 @@ async def test_route_publication_join_keeps_actual_caller_withdrawal(tmp_path, m
 
 
 @pytest.mark.parametrize('public_handle', [False, True])
-async def test_route_cancelled_publication_keeps_its_original_join_failure(tmp_path, monkeypatch, public_handle):
+async def test_route_cancelled_publication_does_not_observe_its_completed_original(tmp_path, monkeypatch, public_handle):
     await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, False, 'publication_cancel_source')
 
 
@@ -764,7 +764,11 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
                 assert any(isinstance(error, asyncio.CancelledError) for error in errors), 'actual join withdrawal disappeared from public outcome'
                 assert not isinstance(outcome.error, Exception), 'ordinary publication failure demoted actual withdrawal'
             if phase == 'publication_cancel_source':
-                assert join_error in errors, 'bare cancellation rethrow discarded actual original join failure'
+                # The accepted route has already physically settled. A new
+                # observer would manufacture cleanup debt after completion.
+                assert not any(original.join_refused for original in accepted), (
+                    'Completed route cancellation attempted redundant observer cleanup')
+                assert join_error not in errors, 'Completed original gained an unneeded observer failure'
         elif phase != 'begin_failure':
             assert any(isinstance(error, asyncio.CancelledError) for error in errors)
         elif not release_failure:
