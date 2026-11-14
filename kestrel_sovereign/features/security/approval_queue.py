@@ -820,7 +820,9 @@ class ApprovalQueue:
         # but the in-flight call is orphaned — signal that via
         # ``awaiter_gone`` so the frontend can prompt a retry (#2558).
         awaiter_gone = request.status == ApprovalStatus.AWAITER_GONE
-        if request.status != ApprovalStatus.PENDING and not awaiter_gone:
+        if request.decision_operation is not None or (
+            request.status != ApprovalStatus.PENDING and not awaiter_gone
+        ):
             logger.warning(
                 f"Decision submitted for already-decided request "
                 f"{request_id[:8]} (status={request.status.value}); ignored"
@@ -858,9 +860,10 @@ class ApprovalQueue:
             request.status = ApprovalStatus.AWAITER_GONE
             request.resume_event.set()
             self._pending.pop(request_id, None)
-        persist_error = raise_owned_outcome(
-            outcome, operation="approval decision persistence", retain_originals=True,
-        )
+            raise_owned_outcome(
+                outcome, operation="approval decision persistence", retain_originals=True,
+            )
+        persist_error = outcome.result
 
         # Re-read status after the persist await: a concurrent awaiter
         # cancellation may have flipped PENDING → AWAITER_GONE while we
@@ -887,6 +890,11 @@ class ApprovalQueue:
             f"{' [awaiter gone — call orphaned]' if awaiter_gone else ''}"
         )
 
+        # Deliver the original completed decision before propagating observer
+        # cancellation. Cancellation cannot undo successful persistence.
+        raise_owned_outcome(
+            outcome, operation="approval decision persistence", retain_originals=True,
+        )
         return DecisionResult(
             in_memory=True,
             persisted=persist_error is None,
