@@ -3,7 +3,8 @@
 import asyncio
 import contextvars
 import inspect
-from contextlib import AsyncExitStack, asynccontextmanager
+import os
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -34,7 +35,6 @@ from kestrel_sdk.native_a2a.types import (
 )
 from kestrel_sdk.native_a2a.utils.errors import (
     ContentTypeNotSupportedError,
-    InternalError,
     InvalidParamsError,
     PushNotificationNotSupportedError,
     TaskNotCancelableError,
@@ -186,7 +186,7 @@ async def submit(wire):
 @asynccontextmanager
 async def observed_native_http(wire, *, binding=None):
     """Observe real server control separately from its serialized HTTP status."""
-    failures, statuses = [], []
+    failures, statuses, bodies = [], [], []
     original_app = Starlette(routes=[(wire.binding if binding is None else binding).route])
 
     async def checked_app(scope, receive, send_response):
@@ -194,6 +194,8 @@ async def observed_native_http(wire, *, binding=None):
             if message["type"] == "http.response.start":
                 assert not wire.admission.lock.locked()
                 statuses.append(message["status"])
+            elif message["type"] == "http.response.body":
+                bodies.append(message.get("body", b""))
             await send_response(message)
 
         try:
@@ -207,7 +209,7 @@ async def observed_native_http(wire, *, binding=None):
         base_url="http://native-core.test",
         headers=dict(wire.http.headers),
     ) as actual:
-        yield SimpleNamespace(http=actual, failures=failures, statuses=statuses)
+        yield SimpleNamespace(http=actual, failures=failures, statuses=statuses, bodies=bodies)
 
 
 @pytest.mark.parametrize(
@@ -517,16 +519,25 @@ async def test_actual_dispatcher_preserves_duplicate_proof_headers_for_rejection
     )
 
 
-async def test_persistence_failure_is_a_standard_internal_error_without_sql_details(
+async def test_persistence_failure_is_control_without_exposing_sql_details(
     wire,
 ):
     await wire.admission.backend.execute("DROP TABLE native_test_principals")
-    with pytest.raises(InternalError, match="A2A persistence is unavailable") as failed:
-        await wire.client().get_task(
-            GetTaskRequest(id="unknown", tenant=wire.admission.scope.tenant)
-        )
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers, is_execution_control_error
+    from kestrel_sovereign.storage.db.interface import QueryError
+
+    async with observed_native_http(wire) as observed:
+        with pytest.raises(A2AClientError, match="500") as failed:
+            await wire.client(http_client=observed.http).get_task(
+                GetTaskRequest(id="unknown", tenant=wire.admission.scope.tenant)
+            )
+    assert observed.statuses == [500] and len(observed.failures) == 1
+    assert is_execution_control_error(observed.failures[0])
+    assert any(isinstance(error, QueryError) for error in execution_evidence_carriers(observed.failures[0]))
     assert "native_test_principals" not in str(failed.value)
     assert "SELECT" not in str(failed.value)
+    assert b"native_test_principals" not in b"".join(observed.bodies)
+    assert b"SELECT" not in b"".join(observed.bodies)
 
 
 async def test_registry_withdrawal_cannot_remove_a_newer_registration(wire):
@@ -1469,7 +1480,8 @@ async def test_actual_lease_exit_after_commit_retains_outcome_and_submission(
 
 
 @pytest.mark.parametrize("rollback", [False, True])
-async def test_continuation_notification_follows_actual_outer_commit(native_request_admission, monkeypatch, rollback):
+@pytest.mark.parametrize("mutate_result", [False, True])
+async def test_continuation_notification_follows_actual_outer_commit(native_request_admission, monkeypatch, rollback, mutate_result):
     from kestrel_sovereign.execution_custody import execution_evidence_carriers
     from kestrel_sovereign.storage.db.interface import TransactionError
 
@@ -1493,6 +1505,11 @@ async def test_continuation_notification_follows_actual_outer_commit(native_requ
             result = await a.manager.continue_task(params, creator_agent_id=PRINCIPAL)
             assert result.id == task.id
             assert len(notifications) == 1, "An uncommitted input woke the recipient"
+            if mutate_result:
+                result.id = "caller-return-value"
+                result.context_id = "caller-return-context"
+                result.history[-1].parts[0].text = "Caller changed its return projection"
+                result.metadata["caller_projection"] = True
             if rollback:
                 raise original_error
     except (RollBackOriginal, TransactionError) as error:
@@ -1502,6 +1519,86 @@ async def test_continuation_notification_follows_actual_outer_commit(native_requ
     assert len(notifications) == (1 if rollback else 2)
     revision = await a.backend.fetch_one("SELECT input_revision FROM a2a_tasks WHERE id = ?", (task.id,))
     assert revision[0] == before_revision[0] + (0 if rollback else 1)
+    canonical = await a.manager.task_store.get_task_snapshot(task.id, recipient_agent_id=a.scope.recipient_id)
+    assert notifications[-1].task.SerializeToString(deterministic=True) == canonical.task.SerializeToString(deterministic=True), (
+        "The committed wake retained a caller-mutable return projection instead of its admitted snapshot"
+    )
+
+
+@pytest.mark.parametrize("source", ["resolver-sync", "resolver-async", "replay", "authorization"])
+@pytest.mark.parametrize("error_kind", ["proof", "http", "opaque"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_original_proof_io_exit_is_not_an_authentication_refusal(wire, monkeypatch, source, error_kind, streaming):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers, is_execution_control_error
+
+    authority = wire.handler.guard.authority_factory()
+    physical, originals, owners, descriptors = [], [], [], []
+
+    @contextmanager
+    def original_io():
+        descriptor = os.open(os.devnull, os.O_WRONLY)
+        descriptors.append(descriptor)
+        owner = asyncio.current_task()
+        try:
+            yield
+        finally:
+            owners.append((owner, asyncio.current_task()))
+            try:
+                os.read(descriptor, 1)
+            except OSError as error:
+                physical.append(error)
+                original = (
+                    NativeSenderProofError("Actual original proof resource closer failed") if error_kind == "proof"
+                    else HTTPException(401, detail="Actual original authentication resource closer failed") if error_kind == "http"
+                    else ValueError("Actual opaque authentication resource closer failed")
+                )
+                originals.append(original)
+                raise original from error
+            finally:
+                os.close(descriptor)
+
+    def resolve_sync(did):
+        with original_io():
+            return authority.resolver(did)
+
+    async def resolve_async(did):
+        await asyncio.sleep(0)
+        return resolve_sync(did)
+
+    store = wire.handler.guard.replay_store
+
+    class OriginalReplay:
+        async def reserve(self, *args, **kwargs):
+            with original_io():
+                return await store.reserve(*args, **kwargs)
+
+    async def authorize(did):
+        with original_io():
+            return await authority.authorize_sender(did)
+
+    if source == "replay":
+        guard = replace(wire.handler.guard, replay_store=OriginalReplay())
+    elif source == "authorization":
+        guard = replace(wire.handler.guard, authority_factory=lambda: replace(authority, authorize_sender=authorize))
+    else:
+        guard = replace(wire.handler.guard, authority_factory=lambda: replace(
+            authority, resolver=resolve_sync if source == "resolver-sync" else resolve_async))
+    monkeypatch.setattr(wire.handler, "guard", guard)
+    async with observed_native_http(wire) as observed:
+        with pytest.raises(A2AClientError, match="500"):
+            async for _ in wire.client(streaming=streaming, polling=False, http_client=observed.http).send_message(send(wire.admission)):
+                pytest.fail("A failed original proof resource delivered a business reply")
+    assert len(physical) == len(originals) == len(owners) == len(descriptors) == 1
+    assert owners[0][0] is owners[0][1]
+    assert observed.statuses == [500] and len(observed.failures) == 1
+    assert is_execution_control_error(observed.failures[0])
+    evidence = tuple(execution_evidence_carriers(observed.failures[0]))
+    assert any(error is originals[0] for error in evidence)
+    assert any(error is physical[0] for error in evidence)
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+    assert not wire.submissions and not wire.manager._subscribers and not wire.admission.lock.locked()
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
 
 
 async def test_input_admission_refuses_unobservable_commit_before_write(native_request_admission, monkeypatch):

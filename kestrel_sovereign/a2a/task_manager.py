@@ -12,6 +12,7 @@ This is the primary API for working with A2A tasks.
 
 import asyncio
 import logging
+from copy import deepcopy
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from datetime import UTC, datetime
@@ -1594,6 +1595,10 @@ class TaskManager:
             or callback is None
         ):
             return
+        # A continuation returns candidate.task to its caller before a joined
+        # outer transaction commits. Capture an independent native snapshot,
+        # not that mutable return projection, for the eventual cognition wake.
+        candidate = deepcopy(candidate)
 
         def announce():
             try:
