@@ -1,6 +1,6 @@
 # Generated for the measured pinned Python3.12/LinuxARM64 base.
 # Exact private Core wheel plus normal complete public dependency closure.
-# Private Core reproducible SOURCE_DATE_EPOCH=1794632589; source base f8b0f014c68066bd243f3477eb12bae23301ec4f.
+# Private Core reproducible SOURCE_DATE_EPOCH=1794637577; source base 05f79ae399baae1ecf256920591588ef7ae3780e.
 aiohappyeyeballs==2.6.1 \
     --hash=sha256:c3f9d0113123803ccadfdf3f0faa505bc78e6a72d1cc4806cbd719826e943558 \
     --hash=sha256:f349ba8f4b75cb25c99c5c2d84e997e485204d2902a9597802b0371f09331fb8
@@ -1159,7 +1159,7 @@ kestrel-llms==0.2.0 \
     --hash=sha256:3ab66ccbb5a0a9a9125de29a2d92dd951965d1992287ea3af11a9ba6636c0b24 \
     --hash=sha256:fbd7272ec6552711791e67447e9608e4c68141f5b81857d17e900df24ee8923e
 kestrel-sovereign==0.65.6 \
-    --hash=sha256:956e980fcae206ee86b98dcb1159ec38109179ed5ffeb3cc68f5c03313845fde
+    --hash=sha256:ea7a4eddcc4acf3ce417003f1faafb133477cc384591964e564eddd5e167984b
 kestrel-sovereign-sdk==0.52.2 \
     --hash=sha256:cadb3151b310448b220df9feddc4f4fa68432864c2430f424b55340a6f9b0067 \
     --hash=sha256:dc99b44f9e72cb72ad566eb165f4c1dc8a4807ebe44eddad65cdfd9b4e0ffba2
