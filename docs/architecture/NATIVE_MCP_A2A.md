@@ -1742,8 +1742,13 @@ its reply or performed its described actions.
 
 A successful pair receipt currently reports `memory_processing=not_scheduled`.
 Persistence alone does not claim emotional tagging, later reflection or
-consolidation. Restart-safe processing and real native-provider installation
-remain separate acceptance work.
+consolidation. An isolated native-MCP acceptance test closes the original SDK
+and agent, starts a fresh Python process on the same identity and SQLite
+database, and runs the existing canonical consolidator over the exact imported
+rows. It verifies one episode, repeat-pass deduplication and privacy refusal
+after restart. Consolidation is invoked explicitly in the test. This does not
+schedule per-turn enrichment or establish LLM reflection or real native-provider
+installation; those remain separate acceptance work.
 
 The canonical effect journal commits its original claim before acquiring the
 write lifetime, then revalidates registration after that awaited acquisition.
