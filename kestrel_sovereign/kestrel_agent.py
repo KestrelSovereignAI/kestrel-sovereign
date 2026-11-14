@@ -10706,6 +10706,7 @@ Expected Duration: {expected_duration}
             Only then does it leave the unreleased-feature registry, so one
             that failed is retried by a later shutdown (#3522).
             """
+            self._keep_unreleased_feature(_feature_key(feature), feature)
             reported = await _release_within(resource, label, operation, budget)
             if reported is ReleaseOutcome.RELEASED:
                 self._forget_unreleased_feature(feature)
@@ -10736,13 +10737,14 @@ Expected Duration: {expected_duration}
                 return feature.shutdown_with_agent_deadline()
             return feature.shutdown()
 
-        def _feature_resource(feature) -> str:
-            return feature_resource_name(
-                next(
-                    (key for key, value in self.features.items() if value is feature),
-                    getattr(feature, "name", None),
-                )
+        def _feature_key(feature) -> str | None:
+            return next(
+                (key for key, value in self.features.items() if value is feature),
+                getattr(feature, "name", None),
             )
+
+        def _feature_resource(feature) -> str:
+            return feature_resource_name(_feature_key(feature))
 
         def _stop_request(worker) -> Optional[Callable[[], None]]:
             # A worker's synchronous stop request, made before its step's
