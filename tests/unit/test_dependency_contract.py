@@ -121,9 +121,9 @@ _JSDELIVR_NPM_SCRIPT = re.compile(
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-# Version 0.53 adds the explicit original source lifetime and terminal semantic
-# refusal contracts imported by Core's request adapter. 0.52.2 cannot import it.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.53.0"), ("<", "1")})
+# Version 0.53.1 includes explicit source lifetime and protocol/HTTP terminal
+# refusals consumed by Core's native request and authentication adapter.
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.53.1"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -500,7 +500,8 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.52.0") not in specifier
         assert Version("0.52.1") not in specifier
         assert Version("0.52.2") not in specifier
-        assert Version("0.53.0") in specifier
+        assert Version("0.53.0") not in specifier
+        assert Version("0.53.1") in specifier
         assert Version("1.0.0") not in specifier
 
 
