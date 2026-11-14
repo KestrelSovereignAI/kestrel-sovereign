@@ -280,3 +280,89 @@ async def test_sweep_settles_an_original_live_waiter_with_timeout_provenance():
         if not waiter.done():
             waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
+
+
+async def test_handled_foreign_control_does_not_replace_a_successful_approval(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:ambient-approval-control")
+    foreign = original_control(agent, "direct")
+    async def approve(request):
+        await queue.submit_decision(request.id, approved=True, scope="once")
+    queue = ApprovalQueue(on_request_added=approve)
+    try:
+        raise foreign
+    except ExecutionAuthorityError:
+        result = await queue.request_approval(feature_name="ReflectionFeature", tool_name="self_modify", tool_args={})
+    assert result == (True, "once"), "Ambient handled control replaced an unrelated successful approval"
+
+
+@pytest.mark.parametrize("arrival", ["during_withdrawal", "after_withdrawal"])
+async def test_native_decision_failure_during_withdrawal_reaches_the_original_waiter(
+    native_tool_effect_agent, tmp_path, monkeypatch, arrival,
+):
+    import asyncio
+    agent = await native_tool_effect_agent(did="did:test:late-decision-control")
+    error = original_control(agent, "direct")
+    store = PermissionStore(str(tmp_path / "late-decision.db"))
+    await store.initialize()
+    original = store.log_decision
+    entered, release, withdrawing, withdrawn = (asyncio.Event() for _ in range(4))
+    async def original_audit_then_wait(*args, **kwargs):
+        await original(*args, **kwargs)
+        if kwargs.get("decision") == "user_approved":
+            entered.set()
+            await release.wait()
+            raise error
+    monkeypatch.setattr(store, "log_decision", original_audit_then_wait)
+    submissions = []
+    async def notify(request):
+        submissions.append(asyncio.create_task(queue.submit_decision(request.id, True)))
+        await entered.wait()
+    async def withdraw(*args):
+        withdrawing.set()
+        if arrival == "during_withdrawal":
+            await withdrawn.wait()
+    queue = ApprovalQueue(permission_store=store, on_request_added=notify, on_request_withdrawn=withdraw)
+    waiter = asyncio.create_task(queue.request_approval(
+        feature_name="ReflectionFeature", tool_name="self_modify", tool_args={}, timeout=0))
+    try:
+        async with asyncio.timeout(5):
+            await withdrawing.wait()
+        if arrival == "after_withdrawal":
+            assert not waiter.done(), "Original waiter completed before its claimed decision settled"
+        release.set()
+        with pytest.raises(type(error)) as sender:
+            await submissions[0]
+        assert sender.value is error
+        withdrawn.set()
+        with pytest.raises(type(error)) as receiver:
+            await waiter
+        assert receiver.value is error, "Late native decision failure missed the original waiter"
+        assert not queue.pending_requests
+    finally:
+        release.set()
+        withdrawn.set()
+        for task in [waiter, *submissions]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(waiter, *submissions, return_exceptions=True)
+
+
+@pytest.mark.parametrize("carrier", ["direct", "group", "timeout"])
+async def test_actual_security_permission_listing_preserves_native_control(
+    native_tool_effect_agent, tmp_path, monkeypatch, carrier,
+):
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    agent = await native_tool_effect_agent(did="did:test:security-list-control")
+    store = PermissionStore(str(tmp_path / "security-list.db"))
+    await store.initialize()
+    security = SecurityFeature(agent)
+    security.permission_store = store
+    error = original_control(agent, carrier)
+    read = store.get_permission_tree
+    async def original_tree_then_fence():
+        await read()
+        raise error
+    monkeypatch.setattr(store, "get_permission_tree", original_tree_then_fence)
+    with pytest.raises(type(error)) as captured:
+        await security.list_permissions()
+    assert captured.value is error, "Security listing erased original native control"
