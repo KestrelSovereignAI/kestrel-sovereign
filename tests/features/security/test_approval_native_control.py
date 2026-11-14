@@ -366,3 +366,49 @@ async def test_actual_security_permission_listing_preserves_native_control(
     with pytest.raises(type(error)) as captured:
         await security.list_permissions()
     assert captured.value is error, "Security listing erased original native control"
+
+
+async def test_disconnected_waiter_leaves_claimed_ui_decision_with_its_original_owner(tmp_path, monkeypatch):
+    import asyncio
+    store = PermissionStore(str(tmp_path / "disconnected-original-owner.db"))
+    await store.initialize()
+    original = store.log_decision
+    queued, entered, release, completed = (asyncio.Event() for _ in range(4))
+    async def original_audit_then_wait(*args, **kwargs):
+        await original(*args, **kwargs)
+        entered.set()
+        await release.wait()
+    async def notify(request):
+        queued.set()
+    monkeypatch.setattr(store, "log_decision", original_audit_then_wait)
+    queue = ApprovalQueue(permission_store=store, on_request_added=notify)
+    waiter = asyncio.create_task(queue.request_approval(
+        feature_name="ReflectionFeature", tool_name="self_modify", tool_args={}))
+    waiter.add_done_callback(lambda _task: completed.set())
+    deciding = None
+    try:
+        async with asyncio.timeout(5):
+            await queued.wait()
+            deciding = asyncio.create_task(queue.submit_decision(queue.pending_requests[0].id, True))
+            await entered.wait()
+        waiter.cancel()
+        disconnected = False
+        try:
+            async with asyncio.timeout(1):
+                await completed.wait()
+            disconnected = True
+        except TimeoutError:
+            pass
+        release.set()
+        result = await deciding
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert disconnected, "Disconnected waiter waited for an independently owned UI decision"
+        assert result.awaiter_gone and result.persisted
+        assert not queue.pending_requests
+    finally:
+        release.set()
+        for task in [waiter, deciding]:
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in [waiter, deciding] if t is not None], return_exceptions=True)
