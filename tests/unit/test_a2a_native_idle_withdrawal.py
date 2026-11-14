@@ -4,12 +4,15 @@ import asyncio
 import errno
 import json
 import os
+from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.native_a2a.client.interceptors import BeforeArgs
 from kestrel_sdk.native_a2a.types import SubscribeToTaskRequest, TaskState
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 
 from kestrel_sovereign.execution_custody import (
     execution_evidence_carriers,
@@ -149,3 +152,111 @@ async def test_actual_disconnect_wakes_idle_subscription_and_joins_original_fina
                 await wire.manager.complete_task(rows[0][0], "test-only original release", recipient_agent_id=wire.admission.scope.recipient_id)
         async with asyncio.timeout(5):
             await asyncio.gather(request_task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("operation", ["send", "subscribe", "blocking"])
+@pytest.mark.parametrize("retirement", ["clean", "blocked", "failed"])
+async def test_acquired_subscription_retires_before_failed_authority_exit_returns(
+    wire, monkeypatch, tmp_path, operation, retirement
+):
+    original_subscribe = wire.manager.subscribe
+    original_lease = wire.handler.guard.lifecycle_lease
+    closing, release = asyncio.Event(), asyncio.Event()
+    progressed = asyncio.Event()
+    sources, wrappers, descriptors, owner_tasks, close_tasks, close_errors = [], [], [], [], [], []
+    lease_error = HTTPException(403, detail="actual lease exit after subscription acquisition")
+    armed = True
+
+    async def witnessed_subscription(*args, **kwargs):
+        source = original_subscribe(*args, **kwargs)
+        sources.append(source)
+        fd = os.open(tmp_path / "acquired-source", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        descriptors.append(fd)
+        owner_tasks.append(asyncio.current_task())
+        try:
+            async for event in source:
+                yield event
+        finally:
+            close_tasks.append(asyncio.current_task())
+            await source.aclose()
+            closing.set()
+            progressed.set()
+            if retirement != "clean":
+                await release.wait()
+            os.close(fd)
+            if retirement == "failed":
+                try:
+                    os.fsync(fd)
+                except OSError as error:
+                    close_errors.append(error)
+                    raise
+
+    def acquire(*args, **kwargs):
+        source = witnessed_subscription(*args, **kwargs)
+        wrappers.append(source)
+        return source
+
+    @asynccontextmanager
+    async def fail_original_lease_exit():
+        nonlocal armed
+        async with original_lease():
+            yield
+        if armed and wire.manager._subscribers:
+            armed = False
+            assert not wire.admission.lock.locked()
+            raise lease_error
+
+    monkeypatch.setattr(wire.manager, "subscribe", acquire)
+    monkeypatch.setattr(wire.handler, "guard", replace(wire.handler.guard, lifecycle_lease=fail_original_lease_exit))
+    if operation == "subscribe":
+        task = await wire.manager.create_task(send(wire.admission), creator_agent_id=PRINCIPAL)
+        params = SubscribeToTaskRequest(id=task.id, tenant=wire.admission.scope.tenant)
+    else:
+        params = send(wire.admission)
+        params.configuration.return_immediately = False
+
+    async def actual_request():
+        client = wire.client(streaming=operation != "blocking", polling=False)
+        stream = client.subscribe(params) if operation == "subscribe" else client.send_message(params)
+        async for _ in stream:
+            pytest.fail("Failed original acquisition lease delivered a response")
+
+    request_task = asyncio.create_task(actual_request())
+    request_task.add_done_callback(lambda _: progressed.set())
+    try:
+        async with asyncio.timeout(5):
+            await progressed.wait()
+        assert not armed, "The request never reached the injected acquisition lease exit"
+        assert len(sources) == len(wrappers) == 1
+        if request_task.done():
+            outcome, = await asyncio.gather(request_task, return_exceptions=True)
+            assert isinstance(outcome, BaseException)
+            assert any(error is lease_error for error in execution_evidence_carriers(outcome))
+        assert closing.is_set(), "The actual request exited without retiring its acquired source"
+        if retirement != "clean":
+            assert not request_task.done()
+            os.fstat(descriptors[0])
+        release.set()
+        outcome, = await asyncio.gather(request_task, return_exceptions=True)
+        assert isinstance(outcome, BaseException) and is_execution_control_error(outcome)
+        assert any(error is lease_error for error in execution_evidence_carriers(outcome))
+        if retirement == "failed":
+            assert len(close_errors) == 1
+            assert any(error is close_errors[0] for error in execution_evidence_carriers(outcome))
+        assert owner_tasks == close_tasks and len(owner_tasks) == 1
+        assert len(sources) == len(wrappers) == 1
+        assert sources[0].ag_frame is wrappers[0].ag_frame is None
+        assert not wire.manager._subscribers and not wire.admission.lock.locked()
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        release.set()
+        # Test-only cleanup of leaked baseline originals, not an ACK or pass:
+        # the actual failed request has already physically exited before these
+        # captured abandoned generators can be retired for fixture isolation.
+        async with asyncio.timeout(5):
+            await asyncio.gather(request_task, return_exceptions=True)
+        for source in wrappers:
+            if source.ag_frame is not None:
+                await source.aclose()

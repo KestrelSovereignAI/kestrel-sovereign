@@ -3,6 +3,7 @@
 import asyncio
 import contextvars
 import inspect
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -634,20 +635,23 @@ async def test_real_host_auth_keeps_sdk_calls_on_the_peer_lane(
 async def test_revocation_before_the_first_stream_event_exposes_no_snapshot(wire):
     params = send(wire.admission)
     guard = wire.admission.guard
-    async with guard.admit(
-        params, "SendMessage", signed_context(wire.admission, params)
-    ) as admitted:
-        task = await wire.manager.create_task(params, creator_agent_id=PRINCIPAL)
-        stream, initial = await wire.handler._open_stream(task.id, PRINCIPAL)
-    wire.admission.state.current = False
-    events = wire.handler._events(stream, initial, admitted)
-    try:
-        with pytest.raises(HTTPException) as denied:
-            await anext(events)
-        assert denied.value.status_code == 403
-        assert not wire.manager._subscribers
-    finally:
-        await events.aclose()
+    async with AsyncExitStack() as streams:
+        async with guard.admit(
+            params, "SendMessage", signed_context(wire.admission, params)
+        ) as admitted:
+            task = await wire.manager.create_task(params, creator_agent_id=PRINCIPAL)
+            stream, initial = await streams.enter_async_context(
+                wire.handler._open_stream(task.id, PRINCIPAL)
+            )
+        wire.admission.state.current = False
+        events = wire.handler._events(stream, initial, admitted)
+        try:
+            with pytest.raises(HTTPException) as denied:
+                await anext(events)
+            assert denied.value.status_code == 403
+        finally:
+            await events.aclose()
+    assert not wire.manager._subscribers
 
 
 async def test_terminal_cancel_and_subscribe_return_standard_lifecycle_errors(
