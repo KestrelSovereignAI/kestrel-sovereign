@@ -263,7 +263,9 @@ class CommandHandler:
         the trailing block, read-style commands like ``!recall``,
         ``!recall list``, and ``!recall get`` would render only the
         summary line and drop the actual results/content the user
-        asked for. Write-style commands keep their confirmation-only
+        asked for. Otherwise a string ``data.content`` (the text a read
+        such as ``!fs-read`` returned) follows the confirmation as plain
+        text. Write-style commands keep their confirmation-only
         rendering because their ``data`` is scalar bookkeeping.
         ERROR → ``❌ Error: <error>``.
         PARTIAL → confirmation + a ``⚠ Caveat: <error>`` line + the
@@ -298,6 +300,12 @@ class CommandHandler:
         data_block = ""
         if _has_structural_payload(data):
             data_block = "\n" + json.dumps(data, indent=2, default=str)
+        elif isinstance(data, dict) and isinstance(data.get("content"), str):
+            # A read's text body (``!fs-read``) is a scalar string, which
+            # the heuristic above treats as bookkeeping. The tool returns
+            # it once, here, so this is where it is shown (#4069).
+            if data["content"]:
+                data_block = "\n" + data["content"]
 
         if status == "ok":
             return (confirmation or "(no confirmation)") + data_block

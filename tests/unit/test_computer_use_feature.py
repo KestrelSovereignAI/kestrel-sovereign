@@ -1039,3 +1039,92 @@ async def test_a_malformed_subcommand_policy_refuses_every_call(tmp_path: Path):
     assert envelope.error.startswith("readiness:backend not initialized")
     assert "must name at least one subcommand" in envelope.error
     assert queue.calls == []
+
+
+# ---------------------------------------------------------------------------
+# #4069: fs_read returns the file once, in data.content
+# ---------------------------------------------------------------------------
+
+
+def _fs_read_tool(feature: ComputerUseFeature):
+    return next(t for t in feature.get_tools() if t.name == "fs_read")
+
+
+@pytest.mark.asyncio
+async def test_fs_read_model_facing_result_carries_the_file_once(workspace: Path):
+    """The envelope every model-facing path serializes (the ``DynamicTool``
+    wrapper) holds an N-character file once. With the old copy in
+    ``confirmation`` a 20,000-character file serialized to over 40,000."""
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+        queue=FakeApprovalQueue(),
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    # No character JSON escapes, so the content serializes to its own length.
+    text = "kestrel " * 2_500
+    assert len(text) == 20_000
+    target = workspace / "big.txt"
+    target.write_text(text)
+
+    response = await _fs_read_tool(feature).execute(path=str(target))
+
+    assert response["status"] == "ok", response.get("error")
+    assert len(json.dumps(response)) <= len(text) + 1_000
+    assert response["data"]["content"] == text
+    assert response["confirmation"] == f"Read 20000 bytes from {target.resolve()}."
+
+
+@pytest.mark.parametrize("content", ["first line\nsecond line\n", ""], ids=["text", "empty"])
+@pytest.mark.asyncio
+async def test_fs_read_command_shows_the_file_content(
+    native_feature_case, workspace: Path, content: str
+):
+    """``!fs-read`` through the real command path (``CommandHandler`` →
+    ``TaskManager.execute_command`` → the tool) prints the summary line and
+    then the file, once."""
+    from kestrel_sovereign.command_handler import CommandHandler
+    from tests.utils.native_tool_effects import drive_native
+
+    agent, manager = native_feature_case.agent, native_feature_case.manager
+    agent.privacy_agent._privacy_config.computer_access = True
+    agent.granted_capabilities = frozenset(
+        {"filesystem_read", "shell_execution_sandboxed", "shell_execution_host"}
+    )
+    feature = ComputerUseFeature(agent)
+    feature._cfg = _config(workspace)
+    await feature.initialize()
+    manager.register_provider(
+        feature.name, feature.get_agent_skills(), feature, {"!fs-read": "fs_read"}
+    )
+    target = workspace / "notes.txt"
+    target.write_text(content)
+    handler = CommandHandler(agent, task_manager=manager)
+
+    text = await drive_native(agent, lambda: handler.handle(f"!fs-read {target}"))
+
+    summary = f"Read {len(content.encode())} bytes from {target.resolve()}."
+    assert text == (f"{summary}\n{content}" if content else summary)
+
+
+@pytest.mark.parametrize("name", ["missing.txt", "secret/leak.txt"], ids=["missing", "refused"])
+@pytest.mark.asyncio
+async def test_fs_read_missing_or_refused_path_is_unchanged(workspace: Path, name: str):
+    """A read that fails returns only its error: no confirmation, no data."""
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"filesystem_read"},
+        queue=FakeApprovalQueue(),
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+
+    envelope = await feature.fs_read(path=str(workspace / name))
+
+    assert envelope.status is ToolResultStatus.ERROR
+    assert (envelope.confirmation, envelope.data) == (None, None)
+    if name == "missing.txt":
+        assert "No such file or directory" in envelope.error
+    else:
+        assert envelope.error.startswith("policy:deny")
