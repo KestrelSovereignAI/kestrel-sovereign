@@ -51,6 +51,8 @@ import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kestrel_sovereign.features.security.permissions import PermissionStore
 
@@ -79,6 +81,8 @@ class AutoApproveRule:
         try:
             return re.compile(self.pattern)
         except re.error as exc:  # pragma: no cover - operator misconfig
+            if is_execution_control_error(exc):
+                raise
             logger.warning(
                 "auto_approve: skipping invalid pattern %r: %s",
                 self.pattern,
@@ -139,7 +143,9 @@ def _extract_repo_token(command: str) -> Optional[str]:
     """
     try:
         toks = shlex.split(command)
-    except ValueError:
+    except ValueError as error:
+        if is_execution_control_error(error):
+            raise
         toks = command.split()
     for i, t in enumerate(toks):
         if t in ("-R", "--repo") and i + 1 < len(toks):
@@ -171,7 +177,9 @@ def suggest_rule_from_command(command: str) -> tuple[str, str]:
     """
     try:
         tokens = shlex.split(command)
-    except ValueError:
+    except ValueError as error:
+        if is_execution_control_error(error):
+            raise
         tokens = command.split()
     prefix: List[str] = []
     repo_scope = ""
@@ -242,6 +250,8 @@ class AutoApprovePolicy:
                     )
                 )
             except (KeyError, TypeError) as exc:
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "auto_approve: ignoring malformed seed entry %r: %s",
                     entry,
@@ -268,7 +278,9 @@ class AutoApprovePolicy:
                             source="db",
                         )
                     )
-            except Exception as exc:  # noqa: BLE001 - never block approvals
+            except Exception as exc:  # Ordinary rule-store errors do not deny a request.
+                if is_execution_control_error(exc):
+                    raise
                 logger.warning(
                     "auto_approve: failed to load dynamic rules: %s",
                     exc,

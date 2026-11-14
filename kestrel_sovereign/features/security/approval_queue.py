@@ -13,6 +13,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
+
 from .args_summary import summarize_args
 
 if TYPE_CHECKING:
@@ -355,11 +357,13 @@ class ApprovalQueue:
                         tool_name,
                     )
                     return (True, "auto")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 # Fail CLOSED: a security gate must not auto-approve on a
                 # store-read error. We cannot confirm the tool is NOT
                 # ALWAYS_ASK, so assume it is — this skips the scoped
                 # auto-approve path below and queues a human (#2056).
+                if is_execution_control_error(e):
+                    raise
                 always_ask = True
                 logger.warning(
                     "ApprovalQueue: failed to evaluate pre-approval policy for "
@@ -447,7 +451,9 @@ class ApprovalQueue:
                     # "approval:<scope>" chain so the executing tool can
                     # finalize the real exit code once it returns.
                     return (True, f"auto_approve:{audit_id}")
-            except Exception as e:  # noqa: BLE001 - never block on policy
+            except Exception as e:  # Ordinary policy errors still reach human approval.
+                if is_execution_control_error(e):
+                    raise
                 logger.warning(
                     "ApprovalQueue: auto-approve evaluation failed for "
                     f"{feature_name}.{tool_name}: {e}",
@@ -511,17 +517,6 @@ class ApprovalQueue:
             f"({feature_name}.{tool_name})"
         )
 
-        # Notify UI via SSE
-        if self._on_request_added:
-            try:
-                await self._on_request_added(request)
-            except (ConnectionError, TimeoutError) as e:
-                logger.warning(f"Failed to notify UI of approval request (network error): {e}", exc_info=True)
-            except (TypeError, AttributeError) as e:
-                logger.warning(f"Failed to notify UI of approval request (callback error): {e}", exc_info=True)
-            except Exception as e:
-                logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
-
         # Wait for user decision or wall-clock timeout.
         #
         # Past behavior popped the request and emitted ``approval_withdrawn``
@@ -540,6 +535,23 @@ class ApprovalQueue:
         # background task or directly by tests).
         timed_out = False
         try:
+            # Notify UI via SSE
+            if self._on_request_added:
+                try:
+                    await self._on_request_added(request)
+                except (ConnectionError, TimeoutError) as e:
+                    if is_execution_control_error(e):
+                        raise
+                    logger.warning(f"Failed to notify UI of approval request (network error): {e}", exc_info=True)
+                except (TypeError, AttributeError) as e:
+                    if is_execution_control_error(e):
+                        raise
+                    logger.warning(f"Failed to notify UI of approval request (callback error): {e}", exc_info=True)
+                except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
+                    logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
+
             await asyncio.wait_for(
                 request.resume_event.wait(),
                 timeout=timeout
@@ -555,7 +567,10 @@ class ApprovalQueue:
 
             return (approved, scope)
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as error:
+            if is_execution_control_error(error):
+                request.status = ApprovalStatus.AWAITER_GONE
+                raise
             request.status = ApprovalStatus.TIMEOUT
             timed_out = True
             logger.warning(
@@ -596,6 +611,11 @@ class ApprovalQueue:
             )
             raise
 
+        except Exception as error:
+            if is_execution_control_error(error):
+                request.status = ApprovalStatus.AWAITER_GONE
+            raise
+
         finally:
             # Only remove the request on a true success (resume_event
             # fired) or timeout. Cancellation leaves it for the user.
@@ -610,16 +630,22 @@ class ApprovalQueue:
                 try:
                     await self._on_request_withdrawn(popped, "timeout")
                 except (ConnectionError, TimeoutError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         f"Failed to notify UI of approval withdrawal (network error): {e}",
                         exc_info=True,
                     )
                 except (TypeError, AttributeError) as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         f"Failed to notify UI of approval withdrawal (callback error): {e}",
                         exc_info=True,
                     )
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         f"Failed to notify UI of approval withdrawal: {e}",
                         exc_info=True,
@@ -699,10 +725,12 @@ class ApprovalQueue:
                 user_choice=scope,
                 args_summary=args_summary,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             # A persistence failure must not corrupt the user's decision.
             # Log loudly and let the caller report the exact persistence
             # failure while preserving the in-memory decision.
+            if is_execution_control_error(e):
+                raise
             logger.warning(
                 "ApprovalQueue: failed to persist decision for "
                 f"{feature_name}.{tool_name}: {e}",
@@ -906,6 +934,8 @@ class ApprovalQueue:
                 try:
                     await self._on_request_withdrawn(req, "timeout")
                 except Exception as e:
+                    if is_execution_control_error(e):
+                        raise
                     logger.warning(
                         f"Sweep withdrawal callback failed for "
                         f"{req.id[:8]}: {e}",
