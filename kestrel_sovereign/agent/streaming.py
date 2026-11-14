@@ -1473,7 +1473,7 @@ class StreamingMixin:
             except Exception as error:
                 if is_execution_control_error(error):
                     raise
-                logging.warning("Failed to fetch reflection guidance: %s", error)
+                logging.getLogger(__name__).warning("Failed to fetch reflection guidance: %s", error)
 
         # Snapshot tool schemas before planning so dry/live accounting and the
         # eventual provider payload use identical registry bytes.
