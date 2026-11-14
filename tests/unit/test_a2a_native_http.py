@@ -1385,6 +1385,40 @@ async def test_post_commit_missing_subscription_retains_committed_outcome(wire, 
     assert not wire.manager._subscribers and not wire.admission.lock.locked()
 
 
+@pytest.mark.parametrize("operation,streaming", [("send", False), ("send", True), ("subscribe", True)])
+async def test_first_event_policy_recheck_retains_committed_outcome(wire, monkeypatch, operation, streaming):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+
+    original = wire.handler.guard.lifecycle_lease
+
+    @asynccontextmanager
+    async def revoke_after_acquisition():
+        async with original():
+            yield
+        if wire.manager._subscribers:
+            wire.admission.state.current = False
+
+    monkeypatch.setattr(wire.handler, "guard", replace(wire.handler.guard, lifecycle_lease=revoke_after_acquisition))
+    params = send(wire.admission)
+    params.configuration.return_immediately = False
+    if operation == "subscribe":
+        task = await wire.manager.create_task(send(wire.admission), creator_agent_id=PRINCIPAL)
+        params = SubscribeToTaskRequest(id=task.id, tenant=wire.admission.scope.tenant)
+    async with observed_native_http(wire) as observed:
+        with pytest.raises(A2AClientError, match="500"):
+            client = wire.client(streaming=streaming, polling=False, http_client=observed.http)
+            source = client.send_message(params) if operation == "send" else client.subscribe(params)
+            async for _ in source:
+                pytest.fail("Post-acquisition authority loss delivered a normal response")
+    assert observed.statuses == [500]
+    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == ("committed" if operation == "send" else None)
+    assert len(wire.submissions) == 1
+    rows = await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks")
+    assert len(rows) == 1 and rows[0][0] == wire.submissions[0].task.id
+    assert not wire.manager._subscribers and not wire.admission.lock.locked()
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_raw_http_invalid_tenant_is_protocol_data_not_source_failure(
     wire, streaming

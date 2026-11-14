@@ -91,6 +91,8 @@ from kestrel_sovereign.a2a.task_manager import (
 )
 from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError,
+    execution_commit_outcome,
+    execution_observation_error,
     is_execution_control_error,
     owned_execution_stream,
 )
@@ -454,6 +456,7 @@ class NativeA2ARequestHandler(RequestHandler):
     async def _open_stream(
         self, task_id: str, principal_id: str, *, withdrawal: SourceWithdrawal | None = None
     ) -> AsyncIterator[tuple[AsyncIterator[Event], Task] | StreamRefusal]:
+        withdrawal = SourceWithdrawal() if withdrawal is None else withdrawal
         original = self.manager.subscribe(
             task_id,
             creator_agent_id=principal_id,
@@ -463,7 +466,7 @@ class NativeA2ARequestHandler(RequestHandler):
         # Ownership precedes the FIRST read, not just later event forwarding.
         # The caller registers this scope before leaving its acquisition lease,
         # so an actual lease-exit failure still joins this same source owner.
-        async with owned_execution_stream(self, original) as stream:
+        async with owned_execution_stream(self, original, withdrawal=withdrawal) as stream:
             try:
                 initial = await anext(stream)
             except StopAsyncIteration as error:
@@ -482,13 +485,19 @@ class NativeA2ARequestHandler(RequestHandler):
         yield StreamRefusal(refusal)
 
     async def _events(
-        self, stream, initial: Task, admitted: AuthorizedNativeRequest
+        self, stream, initial: Task, admitted: AuthorizedNativeRequest,
+        *, response_result: Task | None = None,
     ) -> AsyncGenerator[Event]:
         # Borrow the already-owned subscription. _open_stream retains its
         # original owner across acquisition, every read, and physical close.
         event = initial
         while True:
-            async with self.guard.hold_authority(admitted):
+            authority = (
+                self.guard.hold_authority(admitted)
+                if response_result is None
+                else self._response_authority(admitted, response_result)
+            )
+            async with authority:
                 await self._task(initial.id, admitted.principal_id)
             yield event
             try:
@@ -497,20 +506,40 @@ class NativeA2ARequestHandler(RequestHandler):
                 return
 
     @staticmethod
-    def _raise_response_refusal(result: Task | Message, refusal: StreamRefusal) -> NoReturn:
+    def _raise_response_failure(result: Task | Message, error: BaseException) -> NoReturn:
         # A returned Task proves canonical durable admission. A taskless
         # control Message may describe another effect, not a Task transaction;
         # retain that uncertainty instead of manufacturing a commit receipt.
         outcome = "committed" if isinstance(result, Task) else "unknown"
-        raise ExecutionCommitOutcomeError(outcome) from refusal.error
+        raise execution_observation_error(ExecutionCommitOutcomeError(outcome), error)
 
     @asynccontextmanager
     async def _response_authority(self, admitted: AuthorizedNativeRequest, result: Task | Message):
         """A later denial cannot retroactively turn an effect into refusal."""
         async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
             if isinstance(refused, StreamRefusal):
-                self._raise_response_refusal(result, refused)
+                self._raise_response_failure(result, refused.error)
             yield
+
+    async def _send_task_events(
+        self, task: Task, admitted: AuthorizedNativeRequest, withdrawal: SourceWithdrawal
+    ) -> AsyncGenerator[Event]:
+        """One post-admission subscription path for unary and streamed sends."""
+        async with AsyncExitStack() as streams:
+            async with self._response_authority(admitted, task):
+                opened = await streams.enter_async_context(
+                    self._open_stream(task.id, admitted.principal_id, withdrawal=withdrawal)
+                )
+            if not isinstance(opened, StreamRefusal):
+                stream, initial = opened
+                async with owned_execution_stream(
+                    self, self._events(stream, initial, admitted, response_result=task),
+                    withdrawal=withdrawal,
+                ) as events:
+                    async for event in events:
+                        yield event
+                return
+        self._raise_response_failure(task, opened.error)
 
     async def on_message_send(
         self, params: SendMessageRequest, context: ServerCallContext
@@ -520,43 +549,58 @@ class NativeA2ARequestHandler(RequestHandler):
         task = await self._submit(admitted)
         if isinstance(task, StreamRefusal):
             raise task.error
-        async with AsyncExitStack() as streams:
+        # Bind outcome to the whole post-admission response, not selected
+        # rechecks. Physical source/retirement errors can precede the explicit
+        # disconnect branch; they must retain BOTH their original evidence and
+        # the already-committed operation. Raw caller cancellation stays raw.
+        try:
+            return await self._message_response(task, admitted, context)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            if execution_commit_outcome(error) is not None:
+                raise
+            self._raise_response_failure(task, error)
+
+    async def _message_response(
+        self, task: Task | Message, admitted: AuthorizedNativeRequest[SendMessageRequest], context: ServerCallContext
+    ) -> Task | Message:
+        if isinstance(task, Message) or admitted.request.configuration.return_immediately:
             async with self._response_authority(admitted, task):
                 if isinstance(task, Message):
                     return task
-                if admitted.request.configuration.return_immediately:
-                    return apply_history_length(task, admitted.request.configuration)
-                opened = await streams.enter_async_context(
-                    self._open_stream(task.id, admitted.principal_id)
-                )
-            if isinstance(opened, StreamRefusal):
-                self._raise_response_refusal(task, opened)
-            stream, initial = opened
-            async with owned_execution_stream(
-                self, self._events(stream, initial, admitted)
-            ) as events:
+                return apply_history_length(task, admitted.request.configuration)
 
-                async def wait_events():
-                    async for _ in events:
-                        pass
-                    return True
+        withdrawal = SourceWithdrawal()
 
-                completed, _ = await gather_owned(
-                    (
-                        factory()
-                        for factory in (
-                            wait_events,
-                            lambda: wait_native_disconnect(context),
-                        )
-                    ),
-                    return_when=asyncio.FIRST_COMPLETED,
-                    retain_originals=True,
-                    name_prefix="native-a2a-blocking-response",
-                )
-                if completed is not True:
-                    raise HTTPException(
-                        status_code=499, detail="A2A HTTP client disconnected"
+        # Race ONLY demand from the canonical native source kernel. Stopping
+        # that observer wakes known idle waits; it never cancels the original
+        # source or an already-running finally. This same lifetime scope joins
+        # physical retirement before a blocking response can leave.
+        async with owned_execution_stream(
+            self, self._send_task_events(task, admitted, withdrawal), withdrawal=withdrawal
+        ) as events:
+            async def wait_events():
+                async for _ in events:
+                    pass
+                return True
+
+            completed, _ = await gather_owned(
+                (
+                    factory()
+                    for factory in (
+                        wait_events,
+                        lambda: wait_native_disconnect(context),
                     )
+                ),
+                return_when=asyncio.FIRST_COMPLETED,
+                retain_originals=True,
+                name_prefix="native-a2a-blocking-response",
+            )
+            if completed is not True:
+                self._raise_response_failure(
+                    task, HTTPException(status_code=499, detail="A2A HTTP client disconnected")
+                )
         async with self._response_authority(admitted, task):
             task = await self._task(task.id, admitted.principal_id)
             return apply_history_length(task, admitted.request.configuration)
@@ -599,20 +643,11 @@ class NativeA2ARequestHandler(RequestHandler):
                 pass
             yield task
             return
-        async with AsyncExitStack() as streams:
-            async with self._response_authority(admitted, task):
-                opened = await streams.enter_async_context(
-                    self._open_stream(task.id, admitted.principal_id, withdrawal=withdrawal)
-                )
-            if not isinstance(opened, StreamRefusal):
-                stream, initial = opened
-                async with owned_execution_stream(
-                    self, self._events(stream, initial, admitted)
-                ) as events:
-                    async for event in events:
-                        yield event
-                return
-        self._raise_response_refusal(task, opened)
+        async with owned_execution_stream(
+            self, self._send_task_events(task, admitted, withdrawal), withdrawal=withdrawal
+        ) as events:
+            async for event in events:
+                yield event
 
     def on_subscribe_to_task(
         self, params: SubscribeToTaskRequest, context: ServerCallContext
@@ -652,7 +687,7 @@ class NativeA2ARequestHandler(RequestHandler):
             if not isinstance(opened, StreamRefusal):
                 stream, initial = opened
                 async with owned_execution_stream(
-                    self, self._events(stream, initial, admitted)
+                    self, self._events(stream, initial, admitted), withdrawal=withdrawal
                 ) as events:
                     async for event in events:
                         yield event

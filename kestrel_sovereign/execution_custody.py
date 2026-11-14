@@ -33,6 +33,7 @@ from httpx2 import Response as _NativeHTTPX2Response
 from kestrel_sdk.features.host_errors import register_control_error_predicate
 from kestrel_sdk.storage.database import TransactionError
 from kestrel_sdk.resources import ResourceOutcomeUnknown
+from kestrel_sdk.native_a2a.utils.source_ownership import SourceAcquisition, SourceWithdrawal, WakeableSource
 
 from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
 
@@ -1858,7 +1859,10 @@ class _ExecutionForwarder:
     bindings, and later foreign consumers may add but never discard custody.
     """
 
-    def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = (), *, lifecycle: ExecutionStreamLifecycle | None = None):
+    def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = (), *, lifecycle: ExecutionStreamLifecycle | None = None, withdrawal: SourceWithdrawal | None = None):
+        if withdrawal is not None and not isinstance(withdrawal, SourceWithdrawal):
+            raise TypeError("execution withdrawal must be a SourceWithdrawal")
+        self._withdrawal = withdrawal
         self._runtime_owner = owner
         self._source = aiter(stream)
         self._native_admission = capture_native_execution_admission()
@@ -1898,6 +1902,12 @@ class _ExecutionForwarder:
         self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
         self._cleanup_state.scopes = self._scopes
 
+    def _acquire_cooperative_source(self, resources: SourceAcquisition):
+        # Select the SAME SDK body kernel, not another forwarding algorithm.
+        # _produce still binds the original captured runtime/turn/admission;
+        # explicit withdrawal changes only demand/retirement ownership.
+        return resources.retain_iterable(WakeableSource(self._produce(), self._withdrawal))
+
     async def _ensure_iterator(self):
         if self._iterator is None:
             from kestrel_sovereign._async_ownership import create_owned_iterator
@@ -1916,7 +1926,9 @@ class _ExecutionForwarder:
                     self._lifecycle.resource_started(iterator, task, self)
             with self._turn_scope.bind():
                 self._iterator = await create_owned_iterator(
-                    self._produce, operation="execution-stream-forward",
+                    self._produce if self._withdrawal is None else None,
+                    source_factory=None if self._withdrawal is None else self._acquire_cooperative_source,
+                    operation="execution-stream-forward",
                     owner_context=self._owner_context,
                     owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
                     owner_started=started,
@@ -2121,9 +2133,15 @@ async def close_execution_stream(
 
 
 @asynccontextmanager
-async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
-    """Own every forwarding layer until the source's terminal classification."""
-    iterator = _ExecutionForwarder(owner, stream)
+async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any], *, withdrawal: SourceWithdrawal | None = None):
+    """Own every forwarding layer until the source's terminal classification.
+
+    Explicit withdrawal selects the canonical cooperative source kernel. Pass
+    that SAME signal to known idle waits: close may request demand withdrawal,
+    but must join an opaque original body/finally rather than cancel it. Omitted
+    withdrawal preserves the existing general execution-stream contract.
+    """
+    iterator = _ExecutionForwarder(owner, stream, withdrawal=withdrawal)
     error = None
     try:
         yield iterator
