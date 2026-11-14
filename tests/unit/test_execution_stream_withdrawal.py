@@ -34,6 +34,119 @@ def original_withdrawals(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["legacy-close", "close", "signal"])
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("eager", [False, True])
+async def test_reserved_source_retires_without_a_consumer_pull(trigger, fail, eager):
+    import sqlite3
+
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("native eager Task requires Python 3.12")
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    signal = None if trigger == "legacy-close" else SourceWithdrawal()
+    native = sqlite3.connect(":memory:")
+    descriptors = os.pipe()
+    advanced, closed, physical = [], [], []
+    closer = None
+    assertions_finished = False
+    recovering = False
+
+    class AcquiredOriginal:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if recovering:
+                raise StopAsyncIteration
+            advanced.append(asyncio.current_task())
+            pytest.fail("Reserved source advanced without an admitted consumer pull")
+
+        async def aclose(self):
+            closed.append(asyncio.current_task())
+            native.close()
+            for descriptor in descriptors:
+                os.close(descriptor)
+            if fail:
+                try:
+                    os.fstat(descriptors[0])
+                except OSError as error:
+                    physical.append(error)
+                    raise
+
+    try:
+        if eager:
+            loop.set_task_factory(asyncio.eager_task_factory)
+        async with owned_execution_stream(object(), AcquiredOriginal(), withdrawal=signal) as events:
+            async def close():
+                try:
+                    await events.aclose()
+                except BaseException as error:
+                    return error
+
+            try:
+                await events.reserve()
+                producer = events._iterator.producer_task
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert events._producer_started and not advanced and not closed
+                if trigger == "signal":
+                    signal.request_stop()
+                    target = producer
+                else:
+                    closer = asyncio.create_task(close())
+                    target = closer
+                done, _ = await asyncio.wait((target,), timeout=0.2)
+                if not done:
+                    # Capture the real leaked resource BEFORE test-only recovery.
+                    assert native.execute("SELECT 1").fetchone() == (1,)
+                    assert not closed
+                assert done, "Reserved consumer gate ignored cooperative withdrawal"
+                if closer is None:
+                    closer = asyncio.create_task(close())
+                terminal = await closer
+                if fail:
+                    assert len(physical) == 1
+                    if signal is not None:
+                        assert is_execution_control_error(terminal)
+                    assert any(node is physical[0] for node in execution_evidence_carriers(terminal))
+                else:
+                    assert terminal is None
+                assert closed == [producer] and producer.done() and not advanced
+                if signal is not None:
+                    assert producer.cancelling() == 0
+                with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                    native.in_transaction
+                for descriptor in descriptors:
+                    with pytest.raises(OSError) as error:
+                        os.fstat(descriptor)
+                    assert error.value.errno == errno.EBADF
+                assertions_finished = True
+            finally:
+                if not assertions_finished:
+                    # Recover only the known resource-free TEST gate after the
+                    # actual stuck-owner/open-C evidence, never a product ACK.
+                    recovering = True
+                    events._consumer_started.set()
+                if closer is not None:
+                    await asyncio.gather(closer, return_exceptions=True)
+    except BaseException as error:
+        if not assertions_finished:
+            raise
+        assert fail and any(node is physical[0] for node in execution_evidence_carriers(error))
+    finally:
+        loop.set_task_factory(previous_factory)
+        native.close()
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["request", "forwarder", "iterator", "callback"])
 async def test_cancelled_original_finally_is_not_a_private_stop_ack(route):
     from kestrel_sovereign.execution_custody import execution_cleanup_debts, is_execution_control_error

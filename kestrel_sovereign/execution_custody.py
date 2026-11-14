@@ -2017,7 +2017,25 @@ class _ExecutionForwarder:
         error = None
         lifetime_token = None
         try:
-            await self._consumer_started.wait()
+            if self._withdrawal is None:
+                await self._consumer_started.wait()
+            else:
+                from kestrel_sovereign._async_ownership import gather_owned
+
+                if not self._withdrawal.requested:
+                    # Only these known, resource-free waits may be cancelled.
+                    # The SAME producer retires its already-acquired source in
+                    # its original finally without dispatching source payload.
+                    await gather_owned(
+                        (factory() for factory in (
+                            self._consumer_started.wait, self._withdrawal.wait,
+                        )),
+                        return_when=asyncio.FIRST_COMPLETED,
+                        retain_originals=True,
+                        name_prefix="execution-stream-consumer-wait",
+                    )
+                if self._withdrawal.requested:
+                    return
             inherited = self._lifecycle
             if inherited is not None and inherited.descendant_lifecycle is not None:
                 inherited.require_work()
