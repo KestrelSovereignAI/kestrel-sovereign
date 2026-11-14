@@ -1741,9 +1741,18 @@ budget. Native tool annotations remain conservative because governed reads write
 records. Actual SDK/source tests cover these paths; they are not installed
 external-client acceptance.
 
-Atomic external `log_turn`, a real browser consent flow, actual Claude/ChatGPT
-installation and subsequent reflection/consolidation remain acceptance gates
-of #1990 and the original epic.
+Native browser acceptance drives the real consent page with Chromium over
+owned HTTPS listeners, an initialized Core agent and an owned connector
+callback, inside a private container with no host mounts or external network.
+It covers explicit owner-key entry, scope display, approval and denial,
+issuer/state preservation, consumed tab hints and withholding the owner key
+from the callback. The approved grant also completes native PKCE exchange and
+a governed memory read. The existing browser CI lane runs both its operator
+input and server consent suites and retires each original container.
+
+This is owned-connector acceptance. Atomic external `log_turn`, actual
+Claude/ChatGPT installation and subsequent reflection/consolidation remain
+acceptance gates of #1990 and the original epic.
 
 ## Review, verification and release order
 
