@@ -681,5 +681,31 @@ fails with `Distributed Stop owner heartbeat has not retired`, naming the
 thread or the connection, and keeps the Stop registry and its database open
 rather than closing them under a renewal that may still hold a transaction.
 
+### A subagent is refused with `exceeded its context budget`
+A feature subagent measures each request before sending it, as an upper bound
+on its tokens taken from the request's bytes (#4068): tiktoken's count was 43%
+low for a Claude request on 2026-11-13. Each refusal logs one `WARNING`,
+`[SUBAGENT <feature>] refused: bound=... count=... budget=... model=... route=...`,
+where `count` is the old tiktoken figure, so the refusals can be counted. The
+bound overstates ordinary prose, so a prose-heavy subagent is refused at about
+half its real window until compaction lands (#4067).
+
+The bound learns from the counts providers report. Its values live in
+`token_bound_ratchet.json`, beside the context-limit cache
+(`$KESTREL_CONTEXT_LIMITS_CACHE_FILE`, default
+`~/.kestrel/discovered_context_limits.json`). Each value is stored with the
+sizes and counts of the sample that moved it, never content. Delete the file,
+or one entry, to reset it; a running host picks the change up. A missing or
+unreadable file means the starting values, and the gate still refuses.
+
+Every host sharing the file publishes one value at a time under
+`token_bound_ratchet.json.lock` beside it: it re-reads the file and keeps the
+stricter value, so a host never overwrites a lower `bpt_min` or a higher
+`overhead` another host wrote. A value that cannot be published within half a
+second logs `Could not persist token bound ratchet` and applies in that process
+until it exits. A sample observed in a volatile privacy mode is never written:
+it is kept in memory for that agent's privacy epoch only, and another agent on
+the same host neither uses it nor drops it.
+
 ### Logs not appearing in Cloud Run
 Python `logging.info()` calls from request handlers don't always reach Cloud Run's structured log pipeline. Use `print(json.dumps({"severity": "WARNING", "message": "..."}), flush=True)` for debugging.

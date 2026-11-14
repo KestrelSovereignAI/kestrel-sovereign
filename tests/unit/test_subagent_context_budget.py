@@ -79,16 +79,21 @@ def _messages(total_chars):
     return [{"role": "tool", "tool_call_id": "t", "content": "x" * total_chars}]
 
 
+def _refusal(feature, messages, model, tools=None):
+    """The gate's refusal for a request whose system prompt is in ``messages``."""
+    return feature._subagent_context_overflow(messages, model, tools, system=None).refusal
+
+
 def test_a_small_conversation_is_not_refused(feature):
     """Control: the ceiling must not fire on ordinary work, or the refusal
     below proves nothing."""
-    assert feature._subagent_context_overflow(_messages(1000), SMALL_MODEL) is None
+    assert _refusal(feature, _messages(1000), SMALL_MODEL) is None
 
 
 def test_an_oversized_conversation_is_refused(feature):
     # claude-opus-5 is recorded at 1,000,000 tokens; 0.85 of that is the
     # ceiling. ~1.2M tokens of content clears it comfortably.
-    reason = feature._subagent_context_overflow(_messages(5_000_000), SMALL_MODEL)
+    reason = _refusal(feature, _messages(5_000_000), SMALL_MODEL)
     assert reason is not None
     assert "context budget" in reason
 
@@ -96,7 +101,7 @@ def test_an_oversized_conversation_is_refused(feature):
 def test_the_refusal_names_the_numbers_and_the_cause(feature):
     """An operator-facing message has to say what was exceeded and why, not
     just that something failed."""
-    reason = feature._subagent_context_overflow(_messages(5_000_000), SMALL_MODEL)
+    reason = _refusal(feature, _messages(5_000_000), SMALL_MODEL)
     assert SMALL_MODEL in reason
     assert "tool result" in reason
     assert any(c.isdigit() for c in reason)
@@ -130,7 +135,7 @@ def test_an_unknown_model_does_not_enforce(feature):
     """
     fake = "not-a-real-model-xyz"
     assert feature._subagent_context_budget(fake) is None
-    assert feature._subagent_context_overflow(_messages(5_000_000), fake) is None
+    assert _refusal(feature, _messages(5_000_000), fake) is None
 
 
 def test_no_model_does_not_enforce(feature):
@@ -138,7 +143,7 @@ def test_no_model_does_not_enforce(feature):
     loop learns the model from the response. Until it has one, enforcing
     would be guessing."""
     assert feature._subagent_context_budget(None) is None
-    assert feature._subagent_context_overflow(_messages(5_000_000), None) is None
+    assert _refusal(feature, _messages(5_000_000), None) is None
 
 
 def test_budget_is_derived_from_the_named_model(feature):
@@ -158,15 +163,14 @@ def test_budget_is_derived_from_the_named_model(feature):
     assert big < KNOWN_LIMIT
 
 
-def test_measurement_failure_does_not_refuse(feature, monkeypatch):
-    """A broken measurement must fail open. Refusing on our own inability to
-    count would turn a metrology bug into an outage.
+def test_a_broken_count_does_not_change_the_decision(feature, monkeypatch):
+    """The gate measures with ``upper_bound``; ``count`` only feeds the log line.
 
-    Only the token count is broken, not the limit lookup: breaking the
-    factory (or the limit) makes the BUDGET resolve to None first, so the
-    check short-circuits and the measurement path it names is never reached
-    -- the test would pass without exercising anything. The assertion below
-    that the budget still resolves is what keeps that honest.
+    Before #4068 a broken ``count`` made the gate fail open, so a request it
+    could not measure was sent. A gate that cannot measure cannot say "fits",
+    and ``count`` is no longer the measure: breaking it changes nothing but
+    the refusal's log line. The budget must still resolve, or the check
+    short-circuits before measuring anything.
     """
     from kestrel_sovereign.agent.token_counter import TokenCounter
 
@@ -177,7 +181,8 @@ def test_measurement_failure_does_not_refuse(feature, monkeypatch):
     assert feature._subagent_context_budget(SMALL_MODEL) is not None, (
         "budget lookup must still work, or this test proves nothing"
     )
-    assert feature._subagent_context_overflow(_messages(5_000_000), SMALL_MODEL) is None
+    assert _refusal(feature, _messages(5_000_000), SMALL_MODEL) is not None
+    assert _refusal(feature, _messages(1000), SMALL_MODEL) is None
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +295,7 @@ def test_tool_schemas_count_against_the_budget(feature):
     fits on its own can still overflow once the schemas are added, so leaving
     them out of the measurement lets the gate pass a doomed request."""
     small_messages = _messages(1000)
-    assert feature._subagent_context_overflow(small_messages, SMALL_MODEL) is None
+    assert _refusal(feature, small_messages, SMALL_MODEL) is None
 
     fat_tools = [
         {"type": "function",
@@ -298,7 +303,5 @@ def test_tool_schemas_count_against_the_budget(feature):
                       "parameters": {"type": "object", "properties": {}}}}
         for i in range(40)
     ]
-    reason = feature._subagent_context_overflow(
-        small_messages, SMALL_MODEL, fat_tools
-    )
+    reason = _refusal(feature, small_messages, SMALL_MODEL, fat_tools)
     assert reason is not None, "tool schemas were not counted"

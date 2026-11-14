@@ -11,10 +11,20 @@ Context limits are sourced from (in priority order):
 4. DEFAULT_CONTEXT_LIMIT fallback
 """
 
+import contextlib
 import json
 import logging
+import math
+import os
+import re
+import tempfile
+import time
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from types import MappingProxyType
+from typing import Optional, List, Dict, Any, Iterator, Mapping, Tuple, Union
 
 from kestrel_sovereign.paths import CONTEXT_LIMITS_CACHE_FILE_ENV, runtime_path_env
 
@@ -119,6 +129,703 @@ DEFAULT_CONTEXT_LIMIT = 32768
 
 # Characters per token estimate for non-tiktoken models
 CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+# ---------------------------------------------------------------------------
+# Upper bound on a request's input tokens (#4068)
+#
+# ``count`` uses tiktoken, OpenAI's tokenizer. On 2026-11-13 it counted a
+# subagent request at 663,779 tokens that the provider counted at 1,158,906,
+# so the gate sent a request the provider rejected. ``upper_bound`` bounds the
+# request from its UTF-8 bytes instead:
+#
+#     bound = ceil(wire_bytes / bpt_min[family]) + overhead[route]
+#
+# ``bpt_min`` (bytes per token) only moves down and ``overhead`` (tokens the
+# route adds that have no bytes on our side) only moves up, both learned from
+# the counts providers report for requests whose bytes were captured before
+# the send. A family tiktoken really tokenizes uses its tiktoken count plus
+# ``overhead``. ``count`` and its callers are unchanged.
+# ---------------------------------------------------------------------------
+
+#: Bytes per token a byte-bounded family starts from. The one count we have
+#: is 2,616,316 bytes for 1,158,906 tokens (2.26). Provisional until the six
+#: fixture classes are recorded (#4085).
+STARTING_BYTES_PER_TOKEN = 2.0
+#: ``bpt_min`` never goes below this.
+MIN_BYTES_PER_TOKEN = 1.0
+#: ``overhead[route]`` is capped at this share of the model's context limit.
+OVERHEAD_CAP_FRACTION = 0.02
+#: A sample moves ``bpt_min`` only when its total input count is at or above
+#: the smaller of this and a quarter of the context limit.
+SAMPLE_FLOOR_TOKENS = 100_000
+SAMPLE_FLOOR_LIMIT_FRACTION = 0.25
+#: The ratchet's file, beside :func:`context_limits_cache_file`.
+TOKEN_BOUND_CACHE_FILENAME = "token_bound_ratchet.json"
+_TOKEN_BOUND_CACHE_VERSION = 1
+#: The lock beside the ratchet file that serializes its writers across
+#: processes: ``token_bound_ratchet.json.lock``. It is kept after release.
+TOKEN_BOUND_LOCK_SUFFIX = ".lock"
+#: How long a writer waits for another before its value stays in memory.
+TOKEN_BOUND_LOCK_TIMEOUT_SECONDS = 0.5
+TOKEN_BOUND_LOCK_POLL_SECONDS = 0.005
+
+#: Content-block types costed by their bytes alone.
+BYTE_COSTED_BLOCK_TYPES = frozenset({"text", "tool_use", "tool_result"})
+#: Any other block type needs an entry here: the tokens one block of that type
+#: costs beyond its bytes, backed by a recorded provider count. None is
+#: recorded, so every other type is refused by name.
+RECORDED_BLOCK_TOKEN_COSTS: Mapping[str, int] = MappingProxyType({})
+
+_PROMPT_TOO_LONG_RE = re.compile(r"prompt is too long:\s*([0-9][0-9,]*)\s*tokens", re.IGNORECASE)
+_FAMILY_RE = re.compile(r"[a-z]+")
+_TIKTOKEN_FAMILY = "tiktoken"
+
+#: Events an operator can count: gate refusals and samples whose excess the
+#: overhead cap could not cover. Read with :func:`token_bound_event_counts`.
+_TOKEN_BOUND_EVENTS: Counter = Counter()
+
+
+def count_token_bound_event(name: str) -> None:
+    """Count one token-bound event (a refusal, an unlearned excess)."""
+    _TOKEN_BOUND_EVENTS[name] += 1
+
+
+def token_bound_event_counts() -> Dict[str, int]:
+    """A snapshot of the token-bound event counts in this process."""
+    return dict(_TOKEN_BOUND_EVENTS)
+
+
+@dataclass(frozen=True)
+class TokenBound:
+    """An upper bound on a request's input tokens, and what it was made of.
+
+    ``wire_bytes`` is captured here, before the send, so a sample pairs a
+    provider's count with the bytes of the request it counted, not with an
+    array that grew afterwards.
+    """
+
+    tokens: int
+    wire_bytes: int
+    model: str
+    family: str
+    route: str
+    #: The tokens before ``overhead``: the byte quotient, or the tiktoken count.
+    measured_tokens: int
+    overhead: int
+    #: ``None`` for a tiktoken family.
+    bytes_per_token: Optional[float]
+
+
+@dataclass(frozen=True)
+class MeasurementRefusal:
+    """A request ``upper_bound`` cannot bound, and why."""
+
+    reason: str
+
+
+def _wire_json(part: Any) -> str:
+    """One request part serialized as it is measured."""
+    return json.dumps(part, ensure_ascii=True, separators=(",", ":"), default=str)
+
+
+def _bare_model(model: str) -> str:
+    """The model id without a ``vendor:route/`` or ``vendor/`` prefix."""
+    if ":" in model and "/" in model:
+        return model.split("/", 1)[1]
+    if "/" in model:
+        return model.rsplit("/", 1)[1]
+    return model
+
+
+def model_route(model: str) -> str:
+    """``vendor:route`` of a route-qualified model id, else ``""``."""
+    if ":" in model and "/" in model:
+        return model.split("/", 1)[0]
+    return ""
+
+
+def _tiktoken_encoding(bare_model: str):
+    """The encoding tiktoken really has for this model, or ``None``.
+
+    The ``cl100k_base`` fallback ``TokenCounter`` uses for an unknown model is
+    not one: it is a guess, so such a model is bounded by its bytes.
+    """
+    if not TIKTOKEN_AVAILABLE:
+        return None
+    try:
+        return tiktoken.encoding_for_model(bare_model)
+    except KeyError:
+        return None
+
+
+def model_family(model: str) -> str:
+    """The family whose ``bpt_min`` bounds this model's requests."""
+    bare = _bare_model(model).lower()
+    if "claude" in bare:
+        return "claude"
+    if _tiktoken_encoding(bare) is not None:
+        return _TIKTOKEN_FAMILY
+    match = _FAMILY_RE.match(bare)
+    return match.group(0) if match else "unknown"
+
+
+def _request_additions(model: str) -> List[Any]:
+    """What a route adds to the request, built in this process, as parts.
+
+    Counted in ``wire_bytes`` for every route that could serve the model, so
+    it bounds the route that does:
+
+    * ``claude``: the Claude Code identity system block the plan route
+      prepends, and one cache-control content block for each of the four
+      breakpoints ``AnthropicAdapter._apply_cache_control`` can place. Each
+      such block is at least what wrapping a string costs.
+    * ``gpt-5``: the behaviour contract ``prepend_gpt5_overlay`` puts before
+      the system prompt, with its separator.
+
+    What a route adds outside this process (a provider's own tool-use prompt,
+    the Codex app-server's instructions) has no bytes here and is left to
+    ``overhead``.
+    """
+    additions: List[Any] = []
+    if model_family(model) == "claude":
+        from kestrel_sovereign.llm.anthropic_adapter import (
+            CACHE_CONTROL_EPHEMERAL,
+            CLAUDE_CODE_IDENTITY,
+        )
+
+        additions.append({
+            "type": "text",
+            "text": CLAUDE_CODE_IDENTITY,
+            "cache_control": CACHE_CONTROL_EPHEMERAL,
+        })
+        additions.extend(
+            [{"type": "text", "text": "", "cache_control": CACHE_CONTROL_EPHEMERAL}] * 4
+        )
+    from kestrel_sovereign.llm.gpt5_overlay import (
+        GPT5_BEHAVIOR_CONTRACT,
+        is_gpt5_model_id,
+    )
+
+    if is_gpt5_model_id(model):
+        additions.append(f"{GPT5_BEHAVIOR_CONTRACT}\n\n")
+    return additions
+
+
+def _unbounded_block_type(content: Any) -> Optional[str]:
+    """The first block type in ``content`` with no cost, or ``None``."""
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict):
+            return type(block).__name__
+        block_type = block.get("type")
+        if (
+            block_type not in BYTE_COSTED_BLOCK_TYPES
+            and block_type not in RECORDED_BLOCK_TOKEN_COSTS
+        ):
+            return str(block_type)
+        nested = _unbounded_block_type(block.get("content"))
+        if nested is not None:
+            return nested
+    return None
+
+
+def _recorded_block_tokens(content: Any) -> int:
+    """Tokens the recorded block costs add for ``content``, beyond its bytes."""
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for block in content:
+        if isinstance(block, dict):
+            total += RECORDED_BLOCK_TOKEN_COSTS.get(block.get("type"), 0)
+            total += _recorded_block_tokens(block.get("content"))
+    return total
+
+
+def _cause_chain(error: BaseException) -> Iterator[BaseException]:
+    """``error`` and each exception it was raised from or during, once each."""
+    seen: set = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _prompt_too_long_count(text: str) -> Optional[int]:
+    match = _PROMPT_TOO_LONG_RE.search(text)
+    return int(match.group(1).replace(",", "")) if match else None
+
+
+def rejected_prompt_tokens(error: BaseException) -> Optional[int]:
+    """The count inside a provider's ``prompt is too long`` rejection.
+
+    The service wraps the provider's error, so the whole cause chain is read.
+    """
+    for current in _cause_chain(error):
+        counted = _prompt_too_long_count(str(current))
+        if counted is not None:
+            return counted
+    return None
+
+
+def rejected_prompt_samples(error: BaseException) -> List[Tuple[Optional[str], int]]:
+    """Each ``prompt is too long`` count in a failed send, with the route that counted it.
+
+    When every route of ``get_response`` failed (the path a subagent's first
+    ``generate`` takes) the service raises ``LLMAllProvidersFailedError``,
+    which holds each route's own error under the route's name: each count is
+    returned under that name. Any other error is read through its cause chain
+    and returned with no route, for the caller to name the route it sent to.
+    """
+    from kestrel_sovereign.llm.error_handling import LLMAllProvidersFailedError
+
+    for current in _cause_chain(error):
+        if isinstance(current, LLMAllProvidersFailedError):
+            samples: List[Tuple[Optional[str], int]] = []
+            for route, route_error in current.errors.items():
+                counted = (
+                    rejected_prompt_tokens(route_error)
+                    if isinstance(route_error, BaseException)
+                    else _prompt_too_long_count(str(route_error))
+                )
+                if counted is not None:
+                    samples.append((str(route), counted))
+            return samples
+    counted = rejected_prompt_tokens(error)
+    return [] if counted is None else [(None, counted)]
+
+
+def token_bound_cache_file() -> Path:
+    """Where the ratchet persists: beside the context-limit cache."""
+    return context_limits_cache_file().with_name(TOKEN_BOUND_CACHE_FILENAME)
+
+
+def _sample_record(model: str, route: str, wire_bytes: int, total_input: int) -> Dict[str, Any]:
+    """The sample stored with a value: sizes and counts, no content."""
+    return {
+        "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model": model,
+        "route": route,
+        "wire_bytes": wire_bytes,
+        "total_input": total_input,
+    }
+
+
+@dataclass(frozen=True)
+class PrivacyEpoch:
+    """The privacy policy one agent has in force: whose it is, and which epoch.
+
+    A sample observed while persistent writes are not allowed is held in
+    memory for its owner's current epoch only. It applies to that owner's
+    requests and is dropped when that owner's epoch changes. Co-hosted agents
+    share one ratchet, so another agent's epoch never touches it.
+    """
+
+    owner: str
+    epoch: str
+
+
+class TokenBoundRatchetBusy(RuntimeError):
+    """Another writer held the ratchet file's lock past the wait."""
+
+
+class _VolatileSamples:
+    """What one owner learned in its current privacy epoch, held in memory."""
+
+    __slots__ = ("epoch", "bpt_min", "overhead")
+
+    def __init__(self, epoch: str) -> None:
+        self.epoch = epoch
+        self.bpt_min: Dict[str, float] = {}
+        self.overhead: Dict[str, int] = {}
+
+
+#: The ratchet's two sections, as named in its file.
+_BPT_MIN = "bpt_min"
+_OVERHEAD = "overhead"
+
+
+def _stricter(section: str, value: Union[int, float], than: Union[int, float]) -> bool:
+    """Whether ``value`` bounds more conservatively than ``than``."""
+    return value < than if section == _BPT_MIN else value > than
+
+
+def _lock_contended(error: OSError) -> bool:
+    """Whether a refused non-blocking lock attempt means another holder."""
+    # POSIX flock: EWOULDBLOCK. Windows LockFileEx: ERROR_LOCK_VIOLATION (33).
+    return isinstance(error, BlockingIOError) or getattr(error, "winerror", None) == 33
+
+
+class _TokenBoundRatchet:
+    """``bpt_min`` per family and ``overhead`` per route, for one cache file.
+
+    The file is re-read whenever it changes on disk, so an operator resets the
+    ratchet by deleting the file or one entry, and the running host sees it.
+    A missing or unreadable file means the starting values.
+
+    Every process sharing the file publishes one learned value at a time,
+    under a lock beside the file: it re-reads the file, keeps the stricter of
+    its value and the one there (the lower ``bpt_min``, the higher
+    ``overhead``, each with its own sample), and replaces the file. A stricter
+    value another process wrote is never overwritten, and an entry the
+    operator deleted is not written back. A value that could not be published
+    applies in this process until it exits.
+
+    Samples observed while persistent writes are not allowed are never
+    written: they live in memory, per owner, for the privacy epoch they were
+    observed in (:class:`PrivacyEpoch`).
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock_path = path.with_name(path.name + TOKEN_BOUND_LOCK_SUFFIX)
+        self._stamp: Any = object()  # never equal to a real stamp
+        self._bpt: Dict[str, Dict[str, Any]] = {}
+        self._overhead: Dict[str, Dict[str, Any]] = {}
+        self._unpublished: Dict[str, Dict[str, Union[int, float]]] = {_BPT_MIN: {}, _OVERHEAD: {}}
+        self._volatile: Dict[str, _VolatileSamples] = {}
+
+    # -- reading -----------------------------------------------------------
+
+    def _file_stamp(self) -> Any:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            return ("unreadable", type(error).__name__)
+        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+    def _refresh(self) -> None:
+        stamp = self._file_stamp()
+        if stamp == self._stamp:
+            return
+        self._stamp = stamp
+        if stamp is None:
+            self._bpt, self._overhead = {}, {}
+            logger.warning(
+                "Token bound ratchet %s does not exist; using the starting values",
+                self.path,
+            )
+            return
+        self._bpt, self._overhead = self._read()
+
+    def _read(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """The file's valid entries; none when it is missing or unreadable."""
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}, {}
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            logger.warning(
+                "Token bound ratchet %s is unreadable (%s); using the starting values",
+                self.path, type(error).__name__,
+            )
+            return {}, {}
+        if not isinstance(data, dict):
+            logger.warning(
+                "Token bound ratchet %s is not an object; using the starting values",
+                self.path,
+            )
+            return {}, {}
+        return (
+            self._entries(data.get(_BPT_MIN), _BPT_MIN, self._valid_bpt),
+            self._entries(data.get(_OVERHEAD), _OVERHEAD, self._valid_overhead),
+        )
+
+    def _entries(self, section: Any, name: str, valid) -> Dict[str, Dict[str, Any]]:
+        if section is None:
+            return {}
+        if not isinstance(section, dict):
+            logger.warning("Token bound ratchet %s: %s is not an object; ignored", self.path, name)
+            return {}
+        kept: Dict[str, Dict[str, Any]] = {}
+        for key, entry in section.items():
+            if isinstance(entry, dict) and valid(entry.get("value")):
+                kept[str(key)] = entry
+            else:
+                logger.warning(
+                    "Token bound ratchet %s: entry %s[%r] is invalid; ignored",
+                    self.path, name, key,
+                )
+        return kept
+
+    @staticmethod
+    def _valid_bpt(value: Any) -> bool:
+        return (
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0
+        )
+
+    @staticmethod
+    def _valid_overhead(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    def _volatile_for(self, privacy_epoch: Optional[PrivacyEpoch]) -> Optional[_VolatileSamples]:
+        """The owner's samples for its current epoch, or ``None`` without an epoch.
+
+        An owner whose epoch changed has its own samples dropped; no other
+        owner's are touched.
+        """
+        if privacy_epoch is None:
+            return None
+        if not isinstance(privacy_epoch, PrivacyEpoch):
+            raise TypeError(
+                f"privacy_epoch must be a PrivacyEpoch, not {type(privacy_epoch).__name__}"
+            )
+        held = self._volatile.get(privacy_epoch.owner)
+        if held is None or held.epoch != privacy_epoch.epoch:
+            held = self._volatile[privacy_epoch.owner] = _VolatileSamples(privacy_epoch.epoch)
+        return held
+
+    def bytes_per_token(self, family: str, privacy_epoch: Optional[PrivacyEpoch]) -> float:
+        self._refresh()
+        candidates = [STARTING_BYTES_PER_TOKEN]
+        stored = self._bpt.get(family)
+        if stored is not None:
+            candidates.append(float(stored["value"]))
+        if family in self._unpublished[_BPT_MIN]:
+            candidates.append(float(self._unpublished[_BPT_MIN][family]))
+        held = self._volatile_for(privacy_epoch)
+        if held is not None and family in held.bpt_min:
+            candidates.append(held.bpt_min[family])
+        return max(MIN_BYTES_PER_TOKEN, min(candidates))
+
+    def overhead(
+        self, route: str, cap: Optional[int], privacy_epoch: Optional[PrivacyEpoch],
+    ) -> int:
+        """``overhead[route]``; for an unknown route, the largest any route learned."""
+        self._refresh()
+        held = self._volatile_for(privacy_epoch)
+        learned = [
+            {key: entry["value"] for key, entry in self._overhead.items()},
+            self._unpublished[_OVERHEAD],
+            held.overhead if held is not None else {},
+        ]
+        if route:
+            values = [0, *(source[route] for source in learned if route in source)]
+        else:
+            values = [0, *(value for source in learned for value in source.values())]
+        value = max(values)
+        return value if cap is None else min(value, cap)
+
+    # -- learning ----------------------------------------------------------
+
+    def record(
+        self,
+        bound: TokenBound,
+        total_input: int,
+        *,
+        route: str,
+        context_limit: Optional[int],
+        persist: bool,
+        privacy_epoch: Optional[PrivacyEpoch],
+    ) -> None:
+        """Learn from one provider count for a request bounded at ``bound``."""
+        if total_input <= 0:
+            return
+        cap = int(context_limit * OVERHEAD_CAP_FRACTION) if context_limit else None
+        overhead = self.overhead(route, cap, privacy_epoch)
+        floor = SAMPLE_FLOOR_TOKENS
+        if context_limit:
+            floor = min(floor, int(context_limit * SAMPLE_FLOOR_LIMIT_FRACTION))
+        if bound.bytes_per_token is not None and total_input >= floor:
+            self._learn_bytes_per_token(
+                bound, total_input, overhead,
+                route=route, persist=persist, privacy_epoch=privacy_epoch,
+            )
+            return
+        if bound.bytes_per_token is None:
+            measured = bound.measured_tokens
+        else:
+            measured = math.ceil(
+                bound.wire_bytes / self.bytes_per_token(bound.family, privacy_epoch)
+            )
+        excess = total_input - (measured + overhead)
+        if excess <= 0:
+            return
+        if cap is None:
+            self._unlearned(bound, total_input, route, "the context limit is unknown, so overhead has no cap")
+            return
+        raised = min(cap, overhead + excess)
+        if raised > overhead:
+            self._store(_OVERHEAD, route, raised, bound, total_input, route, persist, privacy_epoch)
+        if overhead + excess > cap:
+            self._unlearned(bound, total_input, route, f"overhead is at its cap of {cap:,} tokens")
+
+    def _learn_bytes_per_token(
+        self, bound: TokenBound, total_input: int, overhead: int, *,
+        route: str, persist: bool, privacy_epoch: Optional[PrivacyEpoch],
+    ) -> None:
+        tokens = total_input - overhead
+        if tokens <= 0:
+            return
+        current = self.bytes_per_token(bound.family, privacy_epoch)
+        observed = bound.wire_bytes / tokens
+        if observed >= current:
+            return
+        learned = max(MIN_BYTES_PER_TOKEN, observed)
+        if learned < current:
+            self._store(_BPT_MIN, bound.family, learned, bound, total_input, route, persist, privacy_epoch)
+        if observed < MIN_BYTES_PER_TOKEN:
+            self._unlearned(
+                bound, total_input, route,
+                f"bytes per token would fall below {MIN_BYTES_PER_TOKEN}",
+            )
+
+    def _unlearned(self, bound: TokenBound, total_input: int, route: str, why: str) -> None:
+        count_token_bound_event("unlearned_excess")
+        logger.warning(
+            "Token bound sample not learned (%s): route=%s model=%s T=%d wire_bytes=%d bound=%d",
+            why, route or "unknown", bound.model, total_input, bound.wire_bytes, bound.tokens,
+        )
+
+    def _store(
+        self, section: str, key: str, value: Union[int, float], bound: TokenBound,
+        total_input: int, route: str, persist: bool, privacy_epoch: Optional[PrivacyEpoch],
+    ) -> None:
+        logger.info(
+            "Token bound ratchet: %s[%s] -> %s (route=%s model=%s T=%d wire_bytes=%d)",
+            section, key or "unknown", value, route or "unknown", bound.model,
+            total_input, bound.wire_bytes,
+        )
+        if not persist:
+            held = self._volatile_for(privacy_epoch)
+            if held is None:
+                logger.warning(
+                    "Token bound sample not held: persistent writes are not allowed and "
+                    "no privacy epoch names whose sample it is (route=%s model=%s)",
+                    route or "unknown", bound.model,
+                )
+                return
+            getattr(held, section)[key] = value
+            return
+        self._publish(section, key, {
+            "value": value,
+            "sample": _sample_record(bound.model, route, bound.wire_bytes, total_input),
+        })
+
+    # -- publishing --------------------------------------------------------
+
+    def _publish(self, section: str, key: str, entry: Dict[str, Any]) -> None:
+        """Merge one learned value into the file, under the writers' lock."""
+        try:
+            with self._locked():
+                bpt, overhead = self._read()
+                on_disk = {_BPT_MIN: bpt, _OVERHEAD: overhead}[section]
+                current = on_disk.get(key)
+                if current is None or _stricter(section, entry["value"], current["value"]):
+                    on_disk[key] = entry
+                    self._replace_file(bpt, overhead)
+                else:
+                    logger.info(
+                        "Token bound ratchet: %s[%s] is already %s in %s; kept",
+                        section, key or "unknown", current["value"], self.path,
+                    )
+                self._bpt, self._overhead = bpt, overhead
+                # Stamped while the lock is held, so a later writer's change
+                # is seen as a change.
+                self._stamp = self._file_stamp()
+        except (OSError, TokenBoundRatchetBusy) as error:
+            logger.warning(
+                "Could not persist token bound ratchet %s (%s: %s); the learned "
+                "value applies in this process until it exits",
+                self.path, type(error).__name__, error,
+            )
+            held = self._unpublished[section].get(key)
+            if held is None or _stricter(section, entry["value"], held):
+                self._unpublished[section][key] = entry["value"]
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold the writers' lock beside the file, or raise ``TokenBoundRatchetBusy``.
+
+        The wait is bounded: a writer runs on the event loop, and a holder only
+        ever reads and replaces one small file.
+        """
+        from kestrel_sovereign.private_storage import (
+            lock_file_descriptor,
+            unlock_file_descriptor,
+        )
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            self.lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+        try:
+            deadline = time.monotonic() + TOKEN_BOUND_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    token = lock_file_descriptor(descriptor, blocking=False)
+                    break
+                except OSError as error:
+                    if not _lock_contended(error):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TokenBoundRatchetBusy(
+                            f"{self.lock_path} was held by another writer for "
+                            f"{TOKEN_BOUND_LOCK_TIMEOUT_SECONDS}s"
+                        ) from error
+                    time.sleep(TOKEN_BOUND_LOCK_POLL_SECONDS)
+            try:
+                yield
+            finally:
+                # Closing the descriptor below releases the lock even if this fails.
+                with contextlib.suppress(OSError):
+                    unlock_file_descriptor(descriptor, token)
+        finally:
+            os.close(descriptor)
+
+    def _replace_file(
+        self, bpt: Dict[str, Dict[str, Any]], overhead: Dict[str, Dict[str, Any]],
+    ) -> None:
+        payload = json.dumps(
+            {"version": _TOKEN_BOUND_CACHE_VERSION, _BPT_MIN: bpt, _OVERHEAD: overhead},
+            indent=2, sort_keys=True,
+        )
+        fd, staging = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            os.replace(staging, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(staging)
+            raise
+
+
+_ratchets: Dict[Path, _TokenBoundRatchet] = {}
+
+
+def _ratchet() -> _TokenBoundRatchet:
+    """The ratchet for the cache file the environment names now."""
+    path = token_bound_cache_file()
+    ratchet = _ratchets.get(path)
+    if ratchet is None:
+        ratchet = _ratchets[path] = _TokenBoundRatchet(path)
+    return ratchet
+
+
+def record_input_sample(
+    bound: TokenBound,
+    total_input: int,
+    *,
+    route: Optional[str] = None,
+    persist: bool,
+    privacy_epoch: Optional[PrivacyEpoch],
+) -> None:
+    """Feed one provider count for the request ``bound`` measured.
+
+    ``total_input`` is the response's input, cache-read and cache-creation
+    counts together, or the count inside a ``prompt is too long`` rejection.
+    ``persist`` is whether persistent writes are allowed now: a sample that
+    may not be persisted lives in memory for ``privacy_epoch`` only.
+    """
+    TokenCounter(bound.model).record_sample(
+        bound, total_input, route=route, persist=persist, privacy_epoch=privacy_epoch,
+    )
 
 
 class TokenCounter:
@@ -229,6 +936,109 @@ class TokenCounter:
             total += 3
 
         return total
+
+    def upper_bound(
+        self,
+        system: Any,
+        messages: Any,
+        tools: Any,
+        *,
+        route: Optional[str] = None,
+        privacy_epoch: Optional[PrivacyEpoch] = None,
+    ) -> Union[TokenBound, MeasurementRefusal]:
+        """An upper bound on the input tokens of one request, or why there is none.
+
+        Takes the request's structured parts, never a string someone already
+        serialized: the system prompt (``None`` when it sits inside
+        ``messages``), the message array and the tool schemas. Each is
+        serialized exactly once, as ``_wire_json`` does, and its UTF-8 bytes
+        are summed with what the route adds in this process
+        (:func:`_request_additions`). ``route`` names the route the request
+        goes to when the caller knows it; otherwise it is read from a
+        route-qualified model id. ``privacy_epoch`` applies the samples its
+        owner holds in memory for that epoch.
+
+        A request it cannot bound is returned as a :class:`MeasurementRefusal`,
+        never raised: a part that does not serialize, or a content block of a
+        type with no recorded cost.
+        """
+        for content in self._block_contents(system, messages):
+            block_type = _unbounded_block_type(content)
+            if block_type is not None:
+                return MeasurementRefusal(
+                    f"content block type {block_type!r} has no recorded token count, "
+                    f"so its size cannot be bounded"
+                )
+        parts = [part for part in (system, messages, tools) if part is not None]
+        parts.extend(_request_additions(self.model))
+        serialized = []
+        for part in parts:
+            try:
+                serialized.append(_wire_json(part))
+            except (TypeError, ValueError, RecursionError) as error:
+                return MeasurementRefusal(
+                    f"a request part does not serialize ({type(error).__name__}: {error})"
+                )
+        wire_bytes = sum(len(text.encode("utf-8")) for text in serialized)
+        extra = sum(
+            _recorded_block_tokens(content)
+            for content in self._block_contents(system, messages)
+        )
+        family = model_family(self.model)
+        route = route or model_route(self.model)
+        limit = self.resolved_context_limit()
+        cap = int(limit * OVERHEAD_CAP_FRACTION) if limit else None
+        ratchet = _ratchet()
+        overhead = ratchet.overhead(route, cap, privacy_epoch)
+        if family == _TIKTOKEN_FAMILY:
+            encoder = _tiktoken_encoding(_bare_model(self.model).lower())
+            measured = sum(len(encoder.encode(text)) for text in serialized) + extra
+            bytes_per_token = None
+        else:
+            bytes_per_token = ratchet.bytes_per_token(family, privacy_epoch)
+            measured = math.ceil(wire_bytes / bytes_per_token) + extra
+        return TokenBound(
+            tokens=measured + overhead,
+            wire_bytes=wire_bytes,
+            model=self.model,
+            family=family,
+            route=route,
+            measured_tokens=measured,
+            overhead=overhead,
+            bytes_per_token=bytes_per_token,
+        )
+
+    @staticmethod
+    def _block_contents(system: Any, messages: Any) -> List[Any]:
+        """Every value that can hold content blocks: the system and each message's content."""
+        contents = [system]
+        if isinstance(messages, list):
+            contents.extend(
+                message.get("content") for message in messages if isinstance(message, dict)
+            )
+        return contents
+
+    def record_sample(
+        self,
+        bound: TokenBound,
+        total_input: int,
+        *,
+        route: Optional[str] = None,
+        persist: bool,
+        privacy_epoch: Optional[PrivacyEpoch],
+    ) -> None:
+        """Feed the ratchet one provider count for the request ``bound`` measured.
+
+        See :func:`record_input_sample`.
+        """
+        _ratchet().record(
+            bound,
+            total_input,
+            route=route if route is not None else bound.route,
+            context_limit=self.resolved_context_limit(),
+            persist=persist,
+            privacy_epoch=privacy_epoch,
+        )
 
     def resolved_context_limit(self) -> Optional[int]:
         """
