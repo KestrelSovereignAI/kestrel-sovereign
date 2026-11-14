@@ -52,6 +52,7 @@ from kestrel_sovereign.storage.memory_system import (
     MemoryConsolidationTimeoutError,
     _consolidation_timeout_seconds,
 )
+from kestrel_sovereign.storage.memory_attestation_state import ensure_attestation_tables
 from kestrel_sovereign.storage.memory_retriever import _is_user_query_echo
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -134,6 +135,10 @@ class MemoryFeature(Feature):
         """Initialize the memory feature with storage references."""
         self.storage = self.agent.storage
         self._db = resolve_feature_database(self.agent)
+        # The first sleep must not migrate schema after its original signal
+        # journal has pinned the native destination. Prepare the hook's own
+        # tables during feature initialization, before any scheduler is armed.
+        await ensure_attestation_tables(self._db)
         # MemorySystem is the single facade for all memory components.
         # Lazily loaded since it's initialized on the agent after feature registration.
         self._memory_system = None

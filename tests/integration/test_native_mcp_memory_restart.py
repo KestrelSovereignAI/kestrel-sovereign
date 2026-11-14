@@ -15,6 +15,8 @@ from fastapi.encoders import jsonable_encoder
 from kestrel_sdk.storage.database.interface import QueryError
 
 from kestrel_sovereign.agent.custody import ReleaseOutcome
+from kestrel_sovereign.features.memory.feature import MemoryFeature
+from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import memory_consolidator
 from kestrel_sovereign.storage.db.sqlite import _aiosqlite_worker_is_alive
@@ -70,30 +72,9 @@ async def test_original_external_rows_reach_privacy_governed_consolidation_after
 ):
     # A normal source-checkout CWD must not shadow the installed parent Core.
     monkeypatch.chdir(Path(__file__).resolve().parents[2])
-    owner, http = publication
-    owner.publish()
-    original = owner.agent
-    token = (await issue_native_tokens(owner, http, scope="memory:write"))["access_token"]
-    receipts = []
-    for number in range(2):
-        result, failure, _ = await observe_native_call(owner, token, "log_turn",
-            exchange_arguments(user_content=f"Remember the orbital garden plan {number}.",
-                assistant_content=f"The external assistant discussed orbital garden {number}."))
-        assert failure is None and not result.is_error
-        data = result.structured_content["data"]
-        assert data["memory_processing"] == "not_scheduled"
-        receipts.extend((data["user_message_id"], data["assistant_message_id"]))
-    assert len(set(receipts)) == 4
-    persisted = await original._raw_storage.conversation.get_messages_by_ids(receipts)
-    assert len(persisted) == 4
-    assert not await original.memory_system.get_episodes()
-
-    # End the real SDK and agent owners, then let a fresh Python process
-    # reconstruct the same identity/database. No store is copied or substituted.
-    await owner.close()
-    closed = await close_restart_agent(original)
-    assert closed["primary_sqlite_closed"] and closed["original_primary_workers"] >= 1
-    assert owner._resident.done() and not owner.registry.is_current(owner.binding)
+    original, receipts, persisted = await persist_external_exchanges(publication)
+    owner, _ = publication
+    await retire_original_publication(owner)
     receipt_path = Path(original.storage_path).parent / (mode.value + "-restarted-memory.json")
     assert not receipt_path.exists()
     request = restart_request(original, receipt_path, receipts=receipts, mode=mode)
@@ -126,6 +107,51 @@ async def test_original_external_rows_reach_privacy_governed_consolidation_after
         assert "orbital" in episodes[0]["title"].lower() + episodes[0]["summary"].lower()
         assert [episode["id"] for episode in result["repeat_episodes"]] == [episodes[0]["id"]], (
             "Reprocessing an external exchange duplicated its canonical episode")
+
+
+async def persist_external_exchanges(publication):
+    """Store two real native exchanges and retain their original receipts."""
+    owner, http = publication
+    owner.publish()
+    original = owner.agent
+    token = (await issue_native_tokens(owner, http, scope="memory:write"))["access_token"]
+    receipts = []
+    for number in range(2):
+        result, failure, _ = await observe_native_call(owner, token, "log_turn",
+            exchange_arguments(user_content=f"Remember the orbital garden plan {number}.",
+                assistant_content=f"The external assistant discussed orbital garden {number}."))
+        assert failure is None and not result.is_error
+        data = result.structured_content["data"]
+        assert data["memory_processing"] == "not_scheduled"
+        receipts.extend((data["user_message_id"], data["assistant_message_id"]))
+    assert len(set(receipts)) == 4
+    persisted = await original._raw_storage.conversation.get_messages_by_ids(receipts)
+    assert len(persisted) == 4
+    assert not await original.memory_system.get_episodes()
+    return original, receipts, persisted
+
+
+async def retire_original_publication(owner):
+    """Close the original SDK and agent before opening the same database."""
+    original = owner.agent
+    # End the real SDK and agent owners, then let a fresh Python process
+    # reconstruct the same identity/database. No store is copied or substituted.
+    await owner.close()
+    closed = await close_restart_agent(original)
+    assert closed["primary_sqlite_closed"] and closed["original_primary_workers"] >= 1
+    assert owner._resident.done() and not owner.registry.is_current(owner.binding)
+
+
+async def test_attestation_schema_failure_prevents_memory_hook_activation(publication):
+    owner, _ = publication
+    agent = owner.agent
+    db = agent._raw_storage.db
+    assert not await db.table_exists("memory_attestation_state")
+    await db.execute("CREATE VIEW memory_attestation_state AS SELECT 'conflicting schema' AS agent_id")
+    feature = MemoryFeature(agent)
+    with pytest.raises(RuntimeError, match="^memory_attestation_state was not created$"):
+        await feature.initialize()
+    assert not any(isinstance(hook, ReflectionSleepHook) for hook in agent.sleep_hooks)
 
 
 async def test_restart_process_observation_has_its_own_deadline(publication):

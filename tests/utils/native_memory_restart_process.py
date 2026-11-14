@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 from fastapi.encoders import jsonable_encoder
 from kestrel_sdk.payer_policy import PayerPolicy
@@ -17,6 +18,7 @@ from kestrel_sovereign.kestrel_agent import (
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import memory_consolidator
+from kestrel_sovereign.features.scheduler import runner as scheduler_runner
 from kestrel_sovereign.storage.db.sqlite import _aiosqlite_worker_is_alive
 from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
@@ -39,25 +41,38 @@ async def close_restart_agent(agent):
 
 async def main():
     request = json.load(sys.stdin)
+    processing = request.get("processing", "explicit")
+    if processing not in {"explicit", "scheduled_sleep"}:
+        raise ValueError("Unknown restart processing path")
+    features = {"MemoryAgencyFeature"}
+    if processing == "scheduled_sleep":
+        features.update({"MemoryFeature", "SchedulerFeature"})
     llm = LLMService()
     agent = KestrelAgent(did=request["did"], storage_path=request["storage_path"],
-        llm_service=llm, allowed_features={"MemoryAgencyFeature"},
+        llm_service=llm, allowed_features=features,
+        privacy_mode=PrivacyMode(request["mode"]),
         payer_policy=PayerPolicy.model_validate(request["payer_policy"]))
     try:
         await agent.initialize()
         rows = await agent._raw_storage.conversation.get_messages_by_ids(request["receipts"])
-        await agent.set_privacy_mode(PrivacyMode(request["mode"]))
-        report = await agent.memory_system.consolidate()
-        episodes = [episode.to_dict() for episode in await agent.memory_system.get_episodes()]
-        repeat_report = await agent.memory_system.consolidate()
-        repeat_episodes = [episode.to_dict() for episode in await agent.memory_system.get_episodes()]
+        if processing == "scheduled_sleep":
+            if agent.privacy_mode != PrivacyMode(request["mode"]):
+                raise RuntimeError("Scheduled restart did not restore its original privacy mode")
+            processing_result = await observe_original_scheduled_sleep(agent, request)
+        else:
+            await agent.set_privacy_mode(PrivacyMode(request["mode"]))
+            report = await agent.memory_system.consolidate()
+            episodes = [episode.to_dict() for episode in await agent.memory_system.get_episodes()]
+            repeat_report = await agent.memory_system.consolidate()
+            repeat_episodes = [episode.to_dict() for episode in await agent.memory_system.get_episodes()]
+            processing_result = {"report": report, "episodes": episodes,
+                "repeat_report": repeat_report, "repeat_episodes": repeat_episodes}
         stored_episode_ids = await agent._raw_storage.db.fetchall(
             "SELECT id FROM memory_episodes WHERE agent_id = ?", (agent.did,))
         result = {"pid": os.getpid(), "did": agent.did,
             "core_source": str(Path(memory_consolidator.__file__).resolve()),
-            "generation_disabled": agent.llm_service.disabled, "rows": rows, "report": report,
-            "episodes": episodes, "repeat_report": repeat_report,
-            "repeat_episodes": repeat_episodes, "stored_episode_ids": stored_episode_ids}
+            "generation_disabled": agent.llm_service.disabled, "rows": rows,
+            "stored_episode_ids": stored_episode_ids, **processing_result}
     finally:
         try:
             cleanup = await close_restart_agent(agent)
@@ -66,6 +81,40 @@ async def main():
     # Publish this storage witness only after original native cleanup is verified.
     result["cleanup"] = cleanup
     Path(request["receipt_path"]).write_text(json.dumps(jsonable_encoder(result)), encoding="utf-8")
+
+
+async def observe_original_scheduled_sleep(agent, request):
+    """Observe the real boot-armed poller; never invoke its tick or handler."""
+    runner = agent.features["SchedulerFeature"]._runner
+    schedule_id = request["sleep_schedule_id"]
+    db = agent._raw_storage.db
+    async with asyncio.timeout(10):
+        while True:
+            history = await db.fetchall(
+                "SELECT id, status, occurrence_at, completed_at, result_text FROM task_execution_log "
+                "WHERE task_id = ? AND agent_id = ? AND occurrence_at = ?",
+                (schedule_id, agent.did, request["occurrence_at"]))
+            if history and history[0][3] and schedule_id not in runner._occurrences:
+                break
+            await asyncio.sleep(0.01)
+    await runner.stop()
+    schedule = await db.fetchone(
+        "SELECT id, task_name, cron_expression, args_json, next_run_at, "
+        "lease_owner, claim_token, claim_execution_id FROM scheduled_tasks WHERE id = ?",
+        (schedule_id,))
+    episodes = [episode.to_dict() for episode in await agent.memory_system.get_episodes()]
+    signals = await db.fetchall(
+        "SELECT id, source, status, error FROM signal_log WHERE target_agent = ? AND source = 'cron.sleep'",
+        (agent.did,))
+    result = {"history": history, "schedule": schedule, "episodes": episodes,
+        "signals": signals,
+        "scheduler_source": str(Path(scheduler_runner.__file__).resolve())}
+    if request.get("prepare_repeat", False):
+        due = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        await db.execute("UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ? AND agent_id = ?",
+            (due, schedule_id, agent.did))
+        result["repeat_occurrence_at"] = due
+    return result
 
 
 async def main_with_retained_storage():
