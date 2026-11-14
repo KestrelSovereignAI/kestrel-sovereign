@@ -769,10 +769,10 @@ async def test_domain_typed_actual_authority_exit_failure_is_not_protocol_refusa
         return result
 
     @asynccontextmanager
-    async def lose_original_authority_ack(guard, admitted):
+    async def lose_original_authority_ack(guard, admitted, **options):
         nonlocal armed
-        async with hold(guard, admitted):
-            yield
+        async with hold(guard, admitted, **options) as decision:
+            yield decision
         if guard is wire.admission.guard and armed:
             armed = False
             assert not wire.admission.lock.locked()
@@ -1167,6 +1167,87 @@ async def test_canonical_input_refusals_remain_standard_before_any_admission(
     assert not is_execution_control_error(refused.value)
     assert not wire.submissions
     assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not wire.manager._subscribers
+    assert not wire.admission.lock.locked()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("continuation", [False, True])
+@pytest.mark.parametrize("fail_original_exit", [False, True])
+async def test_pre_effect_policy_recheck_settles_before_http_refusal(
+    wire, monkeypatch, streaming, continuation, fail_original_exit
+):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.execution_custody import (
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
+
+    params = send(wire.admission)
+    params.configuration.return_immediately = True
+    if continuation:
+        original_task = await wire.manager.create_task(
+            send(wire.admission), creator_agent_id=PRINCIPAL
+        )
+        params.message.task_id = original_task.id
+        params.message.context_id = original_task.context_id
+    before = await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks")
+    submissions = len(wire.submissions)
+    original_lease = wire.handler.guard.lifecycle_lease
+    exits = []
+    failures = []
+    statuses = []
+    physical = HTTPException(403, detail="Actual recheck lease exit failed")
+
+    @asynccontextmanager
+    async def revoke_after_initial_lease():
+        try:
+            async with original_lease():
+                yield
+        finally:
+            exits.append(asyncio.current_task())
+            if len(exits) == 1:
+                await wire.admission.backend.execute("DELETE FROM native_test_principals")
+            elif len(exits) == 2 and fail_original_exit:
+                raise physical
+
+    monkeypatch.setattr(
+        wire.handler,
+        "guard",
+        replace(wire.handler.guard, lifecycle_lease=revoke_after_initial_lease),
+    )
+    original_app = Starlette(routes=[wire.binding.route])
+
+    async def checked_app(scope, receive, send_response):
+        async def checked_send(message):
+            if message["type"] == "http.response.start":
+                assert not wire.admission.lock.locked()
+                statuses.append(message["status"])
+            await send_response(message)
+
+        try:
+            await original_app(scope, receive, checked_send)
+        except BaseException as error:
+            failures.append(error)
+            raise
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(checked_app, raise_app_exceptions=False),
+        base_url="http://native-core.test",
+        headers=dict(wire.http.headers),
+    ) as actual:
+        with pytest.raises(A2AClientError, match="500" if fail_original_exit else "403"):
+            async for _ in wire.client(streaming=streaming, http_client=actual).send_message(params):
+                pytest.fail("A revoked pre-effect policy dispatched business work")
+    assert statuses == [500 if fail_original_exit else 403]
+    assert len(exits) == 2
+    if fail_original_exit:
+        assert len(failures) == 1 and is_execution_control_error(failures[0])
+        assert any(error is physical for error in execution_evidence_carriers(failures[0]))
+    else:
+        assert not failures
+    assert len(wire.submissions) == submissions
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == before
     assert not wire.manager._subscribers
     assert not wire.admission.lock.locked()
 

@@ -44,6 +44,7 @@ from kestrel_sdk.native_a2a.utils.errors import (
     PushNotificationNotSupportedError,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign._async_ownership import (
@@ -308,14 +309,17 @@ class TaskManager:
         self,
         outbox: NativePushOutbox | None,
         admission_fence: Callable[[], AbstractAsyncContextManager[object]] | None,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncIterator[StreamRefusal | None]:
         """Recheck native authority after preparation, holding it only for commit.
 
         Internal callers already own their admission. HTTP callers retain the
         original verified receipt and supply its finite policy/topology fence.
         Neither callback DNS nor post-commit projections hold that fence.
         """
-        async with admission_fence() if admission_fence is not None else nullcontext():
+        async with (admission_fence() if admission_fence is not None else nullcontext()) as decision:
+            if isinstance(decision, StreamRefusal):
+                yield decision
+                return
             if self._push_service is not None:
                 self._push_service.require_execution_safe()
             if outbox is not None and (
@@ -1578,7 +1582,8 @@ class TaskManager:
         *,
         creator_agent_id: str,
         admission_fence: Callable[[], AbstractAsyncContextManager[object]] | None = None,
-    ) -> Task | None:
+        refusal_values: bool = False,
+    ) -> Task | StreamRefusal | None:
         """Admit a follow-up on the same creator-owned task and native context."""
         if not isinstance(params, SendMessageRequest):
             raise TypeError("Task continuation requires an official SendMessageRequest")
@@ -1586,7 +1591,11 @@ class TaskManager:
         parse_message_metadata(MessageToDict(params.metadata))
         prepared_input = prepare_native_task_input(params)
         push_outbox, push_config = await self._prepare_task_push(prepared_input)
-        async with self._task_input_admission(push_outbox, admission_fence):
+        async with self._task_input_admission(push_outbox, admission_fence) as decision:
+            if isinstance(decision, StreamRefusal):
+                if refusal_values:
+                    return decision
+                raise decision.error
             candidate, appended = await self.task_store.append_creator_input(
                 prepared_input, creator_agent_id=creator_agent_id
             )
@@ -1621,7 +1630,8 @@ class TaskManager:
         cognition_wake_eligible: bool = True,
         input_wake_eligible: bool = True,
         admission_fence: Callable[[], AbstractAsyncContextManager[object]] | None = None,
-    ) -> Task:
+        refusal_values: bool = False,
+    ) -> Task | StreamRefusal:
         """Admit a new native task after sender and recipient authorization.
 
         The caller supplies a verified creator, never metadata-derived identity.
@@ -1661,7 +1671,11 @@ class TaskManager:
         transaction = self._task_input_admission(push_outbox, admission_fence)
         ownership_refusal = None
         admitted_snapshot = None
-        async with transaction:
+        async with transaction as decision:
+            if isinstance(decision, StreamRefusal):
+                if refusal_values:
+                    return decision
+                raise decision.error
             try:
                 await self.context_store.reserve(
                     task.context_id,

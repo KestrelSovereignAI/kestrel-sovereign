@@ -385,7 +385,9 @@ class NativeA2ARequestHandler(RequestHandler):
         if claims.peer_stop is not None:
             from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
 
-            async with self.guard.hold_authority(admitted):
+            async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+                if isinstance(refused, StreamRefusal):
+                    return refused
                 receipt = await dispatch_peer_stop(
                     self._peer_stop_target,
                     actor_id=principal_id,
@@ -401,8 +403,8 @@ class NativeA2ARequestHandler(RequestHandler):
                 ],
             )
 
-        def admission_fence() -> OriginalContextExit[None]:
-            return OriginalContextExit(self.guard.hold_authority(admitted))
+        def admission_fence() -> OriginalContextExit[StreamRefusal | None]:
+            return OriginalContextExit(self.guard.hold_authority(admitted, refusal_values=True))
 
         try:
             if params.message.task_id:
@@ -410,6 +412,7 @@ class NativeA2ARequestHandler(RequestHandler):
                     params,
                     creator_agent_id=principal_id,
                     admission_fence=admission_fence,
+                    refusal_values=True,
                 )
                 if task is None:
                     return StreamRefusal(TaskNotFoundError())
@@ -418,6 +421,7 @@ class NativeA2ARequestHandler(RequestHandler):
                 params,
                 creator_agent_id=principal_id,
                 admission_fence=admission_fence,
+                refusal_values=True,
             )
         except TaskInputUnsupportedError as error:
             if is_execution_control_error(error):
