@@ -3,7 +3,7 @@
 import asyncio
 import contextvars
 import inspect
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -181,6 +181,33 @@ async def submit(wire):
     events = [event async for event in wire.client().send_message(params)]
     assert len(events) == 1 and events[0].HasField("task")
     return events[0].task
+
+
+@asynccontextmanager
+async def observed_native_http(wire, *, binding=None):
+    """Observe real server control separately from its serialized HTTP status."""
+    failures, statuses = [], []
+    original_app = Starlette(routes=[(wire.binding if binding is None else binding).route])
+
+    async def checked_app(scope, receive, send_response):
+        async def checked_send(message):
+            if message["type"] == "http.response.start":
+                assert not wire.admission.lock.locked()
+                statuses.append(message["status"])
+            await send_response(message)
+
+        try:
+            await original_app(scope, receive, checked_send)
+        except BaseException as error:
+            failures.append(error)
+            raise
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(checked_app, raise_app_exceptions=False),
+        base_url="http://native-core.test",
+        headers=dict(wire.http.headers),
+    ) as actual:
+        yield SimpleNamespace(http=actual, failures=failures, statuses=statuses)
 
 
 @pytest.mark.parametrize(
@@ -1199,8 +1226,6 @@ async def test_pre_effect_policy_recheck_settles_before_http_refusal(
     submissions = len(wire.submissions)
     original_lease = wire.handler.guard.lifecycle_lease
     exits = []
-    failures = []
-    statuses = []
     physical = HTTPException(403, detail="Actual recheck lease exit failed")
 
     @asynccontextmanager
@@ -1220,40 +1245,144 @@ async def test_pre_effect_policy_recheck_settles_before_http_refusal(
         "guard",
         replace(wire.handler.guard, lifecycle_lease=revoke_after_initial_lease),
     )
-    original_app = Starlette(routes=[wire.binding.route])
-
-    async def checked_app(scope, receive, send_response):
-        async def checked_send(message):
-            if message["type"] == "http.response.start":
-                assert not wire.admission.lock.locked()
-                statuses.append(message["status"])
-            await send_response(message)
-
-        try:
-            await original_app(scope, receive, checked_send)
-        except BaseException as error:
-            failures.append(error)
-            raise
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(checked_app, raise_app_exceptions=False),
-        base_url="http://native-core.test",
-        headers=dict(wire.http.headers),
-    ) as actual:
+    async with observed_native_http(wire) as observed:
         with pytest.raises(A2AClientError, match="500" if fail_original_exit else "403"):
-            async for _ in wire.client(streaming=streaming, http_client=actual).send_message(params):
+            async for _ in wire.client(streaming=streaming, http_client=observed.http).send_message(params):
                 pytest.fail("A revoked pre-effect policy dispatched business work")
-    assert statuses == [500 if fail_original_exit else 403]
+    assert observed.statuses == [500 if fail_original_exit else 403]
     assert len(exits) == 2
     if fail_original_exit:
-        assert len(failures) == 1 and is_execution_control_error(failures[0])
-        assert any(error is physical for error in execution_evidence_carriers(failures[0]))
+        assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+        assert any(error is physical for error in execution_evidence_carriers(observed.failures[0]))
     else:
-        assert not failures
+        assert not observed.failures
     assert len(wire.submissions) == submissions
     assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == before
     assert not wire.manager._subscribers
     assert not wire.admission.lock.locked()
+
+
+@pytest.mark.parametrize("operation", ["unary-immediate", "unary-blocking", "streaming"])
+@pytest.mark.parametrize("continuation", [False, True])
+async def test_post_commit_policy_loss_retains_outcome_not_ordinary_refusal(
+    wire, monkeypatch, operation, continuation
+):
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
+
+    params = send(wire.admission)
+    params.configuration.return_immediately = operation == "unary-immediate"
+    if continuation:
+        original = await wire.manager.create_task(send(wire.admission), creator_agent_id=PRINCIPAL)
+        params.message.task_id = original.id
+        params.message.context_id = original.context_id
+    submissions = len(wire.submissions)
+    announce = wire.manager._on_task_submitted
+
+    def revoke_after_commit(snapshot):
+        announce(snapshot)
+        wire.admission.state.current = False
+
+    monkeypatch.setattr(wire.manager, "_on_task_submitted", revoke_after_commit)
+    async with observed_native_http(wire) as observed:
+        with pytest.raises(A2AClientError, match="500"):
+            async for _ in wire.client(
+                streaming=operation == "streaming", polling=False, http_client=observed.http
+            ).send_message(params):
+                pytest.fail("Post-commit authority loss delivered a normal response")
+    assert observed.statuses == [500]
+    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == "committed"
+    assert len(wire.submissions) == submissions + 1
+    rows = await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks")
+    assert len(rows) == 1 and rows[0][0] == wire.submissions[-1].task.id
+    assert not wire.manager._subscribers and not wire.admission.lock.locked()
+
+
+async def test_blocking_final_response_recheck_retains_committed_outcome(wire, monkeypatch):
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
+
+    subscribe = wire.manager.subscribe
+
+    async def revoke_after_original_eof(*args, **kwargs):
+        source = subscribe(*args, **kwargs)
+        try:
+            async for event in source:
+                yield event
+        finally:
+            await source.aclose()
+            wire.admission.state.current = False
+
+    monkeypatch.setattr(wire.manager, "subscribe", revoke_after_original_eof)
+    params = send(wire.admission)
+    params.configuration.return_immediately = False
+    async with observed_native_http(wire) as observed:
+        async def request():
+            async for _ in wire.client(polling=False, http_client=observed.http).send_message(params):
+                pytest.fail("Final post-commit authority loss delivered a normal response")
+
+        original_request = asyncio.create_task(request())
+        try:
+            async with asyncio.timeout(5):
+                await wire.submitted.wait()
+            task_id = wire.submissions[-1].task.id
+            # Actual durable completion, not a fake EOF or source cancellation.
+            await wire.manager.complete_task(
+                task_id, "actual test completion", recipient_agent_id=wire.admission.scope.recipient_id
+            )
+            outcome, = await asyncio.gather(original_request, return_exceptions=True)
+            assert isinstance(outcome, A2AClientError) and "500" in str(outcome)
+        finally:
+            async with asyncio.timeout(5):
+                await asyncio.gather(original_request, return_exceptions=True)
+    assert observed.statuses == [500]
+    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == "committed"
+    snapshot = await wire.manager.get_task_snapshot(task_id, recipient_agent_id=wire.admission.scope.recipient_id)
+    assert snapshot.task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert len(wire.submissions) == 1
+    assert not wire.manager._subscribers and not wire.admission.lock.locked()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_post_commit_missing_subscription_retains_committed_outcome(wire, monkeypatch, streaming):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+
+    subscribe = wire.manager.subscribe
+    originals = []
+
+    async def erased_subscription(task_id, **kwargs):
+        # Erase ONLY this test's actual committed row after submission and
+        # before the canonical authorized read, never fabricate an empty source.
+        assert len(wire.submissions) == 1 and wire.submissions[0].task.id == task_id
+        await wire.admission.backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task_id,))
+        source = subscribe(task_id, **kwargs)
+        originals.append(source)
+        try:
+            async for event in source:
+                yield event
+        finally:
+            await source.aclose()
+
+    monkeypatch.setattr(wire.manager, "subscribe", erased_subscription)
+    params = send(wire.admission)
+    params.configuration.return_immediately = False
+    async with observed_native_http(wire) as observed:
+        with pytest.raises(A2AClientError, match="500"):
+            async for _ in wire.client(streaming=streaming, polling=False, http_client=observed.http).send_message(params):
+                pytest.fail("A committed task disappearance delivered a normal response")
+    assert observed.statuses == [500]
+    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == "committed"
+    assert len(originals) == 1 and originals[0].ag_frame is None
+    assert len(wire.submissions) == 1
+    assert await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not wire.manager._subscribers and not wire.admission.lock.locked()
 
 
 @pytest.mark.parametrize("streaming", [False, True])
