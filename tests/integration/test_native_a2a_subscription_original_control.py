@@ -155,11 +155,19 @@ async def test_native_subscription_keeps_actual_postgres_release_receipt(peer_se
                 await asyncio.sleep(0)
                 release.set()
             outcome = await asyncio.wait_for(await_owned_task(pending), 5)
-        assert len(reads) == 3 and failures
-        assert is_execution_control_error(failures[0])
-        assert execution_commit_outcome(failures[0]) == "committed"
-        assert carries(outcome.error, failures[0]), "Native receipt became generic data or EOF"
-        if route != "caller-cancel":
+        assert len(reads) == 3
+        if route == "caller-cancel":
+            # Demand withdrawal no longer cancels the original PostgreSQL
+            # read/retirement Task. Its actual release completes normally;
+            # preserve the raw caller cancellation, not invented native debt.
+            assert not failures and reads[2].done() and reads[2].cancelling() == 0
+            assert isinstance(outcome.error, asyncio.CancelledError)
+            assert not is_execution_control_error(outcome.error)
+            assert execution_commit_outcome(outcome.error) is None
+        else:
+            assert failures and is_execution_control_error(failures[0])
+            assert execution_commit_outcome(failures[0]) == "committed"
+            assert carries(outcome.error, failures[0]), "Native receipt became generic data or EOF"
             assert carries(failures[0], original)
         assert task.id not in p.admission.manager._subscribers
         assert len(sources) == 1 and all(source.ag_frame is None for source in sources)

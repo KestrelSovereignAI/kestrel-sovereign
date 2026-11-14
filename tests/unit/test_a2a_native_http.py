@@ -1419,6 +1419,130 @@ async def test_first_event_policy_recheck_retains_committed_outcome(wire, monkey
     assert not wire.manager._subscribers and not wire.admission.lock.locked()
 
 
+@pytest.mark.parametrize("phase", ["admission", "acquisition"])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("continuation", [False, True])
+async def test_actual_lease_exit_after_commit_retains_outcome_and_submission(
+    wire, monkeypatch, phase, streaming, continuation
+):
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
+
+    params = send(wire.admission)
+    params.configuration.return_immediately = False
+    if continuation:
+        original_task = await wire.manager.create_task(send(wire.admission), creator_agent_id=PRINCIPAL)
+        params.message.task_id = original_task.id
+        params.message.context_id = original_task.context_id
+    before = len(wire.submissions)
+    original = wire.handler.guard.lifecycle_lease
+    physical = HTTPException(403, detail="Actual post-commit original " + phase + " exit")
+    exits = []
+    armed = True
+
+    @asynccontextmanager
+    async def failed_original_exit():
+        nonlocal armed
+        async with original():
+            yield
+        exits.append(asyncio.current_task())
+        if armed and ((phase == "admission" and len(exits) == 2) or (phase == "acquisition" and wire.manager._subscribers)):
+            armed = False
+            raise physical
+
+    monkeypatch.setattr(wire.handler, "guard", replace(wire.handler.guard, lifecycle_lease=failed_original_exit))
+    async with observed_native_http(wire) as observed:
+        with pytest.raises(A2AClientError, match="500"):
+            async for _ in wire.client(streaming=streaming, polling=False, http_client=observed.http).send_message(params):
+                pytest.fail("Actual failed lease exit delivered a normal reply")
+    assert not armed and observed.statuses == [500]
+    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+    assert execution_commit_outcome(observed.failures[0]) == "committed"
+    assert any(error is physical for error in execution_evidence_carriers(observed.failures[0]))
+    assert len(wire.submissions) == before + 1
+    rows = await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks")
+    assert len(rows) == 1 and rows[0][0] == wire.submissions[-1].task.id
+    assert not wire.manager._subscribers and not wire.admission.lock.locked()
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+async def test_continuation_notification_follows_actual_outer_commit(native_request_admission, monkeypatch, rollback):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.storage.db.interface import TransactionError
+
+    a = native_request_admission
+    notifications = []
+    monkeypatch.setattr(a.manager, "_on_task_submitted", notifications.append)
+    task = await a.manager.create_task(send(a), creator_agent_id=PRINCIPAL)
+    assert len(notifications) == 1
+    params = send(a)
+    params.message.task_id = task.id
+    params.message.context_id = task.context_id
+    before_revision = await a.backend.fetch_one("SELECT input_revision FROM a2a_tasks WHERE id = ?", (task.id,))
+
+    class RollBackOriginal(RuntimeError):
+        pass
+
+    original_error = RollBackOriginal("Actual outer test rollback")
+    rolled_back = False
+    try:
+        async with a.backend.transaction():
+            result = await a.manager.continue_task(params, creator_agent_id=PRINCIPAL)
+            assert result.id == task.id
+            assert len(notifications) == 1, "An uncommitted input woke the recipient"
+            if rollback:
+                raise original_error
+    except (RollBackOriginal, TransactionError) as error:
+        assert rollback and any(node is original_error for node in execution_evidence_carriers(error))
+        rolled_back = True
+    assert rolled_back is rollback
+    assert len(notifications) == (1 if rollback else 2)
+    revision = await a.backend.fetch_one("SELECT input_revision FROM a2a_tasks WHERE id = ?", (task.id,))
+    assert revision[0] == before_revision[0] + (0 if rollback else 1)
+
+
+async def test_input_admission_refuses_unobservable_commit_before_write(native_request_admission, monkeypatch):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    a = native_request_admission
+    notifications = []
+    monkeypatch.setattr(a.manager, "_on_task_submitted", notifications.append)
+    monkeypatch.setattr(type(a.backend), "call_after_commit", None)
+    with pytest.raises(Exception) as caught:
+        await a.manager.create_task(send(a), creator_agent_id=PRINCIPAL)
+    assert any(
+        type(error) is RuntimeError and str(error) == "Native task admission requires actual backend commit observation"
+        for error in execution_evidence_carriers(caught.value)
+    )
+    assert not notifications
+    assert await a.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert await a.backend.fetch_all("SELECT task_id FROM a2a_task_inputs") == []
+
+
+async def test_fenced_admission_never_treats_joined_transaction_as_commit(native_request_admission):
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, execution_commit_outcome
+
+    a = native_request_admission
+
+    @asynccontextmanager
+    async def original_admission():
+        yield
+
+    async with a.backend.transaction():
+        with pytest.raises(ExecutionCommitOutcomeError) as pending:
+            async with a.manager._task_input_admission(None, original_admission):
+                await a.backend.execute(
+                    "INSERT INTO native_test_principals VALUES (?, ?)", ("did:staged-input", PRINCIPAL)
+                )
+        assert execution_commit_outcome(pending.value) == "unknown"
+    assert await a.backend.fetch_one(
+        "SELECT principal FROM native_test_principals WHERE signing_did = ?", ("did:staged-input",)
+    ) == (PRINCIPAL,)
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_raw_http_invalid_tenant_is_protocol_data_not_source_failure(
     wire, streaming
