@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-11-13
-**Scope:** 3721 tracked files (2851 `.py`, 378 `.md`, 492 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-11-14
+**Scope:** 3763 tracked files (2890 `.py`, 378 `.md`, 495 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -455,6 +455,8 @@ Repo entry points and standard project files.
   - `class HostStopBody`; `class PeerStopCircuitResetBody`; `async def host_stop_status(request, response)`; `async def peer_stop_circuit_state(request, response)`; `async def reset_peer_stop_circuit(request, response, body)`; `async def peer_stop_circuit_events(request, response, target, limit)`; `async def stop_host(request, response, body)`; `async def host_stop_receipts(request, response, since, until, …)`
 - **kestrel_sovereign/endpoints/mcp_oauth.py** — Public web OAuth client identity and callback shell; neither grants authority.
   - `async def client_metadata(request)`; `async def callback_page(request)`
+- **kestrel_sovereign/endpoints/mcp_server.py** — Private first-party consent routes; the optional MCP SDK is loaded on opt-in.
+  - `def create_consent_router(resolve_controller)`
 - **kestrel_sovereign/endpoints/memories.py** — Memory and knowledge graph endpoints.
   - `async def list_memories(request, node_type, limit)`; `async def get_memory_detail(request, node_id)`; `async def get_identity_chain(request)`; `async def delete_memory(request, node_id)`
 - **kestrel_sovereign/endpoints/metrics.py** — Prometheus metrics endpoint — returns metrics in Prometheus text exposition format.
@@ -1203,6 +1205,31 @@ Repo entry points and standard project files.
   - `class MCPInputConflict`; `class MCPInputIntegrityError`; `class MCPInputBinding`; `class MCPInputRecord`; `class MCPInputClaim`; `class MCPInputStore`
 - **kestrel_sovereign/mcp_oauth.py** — Host-owned MCP OAuth identity and authenticated connection boundaries.
   - `class MCPOAuthHostPolicy`; `class MCPOAuthAction`; `class MCPOAuthAuthorizationRequest`; `class MCPOAuthCallback`; `class MCPOAuthConnectRequest`; `class MCPOAuthConnectionStatus`; `class MCPOAuthRequestError`; `class MCPOAuthRuntimeError`; `…`
+- **kestrel_sovereign/mcp_server/__init__.py** — Native remote MCP server direction and its host-owned authorization.
+- **kestrel_sovereign/mcp_server/consent.py** — Request-owned approval of one pending request, never a durable OAuth grant.
+  - `class MCPConsentApproval`; `class MCPConsentAuthority`
+- **kestrel_sovereign/mcp_server/console.py** — Original Console credentials decide native OAuth consent through delivery.
+  - `class InvalidMCPConsentRequest`; `def consent_page(api_prefix)`; `class MCPConsentController`
+- **kestrel_sovereign/mcp_server/grants.py** — Durable native OAuth credentials with atomic consumption and family revocation.
+  - `class MCPAuthorizationCommitRequired`; `class MCPAuthorizationDecisionUnavailable`; `class MCPAuthorizationGrantQuotaExceeded`; `class MCPAuthorizationGrants`
+- **kestrel_sovereign/mcp_server/http.py** — Retain the original published host through native MCP HTTP delivery.
+  - `class NativeMCPHostMiddleware`
+- **kestrel_sovereign/mcp_server/memory_tools.py** — Native MCP memory callbacks use Core's canonical governed dispatcher.
+  - `class NativeMCPMemoryTools`
+- **kestrel_sovereign/mcp_server/oauth.py** — Standard OAuth endpoints backed by native SQL grants and Authlib authentication.
+  - `class NativeMCPAuthorizationServer`
+- **kestrel_sovereign/mcp_server/pending.py** — Bounded, encrypted pending OAuth requests; none of these records grants access.
+  - `class PendingMCPQuotaExceeded`; `class PendingMCPAuthorizationExpired`; `class PendingMCPAuthorization`; `class PendingMCPAuthorizations`
+- **kestrel_sovereign/mcp_server/policy.py** — Explicit remote-server identity, registered clients and finite OAuth budgets.
+  - `class MCPServerClient`; `class MCPServerPolicy`
+- **kestrel_sovereign/mcp_server/publication.py** — Host-owned native MCP preparation, committed routing and physical retirement.
+  - `def native_mcp_registry(app)`; `class NativeMCPPublication`
+- **kestrel_sovereign/mcp_server/records.py** — One SDK cipher and record-domain policy for durable MCP authorization data.
+  - `class MCPRecordBudgetExceeded`; `class MCPRecordKind`; `def new_mcp_secret()`; `def hash_mcp_secret(secret)`; `class MCPAuthorizationRecords`
+- **kestrel_sovereign/mcp_server/tool_caller.py** — Bind verified native OAuth principals to their original HTTP lifetime.
+  - `class MCPToolCaller`; `async def bind_native_mcp_tool_caller(publication, context, required_scope)`; `def native_mcp_write_lifetime(publication, context, required_scope)`
+- **kestrel_sovereign/mcp_server/transport.py** — Official Streamable HTTP transport and standard per-resource OAuth discovery.
+  - `class NativeMCPServer`; `class NativeMCPHTTP`; `class NativeMCPHTTPRegistry`
 - **kestrel_sovereign/multi_agent/__init__.py** — Kestrel MultiAgent - registry of agents managed by a single Kestrel Host.
 - **kestrel_sovereign/multi_agent/agent_manager.py** — In-process multi-agent manager for Kestrel.
   - `def cancel_remote_work_at_shutdown_budget(cancel_remote_work, owner)`; `class HostedIsolatedRuntimeLifecyclePolicy`; `def public_exception_type_name(error)`; `class RuntimeOffboardingRetainedError`; `class RuntimeOffboardingNotPerformedError`; `class ChildTerminationReconciliationError`; `class ChildTerminationNotPerformedError`; `class PersistedSpawnParentUnavailableError`; `…`
@@ -1216,6 +1243,8 @@ Repo entry points and standard project files.
   - `def get_agent_base_url(agent_config)`; `def resolve_agent(agent_id, config)`; `def build_proxy_headers(request)`; `async def proxy_request_streaming(request, agent_id, path, config, …)`
 - **kestrel_sovereign/multi_agent/route_name.py** — Lossless path-safe encoding for host-routed agent names.
   - `def encode_agent_route_name(agent_name)`; `def decode_agent_route_name(segment)`
+- **kestrel_sovereign/native_http.py** — Publish exact native HTTP route objects and classify their installed surface.
+  - `class NativeHTTPBinding`; `class NativeHTTPRegistry`
 - **kestrel_sovereign/native_retirement.py** — Passive observation of original native resource/epilogue lifetimes.
   - `class NativeExecutionObserver`; `def bind_native_execution_observer(observer)`
 - **kestrel_sovereign/offline_migrations.py** — Refuse a deploy onto a release that needs an offline migration not yet done (#3832).
@@ -1269,8 +1298,9 @@ Repo entry points and standard project files.
   - `class AutoApproveRule`; `class AutoApproveMatch`; `def derive_command(feature_name, tool_name, tool_args)`; `def suggest_rule_from_command(command)`; `class AutoApprovePolicy`
 - **kestrel_sovereign/security/bootstrap_access.py** — Source-host gating for the bootstrap API-key endpoint (#1724).
   - `def bootstrap_allowed_hosts()`; `def is_bootstrap_host_allowed(client_host)`; `def forwarding_header_names(header_names)`
+- **kestrel_sovereign/security/browser_shell.py** — Headers for first-party OAuth shells with external, same-origin assets.
 - **kestrel_sovereign/security/capability_authority.py** — Original host-context bindings shared by private capability services.
-  - `class HostCapabilityAccessDenied`; `def require_raw_capability_disclosure(holder, capability)`; `class HostCapabilityAuthority`; `def require_current_feature_host(agent, feature, agent_id)`
+  - `class HostCapabilityAccessDenied`; `def require_raw_capability_disclosure(holder, capability)`; `class HostCapabilityAuthority`; `def require_current_feature_host(agent, feature, agent_id)`; `def require_current_http_agent(agent, request)`
 - **kestrel_sovereign/security/crypto_suite.py** — CryptoSuite — pluggable signature suites for Kestrel.
   - `class Keypair`; `class CryptoSuite`; `class CryptoSuiteError`; `def register_suite(suite)`; `def get_suite(alg_id)`; `def list_registered()`; `class Secp256k1Suite`; `class Ed25519Suite`; `…`
 - **kestrel_sovereign/security/csrf.py** — Double-submit-cookie CSRF protection (#2293).
@@ -1317,6 +1347,8 @@ Repo entry points and standard project files.
   - `class ArtifactEntry`; `class ReleaseManifest`; `class ReleaseManifestError`; `def signable_payload(manifest)`; `def compute_manifest_id(manifest)`; `def new_manifest()`; `def add_artifact_entry(manifest, path, content)`; `def add_artifact_entry_from_path(manifest, rel_path, abs_path)`; `…`
 - **kestrel_sovereign/security/request_auth.py** — Request-owned interactive credentials for private response delivery.
   - `class AuthenticatedSessionMiddleware`; `class RetainedCredentialProof`; `class InteractiveRequestAuthentication`; `class RequestAuthenticationService`; `def current_request_authentication()`; `class InteractiveAuthenticationLifetimeMiddleware`
+- **kestrel_sovereign/security/request_body.py** — Read a bounded JSON body before entering private capability operations.
+  - `class InvalidJSONRequest`; `async def read_json_model(request, model)`
 - **kestrel_sovereign/security/sealed_capsule.py** — Sealed capsule — Wave 4 sub-PR 3 of Quantum Hardening (#921, #919).
   - `class SealedCapsuleError`; `def seal_capsule(payload)`; `def open_capsule(capsule, classical_keypair, pq_keypair)`
 - **kestrel_sovereign/security/service_key_storage.py** — Service API Key Storage for Kestrel.
@@ -1498,6 +1530,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/ipfs.js** — (js asset)
 - **kestrel_sovereign/static/js/kebab_menu.js** — (js asset)
 - **kestrel_sovereign/static/js/mcp-oauth-callback.mjs** — (mjs asset)
+- **kestrel_sovereign/static/js/mcp-server-consent.mjs** — (mjs asset)
 - **kestrel_sovereign/static/js/memories.js** — (js asset)
 - **kestrel_sovereign/static/js/message_kebab.js** — (js asset)
 - **kestrel_sovereign/static/js/metrics.js** — (js asset)
@@ -1539,6 +1572,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/voice/state-machine.js** — (js asset)
 - **kestrel_sovereign/static/js/voice/ui.js** — (js asset)
 - **kestrel_sovereign/static/kestrel_logo.svg** — —
+- **kestrel_sovereign/static/mcp-server-consent.html** — (html asset)
 - **kestrel_sovereign/static/shared/markdown/highlight.js** — (js asset)
 - **kestrel_sovereign/static/shared/markdown/index.js** — (js asset)
 - **kestrel_sovereign/static/shared/markdown/katex.js** — (js asset)
@@ -2137,7 +2171,7 @@ Repo entry points and standard project files.
 - **docs/architecture/MEMORY_OWNERSHIP.md** — Memory System Ownership Map — > Created for Issue #501.
 - **docs/architecture/MEMORY_SYSTEM.md** — Kestrel Memory System — > The difference between a search engine and a friend is that a friend *actually remembers*.
 - **docs/architecture/MULTI_AGENT_VOICE.md** — Multi-Agent Voice — The Mixing Board — **Status:** Draft v1 — design proposal.
-- **docs/architecture/NATIVE_ARTIFACT_PRODUCER_SOURCE_CANDIDATE.md** — Native artifact producer: unpublished source candidate — This implementation is an unpublished Core 0.57.0 source successor.
+- **docs/architecture/NATIVE_ARTIFACT_PRODUCER_SOURCE_CANDIDATE.md** — Native artifact producer: bounded source contract — This bounded implementation originated as a Core 0.57.0 source successor and is now present in merged Core source.
 - **docs/architecture/NATIVE_MCP_A2A.md** — Native MCP and A2A interoperability — Implementation contract for [#3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679).
 - **docs/architecture/NATIVE_PROTOCOL_SPIKES.md** — Native protocol Phase 0 evidence — Evidence for [#3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679), measured 2026-10-17.
 - **docs/architecture/NIGHTLY_FORGETTING.md** — Nightly Forgetting — Unified Cognition Maintenance — > **Status (2026-06-12): Active for P1–P3; Aspirational for P4.** This consolidates Kestrel's scattered nightly-maintenance crons and the unbounded-cognition-table problem (#1674) under one orchestra…
@@ -2602,6 +2636,7 @@ Repo entry points and standard project files.
 - **tests/frontend/markdown_sanitize.test.mjs** — (mjs asset)
 - **tests/frontend/markdown_streaming_autoclose.test.mjs** — (mjs asset)
 - **tests/frontend/mcp_oauth_callback.test.mjs** — (mjs asset)
+- **tests/frontend/mcp_server_consent.test.mjs** — (mjs asset)
 - **tests/frontend/mermaid_cache.test.mjs** — (mjs asset)
 - **tests/frontend/message_kebab.test.mjs** — (mjs asset)
 - **tests/frontend/modal_async_ownership.test.mjs** — (mjs asset)
@@ -3242,6 +3277,36 @@ Repo entry points and standard project files.
   - `async def test_gather_keeps_original_failed_gate_even_without_resource_keyword(native_pg, monkeypatch, mode, eager, …)`; `async def test_synchronous_budget_record_keeps_original_not_substitute_future(native_pg, onboarding_owner, monkeypatch, mode, …)`; `async def test_synchronous_sqlite_drain_retains_original_and_refuses_later_work(native_pg, tmp_path, monkeypatch, mode, …)`
 - **tests/integration/test_native_input_fixture.py** — Core-only integration input exercises the public native fixture end to end.
   - `async def test_native_fixture_owns_original_storage_and_effect(native_tool_effect_agent)`
+- **tests/integration/test_native_mcp_access_lifetime.py** — Original SQL authorization ownership spans private delivery and revocation.
+  - `async def test_independent_sql_owner_cannot_acknowledge_revocation_during_access(consent_http, native_pg)`; `async def test_access_reader_cannot_escape_its_original_task_or_reactivate_in_later_transaction(consent_http)`; `async def test_access_reader_rechecks_current_authority_before_release(consent_http, change)`; `async def test_access_lifetime_refuses_foreign_resource_client_token_and_outer_transaction(consent_http)`
+- **tests/integration/test_native_mcp_consent.py** — Real first-party HTTP credentials approve only the original encrypted SQL request.
+  - `async def consent_http(request, native_pg, tmp_path, monkeypatch)`; `async def test_actual_sovereign_request_approves_without_consuming_or_minting_tokens(consent_http)`; `async def test_native_middleware_rejects_unauthenticated_consent(consent_http)`; `async def test_actual_signed_in_user_is_not_promoted_to_sovereign(consent_http)`; `async def test_actual_consent_cannot_expand_requested_scope_or_target_agent(consent_http, query)`; `async def test_original_consent_authority_is_rechecked_after_native_await(consent_http, mode)`; `async def test_ephemeral_boot_key_cannot_authorize_a_durable_mcp_grant(consent_http, monkeypatch)`; `async def test_original_sovereign_reads_pending_consent_without_minting_or_consuming(consent_http)`; `…`
+- **tests/integration/test_native_mcp_consent_browser.py** — Real Chromium consent over HTTPS in an isolated, networkless namespace.
+  - `def owned_identity_domain(monkeypatch)`; `async def native_consent_https(publication, tmp_path, monkeypatch)`; `async def test_original_native_consent_browser_uses_owner_entry_and_exact_callback(publication, native_consent_https, tmp_path, decision)`
+- **tests/integration/test_native_mcp_console.py** — Native consent controller with actual HTTP credentials, privacy and SQL.
+  - `async def console(request, native_pg, native_tool_effect_agent, monkeypatch)`; `async def test_original_console_description_is_private_and_does_not_mint_or_consume(console)`; `async def test_console_decision_commits_once_and_preserves_original_callback(console, decision)`; `async def test_console_rejects_non_owner_credentials_before_reading_body_or_pending(console, method, credential)`; `async def test_console_invalid_selection_never_consumes_or_mints(console, body)`; `async def test_original_console_authority_is_checked_after_read(console, change, monkeypatch)`; `async def test_concurrent_console_approval_and_denial_have_one_committed_winner(console)`; `async def test_invalid_bounded_console_body_never_consumes_pending(console, content, media)`; `…`
+- **tests/integration/test_native_mcp_delivery_revocation.py** — Revocation acknowledges only after original private delivery retires.
+  - `async def test_native_revocation_cannot_acknowledge_before_blocked_private_delivery(publication, monkeypatch)`; `async def test_native_delivery_checks_deadline_between_original_http_messages(publication)`
+- **tests/integration/test_native_mcp_grants.py** — Original SQL owns code consumption, opaque token rotation and replay revocation.
+  - `async def approved_code(boundary)`; `async def pair(boundary)`; `def store_with_policy(pending, keys, original, policy)`; `async def test_original_consent_commits_only_hashes_and_encrypted_native_models(consent_http)`; `async def test_exact_resource_refusal_preserves_the_original_credential(consent_http, kind)`; `async def test_refresh_rotates_opaque_tokens_and_replay_revocation_survives_commit(consent_http)`; `async def test_two_native_code_exchanges_cannot_publish_two_token_pairs(consent_http)`; `async def test_consumed_code_replay_revokes_tokens_even_after_code_expiry(consent_http)`; `…`
+- **tests/integration/test_native_mcp_memory_policy_guards.py** — Actual native policy must cover effective arguments and fractional expiry.
+  - `async def test_native_memory_hook_omission_validates_the_selected_tools_actual_default(publication, monkeypatch)`; `async def test_native_memory_count_default_comes_only_from_the_selected_canonical_schema(publication)`; `async def test_native_memory_bounds_actual_hook_rewritten_arguments(publication, monkeypatch, rewrite)`; `async def test_native_private_delivery_obeys_fractional_token_expiry(publication, monkeypatch)`; `async def test_native_authorization_clock_keeps_fractional_deadline_precision(publication, monkeypatch)`; `async def test_direct_argument_guards_refuse_other_execution_paths(assistant_agent, dispatch, guard_kind)`
+- **tests/integration/test_native_mcp_memory_review_guards.py** — Reproduce whole-review findings on real native memory and HTTP owners.
+  - `async def test_native_memory_bounds_the_complete_emitted_result(publication)`; `async def test_retired_legacy_http_revokes_original_governed_hook_caller(publication)`; `async def test_actual_invocation_borrows_only_its_original_caller_binding(assistant_agent, binding_kind)`; `async def test_native_private_delivery_counts_actual_protocol_envelope_bytes(publication)`
+- **tests/integration/test_native_mcp_memory_tools.py** — Real native MCP clients reach actual governed MemoryFeature execution.
+  - `async def test_native_memory_tools_use_actual_cold_core_feature_and_durable_admission(publication)`; `async def observe_native_call(owner, token, name, arguments)`; `async def test_native_memory_honors_actual_hooks_and_principal_session(publication, decision)`; `async def test_native_memory_retry_after_refresh_retains_original_durable_intention(publication)`; `async def test_native_memory_input_limits_refuse_before_canonical_admission(publication, invalid)`; `async def test_native_memory_result_byte_limit_withholds_actual_private_body(publication)`; `async def test_native_memory_budget_covers_original_governed_execution(publication)`; `async def test_native_read_upgrade_preserves_prior_raw_intention_fence(publication, monkeypatch, prior_outcome)`; `…`
+- **tests/integration/test_native_mcp_memory_writes.py** — Native MCP writes use the original governed MemoryAgencyFeature.
+  - `def fact_arguments()`; `async def test_native_fact_write_reaches_canonical_semantic_storage(publication)`; `async def test_read_consent_never_authorizes_a_canonical_fact_write(publication)`; `async def test_native_fact_write_honors_original_governed_hooks(publication, decision)`; `async def test_native_fact_unsupported_terms_are_canonical_refusals(publication)`; `async def test_revocation_during_original_hook_prevents_native_fact_effect(publication, monkeypatch)`; `async def test_expired_original_grant_rolls_back_canonical_fact_and_receipt(publication, monkeypatch)`; `async def test_native_fact_bounds_actual_post_hook_write_arguments(publication, monkeypatch)`; `…`
+- **tests/integration/test_native_mcp_oauth_http.py** — Native HTTP OAuth handlers use original sovereign consent and SQL token custody.
+  - `def provider(boundary)`; `def oauth_app(native)`; `async def approved_code(boundary)`; `def authorization_request()`; `def code_request(code)`; `async def test_authorization_redirect_only_creates_original_pending_consent(consent_http)`; `async def test_native_http_code_pkce_refresh_rotation_and_revocation(consent_http)`; `async def test_wrong_resource_cannot_consume_original_http_code(consent_http)`; `…`
+- **tests/integration/test_native_mcp_oauth_pending.py** — Original SQL transactions bound pending consent; this is not an OAuth server acceptance claim.
+  - `async def wait_for_native_pending_sql_lock(control)`; `async def pending_store(request, native_pg, tmp_path, monkeypatch)`; `def parameters()`; `async def test_pending_native_request_is_encrypted_once_and_scoped_to_its_agent(pending_store)`; `async def test_two_native_creators_cannot_overrun_the_original_agent_quota(pending_store)`; `async def test_missing_native_capacity_record_cannot_admit_authorization(pending_store)`; `async def test_two_native_consent_owners_receive_only_one_original_request(pending_store)`; `async def test_native_pending_cipher_binds_original_agent_and_expiry(pending_store, tampering)`; `…`
+- **tests/integration/test_native_mcp_publication.py** — Publish an actual initialized Core agent through the original native SDK.
+  - `async def publication(assistant_agent, monkeypatch, request)`; `async def test_prepared_mcp_routes_are_private_until_the_original_host_commit(publication)`; `async def test_actual_mcp_lane_does_not_promote_an_added_owner_key(publication, monkeypatch)`; `async def test_published_authorization_and_console_use_the_same_original_sql_grants(publication)`; `async def test_withdrawal_precedes_sdk_retirement_and_keeps_borrowed_primary_backend(publication)`; `async def test_retirement_waits_for_the_original_native_http_reader(publication)`; `async def test_normal_agent_shutdown_physically_joins_the_original_mcp_owner(publication)`; `async def test_actual_single_agent_onboarding_is_independent_of_a2a_configuration(publication)`; `…`
+- **tests/integration/test_native_mcp_tool_context.py** — Actual official SDK tool callbacks retain their native HTTP/auth context.
+  - `async def issue_native_tokens(owner, http, client_id, scope)`; `async def test_original_official_sdk_request_and_bearer_reach_actual_tool_callback(publication, required_scope, substitution)`; `async def test_native_principal_survives_refresh_and_sdk_restart_but_separates_clients(publication)`; `async def test_native_raw_result_holds_privacy_until_actual_body_delivery(publication, execution)`; `async def test_native_raw_result_is_refused_after_original_privacy_epoch_changes(publication, monkeypatch, withdrawal)`; `async def test_write_only_native_grant_cannot_disclose_memory(publication)`; `async def test_native_private_delivery_expires_without_abandoning_its_original_owner(publication)`
+- **tests/integration/test_native_mcp_transport.py** — Official MCP client and HTTP transport retain standard discovery and audience.
+  - `def runtime(boundary)`; `async def test_native_resource_challenge_and_pathful_issuer_discovery(consent_http)`; `async def test_actual_official_client_uses_native_authenticated_streamable_http(consent_http)`; `async def test_native_oauth_body_limit_refuses_before_code_consumption(consent_http)`; `async def test_host_mount_and_classification_share_original_native_routes(consent_http)`
 - **tests/integration/test_native_memory_exchange_receipts.py** — Actual inline memory enrichment must target its original exchange rows.
   - `async def test_memory_enrichment_keeps_original_exchange_identity(assistant_agent)`; `async def native_pipeline_owner(native_memory_owners, monkeypatch)`; `def observe_original_pg_release(monkeypatch, target, name)`; `async def test_memory_tagging_retains_the_original_native_metadata_lease_control(native_pipeline_owner, monkeypatch, door, kind)`; `def observe_original_conversation_receipts(agent, monkeypatch, marker)`; `async def test_streaming_persistence_returns_the_original_native_task_receipt(assistant_agent)`; `async def test_actual_bootstrap_cognition_enriches_its_own_write_receipts(assistant_agent, monkeypatch)`; `async def test_anonymous_memory_enrichment_uses_only_stored_privacy_projections(assistant_agent, monkeypatch)`; `…`
 - **tests/integration/test_native_observer_original_projection.py** — Native inventory and iterator observers preserve independent original graphs.
@@ -3356,6 +3421,8 @@ Repo entry points and standard project files.
   - `async def test_retained_worker_keeps_actual_pg_reset_withdrawal_inside_core_wrapper(native_pg, onboarding_owner, retained_worker, monkeypatch, …)`
 - **tests/integration/test_retention_purge_primitive.py** — Integration tests for the retention-purge primitive (#764).
   - `async def test_purge_trash_older_than_destroys_aged_rows(tmp_path)`; `async def test_purge_all_audit_survives_conversation_history_wipe(tmp_path)`; `async def test_destructive_audit_log_is_append_only(tmp_path)`; `async def test_purge_does_not_touch_rows_within_window(tmp_path)`; `async def test_purge_never_touches_live_rows(tmp_path)`; `async def test_per_agent_scoping(tmp_path)`; `async def test_max_rows_caps_a_single_sweep(tmp_path)`; `async def test_idempotent_when_nothing_to_purge(tmp_path)`; `…`
+- **tests/integration/test_runpod_optional_fact_ack.py** — Known native create IDs survive optional validation and late payload changes.
+  - `async def test_successful_original_create_persists_known_id_before_rejecting_optional_facts(custody, vendor, peer, monkeypatch, …)`
 - **tests/integration/test_runtime_monitor_original_admission.py** — A refused owner monitor cannot orphan an actual leased native component.
   - `async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(native_pg, tmp_path, monkeypatch, mode, …)`
 - **tests/integration/test_runtime_owner_liveness_pg.py** — #4001: on PostgreSQL an unretired owner's renewal never depends on its leases.
@@ -3662,7 +3729,7 @@ Repo entry points and standard project files.
   - `def skip_unless_load(request)`; `def tls_contexts(tmp_path)`; `def test_one_tls_write_past_the_memory_bio_fails_with_emmas_error(skip_unless_load, tls_contexts)`; `async def test_a_car_past_the_ceiling_uploads_over_real_tls(skip_unless_load, tls_contexts)`
 - **tests/load/test_load_storage.py** — Storage load tests for performance benchmarking.
   - `def skip_unless_load(request)`; `async def load_test_storage(tmp_path)`; `async def test_concurrent_write_throughput(skip_unless_load, load_test_storage)`; `async def test_mixed_read_write_workload(skip_unless_load, load_test_storage)`; `async def test_rag_indexing_at_scale(skip_unless_load, load_test_storage)`; `async def test_large_conversation_history(skip_unless_load, load_test_storage)`; `async def test_concurrent_agent_sessions(skip_unless_load, tmp_path)`
-- **tests/native_mcp/run_input_browser.py** — Run Core's operator forms with published MCP in its original Docker namespace.
+- **tests/native_mcp/run_input_browser.py** — Run Core's native browser paths with published MCP in an owned namespace.
   - `def tracked_files(repository)`; `def wheel_inventory(wheel, repository)`; `def runtime_install_command(python, mcp_version, core_wheel)`; `def build_input_image(client, owner, core, mcp, …)`; `def run_acceptance(client, owner, image_id, output)`; `def main()`
 - **tests/native_mcp/test_oauth_logging.py** — Mandatory real-SDK logging coverage in the installed MCP dependency lane.
   - `def test_actual_native_sdk_oauth_logger_drops_secrets_and_exception_traceback(caplog)`
@@ -3969,7 +4036,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_access_grant.py** — Data-access grant schema + verification tests (#1273).
   - `def owner()`; `def source()`; `def host()`; `def signed_grant(owner, source, host)`; `def package_signed_ok(monkeypatch)`; `def package_signed_invalid(monkeypatch)`; `def test_signable_payload_is_deterministic(signed_grant)`; `def test_compute_grant_id_excludes_id_and_created_at(owner, source, host)`; `…`
 - **tests/unit/test_access_log_redaction.py** — Credential redaction at Uvicorn's ASGI access-log seam (#2429).
-  - `def test_legacy_artifact_family_is_private_in_raw_and_decoded_paths(path, prefix)`; `def test_legacy_classifier_does_not_claim_all_workflow_urls(path)`; `def test_repeated_run_prefixes_remain_bounded_before_authentication()`; `async def test_legacy_artifact_access_send_preserves_decoded_handler_path(path)`; `async def test_legacy_artifact_escaped_error_keeps_outer_scope_private(during_send)`; `def test_sensitive_query_values_are_redacted_without_dropping_safe_fields()`; `def test_percent_encoded_sensitive_name_is_redacted()`; `def test_safe_query_is_returned_byte_for_byte()`; `…`
+  - `def test_native_mcp_private_urls_share_the_diagnostic_classifier(path, marker)`; `def test_native_mcp_private_urls_are_excluded_before_trace_creation(path, _marker)`; `async def test_native_mcp_access_log_hides_original_pending_and_state(path, marker)`; `def test_oauth_request_and_state_query_fields_are_not_diagnostic_values()`; `def test_legacy_artifact_family_is_private_in_raw_and_decoded_paths(path, prefix)`; `def test_legacy_classifier_does_not_claim_all_workflow_urls(path)`; `def test_repeated_run_prefixes_remain_bounded_before_authentication()`; `async def test_legacy_artifact_access_send_preserves_decoded_handler_path(path)`; `…`
 - **tests/unit/test_acknowledged_execution_commit.py** — Receipt classification only; actual transaction proofs live in integration.
   - `async def test_settled_fact_cannot_hide_combined_unscoped_control()`; `async def test_selected_cancel_keeps_scoped_provenance_across_reaggregation()`; `async def test_settled_fact_never_localizes_legacy_unresolved_committed_carrier()`; `async def acknowledged_receipt()`; `def test_native_original_retention_keeps_enclosing_cancellation_without_cause_cycle()`; `async def test_observer_receipt_is_local_only_after_original_retirement()`; `async def test_settled_commit_does_not_localize_unknown_or_actual_failed_closer()`; `async def test_only_denied_scope_retains_acknowledged_commit_after_retirement()`
 - **tests/unit/test_adapter_cache_stability.py** — Per-adapter cache-stability tests.
@@ -4959,7 +5026,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_host_authority_shared_mutations.py** — Shared host resources need the sovereign, not an agent's consent (#3221, #3223).
   - `def stable_key(monkeypatch)`; `def sovereign(credential)`; `def test_predicate_refuses_every_non_sovereign_turn(stable_key, caller)`; `def test_predicate_admits_the_sovereign_under_the_current_key(stable_key)`; `def test_predicate_refuses_without_a_stable_key(monkeypatch)`; `def test_a_sovereign_turn_does_not_leak_into_a_dispatched_wake(stable_key)`; `async def test_pull_refuses_before_touching_the_daemon(stable_key, caller)`; `async def test_pull_proceeds_for_the_sovereign(stable_key)`; `…`
 - **tests/unit/test_host_capability_authority.py** — Current host authority cannot be replaced by a serialized context or task copy.
-  - `class Action`; `class Holder`; `class Admission`; `async def test_exact_original_binding_and_lifetime_required()`; `async def test_safety_action_still_requires_exact_current_grants(changes)`; `async def test_only_explicit_non_disclosing_safety_action_survives_raw_policy(mode)`; `async def test_rechecks_expiry_target_and_current_authority_inside_retained_operation()`; `async def test_checker_must_raise_or_return_none_and_never_discloses_its_diagnostic()`; `…`
+  - `class Action`; `class Holder`; `class Admission`; `async def test_exact_original_binding_and_lifetime_required()`; `async def test_current_checker_preserves_original_execution_control_and_commit_evidence()`; `async def test_safety_action_still_requires_exact_current_grants(changes)`; `async def test_only_explicit_non_disclosing_safety_action_survives_raw_policy(mode)`; `async def test_rechecks_expiry_target_and_current_authority_inside_retained_operation()`; `…`
 - **tests/unit/test_host_context_native_cleanup.py** — Actual host-owned SQLite resources survive allocation/control failures.
   - `async def test_public_context_closer_keeps_original_native_resource_debt(tmp_path, refusal)`; `async def test_actual_host_bootstrap_unknown_is_not_a_degraded_context(tmp_path, monkeypatch)`; `async def test_context_close_keeps_original_native_ack_through_repeated_cancellation(tmp_path, monkeypatch)`
 - **tests/unit/test_host_feature_cleanup_retention.py** — Actual host contribution cleanup keeps failure and compatibility contracts.
@@ -5056,6 +5123,8 @@ Repo entry points and standard project files.
   - `async def test_actual_privacy_invocation_observes_every_native_completion(tmp_path, monkeypatch, physical_kind, publication_kind, …)`; `async def test_kite_endpoint_retires_original_observation_before_registration(tmp_path, monkeypatch, mode, prior, …)`; `async def test_invocation_admission_retires_exact_original_child_and_registration(tmp_path, monkeypatch, mode, prior)`; `async def test_isolated_invocation_recovers_original_terminal_cancellation_receipt(tmp_path, monkeypatch, kind, stop)`; `async def test_kite_endpoint_recovers_original_terminal_cancellation_before_stop(tmp_path, monkeypatch, kind, stop)`; `async def test_ordinary_endpoint_preserves_original_tool_uncertainty_after_stop(tmp_path, monkeypatch, kind, stop)`; `async def test_formatted_stream_terminal_retains_actual_abandoned_generation(tmp_path, monkeypatch, transport, kind)`; `async def test_direct_stream_close_uncertainty_preserves_actual_generation(tmp_path, monkeypatch, kind)`; `…`
 - **tests/unit/test_invocation_outcome.py** — One tool invocation's outcome type, characterized against main (#3977).
   - `def test_the_outcome_is_exactly_the_five_variants()`; `def test_every_variant_is_immutable(variant)`; `def test_every_variant_has_a_public_projection(variant)`; `def test_the_projection_refuses_anything_outside_the_type()`; `def test_the_projection_match_is_checked_exhaustive(tmp_path)`; `def test_a_match_missing_a_variant_fails_the_static_check(tmp_path)`; `def test_outcome_unknown_is_a_fact_on_every_variant(variant)`; `def test_a_variant_refuses_another_variants_payload(make)`; `…`
+- **tests/unit/test_invocation_provenance_limits.py** — Trusted resource provenance has a byte budget independent of retry IDs.
+  - `def test_resource_provenance_and_invocation_ids_keep_distinct_size_contracts()`; `def test_configured_provenance_budget_counts_actual_utf8_bytes()`; `def test_provenance_locator_rejects_nontext_empty_and_invalid_unicode(locator)`; `def test_provenance_locator_budget_must_be_a_positive_integer(budget)`
 - **tests/unit/test_isolated_feature_config_scope.py** — DID-scoped durable config and pre-hook lease-fencing regressions.
   - `async def test_did_scoped_configs_initialize_and_configure_independently(monkeypatch, tmp_path)`; `async def test_visible_legacy_config_is_adopted_in_place_for_its_owner_only(tmp_path)`; `async def test_visible_legacy_config_wins_over_scoped_during_rolling_overlap(tmp_path)`; `async def test_scoped_row_appearing_during_resolution_does_not_displace_legacy(tmp_path)`; `async def test_empty_scoped_config_is_authoritative_without_visible_legacy(tmp_path)`; `async def test_cached_scoped_authority_fences_legacy_before_new_stage_or_hook(monkeypatch, tmp_path)`; `async def test_clientless_authority_change_caches_legacy_until_explicit_initialize(monkeypatch, tmp_path)`; `async def test_read_only_cached_scoped_authority_adopts_legacy_without_start(monkeypatch, tmp_path)`; `…`
 - **tests/unit/test_isolated_feature_runtime.py** — Tests for isolated feature runtime proxy behavior.
@@ -5172,8 +5241,10 @@ Repo entry points and standard project files.
   - `def cancel_app_call()`; `async def test_app_call_enters_the_original_native_privacy_span(native_tool_effect_agent, cancel_app_call)`; `async def test_app_call_preserves_the_original_failure(native_tool_effect_agent, cancel_app_call)`; `async def test_app_call_refuses_a_borrowed_task_without_cancelling_it(native_tool_effect_agent, completed, cancel_app_call)`; `async def test_app_call_joins_its_original_epilogue_under_repeated_cancellation(native_tool_effect_agent, first, cancel_app_call)`; `async def test_app_call_rejects_missing_cancellation_policy_before_start(native_tool_effect_agent, cancel)`
 - **tests/unit/test_mcp_apps_tool_effect_contract.py** — Required App intent identity and shared retry-failure HTTP semantics.
   - `def test_app_operation_identity_is_required_bounded_and_strict(operation_id)`; `def test_app_operation_identity_is_independent_of_json_rpc_id()`; `def test_app_effect_errors_precede_the_generic_expired_view_branch(error, status, code)`; `def test_failed_physical_delivery_never_becomes_a_replay_instruction()`
+- **tests/unit/test_mcp_authorization_records.py** — Native SDK authenticated records retain one domain, agent, identity and expiry.
+  - `def records(monkeypatch)`; `def test_pending_record_uses_the_original_native_sdk_aad_and_cipher(records)`; `def test_native_record_refuses_authenticated_domain_retargeting(records, change)`; `def test_current_record_budget_applies_to_both_writes_and_authenticated_reads(records)`; `def test_only_native_opaque_secret_shapes_have_lookup_hashes(secret)`; `def test_record_codec_requires_explicit_original_identity_and_budget(agent, budget)`
 - **tests/unit/test_mcp_input_browser_runner.py** — Actual wheel custody failures must stop native browser acceptance.
-  - `def runner()`; `def test_input_browser_support_matches_the_public_host_feature_minimum()`; `def test_input_browser_runtime_install_resolves_candidate_dependencies()`; `def test_input_browser_rejects_wheel_without_exact_unique_source_bytes(tmp_path, fault)`; `def test_input_browser_binds_the_installed_runtime_to_real_wheel_bytes(tmp_path)`
+  - `def runner()`; `def test_input_browser_support_matches_the_public_host_feature_minimum()`; `def test_input_browser_runtime_install_resolves_candidate_dependencies()`; `def test_native_browser_refuses_unknown_suite_before_building()`; `def test_native_consent_ci_runs_and_retires_the_same_owned_namespace()`; `def test_input_browser_rejects_wheel_without_exact_unique_source_bytes(tmp_path, fault)`; `def test_input_browser_binds_the_installed_runtime_to_real_wheel_bytes(tmp_path)`
 - **tests/unit/test_mcp_oauth_controller.py** — Host contract checks over real HTTP/authentication; no vendor protocol claim.
   - `class HostContractConsumer`; `async def controller(oauth_boundary)`; `async def begin(b)`; `def callback_body(b)`; `async def test_native_http_complete_connect_read_and_local_disconnect_contract(controller)`; `async def test_foreign_principal_cannot_consume_or_cancel_an_original_operation(controller, route)`; `async def test_bad_state_retires_original_handle_without_exchange(controller)`; `async def test_consumed_unknown_exchange_is_never_replayed(controller)`; `…`
 - **tests/unit/test_mcp_oauth_host.py** — Actual Core feature activation and HTTP credentials govern original OAuth leases.
@@ -5184,6 +5255,8 @@ Repo entry points and standard project files.
   - `async def test_native_public_identity_and_callback_shell(configured, monkeypatch)`; `def test_native_server_wires_public_identity_and_callback_routes()`; `async def test_callback_access_log_redacts_all_parameters_at_actual_send_seam(suffix)`; `def test_oauth_diagnostic_logger_drops_secrets_and_exception_traceback(caplog)`; `def test_host_managed_child_can_use_identity_with_console_assets_served_by_parent()`
 - **tests/unit/test_mcp_permission_peer.py** — The finite external model must distinguish task completion from a new effect request.
   - `async def test_completion_wake_does_not_script_another_marker_effect(tmp_path, prior_submission, notification)`; `async def test_original_effect_request_survives_a_native_trailing_operator_notice(tmp_path, request_content)`
+- **tests/unit/test_mcp_server_policy.py** — Server configuration is explicit and never implies an agent grant.
+  - `def configured()`; `def test_server_is_disabled_only_when_configuration_is_absent()`; `def test_registered_client_and_origin_keep_their_explicit_identity()`; `def test_invalid_or_ambiguous_server_configuration_fails(change)`; `def test_client_cannot_gain_implicit_authority_or_redirect_credentials(change)`; `def test_public_client_is_explicit_and_duplicate_client_ids_are_refused()`; `def test_actual_official_sdk_receives_only_the_registered_client_information(public)`; `def test_registration_rejects_redirect_identity_changed_by_native_sdk(uri)`; `…`
 - **tests/unit/test_memory_agency_feature.py** — Tests for the MemoryAgencyFeature.
   - `class FakeDB`; `class FakeGraphStore`; `class FakeCanonicalFactStorage`; `class PrivacyBlockedCanonicalFactStorage`; `class ErasedCanonicalFactStorage`; `class ValidationRejectedCanonicalFactStorage`; `class ValidationUnavailableCanonicalFactStorage`; `class PrivacyWrappedStorage`; `…`
 - **tests/unit/test_memory_answerability.py** — —
@@ -5294,6 +5367,8 @@ Repo entry points and standard project files.
   - `async def concrete_feature(native_tool_effect_agent, tmp_path, request)`; `async def test_concrete_feature_keeps_original_registration_through_native_admission(concrete_feature, monkeypatch, lane, timing, …)`; `async def test_async_native_acceptance_retains_original_provider_feature(native_tool_effect_agent, tmp_path, monkeypatch, timing, …)`; `async def test_mounted_feature_alias_retains_its_original_concrete_owner(concrete_feature, monkeypatch, change)`; `async def test_custom_sync_native_provider_fences_its_original_uncertain_effect(native_tool_effect_agent, tmp_path, lane, error_type, …)`; `async def test_custom_native_reply_contract_fences_its_original_effect(concrete_feature, lane)`; `async def test_canonical_native_encoding_failure_keeps_original_effect_receipt(native_tool_effect_agent, tmp_path, lane)`; `async def test_native_task_invariant_failure_keeps_one_original_effect(concrete_feature, lane, malformation)`; `…`
 - **tests/unit/test_native_host_runbook.py** — The "Start the native host" runbook settings reach the host (#3878).
   - `def test_the_runbook_names_both_settings_in_the_project_env()`; `def test_the_documented_lines_reach_the_host_and_publish(tmp_path, monkeypatch)`; `def test_the_runbook_gives_the_advice_the_startup_warning_gives()`; `def test_the_release_note_matches_the_runbook()`
+- **tests/unit/test_native_http_registry.py** — Host publications retain exact route ownership across replacement and failure.
+  - `async def endpoint(_request)`; `class Binding`; `def binding(key, path)`; `def scope(app, path, method)`; `def test_replacement_and_stale_withdrawal_keep_current_native_generation()`; `def test_collision_is_refused_before_either_registration_changes()`; `def test_corrupt_route_ownership_cannot_admit_withdraw_or_replace(fault)`; `def test_admission_cannot_borrow_another_application()`; `…`
 - **tests/unit/test_native_interop_process.py** — The independent TCK launcher must join its entire owned process session.
   - `async def test_retiring_the_tck_launcher_also_terminates_its_actual_child()`
 - **tests/unit/test_native_journal_programs.py** — Real native connection program registration and transaction-lifetime fences.
@@ -5580,6 +5655,8 @@ Repo entry points and standard project files.
   - `def test_remote_first_allowed_with_no_mandate_and_no_override()`; `def test_remote_first_allowed_with_bare_model_override()`; `def test_remote_first_allowed_rejects_vendor_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_route_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_selector_without_slash()`; `def test_remote_first_allowed_rejects_mandate_with_vendor()`; `def test_remote_first_allowed_rejects_mandate_with_route()`; `def test_remote_first_allowed_with_model_only_mandate()`; `…`
 - **tests/unit/test_rename_command.py** — Unit tests for the rename command.
   - `class MockStorage`; `class FailingAddNodeStorage`; `class MockDB`; `class FailingDB`; `class MockAgent`; `class MockNode`; `def mock_agent()`; `def temp_agent_dir(tmp_path)`; `…`
+- **tests/unit/test_request_body.py** — Native ASGI streamed JSON budgets precede private schema admission.
+  - `class Selection`; `def request(chunks)`; `async def test_streamed_json_accepts_exact_budget_and_original_schema()`; `async def test_streamed_json_rejects_over_budget_before_reading_the_rest()`; `async def test_wrong_media_type_does_not_read_private_body()`; `async def test_original_schema_errors_remain_explicit(content)`
 - **tests/unit/test_request_lifecycle_original_ownership.py** — Actual registering/bound Tasks distinguish input ownership from copied ids.
   - `def test_synchronous_registration_has_no_native_input_owner()`; `async def test_original_request_generation_requires_live_native_owner()`; `def test_active_projection_does_not_prove_another_request_owner()`; `async def test_loop_callback_registration_has_no_original_task_owner()`; `async def test_unowned_requester_cannot_publish_operation_binding()`; `async def test_captured_binding_delegates_only_its_original_operation()`; `async def test_captured_binding_observes_its_original_cancellation_generation()`; `async def test_retired_captured_binding_cannot_dispatch_an_owned_stream()`; `…`
 - **tests/unit/test_reserved_session_id_boundary.py** — A request cannot claim a reserved non-interactive session id (#3284).
@@ -6391,6 +6468,8 @@ Repo entry points and standard project files.
   - `def refusing_runtime_completion_factory(opening)`
 - **tests/utils/scheduler_ticks.py** — Drive one scheduler poll and wait for the occurrences it admitted.
   - `async def settle_occurrences(runner)`; `async def tick_and_settle(runner)`; `async def dispatch_scheduled_tool(feature, task_name, arguments)`
+- **tests/utils/semantic_mutation_faults.py** — Fault the original semantic revision boundary after real predecessor writes.
+  - `def immutable_revision_conflict(monkeypatch, store)`
 - **tests/utils/test_result_analyzer.py** — Test Result Analyzer for Agent Reflection.
   - `class InsightType`; `class TestInsight`; `class TestPattern`; `class TestResultAnalyzer`
 - **tests/utils/tls.py** — Shared real TLS certificate and isolated HTTP server fixtures.
