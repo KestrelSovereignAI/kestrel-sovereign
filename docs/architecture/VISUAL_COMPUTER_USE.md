@@ -251,9 +251,25 @@ not a verified physical release and has no fabricated lease. Atomic owner and
 revision checks prevent retirement racing into acquisition, or a stale task
 saving over the tombstone. Only authenticated admitted/quoted phases with no
 lease, connection, session, control or action facts qualify. Acquiring, unknown
-or any legacy possible-effect custody remains live and charged. Release,
+or any legacy possible-effect custody remains live and charged without verified
+original physical cleanup. Release,
 request reconciliation and expired-request maintenance expose these separate
 retirement semantics; exact-ID reopen cannot restore quota or acquire again.
+
+Failed local worker setup has a separate settlement path. It joins the original
+setup and physical close, and reloads the durable row under the session lock.
+Foreground settlement requires its current Host grant. A narrow revision CAS may retire an acquiring row
+with no accepted lease only when that exact original setup proves physical
+retirement. Its response uses `acquired: null` and
+`setup_cleanup: "verified_original_physical_retirement"`; it makes no claim that
+acquisition had no effect. If a lease was accepted before setup failed, normal
+verified release settles that same lease. Eligible maintenance of an already
+accepted fixed lease uses its existing cleanup authority without minting a new
+foreground grant; maintenance does not retire failed setups with no accepted
+lease. Unknown cleanup, stale foreground authority or a
+failed storage acknowledgement retains charged custody and the original setup
+for a fresh permitted release or request reconciliation. Original setup and
+credential-bearing driver maps are pruned only after durable settlement.
 
 
 Persist the admitted request and accepted quote before acquisition. Quotes bind
@@ -391,12 +407,13 @@ the environment. Export and transfer always select an exact source revision.
 
 ### Manual human channel
 
-This source integration requires published SDK 0.45 human-control contracts.
-Core declares `>=0.45.0,<1`; its normal-index lock and the exact hash-locked
-worker requirements select 0.45.0. The Dockerfile verifies the installed worker
-pin and human contract. This Core 0.58 source successor still requires complete
-review, CI and built-image/host acceptance before release. Published SDK
-installability alone does not establish Core product readiness.
+Manual human control uses the published SDK human-control contracts. The host
+SDK requirement is declared in `pyproject.toml` and resolved through `uv.lock`.
+Each worker image uses its own exact hash-locked requirements; the legacy and
+two-domain worker locks are separate inputs. The Dockerfiles verify the installed
+SDK pin. Published SDK installability alone does not establish Core product
+readiness: source review, CI, built-image/host acceptance and worker registration
+remain separate gates.
 
 Trusted visual configuration explicitly enables `human_control_enabled` and may
 set `human_lease_seconds` from 1 to 120 (default 120). The original session owner
@@ -445,6 +462,45 @@ resume agent control. After manual Stop, workspace export remains private and
 fenced. Handback requires the operator to confirm that the screen is ready to
 share, retires the human channel, purges retained human frame metadata and obtains
 a fresh agent observation. There is no automatic secret detection or redaction.
+
+## Private local two-domain profile v2
+
+The unregistered `local-two-domain-worker-v2` profile keeps the browser offline:
+its network mode is `none`, it publishes no ports, and its fixed worker/control
+Unix endpoints share only the nonce-owned IPC volume. The browser sandbox,
+separate UID, capability removal, read-only root and original Host admission
+checks remain required. Setup metadata does not grant a live session.
+
+Lifecycle withdrawal fences input immediately, then drains the original browser
+and transport handles. The pinned Playwright browser close has a 30-second
+budget, the browser process has a 40-second shutdown watchdog, and the Host
+allows 50 seconds for the original container wait. These cleanup budgets do not
+extend the admitted session or permit another action. Release still requires
+the original zero exit and confirmed resource removal; a timeout or nonzero
+exit retains UNKNOWN custody and charged capacity.
+
+The broker is trusted networked code on one fresh, nonce-labelled noninternal
+bridge. Only that broker may attach. Its two fixed container ports publish
+solely to distinct numeric `127.0.0.1` endpoints, authenticated by the original
+host's dedicated mTLS identity and per-role leaf pins. V2 requires both images'
+`core-sdk046-two-domain-v2` contract; it does not retry v1 on another network.
+The supported Docker daemon's measured local bridge flags/options are checked;
+dynamic subnet, gateway and status values are not assumed to be fixed.
+
+A noninternal bridge can provide the broker a default route and outbound
+host/LAN/public/metadata access, subject to host routing and firewalls. A
+dedicated bridge and mTLS do not contain a compromised broker or promise broker
+outbound isolation. The offline browser is the constrained execution domain;
+no browser proxy, relay or arbitrary navigation path is added.
+
+The original post-start inspect must prove the broker's exact CID/start,
+single network attachment and complete two-port loopback map before application
+credentials are initialized. The same original map is retained and rechecked
+on the later bootstrap inspect and live checks; map replacement refuses before
+a new RPC. Existing live network inspection requires the original network's
+sole member to be that broker. These metadata checks prove neither listener
+readiness nor a browser session, physical cleanup, usable Remote registration,
+cloud provisioning or billing conformance. Each needs its separate native gate.
 
 ## Delivery and evidence
 

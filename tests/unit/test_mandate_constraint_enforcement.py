@@ -319,7 +319,7 @@ async def test_initialize_reattaches_enforcement_on_any_boot_path(tmp_path):
     )
     try:
         await agent.initialize()
-    
+
         hooks = agent.hooks_manager.get_hooks(HookEvent.PRE_TOOL_USE)
         assert any(isinstance(h, MandateRestrictionHook) for h in hooks)
         assert getattr(agent, "spawn_mandate", None) is not None

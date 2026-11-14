@@ -344,7 +344,10 @@ async def test_reaper_admission_failure_retains_exact_live_process_debt(monkeypa
             raise refusal
         return task
     def current():
-        raise RuntimeError('original prewrite authority refused')
+        # The pre-launch authority check must pass: this test deliberately
+        # refuses only after the SAME actual child exists, at pre-write.
+        if children:
+            raise RuntimeError('original prewrite authority refused')
     try:
         loop.set_task_factory(factory)
         with pytest.raises(BaseException) as caught:

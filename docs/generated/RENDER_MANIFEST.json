@@ -805,7 +805,9 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "pyproject.toml"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],

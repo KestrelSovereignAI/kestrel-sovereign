@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from fastapi import Request
 from fastapi.routing import APIRoute
+from kestrel_sdk.operator import OperatorAuthorizationError
 from kestrel_sdk.resources import ResourceNotFound, ResourceOutcomeUnknown
 from starlette.responses import JSONResponse
 
@@ -233,12 +234,33 @@ class BorrowControl(asyncio.CancelledError):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', ['cause', 'group', 'commit', 'retirement', 'cancel-retirement', 'cancel-subclass', 'ordinary-cause', 'nested-control', 'unknown-subclass', 'unknown-group', 'unknown-commit', 'unknown-debt', 'base-control'])
+@pytest.mark.parametrize('kind', ['cause', 'group', 'commit', 'retirement', 'cancel-retirement', 'cancel-subclass', 'ordinary-cause', 'nested-control', 'unknown-subclass', 'unknown-group', 'unknown-commit', 'unknown-debt', 'base-control', 'authorization-subclass', 'authorization-fact', 'authorization-commit', 'authorization-debt', 'spoofed-authorization'])
 async def test_borrower_preserves_original_explicit_control_graph(harness, tmp_path, kind):
     h = harness
     ctx = h.context()
     marker = NativeAbort('original-native-control')
-    if kind == 'cause':
+    if kind.startswith('authorization-') or kind == 'spoofed-authorization':
+        error = asyncio.CancelledError('original interrupted native join')
+        if kind == 'authorization-subclass':
+            class SpecificAuthorization(OperatorAuthorizationError):
+                pass
+            cause = SpecificAuthorization('original specific authorization')
+        elif kind == 'spoofed-authorization':
+            class SpoofedAuthorization(Exception):
+                @property
+                def __class__(self):
+                    return OperatorAuthorizationError
+            cause = SpoofedAuthorization('original native error')
+        else:
+            cause = OperatorAuthorizationError('original egress expired')
+            if kind == 'authorization-commit':
+                cause.__cause__ = ExecutionCommitOutcomeError('unknown')
+            elif kind == 'authorization-debt':
+                cause._kestrel_native_retirement_debts = ((marker, None),)
+            else:
+                cause.original_native_admission = marker
+        error.__cause__ = cause
+    elif kind == 'cause':
         error = asyncio.CancelledError('original-child')
         error.__cause__ = marker
     elif kind == 'ordinary-cause':

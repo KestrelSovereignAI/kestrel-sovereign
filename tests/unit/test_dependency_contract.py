@@ -52,6 +52,8 @@ SECURITY_FLOORS = {
     # before importing a local model directory's custom code; 6.0 refuses it.
     "sentence-transformers": "6.0.0",
     "setuptools": "83.0.0",
+    # GHSA-mmhr-3c5m-f64f and GHSA-6655-6qjp-jx7x (2026-11-13).
+    "soupsieve": "4.0.0",
     "torch": "2.13.0",
     "transformers": "5.5.0",
     "web3": "7.15.0",
@@ -536,9 +538,10 @@ def test_sdk_native_release_cascade_contract_is_locked():
         if package["name"] == "kestrel-sovereign-sdk"
     ]
     assert sdk_versions
-    assert all(
-        Version("0.52.2") <= version < Version("1.0.0") for version in sdk_versions
+    sdk_specifier = SpecifierSet(
+        ",".join(operator + version for operator, version in SDK_RELEASE_CASCADE_SPECIFIERS)
     )
+    assert all(version in sdk_specifier for version in sdk_versions)
 
 
 def test_native_provider_completion_release_is_required():
