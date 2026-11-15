@@ -709,6 +709,34 @@ before signing; the manager's routing key and interface URLs remain stable.
 The console's `/api/agents` response uses public display profiles independently
 of this protocol publication.
 
+For a selected recipient in the same application, use
+`publication.inprocess_http_transport(app)` as the official SDK's HTTPX client
+transport. Obtain the signed card through that publication's `get_card()` and
+retain the normal sender interceptor. The transport admits only this exact
+published route generation, application and configured public origin; it does
+not grant sender permission, bypass host middleware, discover alternate routes,
+start ASGI lifespan, or fall back to the network. Revocation/replacement fails
+closed, including across an awaited read. Mounted applications retain their
+original ingress scope for route checks, independently of router mutations.
+
+This transport is incremental, unlike HTTPX's buffering `ASGITransport`.
+Response headers and body frames flow through Core's canonical owned callback
+source; each subsequent pull acknowledges the previous frame. `buffer_bytes`
+(default 65536) bounds each outstanding body frame, not the application's own
+allocation before `send`. The SDK still owns A2A parsing, messages and errors.
+Both HTTPX `read` and `write` timeouts must be finite and nonnegative; each
+actual response read/request-body read enforces its corresponding inactivity
+deadline. Use an outer operation deadline when a whole-exchange bound is needed.
+Early response/client closure signals disconnect and withdraws source demand.
+One original close task joins the original application and source owners, using
+one nonrenewing retirement budget equal to the request's read timeout. Slow
+opaque cleanup is retained as private debt with those exact original tasks,
+never reported as a successful close or interrupted by a replacement cancel.
+The host must retain and retry closing that transport after the originals settle
+to reconcile such debt; no background supervisor or retry service is created.
+Original application/control/cleanup failures remain in their explicit error
+graph rather than becoming a successful body or protocol error reply.
+
 Public hosting requires `KESTREL_BASE_URL`. Without it, operator APIs remain
 available and no peer card or binding is published; a listen address is never
 substituted for a public URL. `KESTREL_A2A_DISCOVERY_AGENT` explicitly selects
