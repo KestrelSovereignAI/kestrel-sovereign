@@ -166,8 +166,11 @@ _TOKEN_BOUND_CACHE_VERSION = 1
 #: The lock beside the ratchet file that serializes its writers across
 #: processes: ``token_bound_ratchet.json.lock``. It is kept after release.
 TOKEN_BOUND_LOCK_SUFFIX = ".lock"
-#: How long a writer waits for another before its value stays in memory.
-TOKEN_BOUND_LOCK_TIMEOUT_SECONDS = 0.5
+#: The total time a writer waits for the lock before its value is held in
+#: memory. The wait blocks the event loop every co-hosted agent runs on, so it
+#: is at most 250 ms.
+TOKEN_BOUND_LOCK_TIMEOUT_SECONDS = 0.25
+#: How long a waiting writer sleeps between attempts, within that total.
 TOKEN_BOUND_LOCK_POLL_SECONDS = 0.005
 
 #: Content-block types costed by their bytes alone.
@@ -181,8 +184,9 @@ _PROMPT_TOO_LONG_RE = re.compile(r"prompt is too long:\s*([0-9][0-9,]*)\s*tokens
 _FAMILY_RE = re.compile(r"[a-z]+")
 _TIKTOKEN_FAMILY = "tiktoken"
 
-#: Events an operator can count: gate refusals and samples whose excess the
-#: overhead cap could not cover. Read with :func:`token_bound_event_counts`.
+#: Events an operator can count: gate refusals, samples that were not
+#: learned, and values that could not be published. Read with
+#: :func:`token_bound_event_counts`.
 _TOKEN_BOUND_EVENTS: Counter = Counter()
 
 
@@ -376,10 +380,16 @@ def rejected_prompt_samples(error: BaseException) -> List[Tuple[Optional[str], i
     When every route of ``get_response`` failed (the path a subagent's first
     ``generate`` takes) the service raises ``LLMAllProvidersFailedError``,
     which holds each route's own error under the route's name: each count is
-    returned under that name. Any other error is read through its cause chain
-    and returned with no route, for the caller to name the route it sent to.
+    returned under that name. Any other error is read through its cause chain:
+    a route walk such as ``generate_with_messages`` raises its own error from
+    the last route's, and the service names on each route attempt's error the
+    route it was sent to (:func:`~kestrel_sovereign.llm.error_handling.attempt_route`).
+    The count is returned under the route of the attempt error that carries
+    it. A count no attempt error carries is returned with no route: which
+    route counted it is not known, and it is never the route of an earlier
+    response.
     """
-    from kestrel_sovereign.llm.error_handling import LLMAllProvidersFailedError
+    from kestrel_sovereign.llm.error_handling import LLMAllProvidersFailedError, attempt_route
 
     for current in _cause_chain(error):
         if isinstance(current, LLMAllProvidersFailedError):
@@ -393,6 +403,13 @@ def rejected_prompt_samples(error: BaseException) -> List[Tuple[Optional[str], i
                 if counted is not None:
                     samples.append((str(route), counted))
             return samples
+    for current in _cause_chain(error):
+        route = attempt_route(current)
+        if route is not None:
+            # The first attempt error in the chain is the one the send failed
+            # on; every later link is its own cause.
+            counted = rejected_prompt_tokens(current)
+            return [] if counted is None else [(route, counted)]
     counted = rejected_prompt_tokens(error)
     return [] if counted is None else [(None, counted)]
 
@@ -461,21 +478,39 @@ def _lock_contended(error: OSError) -> bool:
 class _TokenBoundRatchet:
     """``bpt_min`` per family and ``overhead`` per route, for one cache file.
 
-    The file is re-read whenever it changes on disk, so an operator resets the
-    ratchet by deleting the file or one entry, and the running host sees it.
-    A missing or unreadable file means the starting values.
+    The sample store (#4068 ruling rv-4068-2, S1-S8):
 
-    Every process sharing the file publishes one learned value at a time,
-    under a lock beside the file: it re-reads the file, keeps the stricter of
-    its value and the one there (the lower ``bpt_min``, the higher
-    ``overhead``, each with its own sample), and replaces the file. A stricter
-    value another process wrote is never overwritten, and an entry the
-    operator deleted is not written back. A value that could not be published
-    applies in this process until it exits.
-
-    Samples observed while persistent writes are not allowed are never
-    written: they live in memory, per owner, for the privacy epoch they were
-    observed in (:class:`PrivacyEpoch`).
+    * **Published.** The file is host-wide: every agent and every process
+      using this cache directory shares it. A value describes a model family
+      or a route, not an agent, and is stored with the sample that moved it.
+    * **Writers.** Any process publishes one value at a time under the lock
+      beside the file: it re-reads the file, keeps the stricter of its value
+      and the one there (the lower ``bpt_min``, the higher ``overhead``, each
+      with its own sample), and replaces the file atomically. The lock wait is
+      at most :data:`TOKEN_BOUND_LOCK_TIMEOUT_SECONDS`.
+    * **Held.** An entry that could not be published (lock timeout or
+      ``OSError``) is held whole, with its sample, and applies in this process
+      only. It is retired once the file holds an equal or stricter value for
+      its key, checked on every file load and every publish; the next publish
+      for its key writes the stricter of the two. It is never retried on its
+      own, and it ends with the process.
+    * **Volatile.** A sample observed while persistent writes are not allowed
+      lives in memory for its owner's privacy epoch (:class:`PrivacyEpoch`),
+      applies to that owner's bounds only, and is dropped only when that
+      owner's epoch changes. Without an owner and an epoch it is not learned.
+    * **Readers** take no lock and apply the strictest of the file's value,
+      the held value and the calling owner's volatile value. A reader sees a
+      whole file, old or new; the file's value for a key loosens only when the
+      operator deletes the file or the entry. Another process's publish is
+      visible at this process's next file load, and a held value does not
+      survive a restart.
+    * **Reset.** The file is re-read whenever it changes on disk, so deleting
+      the file or one entry resets what the file held, and the running host
+      sees it. A held value that never reached the file is not reset by that;
+      the warning on each load names it. A missing or unreadable file means
+      the starting values.
+    * **Threads.** The in-process state is touched only from one thread, the
+      event loop's: the subagent gate measures and feeds on it.
     """
 
     def __init__(self, path: Path):
@@ -484,7 +519,8 @@ class _TokenBoundRatchet:
         self._stamp: Any = object()  # never equal to a real stamp
         self._bpt: Dict[str, Dict[str, Any]] = {}
         self._overhead: Dict[str, Dict[str, Any]] = {}
-        self._unpublished: Dict[str, Dict[str, Union[int, float]]] = {_BPT_MIN: {}, _OVERHEAD: {}}
+        #: Whole entries (``value`` and ``sample``) that could not be published.
+        self._unpublished: Dict[str, Dict[str, Dict[str, Any]]] = {_BPT_MIN: {}, _OVERHEAD: {}}
         self._volatile: Dict[str, _VolatileSamples] = {}
 
     # -- reading -----------------------------------------------------------
@@ -504,13 +540,41 @@ class _TokenBoundRatchet:
             return
         self._stamp = stamp
         if stamp is None:
-            self._bpt, self._overhead = {}, {}
             logger.warning(
                 "Token bound ratchet %s does not exist; using the starting values",
                 self.path,
             )
+            self._load({}, {})
             return
-        self._bpt, self._overhead = self._read()
+        self._load(*self._read())
+
+    def _load(
+        self, bpt: Dict[str, Dict[str, Any]], overhead: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Take the file's entries, and retire each held entry the file now covers."""
+        self._bpt, self._overhead = bpt, overhead
+        for section, on_disk in ((_BPT_MIN, bpt), (_OVERHEAD, overhead)):
+            held = self._unpublished[section]
+            for key in [
+                key for key, entry in held.items()
+                if key in on_disk
+                and not _stricter(section, entry["value"], on_disk[key]["value"])
+            ]:
+                del held[key]
+        names = self._held_names()
+        if names:
+            logger.warning(
+                "Token bound ratchet %s: values this process could not publish "
+                "still apply here until it exits, whatever the file holds: %s",
+                self.path, names,
+            )
+
+    def _held_names(self) -> str:
+        return ", ".join(
+            f"{section}[{key or 'unknown'}]={entry['value']}"
+            for section in (_BPT_MIN, _OVERHEAD)
+            for key, entry in sorted(self._unpublished[section].items())
+        )
 
     def _read(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
         """The file's valid entries; none when it is missing or unreadable."""
@@ -587,7 +651,7 @@ class _TokenBoundRatchet:
         if stored is not None:
             candidates.append(float(stored["value"]))
         if family in self._unpublished[_BPT_MIN]:
-            candidates.append(float(self._unpublished[_BPT_MIN][family]))
+            candidates.append(float(self._unpublished[_BPT_MIN][family]["value"]))
         held = self._volatile_for(privacy_epoch)
         if held is not None and family in held.bpt_min:
             candidates.append(held.bpt_min[family])
@@ -601,7 +665,7 @@ class _TokenBoundRatchet:
         held = self._volatile_for(privacy_epoch)
         learned = [
             {key: entry["value"] for key, entry in self._overhead.items()},
-            self._unpublished[_OVERHEAD],
+            {key: entry["value"] for key, entry in self._unpublished[_OVERHEAD].items()},
             held.overhead if held is not None else {},
         ]
         if route:
@@ -619,13 +683,33 @@ class _TokenBoundRatchet:
         total_input: int,
         *,
         route: str,
+        served_model: Optional[str],
         context_limit: Optional[int],
         persist: bool,
         privacy_epoch: Optional[PrivacyEpoch],
     ) -> None:
-        """Learn from one provider count for a request bounded at ``bound``."""
+        """Learn from one provider count for a request bounded at ``bound``.
+
+        ``served_model`` is the model a response says served the request; its
+        count is learned only when that model is in the family the bound was
+        computed for. ``None`` for the count inside a rejection, which names
+        no model.
+        """
         if total_input <= 0:
             return
+        if served_model is not None:
+            served_family = model_family(served_model) if served_model else None
+            if served_family != bound.family:
+                count_token_bound_event("sample_family_mismatch")
+                logger.warning(
+                    "Token bound sample not learned: %s served the request, not "
+                    "a %s-family model as bounded (route=%s bound model=%s T=%d "
+                    "wire_bytes=%d)",
+                    f"model {served_model!r}" if served_model else "a response naming no model",
+                    bound.family, route or "unknown", bound.model,
+                    total_input, bound.wire_bytes,
+                )
+                return
         cap = int(context_limit * OVERHEAD_CAP_FRACTION) if context_limit else None
         overhead = self.overhead(route, cap, privacy_epoch)
         floor = SAMPLE_FLOOR_TOKENS
@@ -694,6 +778,7 @@ class _TokenBoundRatchet:
         if not persist:
             held = self._volatile_for(privacy_epoch)
             if held is None:
+                count_token_bound_event("volatile_sample_dropped")
                 logger.warning(
                     "Token bound sample not held: persistent writes are not allowed and "
                     "no privacy epoch names whose sample it is (route=%s model=%s)",
@@ -710,7 +795,14 @@ class _TokenBoundRatchet:
     # -- publishing --------------------------------------------------------
 
     def _publish(self, section: str, key: str, entry: Dict[str, Any]) -> None:
-        """Merge one learned value into the file, under the writers' lock."""
+        """Merge one learned entry into the file, under the writers' lock.
+
+        An entry held for the same key, because an earlier publish failed, is
+        merged too: the stricter of the two is written, with its own sample.
+        """
+        held = self._unpublished[section].get(key)
+        if held is not None and _stricter(section, held["value"], entry["value"]):
+            entry = held
         try:
             with self._locked():
                 bpt, overhead = self._read()
@@ -724,19 +816,22 @@ class _TokenBoundRatchet:
                         "Token bound ratchet: %s[%s] is already %s in %s; kept",
                         section, key or "unknown", current["value"], self.path,
                     )
-                self._bpt, self._overhead = bpt, overhead
+                # The file now holds this key's value or a stricter one, so
+                # loading it retires the entry held for this key.
+                self._load(bpt, overhead)
                 # Stamped while the lock is held, so a later writer's change
                 # is seen as a change.
                 self._stamp = self._file_stamp()
         except (OSError, TokenBoundRatchetBusy) as error:
+            count_token_bound_event("ratchet_publish_failed")
+            self._unpublished[section][key] = entry
             logger.warning(
-                "Could not persist token bound ratchet %s (%s: %s); the learned "
-                "value applies in this process until it exits",
+                "Could not persist token bound ratchet %s (%s: %s); %s[%s]=%s "
+                "applies in this process until it exits or the file holds a "
+                "value as strict",
                 self.path, type(error).__name__, error,
+                section, key or "unknown", entry["value"],
             )
-            held = self._unpublished[section].get(key)
-            if held is None or _stricter(section, entry["value"], held):
-                self._unpublished[section][key] = entry["value"]
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
@@ -763,12 +858,13 @@ class _TokenBoundRatchet:
                 except OSError as error:
                     if not _lock_contended(error):
                         raise
-                    if time.monotonic() >= deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         raise TokenBoundRatchetBusy(
                             f"{self.lock_path} was held by another writer for "
                             f"{TOKEN_BOUND_LOCK_TIMEOUT_SECONDS}s"
                         ) from error
-                    time.sleep(TOKEN_BOUND_LOCK_POLL_SECONDS)
+                    time.sleep(min(TOKEN_BOUND_LOCK_POLL_SECONDS, remaining))
             try:
                 yield
             finally:
@@ -813,6 +909,7 @@ def record_input_sample(
     total_input: int,
     *,
     route: Optional[str] = None,
+    served_model: Optional[str],
     persist: bool,
     privacy_epoch: Optional[PrivacyEpoch],
 ) -> None:
@@ -820,11 +917,15 @@ def record_input_sample(
 
     ``total_input`` is the response's input, cache-read and cache-creation
     counts together, or the count inside a ``prompt is too long`` rejection.
+    ``served_model`` is the model the response says served the request (``""``
+    when it names none), and ``None`` for a rejection's count: a response's
+    count is learned only when that model is in the bound's family.
     ``persist`` is whether persistent writes are allowed now: a sample that
     may not be persisted lives in memory for ``privacy_epoch`` only.
     """
     TokenCounter(bound.model).record_sample(
-        bound, total_input, route=route, persist=persist, privacy_epoch=privacy_epoch,
+        bound, total_input, route=route, served_model=served_model,
+        persist=persist, privacy_epoch=privacy_epoch,
     )
 
 
@@ -1024,6 +1125,7 @@ class TokenCounter:
         total_input: int,
         *,
         route: Optional[str] = None,
+        served_model: Optional[str],
         persist: bool,
         privacy_epoch: Optional[PrivacyEpoch],
     ) -> None:
@@ -1035,6 +1137,7 @@ class TokenCounter:
             bound,
             total_input,
             route=route if route is not None else bound.route,
+            served_model=served_model,
             context_limit=self.resolved_context_limit(),
             persist=persist,
             privacy_epoch=privacy_epoch,

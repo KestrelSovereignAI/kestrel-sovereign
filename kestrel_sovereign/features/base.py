@@ -2034,9 +2034,19 @@ class Feature(_SdkFeature):
                     # adapter (it feeds only the invocation context and the span),
                     # so it carries no provider-continuation meaning to collide with.
                     session_id=turn_session_id,
+                    # The response that carries the provider's input count, so
+                    # a text-only request feeds the token bound too (#4068).
+                    return_response=True,
                 ),
                 _dispatch_host=host,
             )
+            if first_tools is None:
+                from kestrel_sdk.llm import LLMResponse
+
+                if isinstance(response, LLMResponse):
+                    # What ``generate`` returns for a text-only call without
+                    # ``return_response``.
+                    response = response.content or ""
             require_execution_work(host)
 
             # Log what we got back
@@ -2892,6 +2902,12 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         ``generate`` raises ``LLMAllProvidersFailedError`` when every route
         failed, which is not an ``LLMServiceError``. Its rejections are fed
         under the route each came from.
+
+        A rejection is fed only under the route that counted it. The bound's
+        route is the route of the previous response, and a continuation may
+        fail on another one: its count, with that route's overhead, would
+        teach the route that rejected it a bound below its own count. A count
+        whose route is not known is not learned; it is logged and counted.
         """
         from kestrel_sovereign.llm.error_handling import LLMError
 
@@ -2900,10 +2916,23 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             response = await send()
         except LLMError as error:
             if check.bound is not None:
-                from kestrel_sovereign.agent.token_counter import rejected_prompt_samples
+                from kestrel_sovereign.agent.token_counter import (
+                    count_token_bound_event,
+                    rejected_prompt_samples,
+                )
 
                 for route, counted in rejected_prompt_samples(error):
-                    self._subagent_feed(check, counted, route or check.bound.route, host)
+                    if route is None:
+                        count_token_bound_event("rejection_route_unknown")
+                        logger.warning(
+                            "[SUBAGENT %s] size rejection not learned: no route attempt "
+                            "carries its count (T=%d wire_bytes=%d bound model=%s)",
+                            self.name, counted, check.bound.wire_bytes, check.bound.model,
+                        )
+                        continue
+                    # A rejection counts the request as it was sent and names
+                    # no model.
+                    self._subagent_feed(check, counted, route, host, served_model=None)
             raise
         self._subagent_feed_response(check, response, host)
         return response
@@ -2927,7 +2956,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             if isinstance(value, int) and not isinstance(value, bool)
         )
         route = self._subagent_response_route(response) or check.bound.route
-        self._subagent_feed(check, total, route, host)
+        served = getattr(response, "model", None)
+        self._subagent_feed(
+            check, total, route, host,
+            served_model=served if isinstance(served, str) else "",
+        )
 
     @staticmethod
     def _subagent_response_route(response: Any) -> Optional[str]:
@@ -2935,13 +2968,22 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         provider = getattr(response, "provider", None)
         return provider if isinstance(provider, str) and provider else None
 
-    def _subagent_feed(self, check: _SubagentSendCheck, total: int, route: str, host: Any) -> None:
-        """Hand one sample to the ratchet."""
+    def _subagent_feed(
+        self, check: _SubagentSendCheck, total: int, route: str, host: Any, *,
+        served_model: Optional[str],
+    ) -> None:
+        """Hand one sample to the ratchet.
+
+        ``served_model`` is the model the response names (``""`` when none),
+        or ``None`` for a rejection's count; the ratchet learns a response's
+        count only for a model in the bound's family.
+        """
         from kestrel_sovereign.agent.token_counter import record_input_sample
 
         persist, privacy_epoch = self._subagent_ratchet_privacy(host)
         record_input_sample(
-            check.bound, total, route=route, persist=persist, privacy_epoch=privacy_epoch,
+            check.bound, total, route=route, served_model=served_model,
+            persist=persist, privacy_epoch=privacy_epoch,
         )
 
     async def _handle_feature_tool_calls(

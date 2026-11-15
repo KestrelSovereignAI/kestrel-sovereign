@@ -7,7 +7,9 @@ bounds the same request at ``ceil(wire_bytes / bpt_min) + overhead``, with
 both values ratcheted from the counts providers report.
 
 Each test is named for its row in the #4068 binding scope (#4067 comment
-6870146659, amended by #4068 comment 6883985733). No test makes a live call,
+6870146659), as amended by #4068 comments 6883985733 (rv-4068-1, rows 16-19)
+and 6885688316 (rv-4068-2, rows 20-26). Rows 27 and 28 are the two sends
+rv-4068-1 leaves for the subagent admission PR. No test makes a live call,
 starts a host, or runs a provider tokenizer.
 """
 
@@ -132,9 +134,123 @@ def _user(chars: int):
 
 
 def _response(total, **kwargs):
+    """A response as the service stamps it: the route and the model that served it."""
     response = LLMResponse(content="done", input_tokens=total, **kwargs)
     response.provider = "anthropic:plan"
+    response.model = CLAUDE
     return response
+
+
+# ---------------------------------------------------------------------------
+# A real LLMService over fake adapters
+# ---------------------------------------------------------------------------
+
+
+def _too_long(count: int) -> str:
+    return f"prompt is too long: {count} tokens > 1000000 maximum"
+
+
+def _anthropic_error(status: int, message: str):
+    """The Anthropic SDK's own error for one HTTP status, as an adapter raises it."""
+    import anthropic
+    import httpx
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(status, request=request, json={
+        "type": "error", "error": {"type": "invalid_request_error", "message": message}})
+    error_class = {400: anthropic.BadRequestError, 500: anthropic.InternalServerError}[status]
+    return error_class(f"Error code: {status} - {message}", response=response, body=None)
+
+
+class _Adapter:
+    """A route's adapter: records what the service gave it, then acts."""
+
+    def __init__(self):
+        self.system_prompts, self.user_prompts, self.calls = [], [], 0
+
+    def create_messages(self, user_prompt=None, system_prompt=None, **_):
+        self.system_prompts.append(system_prompt)
+        self.user_prompts.append(user_prompt)
+        return [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}]
+
+    async def get_response(self, **_):
+        self.calls += 1
+        return await self.act()
+
+
+class _Answering(_Adapter):
+    """Answers with usage reporting ``count_of()`` input tokens."""
+
+    def __init__(self, count_of):
+        super().__init__()
+        self.count_of = count_of
+
+    async def act(self):
+        return LLMResponse(content="done", input_tokens=self.count_of(), output_tokens=1,
+                           stop_reason="end_turn")
+
+
+class _Rejecting(_Adapter):
+    """Rejects every request for size, naming ``count_of()`` tokens."""
+
+    def __init__(self, count_of):
+        super().__init__()
+        self.count_of = count_of
+
+    async def act(self):
+        raise _anthropic_error(400, _too_long(self.count_of()))
+
+
+class _Failing(_Adapter):
+    """Fails every request for a reason that is not its size."""
+
+    async def act(self):
+        raise _anthropic_error(500, "Internal server error")
+
+
+def _service(*routes):
+    """A real ``LLMService`` whose routes are ``(name, adapter)``, tried in order.
+
+    Each route is an Anthropic route serving the Claude model, so the service's
+    route loop wraps each adapter's error and raises what it raises in
+    production. Discovery is skipped: the routes and the model are explicit.
+    """
+    from kestrel_sovereign.llm.service import LLMService
+
+    service = LLMService()
+    service.providers = [{
+        "name": name, "vendor": name.split(":")[0], "route": name.split(":")[1],
+        "adapter": adapter, "client": object(), "model": CLAUDE,
+        "is_cloud": True, "is_local": False,
+    } for name, adapter in routes]
+    service._ensure_models_discovered = AsyncMock(return_value=None)
+    return service
+
+
+def _capture_raises(monkeypatch, owner, name):
+    """Record every exception ``owner.<name>`` raises, and re-raise it."""
+    real = getattr(owner, name)
+    raised = []
+
+    async def wrapper(*args, **kwargs):
+        try:
+            return await real(*args, **kwargs)
+        except BaseException as error:
+            raised.append(error)
+            raise
+
+    monkeypatch.setattr(owner, name, wrapper)
+    return raised
+
+
+def _route_overhead(route, epoch=None, limit=1_000_000):
+    """``overhead[route]`` as the ratchet holds it: the file, held and volatile values."""
+    return tc._ratchet().overhead(route, int(limit * tc.OVERHEAD_CAP_FRACTION), epoch)
+
+
+def _agent_epoch(agent):
+    return tc.PrivacyEpoch(agent.did, agent._get_privacy_policy_epoch())
 
 
 # ---------------------------------------------------------------------------
@@ -273,29 +389,32 @@ async def test_row_05_the_system_prompt_is_in_the_gate_bytes_and_the_sample_byte
     feature, monkeypatch,
 ):
     calls = _spy_gate(feature, monkeypatch)
-    sent = {}
-
-    class Service:
-        async def generate(self, **kwargs):
-            sent.update(kwargs)
-            bound = calls[0].check.bound
-            # Below the sample floor and above the bound: it lands as overhead,
-            # stored with its sample.
-            return _response(bound.tokens + 300)
-
-    feature.agent.llm_service = Service()
-    result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(
-        task="read one record", model_override=PLAN,
-    ))
+    # Below the sample floor and above the bound: it lands as overhead, stored
+    # with its sample.
+    adapter = _Answering(lambda: calls[0].check.bound.tokens + 300)
+    service = _service(("anthropic:plan", adapter))
+    feature.agent.llm_service = service
+    try:
+        result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(
+            task="read one record", model_override=PLAN,
+        ))
+    finally:
+        await service.close()
     assert result["success"] is True, result
+    assert adapter.system_prompts, "the request never reached the route"
     gated = calls[0]
-    assert gated.kwargs["system"] == sent["system_prompt"]
+    assert gated.kwargs["system"] == adapter.system_prompts[0]
     bound = gated.check.bound
-    assert bound.wire_bytes >= _wire(sent["system_prompt"]) + _wire(
-        [{"role": "user", "content": sent["user_prompt"]}]
+    assert bound.wire_bytes >= _wire(adapter.system_prompts[0]) + _wire(
+        [{"role": "user", "content": adapter.user_prompts[0]}]
     )
-    sample = _cache()["overhead"]["anthropic:plan"]["sample"]
-    assert sample["wire_bytes"] == bound.wire_bytes
+    epoch = tc.PrivacyEpoch(feature.agent.did, feature.agent._get_privacy_policy_epoch())
+    assert _bound(
+        PLAN, gated.args[0], system=gated.kwargs["system"], privacy_epoch=epoch,
+    ).overhead == 300, "the sample was not fed"
+    cache = _cache()
+    if cache is not None:
+        assert cache["overhead"]["anthropic:plan"]["sample"]["wire_bytes"] == bound.wire_bytes
 
 
 @pytest.mark.asyncio
@@ -648,7 +767,8 @@ def test_row_19_the_gpt5_behaviour_contract_is_counted():
 
 
 # ---------------------------------------------------------------------------
-# Rows 20-21: sends left unmeasured for the subagent admission PR
+# Rows 27-28: sends left unmeasured for the subagent admission PR (rv-4068-1;
+# numbered after rv-4068-2's rows 20-26)
 # ---------------------------------------------------------------------------
 
 
@@ -658,7 +778,7 @@ def test_row_19_the_gpt5_behaviour_contract_is_counted():
            "sent inside the app-server, where no gate runs",
 )
 @pytest.mark.asyncio
-async def test_row_20_every_codex_inline_continuation_is_measured(feature, monkeypatch):
+async def test_row_27_every_codex_inline_continuation_is_measured(feature, monkeypatch):
     calls = _spy_gate(feature, monkeypatch)
     route_sends = []
 
@@ -686,7 +806,7 @@ async def test_row_20_every_codex_inline_continuation_is_measured(feature, monke
            "rendered and its model chosen inside LLMService.decide",
 )
 @pytest.mark.asyncio
-async def test_row_21_the_continuation_decision_request_is_measured(feature, monkeypatch):
+async def test_row_28_the_continuation_decision_request_is_measured(feature, monkeypatch):
     from kestrel_sovereign.turn_completion import CONTINUATION_QUESTION
 
     monkeypatch.setenv("KESTREL_CONTINUATION_CHECK", "decision")
@@ -727,18 +847,49 @@ def test_the_count_inside_a_prompt_is_too_long_rejection_is_read_through_its_cau
 
 @pytest.mark.asyncio
 async def test_a_prompt_is_too_long_rejection_feeds_and_propagates(gate):
+    """A route walk's error is raised from the route attempt's, which names its route."""
+    from kestrel_sovereign.llm.error_handling import stamp_attempt_route
     from kestrel_sovereign.llm.service import LLMServiceError
 
     messages = _user(400_000)
     check = gate._subagent_context_overflow(messages, PLAN, None, system=None)
     total = check.bound.tokens + 60_000
+    attempt = _anthropic_error(400, _too_long(total))
+    stamp_attempt_route(attempt, "anthropic:plan")
+    walk = LLMServiceError("All providers failed for generate_with_messages")
+    walk.__cause__ = attempt
 
     async def send():
-        raise LLMServiceError(f"Request rejected: prompt is too long: {total} tokens > 1000000 maximum")
+        raise walk
 
-    with pytest.raises(LLMServiceError):
+    with pytest.raises(LLMServiceError) as info:
         await gate._subagent_measured_send(check, send, _dispatch_host=HOST)
+    assert info.value is walk
     assert _bound(PLAN, messages).tokens >= total
+    assert tc.rejected_prompt_samples(walk) == [("anthropic:plan", total)]
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_no_route_attempt_carries_is_not_learned_and_is_counted(gate, caplog):
+    """Which route counted it is not known, so it is not learned under the bound's route."""
+    from kestrel_sovereign.llm.service import LLMServiceError
+
+    messages = _user(400_000)
+    check = gate._subagent_context_overflow(messages, PLAN, None, system=None)
+    total = check.bound.tokens + 60_000
+    rejected = LLMServiceError(f"Request rejected: {_too_long(total)}")
+
+    async def send():
+        raise rejected
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(LLMServiceError) as info:
+            await gate._subagent_measured_send(check, send, _dispatch_host=HOST)
+    assert info.value is rejected
+    assert _cache() is None, "a rejection was learned under a route that may not have counted it"
+    assert _bound(PLAN, messages).tokens == check.bound.tokens
+    assert tc.token_bound_event_counts()["rejection_route_unknown"] == 1
+    assert any("size rejection not learned" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -782,109 +933,413 @@ def test_a_tiktoken_family_is_bounded_by_its_tiktoken_count_plus_overhead():
         messages, ensure_ascii=True, separators=(",", ":"))))
 
 
+
+
 # ---------------------------------------------------------------------------
-# Review findings: rejections on the first send, co-hosted agents, and
-# concurrent writers of the ratchet file
+# Rows 20-26 (rv-4068-2): which sends feed the ratchet, and the sample store
 # ---------------------------------------------------------------------------
-
-
-def _too_long(count: int) -> str:
-    return f"prompt is too long: {count} tokens > 1000000 maximum"
-
-
-def _rejecting_service(count_of):
-    """A real ``LLMService`` whose one route, ``anthropic:plan``, rejects every request.
-
-    Its adapter raises the Anthropic SDK's own 400 naming ``count_of()``
-    tokens, so the service's route loop wraps it and raises what it raises in
-    production. Discovery is skipped: the route and the model are explicit.
-    """
-    import anthropic
-    import httpx
-
-    from kestrel_sovereign.llm.service import LLMService
-
-    class Rejecting:
-        def create_messages(self, user_prompt=None, system_prompt=None, **_):
-            return [{"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}]
-
-        async def get_response(self, **_):
-            message = _too_long(count_of())
-            request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-            response = httpx.Response(400, request=request, json={
-                "type": "error", "error": {"type": "invalid_request_error", "message": message}})
-            raise anthropic.BadRequestError(
-                f"Error code: 400 - {message}", response=response, body=None)
-
-    service = LLMService()
-    service.providers = [{
-        "name": "anthropic:plan", "vendor": "anthropic", "route": "plan",
-        "adapter": Rejecting(), "client": object(), "model": CLAUDE,
-        "is_cloud": True, "is_local": False,
-    }]
-    service._ensure_models_discovered = AsyncMock(return_value=None)
-    return service
 
 
 @pytest.mark.asyncio
-async def test_a_first_request_every_route_rejects_feeds_its_count_through_the_service(
+async def test_row_20_a_first_send_every_route_fails_feeds_its_size_rejection_under_its_route(
     feature, monkeypatch,
 ):
-    """The first ``generate`` raises ``LLMAllProvidersFailedError``, not an ``LLMServiceError``."""
+    """Every route fails, one for size: ``generate`` raises ``LLMAllProvidersFailedError``.
+
+    That is an ``LLMError`` but not an ``LLMServiceError``. Its size rejection
+    is learned under the route that counted it, and the service's own error
+    leaves the gated send unchanged.
+    """
     from kestrel_sovereign.llm.error_handling import LLMAllProvidersFailedError
 
     calls = _spy_gate(feature, monkeypatch)
-    service = _rejecting_service(lambda: calls[-1].check.bound.tokens + 500)
-    raised = []
-    real_generate = service.generate
-
-    async def generate(**kwargs):
-        try:
-            return await real_generate(**kwargs)
-        except BaseException as error:
-            raised.append(error)
-            raise
-
-    service.generate = generate
+    failing = _Failing()
+    rejecting = _Rejecting(lambda: calls[-1].check.bound.tokens + 500)
+    service = _service(("anthropic:api", failing), ("anthropic:plan", rejecting))
+    from_service = _capture_raises(monkeypatch, service, "generate")
+    from_send = _capture_raises(monkeypatch, feature, "_subagent_measured_send")
     feature.agent.llm_service = service
     try:
         result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(
-            task="Task: read one record.", model_override=PLAN,
+            task="Task: read one record.", model_override=CLAUDE,
         ))
     finally:
         await service.close()
 
-    assert len(raised) == 1 and isinstance(raised[0], LLMAllProvidersFailedError), raised
+    if not (failing.calls and rejecting.calls):
+        raise RuntimeError(f"precondition: both routes must be tried ({failing.calls}, "
+                           f"{rejecting.calls})")
     assert result["success"] is False
-    first = calls[0]
-    epoch = tc.PrivacyEpoch(feature.agent.did, feature.agent._get_privacy_policy_epoch())
-    after = _bound(PLAN, first.args[0], system=first.kwargs["system"], tools=first.args[2],
-                   privacy_epoch=epoch)
-    assert after.overhead == 500, "the route's rejection count was not fed"
+    assert len(from_service) == 1 and isinstance(from_service[0], LLMAllProvidersFailedError)
+    assert len(from_send) == 1 and from_send[0] is from_service[0], "the error was replaced"
+    epoch = _agent_epoch(feature.agent)
+    assert _route_overhead("anthropic:plan", epoch) == 500, "the size rejection was not learned"
+    assert _route_overhead("anthropic:api", epoch) == 0
 
 
 @pytest.mark.asyncio
-async def test_a_rejection_every_route_raised_propagates_unchanged(gate):
-    service = _rejecting_service(lambda: 1_158_906)
-    messages = [{"role": "user", "content": "Task: read one record."}]
-    check = gate._subagent_context_overflow(messages, PLAN, None, system="sp")
-    raised = []
+async def test_row_20_a_continuation_size_rejection_is_learned_under_the_route_that_rejected_it(
+    feature, monkeypatch,
+):
+    """The previous response came from one route; the continuation fails on another.
 
-    async def send():
-        try:
-            return await service.generate(system_prompt="sp", user_prompt=messages[0]["content"],
-                                          model_override=PLAN)
-        except BaseException as error:
-            raised.append(error)
-            raise
+    The gate bounded the continuation with the answering route's learned
+    overhead. ``generate_with_messages`` tries that route, which fails, then
+    another, which rejects the request for size. The count is learned under
+    the route that rejected it, with that route's own overhead, and the
+    service's error leaves the gated send unchanged.
+    """
+    from kestrel_sovereign.llm.service import LLMServiceError
 
+    api_overhead = 15_000
+    seed = _bound(CLAUDE, _user(20_000))
+    tc.record_input_sample(seed, seed.tokens + api_overhead, route="anthropic:api",
+                           served_model=CLAUDE, persist=True, privacy_epoch=None)
+    assert _route_overhead("anthropic:api") == api_overhead
+    assert _route_overhead("anthropic:plan") == 0
+
+    calls = _spy_gate(feature, monkeypatch)
+    failing = _Failing()
+    # Above the floor and above the bound: the count moves bpt_min.
+    rejecting = _Rejecting(lambda: calls[-1].check.bound.tokens + 50_000)
+    service = _service(("anthropic:api", failing), ("anthropic:plan", rejecting))
+    from_service = _capture_raises(monkeypatch, service, "generate_with_messages")
+    from_send = _capture_raises(monkeypatch, feature, "_subagent_measured_send")
+    feature.agent.llm_service = service
+
+    async def small(*, tool_name, args, tools_by_name, **kwargs):
+        return {"payload": "ok"}
+
+    feature._execute_subagent_tool = small
+    first = _Resp(tool_calls=[_Call("small_tool")], model=CLAUDE)
+    first.provider = "anthropic:api"
     try:
-        with pytest.raises(Exception) as info:
-            await gate._subagent_measured_send(check, send, _dispatch_host=HOST)
+        with pytest.raises(LLMServiceError):
+            await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
+                first, tools=SCHEMA, system_prompt="sp",
+                user_prompt="Task: " + "x" * _BPT_SAMPLE_BYTES, max_iterations=3,
+                model_override=CLAUDE, runtime_tools=[_small_tool()],
+            ))
     finally:
         await service.close()
-    assert info.value is raised[0]
+
+    if not (failing.calls and rejecting.calls):
+        raise RuntimeError(f"precondition: both routes must be tried ({failing.calls}, "
+                           f"{rejecting.calls})")
+    sent = calls[-1]
+    if not (sent.kwargs["route"] == "anthropic:api"
+            and sent.check.bound.overhead == api_overhead):
+        raise RuntimeError("precondition: the continuation must be bounded with the previous "
+                           f"response's route and overhead: {sent.kwargs['route']!r}, "
+                           f"{sent.check.bound.overhead}")
+    assert len(from_service) == 1 and len(from_send) == 1
+    assert from_send[0] is from_service[0], "the error was replaced"
+    counted = sent.check.bound.tokens + 50_000
+    epoch = _agent_epoch(feature.agent)
+    after = _bound(CLAUDE, sent.args[0], tools=sent.args[2], route="anthropic:plan",
+                   privacy_epoch=epoch)
+    assert after.tokens >= counted, (
+        f"the route that rejected {counted:,} tokens is now bounded at {after.tokens:,}"
+    )
+    assert _route_overhead("anthropic:api", epoch) == api_overhead
+
+
+def _agent_host(did: str, epoch: str, *, persist: bool):
+    return SimpleNamespace(
+        did=did,
+        storage=SimpleNamespace(allows_persistent_writes=lambda: persist),
+        _get_privacy_policy_epoch=lambda: epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_row_21_another_agents_sends_neither_drop_nor_apply_a_held_sample(gate):
+    """Co-hosted agents share the ratchet; each one's volatile samples stay its own."""
+    agent_a = _agent_host("did:test:agent-a", "ephemeral:a:1", persist=False)
+    agent_b = _agent_host("did:test:agent-b", "isolated:b:1", persist=False)
+    agent_c = _agent_host("did:test:agent-c", "normal:c:0", persist=True)
+    messages = _user(20_000)
+
+    def gate_for(host):
+        return gate._subagent_gate_send(
+            messages, PLAN, None, system=None, route=None, _dispatch_host=host,
+        )
+
+    async def learn(host, extra):
+        check = gate_for(host)
+
+        async def send():
+            return _response(check.bound.tokens + extra)
+
+        await gate._subagent_measured_send(check, send, _dispatch_host=host)
+
+    await learn(agent_a, 500)
+    assert gate_for(agent_c).bound.overhead == 0, "agent C applied agent A's held sample"
+    assert gate_for(agent_b).bound.overhead == 0, "agent B applied agent A's held sample"
+    await learn(agent_b, 300)
+    assert gate_for(agent_a).bound.overhead == 500, "another agent's send dropped A's sample"
+    assert gate_for(agent_b).bound.overhead == 300
+
+    # A's transition drops A's samples and nobody else's.
+    agent_a._get_privacy_policy_epoch = lambda: "normal:a:2"
+    assert gate_for(agent_a).bound.overhead == 0
+    assert gate_for(agent_b).bound.overhead == 300
+    cache = _cache()
+    assert cache is None or "anthropic:plan" not in cache.get("overhead", {})
+
+
+_BPT_SAMPLE_BYTES = 400_000
+
+
+def _sample_total(section: str, bound, value):
+    """The total input count that makes a ratchet learn ``value`` for ``bound``."""
+    if section == "bpt_min":
+        return round(bound.wire_bytes / value)
+    return bound.tokens + value
+
+
+def _feed(bound, total):
+    tc.record_input_sample(bound, total, served_model=CLAUDE, persist=True, privacy_epoch=None)
+
+
+@pytest.mark.parametrize("section, key, theirs, mine", [
+    ("bpt_min", "claude", 1.5, 1.8),
+    ("overhead", "anthropic:plan", 900, 500),
+])
+def test_row_22_a_stale_writer_keeps_the_stricter_value_and_its_sample_in_the_file(
+    monkeypatch, section, key, theirs, mine,
+):
+    """Two ratchets on one file: B commits a stricter value between A's read and A's write."""
+    messages = _user(_BPT_SAMPLE_BYTES if section == "bpt_min" else 20_000)
+    bound = _bound(PLAN, messages)
+    their_total = _sample_total(section, bound, theirs)
+    real_sample_record = tc._sample_record
+    raced = []
+
+    def other_process_commits_first(*args):
+        if not raced:
+            raced.append(True)
+            # Ratchet B: another process, its own memory, the same file.
+            ratchet_a = dict(tc._ratchets)
+            tc._ratchets.clear()
+            _feed(bound, their_total)
+            tc._ratchets.clear()
+            tc._ratchets.update(ratchet_a)
+        return real_sample_record(*args)
+
+    monkeypatch.setattr(tc, "_sample_record", other_process_commits_first)
+    # Ratchet A learned its looser value from the file as it was before B wrote.
+    _feed(bound, _sample_total(section, bound, mine))
+    assert raced, "the other writer never ran inside this one's write"
+    entry = _cache()[section][key]
+    assert entry["value"] == pytest.approx(theirs), "a looser value replaced a stricter one"
+    assert entry["sample"]["total_input"] == their_total, "the value lost its own sample"
+    _restart()
+    after = _bound(PLAN, messages)
+    if section == "bpt_min":
+        assert after.bytes_per_token == pytest.approx(theirs)
+    else:
+        assert after.overhead == theirs
+
+
+@pytest.mark.asyncio
+async def test_row_23_a_text_only_first_send_feeds_through_the_real_service(
+    feature, monkeypatch,
+):
+    """With no tools, ``generate`` returns a bare string unless asked for the response."""
+    calls = _spy_gate(feature, monkeypatch)
+    adapter = _Answering(lambda: calls[0].check.bound.tokens + 300)
+    service = _service(("anthropic:plan", adapter))
+    feature.agent.llm_service = service
+    try:
+        result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(
+            task="read one record", model_override=PLAN,
+        ))
+    finally:
+        await service.close()
+    first = calls[0]
+    assert first.args[2] is None, "the first send must be text-only, or this proves nothing"
+    assert adapter.calls == 1
+    # The call site still returns the text, as before #4068.
+    assert result == {"success": True, "result": "done"}
+    assert _bound(
+        PLAN, first.args[0], system=first.kwargs["system"],
+        privacy_epoch=_agent_epoch(feature.agent),
+    ).overhead == 300, "the text-only send's input count was not learned"
+
+
+@pytest.mark.asyncio
+async def test_a_text_only_first_send_still_hands_the_loop_its_text(feature):
+    """Asking for the response changes what is fed, not what the loop receives.
+
+    Before #4068 a text-only ``generate`` returned the text, so a tool call
+    nobody offered was dropped with the rest of the response.
+    """
+    from kestrel_sdk.llm.response import ToolCall
+
+    class Unoffered(_Answering):
+        async def act(self):
+            response = await super().act()
+            response.tool_calls = [ToolCall(id="c1", name="fs_read", arguments={})]
+            return response
+
+    adapter = Unoffered(lambda: 10)
+    service = _service(("anthropic:plan", adapter))
+    feature.agent.llm_service = service
+    try:
+        result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(
+            task="read one record", model_override=PLAN,
+        ))
+    finally:
+        await service.close()
+    assert result == {"success": True, "result": "done"}
+    assert adapter.calls == 1, "the loop ran a tool call the request never offered"
+
+
+@pytest.mark.xfail(
+    strict=True, raises=AssertionError,
+    reason="#4101: LLMService does not report a route attempt's size rejection "
+           "when another route answers",
+)
+@pytest.mark.asyncio
+async def test_row_24_a_size_rejection_another_route_absorbed_is_learned(feature, monkeypatch):
+    calls = _spy_gate(feature, monkeypatch)
+    rejecting = _Rejecting(lambda: calls[-1].check.bound.tokens + 500)
+    # The answer reports less than the bound, so it teaches nothing itself.
+    answering = _Answering(lambda: calls[-1].check.bound.tokens - 100)
+    service = _service(("anthropic:api", rejecting), ("anthropic:plan", answering))
+    feature.agent.llm_service = service
+    try:
+        result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(
+            task="read one record", model_override=CLAUDE,
+        ))
+    finally:
+        await service.close()
+    if not (rejecting.calls and answering.calls and result.get("success") is True):
+        raise RuntimeError(f"precondition: the second route must answer: {result!r}")
+    assert _route_overhead("anthropic:api", _agent_epoch(feature.agent)) == 500
+
+
+class _PublishingFails:
+    """While active, every attempt to replace the ratchet file fails."""
+
+    def __init__(self, monkeypatch):
+        self.monkeypatch = monkeypatch
+
+    def __enter__(self):
+        def refuse(self, bpt, overhead):
+            raise OSError(28, "No space left on device")
+
+        self.context = self.monkeypatch.context()
+        self.context.__enter__().setattr(tc._TokenBoundRatchet, "_replace_file", refuse)
+
+    def __exit__(self, *exc):
+        return self.context.__exit__(*exc)
+
+
+def test_row_25_a_published_value_retires_the_one_held_after_a_failed_publish(monkeypatch):
+    messages = _user(20_000)
+    bound = _bound(PLAN, messages)
+    path = tc.token_bound_cache_file()
+
+    def overhead():
+        return _bound(PLAN, messages).overhead
+
+    # A publish of 500 fails, one of 800 succeeds, the file is deleted.
+    with _PublishingFails(monkeypatch):
+        _feed(bound, bound.tokens + 500)
+    assert overhead() == 500, "a value that could not be published must still apply here"
+    _feed(bound, bound.tokens + 800)
+    assert _cache()["overhead"]["anthropic:plan"]["value"] == 800
+    path.unlink()
+    assert overhead() == 0, "the held 500 outlived the file that holds 800"
+
+    # The same, deleting only the entry.
+    _restart()
+    with _PublishingFails(monkeypatch):
+        _feed(bound, bound.tokens + 500)
+    _feed(bound, bound.tokens + 800)
+    data = _cache()
+    del data["overhead"]["anthropic:plan"]
+    path.write_text(json.dumps(data))
+    assert overhead() == 0, "the held 500 outlived the entry that held 800"
+
+    # A failed 800, then a successful publish of 500: the file gets 800 and its
+    # own sample. ``record`` never publishes a value looser than one it holds,
+    # because the held value applies to the bound it compares with, so this
+    # drives the publish rule directly.
+    _restart()
+    path.unlink()
+    with _PublishingFails(monkeypatch):
+        _feed(bound, bound.tokens + 800)
+    tc._ratchet()._publish("overhead", "anthropic:plan", {
+        "value": 500,
+        "sample": tc._sample_record(PLAN, "anthropic:plan", bound.wire_bytes, bound.tokens + 500),
+    })
+    entry = _cache()["overhead"]["anthropic:plan"]
+    assert entry["value"] == 800
+    assert entry["sample"]["total_input"] == bound.tokens + 800, "800 lost its own sample"
+    path.unlink()
+    assert overhead() == 0
+
+
+@pytest.mark.asyncio
+async def test_row_26_a_response_from_another_family_learns_nothing_and_is_counted(gate, caplog):
+    messages = _user(400_000)
+    check = gate._subagent_context_overflow(messages, PLAN, None, system=None)
+
+    async def send():
+        # Above the floor and the bound: from the right family it would move
+        # bpt_min.
+        response = _response(check.bound.tokens + 50_000)
+        response.model = "gpt-4o"
+        return response
+
+    with caplog.at_level(logging.WARNING, logger=tc.logger.name):
+        await gate._subagent_measured_send(check, send, _dispatch_host=HOST)
+    assert _cache() is None, "a response from another family was learned"
+    assert _bound(PLAN, messages).tokens == check.bound.tokens
+    assert tc.token_bound_event_counts()["sample_family_mismatch"] == 1
+    assert any(
+        "not learned" in record.getMessage() and "gpt-4o" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# Supporting the sample store
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_response_that_names_no_model_is_not_learned(gate):
+    messages = _user(20_000)
+    check = gate._subagent_context_overflow(messages, PLAN, None, system=None)
+
+    async def send():
+        response = _response(check.bound.tokens + 500)
+        response.model = None
+        return response
+
+    await gate._subagent_measured_send(check, send, _dispatch_host=HOST)
+    assert _cache() is None
+    assert tc.token_bound_event_counts()["sample_family_mismatch"] == 1
+
+
+def test_a_volatile_sample_without_an_owner_epoch_is_not_learned_and_is_counted(caplog):
+    bound = _bound(PLAN, _user(20_000))
+    with caplog.at_level(logging.WARNING, logger=tc.logger.name):
+        tc.record_input_sample(bound, bound.tokens + 500, served_model=CLAUDE,
+                               persist=False, privacy_epoch=None)
+    assert _cache() is None
+    assert _bound(PLAN, _user(20_000)).overhead == 0
+    assert tc.token_bound_event_counts()["volatile_sample_dropped"] == 1
+    assert any("not held" in record.getMessage() for record in caplog.records)
+
+
+def test_a_held_sample_needs_a_privacy_epoch_object():
+    with pytest.raises(TypeError, match="PrivacyEpoch"):
+        tc.get_token_counter(PLAN).upper_bound(None, _user(10), None, privacy_epoch="ephemeral:a:1")
 
 
 def _wrapped_route_error(text: str):
@@ -927,109 +1382,10 @@ async def test_an_aggregate_rejection_is_fed_under_the_route_that_counted_it(gat
     assert tc.rejected_prompt_samples(aggregate) == [("anthropic:plan", total)]
 
 
-def _agent_host(did: str, epoch: str, *, persist: bool):
-    return SimpleNamespace(
-        did=did,
-        storage=SimpleNamespace(allows_persistent_writes=lambda: persist),
-        _get_privacy_policy_epoch=lambda: epoch,
-    )
-
-
-@pytest.mark.asyncio
-async def test_another_agents_measurement_neither_drops_nor_applies_a_held_sample(gate):
-    """Co-hosted agents share the ratchet; each one's volatile samples stay its own."""
-    agent_a = _agent_host("did:test:agent-a", "ephemeral:a:1", persist=False)
-    agent_b = _agent_host("did:test:agent-b", "isolated:b:1", persist=False)
-    agent_c = _agent_host("did:test:agent-c", "normal:c:0", persist=True)
-    messages = _user(20_000)
-
-    def gate_for(host):
-        return gate._subagent_gate_send(
-            messages, PLAN, None, system=None, route=None, _dispatch_host=host,
-        )
-
-    async def learn(host, extra):
-        check = gate_for(host)
-
-        async def send():
-            return _response(check.bound.tokens + extra)
-
-        await gate._subagent_measured_send(check, send, _dispatch_host=host)
-
-    await learn(agent_a, 500)
-    assert gate_for(agent_c).bound.overhead == 0, "agent C applied agent A's held sample"
-    assert gate_for(agent_b).bound.overhead == 0, "agent B applied agent A's held sample"
-    await learn(agent_b, 300)
-    assert gate_for(agent_a).bound.overhead == 500, "another agent's measurement dropped A's sample"
-    assert gate_for(agent_b).bound.overhead == 300
-
-    # A's transition drops A's samples and nobody else's.
-    agent_a._get_privacy_policy_epoch = lambda: "normal:a:2"
-    assert gate_for(agent_a).bound.overhead == 0
-    assert gate_for(agent_b).bound.overhead == 300
-    cache = _cache()
-    assert cache is None or "anthropic:plan" not in cache.get("overhead", {})
-
-
-def test_a_held_sample_needs_a_privacy_epoch_object():
-    with pytest.raises(TypeError, match="PrivacyEpoch"):
-        tc.get_token_counter(PLAN).upper_bound(None, _user(10), None, privacy_epoch="ephemeral:a:1")
-
-
-_BPT_SAMPLE_BYTES = 400_000
-
-
-def _sample_total(section: str, bound, value):
-    """The total input count that makes a ratchet learn ``value`` for ``bound``."""
-    if section == "bpt_min":
-        return round(bound.wire_bytes / value)
-    return bound.tokens + value
-
-
-@pytest.mark.parametrize("section, key, theirs, mine", [
-    ("bpt_min", "claude", 1.5, 1.8),
-    ("overhead", "anthropic:plan", 900, 500),
-])
-def test_a_writer_keeps_the_stricter_value_another_process_published_after_it_read(
-    monkeypatch, section, key, theirs, mine,
-):
-    """Another host commits a stricter value between this one's read and its write."""
-    messages = _user(_BPT_SAMPLE_BYTES if section == "bpt_min" else 20_000)
-    bound = _bound(PLAN, messages)
-    their_total = _sample_total(section, bound, theirs)
-    real_sample_record = tc._sample_record
-    raced = []
-
-    def other_process_commits_first(*args):
-        if not raced:
-            raced.append(True)
-            # A second host: its own ratchet, reading and writing the same file.
-            mine_in_memory = dict(tc._ratchets)
-            tc._ratchets.clear()
-            tc.record_input_sample(bound, their_total, persist=True, privacy_epoch=None)
-            tc._ratchets.clear()
-            tc._ratchets.update(mine_in_memory)
-        return real_sample_record(*args)
-
-    monkeypatch.setattr(tc, "_sample_record", other_process_commits_first)
-    tc.record_input_sample(
-        bound, _sample_total(section, bound, mine), persist=True, privacy_epoch=None,
-    )
-    assert raced, "the other writer never ran inside this one's write"
-    entry = _cache()[section][key]
-    assert entry["value"] == pytest.approx(theirs), "a weaker value replaced a stricter one"
-    assert entry["sample"]["total_input"] == their_total, "the value lost its own sample"
-    _restart()
-    after = _bound(PLAN, messages)
-    if section == "bpt_min":
-        assert after.bytes_per_token == pytest.approx(theirs)
-    else:
-        assert after.overhead == theirs
-
-
-def test_a_writer_never_replaces_the_file_while_another_holds_its_lock(monkeypatch, caplog):
+def test_a_writer_waits_at_most_its_cap_then_holds_its_value_and_counts_it(monkeypatch, caplog):
     from kestrel_sovereign.private_storage import lock_file_descriptor, unlock_file_descriptor
 
+    assert tc.TOKEN_BOUND_LOCK_TIMEOUT_SECONDS <= 0.25, "the wait blocks the event loop"
     monkeypatch.setattr(tc, "TOKEN_BOUND_LOCK_TIMEOUT_SECONDS", 0.05)
     path = tc.token_bound_cache_file()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1040,12 +1396,29 @@ def test_a_writer_never_replaces_the_file_while_another_holds_its_lock(monkeypat
     token = lock_file_descriptor(holder)
     try:
         with caplog.at_level(logging.WARNING, logger=tc.logger.name):
-            tc.record_input_sample(bound, bound.tokens + 500, persist=True, privacy_epoch=None)
+            _feed(bound, bound.tokens + 500)
         assert not path.exists(), "the file was replaced while another writer held its lock"
         assert any("Could not persist" in record.getMessage() for record in caplog.records)
+        assert tc.token_bound_event_counts()["ratchet_publish_failed"] == 1
         assert _bound(PLAN, messages).overhead == 500, "the value does not apply in this process"
     finally:
         unlock_file_descriptor(holder, token)
         os.close(holder)
-    tc.record_input_sample(bound, bound.tokens + 800, persist=True, privacy_epoch=None)
+    _feed(bound, bound.tokens + 800)
     assert _cache()["overhead"]["anthropic:plan"]["value"] == 800
+
+
+def test_each_load_names_a_held_value_the_file_does_not_cover(monkeypatch, caplog):
+    bound = _bound(PLAN, _user(20_000))
+    with _PublishingFails(monkeypatch):
+        _feed(bound, bound.tokens + 500)
+    path = tc.token_bound_cache_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"overhead": {"other:route": {"value": 10}}}))
+    with caplog.at_level(logging.WARNING, logger=tc.logger.name):
+        assert _bound(PLAN, _user(20_000)).overhead == 500
+    assert any(
+        "could not publish" in record.getMessage()
+        and "overhead[anthropic:plan]=500" in record.getMessage()
+        for record in caplog.records
+    )
