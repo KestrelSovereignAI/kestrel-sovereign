@@ -25,17 +25,16 @@ from kestrel_sovereign._async_ownership import (
     pending_owned_retirement_error,
     wait_owned_tasks_until,
 )
-from kestrel_sovereign.execution_custody import execution_observation_error
+from kestrel_sovereign.execution_custody import (
+    execution_observation_error,
+    retain_native_execution_stream_close,
+)
 
 
 @dataclass(frozen=True)
 class _ResponseStart:
     status: int
     headers: tuple[tuple[bytes, bytes], ...]
-
-
-class _DemandClosed(Exception):
-    """Private false-emission result, never a protocol or retirement receipt."""
 
 
 def _deadline(request: httpx.Request, key: str) -> float:
@@ -87,8 +86,22 @@ class _Exchange:
             return {"type": "http.request", "body": chunk, "more_body": True}
 
         async def produce(emit):
+            async def publish(frame: _ResponseStart | bytes) -> bool:
+                if await emit(frame):
+                    return True
+                self.disconnected.set()
+                return False
+
             async def send(message: Message) -> None:
                 nonlocal response_started
+                if self.disconnected.is_set():
+                    # ASGI 2.0 withdrawal is a receive-side disconnect, not an
+                    # exception injected through opaque middleware/finalizers.
+                    # Do not admit any later frames. Yield even if an application
+                    # ignores disconnect and keeps sending: close still has its
+                    # finite budget and retains that original as private debt.
+                    await asyncio.sleep(0)
+                    return
                 self.transport.require_binding(self.scope)
                 if message["type"] == "http.response.start":
                     if response_started or self.response_finished:
@@ -100,8 +113,7 @@ class _Exchange:
                     if any(not isinstance(k, bytes) or not isinstance(v, bytes) for k, v in headers):
                         raise TypeError("Native ASGI response headers must be byte pairs")
                     response_started = True
-                    if not await emit(_ResponseStart(status, headers)):
-                        raise _DemandClosed()
+                    await publish(_ResponseStart(status, headers))
                     return
                 if message["type"] != "http.response.body":
                     raise ValueError("Unsupported native ASGI response message")
@@ -114,25 +126,18 @@ class _Exchange:
                     for offset in range(0, len(data), self.transport.buffer_bytes):
                         # Canonical SourceHandoff admits only one unacknowledged
                         # frame. The next pull ACKs it; no response body list.
-                        if not await emit(data[offset:offset + self.transport.buffer_bytes]):
-                            raise _DemandClosed()
+                        if not await publish(data[offset:offset + self.transport.buffer_bytes]):
+                            return
                 if not message.get("more_body", False):
                     self.response_finished = True
                     self.disconnected.set()
 
-            try:
-                # Routers mutate their per-dispatch scope (e.g. Mount rewrites
-                # root_path). Revalidate the retained ingress route, not that
-                # mutable child scope, on each outward frame/read.
-                await self.transport.application(dict(self.scope), receive, send)
-            except _DemandClosed as closed:
-                if not self.disconnected.is_set():
-                    raise
-                if closed.__context__ is not None:
-                    raise closed.__context__
-            else:
-                if (not response_started or not self.response_finished) and not self.disconnected.is_set():
-                    raise RuntimeError("Native ASGI application returned an incomplete response")
+            # Routers mutate their per-dispatch scope (e.g. Mount rewrites
+            # root_path). Revalidate the retained ingress route, not that
+            # mutable child scope, on each outward frame/read.
+            await self.transport.application(dict(self.scope), receive, send)
+            if (not response_started or not self.response_finished) and not self.disconnected.is_set():
+                raise RuntimeError("Native ASGI application returned an incomplete response")
 
         return CallbackSource(produce)
 
@@ -243,7 +248,12 @@ class _NativeInProcessHTTPTransport(httpx.AsyncBaseTransport):
             start = await exchange.next()
             if not isinstance(start, _ResponseStart):
                 raise RuntimeError("Native ASGI response body preceded its headers")
-            return httpx.Response(start.status, headers=start.headers, stream=_ResponseBody(exchange))
+            response = httpx.Response(start.status, headers=start.headers, stream=_ResponseBody(exchange))
+            # HTTPX closes inside its read-error handler, after marking the
+            # response closed. The existing canonical owner retains that exact
+            # original failure alongside bounded source-retirement evidence.
+            retain_native_execution_stream_close(response)
+            return response
         except BaseException as original:
             if exchange.source is None:
                 self.exchanges.discard(exchange)
@@ -252,6 +262,14 @@ class _NativeInProcessHTTPTransport(httpx.AsyncBaseTransport):
             except BaseException as retirement:
                 raise execution_observation_error(original, retirement)
             raise
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        try:
+            await self.aclose()
+        except BaseException as cleanup:
+            # AsyncClient delegates its context exit to this transport. Its
+            # original read/cancellation must survive a later pool close too.
+            raise execution_observation_error(exc_value, cleanup)
 
     async def aclose(self) -> None:
         self.closed = True

@@ -138,6 +138,8 @@ async def test_close_after_headers_joins_same_original_source_without_payload_ad
     async def app(scope, receive, send):
         try:
             await send({"type": "http.response.start", "status": 200})
+            if (await receive())["type"] == "http.disconnect":
+                return
             advanced.set()
             await send({"type": "http.response.body", "body": b"not admitted"})
         finally:
@@ -254,6 +256,164 @@ async def test_error_middleware_does_not_turn_original_control_into_success(phas
                     await response.aread()
     assert any(error is original for error in _explicit_control_chain(failure.value))
     assert not transport.exchanges
+
+
+@pytest.mark.parametrize("after_body", [False, True])
+async def test_base_middleware_early_close_is_not_a_private_source_error(after_body):
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    finished = asyncio.Event()
+
+    async def app(scope, receive, send):
+        try:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"initial", "more_body": True})
+            await disconnected(receive)
+        finally:
+            finished.set()
+
+    async def dispatch(request, call_next):
+        return await call_next(request)
+
+    transport = transport_for(BaseHTTPMiddleware(app, dispatch=dispatch))
+    async with httpx.AsyncClient(transport=transport) as client:
+        async with client.stream("GET", "https://native.test/native") as response:
+            if after_body:
+                assert await anext(response.aiter_raw()) == b"initial"
+    assert finished.is_set() and not transport.exchanges
+
+
+@pytest.mark.parametrize("read_body", [False, True])
+async def test_base_middleware_keeps_actual_application_failure_after_headers(read_body):
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    original = ExecutionCommitOutcomeError("unknown")
+    raised, finished = asyncio.Event(), asyncio.Event()
+
+    async def app(scope, receive, send):
+        try:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            raised.set()
+            raise original
+        finally:
+            finished.set()
+
+    async def dispatch(request, call_next):
+        return await call_next(request)
+
+    transport = transport_for(BaseHTTPMiddleware(app, dispatch=dispatch))
+    with pytest.raises(BaseException) as failed:
+        async with httpx.AsyncClient(transport=transport) as client:
+            async with client.stream("GET", "https://native.test/native") as response:
+                await raised.wait()
+                if read_body:
+                    await response.aread()
+    assert any(error is original for error in _explicit_control_chain(failed.value))
+    assert finished.is_set() and not transport.exchanges
+
+
+async def test_ignoring_disconnect_cannot_starve_observer_or_fake_physical_retirement():
+    release, finished = asyncio.Event(), asyncio.Event()
+
+    async def app(scope, receive, send):
+        try:
+            await send({"type": "http.response.start", "status": 200})
+            while not release.is_set():
+                await send({"type": "http.response.body", "body": b"not admitted", "more_body": True})
+        finally:
+            finished.set()
+
+    transport = transport_for(app)
+    request = httpx.Request("GET", "https://native.test/native", extensions={
+        "timeout": {"read": 0.02, "write": 0.02},
+    })
+    response = await transport.handle_async_request(request)
+    try:
+        async with asyncio.timeout(1):
+            with pytest.raises(BaseException) as failed:
+                await response.aclose()
+        assert any(getattr(error, "_kestrel_native_retirement_debts", ())
+                   for error in _explicit_control_chain(failed.value))
+        exchange, = transport.exchanges
+        assert not exchange.source.producer_task.done()
+        assert not exchange.source.producer_task.cancelling() and not finished.is_set()
+        with pytest.raises(httpx.StreamClosed):
+            await anext(response.aiter_raw())
+    finally:
+        release.set()
+        if transport.exchanges:
+            exchange, = transport.exchanges
+            async with asyncio.timeout(1):
+                await await_owned_task(exchange.close_task)
+        await transport.aclose()
+    assert finished.is_set() and not transport.exchanges
+
+
+@pytest.mark.parametrize("reason", ["read-timeout", "cancelled", "revoked"])
+async def test_body_failure_retirement_timeout_retains_both_explicit_originals(reason):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_cleanup_debts
+
+    reading, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    current = True
+    denied = ExecutionAuthorityError("Original route was revoked")
+
+    def check(scope):
+        if not current:
+            raise denied
+
+    async def app(scope, receive, send):
+        try:
+            await send({"type": "http.response.start", "status": 200})
+            await send({"type": "http.response.body", "body": b"initial", "more_body": True})
+            await disconnected(receive)
+        finally:
+            await release.wait()
+            finished.set()
+
+    transport = transport_for(app, check=check)
+
+    async def consume():
+        nonlocal current
+        async with httpx.AsyncClient(transport=transport, timeout=0.02) as client:
+            async with client.stream("GET", "https://native.test/native") as response:
+                body = response.aiter_raw()
+                assert await anext(body) == b"initial"
+                if reason == "revoked":
+                    current = False
+                reading.set()
+                await anext(body)
+
+    consuming = create_owned_task(consume())
+    try:
+        await reading.wait()
+        if reason == "cancelled":
+            consuming.cancel("original body reader withdrew")
+        async with asyncio.timeout(1):
+            outcome = await await_owned_task(consuming)
+        assert outcome.error is not None
+        errors = tuple(_explicit_control_chain(outcome.error))
+        assert execution_cleanup_debts(outcome.error)
+        if reason == "read-timeout":
+            assert any(isinstance(error, httpx.ReadTimeout) for error in errors)
+        elif reason == "cancelled":
+            assert any(isinstance(error, asyncio.CancelledError) and error.args == (
+                "original body reader withdrew",
+            ) for error in errors)
+        else:
+            assert any(error is denied for error in errors)
+        exchange, = transport.exchanges
+        assert not exchange.source.producer_task.cancelling()
+        assert not finished.is_set()
+    finally:
+        current = True
+        release.set()
+        await await_owned_task(consuming)
+        if transport.exchanges:
+            exchange, = transport.exchanges
+            async with asyncio.timeout(1):
+                await await_owned_task(exchange.close_task)
+        await transport.aclose()
+    assert finished.is_set() and not transport.exchanges
 
 
 async def test_slow_original_finally_is_bounded_private_debt_not_cancelled_or_replaced():

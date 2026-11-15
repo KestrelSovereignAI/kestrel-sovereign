@@ -728,6 +728,13 @@ Both HTTPX `read` and `write` timeouts must be finite and nonnegative; each
 actual response read/request-body read enforces its corresponding inactivity
 deadline. Use an outer operation deadline when a whole-exchange bound is needed.
 Early response/client closure signals disconnect and withdraws source demand.
+The bridge advertises ASGI HTTP2.0: after withdrawal it admits no further
+frames, but lets the original application observe `http.disconnect` and unwind
+normally instead of throwing a private error through opaque middleware. An
+application that ignores disconnect can keep running; that is pending physical
+debt, not proof that its body or cleanup stopped. Closed sends yield to preserve
+the observer's bound even for a repeatedly sending application. See the
+[ASGI disconnect contract](https://asgi.readthedocs.io/en/stable/specs/www.html#disconnect-receive-event).
 One original close task joins the original application and source owners, using
 one nonrenewing retirement budget equal to the request's read timeout. Slow
 opaque cleanup is retained as private debt with those exact original tasks,
