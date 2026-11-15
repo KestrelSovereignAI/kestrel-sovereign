@@ -54,6 +54,27 @@ def test_closed_roles_profiles_and_absent_extensions():
         container_arguments(profile, "arbitrary-role", "c"*64)
 
 
+def test_broker_atomic_publication_uses_only_no_follow_linkat_policy():
+    """Actual packaged policy/CLI binding; not Linux syscall acceptance.
+
+    The pinned CPython3.12 os.link(..., follow_symlinks=False) invokes
+    linkat(..., flags=0). Other flags and plain link stay outside this grant.
+    """
+    profile = LocalWorkerProfile("browser@sha256:"+"a"*64, "broker@sha256:"+"b"*64)
+    arguments = container_arguments(profile, "broker", "c"*64)
+    policies = [arguments[index+1].partition("=")[2]
+                for index, value in enumerate(arguments)
+                if value == "--security-opt" and arguments[index+1].startswith("seccomp=")]
+    assert policies == [str(DATA/"broker-seccomp.json")]
+    policy = json.loads(Path(policies[0]).read_bytes())
+    grants = [rule for rule in policy["syscalls"]
+              if rule["action"] == "SCMP_ACT_ALLOW" and {"link", "linkat"}.intersection(rule["names"])]
+    assert grants, "BROKER_ATOMIC_PUBLICATION_SYSCALL_DENIED"
+    assert len(grants) == 1 and grants[0]["names"] == ["linkat"]
+    assert grants[0].get("args") == [{"index": 4, "value": 0, "valueTwo": 0, "op": "SCMP_CMP_EQ"}]
+    assert policy["defaultAction"] == "SCMP_ACT_ERRNO"
+
+
 @pytest.mark.parametrize("changed", ["roles", "expiry", "identity", "extra"])
 def test_broker_bootstrap_refuses_noncanonical_shapes(changed):
     value = settings()

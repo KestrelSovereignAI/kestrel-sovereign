@@ -34,6 +34,7 @@ from kestrel_sovereign.visual_computer.worker_profile import (
     BROWSER_CLOSE_SECONDS, BROWSER_RETIRE_SECONDS, DRIVER, IPC, PRIVATE, TOKEN,
 )
 from kestrel_sovereign.visual_computer.worker_stream import join_original_writer_close as _join_original_writer_close
+from kestrel_sovereign.visual_computer.worker_publication import publish_record
 
 
 def configuration(value):
@@ -55,14 +56,11 @@ def initialize(raw):
     if not hmac.compare_digest(value["incarnation"], (directory/"incarnation").read_text()):
         raise Refused("worker_incarnation_mismatch")
     (directory/"initialized").touch(mode=0o600, exist_ok=False)
-    pending = directory/"bootstrap.pending"
-    with open(pending, "xb", opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
-        stream.write(raw)
-    os.rename(pending, directory/"bootstrap.json")
+    publish_record(directory/"bootstrap.json", raw)
     return encode({"schema_version": 1, "submitted": True})
 
 
-async def serve(controller, secret):
+async def serve(controller, secret, admission, *, startup_deadline):
     """One controller/journal with the original finite Endpoint dispatch.
 
     Retain every actual server callback Task before coroutine publication.
@@ -103,15 +101,24 @@ async def serve(controller, secret):
             terminal = execution_terminal_error(terminal, error, retain_originals=True)
             active = False
     try:
-        for endpoint, name in zip(endpoints, ("worker.sock", "control.sock"), strict=True):
-            path = Path(IPC)/name
-            async def open_original(endpoint=endpoint, path=path):
-                server = await asyncio.start_unix_server(lambda r, w: accept(endpoint, r, w), str(path), limit=MAX_REQUEST)
-                servers.append(server)  # Original Server before publication.
-                return server
-            raise_owned_outcome(await await_owned_operation(open_original(), retirement_resource=servers),
-                                operation="original browser IPC listener", retain_originals=True)
-            os.chmod(path, 0o660)
+        # Keep the original startup deadline across browser and IPC setup.
+        # Caller withdrawal still joins an opening listener before cleanup.
+        async with asyncio.timeout_at(startup_deadline):
+            for endpoint, name in zip(endpoints, ("worker.sock", "control.sock"), strict=True):
+                path = Path(IPC)/name
+                async def open_original(endpoint=endpoint, path=path):
+                    server = await asyncio.start_unix_server(lambda r, w: accept(endpoint, r, w), str(path), limit=MAX_REQUEST)
+                    servers.append(server)  # Original Server before publication.
+                    return server
+                raise_owned_outcome(await await_owned_operation(open_original(), retirement_resource=servers),
+                                    operation="original browser IPC listener", retain_originals=True)
+                os.chmod(path, 0o660)
+            if terminal is not None:
+                raise terminal
+            controller._live()
+            if controller._session["state"] in {"closing", "closed"}:
+                return  # Withdrawal during listener startup cannot publish ready.
+            publish_record(Path(PRIVATE)/"admission.json", encode(admission))
         while controller._session["state"] not in {"closing", "closed"}:
             await asyncio.sleep(.1)
             controller._live()
@@ -285,7 +292,7 @@ async def _main(lifecycle):
     directory = Path(PRIVATE)
     directory.mkdir(mode=0o700, exist_ok=False)
     incarnation = secrets.token_hex(32)
-    (directory/"incarnation").write_text(incarnation)
+    publish_record(directory/"incarnation", incarnation.encode("ascii"))
     source = directory/"bootstrap.json"
     if not await ProcessLifetime.wait_for_bootstrap(lifecycle, source, retirement):
         return
@@ -297,13 +304,11 @@ async def _main(lifecycle):
         raise Refused("worker_incarnation_mismatch")
     shared = Path(IPC)
     for name, value in (("incarnation", incarnation), ("profile", settings["profile_sha256"])):
-        with open(shared/name, "x", opener=lambda p, flags: os.open(p, flags, 0o640)) as stream:
-            stream.write(value)
-            os.fchmod(stream.fileno(), 0o640)
+        publish_record(shared/name, value.encode("ascii"), mode=0o640)
     async with original_playwright() as playwright:
         browser, failure = None, None
         try:
-            async with asyncio.timeout(20):
+            async with asyncio.timeout(20) as startup:
                 async def launch_original():
                     nonlocal browser
                     browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True, channel="chromium")
@@ -331,10 +336,9 @@ async def _main(lifecycle):
                     await route.abort("blockedbyclient")
                 await context.route("**/*", deny_request)
                 await page.set_content(settings["document_html"], timeout=5000)
-                (directory/"admission.json").write_bytes(encode(admission))
             if not retirement_started:
                 signal.alarm(max(1, math.ceil(controller.deadline-controller.monotonic()))+BROWSER_RETIRE_SECONDS)
-            await serve(controller, settings["secret"])
+            await serve(controller, settings["secret"], admission, startup_deadline=startup.when())
         except BaseException as error:
             failure = error
         finally:

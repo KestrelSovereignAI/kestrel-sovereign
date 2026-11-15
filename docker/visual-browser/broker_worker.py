@@ -18,6 +18,7 @@ from wire import MAX_REQUEST, decode, encode
 from kestrel_sovereign.visual_computer.worker_broker import (
     LaneRole, WorkerLane, require_ipc, server_context, supervise, validate_configuration,
 )
+from kestrel_sovereign.visual_computer.worker_publication import publish_record
 
 PRIVATE = Path("/tmp/kestrel-broker")
 
@@ -30,10 +31,7 @@ def initialize(raw):
     if not hmac.compare_digest(value["broker_incarnation"], (PRIVATE/"incarnation").read_text()):
         raise ValueError("original_broker_incarnation_differs")
     (PRIVATE/"initialized").touch(mode=0o600, exist_ok=False)
-    path = PRIVATE/"bootstrap.pending"
-    with open(path, "xb", opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
-        stream.write(raw)
-    os.rename(path, PRIVATE/"bootstrap.json")
+    publish_record(PRIVATE/"bootstrap.json", raw)
     return encode({"schema_version": 1, "submitted": True})
 
 
@@ -57,7 +55,7 @@ async def _main(lifecycle):
         return
     if not sys.argv[1:]:
         PRIVATE.mkdir(mode=0o700, exist_ok=False)
-        (PRIVATE/"incarnation").write_text(secrets.token_hex(32))
+        publish_record(PRIVATE/"incarnation", secrets.token_hex(32).encode("ascii"))
         path = PRIVATE/"bootstrap.json"
         if not await ProcessLifetime.wait_for_bootstrap(lifecycle, path, retirement):
             return

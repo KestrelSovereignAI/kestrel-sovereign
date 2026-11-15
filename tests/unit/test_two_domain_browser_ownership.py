@@ -68,6 +68,13 @@ class ScriptedController:
         self.retired_ack = True
 
 
+@pytest.fixture(autouse=True)
+def scripted_readiness_publication(monkeypatch):
+    # These ownership tests have no real listener or worker private directory.
+    # Startup publication has separate file and scripted-order regressions.
+    monkeypatch.setattr(worker, "publish_record", lambda *_args, **_kwargs: None)
+
+
 @pytest.mark.asyncio
 async def test_original_browser_server_open_is_joined_before_withdrawal_settles(monkeypatch):
     entered, release = asyncio.Event(), asyncio.Event()
@@ -82,7 +89,8 @@ async def test_original_browser_server_open_is_joined_before_withdrawal_settles(
     monkeypatch.setattr(worker.asyncio, "start_unix_server", open_server)
     monkeypatch.setattr(worker, "os", SimpleNamespace(chmod=lambda *_: None))
     admission = OwnedTaskAdmission()
-    task = create_owned_task(worker.serve(controller, "a"*64), admission=admission, name="scripted-browser-serve")
+    task = create_owned_task(worker.serve(controller, "a"*64, {},
+        startup_deadline=asyncio.get_running_loop().time()+20), admission=admission, name="scripted-browser-serve")
     try:
         await asyncio.wait_for(entered.wait(), 5)
         task.cancel()
@@ -123,7 +131,8 @@ async def test_original_browser_writer_close_error_still_joins_actual_writer(mon
     monkeypatch.setattr(worker.asyncio, "start_unix_server", open_server)
     monkeypatch.setattr(worker, "os", SimpleNamespace(chmod=lambda *_: None))
     admission = OwnedTaskAdmission()
-    task = create_owned_task(worker.serve(controller, "a"*64), admission=admission, name="scripted-browser-serve")
+    task = create_owned_task(worker.serve(controller, "a"*64, {},
+        startup_deadline=asyncio.get_running_loop().time()+20), admission=admission, name="scripted-browser-serve")
     outcome = await await_owned_task(task)
     assert outcome.error is not None
     assert all(server.closed and server.wait_ack == 1 for server in servers)
@@ -309,7 +318,8 @@ async def test_review21_original_endpoint_peer_close_does_not_poison_browser_ret
     monkeypatch.setattr(worker, "Path", PathDouble)
     monkeypatch.setattr(worker, "require_peer", scripted_peer)
     admission = OwnedTaskAdmission()
-    task = create_owned_task(worker.serve(controller, "a"*64), admission=admission,
+    task = create_owned_task(worker.serve(controller, "a"*64, {},
+        startup_deadline=asyncio.get_running_loop().time()+20), admission=admission,
         name="review21-original-browser-serve")
     primary, outcome = None, None
     try:
