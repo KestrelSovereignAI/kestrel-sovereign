@@ -13,6 +13,7 @@ from uuid import uuid4
 import httpx2
 import pytest
 import pytest_asyncio
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 
 from kestrel_sovereign.endpoints.agent import router as invoke_router
 from kestrel_sovereign.endpoints.security import router as security_router
@@ -30,16 +31,36 @@ native_permission_case = entrypoints.native_permission_case
 native_permission_inherited_environment = entrypoints.native_permission_inherited_environment
 
 
+def owned_script_task(script):
+    return f'Run owned signed script {script.id} through compute_feature.'
+
+
+class OriginalSubagentTurnObserver(Hook):
+    """Read the original invocation before the ledger writes being tested."""
+
+    def __init__(self, agent):
+        super().__init__('owned-native-subagent-turn', [HookEvent.PRE_SUBAGENT_CALL], priority=1000)
+        self.agent = agent
+        self.observations = []
+
+    async def execute(self, hook_input):
+        if hook_input.feature_name == 'ComputeFeature' and hook_input.tool_name == 'compute_feature':
+            self.observations.append((hook_input.session_id, self.agent.get_current_turn_id(),
+                hook_input.tool_input['task']))
+        return HookOutput()
+
+
 @dataclass
 class NativeSubagentHTTP:
     case: entrypoints.NativePermissionCase
     peer: MCPTestPeer
     client: httpx2.AsyncClient
     dials: list
+    observer: OriginalSubagentTurnObserver
 
     def start(self, script):
         return self.case.own_call(self.client.post('/api/agent/invoke', json={
-            'input': f'Run owned signed script {script.id} through compute_feature.',
+            'input': owned_script_task(script),
             'provider': 'deepseek:api', 'model': 'owned-permission-model',
             'session_id': 'owned-subagent-permission',
         }))
@@ -51,17 +72,35 @@ class NativeSubagentHTTP:
     async def assert_dispatches(self, expected):
         database = self.case.agent.tool_effect_store.database
         leaves = await database.fetchall(
-            'SELECT parent_dispatch_id,result_status,args_redacted,adapter FROM a2a_tool_dispatches '
+            'SELECT parent_dispatch_id,session_id,turn_id,result_status,error_class,args_redacted,adapter '
+            'FROM a2a_tool_dispatches '
             "WHERE tool_name='run_script' ORDER BY id")
         assert len(leaves) == len(expected), 'Every attempted leaf needs exactly one dispatch row'
-        for leaf, (script, status) in zip(leaves, expected, strict=True):
-            assert leaf[0], 'The leaf must retain its actual parent subagent dispatch'
-            assert leaf[1] == status
-            assert json.loads(leaf[2])['script_id'] == script.id
-            assert leaf[3] == 'subagent:ComputeFeature.run_script'
-            assert await database.fetchone(
-                'SELECT tool_name,session_id FROM a2a_tool_dispatches WHERE dispatch_id=?',
-                (leaf[0],)) == ('compute_feature', 'owned-subagent-permission')
+        parents, turns = set(), set()
+        for leaf, (script, expected_status, expected_error) in zip(leaves, expected, strict=True):
+            parent_id, leaf_session, leaf_turn, status, error_class, arguments, adapter = leaf
+            observed, = [(session, turn) for session, turn, task in self.observer.observations
+                if task == owned_script_task(script)]
+            assert observed[0] == 'owned-subagent-permission'
+            assert observed[1] and observed[1] != 'turn_unknown'
+            assert leaf_session == observed[0], 'The leaf must retain its original session'
+            assert leaf_turn == observed[1], 'The leaf must belong to its original HTTP turn'
+            assert parent_id, 'The leaf must retain its actual parent subagent dispatch'
+            assert parent_id not in parents, 'Every invocation needs its own parent dispatch'
+            parent = await database.fetchone(
+                'SELECT tool_name,session_id,turn_id,args_redacted FROM a2a_tool_dispatches '
+                'WHERE dispatch_id=?', (parent_id,))
+            assert parent is not None
+            assert parent[0] == 'compute_feature' and parent[1] == observed[0]
+            assert parent[2] == observed[1], 'The parent must retain its original HTTP turn'
+            assert json.loads(parent[3])['task'] == owned_script_task(script)
+            assert parent[2] not in turns, 'Distinct HTTP invocations need distinct original turns'
+            assert status == expected_status
+            assert error_class == expected_error, 'The leaf must retain its exact diagnostic class'
+            assert json.loads(arguments)['script_id'] == script.id
+            assert adapter == 'subagent:ComputeFeature.run_script'
+            parents.add(parent_id)
+            turns.add(parent[2])
 
     def assert_native_subagent(self, *, leaf_advertised):
         requests = [row for row in self.peer.provider_requests()
@@ -96,10 +135,15 @@ async def native_subagent_http(tmp_path, monkeypatch, native_permission_case):
                     transport=httpx2.ASGITransport(app=app), base_url=case.http.base_url,
                     headers=case.http.headers,
                 ) as client:
+                    observer = OriginalSubagentTurnObserver(case.agent)
+                    case.agent.hooks_manager.register(observer)
                     try:
-                        yield NativeSubagentHTTP(case, peer, client, dials)
+                        yield NativeSubagentHTTP(case, peer, client, dials, observer)
                     finally:
-                        await case.retire_calls()
+                        try:
+                            await case.retire_calls()
+                        finally:
+                            case.agent.hooks_manager.unregister(observer)
 
 
 @pytest.mark.parametrize('permission', [PermissionLevel.ALLOW, PermissionLevel.DENY])
@@ -116,7 +160,8 @@ async def test_native_http_feature_subagent_obeys_leaf_permission(native_subagen
     executions = await case.compute.script_store.get_executions_for_script(script.id)
     assert len(executions) == int(allowed)
     assert all(row.succeeded and not row.dry_run for row in executions)
-    await native.assert_dispatches([(script, 'success' if allowed else 'error')])
+    await native.assert_dispatches([(script, 'success' if allowed else 'error',
+        None if allowed else 'UnknownToolError')])
     native.assert_native_subagent(leaf_advertised=allowed)
     assert not case.security.approval_queue.pending_requests
 
@@ -147,7 +192,8 @@ async def test_native_http_subagent_one_shot_and_invalid_decisions(native_subage
     await native.finish(call)
     case.assert_effect_count(int(approved))
     first_status = 'success' if approved else 'policy_denied'
-    await native.assert_dispatches([(first, first_status)])
+    first_error = None if approved else 'PermissionDenied'
+    await native.assert_dispatches([(first, first_status, first_error)])
     second = await case.stage_script()
     following = native.start(second)
     fresh = await case.next_approval(following)
@@ -163,7 +209,8 @@ async def test_native_http_subagent_one_shot_and_invalid_decisions(native_subage
     assert sorted(row['decision'] for row in await case.audit()) == sorted(
         ['user_approved' if approved else 'user_denied', 'user_denied'])
     assert await case.security.permission_store.get_permission('ComputeFeature', 'run_script') == PermissionLevel.ASK
-    await native.assert_dispatches([(first, first_status), (second, 'policy_denied')])
+    await native.assert_dispatches([(first, first_status, first_error),
+        (second, 'policy_denied', 'PermissionDenied')])
     native.assert_native_subagent(leaf_advertised=True)
     assert not case.security.approval_queue.pending_requests
 
