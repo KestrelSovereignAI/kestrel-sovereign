@@ -1131,7 +1131,9 @@ async def test_fs_read_missing_or_refused_path_is_unchanged(workspace: Path, nam
 
 # --- #4104: a gate exception is an audited refusal ------------------------------
 
+import asyncio  # noqa: E402
 import errno  # noqa: E402
+import logging  # noqa: E402
 import sys  # noqa: E402
 
 from kestrel_sovereign.features.computer_use import feature as feature_module  # noqa: E402
@@ -1260,11 +1262,16 @@ async def test_fs_read_unresolvable_home_is_an_audited_refusal(workspace: Path):
     assert queue.calls == []
 
 
+async def _fail_audit_writes(record):
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
 @pytest.mark.asyncio
 async def test_a_gate_error_whose_audit_also_fails_still_refuses(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, caplog
 ):
-    """The refusal stands without its row, and says the row is missing."""
+    """The refusal stands without its row, says the row is missing, and the
+    failed audit write is logged at ERROR."""
     (tmp_path / "proj").mkdir()
     agent = FakeAgent(
         privacy=PrivacyConfig(computer_access=True),
@@ -1273,11 +1280,8 @@ async def test_a_gate_error_whose_audit_also_fails_still_refuses(
     )
     feature = await _make_f137_feature(tmp_path, agent)
     monkeypatch.setattr(feature_module, "evaluate_argv_paths", _raise_name_too_long)
-
-    async def write(record):
-        raise OSError(errno.ENOSPC, "No space left on device")
-
-    monkeypatch.setattr(feature._audit, "write", write)
+    monkeypatch.setattr(feature._audit, "write", _fail_audit_writes)
+    caplog.set_level(logging.ERROR, logger=feature_module.__name__)
 
     envelope = await feature.shell(command="echo hi", timeout=5)
 
@@ -1287,6 +1291,40 @@ async def test_a_gate_error_whose_audit_also_fails_still_refuses(
         "; the refusal was not audited: OSError: [Errno "
         f"{errno.ENOSPC}] No space left on device"
     )
+    assert any(
+        record.levelno == logging.ERROR
+        and record.getMessage().startswith("computer_use: could not audit the shell gate error")
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_inside_a_gate_propagates_unchanged(
+    tmp_path: Path, monkeypatch
+):
+    """C4 stops at ``Exception``: a cancellation is not a refusal, so it is
+    neither audited nor turned into a result."""
+    (tmp_path / "proj").mkdir()
+    queue = FakeApprovalQueue()
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_f137_feature(tmp_path, agent)
+    cancellation = asyncio.CancelledError("stop requested")
+
+    def evaluate(argv, path_policy, *, cwd=None):
+        raise cancellation
+
+    monkeypatch.setattr(feature_module, "evaluate_argv_paths", evaluate)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await feature.shell(command="echo hi", timeout=5)
+
+    assert raised.value is cancellation
+    assert queue.calls == []
+    assert not (tmp_path / "audit.jsonl").exists() or _audit_rows(tmp_path) == []
 
 
 @pytest.mark.asyncio
@@ -1319,13 +1357,15 @@ async def test_gate_execution_control_is_audited_and_propagates(
     assert row["error"] == "ExecutionAuthorityError: original admission retired"
 
 
+@pytest.mark.parametrize("audit_fails", [False, True])
 @pytest.mark.asyncio
 async def test_a_gate_exception_on_the_direct_tool_door_does_not_fence_the_turn(
-    tmp_path: Path, monkeypatch, native_tool_effect_agent
+    tmp_path: Path, monkeypatch, native_tool_effect_agent, audit_fails: bool
 ):
     """The 2026-11-14 shape, reproduced: the model's ``shell`` call reaches
     the gate through the direct-tool door. Its claim settles as a returned
-    error, not ``UNCONFIRMED``, so no uncertain effect fences the turn."""
+    error, not ``UNCONFIRMED``, so no uncertain effect fences the turn, and
+    that holds when the refusal's audit write fails too."""
     from kestrel_sdk.llm.response import ToolCall
 
     from tests.utils.native_tool_effects import drive_native
@@ -1342,6 +1382,8 @@ async def test_a_gate_exception_on_the_direct_tool_door_does_not_fence_the_turn(
     agent.features[type(feature).__name__] = feature
     agent._register_explored_feature_tools(feature)
     monkeypatch.setattr(feature_module, "evaluate_argv_paths", _raise_name_too_long)
+    if audit_fails:
+        monkeypatch.setattr(feature._audit, "write", _fail_audit_writes)
 
     result = await drive_native(
         agent,
@@ -1360,5 +1402,9 @@ async def test_a_gate_exception_on_the_direct_tool_door_does_not_fence_the_turn(
     assert await agent.tool_effect_store.database.fetchone(
         "SELECT state FROM tool_effect_claims ORDER BY rowid DESC LIMIT 1"
     ) == ("RETURNED_ERROR",)
-    [row] = _audit_rows(tmp_path)
-    assert row["allowed_by"][-1] == "denied:gate_error"
+    if audit_fails:
+        assert "the refusal was not audited" in json.dumps(result)
+        assert not (tmp_path / "audit.jsonl").exists()
+    else:
+        [row] = _audit_rows(tmp_path)
+        assert row["allowed_by"][-1] == "denied:gate_error"

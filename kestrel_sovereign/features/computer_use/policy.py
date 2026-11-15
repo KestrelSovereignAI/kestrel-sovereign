@@ -356,37 +356,31 @@ def _names_over_byte_limit(candidate: Path) -> list[bytes]:
 
 
 def _cannot_name_a_file(candidate: Path, error: OSError) -> bool:
-    """Whether a component of ``candidate`` is provably too long to exist (#4104).
+    """Whether the probe's own refusal proves ``candidate`` names no file (#4104).
 
-    Filesystems measure a name in different units (bytes on Linux; UTF-16
-    units on APFS, HFS+, FAT and NTFS), and a lookup may fold case or
-    compose characters first: APFS finds a 255-character name by a
-    510-code-point decomposed spelling of it, and a 100-character CJK name
-    is 300 bytes against a ``PC_NAME_MAX`` of 255. A length measured here
-    therefore proves nothing in general, and is a proof only where it
-    cannot be wrong:
+    All three must hold:
 
-    - an ASCII name longer than its parent's limit, whatever the probe
-      reported. Every unit counts ASCII the same, and neither case folding
-      nor normalization shortens it. The probe may still answer EACCES:
-      Linux checks search permission on a directory before the length of a
-      name in it.
-    - any name longer in bytes than its limit, when the probe answered
-      ENAMETOOLONG for a path shorter than ``PC_PATH_MAX``: the filesystem
-      itself refused a component, not the path's total length.
+    1. the probe failed with ENAMETOOLONG;
+    2. ``candidate`` is shorter in bytes than the ``PC_PATH_MAX`` its anchor
+       reports, so the refusal was not about the path's total length;
+    3. a component is longer in bytes than the ``PC_NAME_MAX`` its own
+       parent directory reports.
 
-    Anything else (a non-ASCII name behind a parent the probe may not
-    search, a path too long in total) is left unanswered.
+    The proof is the filesystem's own answer (1 and 2): the path was short
+    enough in total, so what it refused was a component. The count in 3
+    only rules out an ENAMETOOLONG with some other cause, and proves
+    nothing by itself: a filesystem may measure a name in units other than
+    bytes, and a lookup may fold case or normalize a name before measuring
+    it. Where the probe could not look (a parent it may not search), there
+    is no such answer, so even an over-long name is left unanswered. So is
+    any case where ``pathconf`` reports no limit.
     """
-    over = _names_over_byte_limit(candidate)
-    if not over:
-        return False
-    if any(name.isascii() for name in over):
-        return True
     if error.errno != errno.ENAMETOOLONG:
         return False
     path_limit = _pathconf(Path(candidate.anchor), "PC_PATH_MAX")
-    return path_limit is not None and len(os.fsencode(candidate)) < path_limit
+    if path_limit is None or len(os.fsencode(candidate)) >= path_limit:
+        return False
+    return bool(_names_over_byte_limit(candidate))
 
 
 def _probe(candidate: Path) -> tuple[bool, str | None]:
@@ -394,8 +388,8 @@ def _probe(candidate: Path) -> tuple[bool, str | None]:
 
     ``failure`` names why it is unknown whether ``candidate`` exists, and is
     ``None`` when that is known. A path provably does not exist when nothing
-    is there, or when a component of it is provably longer than its
-    filesystem allows (:func:`_cannot_name_a_file`).
+    is there, or when the probe's own ENAMETOOLONG proves that a component
+    of it is longer than its filesystem allows (:func:`_cannot_name_a_file`).
     ``Path.exists`` is not used: it raises on some errors (ENAMETOOLONG,
     EACCES), and from Python 3.14 it answers ``False`` for every one of
     them, so a path the agent cannot look into would skip the approval it
@@ -446,13 +440,16 @@ def evaluate_argv_paths(
       provably longer than its filesystem's name limit, which cannot name
       a file (see :func:`_cannot_name_a_file` for when that is provable).
 
-    It never raises (#4104): an exception here left the ``shell`` gate
-    before its audit row. Tokens that can't be resolved (traversal/NUL)
-    are skipped; a token that fails to resolve for any other reason
-    (``~user`` naming no user) gives ``REQUIRE_APPROVAL``, and a string
-    ``shlex`` cannot tokenize gives ``DENY``, since none of its
-    arguments can be vetted. Returns the strictest aggregate — ``ALLOW``
-    means no argument path changed the binary's decision.
+    Tokenizing, resolving and probing never raise (#4104): an exception
+    here left the ``shell`` gate before its audit row. Tokens that can't be
+    resolved (traversal/NUL) are skipped; a token that fails to resolve for
+    any other reason (``~user`` naming no user) gives ``REQUIRE_APPROVAL``,
+    and a string ``shlex`` cannot tokenize gives ``DENY``, since none of
+    its arguments can be vetted. An error from the deny check itself is not
+    caught: a call whose deny check did not run must be refused (the
+    ``shell`` gate audits it as ``denied:gate_error``), not queued for an
+    approval that would stand in for it. Returns the strictest aggregate —
+    ``ALLOW`` means no argument path changed the binary's decision.
     """
     try:
         tokens = split_command(argv) if isinstance(argv, str) else list(argv)
@@ -466,7 +463,7 @@ def evaluate_argv_paths(
             candidate = resolve_realpath(token, base=cwd)
         except PathSafetyError:
             continue
-        except (OSError, RuntimeError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - an unresolvable token is not ALLOW
             aggregate = ArgvPathResult(
                 Decision.REQUIRE_APPROVAL, f"unresolvable:{type(exc).__name__}", token
             )

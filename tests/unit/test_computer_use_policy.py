@@ -737,6 +737,7 @@ def test_a_malformed_policy_is_refused_not_dropped(raw, message):
 
 import errno  # noqa: E402
 import os  # noqa: E402
+import sys  # noqa: E402
 
 from kestrel_sovereign.features.computer_use.policy import (  # noqa: E402
     ArgvPathResult,
@@ -824,15 +825,19 @@ def test_a_probe_denied_permission_requires_approval(tmp_path: Path):
 @pytest.mark.skipif(
     os.name == "nt" or os.geteuid() == 0, reason="needs POSIX permissions, non-root"
 )
-def test_a_long_token_under_a_parent_the_probe_may_not_search_is_not_a_path(
+def test_a_long_ascii_token_under_a_parent_the_probe_may_not_search_requires_approval(
     tmp_path: Path,
 ):
-    """C2 whatever the probe reports: the name still cannot exist when the
-    kernel answers EACCES before it looks at the name's length."""
+    """C3, not C2: where the probe could not look, the filesystem gave no
+    answer about the name, and a limit ``pathconf`` reports does not switch
+    approval off by itself, even for an ASCII name over it."""
     policy, _ = _roots(tmp_path)
     locked = tmp_path / "locked"
     locked.mkdir()
-    token = str(locked / python_c_program(372))
+    program = python_c_program(372)
+    assert len(program) > os.pathconf(locked, "PC_NAME_MAX")
+    token = str(locked / program)
+    expected = str(Path(os.path.realpath(locked)) / program)
     locked.chmod(0)
     try:
         with pytest.raises(OSError) as probed:
@@ -841,8 +846,18 @@ def test_a_long_token_under_a_parent_the_probe_may_not_search_is_not_a_path(
     finally:
         locked.chmod(0o700)
 
+    if probed.value.errno == errno.ENAMETOOLONG and sys.platform not in (
+        "darwin",
+        "linux",
+    ):
+        pytest.skip(
+            "this kernel checks a name's length before search permission, so "
+            "its own ENAMETOOLONG proves the name cannot exist"
+        )
     assert probed.value.errno == errno.EACCES
-    assert result == ArgvPathResult(Decision.ALLOW, "no_path_args")
+    assert result == ArgvPathResult(
+        Decision.REQUIRE_APPROVAL, "no_match:probe_error:EACCES", expected
+    )
 
 
 def _locked_multibyte_file(tmp_path: Path, characters: int) -> tuple[Path, Path]:
@@ -944,6 +959,25 @@ def test_a_long_non_ascii_name_the_kernel_refuses_is_not_a_path(tmp_path: Path):
     assert long == short == ArgvPathResult(Decision.ALLOW, "no_path_args")
 
 
+def _over_long_name_in_a_path_too_long_in_total(tmp_path: Path, character: str) -> str:
+    """A name of ``character`` one over ``PC_NAME_MAX``, under real directories
+    deep enough that the whole path reaches ``PC_PATH_MAX`` in bytes."""
+    limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    path_limit = os.pathconf(tmp_path, "PC_PATH_MAX")
+    name = character * (limit + 1)
+    segment = "d" * min(limit, 200)
+    parent = Path(os.path.realpath(tmp_path))
+    while len(os.fsencode(parent / name)) < path_limit:
+        parent = parent / segment
+        parent.mkdir()
+    token = str(parent / name)
+    assert len(os.fsencode(token)) >= path_limit
+    with pytest.raises(OSError) as probed:
+        os.stat(token)
+    assert probed.value.errno == errno.ENAMETOOLONG
+    return token
+
+
 @_POSIX_LIMITS
 def test_a_long_non_ascii_name_in_a_path_too_long_in_total_requires_approval(
     tmp_path: Path,
@@ -951,18 +985,23 @@ def test_a_long_non_ascii_name_in_a_path_too_long_in_total_requires_approval(
     """C3: ENAMETOOLONG for a path longer in total than ``PC_PATH_MAX`` may be
     about its total length, so even an over-long name in it proves nothing."""
     policy, _ = _roots(tmp_path)
-    limit = os.pathconf(tmp_path, "PC_NAME_MAX")
-    path_limit = os.pathconf(tmp_path, "PC_PATH_MAX")
-    name = "é" * (limit + 1)
-    segment = "d" * min(limit, 200)
-    parent = Path(os.path.realpath(tmp_path))
-    while len(os.fsencode(parent / name)) < path_limit:
-        parent = parent / segment
-        parent.mkdir()
-    token = str(parent / name)
-    with pytest.raises(OSError) as probed:
-        os.stat(token)
-    assert probed.value.errno == errno.ENAMETOOLONG
+    token = _over_long_name_in_a_path_too_long_in_total(tmp_path, "é")
+
+    result = evaluate_argv_paths(["cat", token], policy)
+
+    assert result == ArgvPathResult(
+        Decision.REQUIRE_APPROVAL, "no_match:probe_error:ENAMETOOLONG", token
+    )
+
+
+@_POSIX_LIMITS
+def test_a_long_ascii_name_in_a_path_too_long_in_total_requires_approval(
+    tmp_path: Path,
+):
+    """C3 for an ASCII name too: the filesystem's ENAMETOOLONG may be about
+    the total, and a name counted over the limit does not prove it is not."""
+    policy, _ = _roots(tmp_path)
+    token = _over_long_name_in_a_path_too_long_in_total(tmp_path, "x")
 
     result = evaluate_argv_paths(["cat", token], policy)
 
@@ -986,6 +1025,39 @@ def test_a_total_path_too_long_requires_approval(tmp_path: Path):
 
     assert result.decision is Decision.REQUIRE_APPROVAL
     assert result.rule == "no_match:probe_error:ENAMETOOLONG"
+
+
+@_POSIX_LIMITS
+@pytest.mark.parametrize("failure", ["raises", "no_limit"])
+@pytest.mark.parametrize("limit_name", ["PC_NAME_MAX", "PC_PATH_MAX"])
+def test_a_limit_pathconf_cannot_report_requires_approval(
+    tmp_path: Path, monkeypatch, limit_name: str, failure: str
+):
+    """C2 needs both limits: without either one the filesystem's ENAMETOOLONG
+    proves nothing, so the issue's first token is no longer "not a path"."""
+    policy, elsewhere = _roots(tmp_path)
+    program = python_c_program(372)
+    assert evaluate_argv_paths(
+        ["python", "-c", program], policy, cwd=elsewhere
+    ) == ArgvPathResult(Decision.ALLOW, "no_path_args")
+    real_pathconf = os.pathconf
+
+    def pathconf(path, name):
+        if name != limit_name:
+            return real_pathconf(path, name)
+        if failure == "raises":
+            raise OSError(errno.EINVAL, "Invalid argument", os.fspath(path))
+        return -1
+
+    monkeypatch.setattr(os, "pathconf", pathconf)
+
+    result = evaluate_argv_paths(["python", "-c", program], policy, cwd=elsewhere)
+
+    assert result == ArgvPathResult(
+        Decision.REQUIRE_APPROVAL,
+        "no_match:probe_error:ENAMETOOLONG",
+        str(Path(os.path.realpath(elsewhere)) / program),
+    )
 
 
 def test_an_io_error_from_the_probe_requires_approval(tmp_path: Path, monkeypatch):
@@ -1020,6 +1092,24 @@ def test_a_token_that_cannot_be_resolved_requires_approval(tmp_path: Path):
     assert result == ArgvPathResult(
         Decision.REQUIRE_APPROVAL, "unresolvable:RuntimeError", token
     )
+
+
+@pytest.mark.parametrize("denied_first", [True, False])
+def test_an_unresolvable_token_does_not_hide_a_denied_one(
+    tmp_path: Path, denied_first: bool
+):
+    """C1a: an unresolvable token asks for approval and the loop goes on, so
+    a deny-listed token in the same call is still DENY, in either order."""
+    policy, _ = _roots(tmp_path)
+    (tmp_path / "secret").mkdir()
+    unresolvable = "~kestrel-no-such-user-4104/notes.txt"
+    denied = str(tmp_path / "secret" / "key")
+    tokens = [denied, unresolvable] if denied_first else [unresolvable, denied]
+
+    result = evaluate_argv_paths(["cat", *tokens], policy)
+
+    assert result.decision is Decision.DENY
+    assert result.rule == f"deny:{tmp_path / 'secret'}"
 
 
 def test_a_command_shlex_cannot_tokenize_is_denied(tmp_path: Path):
