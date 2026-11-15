@@ -9,8 +9,9 @@ both values ratcheted from the counts providers report.
 Each test is named for its row in the #4068 binding scope (#4067 comment
 6870146659), as amended by #4068 comments 6883985733 (rv-4068-1, rows 16-19)
 and 6885688316 (rv-4068-2, rows 20-26). Rows 27 and 28 are the two sends
-rv-4068-1 leaves for the subagent admission PR. No test makes a live call,
-starts a host, or runs a provider tokenizer.
+rv-4068-1 leaves for the subagent admission PR. Rows 32 and 33 are
+6888003857's (rv-4068-4, G1). No test makes a live call, starts a host, or
+runs a provider tokenizer.
 """
 
 from __future__ import annotations
@@ -968,6 +969,38 @@ def test_a_tiktoken_family_is_bounded_by_its_tiktoken_count_plus_overhead():
         messages, ensure_ascii=True, separators=(",", ":"))))
 
 
+def test_row_34_a_tool_result_holding_special_token_text_is_measured_as_text_and_sent(
+    gate, monkeypatch,
+):
+    """A literal ``<|endoftext|>`` in request data is ordinary text, not a refusal.
+
+    tiktoken's ``encode`` raises on special-token text by default, and the gate
+    refuses any request it fails to measure, so a GPT subagent that read a
+    tokenizer configuration was refused at 27 tokens against a 108,800-token
+    budget. The provider counts the literal as ordinary text, and so does the
+    bound.
+    """
+    tiktoken = pytest.importorskip("tiktoken")
+    model = "gpt-4o"
+    monkeypatch.setitem(LIMITS, model, 128_000)
+    messages = [
+        {"role": "user", "content": "Read the tokenizer configuration."},
+        {"role": "tool", "tool_call_id": "call_1",
+         "content": 'eos_token="<|endoftext|>" prompt_end="<|endofprompt|>"'},
+    ]
+    budget = gate._subagent_context_budget(model)
+    assert budget == 108_800
+
+    check = gate._subagent_context_overflow(messages, model, None, system=None)
+
+    assert check.refusal is None, check.refusal
+    assert isinstance(check.bound, tc.TokenBound)
+    wire = json.dumps(messages, ensure_ascii=True, separators=(",", ":"))
+    ordinary = tiktoken.encoding_for_model(model).encode(wire, disallowed_special=())
+    assert check.bound.tokens == len(ordinary) <= budget
+    assert "subagent_gate_measure_error" not in tc.token_bound_event_counts()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1457,3 +1490,139 @@ def test_each_load_names_a_held_value_the_file_does_not_cover(monkeypatch, caplo
         and "overhead[anthropic:plan]=500" in record.getMessage()
         for record in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Rows 32-33 (rv-4068-4, G1): after a repair, the gate bounds the next request
+# against the model and route of the response the repair returned
+# ---------------------------------------------------------------------------
+
+ROUTE_A, ROUTE_B = "anthropic:api", "anthropic:plan"
+#: Route A's learned overhead is small and route B's large, both under the
+#: 20,000-token cap of a 1,000,000-token window.
+OVERHEAD_A, OVERHEAD_B = 1_000, 19_000
+#: The tool result after the repair. At 2.0 bytes per token it bounds the
+#: continuation near 840,000 tokens: under the 850,000 budget with route A's
+#: overhead, over it with route B's. The test checks both on the request the
+#: gate actually measured.
+REPAIRED_RESULT_BYTES = 2 * (BUDGET_1M - (OVERHEAD_A + OVERHEAD_B) // 2)
+
+
+def _seed_overhead(route: str, value: int) -> None:
+    seed = _bound(CLAUDE, _user(20_000), route=route)
+    tc.record_input_sample(seed, seed.measured_tokens + value, route=route,
+                           served_model=CLAUDE, persist=True, privacy_epoch=None)
+
+
+class _Scripted(_Adapter):
+    """Takes one action per call, in order; past its script it answers ``done``."""
+
+    def __init__(self, *script):
+        super().__init__()
+        self.script = list(script)
+
+    async def act(self):
+        if self.calls <= len(self.script):
+            return self.script[self.calls - 1]()
+        return _answer("done")
+
+
+def _answer(content: str, *tool_names: str):
+    """A response reporting one input token: below every bound, so it teaches nothing."""
+    from kestrel_sdk.llm.response import ToolCall
+
+    calls = [ToolCall(id=f"r{i}", name=name, arguments={}) for i, name in enumerate(tool_names)]
+    return LLMResponse(content=content, tool_calls=calls, input_tokens=1, output_tokens=1,
+                       stop_reason="tool_use" if calls else "end_turn")
+
+
+def _fail():
+    raise _anthropic_error(500, "Internal server error")
+
+
+async def _assert_the_repaired_route_bounds_the_continuation(
+    feature, monkeypatch, first, route_a, route_b, payloads,
+):
+    """Drive the loop from ``first`` and check the request after the repair.
+
+    The repair is answered on route B with a tool call. The continuation that
+    carries that tool's result fits with route A's overhead and not with
+    route B's, so it is refused only when the gate bounds it against the
+    route that answered the repair.
+    """
+    _seed_overhead(ROUTE_A, OVERHEAD_A)
+    _seed_overhead(ROUTE_B, OVERHEAD_B)
+    if not (_route_overhead(ROUTE_A) == OVERHEAD_A and _route_overhead(ROUTE_B) == OVERHEAD_B):
+        raise RuntimeError("precondition: both routes' overheads must be learned")
+
+    calls = _spy_gate(feature, monkeypatch)
+    service = _service((ROUTE_A, route_a), (ROUTE_B, route_b))
+    feature.agent.llm_service = service
+    results = list(payloads)
+
+    async def tool(*, tool_name, args, tools_by_name, **kwargs):
+        return {"payload": results.pop(0)}
+
+    feature._execute_subagent_tool = tool
+    try:
+        with pytest.raises(SubagentContextBudgetExceeded):
+            await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
+                first, tools=SCHEMA, system_prompt="sp", user_prompt="Task: read one record.",
+                max_iterations=3, model_override=CLAUDE, runtime_tools=[_small_tool()],
+            ))
+        sends = route_a.calls + route_b.calls
+    finally:
+        await service.close()
+
+    if results:
+        raise RuntimeError(f"precondition: every tool result must be returned ({results!r})")
+    gated = calls[-1]
+    request = gated.args[0]
+    if not (request[-1]["role"] == "tool"
+            and len(request[-1]["content"]) > REPAIRED_RESULT_BYTES):
+        raise RuntimeError("precondition: the last gate call must be the continuation "
+                           "carrying the result of the repair's tool call")
+    epoch = _agent_epoch(feature.agent)
+    under_a = _bound(CLAUDE, request, tools=gated.args[2], route=ROUTE_A, privacy_epoch=epoch)
+    under_b = _bound(CLAUDE, request, tools=gated.args[2], route=ROUTE_B, privacy_epoch=epoch)
+    assert under_a.tokens <= BUDGET_1M, "the continuation must fit with route A's overhead"
+    assert under_b.tokens > BUDGET_1M, "the continuation must not fit with route B's overhead"
+    assert gated.kwargs["route"] == ROUTE_B, "the gate did not take the repair's route"
+    assert gated.args[1] == CLAUDE
+    assert gated.check.refusal is not None
+    return sends
+
+
+@pytest.mark.asyncio
+async def test_row_32_a_repair_before_the_loop_answered_by_another_route_bounds_the_next_request(
+    feature, monkeypatch,
+):
+    """The first response, from route A, narrates; A fails the repair and B answers it."""
+    route_a, route_b = _Failing(), _Scripted(lambda: _answer("", "small_tool"))
+    first = _Resp(content="I will read the record. Let me check the file now.", model=CLAUDE)
+    first.provider = ROUTE_A
+    sends = await _assert_the_repaired_route_bounds_the_continuation(
+        feature, monkeypatch, first, route_a, route_b, ["x" * REPAIRED_RESULT_BYTES],
+    )
+    # The repair went to A, which failed, then to B; the continuation went nowhere.
+    assert (route_a.calls, route_b.calls) == (1, 1), "the continuation was sent"
+    assert sends == 2
+
+
+@pytest.mark.asyncio
+async def test_row_33_a_repair_inside_the_loop_answered_by_another_route_bounds_the_next_request(
+    feature, monkeypatch,
+):
+    """The continuation, from route A, narrates; A fails its repair and B answers it."""
+    route_a = _Scripted(lambda: _answer("I will read the record. Let me check the file now."),
+                        _fail)
+    route_b = _Scripted(lambda: _answer("", "small_tool"))
+    first = _Resp(tool_calls=[_Call("small_tool")], model=CLAUDE)
+    first.provider = ROUTE_A
+    sends = await _assert_the_repaired_route_bounds_the_continuation(
+        feature, monkeypatch, first, route_a, route_b, ["ok", "x" * REPAIRED_RESULT_BYTES],
+    )
+    # A answered the continuation and failed the repair, B answered the repair;
+    # the next continuation went nowhere.
+    assert (route_a.calls, route_b.calls) == (2, 1), "the next continuation was sent"
+    assert sends == 3

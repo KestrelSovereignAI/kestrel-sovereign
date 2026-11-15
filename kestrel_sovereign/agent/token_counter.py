@@ -1093,7 +1093,11 @@ class TokenCounter:
         overhead = ratchet.overhead(route, cap, privacy_epoch)
         if family == _TIKTOKEN_FAMILY:
             encoder = _tiktoken_encoding(_bare_model(self.model).lower())
-            measured = sum(len(encoder.encode(text)) for text in serialized) + extra
+            # ``encode_ordinary``: request text is data, and a provider counts
+            # a literal such as ``<|endoftext|>`` in it as ordinary text.
+            # ``encode`` raises on it instead, and the gate would then refuse a
+            # request that fits.
+            measured = sum(len(encoder.encode_ordinary(text)) for text in serialized) + extra
             bytes_per_token = None
         else:
             bytes_per_token = ratchet.bytes_per_token(family, privacy_epoch)

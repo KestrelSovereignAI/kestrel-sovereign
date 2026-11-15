@@ -62,6 +62,7 @@ _DISPATCH_METHODS: tuple[str, ...] = (
     "_subagent_measured_send",
     "_subagent_feed_response",
     "_subagent_response_route",
+    "_subagent_bound_target",
     "_subagent_feed",
     "_turn_session_id",
     "_repair_subagent_premature_yield",

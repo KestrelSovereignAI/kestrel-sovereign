@@ -2968,6 +2968,32 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         provider = getattr(response, "provider", None)
         return provider if isinstance(provider, str) and provider else None
 
+    def _subagent_bound_target(
+        self,
+        response: Any,
+        *,
+        model_override: Optional[str],
+        model: Optional[str],
+        route: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """The model and route the gate bounds the next request against.
+
+        They are the model and route of the most recent response the service
+        returned in this run (#4068). Every place the loop assigns a response
+        calls this before another gate runs: the first response, the repair
+        before the loop, each continuation, and the repair inside the loop. A
+        repair can be answered by another route than the response it repairs,
+        and that route's learned overhead must bound what is sent next.
+
+        ``model`` and ``route`` are the current values: a response that names
+        no model or no route keeps them. ``model_override`` wins over any
+        response's model.
+        """
+        return (
+            model_override or getattr(response, "model", None) or model,
+            self._subagent_response_route(response) or route,
+        )
+
     def _subagent_feed(
         self, check: _SubagentSendCheck, total: int, route: str, host: Any, *,
         served_model: Optional[str],
@@ -3056,11 +3082,13 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         # leave the budget resolving "auto" -> the 32768 default and refusing
         # a subagent on a 1,000,000-token window at ~28k. ``LLMResponse``
         # carries the model the provider actually served, so the loop learns
-        # it from the response it already has.
-        effective_model = model_override or getattr(response, "model", None)
-        # The route that served the last response, so the gate applies that
-        # route's learned overhead.
-        effective_route = self._subagent_response_route(response)
+        # it from the response it already has. The route that served it is
+        # learned the same way, so the gate applies that route's overhead.
+        # Both follow the most recent response: every assignment of
+        # ``response`` below updates them through ``_subagent_bound_target``.
+        effective_model, effective_route = self._subagent_bound_target(
+            response, model_override=model_override, model=None, route=None,
+        )
 
         # Build message history for multi-turn tool calling
         messages = [
@@ -3082,6 +3110,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 budget_model=effective_model,
                 budget_route=effective_route,
                 _dispatch_host=host,
+            )
+            effective_model, effective_route = self._subagent_bound_target(
+                response, model_override=model_override,
+                model=effective_model, route=effective_route,
             )
             if isinstance(response, str):
                 return response
@@ -3183,10 +3215,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             )
             require_execution_work(host)
 
-            effective_model = (
-                model_override or getattr(response, "model", None) or effective_model
+            effective_model, effective_route = self._subagent_bound_target(
+                response, model_override=model_override,
+                model=effective_model, route=effective_route,
             )
-            effective_route = self._subagent_response_route(response) or effective_route
 
             # If response is string or has no more tool calls, we're done
             if isinstance(response, str):
@@ -3207,6 +3239,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     budget_model=effective_model,
                     budget_route=effective_route,
                     _dispatch_host=host,
+                )
+                effective_model, effective_route = self._subagent_bound_target(
+                    response, model_override=model_override,
+                    model=effective_model, route=effective_route,
                 )
                 if isinstance(response, str):
                     return response
