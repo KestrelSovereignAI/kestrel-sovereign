@@ -672,6 +672,36 @@ async def test_row_16_an_over_budget_first_request_is_refused_and_generate_is_ne
     assert "exceeded its context budget" in result["error"]
 
 
+def _narration_only_the_repair_prompt_pushes_over(feature, messages, tools):
+    """The longest narration whose repair request fits until its repair prompt is added.
+
+    Returns the narration and the repair request built from it, exactly as
+    ``_repair_subagent_premature_yield`` builds it: the narration as an
+    assistant message, then the repair prompt as a user message. Whether a
+    request fits is the gate's own decision, so nothing here restates the
+    budget or the bound.
+    """
+
+    def build(pad):
+        narration = "y" * pad + " Let me check the file now."
+        return narration, feature._append_missing_tool_call_repair(messages, narration)
+
+    def fits(pad):
+        without_prompt = build(pad)[1][:-1]
+        check = feature._subagent_context_overflow(without_prompt, SMALL, tools, system=None)
+        return check.refusal is None
+
+    fitting, refused = 0, 10_000
+    assert fits(fitting) and not fits(refused)
+    while refused - fitting > 1:
+        middle = (fitting + refused) // 2
+        if fits(middle):
+            fitting = middle
+        else:
+            refused = middle
+    return build(fitting)
+
+
 @pytest.mark.asyncio
 async def test_row_17_the_repair_before_the_loop_is_refused_with_its_repair_prompt(feature):
     sends = []
@@ -681,14 +711,19 @@ async def test_row_17_the_repair_before_the_loop_is_refused_with_its_repair_prom
         return _Resp(content="done")
 
     feature.agent.llm_service.generate_with_messages = generate_with_messages
-    without = feature._subagent_context_overflow(
-        [{"role": "system", "content": "sp"}, {"role": "user", "content": "Task: x"}],
-        SMALL, SCHEMA, system=None,
-    )
-    assert without.refusal is None, "the array must fit without the repair, or this proves nothing"
+    messages = [{"role": "system", "content": "sp"}, {"role": "user", "content": "Task: x"}]
+    narration, repair = _narration_only_the_repair_prompt_pushes_over(feature, messages, SCHEMA)
+    # The request carrying the narration and the schemas fits; only the repair
+    # prompt takes it over. A gate that measures before the prompt is appended
+    # therefore passes it, and the send below happens.
+    assert repair[-2] == {"role": "assistant", "content": narration}
+    without_prompt = feature._subagent_context_overflow(repair[:-1], SMALL, SCHEMA, system=None)
+    assert without_prompt.refusal is None, "the narration alone must fit, or this proves nothing"
+    with_prompt = feature._subagent_context_overflow(repair, SMALL, SCHEMA, system=None)
+    assert with_prompt.refusal is not None, "the repair prompt must take it over the budget"
     with pytest.raises(SubagentContextBudgetExceeded):
         await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
-            _Resp(content=NARRATION), tools=SCHEMA, system_prompt="sp", user_prompt="Task: x",
+            _Resp(content=narration), tools=SCHEMA, system_prompt="sp", user_prompt="Task: x",
             max_iterations=3, model_override=SMALL, runtime_tools=[_small_tool()],
         ))
     assert sends == [], "the repair was sent over budget"

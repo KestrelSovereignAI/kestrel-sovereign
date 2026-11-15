@@ -27,6 +27,9 @@
 !tests/fixtures/artifacts/publication-digest.json
 # Pinned CORE store DDL the native-schema revision guard compares against.
 !tests/fixtures/native_store_schema.json
+# The synthetic #4068 tool-schema fixture, and the provider counts #4085 records.
+!tests/fixtures/token_bound/tool_schemas.json
+!tests/fixtures/token_bound/recorded_counts.json
 # Reviewed TCK observations contain requirement statuses, never credentials.
 !tests/interop/a2a_tck/COVERAGE.json
 # These are immutable, digest-pinned semantic package resources—not local

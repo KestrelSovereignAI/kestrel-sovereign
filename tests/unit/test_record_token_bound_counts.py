@@ -19,7 +19,8 @@ def test_every_fixture_class_has_a_committed_text():
     for name in script.FIXTURE_CLASSES:
         request = script.fixture_request(name)
         if name == "tool_schemas":
-            assert request["tools"] and request["messages"][0]["content"] == script.TOOL_CLASS_PROMPT
+            assert isinstance(request["tools"], list) and request["tools"]
+            assert request["messages"][0]["content"] == script.TOOL_CLASS_PROMPT
         else:
             assert request["tools"] is None
             assert len(request["messages"][0]["content"].encode("utf-8")) > 10_000
