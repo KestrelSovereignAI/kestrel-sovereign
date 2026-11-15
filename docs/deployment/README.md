@@ -622,14 +622,54 @@ responsive. One coupling remains: a Stop-database write transaction left open
 across a stall (SQLite's write lock, or a PostgreSQL lock on one of the owner's
 rows) holds the renewal back until it ends.
 
-The `FENCED` line names what the owner saw:
+A renewal says where its time goes (#4081). The attempt in flight is in one
+phase at a time: `open` while the heartbeat opens its connection; on SQLite
+`slot_wait` until `BEGIN IMMEDIATE` returns with the writer slot, then
+`write`, `inventory` and `commit`. On PostgreSQL every attempt begins in
+`open` until its transaction holds a connection: the heartbeat's pool
+connects only when its first transaction asks it for a connection, and again
+after it loses one, so connecting to the database is `open`. Then `write`,
+`inventory` and `commit`, where a wait for a row lock on one of the owner's
+rows is part of `write`. Time in `slot_wait` means another connection held
+SQLite's writer slot; time in `commit` is the commit itself, so the volume's
+write latency. An attempt that takes a quarter of the lease or more logs one
+`WARNING` once it finishes, `Distributed Stop owner renewal was slow`, with
+every phase's duration.
+
+On SQLite, any transaction that waits for the writer slot, or holds it, for
+0.5 s or more logs one `WARNING`: `Slow SQLite transaction on <file>: task
+'<name>' waited W s for the writer slot and held it H s until it was
+committed` (or `rolled back`, or `cancelled` when its connection was already
+closing), followed by the stack of the code that opened it: each frame's file,
+line and function, never its source, so it carries no SQL and no parameters. A
+long hold names the holder; a long wait names a transaction held back by it. A
+cancelled transaction returns at once and leaves its rollback to a background
+task, which holds the slot until it ends. Its task name and opener are taken
+when it is cancelled, and its one warning is logged when that rollback ends,
+with the hold running to then:
+`held it H s until the rollback it handed off when it was cancelled ended`.
+One cancelled before `BEGIN IMMEDIATE` returned says `did not acquire it
+before it was cancelled; its rollback ended R s later`, since SQLite may have
+granted the slot after the cancellation and before the rollback. Every SQLite
+transaction takes the slot, a read-only one included (#4040). Nothing records
+the holder on PostgreSQL: a renewal held back by a row lock shows only as time
+in `write`.
+
+The `FENCED` line names what the owner saw, then when the registry last
+observed the heartbeat: `The registry last observed the owner heartbeat N s
+earlier`. The registry observes from its relay every poll interval, so `N`
+close to the lease or longer means the server's loop did not observe either,
+and the lapse was noticed late. Then:
 
 - `owner lease not renewed for N s (lease is L s): ...`: the heartbeat did not
   renew the lease within it. The rest says why: the heartbeat thread exited,
-  naming why, a renewal has been in flight for `N` s (the database answered
-  slowly), or the last renewal failed, naming the exception and how long ago
-  the last successful renewal started. A failed attempt alone never fences:
-  renewals that succeeded while the loop was blocked still hold the lease.
+  naming why, a renewal has been in flight for `N` s, naming the phase it is
+  in and how long it has been there (`its renewal has been in flight for 2.0
+  s, 1.9 s of it in slot_wait`), a renewal took the lease or more, naming the
+  phase it spent longest in, or the last renewal failed, naming the exception
+  and how long ago the last successful renewal started. A failed attempt alone
+  never fences: renewals that succeeded while the loop was blocked still hold
+  the lease.
 - `durable generation was lost: the owner heartbeat's renewal found it expired
   or removed`: a renewal found an in-flight row gone, so another replica may
   already have reaped it.

@@ -5,11 +5,14 @@ Implementation of DatabaseBackend using aiosqlite.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
 import sqlite3
+import sys
 import time
+import traceback
 import uuid
 import weakref
 from contextlib import asynccontextmanager, contextmanager
@@ -100,6 +103,161 @@ _SQLITE_OWNER_RENEWAL_DEADLINE_S = 5.0
 # own interrupt aborted. Attempts stop at the drain deadline above.
 _CANCELLED_WRITE_ROLLBACK_RETRY_INITIAL_S = 0.01
 _CANCELLED_WRITE_ROLLBACK_RETRY_MAX_S = 0.25
+
+# A transaction that waits this long for the writer slot, or holds it this
+# long, logs one warning naming its task and opener (#4081): on a shared file
+# the holder is what held back everyone who waited, the Stop owner's lease
+# renewal included.
+_SLOW_TRANSACTION_S = 0.5
+# Frames of the transaction machinery, left off the end of the opener's stack:
+# this module's, contextlib's, and any wrapper's ``transaction`` method.
+_TRANSACTION_MACHINERY_FILES = frozenset({__file__, contextlib.__file__})
+_TRANSACTION_MACHINERY_FUNCTION = "transaction"
+
+
+def _transaction_opener() -> str:
+    """The stack of the code that opened the current task's transaction.
+
+    Called at the transaction's exit, while the task's coroutine chain still
+    runs through it: each frame from the task's root coroutine to the
+    transaction, as its file, line and function. Never a source line: a
+    caller's line can be a call that carries SQL text. The transaction
+    machinery's own frames are left off the end.
+    """
+
+    task = asyncio.current_task()
+    root = getattr(task.get_coro(), "cr_frame", None) if task is not None else None
+    frames = []
+    frame = sys._getframe(1)
+    while frame is not None:
+        frames.append(frame)
+        if frame is root:
+            break
+        frame = frame.f_back
+    stack = traceback.StackSummary.extract(
+        ((caller, caller.f_lineno) for caller in reversed(frames)),
+        lookup_lines=False,
+    )
+    while stack and (
+        stack[-1].filename in _TRANSACTION_MACHINERY_FILES
+        or stack[-1].name == _TRANSACTION_MACHINERY_FUNCTION
+    ):
+        stack.pop()
+    return "\n".join(
+        f'  File "{entry.filename}", line {entry.lineno}, in {entry.name}'
+        for entry in stack
+    )
+
+
+def _current_task_name() -> Optional[str]:
+    task = asyncio.current_task()
+    return task.get_name() if task is not None else None
+
+
+def _is_slow_transaction(waited: float, held: Optional[float]) -> bool:
+    return waited >= _SLOW_TRANSACTION_S or (
+        held is not None and held >= _SLOW_TRANSACTION_S
+    )
+
+
+def _log_slow_transaction(
+    db_path: str, *, task_name: Optional[str], waited: float, holding: str, opener: str
+) -> None:
+    logger.warning(
+        "Slow SQLite transaction on %s: task %r waited %.2f s for the writer "
+        "slot and %s. Opened at:\n%s",
+        Path(db_path).name,
+        task_name,
+        waited,
+        holding,
+        opener,
+    )
+
+
+def _warn_if_slow_transaction(
+    db_path: str,
+    *,
+    entered: float,
+    acquired: Optional[float],
+    released: Optional[float],
+    outcome: str,
+) -> None:
+    """Log one warning when a transaction waited for or held the slot too long.
+
+    ``entered`` is when the transaction began waiting for SQLite's writer
+    slot, ``acquired`` when ``BEGIN IMMEDIATE`` returned with it (``None`` if
+    it never did) and ``released`` when its commit or rollback finished, all
+    ``time.monotonic()``. Called at the transaction's exit, in its task: the
+    warning names the database file, that task and the transaction's opener
+    (:func:`_transaction_opener`), captured only when it is logged.
+    """
+
+    now = time.monotonic()
+    waited = (now if acquired is None else acquired) - entered
+    held = None if acquired is None else (now if released is None else released) - acquired
+    if not _is_slow_transaction(waited, held):
+        return
+    _log_slow_transaction(
+        db_path,
+        task_name=_current_task_name(),
+        waited=waited,
+        holding=(
+            "did not acquire it"
+            if held is None
+            else f"held it {held:.2f} s until it was {outcome}"
+        ),
+        opener=_transaction_opener(),
+    )
+
+
+def _warn_if_slow_after_rollback(
+    db_path: str,
+    *,
+    entered: float,
+    acquired: Optional[float],
+    rollback: "asyncio.Future[Any]",
+) -> None:
+    """Time a cancelled transaction through the rollback it handed off.
+
+    A cancelled transaction exits at once and leaves its rollback to a
+    backend-owned task, which holds the writer slot until it ends. Called at
+    the transaction's exit, in its task: it captures that task's name and the
+    opener's stack (:func:`_transaction_opener`) now, while the opener is
+    still on the stack, and logs at most one warning when ``rollback`` ends,
+    with the hold running to then. A transaction cancelled before ``BEGIN
+    IMMEDIATE`` returned held no slot it knew of; its warning names how long
+    the rollback took instead, since the cancelled BEGIN may have taken the
+    slot in SQLite's worker before the rollback interrupted it.
+    """
+
+    exited = time.monotonic()
+    waited = (exited if acquired is None else acquired) - entered
+    task_name = _current_task_name()
+    opener = _transaction_opener()
+
+    def report(_rollback: "asyncio.Future[Any]") -> None:
+        ended = time.monotonic()
+        if acquired is None:
+            took = ended - exited
+            if not _is_slow_transaction(waited, took):
+                return
+            holding = (
+                "did not acquire it before it was cancelled; its rollback "
+                f"ended {took:.2f} s later"
+            )
+        else:
+            held = ended - acquired
+            if not _is_slow_transaction(waited, held):
+                return
+            holding = (
+                f"held it {held:.2f} s until the rollback it handed off when "
+                "it was cancelled ended"
+            )
+        _log_slow_transaction(
+            db_path, task_name=task_name, waited=waited, holding=holding, opener=opener
+        )
+
+    rollback.add_done_callback(report)
 
 
 class ColdReadUnavailable(RuntimeError):
@@ -3255,34 +3413,77 @@ class SQLiteBackend(DatabaseBackend):
         # transaction is one atomic write unit against concurrent writers
         # sharing this connection (#1675).
         committed: Optional[AfterCommitCallbacks] = None
-        async with self._write_guard():
-            with self._write_operation():
-                self._in_transaction = True
-                self._transaction_poisoned = False
-                self._txn_owner = asyncio.current_task()
-                self._after_commit = AfterCommitCallbacks()
-                try:
-                    await conn.execute("BEGIN IMMEDIATE")
-                    yield
-                    self._require_native_transaction()
-                    await self._commit_write(conn)
-                    committed = self._after_commit
-                except asyncio.CancelledError as error:
-                    self._handoff_cancelled_write(conn, error=error)
-                    raise
-                except Exception as e:
-                    await self._rollback_after_failure(conn, error=e)
-                    if is_execution_control_error(e):
-                        raise
-                    raise TransactionError(f"Transaction failed: {e}") from e
-                except BaseException as error:
-                    await self._rollback_after_failure(conn, error=error)
-                    raise
-                finally:
-                    self._in_transaction = False
+        # Waiting for the writer slot spans this connection's write guard and
+        # BEGIN IMMEDIATE's busy wait on the file; holding it spans BEGIN
+        # IMMEDIATE's return to the commit or rollback finishing (#4081).
+        entered = time.monotonic()
+        acquired: Optional[float] = None
+        released: Optional[float] = None
+        outcome = "rolled back"
+        # The backend-owned rollback a cancelled exit handed off, if any. It
+        # holds the slot after this transaction has exited.
+        rollback: Optional[asyncio.Future[Any]] = None
+        try:
+            async with self._write_guard():
+                with self._write_operation():
+                    # The write guard admits no transaction while an earlier
+                    # one's rollback is still running.
+                    earlier_rollback = self._cancelled_write_drain
+                    self._in_transaction = True
                     self._transaction_poisoned = False
-                    self._txn_owner = None
-                    self._after_commit = None
+                    self._txn_owner = asyncio.current_task()
+                    self._after_commit = AfterCommitCallbacks()
+                    try:
+                        await conn.execute("BEGIN IMMEDIATE")
+                        acquired = time.monotonic()
+                        yield
+                        self._require_native_transaction()
+                        await self._commit_write(conn)
+                        committed = self._after_commit
+                        outcome = "committed"
+                    except asyncio.CancelledError as error:
+                        outcome = "cancelled"
+                        self._handoff_cancelled_write(conn, error=error)
+                        raise
+                    except Exception as e:
+                        await self._rollback_after_failure(conn, error=e)
+                        if is_execution_control_error(e):
+                            raise
+                        raise TransactionError(f"Transaction failed: {e}") from e
+                    except BaseException as error:
+                        await self._rollback_after_failure(conn, error=error)
+                        raise
+                    finally:
+                        released = time.monotonic()
+                        # Cancellation here, or in a rollback after a failure,
+                        # hands the rollback to a task that outlives the exit.
+                        drain = self._cancelled_write_drain
+                        if (
+                            drain is not None
+                            and drain is not earlier_rollback
+                            and not drain.done()
+                        ):
+                            rollback = drain
+                        self._in_transaction = False
+                        self._transaction_poisoned = False
+                        self._txn_owner = None
+                        self._after_commit = None
+        finally:
+            if rollback is None:
+                _warn_if_slow_transaction(
+                    self.db_path,
+                    entered=entered,
+                    acquired=acquired,
+                    released=released,
+                    outcome=outcome,
+                )
+            else:
+                _warn_if_slow_after_rollback(
+                    self.db_path,
+                    entered=entered,
+                    acquired=acquired,
+                    rollback=rollback,
+                )
         # Outside the writer slot, with the transaction closed: the
         # callbacks observe committed state and hold up no other writer.
         if committed is not None:

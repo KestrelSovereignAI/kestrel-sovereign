@@ -42,13 +42,20 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.database_clock import (
+    database_backend_type,
     database_lease_cutoff_sql,
     database_now_sql,
 )
 
 from .owner_heartbeat import (
+    PHASE_COMMIT,
+    PHASE_INVENTORY,
+    PHASE_OPEN,
+    PHASE_SLOT_WAIT,
+    PHASE_WRITE,
     OwnerHeartbeat,
     OwnerRenewal,
+    PhaseReporter,
     independent_database_opener,
 )
 from .receipt import (
@@ -834,6 +841,7 @@ class DistributedInvocationStore:
         owner_id: str,
         *,
         lease_seconds: float,
+        phase: PhaseReporter | None = None,
     ) -> _OwnerPoll:
         """Renew a still-live owner and return its exact durable inventory.
 
@@ -843,7 +851,12 @@ class DistributedInvocationStore:
         have reaped.
 
         The registry calls this only from its owner heartbeat, on that
-        heartbeat's own thread and connection (#3889).
+        heartbeat's own thread and connection (#3889). ``phase`` is told each
+        phase of the renewal as it enters it (#4081): on SQLite
+        ``slot_wait`` until ``BEGIN IMMEDIATE`` returns, then ``write``,
+        ``inventory`` and ``commit``; on PostgreSQL ``open`` until the
+        transaction holds a connection, then ``write``, where a wait for a
+        row lock falls, ``inventory`` and ``commit``.
         """
 
         owner_id = _required_identity(owner_id, "owner identity")
@@ -853,14 +866,36 @@ class DistributedInvocationStore:
         # renewal's native COMMIT acknowledgement. Retain this finite original
         # transaction until physical settlement, then propagate caller Stop.
         task = create_owned_task(
-            self._poll_owner_transaction(owner_id, lease_seconds=lease_seconds),
+            self._poll_owner_transaction(
+                owner_id, lease_seconds=lease_seconds, phase=phase
+            ),
             name=f"distributed-stop-owner-poll:{owner_id}",
         )
         return raise_owned_outcome(await await_owned_task(task),
             operation="distributed Stop owner renewal")
 
-    async def _poll_owner_transaction(self, owner_id: str, *, lease_seconds: float) -> _OwnerPoll:
+    async def _poll_owner_transaction(
+        self,
+        owner_id: str,
+        *,
+        lease_seconds: float,
+        phase: PhaseReporter | None,
+    ) -> _OwnerPoll:
+        def enter(name: str) -> None:
+            if phase is not None:
+                phase(name)
+
+        # Every SQLite transaction waits for the writer slot in BEGIN
+        # IMMEDIATE, on a connection the heartbeat opened. A PostgreSQL
+        # transaction first acquires a pool connection, which the heartbeat's
+        # pool establishes only when asked for one; its BEGIN takes no lock,
+        # so its wait is the UPDATE's, for a row lock.
+        if database_backend_type(self._db) == "sqlite":
+            enter(PHASE_SLOT_WAIT)
+        else:
+            enter(PHASE_OPEN)
         async with self._db.transaction(immediate=True):
+            enter(PHASE_WRITE)
             now_sql = database_now_sql(self._db)
             cutoff_sql, cutoff_args = database_lease_cutoff_sql(
                 self._db, float(lease_seconds)
@@ -871,7 +906,11 @@ class DistributedInvocationStore:
                 f"AND heartbeat_at > {cutoff_sql}",
                 (owner_id, *cutoff_args),
             )
-            return await self._owner_inventory(owner_id, lease_seconds=lease_seconds)
+            enter(PHASE_INVENTORY)
+            poll = await self._owner_inventory(owner_id, lease_seconds=lease_seconds)
+            # The transaction commits as this block exits.
+            enter(PHASE_COMMIT)
+        return poll
 
     async def read_owner(
         self,
@@ -1092,6 +1131,9 @@ class DistributedInvocationRegistry:
         self._renewed_at: dict[str, float] = {}
         self._heartbeat: OwnerHeartbeat | None = None
         self._observed_renewal: OwnerRenewal | None = None
+        # ``time.monotonic()`` when the heartbeat was last observed, so a
+        # fence reports how long the registry had not looked (#4081).
+        self._observed_at: float | None = None
         # The heartbeat thread (by launch count) whose exit was reported.
         self._reported_heartbeat_exit = 0
         # A restarted heartbeat's failure to renew the current owner, kept
@@ -1128,13 +1170,14 @@ class DistributedInvocationRegistry:
 
             async def renew(database, owner_id: str) -> _OwnerPoll:
                 return await DistributedInvocationStore(database).poll_owner(
-                    owner_id, lease_seconds=lease_seconds
+                    owner_id, lease_seconds=lease_seconds, phase=heartbeat.enter_phase
                 )
 
             heartbeat = OwnerHeartbeat(
                 independent_database_opener(self._store._db),
                 renew,
                 interval_seconds=self._poll_seconds,
+                lease_seconds=lease_seconds,
             )
             heartbeat.start(
                 self._candidate_owner_id if self._lease_lost else self._owner_id
@@ -1244,62 +1287,70 @@ class DistributedInvocationRegistry:
         for its insert's reply when that renewal was folded in is published
         afterwards, and the renewal still renewed its row. Only the renewal's
         Stop marks are delivered once.
+
+        Every run records when it ended, whatever it found, so a fence names
+        how long the registry had gone without observing the heartbeat: a
+        lapse noticed late means the loop did not observe either (#4081).
         """
 
-        self._heartbeat_attempt()
-        if self._lease_lost:
-            return
-        if (
-            self._heartbeat_restart_failure is not None
-            and self._standing_restart_failure() is None
-        ):
-            self._heartbeat_restart_failure = None
-        owner_id = self._owner_id
-        heartbeat = self._heartbeat
-        renewal = heartbeat.latest_renewed() if heartbeat is not None else None
-        if renewal is not None and renewal.owner_id == owner_id:
-            unobserved = renewal is not self._observed_renewal
-            self._observed_renewal = renewal
-            live = set(renewal.poll.live_generation_ids)
-            lease_owned = self._lease_owned_generation_ids()
-            if any(
-                generation_id not in live
-                and self._active[generation_id].admitted_at < renewal.started
-                for generation_id in lease_owned
-            ):
-                self._fail_closed_owner(
-                    "durable generation was lost: the owner heartbeat's "
-                    "renewal found it expired or removed"
-                )
+        try:
+            self._heartbeat_attempt()
+            if self._lease_lost:
                 return
-            for generation_id in lease_owned:
-                if (
-                    generation_id in live
-                    and self._renewed_at[generation_id] < renewal.started
-                ):
-                    self._renewed_at[generation_id] = renewal.started
-            for generation_id in (
-                renewal.poll.stop_generation_ids if unobserved else ()
+            if (
+                self._heartbeat_restart_failure is not None
+                and self._standing_restart_failure() is None
             ):
-                target = self._active.get(generation_id)
-                if target is None or target.owner_id != owner_id:
-                    continue
-                cancel = getattr(target.agent, "cancel_current_request", None)
-                if callable(cancel):
-                    cancel(
-                        request_id=target.turn_id,
-                        generation=target.generation,
+                self._heartbeat_restart_failure = None
+            owner_id = self._owner_id
+            heartbeat = self._heartbeat
+            renewal = heartbeat.latest_renewed() if heartbeat is not None else None
+            if renewal is not None and renewal.owner_id == owner_id:
+                unobserved = renewal is not self._observed_renewal
+                self._observed_renewal = renewal
+                live = set(renewal.poll.live_generation_ids)
+                lease_owned = self._lease_owned_generation_ids()
+                if any(
+                    generation_id not in live
+                    and self._active[generation_id].admitted_at < renewal.started
+                    for generation_id in lease_owned
+                ):
+                    self._fail_closed_owner(
+                        "durable generation was lost: the owner heartbeat's "
+                        "renewal found it expired or removed"
                     )
-        now = time.monotonic()
-        oldest = min(
-            (
-                self._renewed_at[generation_id]
-                for generation_id in self._lease_owned_generation_ids()
-            ),
-            default=None,
-        )
-        if oldest is not None and now - oldest >= self._owner_lease_seconds:
-            self._fail_closed_owner(self._lease_lapse_reason(now, oldest))
+                    return
+                for generation_id in lease_owned:
+                    if (
+                        generation_id in live
+                        and self._renewed_at[generation_id] < renewal.started
+                    ):
+                        self._renewed_at[generation_id] = renewal.started
+                for generation_id in (
+                    renewal.poll.stop_generation_ids if unobserved else ()
+                ):
+                    target = self._active.get(generation_id)
+                    if target is None or target.owner_id != owner_id:
+                        continue
+                    cancel = getattr(target.agent, "cancel_current_request", None)
+                    if callable(cancel):
+                        cancel(
+                            request_id=target.turn_id,
+                            generation=target.generation,
+                        )
+            now = time.monotonic()
+            oldest = min(
+                (
+                    self._renewed_at[generation_id]
+                    for generation_id in self._lease_owned_generation_ids()
+                ),
+                default=None,
+            )
+            if oldest is not None and now - oldest >= self._owner_lease_seconds:
+                self._fail_closed_owner(self._lease_lapse_reason(now, oldest))
+        finally:
+            # On every exit, after any fence this observation logged.
+            self._observed_at = time.monotonic()
 
     def _heartbeat_attempt(self) -> OwnerRenewal | None:
         """The heartbeat's newest renewal attempt, once its control is held.
@@ -1981,12 +2032,22 @@ class DistributedInvocationRegistry:
             self._active[generation_id]
             for generation_id in self._lease_owned_generation_ids()
         )
+        observed_at = self._observed_at
+        observed = (
+            "had not observed the owner heartbeat before"
+            if observed_at is None
+            else (
+                "last observed the owner heartbeat "
+                f"{time.monotonic() - observed_at:.1f} s earlier"
+            )
+        )
         logger.error(
-            "Distributed Stop owner FENCED (epoch %d): %s. %d in-flight "
-            "generation(s) self-fenced; new admissions wait for ownership to "
-            "be re-established under a fresh owner identity.",
+            "Distributed Stop owner FENCED (epoch %d): %s. The registry %s. "
+            "%d in-flight generation(s) self-fenced; new admissions wait for "
+            "ownership to be re-established under a fresh owner identity.",
             self._owner_epoch,
             reason,
+            observed,
             len(live_work),
         )
         for target in live_work:
