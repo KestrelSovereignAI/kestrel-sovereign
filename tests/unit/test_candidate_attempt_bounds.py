@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 from unittest.mock import AsyncMock
@@ -80,11 +81,36 @@ def _default_bound(monkeypatch):
     cache.clear()
 
 
-@pytest.fixture
-def loop():
+@pytest.fixture(autouse=True)
+def loop(monkeypatch):
+    # The imported factory's module-private ownership fixture does not travel
+    # with it. Retire real services inside this original loop/config lifetime.
     loop = VirtualClockLoop()
-    yield loop
-    loop.close()
+    services = []
+    resources = AsyncExitStack()
+    factory = _service
+
+    def owned_service(*args, **kwargs):
+        service = factory(*args, **kwargs)
+        services.append(service)
+        resources.push_async_callback(service.close)
+        return service
+
+    monkeypatch.setattr(f"{__name__}._service", owned_service)
+    try:
+        yield loop
+    finally:
+        try:
+            databases = [service._usage_db.backend for service in services if service._usage_db is not None]
+            loop.run_until_complete(resources.aclose())
+            assert all(service._usage_db is None for service in services), (
+                "Virtual-clock test still owns its original usage database"
+            )
+            assert all(not database.is_connected for database in databases), (
+                "Original virtual-clock usage backend did not retire"
+            )
+        finally:
+            loop.close()
 
 
 async def _elapse(loop: VirtualClockLoop, seconds: float) -> None:
