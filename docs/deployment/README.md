@@ -639,18 +639,42 @@ every phase's duration.
 On SQLite, any transaction that waits for the writer slot, or holds it, for
 0.5 s or more logs one `WARNING`: `Slow SQLite transaction on <file>: task
 '<name>' waited W s for the writer slot and held it H s until it was
-committed` (or `rolled back`, or `cancelled` when its connection was already
-closing), followed by the stack of the code that opened it: each frame's file,
-line and function, never its source, so it carries no SQL and no parameters. A
-long hold names the holder; a long wait names a transaction held back by it. A
-cancelled transaction returns at once and leaves its rollback to a background
-task, which holds the slot until it ends. Its task name and opener are taken
-when it is cancelled, and its one warning is logged when that rollback ends,
-with the hold running to then:
-`held it H s until the rollback it handed off when it was cancelled ended`.
-One cancelled before `BEGIN IMMEDIATE` returned says `did not acquire it
-before it was cancelled; its rollback ended R s later`, since SQLite may have
-granted the slot after the cancellation and before the rollback. Every SQLite
+committed`, followed by the stack of the code that opened it: each frame's
+file, line and function, never its source, so it carries no SQL and no
+parameters. A long hold names the holder; a long wait names a transaction held
+back by it. The hold ends when a COMMIT or ROLLBACK that ended the transaction
+returns without raising, and the warning says which:
+
+- `until it was committed`, or `until it was rolled back` after a failure;
+- `until it ended after its commit raised`: a COMMIT that raises may still
+  have taken effect, so this says only that the transaction is over;
+- `until the rollback it handed off when it was cancelled returned`: a
+  cancelled transaction returns at once and leaves its rollback to a
+  background task, which holds the slot until that ROLLBACK returns. Its task
+  name and opener are taken when it is cancelled, and its one warning is
+  logged when that task ends, with the hold running to the ROLLBACK's return.
+  One cancelled before `BEGIN IMMEDIATE` returned says `did not acquire it
+  before it was cancelled; its rollback returned R s later`, since SQLite may
+  have granted the slot after the cancellation and before the rollback;
+- `until it was cancelled during close`: a transaction cancelled while its
+  backend closes leaves its rollback to `close`, which closes the connection
+  and so releases the slot. The hold is measured to the cancellation, and the
+  threshold applies, so a shutdown does not log every transaction it cancels.
+
+When no such return is seen, the release is not confirmed, and the
+transaction may hold the slot until its connection closes. That is logged once
+whatever the durations: `SQLite transaction on <file> may still hold the
+writer slot: task '<name>' waited W s for it and held it at least H s; its
+release was not confirmed (<exception type>)`, with the same stack and the
+type of the failure, never its message. It follows a ROLLBACK that raised
+(for example one an authorizer refused), a cancellation the backend could not
+hand off, and a handed-off rollback that failed or was cancelled. `H` runs to
+the last moment the transaction was known to be open: once its COMMIT was
+issued, that is the COMMIT's start, since the transaction may have ended on
+the connection's worker without being seen, and after a failure that SQLite
+rolled back on its own it is `0`. One cancelled before
+`BEGIN IMMEDIATE` returned says `did not acquire it before it was cancelled;
+the release of a slot it may have taken then was not confirmed`. Every SQLite
 transaction takes the slot, a read-only one included (#4040). Nothing records
 the holder on PostgreSQL: a renewal held back by a row lock shows only as time
 in `write`.
