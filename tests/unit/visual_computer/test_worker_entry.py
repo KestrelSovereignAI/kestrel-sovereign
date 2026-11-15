@@ -325,10 +325,14 @@ async def test_browser_main_joins_close_after_five_seconds_before_original_manag
     wire=canonical_private_worker_programs["wire"]
     private,shared=tmp_path/"private",tmp_path/"shared"
     shared.mkdir()
-    handlers,alarms,events={},[],[]
+    handlers,alarms,events,startup_deadlines={},[],[],[]
     loop=SimpleNamespace(add_signal_handler=lambda number, callback:handlers.setdefault(number,callback))
+    def timeout(seconds):
+        original=asyncio.timeout(seconds)
+        if seconds==20:startup_deadlines.append(original)
+        return original
     monkeypatch.setattr(program,"asyncio",SimpleNamespace(get_running_loop=lambda:loop,
-        Event=asyncio.Event,timeout=asyncio.timeout,sleep=asyncio.sleep))
+        Event=asyncio.Event,timeout=timeout,sleep=asyncio.sleep))
     monkeypatch.setattr(program,"signal",SimpleNamespace(SIGINT=signal.SIGINT,SIGTERM=signal.SIGTERM,
         alarm=lambda seconds:alarms.append(seconds)))
     monkeypatch.setattr(program,"PRIVATE",str(private));monkeypatch.setattr(program,"IPC",str(shared))
@@ -357,7 +361,10 @@ async def test_browser_main_joins_close_after_five_seconds_before_original_manag
         try:yield SimpleNamespace(chromium=SimpleNamespace(launch=launch))
         finally:events.append("original-manager-exit")
     monkeypatch.setattr(program,"original_playwright",manager)
-    async def serve(controller,secret):
+    async def serve(controller,secret,admission,*,startup_deadline):
+        assert secret=="a"*64
+        assert admission=={"worker_incarnation":(private/"incarnation").read_text(),"gid":10003}
+        assert len(startup_deadlines)==1 and startup_deadline==startup_deadlines[0].when()
         handlers[signal.SIGTERM]()
         assert controller._session["state"]=="closing"
         assert alarms[-1]==40,"lifecycle withdrawal must arm the original shutdown watchdog"
