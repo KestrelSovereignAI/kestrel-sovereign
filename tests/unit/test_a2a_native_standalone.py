@@ -316,6 +316,77 @@ async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(sin
 
 
 @pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("middleware", [False, True])
+async def test_inprocess_signed_concurrent_close_preserves_read_deadline(single, protocol, middleware):
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_evidence_carriers
+    from tests.utils.original_failure import fail_original_file_read
+
+    p = single
+    initial, entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    actual = []
+    if middleware:
+        install_passthrough_middleware(p.app)
+
+    class OriginalFinalizer:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                entered.set()
+                await release.wait()
+                fail_original_file_read(actual)
+
+    p.app.add_middleware(OriginalFinalizer)
+    transport = p.publication.inprocess_http_transport(p.app)
+
+    async def consume():
+        async with httpx.AsyncClient(transport=transport, timeout=0.2) as http:
+            client = await signed_sdk_client(p, http, protocol, streaming=True)
+            async for _ in client.send_message(send(p.admission)):
+                initial.set()
+
+    reading, closing, exchange = create_owned_task(consume()), None, None
+    reading.add_done_callback(lambda _: initial.set())
+    try:
+        await initial.wait()
+        assert not reading.done(), "Signed native request ended before its original initial event"
+        await asyncio.sleep(0)
+        exchange, = transport.exchanges
+        closing = create_owned_task(transport.aclose())
+        await entered.wait()
+        closed = await await_owned_task(closing)
+        assert execution_cleanup_debts(closed.error)
+        done, _ = await asyncio.wait((reading,), timeout=0.8)
+        assert reading in done, "Concurrent close stranded the original signed read beyond its deadline"
+        observed = await await_owned_task(reading)
+        assert any(isinstance(error, httpx.ReadTimeout) for error in execution_evidence_carriers(observed.error))
+        assert execution_cleanup_debts(observed.error)
+        assert len(await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks")) == 1
+        assert not exchange.source.producer_task.done() and not exchange.source.producer_task.cancelling()
+    finally:
+        release.set()
+        result = await await_owned_task(reading)
+        if closing is not None:
+            await await_owned_task(closing)
+        if exchange is not None:
+            async with asyncio.timeout(1):
+                await exchange.source.join_source_owners(closing=True)
+            retirement = None
+            try:
+                await transport.aclose()
+            except BaseException as error:
+                retirement = error
+            assert len(actual) == 1
+            assert any(error is actual[0] for failure in (result.error, retirement)
+                       for error in execution_evidence_carriers(failure))
+            assert exchange.source.producer_task.done() and exchange.source.owner_task.done()
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
 @pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
 @pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
 async def test_inprocess_signed_failed_close_admission_retains_late_physical_error(single, protocol, mode, eager):

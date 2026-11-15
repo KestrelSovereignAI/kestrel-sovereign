@@ -137,6 +137,73 @@ async def test_borrowed_observation_withdraws_without_cancelling_or_joining_orig
         await await_owned_task(source)
 
 
+@pytest.mark.parametrize("borrowed", [False, True])
+@pytest.mark.parametrize("withdrawal", ["timeout", "cancelled"])
+async def test_source_terminal_join_is_borrowed_only_when_explicit(borrowed, withdrawal):
+    from kestrel_sdk.native_a2a.utils.source_ownership import CallbackSource
+
+    from kestrel_sovereign._async_ownership import create_owned_iterator
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from tests.utils.original_failure import fail_original_file_read
+
+    next_frame, entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    actual = []
+
+    async def produce(emit):
+        try:
+            await emit("initial")
+            await next_frame.wait()
+            await emit("after withdrawal")
+        finally:
+            entered.set()
+            await release.wait()
+            fail_original_file_read(actual)
+
+    source = await create_owned_iterator(
+        source_factory=lambda resources: CallbackSource(produce),
+        operation="original-terminal-observation",
+    )
+    assert await anext(source) == "initial"
+
+    async def observe():
+        async with asyncio.timeout(0.02 if withdrawal == "timeout" else None):
+            if borrowed:
+                return await source.__anext__(defer_cancellation=False)
+            return await anext(source)
+
+    reading = create_owned_task(observe())
+    try:
+        await asyncio.sleep(0)
+        source.request_stop()
+        next_frame.set()
+        await entered.wait()
+        if withdrawal == "cancelled":
+            reading.cancel("original terminal observer withdrew")
+        done, _ = await asyncio.wait((reading,), timeout=0.08)
+        assert (reading in done) is borrowed
+        assert not source.producer_task.done() and not source.producer_task.cancelling()
+        if borrowed:
+            observed = await await_owned_task(reading)
+            errors = tuple(_explicit_control_chain(observed.error))
+            if withdrawal == "timeout":
+                assert any(isinstance(error, TimeoutError) for error in errors)
+            else:
+                assert any(isinstance(error, asyncio.CancelledError) and error.args == (
+                    "original terminal observer withdrew",
+                ) for error in errors)
+    finally:
+        next_frame.set()
+        release.set()
+        await await_owned_task(reading)
+        outcome = await source.join_source_owners(closing=True)
+        assert len(actual) == 1
+        assert any(error is actual[0] for error in _explicit_control_chain(outcome.error))
+        with pytest.raises(BaseException) as closed:
+            await source.aclose()
+        assert any(error is actual[0] for error in _explicit_control_chain(closed.value))
+        assert source.producer_task.done() and source.owner_task.done()
+
+
 @pytest.mark.asyncio
 async def test_borrowed_callback_removal_failure_cannot_demote_caller_cancellation():
     from kestrel_sovereign.execution_custody import _explicit_control_chain
