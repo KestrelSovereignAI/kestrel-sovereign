@@ -169,20 +169,34 @@ class _Exchange:
             except BaseException as error:
                 self.close_opening = error
                 self.close_task = self.close_admission.task
-        if self.close_task is None:
-            raise self.close_opening
-        observed = await wait_owned_tasks_until((self.close_task,), deadline=self.retirement_deadline)
+        source_tasks = (self.source.producer_task, self.source.owner_task)
+        original_tasks = ((self.close_task, *source_tasks)
+                          if self.close_task is not None else source_tasks)
+        observed = await wait_owned_tasks_until(original_tasks, deadline=self.retirement_deadline)
         debt = pending_owned_retirement_error(
-            self, (self.close_task, self.source.producer_task, self.source.owner_task),
+            self, original_tasks,
             message="Original native ASGI source retirement is still pending",
         )
         if debt is not None:
-            raise execution_observation_error(self.close_opening, observed.cancellation, debt)
-        outcome = await await_owned_task(self.close_task)
-        terminal = execution_observation_error(self.close_opening, outcome.error, outcome.cancellation, observed.cancellation)
+            raise execution_observation_error(
+                self.close_opening, self.source.terminal_error, observed.cancellation, debt,
+            )
+        # An accepted close task can fail publication before its body runs, or
+        # allocation can refuse it entirely. The SAME source owners can still
+        # finish their original cleanup. Harvest those outcomes independently
+        # so a later physical failure never disappears behind admission failure.
+        source = await self.source.join_source_owners(closing=True)
+        outcome = await await_owned_task(self.close_task) if self.close_task is not None else None
+        terminal = execution_observation_error(
+            self.close_opening, source.error, source.cancellation,
+            outcome.error if outcome is not None else None,
+            outcome.cancellation if outcome is not None else None,
+            observed.cancellation,
+        )
         # Settled failure is not pending physical retirement. Concurrent
         # observers still retain this exact exchange/close task and outcome.
-        self.transport.exchanges.discard(self)
+        if self.close_task is not None:
+            self.transport.exchanges.discard(self)
         if terminal is not None:
             raise terminal
 
