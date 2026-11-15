@@ -101,10 +101,16 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
         nonlocal calls
         body = await request.json()
         prompt, current_turn = active_user_turn(body["messages"])
+        compute_subagent = any(
+            message.get('role') == 'system'
+            and 'executing as the ComputeFeature subagent' in str(message.get('content'))
+            for message in body['messages']
+        )
         with request_witness.open("a") as stream:
             stream.write(json.dumps({"path": request.url.path, "model": body.get("model"),
                 "tools": [tool["function"]["name"] for tool in body.get("tools", [])],
                 "last_role": body["messages"][-1]["role"],
+                "compute_subagent": compute_subagent,
                 "message_shapes": [{"role": row['role'],
                     "content_type": type(row.get('content')).__name__,
                     "markers": [marker for marker in ['A2A_TASK_SUBMITTED', 'A2A_COMPLETE',
@@ -128,7 +134,20 @@ def add_owned_provider_routes(app, model: str, request_witness: Path, *, fault: 
         # A finite model script consumes the actual cognition prompt and tool
         # schemas. Task completion still runs through the real governed tool.
         incoming = re.match(r"\[A2A_TASK_SUBMITTED\] Peer `[^`]+` submitted native A2A task `([^`]+)`", prompt)
-        if incoming:
+        compute = re.match(
+            r'^(?:Task: )?(Run owned signed script ([a-f0-9]{32}) through compute_feature\.)',
+            prompt,
+        )
+        if compute:
+            name = 'run_script' if compute_subagent else 'compute_feature'
+            if name not in called:
+                # A denied child deliberately receives the same attempted
+                # call even when its schema was stripped. Core must enforce
+                # the executable palette, not trust a cooperative model.
+                selected = {'name': name}
+                arguments = ({'script_id': compute.group(2), 'executor': 'local', 'timeout': 30}
+                    if compute_subagent else {'task': compute.group(1)})
+        elif incoming:
             replies = [tool for tool in tools if tool['name'].endswith('respond_to_a2a_task')]
             if len(candidates) != 1 or len(replies) != 1:
                 return JSONResponse({"error": "Owned A2A model requires the original marker and task response tools"}, status_code=400)
