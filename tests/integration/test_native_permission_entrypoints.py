@@ -94,6 +94,10 @@ class NativePermissionCase:
             for call in calls:
                 if not call.done():
                     call.cancel()
+            # HTTP cancellation retains its original turn until its private
+            # work settles. Release this fixture's pending approvals before
+            # joining that turn, rather than waiting for our own live queue.
+            self.security.approval_queue.cancel_all()
             if calls:
                 done, pending = await asyncio.wait(calls, timeout=10)
                 assert not pending, "Native permission case retained invocation tasks after bounded cleanup"

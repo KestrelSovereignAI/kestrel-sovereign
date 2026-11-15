@@ -6,8 +6,8 @@ These cases do not establish a full host lifespan or browser acceptance.
 """
 
 import asyncio
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from uuid import uuid4
 
 import httpx2
@@ -17,21 +17,22 @@ import pytest_asyncio
 from kestrel_sovereign.endpoints.agent import router as invoke_router
 from kestrel_sovereign.endpoints.security import router as security_router
 from kestrel_sovereign.features.security.permissions import PermissionLevel
-from tests.integration.mcp_permission_peers import MCPTestPeer, https_peer, owned_provider_network
-from tests.integration.test_native_permission_entrypoints import (
-    NativePermissionCase,
-    native_permission_case as native_permission_case,
-    native_permission_inherited_environment as native_permission_inherited_environment,
+from tests.integration import test_native_permission_entrypoints as entrypoints
+from tests.integration.mcp_permission_peers import (
+    MCPTestPeer,
+    https_peer,
+    owned_provider_network,
 )
 from tests.shared.agent_http import authenticated_agent_app
 
-
 pytestmark = [pytest.mark.asyncio, pytest.mark.mcp_integration, pytest.mark.timeout(120)]
+native_permission_case = entrypoints.native_permission_case
+native_permission_inherited_environment = entrypoints.native_permission_inherited_environment
 
 
 @dataclass
 class NativeSubagentHTTP:
-    case: NativePermissionCase
+    case: entrypoints.NativePermissionCase
     peer: MCPTestPeer
     client: httpx2.AsyncClient
     dials: list
@@ -165,3 +166,18 @@ async def test_native_http_subagent_one_shot_and_invalid_decisions(native_subage
     await native.assert_dispatches([(first, first_status), (second, 'policy_denied')])
     native.assert_native_subagent(leaf_advertised=True)
     assert not case.security.approval_queue.pending_requests
+
+
+async def test_native_http_subagent_cleanup_joins_the_original_pending_approval(native_subagent_http):
+    native = native_subagent_http
+    case = native.case
+    await case.security.permission_store.set_permission('ComputeFeature', 'run_script', PermissionLevel.ASK)
+    script = await case.stage_script()
+    call = native.start(script)
+    original = await case.next_approval(call)
+    assert original.tool_args['script_id'] == script.id
+    case.assert_effect_count(0)
+    await case.retire_calls()
+    assert call.done() and not case.security.approval_queue.pending_requests
+    case.assert_effect_count(0)
+    assert await case.compute.script_store.get_executions_for_script(script.id) == []
