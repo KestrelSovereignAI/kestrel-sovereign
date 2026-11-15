@@ -80,7 +80,11 @@ class NativePermissionCase:
                 if row["feature"] in owners and row["tool"] == "run_script"]
 
     def start(self, entrypoint, script):
-        call = asyncio.create_task(self.invoke(entrypoint, script))
+        return self.own_call(self.invoke(entrypoint, script))
+
+    def own_call(self, awaitable):
+        """Retain the original component or HTTP invocation through cleanup."""
+        call = asyncio.create_task(awaitable)
         self._calls.append(call)
         return call
 

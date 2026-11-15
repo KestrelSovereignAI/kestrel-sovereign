@@ -29,6 +29,7 @@ def test_native_gateway_permission_campaign_cannot_drop_its_cli_or_real_cases():
     legacy = workflow["jobs"]["mcp-permission-seam"]["steps"]
     legacy_campaign, = [step for step in legacy if "pytest tests/integration/test_mcp_permission_boundary.py" in step.get("run", "")]
     assert "--session-timeout=480" in legacy_campaign["run"]
+    assert "tests/integration/test_native_subagent_permission.py" in legacy_campaign["run"]
     assert "test_mcp_gateway_permission_boundary.py" not in legacy_campaign["run"]
 
 
