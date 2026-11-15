@@ -22,8 +22,14 @@ class PrivateStorageError(RuntimeError):
     """Sensitive local storage cannot be opened with exclusive custody."""
 
 
-def _lock_private_file_descriptor(descriptor: int, *, blocking: bool = True) -> Any:
-    """Take one cross-process exclusive lock, optionally refusing contention."""
+def lock_file_descriptor(descriptor: int, *, blocking: bool = True) -> Any:
+    """Take one cross-process exclusive lock, optionally refusing contention.
+
+    Returns the token :func:`unlock_file_descriptor` needs. A refused
+    non-blocking attempt raises ``OSError``. The lock belongs to the open file
+    description, so two descriptors opened separately contend even inside one
+    process.
+    """
 
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI
         import ctypes
@@ -58,8 +64,8 @@ def _lock_private_file_descriptor(descriptor: int, *, blocking: bool = True) -> 
     return None
 
 
-def _unlock_private_file_descriptor(descriptor: int, token: Any) -> None:
-    """Release a lock obtained by ``_lock_private_file_descriptor``."""
+def unlock_file_descriptor(descriptor: int, token: Any) -> None:
+    """Release a lock obtained by :func:`lock_file_descriptor`."""
 
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI
         import ctypes
@@ -304,7 +310,7 @@ def exclusive_private_file_lock(
         label=f"{label} lock",
     )
     try:
-        token = _lock_private_file_descriptor(descriptor, blocking=blocking)
+        token = lock_file_descriptor(descriptor, blocking=blocking)
     except OSError as exc:
         os.close(descriptor)
         raise PrivateStorageError(
@@ -315,7 +321,7 @@ def exclusive_private_file_lock(
         yield
     finally:
         try:
-            _unlock_private_file_descriptor(descriptor, token)
+            unlock_file_descriptor(descriptor, token)
         except OSError:
             # Closing the descriptor releases the ownership even when an
             # explicit unlock reports a teardown-only failure.
@@ -331,8 +337,10 @@ __all__ = [
     "ensure_private_directory",
     "ensure_private_file",
     "exclusive_private_file_lock",
+    "lock_file_descriptor",
     "open_private_file",
     "open_private_file_for_validation",
     "path_exists",
     "require_private_directory",
+    "unlock_file_descriptor",
 ]

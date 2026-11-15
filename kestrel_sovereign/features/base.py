@@ -11,12 +11,14 @@ from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
     ClassVar,
     Dict,
     List,
     Mapping,
     Optional,
+    Tuple,
     Union,
 )
 from typing import (
@@ -25,6 +27,8 @@ from typing import (
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
+
+    from kestrel_sovereign.agent.token_counter import PrivacyEpoch
 from abc import ABC as ABC
 from abc import abstractmethod
 
@@ -166,6 +170,22 @@ class SubagentContextBudgetExceeded(RuntimeError):
     event would be invisible on both the dispatch log and the narration
     audit, the two surfaces an operator would check.
     """
+
+
+class _SubagentSendCheck:
+    """What the subagent's gate decided about one request before it was sent.
+
+    ``refusal`` is the operator-facing reason when the request may not be
+    sent. ``bound`` is the measurement, captured before the send, that a
+    provider's count for this request is later fed against; ``None`` when no
+    limit is known for the model and nothing was measured.
+    """
+
+    __slots__ = ("refusal", "bound")
+
+    def __init__(self, refusal: Optional[str], bound: Optional[Any]) -> None:
+        self.refusal = refusal
+        self.bound = bound
 
 
 class _SubagentDispatchJournal:
@@ -623,12 +643,19 @@ class Feature(_SdkFeature):
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
         request: Optional[str] = None,
+        budget_model: Optional[str] = None,
+        budget_route: Optional[str] = None,
         _dispatch_host: Optional[Any] = None,
     ) -> Any:
         """Give a feature subagent one more step when it narrates but emits no tool.
 
         ``request`` is the task prompt the message answers, for the decision
         check (#3527).
+
+        ``budget_model`` and ``budget_route`` are the model and route the loop
+        learned from the last response. The repair request, the narration and
+        the repair prompt included, is gated on them right before it is sent
+        (#4068).
 
         ``tool_executor`` is threaded through to ``generate_with_messages``
         so codex-routed repair turns don't hit the same "requires a
@@ -669,13 +696,23 @@ class Feature(_SdkFeature):
             "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
             self.name,
         )
+        repair_messages = self._append_missing_tool_call_repair(messages, content)
+        repair_tools = tools if tools else None
+        check = self._subagent_gate_send(
+            repair_messages, budget_model or model_override, repair_tools,
+            system=None, route=budget_route, _dispatch_host=host,
+        )
         require_execution_work(host)
-        repaired = await host.llm_service.generate_with_messages(
-            messages=self._append_missing_tool_call_repair(messages, content),
-            tools=tools if tools else None,
-            tool_executor=tool_executor,
-            model_override=model_override,
-            invocation_context=_subagent_turn_identity(session_id),
+        repaired = await self._subagent_measured_send(
+            check,
+            lambda: host.llm_service.generate_with_messages(
+                messages=repair_messages,
+                tools=repair_tools,
+                tool_executor=tool_executor,
+                model_override=model_override,
+                invocation_context=_subagent_turn_identity(session_id),
+            ),
+            _dispatch_host=host,
         )
         require_execution_work(host)
         # A repair that neither calls a tool nor ran one inline either confirms
@@ -1971,19 +2008,45 @@ class Feature(_SdkFeature):
                 )
                 if feature_tools else None
             )
-            require_execution_work(host)
-            response = await host.llm_service.generate(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                tools=feature_tools if feature_tools else None,
-                tool_executor=tool_executor,
-                model_override=model_override,
-                # Safe as the plain parameter here, unlike on the continuation
-                # calls below: ``generate`` never forwards ``session_id`` to an
-                # adapter (it feeds only the invocation context and the span),
-                # so it carries no provider-continuation meaning to collide with.
-                session_id=turn_session_id,
+            # The first request is gated like every later one (#4068): its
+            # system prompt travels beside the user prompt, and the only model
+            # known before a response is ``model_override``.
+            first_tools = feature_tools if feature_tools else None
+            first_check = self._subagent_gate_send(
+                [{"role": "user", "content": user_prompt}],
+                model_override,
+                first_tools,
+                system=system_prompt,
+                route=None,
+                _dispatch_host=host,
             )
+            require_execution_work(host)
+            response = await self._subagent_measured_send(
+                first_check,
+                lambda: host.llm_service.generate(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    tools=first_tools,
+                    tool_executor=tool_executor,
+                    model_override=model_override,
+                    # Safe as the plain parameter here, unlike on the continuation
+                    # calls below: ``generate`` never forwards ``session_id`` to an
+                    # adapter (it feeds only the invocation context and the span),
+                    # so it carries no provider-continuation meaning to collide with.
+                    session_id=turn_session_id,
+                    # The response that carries the provider's input count, so
+                    # a text-only request feeds the token bound too (#4068).
+                    return_response=True,
+                ),
+                _dispatch_host=host,
+            )
+            if first_tools is None:
+                from kestrel_sdk.llm import LLMResponse
+
+                if isinstance(response, LLMResponse):
+                    # What ``generate`` returns for a text-only call without
+                    # ``return_response``.
+                    response = response.content or ""
             require_execution_work(host)
 
             # Log what we got back
@@ -2645,7 +2708,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 
             limit = get_token_counter(model).resolved_context_limit()
         except Exception as e:
-            logger.debug(f"{self.name}: no context limit for {model!r}: {e}")
+            logger.warning(
+                "%s: no context limit for %r (%s); the subagent's requests are "
+                "not bounded", self.name, model, type(e).__name__,
+            )
             return None
         if not limit or limit <= 0:
             return None
@@ -2653,13 +2719,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 
     @staticmethod
     def _subagent_wire_chars(messages: List[Dict[str, Any]]) -> str:
-        """The array serialised the way it goes on the wire.
+        """The payload the gate counted with ``count`` before #4068.
 
-        ``count_messages`` reads only ``content``, so it cannot see a tool
-        call's ``arguments`` or an assistant turn's ``reasoning_content`` --
-        both of which are resent every iteration and, on a thinking model,
-        can be the larger share. Serialising the whole message measures what
-        is actually sent.
+        Kept only for the old count a refusal's log line reports beside the
+        bound. The gate itself measures with ``TokenCounter.upper_bound``.
         """
         import json as _json
 
@@ -2673,8 +2736,18 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         messages: List[Dict[str, Any]],
         model: Optional[str],
         tools: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[str]:
-        """Return an operator-facing reason when ``messages`` will not fit.
+        *,
+        system: Optional[str],
+        route: Optional[str] = None,
+        privacy_epoch: Optional["PrivacyEpoch"] = None,
+    ) -> _SubagentSendCheck:
+        """Decide whether one request, exactly as it will be sent, may be sent.
+
+        ``system`` is the system prompt when it travels beside ``messages``
+        (the first ``generate``), and ``None`` when it is the array's first
+        message. Every call site passes it. The request is measured with
+        ``TokenCounter.upper_bound``, an upper bound from its bytes; tiktoken's
+        ``count`` undercounted a Claude request by 43% (#4068).
 
         Why this refuses instead of trimming. Trimming is model-visible
         pruning, and salvage.py's invariant forbids that without "a
@@ -2690,35 +2763,253 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         is the only behaviour that neither loses data nor sends a request the
         provider will certainly reject. Once tool results have a durable home,
         this is the seam that becomes a microcompact-and-salvage step.
+
+        A gate that cannot measure cannot say "fits": a request ``upper_bound``
+        refuses, and any error while measuring, is refused too. Only a model
+        with no known limit is not enforced.
         """
+        from kestrel_sovereign.agent.token_counter import (
+            MeasurementRefusal,
+            count_token_bound_event,
+            get_token_counter,
+        )
+
         budget = self._subagent_context_budget(model)
         if budget is None:
-            return None
+            return _SubagentSendCheck(None, None)
         try:
-            from kestrel_sovereign.agent.token_counter import get_token_counter
-
             counter = get_token_counter(model)
-            # Count the SERIALISED payload, not `count_messages`: that helper
-            # reads only `content`, missing tool-call `arguments` and
-            # `reasoning_content`, and never sees the tool schemas that are
-            # resent with every request. See _subagent_wire_chars.
-            payload = self._subagent_wire_chars(messages)
-            if tools:
-                payload += self._subagent_wire_chars(tools)
-            used = counter.count(payload)
-        except Exception as e:
-            logger.debug(f"{self.name}: could not measure subagent context: {e}")
-            return None
-        if used <= budget:
-            return None
+            bound = counter.upper_bound(
+                system, messages, tools, route=route, privacy_epoch=privacy_epoch,
+            )
+        except Exception as error:  # noqa: BLE001 - a gate that cannot measure refuses
+            count_token_bound_event("subagent_gate_measure_error")
+            logger.warning(
+                "[SUBAGENT %s] refused: measuring the request failed (%s) for model %r",
+                self.name, type(error).__name__, model,
+            )
+            return _SubagentSendCheck(
+                f"Subagent {self.name!r} cannot send its request: measuring it "
+                f"failed ({type(error).__name__}: {error}), and a request that "
+                f"cannot be measured is not sent.",
+                None,
+            )
+        if isinstance(bound, MeasurementRefusal):
+            count_token_bound_event("subagent_gate_unmeasurable")
+            logger.warning(
+                "[SUBAGENT %s] refused: %s (model %r)", self.name, bound.reason, model,
+            )
+            return _SubagentSendCheck(
+                f"Subagent {self.name!r} cannot send its request: {bound.reason}, "
+                f"and a request that cannot be measured is not sent.",
+                None,
+            )
+        if bound.tokens <= budget:
+            return _SubagentSendCheck(None, bound)
+        count_token_bound_event("subagent_gate_over_budget")
+        logger.warning(
+            "[SUBAGENT %s] refused: bound=%d tokens (%d wire bytes) count=%s "
+            "budget=%d model=%r route=%s",
+            self.name, bound.tokens, bound.wire_bytes,
+            self._subagent_old_count(counter, system, messages, tools),
+            budget, model, bound.route or "unknown",
+        )
+        return _SubagentSendCheck(
+            f"Subagent {self.name!r} exceeded its context budget: its next "
+            f"request is bounded at {bound.tokens:,} tokens against a "
+            f"{budget:,} ceiling for model {model!r}. The tool-call loop "
+            f"accumulates every tool result and resends them, and tool results "
+            f"have no durable store to be salvaged into, so the loop stops here "
+            f"rather than dropping them silently or sending a request the "
+            f"provider will reject. Narrow the task, or have the tool return less.",
+            bound,
+        )
+
+    def _subagent_old_count(self, counter: Any, system: Any, messages: Any, tools: Any) -> str:
+        """What tiktoken's ``count`` says, for a refusal's log line only."""
+        payload = self._subagent_wire_chars(messages)
+        if system is not None:
+            payload = self._subagent_wire_chars([system]) + payload
+        if tools:
+            payload += self._subagent_wire_chars(tools)
+        try:
+            return str(counter.count(payload))
+        except Exception as error:  # noqa: BLE001 - the line reports it; the decision stands
+            return f"unavailable ({type(error).__name__})"
+
+    def _subagent_gate_send(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str],
+        tools: Optional[List[Dict[str, Any]]],
+        *,
+        system: Optional[str],
+        route: Optional[str],
+        _dispatch_host: Optional[Any] = None,
+    ) -> _SubagentSendCheck:
+        """Run the gate on the request about to be sent; raise when it refuses."""
+        host = _dispatch_host if _dispatch_host is not None else self.agent
+        _, privacy_epoch = self._subagent_ratchet_privacy(host)
+        check = self._subagent_context_overflow(
+            messages, model, tools,
+            system=system, route=route, privacy_epoch=privacy_epoch,
+        )
+        if check.refusal is not None:
+            logger.error(f"[SUBAGENT {self.name}] {check.refusal}")
+            raise SubagentContextBudgetExceeded(check.refusal)
+        return check
+
+    @staticmethod
+    def _subagent_ratchet_privacy(host: Any) -> Tuple[bool, Optional["PrivacyEpoch"]]:
+        """Whether a sample may be persisted now, and whose privacy epoch it belongs to.
+
+        The epoch is the host agent's, owned by its DID: co-hosted agents share
+        one ratchet, and a sample held in memory for one agent's epoch is
+        neither applied to nor dropped by another agent (#4068). ``None`` when
+        the host names no DID or no epoch.
+        """
+        from kestrel_sovereign.agent.token_counter import PrivacyEpoch
+        from kestrel_sovereign.storage.privacy_wrapper import persistent_writes_allowed
+
+        persist = persistent_writes_allowed(getattr(host, "storage", None))
+        owner = getattr(host, "did", None)
+        epoch_of = getattr(host, "_get_privacy_policy_epoch", None)
+        epoch = None
+        if callable(epoch_of):
+            try:
+                epoch = epoch_of()
+            except AttributeError:
+                epoch = None
+        if not (isinstance(owner, str) and owner and isinstance(epoch, str) and epoch):
+            return persist, None
+        return persist, PrivacyEpoch(owner=owner, epoch=epoch)
+
+    async def _subagent_measured_send(
+        self,
+        check: _SubagentSendCheck,
+        send: Callable[[], Awaitable[Any]],
+        *,
+        _dispatch_host: Optional[Any] = None,
+    ) -> Any:
+        """Await one gated send and feed its count to the ratchet.
+
+        The sample pairs the bytes ``check`` captured before the send with the
+        response's total input count, or with the count inside a ``prompt is
+        too long`` rejection. A failed send raises the service's own error,
+        unchanged, after its counts are fed.
+
+        ``LLMError`` is the base both service failures share: the first
+        ``generate`` raises ``LLMAllProvidersFailedError`` when every route
+        failed, which is not an ``LLMServiceError``. Its rejections are fed
+        under the route each came from.
+
+        A rejection is fed only under the route that counted it. The bound's
+        route is the route of the previous response, and a continuation may
+        fail on another one: its count, with that route's overhead, would
+        teach the route that rejected it a bound below its own count. A count
+        whose route is not known is not learned; it is logged and counted.
+        """
+        from kestrel_sovereign.llm.error_handling import LLMError
+
+        host = _dispatch_host if _dispatch_host is not None else self.agent
+        try:
+            response = await send()
+        except LLMError as error:
+            if check.bound is not None:
+                from kestrel_sovereign.agent.token_counter import (
+                    count_token_bound_event,
+                    rejected_prompt_samples,
+                )
+
+                for route, counted in rejected_prompt_samples(error):
+                    if route is None:
+                        count_token_bound_event("rejection_route_unknown")
+                        logger.warning(
+                            "[SUBAGENT %s] size rejection not learned: no route attempt "
+                            "carries its count (T=%d wire_bytes=%d bound model=%s)",
+                            self.name, counted, check.bound.wire_bytes, check.bound.model,
+                        )
+                        continue
+                    # A rejection counts the request as it was sent and names
+                    # no model.
+                    self._subagent_feed(check, counted, route, host, served_model=None)
+            raise
+        self._subagent_feed_response(check, response, host)
+        return response
+
+    def _subagent_feed_response(self, check: _SubagentSendCheck, response: Any, host: Any) -> None:
+        """Feed a response's total input count (input + cache read + cache creation)."""
+        if check.bound is None or isinstance(response, str) or response is None:
+            return
+        # A route that ran tools inside the call reports the count of requests
+        # this gate never measured.
+        if getattr(response, "executed_tool_calls", None):
+            return
+        counts = [
+            getattr(response, name, None)
+            for name in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        ]
+        if not isinstance(counts[0], int) or isinstance(counts[0], bool):
+            return
+        total = sum(
+            value for value in counts
+            if isinstance(value, int) and not isinstance(value, bool)
+        )
+        route = self._subagent_response_route(response) or check.bound.route
+        served = getattr(response, "model", None)
+        self._subagent_feed(
+            check, total, route, host,
+            served_model=served if isinstance(served, str) else "",
+        )
+
+    @staticmethod
+    def _subagent_response_route(response: Any) -> Optional[str]:
+        """The route the service stamped on a response, when it did."""
+        provider = getattr(response, "provider", None)
+        return provider if isinstance(provider, str) and provider else None
+
+    def _subagent_bound_target(
+        self,
+        response: Any,
+        *,
+        model_override: Optional[str],
+        model: Optional[str],
+        route: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """The model and route the gate bounds the next request against.
+
+        They are the model and route of the most recent response the service
+        returned in this run (#4068). Every place the loop assigns a response
+        calls this before another gate runs: the first response, the repair
+        before the loop, each continuation, and the repair inside the loop. A
+        repair can be answered by another route than the response it repairs,
+        and that route's learned overhead must bound what is sent next.
+
+        ``model`` and ``route`` are the current values: a response that names
+        no model or no route keeps them. ``model_override`` wins over any
+        response's model.
+        """
         return (
-            f"Subagent {self.name!r} exceeded its context budget: {used:,} tokens "
-            f"against a {budget:,} ceiling for model {model!r}. The tool-call "
-            f"loop accumulates every tool result and resends them, and tool "
-            f"results have no durable store to be salvaged into, so the loop "
-            f"stops here rather than dropping them silently or sending a "
-            f"request the provider will reject. Narrow the task, or have the "
-            f"tool return less."
+            model_override or getattr(response, "model", None) or model,
+            self._subagent_response_route(response) or route,
+        )
+
+    def _subagent_feed(
+        self, check: _SubagentSendCheck, total: int, route: str, host: Any, *,
+        served_model: Optional[str],
+    ) -> None:
+        """Hand one sample to the ratchet.
+
+        ``served_model`` is the model the response names (``""`` when none),
+        or ``None`` for a rejection's count; the ratchet learns a response's
+        count only for a model in the bound's family.
+        """
+        from kestrel_sovereign.agent.token_counter import record_input_sample
+
+        persist, privacy_epoch = self._subagent_ratchet_privacy(host)
+        record_input_sample(
+            check.bound, total, route=route, served_model=served_model,
+            persist=persist, privacy_epoch=privacy_epoch,
         )
 
     async def _handle_feature_tool_calls(
@@ -2791,8 +3082,13 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         # leave the budget resolving "auto" -> the 32768 default and refusing
         # a subagent on a 1,000,000-token window at ~28k. ``LLMResponse``
         # carries the model the provider actually served, so the loop learns
-        # it from the response it already has.
-        effective_model = model_override or getattr(response, "model", None)
+        # it from the response it already has. The route that served it is
+        # learned the same way, so the gate applies that route's overhead.
+        # Both follow the most recent response: every assignment of
+        # ``response`` below updates them through ``_subagent_bound_target``.
+        effective_model, effective_route = self._subagent_bound_target(
+            response, model_override=model_override, model=None, route=None,
+        )
 
         # Build message history for multi-turn tool calling
         messages = [
@@ -2811,7 +3107,13 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 model_override=model_override,
                 session_id=session_id,
                 request=user_prompt,
+                budget_model=effective_model,
+                budget_route=effective_route,
                 _dispatch_host=host,
+            )
+            effective_model, effective_route = self._subagent_bound_target(
+                response, model_override=model_override,
+                model=effective_model, route=effective_route,
             )
             if isinstance(response, str):
                 return response
@@ -2885,12 +3187,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             # whole, so this is where an unbounded run is caught -- see
             # ``_subagent_context_overflow`` for why it refuses instead of
             # trimming.
-            overflow = self._subagent_context_overflow(
-                messages, effective_model, tools
+            continuation_tools = tools if tools else None
+            check = self._subagent_gate_send(
+                messages, effective_model, continuation_tools,
+                system=None, route=effective_route, _dispatch_host=host,
             )
-            if overflow is not None:
-                logger.error(f"[SUBAGENT {self.name}] {overflow}")
-                raise SubagentContextBudgetExceeded(overflow)
 
             # Continue conversation with tool results — thread the
             # ``tool_executor`` through so codex-routed continuation
@@ -2898,20 +3199,25 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             # provider error the initial subagent call avoided
             # (codex round 1 P2 on #1461 follow-up).
             require_execution_work(host)
-            response = await host.llm_service.generate_with_messages(
-                messages=messages,
-                tools=tools if tools else None,
-                tool_executor=tool_executor,
-                model_override=model_override,
-                # Turn session as invocation identity, not as the wire session:
-                # the subagent shares the turn's Timeline band but must NOT
-                # share its provider thread (:func:`_subagent_turn_identity`).
-                invocation_context=_subagent_turn_identity(session_id),
+            response = await self._subagent_measured_send(
+                check,
+                lambda: host.llm_service.generate_with_messages(
+                    messages=messages,
+                    tools=continuation_tools,
+                    tool_executor=tool_executor,
+                    model_override=model_override,
+                    # Turn session as invocation identity, not as the wire session:
+                    # the subagent shares the turn's Timeline band but must NOT
+                    # share its provider thread (:func:`_subagent_turn_identity`).
+                    invocation_context=_subagent_turn_identity(session_id),
+                ),
+                _dispatch_host=host,
             )
             require_execution_work(host)
 
-            effective_model = (
-                model_override or getattr(response, "model", None) or effective_model
+            effective_model, effective_route = self._subagent_bound_target(
+                response, model_override=model_override,
+                model=effective_model, route=effective_route,
             )
 
             # If response is string or has no more tool calls, we're done
@@ -2919,12 +3225,9 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 return response
 
             if not hasattr(response, 'tool_calls') or not response.tool_calls:
-                overflow = self._subagent_context_overflow(
-                    messages, effective_model, tools
-                )
-                if overflow is not None:
-                    logger.error(f"[SUBAGENT {self.name}] {overflow}")
-                    raise SubagentContextBudgetExceeded(overflow)
+                # The repair gates its own request, narration and repair prompt
+                # included, right before it sends; a final answer that needs no
+                # repair sends nothing and is not refused.
                 response = await self._repair_subagent_premature_yield(
                     response,
                     messages,
@@ -2933,7 +3236,13 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     model_override=model_override,
                     session_id=session_id,
                     request=user_prompt,
+                    budget_model=effective_model,
+                    budget_route=effective_route,
                     _dispatch_host=host,
+                )
+                effective_model, effective_route = self._subagent_bound_target(
+                    response, model_override=model_override,
+                    model=effective_model, route=effective_route,
                 )
                 if isinstance(response, str):
                     return response

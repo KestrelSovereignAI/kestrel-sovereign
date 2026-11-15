@@ -45,7 +45,8 @@ from .error_handling import (
     LLMError,
     LLMProviderError,
     LLMProviderUnavailableError,
-    LLMAllProvidersFailedError
+    LLMAllProvidersFailedError,
+    stamp_attempt_route,
 )
 from .openai_adapter import OpenAIAdapter
 from .adapter import (
@@ -4837,6 +4838,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         recorded as a failed attempt, and a fallback loop moves on from it as
         from any other failure, except on a route whose harness owns its
         transport (:func:`~kestrel_sovereign.llm.streaming.is_harness_owned_stall`).
+
+        Every error the adapter or the generation gate raises here names
+        ``provider_name`` as its route
+        (:func:`~kestrel_sovereign.llm.error_handling.attempt_route`), so a
+        size rejection read behind a route walk's own error is learned under
+        the route that counted it (#4068). The error raised is the same one.
         """
 
         from .completion_protocol import adapter_call
@@ -4871,6 +4878,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             except Exception as exc:
                 if is_execution_control_error(exc):
                     raise
+                # Whoever reads this error behind a route walk's own error can
+                # tell which route raised it (#4068).
+                stamp_attempt_route(exc, provider_name)
                 await require_native_execution_admission(self)
                 reported = reported_usage(exc)
                 usage_available = response_usage_available(reported)
@@ -4904,6 +4914,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                         response, provider_name=provider_name, model=model,
                     )
                 except IncompleteGenerationError as rejected:
+                    stamp_attempt_route(rejected, provider_name)
                     usage_available = response_usage_available(response)
                     await self._finalize_failed_invocation(
                         provider_name,

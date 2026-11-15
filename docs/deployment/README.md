@@ -681,5 +681,40 @@ fails with `Distributed Stop owner heartbeat has not retired`, naming the
 thread or the connection, and keeps the Stop registry and its database open
 rather than closing them under a renewal that may still hold a transaction.
 
+### A subagent is refused with `exceeded its context budget`
+A feature subagent measures each request before sending it, as an upper bound
+on its tokens taken from the request's bytes (#4068): tiktoken's count was 43%
+low for a Claude request on 2026-11-13. Each refusal logs one `WARNING`,
+`[SUBAGENT <feature>] refused: bound=... count=... budget=... model=... route=...`,
+where `count` is the old tiktoken figure, so the refusals can be counted. The
+bound overstates ordinary prose, so a prose-heavy subagent is refused at about
+half its real window until compaction lands (#4067).
+
+The bound learns from the counts providers report. Its values live in
+`token_bound_ratchet.json`, beside the context-limit cache
+(`$KESTREL_CONTEXT_LIMITS_CACHE_FILE`, default
+`~/.kestrel/discovered_context_limits.json`). Each value is stored with the
+sizes and counts of the sample that moved it, never content. Delete the file,
+or one entry, to reset it; a running host picks the change up. A missing or
+unreadable file means the starting values, and the gate still refuses.
+
+Every host sharing the file publishes one value at a time under
+`token_bound_ratchet.json.lock` beside it: it re-reads the file and keeps the
+stricter value, so a host never overwrites a lower `bpt_min` or a higher
+`overhead` another host wrote. A writer waits at most 250 ms for that lock,
+because the wait blocks the event loop every co-hosted agent shares. A value
+that cannot be published logs `Could not persist token bound ratchet` and is
+held in that process until it exits, or until the file holds a value as strict
+(the next publish of that key writes the stricter of the two). Deleting the
+file does not reset a held value that never reached it; every load of the file
+logs a warning naming such values. A sample observed in a volatile privacy
+mode is never written: it is kept in memory for that agent's privacy epoch
+only, and another agent on the same host neither uses it nor drops it. A
+response from a model outside the family the request was bounded for is not
+learned from, and logs `Token bound sample not learned`. A `prompt is too long`
+rejection is learned under the route that rejected it, which can differ from
+the route of the subagent's previous response; one whose route is not known
+is not learned, and logs `size rejection not learned`.
+
 ### Logs not appearing in Cloud Run
 Python `logging.info()` calls from request handlers don't always reach Cloud Run's structured log pipeline. Use `print(json.dumps({"severity": "WARNING", "message": "..."}), flush=True)` for debugging.

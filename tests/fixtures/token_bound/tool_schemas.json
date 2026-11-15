@@ -1,0 +1,673 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_41b86c",
+      "description": "Does one thing with 2f5921ec04; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for 044d05."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for 47b390."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for d0d430."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_800e53",
+      "description": "Does one thing with 75134b7a32; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for 240dd1."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for 9e42bf."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for 5a55d1."
+          },
+          "arg_3": {
+            "type": "integer",
+            "description": "Argument 3 of the tool, used for 923008."
+          },
+          "arg_4": {
+            "type": "boolean",
+            "description": "Argument 4 of the tool, used for 272ec7."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_26ce9c",
+      "description": "Does one thing with d5a0c88c8c; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for 62ab54."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for f08edc."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_44a8ef",
+      "description": "Does one thing with 901ca7defd; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for c691f2."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for ebd522."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for 93f9ae."
+          },
+          "arg_3": {
+            "type": "string",
+            "description": "Argument 3 of the tool, used for ea2eb3."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_5e3575",
+      "description": "Does one thing with 956df6b0ad; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "string",
+            "description": "Argument 0 of the tool, used for f22e7b."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for 9495e0."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for 309cd9."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_b27e49",
+      "description": "Does one thing with 117b2556d1; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for 384a58."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for c64f00."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for 8ca7df."
+          },
+          "arg_3": {
+            "type": "string",
+            "description": "Argument 3 of the tool, used for cbba32."
+          },
+          "arg_4": {
+            "type": "boolean",
+            "description": "Argument 4 of the tool, used for 6d420b."
+          },
+          "arg_5": {
+            "type": "string",
+            "description": "Argument 5 of the tool, used for 7f2c34."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_443bc6",
+      "description": "Does one thing with 7d8aa49739; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "integer",
+            "description": "Argument 0 of the tool, used for 50788b."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for f1ed7b."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for 093292."
+          },
+          "arg_3": {
+            "type": "integer",
+            "description": "Argument 3 of the tool, used for 17a12f."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_c51e47",
+      "description": "Does one thing with de607b08ec; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for b1d2fe."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for fa6e82."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for ea7461."
+          },
+          "arg_3": {
+            "type": "string",
+            "description": "Argument 3 of the tool, used for bc83ac."
+          },
+          "arg_4": {
+            "type": "string",
+            "description": "Argument 4 of the tool, used for 3fb12d."
+          },
+          "arg_5": {
+            "type": "string",
+            "description": "Argument 5 of the tool, used for 2e2720."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_0fba93",
+      "description": "Does one thing with a1fea11633; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "string",
+            "description": "Argument 0 of the tool, used for 55d3fb."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for 902174."
+          },
+          "arg_2": {
+            "type": "integer",
+            "description": "Argument 2 of the tool, used for 9f5b99."
+          },
+          "arg_3": {
+            "type": "integer",
+            "description": "Argument 3 of the tool, used for 505c8a."
+          },
+          "arg_4": {
+            "type": "integer",
+            "description": "Argument 4 of the tool, used for 81c97d."
+          },
+          "arg_5": {
+            "type": "integer",
+            "description": "Argument 5 of the tool, used for 1591f3."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_1f72fc",
+      "description": "Does one thing with 2d9bd23ec4; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "integer",
+            "description": "Argument 0 of the tool, used for 84e0a0."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for 2b350e."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for b0b000."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_fbaf87",
+      "description": "Does one thing with 905729ccc1; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "string",
+            "description": "Argument 0 of the tool, used for 19d0c3."
+          },
+          "arg_1": {
+            "type": "string",
+            "description": "Argument 1 of the tool, used for 3a0b52."
+          },
+          "arg_2": {
+            "type": "integer",
+            "description": "Argument 2 of the tool, used for 0959e4."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_ab3c31",
+      "description": "Does one thing with 02a50f10a8; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "string",
+            "description": "Argument 0 of the tool, used for a5a1f9."
+          },
+          "arg_1": {
+            "type": "string",
+            "description": "Argument 1 of the tool, used for 6a1457."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for fa78ac."
+          },
+          "arg_3": {
+            "type": "string",
+            "description": "Argument 3 of the tool, used for c70506."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_05acc0",
+      "description": "Does one thing with ff1631f364; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "integer",
+            "description": "Argument 0 of the tool, used for 449d3c."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for 4f0d49."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for e9782e."
+          },
+          "arg_3": {
+            "type": "string",
+            "description": "Argument 3 of the tool, used for 1b9cc4."
+          },
+          "arg_4": {
+            "type": "integer",
+            "description": "Argument 4 of the tool, used for 965c72."
+          },
+          "arg_5": {
+            "type": "string",
+            "description": "Argument 5 of the tool, used for 162e58."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_465842",
+      "description": "Does one thing with 7ebffcb25f; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "string",
+            "description": "Argument 0 of the tool, used for 38f64e."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for 5dc461."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for 0da26f."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_0e9cec",
+      "description": "Does one thing with 94a7375973; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "string",
+            "description": "Argument 0 of the tool, used for 3bdff7."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for ea92c0."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for 27de91."
+          },
+          "arg_3": {
+            "type": "string",
+            "description": "Argument 3 of the tool, used for cb0370."
+          },
+          "arg_4": {
+            "type": "integer",
+            "description": "Argument 4 of the tool, used for e1ccf1."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_bd1621",
+      "description": "Does one thing with 9e0ce2c028; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "integer",
+            "description": "Argument 0 of the tool, used for c59db6."
+          },
+          "arg_1": {
+            "type": "string",
+            "description": "Argument 1 of the tool, used for 20893b."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for 3fef5f."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_f38801",
+      "description": "Does one thing with c3b5cffd37; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "integer",
+            "description": "Argument 0 of the tool, used for c7efc5."
+          },
+          "arg_1": {
+            "type": "integer",
+            "description": "Argument 1 of the tool, used for 0a4c82."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for 554ecb."
+          },
+          "arg_3": {
+            "type": "integer",
+            "description": "Argument 3 of the tool, used for c90242."
+          },
+          "arg_4": {
+            "type": "boolean",
+            "description": "Argument 4 of the tool, used for e01207."
+          },
+          "arg_5": {
+            "type": "boolean",
+            "description": "Argument 5 of the tool, used for ba9e89."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_31f4dc",
+      "description": "Does one thing with 2a8fb0e93b; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for 38e5a3."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for 5e1c2a."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_ca284c",
+      "description": "Does one thing with 8e0c6a65b7; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for 3f78e2."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for da6d53."
+          },
+          "arg_2": {
+            "type": "integer",
+            "description": "Argument 2 of the tool, used for f3e124."
+          },
+          "arg_3": {
+            "type": "boolean",
+            "description": "Argument 3 of the tool, used for 1cbb34."
+          },
+          "arg_4": {
+            "type": "integer",
+            "description": "Argument 4 of the tool, used for 5631ea."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_db844c",
+      "description": "Does one thing with 81dac67dae; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "boolean",
+            "description": "Argument 0 of the tool, used for b38c76."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for 20a276."
+          },
+          "arg_2": {
+            "type": "boolean",
+            "description": "Argument 2 of the tool, used for 34ea3e."
+          },
+          "arg_3": {
+            "type": "integer",
+            "description": "Argument 3 of the tool, used for b4439d."
+          },
+          "arg_4": {
+            "type": "boolean",
+            "description": "Argument 4 of the tool, used for 13df3c."
+          },
+          "arg_5": {
+            "type": "integer",
+            "description": "Argument 5 of the tool, used for 9639d2."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tool_841886",
+      "description": "Does one thing with 1062a7ec11; returns a JSON object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "arg_0": {
+            "type": "string",
+            "description": "Argument 0 of the tool, used for 4e56b6."
+          },
+          "arg_1": {
+            "type": "boolean",
+            "description": "Argument 1 of the tool, used for 9d1baa."
+          },
+          "arg_2": {
+            "type": "string",
+            "description": "Argument 2 of the tool, used for 91f2f4."
+          },
+          "arg_3": {
+            "type": "integer",
+            "description": "Argument 3 of the tool, used for 0386cb."
+          }
+        },
+        "required": [
+          "arg_0"
+        ]
+      }
+    }
+  }
+]

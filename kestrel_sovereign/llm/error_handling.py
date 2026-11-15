@@ -72,6 +72,36 @@ class LLMAllProvidersFailedError(LLMError):
         super().__init__(f"All providers failed: {error_summary}")
 
 
+#: Runtime attribute on the error one provider attempt raised: the name of the
+#: route the attempt was sent to. A route walk raises its own error from one
+#: route's error, and that error's text does not say which route counted a
+#: ``prompt is too long`` rejection; this does (#4068).
+ATTEMPT_ROUTE_ATTR = "attempt_route"
+
+
+def stamp_attempt_route(error: BaseException, route: str) -> None:
+    """Record on ``error`` that the attempt sent to ``route`` raised it.
+
+    The latest attempt to raise an error names it: a fake or a cache that
+    raises one instance from several routes is read as the route that raised
+    it last. An error that takes no attribute is left as it is, logged, and
+    reads as naming no route.
+    """
+    try:
+        setattr(error, ATTEMPT_ROUTE_ATTR, route)
+    except AttributeError:
+        logger.warning(
+            "Could not record route %s on its %s; a size rejection in it names no route",
+            route, type(error).__name__,
+        )
+
+
+def attempt_route(error: BaseException) -> Optional[str]:
+    """The route whose attempt raised ``error``, if the service recorded one."""
+    route = getattr(error, ATTEMPT_ROUTE_ATTR, None)
+    return route if isinstance(route, str) and route else None
+
+
 def handle_llm_errors(
     provider_name: Optional[str] = None,
     log_errors: bool = True,
