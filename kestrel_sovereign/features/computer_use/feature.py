@@ -44,6 +44,7 @@ from kestrel_sovereign.constitution.hierarchy import (
     DANGEROUS_CAPABILITIES,
     parse_amendment_ix_grants,
 )
+from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.tools.base import ToolCategory
@@ -779,10 +780,92 @@ class ComputerUseFeature(Feature):
         constitutionally-unauthorized callers never trigger any I/O.
         Refusals inside the hook are signalled by raising
         :class:`_PreApprovalRefusal`; the audit row records the reason.
+
+        An exception from any step is a refusal too (#4104): it is audited
+        as ``denied:gate_error`` with the exception's type and message, and
+        the outcome refuses the call. Escaping instead left no audit row,
+        and the caller settled the call as an unconfirmed effect. Execution
+        control is audited the same way and then re-raised, because it is
+        the host's to act on, not a result.
         """
         allowed_by: List[str] = []
         payload = dict(base_payload)
+        try:
+            return await self._gate_sequence(
+                tool_name=tool_name,
+                capability=capability,
+                payload=payload,
+                allowed_by=allowed_by,
+                path_arg=path_arg,
+                write=write,
+                argv=argv,
+                cwd_arg=cwd_arg,
+                pre_approval=pre_approval,
+                exec_required=exec_required,
+            )
+        except Exception as exc:  # noqa: BLE001 - every gate failure is a refusal
+            error = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "computer_use: %s gate raised %s; refusing the call",
+                tool_name, type(exc).__name__, exc_info=True,
+            )
+            unaudited = await self._audit_gate_error(
+                tool_name, payload, allowed_by, error
+            )
+            if is_tool_execution_terminal_error(exc):
+                raise
+            reason = f"gate_error:{error}"
+            if unaudited is not None:
+                reason = f"{reason}; the refusal was not audited: {unaudited}"
+            return _GateOutcome(False, allowed_by, reason)
 
+    async def _audit_gate_error(
+        self,
+        tool_name: str,
+        payload: Dict[str, Any],
+        allowed_by: List[str],
+        error: str,
+    ) -> Optional[str]:
+        """Audit a gate error as ``denied:gate_error``; describe a failed write.
+
+        The refusal stands whether or not its row could be written, so an
+        audit failure is returned for the caller to report rather than
+        raised over the error it was recording.
+        """
+        try:
+            await self._audit_denied(
+                tool_name, payload, allowed_by + ["denied:gate_error"], error=error
+            )
+        except Exception as audit_exc:  # noqa: BLE001 - reported in the refusal
+            if is_tool_execution_terminal_error(audit_exc):
+                raise
+            logger.error(
+                "computer_use: could not audit the %s gate error: %s",
+                tool_name, audit_exc, exc_info=True,
+            )
+            return f"{type(audit_exc).__name__}: {audit_exc}"
+        return None
+
+    async def _gate_sequence(
+        self,
+        *,
+        tool_name: str,
+        capability: str,
+        payload: Dict[str, Any],
+        allowed_by: List[str],
+        path_arg: Optional[str],
+        write: bool,
+        argv: Optional[list[str]],
+        cwd_arg: Optional[str],
+        pre_approval: Optional[_PreApprovalHook],
+        exec_required: bool,
+    ) -> _GateOutcome:
+        """The gate steps of :meth:`_run_gates`, which owns their refusal on error.
+
+        ``allowed_by``, and ``payload`` up to the pre-approval hook, are
+        updated in place, so an error is audited with what the steps before
+        it had resolved.
+        """
         # 0. Readiness
         if not self._cfg.get("enabled", False):
             await self._audit_denied(tool_name, payload, ["denied:readiness:disabled"])

@@ -21,6 +21,8 @@ Glob patterns are honored via ``fnmatch`` (delegated to
 
 from __future__ import annotations
 
+import errno
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -319,6 +321,97 @@ class ArgvPathResult:
     path: str | None = None
 
 
+# ``stat`` says "nothing is there" with ENOENT, or with ENOTDIR when a parent
+# is not a directory. Any other failure leaves the question unanswered.
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
+
+
+def _pathconf(path: Path, name: str) -> int | None:
+    """``os.pathconf(path, name)`` when it reports a limit, else ``None``."""
+    pathconf = getattr(os, "pathconf", None)
+    if pathconf is None:
+        return None
+    try:
+        limit = pathconf(path, name)
+    except (OSError, ValueError):
+        return None
+    return limit if limit > 0 else None
+
+
+def _names_over_byte_limit(candidate: Path) -> list[bytes]:
+    """The components of ``candidate`` longer in bytes than their parent's limit.
+
+    Each component is compared with the ``PC_NAME_MAX`` its own parent
+    directory reports; a parent that reports none (it cannot be reached, or
+    the platform has no ``pathconf``) contributes nothing.
+    """
+    parts = candidate.parts
+    over = []
+    for depth in range(1, len(parts)):
+        limit = _pathconf(Path(*parts[:depth]), "PC_NAME_MAX")
+        name = os.fsencode(parts[depth])
+        if limit is not None and len(name) > limit:
+            over.append(name)
+    return over
+
+
+def _cannot_name_a_file(candidate: Path, error: OSError) -> bool:
+    """Whether a component of ``candidate`` is provably too long to exist (#4104).
+
+    Filesystems measure a name in different units (bytes on Linux; UTF-16
+    units on APFS, HFS+, FAT and NTFS), and a lookup may fold case or
+    compose characters first: APFS finds a 255-character name by a
+    510-code-point decomposed spelling of it, and a 100-character CJK name
+    is 300 bytes against a ``PC_NAME_MAX`` of 255. A length measured here
+    therefore proves nothing in general, and is a proof only where it
+    cannot be wrong:
+
+    - an ASCII name longer than its parent's limit, whatever the probe
+      reported. Every unit counts ASCII the same, and neither case folding
+      nor normalization shortens it. The probe may still answer EACCES:
+      Linux checks search permission on a directory before the length of a
+      name in it.
+    - any name longer in bytes than its limit, when the probe answered
+      ENAMETOOLONG for a path shorter than ``PC_PATH_MAX``: the filesystem
+      itself refused a component, not the path's total length.
+
+    Anything else (a non-ASCII name behind a parent the probe may not
+    search, a path too long in total) is left unanswered.
+    """
+    over = _names_over_byte_limit(candidate)
+    if not over:
+        return False
+    if any(name.isascii() for name in over):
+        return True
+    if error.errno != errno.ENAMETOOLONG:
+        return False
+    path_limit = _pathconf(Path(candidate.anchor), "PC_PATH_MAX")
+    return path_limit is not None and len(os.fsencode(candidate)) < path_limit
+
+
+def _probe(candidate: Path) -> tuple[bool, str | None]:
+    """``(exists, failure)`` for ``candidate``, without raising.
+
+    ``failure`` names why it is unknown whether ``candidate`` exists, and is
+    ``None`` when that is known. A path provably does not exist when nothing
+    is there, or when a component of it is provably longer than its
+    filesystem allows (:func:`_cannot_name_a_file`).
+    ``Path.exists`` is not used: it raises on some errors (ENAMETOOLONG,
+    EACCES), and from Python 3.14 it answers ``False`` for every one of
+    them, so a path the agent cannot look into would skip the approval it
+    needs.
+    """
+    try:
+        os.stat(candidate)
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS or _cannot_name_a_file(candidate, exc):
+            return False, None
+        return False, errno.errorcode.get(exc.errno) or type(exc).__name__
+    except ValueError as exc:
+        return False, type(exc).__name__
+    return True, None
+
+
 def evaluate_argv_paths(
     argv: list[str] | str,
     path_policy: PathPolicy,
@@ -346,13 +439,25 @@ def evaluate_argv_paths(
     - an *existing*, non-allow-listed path → ``REQUIRE_APPROVAL``
       (aggregated, so an auto-approved binary can't bypass the queue for
       an unusual path);
-    - anything else has no effect.
+    - a non-allow-listed path whose existence the probe cannot establish
+      (a total path too long, a parent it may not search, an I/O error)
+      → ``REQUIRE_APPROVAL``, rule ``<rule>:probe_error:<errno>``;
+    - anything else has no effect, including a token with a component
+      provably longer than its filesystem's name limit, which cannot name
+      a file (see :func:`_cannot_name_a_file` for when that is provable).
 
-    Tokens that can't be resolved (traversal/NUL) are skipped. Returns
-    the strictest aggregate — ``ALLOW`` means no argument path changed
-    the binary's decision.
+    It never raises (#4104): an exception here left the ``shell`` gate
+    before its audit row. Tokens that can't be resolved (traversal/NUL)
+    are skipped; a token that fails to resolve for any other reason
+    (``~user`` naming no user) gives ``REQUIRE_APPROVAL``, and a string
+    ``shlex`` cannot tokenize gives ``DENY``, since none of its
+    arguments can be vetted. Returns the strictest aggregate — ``ALLOW``
+    means no argument path changed the binary's decision.
     """
-    tokens = split_command(argv) if isinstance(argv, str) else list(argv)
+    try:
+        tokens = split_command(argv) if isinstance(argv, str) else list(argv)
+    except ValueError as exc:
+        return ArgvPathResult(Decision.DENY, f"unparseable_argv:{exc}")
     aggregate = ArgvPathResult(Decision.ALLOW, "no_path_args")
     for token in tokens[1:]:
         if not token or token.startswith("-"):
@@ -361,12 +466,26 @@ def evaluate_argv_paths(
             candidate = resolve_realpath(token, base=cwd)
         except PathSafetyError:
             continue
+        except (OSError, RuntimeError, ValueError) as exc:
+            aggregate = ArgvPathResult(
+                Decision.REQUIRE_APPROVAL, f"unresolvable:{type(exc).__name__}", token
+            )
+            continue
         result = path_policy.evaluate(candidate, write=False)
         if result.decision is Decision.DENY:
             return ArgvPathResult(Decision.DENY, result.rule, str(candidate))
-        if result.decision is Decision.REQUIRE_APPROVAL and candidate.exists():
+        if result.decision is not Decision.REQUIRE_APPROVAL:
+            continue
+        exists, failure = _probe(candidate)
+        if exists:
             aggregate = ArgvPathResult(
                 Decision.REQUIRE_APPROVAL, result.rule, str(candidate)
+            )
+        elif failure is not None:
+            aggregate = ArgvPathResult(
+                Decision.REQUIRE_APPROVAL,
+                f"{result.rule}:probe_error:{failure}",
+                str(candidate),
             )
     return aggregate
 
