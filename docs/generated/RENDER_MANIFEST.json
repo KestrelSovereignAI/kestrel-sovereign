@@ -4845,6 +4845,26 @@
     },
     {
       "existing_code_refs": [
+        "AGENTS.md",
+        "kestrel_sovereign/llm/adapter.py",
+        "kestrel_sovereign/llm/anthropic_adapter.py",
+        "kestrel_sovereign/llm/claude_max_adapter.py",
+        "kestrel_sovereign/llm/provider_registry.py",
+        "kestrel_sovereign/llm/retry.py",
+        "kestrel_sovereign/llm/service.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/research/4097-plan-allowance-step0.md",
+      "privacy": "public",
+      "render": "archive",
+      "status": "snapshot",
+      "title": "Plan allowance, step 0: what the anthropic:plan route and the Claude CLI report",
+      "type": "Research Note"
+    },
+    {
+      "existing_code_refs": [
         "scripts/ci/throughput_report.py",
         "tests/unit/test_host_features.py"
       ],
