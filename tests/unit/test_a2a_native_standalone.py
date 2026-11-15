@@ -151,6 +151,15 @@ async def signed_sdk_client(p, http, protocol, *, streaming=False):
     ).create(card, interceptors=[interceptor])
 
 
+def install_passthrough_middleware(app):
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    async def dispatch(request, call_next):
+        return await call_next(request)
+
+    app.add_middleware(BaseHTTPMiddleware, dispatch=dispatch)
+
+
 @pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
 @pytest.mark.parametrize("inprocess", [False, True])
 async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_manager(
@@ -183,12 +192,15 @@ async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_man
 
 @pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
 @pytest.mark.parametrize("single", ["", "/proxy"], indirect=True)
-async def test_inprocess_signed_sdk_observes_initial_and_progress_before_completion(single, protocol):
+@pytest.mark.parametrize("middleware", [False, True])
+async def test_inprocess_signed_sdk_observes_initial_and_progress_before_completion(single, protocol, middleware):
     from kestrel_sdk.native_a2a.types import TaskState
 
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 
     p = single
+    if middleware:
+        install_passthrough_middleware(p.app)
     transport = p.publication.inprocess_http_transport(p.app, buffer_bytes=64)
     async with httpx.AsyncClient(transport=transport, timeout=2) as http:
         client = await signed_sdk_client(p, http, protocol, streaming=True)
@@ -264,7 +276,8 @@ async def test_inprocess_publication_refuses_wrong_application_and_retired_bindi
 
 @pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(single, protocol, streaming, monkeypatch):
+@pytest.mark.parametrize("middleware", [False, True])
+async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(single, protocol, streaming, middleware, monkeypatch):
     import os
 
     from kestrel_sovereign.execution_custody import (
@@ -275,6 +288,8 @@ async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(sin
     )
 
     p = single
+    if middleware:
+        install_passthrough_middleware(p.app)
     actual = []
     projection = p.admission.manager.observability_store.log_tool_call
 
