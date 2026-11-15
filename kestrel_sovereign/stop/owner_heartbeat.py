@@ -52,6 +52,19 @@ One coupling remains, in the database rather than the loop. A renewal is a
 write, so a Stop-store write transaction that the server's loop holds open
 across a stall (SQLite's database write lock, or a PostgreSQL row lock on one
 of this owner's rows) holds the renewal back until that transaction ends.
+
+So a renewal names where its time goes (#4081). The attempt in flight is in
+one phase at a time, each lasting until the next is entered: ``open`` from the
+start of an attempt that opens its connection, then the phases its renewal
+enters (:meth:`OwnerHeartbeat.enter_phase`). On SQLite those are ``slot_wait``
+until ``BEGIN IMMEDIATE`` returns with the writer slot, ``write``,
+``inventory`` and ``commit``. On PostgreSQL the renewal names ``open`` until
+its transaction holds a connection: the heartbeat's pool connects only when a
+transaction first asks it for a connection, and connects again after losing
+one. Then ``write`` (a row-lock wait is inside it), ``inventory`` and
+``commit``. A fence reason names the phase the attempt in flight is in and how
+long it has been in it, and an attempt that takes a quarter of the lease or
+more logs every phase's duration once it finishes.
 """
 
 from __future__ import annotations
@@ -76,8 +89,27 @@ THREAD_NAME = "kestrel-stop-owner-heartbeat"
 # occupying every worker held close past its budget.
 _EXIT_POLL_SECONDS = 0.01
 
+# The phases of one renewal attempt (#4081). The heartbeat enters ``open``
+# when it opens its connection; a renewal names the phases it enters, ``open``
+# included while it still has to acquire a connection.
+PHASE_OPEN = "open"
+PHASE_SLOT_WAIT = "slot_wait"
+PHASE_WRITE = "write"
+PHASE_INVENTORY = "inventory"
+PHASE_COMMIT = "commit"
+RENEWAL_PHASES = frozenset(
+    {PHASE_OPEN, PHASE_SLOT_WAIT, PHASE_WRITE, PHASE_INVENTORY, PHASE_COMMIT}
+)
+
+# A finished attempt that took this fraction of the lease or more logs a
+# warning naming every phase's duration.
+_SLOW_RENEWAL_LEASE_FRACTION = 0.25
+
 DatabaseOpener = Callable[[], AsyncContextManager[Any]]
 Renewal = Callable[[Any, str], Awaitable[Any]]
+PhaseReporter = Callable[[str], None]
+# One phase an attempt entered and when (``time.monotonic()``).
+_PhaseMark = tuple[str, float]
 
 
 async def _no_schema(_database: Any) -> None:
@@ -156,7 +188,8 @@ class OwnerRenewal:
     owner's renewed inventory, or ``None`` when the attempt failed with
     ``failure`` (the exception's type name). ``control`` is the original
     exception when it carried execution control; the heartbeat attempts no
-    renewal after such an attempt.
+    renewal after such an attempt. ``phases`` is each phase the attempt
+    entered, in order, with the seconds it spent there.
     """
 
     owner_id: str
@@ -165,6 +198,7 @@ class OwnerRenewal:
     poll: Any | None
     failure: str | None
     control: BaseException | None = None
+    phases: tuple[tuple[str, float], ...] = ()
 
 
 class OwnerHeartbeat:
@@ -172,6 +206,10 @@ class OwnerHeartbeat:
 
     ``start``, ``retarget``, ``ensure_running`` and ``stop`` are called on
     the registry's loop; the rest of the work happens on the thread.
+
+    ``lease_seconds`` is the owner lease the renewals keep. With it, an
+    attempt that takes a quarter of it or more logs a warning naming every
+    phase's duration; without it, none does.
     """
 
     def __init__(
@@ -180,12 +218,16 @@ class OwnerHeartbeat:
         renew: Renewal,
         *,
         interval_seconds: float,
+        lease_seconds: float | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("owner heartbeat interval must be positive")
+        if lease_seconds is not None and lease_seconds <= 0:
+            raise ValueError("owner heartbeat lease must be positive")
         self._open_database = open_database
         self._renew = renew
         self._interval = float(interval_seconds)
+        self._lease_seconds = None if lease_seconds is None else float(lease_seconds)
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
         self._host: threading.Thread | None = None
@@ -193,6 +235,8 @@ class OwnerHeartbeat:
         self._lock = threading.Lock()
         self._owner_id: str | None = None
         self._in_flight: tuple[str, float] | None = None
+        # The phases the attempt in flight has entered, oldest first.
+        self._phases: list[_PhaseMark] = []
         self._latest: OwnerRenewal | None = None
         self._latest_renewed: OwnerRenewal | None = None
         # The type name of an exception a heartbeat connection's close
@@ -232,6 +276,7 @@ class OwnerHeartbeat:
         with self._lock:
             # Anything the previous thread left in flight ended with it.
             self._in_flight = None
+            self._phases = []
             self._exit_cause = None
             self._start_failure = None
             self._launches += 1
@@ -319,6 +364,27 @@ class OwnerHeartbeat:
         with self._lock:
             self._owner_id = owner_id
 
+    def enter_phase(self, phase: str) -> None:
+        """Record that the renewal in flight has entered ``phase`` now.
+
+        Called by the renewal, on the heartbeat thread, as it enters each of
+        :data:`RENEWAL_PHASES`. A phase lasts until the next is entered, so
+        naming the phase the attempt is already in changes nothing: a
+        PostgreSQL renewal's ``open`` continues the ``open`` of the attempt
+        that created its pool, which has not connected yet. Outside an
+        attempt it records nothing. An unknown phase name is a programming
+        error and raises ``ValueError``.
+        """
+
+        if phase not in RENEWAL_PHASES:
+            raise ValueError(f"unknown owner renewal phase {phase!r}")
+        with self._lock:
+            if self._in_flight is None:
+                return
+            if self._phases and self._phases[-1][0] == phase:
+                return
+            self._phases.append((phase, time.monotonic()))
+
     def latest(self) -> OwnerRenewal | None:
         """The most recent finished renewal attempt, of whichever owner.
 
@@ -340,10 +406,17 @@ class OwnerHeartbeat:
             return self._latest_renewed
 
     def describe(self, now: float, lease_seconds: float) -> str:
-        """Name what the heartbeat is doing, for a fence reason."""
+        """Name what the heartbeat is doing, for a fence reason.
+
+        A renewal in flight is named with the phase it is in and how long it
+        has been there, for example ``its renewal has been in flight for
+        2.0 s, 1.9 s of it in slot_wait``. A finished renewal that took the
+        lease or more is named with the phase it spent longest in.
+        """
 
         with self._lock:
             in_flight = self._in_flight
+            phase = self._phases[-1] if self._phases else None
             latest = self._latest
             renewed = self._latest_renewed
             launched_at = self._launched_at
@@ -358,7 +431,9 @@ class OwnerHeartbeat:
                 return "the heartbeat thread has exited"
             return f"the heartbeat thread has exited ({cause})"
         if in_flight is not None:
-            flight = now - in_flight[1]
+            flight = f"{now - in_flight[1]:.1f} s"
+            if phase is not None:
+                flight += f", {now - phase[1]:.1f} s of it in {phase[0]}"
             if (
                 latest is not None
                 and latest.failure is not None
@@ -367,9 +442,9 @@ class OwnerHeartbeat:
                 # A retry: name the failure it retries, which may recur.
                 return (
                     f"its last renewal failed ({latest.failure}); its retry "
-                    f"has been in flight for {flight:.1f} s"
+                    f"has been in flight for {flight}"
                 )
-            return f"its renewal has been in flight for {flight:.1f} s"
+            return f"its renewal has been in flight for {flight}"
         if latest is None:
             return "it has not finished a renewal"
         if latest.control is not None:
@@ -391,7 +466,10 @@ class OwnerHeartbeat:
             )
         took = latest.finished - latest.started
         if took >= lease_seconds:
-            return f"its last renewal took {took:.1f} s"
+            if not latest.phases:
+                return f"its last renewal took {took:.1f} s"
+            name, seconds = max(latest.phases, key=lambda entry: entry[1])
+            return f"its last renewal took {took:.1f} s, {seconds:.1f} s of it in {name}"
         return f"its last renewal finished {now - latest.finished:.1f} s ago"
 
     def unretired(self) -> str | None:
@@ -504,10 +582,15 @@ class OwnerHeartbeat:
                     started = time.monotonic()
                     if not halted:
                         self._in_flight = (owner_id, started)
+                        self._phases = (
+                            [(PHASE_OPEN, started)] if database is None else []
+                        )
                 if not halted:
                     poll = failure = control = None
                     try:
                         if database is None:
+                            # ``open`` lasts until the renewal names its
+                            # next phase.
                             database = await connection.enter_async_context(
                                 self._open_database()
                             )
@@ -542,14 +625,23 @@ class OwnerHeartbeat:
                                 "owner lease again"
                             )
                         failing = False
-                    renewal = OwnerRenewal(
-                        owner_id, started, time.monotonic(), poll, failure, control
-                    )
+                    finished = time.monotonic()
                     with self._lock:
+                        renewal = OwnerRenewal(
+                            owner_id,
+                            started,
+                            finished,
+                            poll,
+                            failure,
+                            control,
+                            _phase_durations(self._phases, finished),
+                        )
                         self._in_flight = None
+                        self._phases = []
                         self._latest = renewal
                         if failure is None:
                             self._latest_renewed = renewal
+                    self._warn_if_slow(renewal)
                     if control is not None and not isinstance(control, Exception):
                         # Published first, so the registry still retains it.
                         raise control
@@ -569,6 +661,39 @@ class OwnerHeartbeat:
                     self._loop = None
                     self._wake = None
 
+    def _warn_if_slow(self, renewal: OwnerRenewal) -> None:
+        """Log one warning for a finished attempt that took a quarter lease."""
+
+        lease = self._lease_seconds
+        took = renewal.finished - renewal.started
+        if lease is None or took < lease * _SLOW_RENEWAL_LEASE_FRACTION:
+            return
+        outcome = (
+            "renewed" if renewal.failure is None else f"failed ({renewal.failure})"
+        )
+        phases = ", ".join(
+            f"{name} {seconds:.2f} s" for name, seconds in renewal.phases
+        )
+        logger.warning(
+            "Distributed Stop owner renewal was slow: it took %.2f s (lease is "
+            "%.1f s) and %s. Its phases: %s",
+            took,
+            lease,
+            outcome,
+            phases or "none named",
+        )
+
+
+def _phase_durations(
+    marks: list[_PhaseMark], finished: float
+) -> tuple[tuple[str, float], ...]:
+    """Each phase in ``marks`` with the seconds until the next began."""
+
+    ends = [began for _name, began in marks[1:]] + [finished]
+    return tuple(
+        (name, end - began) for (name, began), end in zip(marks, ends)
+    )
+
 
 async def _wait_for_exit(thread: threading.Thread, timeout: float) -> None:
     """Wait up to ``timeout`` seconds for ``thread`` to exit, on this loop."""
@@ -583,7 +708,14 @@ async def _wait_for_exit(thread: threading.Thread, timeout: float) -> None:
 
 
 __all__ = [
+    "PHASE_COMMIT",
+    "PHASE_INVENTORY",
+    "PHASE_OPEN",
+    "PHASE_SLOT_WAIT",
+    "PHASE_WRITE",
+    "RENEWAL_PHASES",
     "OwnerHeartbeat",
     "OwnerRenewal",
+    "PhaseReporter",
     "independent_database_opener",
 ]
