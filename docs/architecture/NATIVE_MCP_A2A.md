@@ -741,6 +741,12 @@ opaque cleanup is retained as private debt with those exact original tasks,
 never reported as a successful close or interrupted by a replacement cancel.
 The host must retain and retry closing that transport after the originals settle
 to reconcile such debt; no background supervisor or retry service is created.
+HTTP reads explicitly borrow the original source's terminal observation. A
+concurrent close cannot strand the reader beyond its read deadline inside a
+physical-retirement join; withdrawal cancels only that observation, not the
+original source or its opaque finalizer. The retained exchange close remains
+the physical retirement owner. Ordinary iterator reads keep their must-join
+default; this is not a global relaxation of source ownership.
 Failed close-task admission remains a failed attempt: later observations still
 harvest the actual source-owner outcomes, including cleanup errors after the
 admission failure. They do not replace the close attempt or turn it into an ACK.

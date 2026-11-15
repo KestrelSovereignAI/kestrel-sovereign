@@ -147,7 +147,10 @@ class _Exchange:
         self.transport.require_binding(self.scope)
         try:
             async with asyncio.timeout(self.read_timeout):
-                value = await anext(self.source)
+                # This read borrows terminal observation; the retained exchange
+                # close owns physical retirement. Concurrent Stop must not turn
+                # a finite read into an unbounded must-join of opaque finally.
+                value = await self.source.__anext__(defer_cancellation=False)
         except TimeoutError as error:
             raise httpx.ReadTimeout("Native ASGI response deadline exceeded", request=self.request) from error
         self.transport.require_binding(self.scope)

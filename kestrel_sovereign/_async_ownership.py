@@ -1344,7 +1344,14 @@ class OwnedAsyncIterator(Generic[_T]):
 
         return self._cleanup_error
 
-    async def __anext__(self) -> _T:
+    async def __anext__(self, *, defer_cancellation: bool = True) -> _T:
+        """Pull demand, optionally borrowing the terminal-owner observation.
+
+        The default retains the source's original must-join contract. A host
+        with its own retained close owner may borrow that terminal join so its
+        read deadline can withdraw observation without cancelling the source.
+        This does not acknowledge physical retirement; ``aclose`` still owns it.
+        """
         if self._closed:
             raise StopAsyncIteration
         received, item = await self._handoff.pull()
@@ -1356,7 +1363,7 @@ class OwnedAsyncIterator(Generic[_T]):
             raise StopAsyncIteration
         if not received:
             self._closed = True
-            outcome = await self.join_source_owners()
+            outcome = await self.join_source_owners(defer_cancellation=defer_cancellation)
             self._terminal_consumed = outcome.cancellation is None
             raise_owned_outcome(outcome, operation=self._operation, retain_originals=True,
                                 retain_observer_cancellations=self._cooperative_source)
@@ -1399,15 +1406,18 @@ class OwnedAsyncIterator(Generic[_T]):
                 self._cancel_owner_if_running()
             raise
 
-    async def join_source_owners(self, *, closing=False, body_close_acknowledged=False):
-        """Retain the source AND its original cancellation observer outcomes."""
+    async def join_source_owners(self, *, closing=False, body_close_acknowledged=False,
+                                 defer_cancellation=True):
+        """Observe both original owners; only an explicit borrower may withdraw."""
         from kestrel_sovereign.execution_custody import (
             ExecutionAuthorityError, execution_commit_outcome, execution_cleanup_debts,
             _explicit_control_chain, execution_observation_error,
             is_tool_execution_terminal_error,
         )
-        outcome = await await_owned_task(self._owner, retain_cancellations=self._cooperative_source)
-        watcher = (await await_owned_task(self._cancellation_owner, retain_cancellations=self._cooperative_source)
+        outcome = await await_owned_task(self._owner, retain_cancellations=self._cooperative_source,
+                                        defer_cancellation=defer_cancellation)
+        watcher = (await await_owned_task(self._cancellation_owner, retain_cancellations=self._cooperative_source,
+                                         defer_cancellation=defer_cancellation)
                    if self._cancellation_owner is not None else None)
         watcher_error = watcher.error if watcher is not None else None
         if self._cancellation_owner is not None:
