@@ -107,7 +107,7 @@ async def single_candidate(native_request_admission, single_identity):
 
 
 @pytest_asyncio.fixture
-async def single(single_candidate):
+async def single(single_candidate, request):
     p = single_candidate
     owner = SingleAgentNativeAuthority(
         p.recipient,
@@ -119,7 +119,7 @@ async def single(single_candidate):
         NativeA2AHTTPRegistry(p.app),
         p.recipient,
         "stable-single",
-        NativeHostingConfiguration("http://single.native.test", "stable-single"),
+        NativeHostingConfiguration("http://single.native.test" + getattr(request, "param", ""), "stable-single"),
         guard_factory=owner.create_guard,
     )
     await owner.publish(publication)
@@ -129,15 +129,9 @@ async def single(single_candidate):
         await owner.close()
 
 
-@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
-async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_manager(
-    single, protocol
-):
-    p = single
+async def signed_sdk_client(p, http, protocol, *, streaming=False):
+    """Use the official codec, original proof interceptor and live signed card."""
     card = await p.publication.get_card()
-    verify_native_agent_card(
-        card, signing_did=p.document["id"], trusted_document=p.document
-    )
     interceptor = NativeSenderInterceptor(
         keypair=p.admission.signing[0],
         sender=SENDER,
@@ -149,15 +143,27 @@ async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_man
         clock=lambda: NOW,
         nonce=lambda: uuid4().hex,
     )
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(p.app)) as http:
-        client = ClientFactory(
-            ClientConfig(
-                httpx_client=http,
-                streaming=False,
-                polling=True,
-                supported_protocol_bindings=[protocol],
-            )
-        ).create(card, interceptors=[interceptor])
+    return ClientFactory(
+        ClientConfig(
+            httpx_client=http, streaming=streaming, polling=not streaming,
+            supported_protocol_bindings=[protocol],
+        )
+    ).create(card, interceptors=[interceptor])
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("inprocess", [False, True])
+async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_manager(
+    single, protocol, inprocess,
+):
+    p = single
+    card = await p.publication.get_card()
+    verify_native_agent_card(
+        card, signing_did=p.document["id"], trusted_document=p.document
+    )
+    transport = p.publication.inprocess_http_transport(p.app) if inprocess else httpx.ASGITransport(p.app)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = await signed_sdk_client(p, http, protocol)
         events = [event async for event in client.send_message(send(p.admission))]
         task = events[0].task
         fetched = await client.get_task(
@@ -173,6 +179,131 @@ async def test_one_runtime_serves_signed_card_and_sdk_tasks_without_an_agent_man
     assert not p.publication.is_published and p.app.routes == []
     with pytest.raises(HTTPException):
         await p.publication.get_card()
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("single", ["", "/proxy"], indirect=True)
+async def test_inprocess_signed_sdk_observes_initial_and_progress_before_completion(single, protocol):
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+
+    p = single
+    transport = p.publication.inprocess_http_transport(p.app, buffer_bytes=64)
+    async with httpx.AsyncClient(transport=transport, timeout=2) as http:
+        client = await signed_sdk_client(p, http, protocol, streaming=True)
+        events = asyncio.Queue(maxsize=4)
+
+        async def collect():
+            async for event in client.send_message(send(p.admission)):
+                await events.put(event)
+
+        consuming = create_owned_task(collect())
+        try:
+            initial = await asyncio.wait_for(events.get(), 1)
+            assert initial.HasField("task")
+            task_id = initial.task.id
+            assert initial.task.status.state == TaskState.TASK_STATE_SUBMITTED
+            assert not consuming.done()
+            await p.admission.manager.update_status(
+                task_id, TaskState.TASK_STATE_WORKING,
+                recipient_agent_id=p.admission.scope.recipient_id,
+            )
+            progress = await asyncio.wait_for(events.get(), 1)
+            assert progress.HasField("status_update")
+            assert progress.status_update.status.state == TaskState.TASK_STATE_WORKING
+            assert not consuming.done()
+            await p.admission.manager.complete_task(
+                task_id, response="Actual completion after observed progress",
+                agent_name=p.recipient.did, recipient_agent_id=p.admission.scope.recipient_id,
+            )
+            async with asyncio.timeout(2):
+                outcome = await await_owned_task(consuming)
+            assert outcome.error is None
+            assert not p.admission.manager._subscribers
+            assert not transport.exchanges
+        finally:
+            if not consuming.done():
+                consuming.cancel("fixture retires its original signed subscription")
+            await await_owned_task(consuming)
+
+
+async def test_inprocess_publication_is_not_permission_to_skip_original_sender_proof(single):
+    p = single
+    transport = p.publication.inprocess_http_transport(p.app)
+    prefix = p.publication._binding.prefix
+    async with httpx.AsyncClient(transport=transport, base_url="http://single.native.test") as http:
+        denied = await http.post(prefix + "/rpc", headers={
+            "A2A-Version": "1.0", "A2A-Extensions": ",".join(sorted(EXTENSIONS)),
+        }, json={
+            "jsonrpc": "2.0", "id": "unsigned", "method": "GetTask",
+            "params": {"id": "unknown", "tenant": p.admission.scope.tenant},
+        })
+        assert denied.status_code == 401
+        assert denied.headers["www-authenticate"].startswith("Kestrel-A2A-Sender-Proof")
+    assert await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not transport.exchanges
+
+
+async def test_inprocess_publication_refuses_wrong_application_and_retired_binding(single):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    p = single
+    with pytest.raises(ValueError, match="different application"):
+        p.publication.inprocess_http_transport(Starlette())
+    transport = p.publication.inprocess_http_transport(p.app)
+    url = (await p.publication.get_card()).supported_interfaces[0].url
+    await p.owner.close()
+    with pytest.raises(ExecutionAuthorityError, match="not published"):
+        p.publication.inprocess_http_transport(p.app)
+    async with httpx.AsyncClient(transport=transport) as http:
+        with pytest.raises(ExecutionAuthorityError, match="recipient changed"):
+            await http.post(url)
+    assert not transport.exchanges
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(single, protocol, streaming, monkeypatch):
+    import os
+
+    from kestrel_sovereign.execution_custody import (
+        ExecutionAuthorityError,
+        execution_commit_outcome,
+        execution_error_with_cause,
+        execution_evidence_carriers,
+    )
+
+    p = single
+    actual = []
+    projection = p.admission.manager.observability_store.log_tool_call
+
+    async def fail_after_original_projection(*args, **kwargs):
+        await projection(*args, **kwargs)
+        descriptor = os.open(os.devnull, os.O_WRONLY)
+        try:
+            try:
+                os.read(descriptor, 1)
+            except OSError as error:
+                actual.append(error)
+                raise execution_error_with_cause(
+                    ExecutionAuthorityError("Actual post-commit projection I/O failed"), error,
+                )
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(p.admission.manager.observability_store, "log_tool_call", fail_after_original_projection)
+    transport = p.publication.inprocess_http_transport(p.app)
+    with pytest.raises(BaseException) as failed:
+        async with httpx.AsyncClient(transport=transport) as http:
+            client = await signed_sdk_client(p, http, protocol, streaming=streaming)
+            async for _ in client.send_message(send(p.admission)):
+                pytest.fail("Actual failed post-commit operation delivered a normal reply")
+    assert len(actual) == 1
+    assert execution_commit_outcome(failed.value) == "committed"
+    assert any(error is actual[0] for error in execution_evidence_carriers(failed.value))
+    assert len(await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks")) == 1
+    assert not p.admission.manager._subscribers and not transport.exchanges
 
 
 @pytest.mark.parametrize(

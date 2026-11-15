@@ -260,6 +260,40 @@ class NativeA2APublication:
         """Whether this exact route binding remains registered with its host."""
         return self._binding is not None and self.registry.is_current(self._binding)
 
+    def inprocess_http_transport(
+        self, app: Starlette, *, buffer_bytes: int = 65536,
+    ) -> httpx.AsyncBaseTransport:
+        """Select this exact published recipient inside its original application.
+
+        The normal signed SDK and recipient guards remain authoritative. This
+        binding is routing/lifetime custody only; it grants no sender permission.
+        Client read/write deadlines must be finite; pending physical retirement
+        is an original private cleanup debt, never a successful close.
+        """
+        from kestrel_sovereign.a2a.native_inprocess_http import _NativeInProcessHTTPTransport
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+        self.registry.require_application(app)
+        binding, recipient = self._binding, self.recipient
+        configuration = self.configuration
+        identity, manager = recipient.identity, recipient.task_manager
+        if binding is None or not self.is_published:
+            raise ExecutionAuthorityError("Native in-process recipient is not published")
+
+        def require_binding(scope):
+            self.registry.require_application(app)
+            if (self._binding is not binding or self.recipient is not recipient
+                    or self.configuration is not configuration
+                    or recipient.identity is not identity or recipient.task_manager is not manager
+                    or not self.registry.is_current(binding)
+                    or self.registry.resolve(scope) is not binding):
+                raise ExecutionAuthorityError("Original native in-process recipient changed")
+
+        return _NativeInProcessHTTPTransport(
+            application=app, public_base_url=configuration.public_base_url,
+            require_binding=require_binding, buffer_bytes=buffer_bytes,
+        )
+
     async def get_card(self, _base: AgentCard | None = None) -> AgentCard:
         """Refresh public display/skills under the same live identity/policy lease."""
         if self._guard is None or self._binding is None:
