@@ -1,11 +1,27 @@
 """Source identity and physical-retirement assertions shared by custody tests."""
 import asyncio
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import NoReturn
 
 import aiosqlite
 
 from kestrel_sovereign.execution_custody import _explicit_control_chain, _native_source_originals, execution_cleanup_debts
+
+
+def fail_original_file_read(observed: list[OSError]) -> NoReturn:
+    """Retain an actual native read failure and close its original descriptor."""
+    descriptor = os.open(os.devnull, os.O_WRONLY)
+    try:
+        try:
+            os.read(descriptor, 1)
+        except OSError as error:
+            observed.append(error)
+            raise
+        raise AssertionError("A write-only native descriptor unexpectedly permitted a read")
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)

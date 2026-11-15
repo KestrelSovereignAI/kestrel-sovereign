@@ -278,14 +278,13 @@ async def test_inprocess_publication_refuses_wrong_application_and_retired_bindi
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("middleware", [False, True])
 async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(single, protocol, streaming, middleware, monkeypatch):
-    import os
-
     from kestrel_sovereign.execution_custody import (
         ExecutionAuthorityError,
         execution_commit_outcome,
         execution_error_with_cause,
         execution_evidence_carriers,
     )
+    from tests.utils.original_failure import fail_original_file_read
 
     p = single
     if middleware:
@@ -295,17 +294,12 @@ async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(sin
 
     async def fail_after_original_projection(*args, **kwargs):
         await projection(*args, **kwargs)
-        descriptor = os.open(os.devnull, os.O_WRONLY)
         try:
-            try:
-                os.read(descriptor, 1)
-            except OSError as error:
-                actual.append(error)
-                raise execution_error_with_cause(
-                    ExecutionAuthorityError("Actual post-commit projection I/O failed"), error,
-                )
-        finally:
-            os.close(descriptor)
+            fail_original_file_read(actual)
+        except OSError as error:
+            raise execution_error_with_cause(
+                ExecutionAuthorityError("Actual post-commit projection I/O failed"), error,
+            )
 
     monkeypatch.setattr(p.admission.manager.observability_store, "log_tool_call", fail_after_original_projection)
     transport = p.publication.inprocess_http_transport(p.app)
@@ -319,6 +313,80 @@ async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(sin
     assert any(error is actual[0] for error in execution_evidence_carriers(failed.value))
     assert len(await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks")) == 1
     assert not p.admission.manager._subscribers and not transport.exchanges
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+async def test_inprocess_signed_failed_close_admission_retains_late_physical_error(single, protocol, mode, eager):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from tests.utils.native_admission_fault import NativeAdmissionFault
+    from tests.utils.original_failure import fail_original_file_read
+
+    p = single
+    entered, release = asyncio.Event(), asyncio.Event()
+    actual = []
+
+    class OriginalFinalizer:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                entered.set()
+                await release.wait()
+                fail_original_file_read(actual)
+
+    p.app.add_middleware(OriginalFinalizer)
+    transport = p.publication.inprocess_http_transport(p.app)
+
+    async def close_at_original_headers(response):
+        await response.aclose()
+
+    http = httpx.AsyncClient(transport=transport, timeout=0.02, event_hooks={
+        "response": [close_at_original_headers],
+    })
+    await http.__aenter__()
+    exchange = None
+    admission_error = OSError("original signed source-close admission failed")
+    fault = NativeAdmissionFault(
+        lambda operation: getattr(getattr(operation, "cr_code", None), "co_qualname", None)
+        == "OwnedAsyncIterator.aclose", admission_error, mode, eager=eager,
+    )
+    try:
+        client = await signed_sdk_client(p, http, protocol)
+        with fault, pytest.raises(BaseException) as first:
+            async for _ in client.send_message(send(p.admission)):
+                pytest.fail("A failed original close admission delivered a normal signed reply")
+        assert any(error is admission_error for error in execution_evidence_carriers(first.value))
+        await entered.wait()
+        exchange, = transport.exchanges
+        assert len(await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks")) == 1
+        closer = exchange.close_task
+        release.set()
+        async with asyncio.timeout(1):
+            source = await exchange.source.join_source_owners(closing=True)
+        assert len(actual) == 1
+        assert any(error is actual[0] for error in execution_evidence_carriers(source.error))
+        with pytest.raises(BaseException) as later:
+            await http.aclose()
+        assert any(error is admission_error for error in execution_evidence_carriers(later.value))
+        assert any(error is actual[0] for error in execution_evidence_carriers(later.value))
+        assert exchange.close_task is closer
+        assert exchange.source.producer_task.done() and exchange.source.owner_task.done()
+        assert not exchange.source.producer_task.cancelling()
+    finally:
+        release.set()
+        if exchange is not None:
+            async with asyncio.timeout(1):
+                await exchange.source.join_source_owners(closing=True)
+                if exchange.close_task is not None:
+                    await await_owned_task(exchange.close_task)
+        if not http.is_closed:
+            await http.aclose()
 
 
 @pytest.mark.parametrize(

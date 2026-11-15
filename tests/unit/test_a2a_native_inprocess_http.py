@@ -416,6 +416,61 @@ async def test_body_failure_retirement_timeout_retains_both_explicit_originals(r
     assert finished.is_set() and not transport.exchanges
 
 
+@pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+async def test_failed_close_admission_keeps_later_original_physical_source_error(mode, eager):
+    from tests.utils.native_admission_fault import NativeAdmissionFault
+    from tests.utils.original_failure import fail_original_file_read
+
+    started, release = asyncio.Event(), asyncio.Event()
+    actual = []
+
+    async def app(scope, receive, send):
+        try:
+            await send({"type": "http.response.start", "status": 200})
+            await disconnected(receive)
+        finally:
+            started.set()
+            await release.wait()
+            fail_original_file_read(actual)
+
+    transport = transport_for(app)
+    response = await transport.handle_async_request(httpx.Request(
+        "GET", "https://native.test/native", extensions={"timeout": {"read": 0.02, "write": 0.02}},
+    ))
+    exchange, = transport.exchanges
+    admission_error = OSError("original source-close admission failed")
+    fault = NativeAdmissionFault(
+        lambda operation: getattr(getattr(operation, "cr_code", None), "co_qualname", None)
+        == "OwnedAsyncIterator.aclose", admission_error, mode, eager=eager,
+    )
+    try:
+        with fault, pytest.raises(BaseException) as first:
+            await response.aclose()
+        assert any(error is admission_error for error in _explicit_control_chain(first.value))
+        await started.wait()
+        closer, deadline = exchange.close_task, exchange.retirement_deadline
+        release.set()
+        async with asyncio.timeout(1):
+            source = await exchange.source.join_source_owners(closing=True)
+        assert len(actual) == 1
+        assert any(error is actual[0] for error in _explicit_control_chain(source.error))
+        with pytest.raises(BaseException) as later:
+            await transport.aclose()
+        errors = tuple(_explicit_control_chain(later.value))
+        assert any(error is admission_error for error in errors)
+        assert any(error is actual[0] for error in errors)
+        assert exchange.close_task is closer and exchange.retirement_deadline == deadline
+        assert exchange.source.producer_task.done() and exchange.source.owner_task.done()
+        assert not exchange.source.producer_task.cancelling()
+    finally:
+        release.set()
+        async with asyncio.timeout(1):
+            await exchange.source.join_source_owners(closing=True)
+            if exchange.close_task is not None:
+                await await_owned_task(exchange.close_task)
+
+
 async def test_slow_original_finally_is_bounded_private_debt_not_cancelled_or_replaced():
     started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original = []
