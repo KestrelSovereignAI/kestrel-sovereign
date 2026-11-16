@@ -73,6 +73,8 @@ TELEGRAM_PACKAGE = "kestrel-channel-telegram"
 TELEGRAM_FEATURE_CLASS = "TelegramFeature"
 TELEGRAM_SERVICE_IMAGE = "kestrel-telegram-service"
 TELEGRAM_TOKEN_ENV = "TELEGRAM_TEST_BOT_TOKEN"
+# What a new agent answers a !command with until its onboarding ends.
+BOOTSTRAP_REFUSAL = "Command unavailable during bootstrap"
 HOST_FEATURE_MANIFEST = ".kestrel-host-features.toml"
 
 TAIL_LINES = 60
@@ -776,14 +778,23 @@ def step_telegram_token(j: Journey) -> Outcome:
         return failed(f"config PATCH returned HTTP {status}: {str(body)[:1500]}")
     deadline = time.monotonic() + 120
     last = ""
+    skipped_discovery = False
     while time.monotonic() < deadline:
         cmd_status, cmd_body, _ = j.invoke("!telegram_status")
         last = _response_text(cmd_body) or str(cmd_body)
+        if BOOTSTRAP_REFUSAL in last and not skipped_discovery:
+            # A new agent refuses commands until onboarding ends, and says to
+            # run !skip-discovery to finish it: what a user would do next.
+            j.invoke("!skip-discovery")
+            skipped_discovery = True
+            continue
         status_doc = json_object_in(last)
         if cmd_status == 200 and status_doc.get("connected") is True:
-            return passed("bot connected", telegram_status=last[:600])
+            return passed("bot connected", telegram_status=last[:600],
+                          needed_skip_discovery=skipped_discovery)
         time.sleep(5)
-    return failed(f"bot never reported connected: {last[:1500]}")
+    return failed(f"bot never reported connected: {last[:1500]}",
+                  needed_skip_discovery=skipped_discovery)
 
 
 def force_stop_tree(pid_file: Path) -> None:

@@ -398,3 +398,28 @@ def test_ownership_reports_a_refused_process_table(tmp_path, monkeypatch):
     monkeypatch.setattr(psutil, "net_connections", refuse)
     data = kj.listener_ownership(tmp_path / "missing.pid", 8888)
     assert "AccessDenied" in data["error"]
+
+
+def test_telegram_token_finishes_onboarding_when_the_agent_says_to(tmp_path, monkeypatch):
+    """Run 7: a new agent answered !telegram_status with the bootstrap refusal."""
+    monkeypatch.setenv(kj.TELEGRAM_TOKEN_ENV, "123456789:token-value")
+    journey = _Recorder(tmp_path)
+    journey.roster = kj.Roster(8888, "Kestrel", 8801)
+    monkeypatch.setattr(journey, "request", lambda *a, **k: (200, {}))
+    sent: list[str] = []
+    replies = iter([
+        "\u274c Command unavailable during bootstrap: !telegram_status\n\nuse !skip-discovery",
+        "skipped",
+        '{"connected": true, "username": "KestrelCIBot"}',
+    ])
+
+    def invoke(text):
+        sent.append(text)
+        return 200, {"response": next(replies)}, 0.1
+
+    monkeypatch.setattr(journey, "invoke", invoke)
+    monkeypatch.setattr(kj.time, "sleep", lambda s: None)
+    outcome = kj.step_telegram_token(journey)
+    assert outcome.status == kj.PASS
+    assert sent == ["!telegram_status", "!skip-discovery", "!telegram_status"]
+    assert outcome.data["needed_skip_discovery"] is True
