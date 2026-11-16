@@ -150,13 +150,104 @@ def _origin(attestation: _LocalProcessAttestation) -> str:
     return f"http://{rendered}:{attestation.port}"
 
 
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_INTERPRETERS = frozenset({"python.exe", "pythonw.exe"})
+
+
 def _process_connections(pid: int) -> list[Any]:
-    """Inspect one recorded process without macOS's root-only fleet query."""
+    """Inspect one recorded server without macOS's root-only fleet query.
+
+    On Windows the recorded process can be a venv launcher rather than the
+    interpreter: a venv's ``Scripts\\python.exe`` starts the base interpreter
+    as a child and waits on it, so the server's sockets belong to the child.
+    That child is the same server, and its sockets are included; no other
+    process's are.
+    """
 
     import psutil
 
     process = psutil.Process(pid)
-    return list(process.net_connections(kind="tcp"))
+    processes = [process]
+    if _IS_WINDOWS:
+        processes.extend(_venv_launcher_interpreters(process))
+    return [
+        connection
+        for member in processes
+        for connection in member.net_connections(kind="tcp")
+    ]
+
+
+def _venv_launcher_interpreters(process: Any) -> list[Any]:
+    """The base interpreters a Windows venv launcher ``process`` has started.
+
+    Recognised only when ``process`` runs ``<venv>\\Scripts\\python[w].exe``
+    beside a ``pyvenv.cfg``, and a child runs ``python[w].exe`` from the
+    ``home`` directory that file names. Any other child, or any other
+    recorded process, contributes nothing, so a listener stays unattributed.
+
+    A host started before ``uv python upgrade`` moved the junction ``home``
+    names is refused until it restarts: its interpreter no longer sits there.
+    """
+
+    import psutil
+
+    try:
+        executable = Path(process.exe())
+    except psutil.AccessDenied:
+        # Not knowing the image leaves the recorded process's own sockets as
+        # the only evidence, exactly as before launchers were considered.
+        return []
+    venv_root = executable.parent.parent
+    if (
+        executable.name.casefold() not in _WINDOWS_INTERPRETERS
+        or executable.parent.name.casefold() != "scripts"
+    ):
+        return []
+    home = _pyvenv_home(venv_root / "pyvenv.cfg")
+    if home is None:
+        return []
+    interpreters = []
+    for child in process.children():
+        try:
+            child_executable = Path(child.exe())
+        except psutil.Error:
+            continue
+        if (
+            child_executable.name.casefold() in _WINDOWS_INTERPRETERS
+            and _same_directory(child_executable.parent, home)
+        ):
+            interpreters.append(child)
+    return interpreters
+
+
+def _pyvenv_home(config: Path) -> Path | None:
+    """The ``home`` a venv's ``pyvenv.cfg`` declares, or None."""
+
+    try:
+        lines = config.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator and key.strip().casefold() == "home" and value.strip():
+            return Path(value.strip())
+    return None
+
+
+def _same_directory(left: Path, right: Path) -> bool:
+    """Whether two paths name one directory, by file identity, not spelling.
+
+    uv's ``pyvenv.cfg`` ``home`` names a minor-version junction
+    (``cpython-3.13-windows-...``) while the running interpreter's image
+    resolves to the patch-version directory it points at
+    (``cpython-3.13.18-windows-...``); a textual comparison never matches.
+    Identity also absorbs 8.3 short names, case, and mapped or ``subst``
+    drives. A path that does not exist matches nothing.
+    """
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
 
 
 def _listener_is_owned_by(port: int, pid: int) -> bool:
