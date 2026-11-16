@@ -178,6 +178,27 @@ def test_a_package_the_manifest_already_declares_is_left_alone(project, spelling
     assert manifest.read_text(encoding="utf-8") == text
 
 
+def test_the_install_is_recorded_in_the_manifest_its_guard_read(
+    venv, project, tmp_path, monkeypatch,
+):
+    """One file: the manifest whose checkouts held the install records it."""
+    elsewhere = tmp_path / "elsewhere" / DEFAULT_HOST_MANIFEST
+    elsewhere.parent.mkdir()
+    read = []
+
+    def manifest_path(args):
+        read.append(args)
+        return elsewhere
+
+    monkeypatch.setattr(cli, "_host_manifest_path", manifest_path)
+
+    assert cli.cmd_feature_install(argparse.Namespace(name="voice")) == 0
+
+    assert read, "the guard and the record name the manifest through one seam"
+    assert cli._load_host_manifest(elsewhere)[0]["name"] == VOICE
+    assert not _manifest(project).exists()
+
+
 def test_a_git_fallback_install_is_recorded_without_a_source(venv, project, capsys):
     """The legacy entry is the one ``feature sync`` falls back to git for."""
     venv.feature_on_index = False
@@ -585,12 +606,14 @@ def test_a_version_change_is_not_a_removal(monkeypatch, tmp_path):
     "answer",
     [
         {"returncode": 2, "stderr": "error: unexpected argument '--output-format'"},
+        # An exit status is part of the answer, whatever stdout says.
+        {"returncode": 1, "stdout": _changes(), "stderr": "error: lock is out of date"},
         {"stdout": "Would uninstall 1 package\n - six==1.17.0\n"},
         {"stdout": '{"sync": {}}'},
         {"stdout": '{"sync": {"changes": [{"name": "six"}]}}'},
         {"stdout": '{"sync": {"changes": [{"name": "six", "action": null}]}}'},
     ],
-    ids=["uv-fails", "not-json", "no-changes", "change-without-action", "null-action"],
+    ids=["uv-fails", "fails-with-an-answer", "not-json", "no-changes", "change-without-action", "null-action"],
 )
 def test_an_answer_that_is_not_one_raises(monkeypatch, tmp_path, answer):
     _uv_answers(monkeypatch, **answer)
