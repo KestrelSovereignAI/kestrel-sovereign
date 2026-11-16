@@ -150,13 +150,86 @@ def _origin(attestation: _LocalProcessAttestation) -> str:
     return f"http://{rendered}:{attestation.port}"
 
 
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_INTERPRETERS = frozenset({"python.exe", "pythonw.exe"})
+
+
 def _process_connections(pid: int) -> list[Any]:
-    """Inspect one recorded process without macOS's root-only fleet query."""
+    """Inspect one recorded server without macOS's root-only fleet query.
+
+    On Windows the recorded process can be a venv launcher rather than the
+    interpreter: a venv's ``Scripts\\python.exe`` starts the base interpreter
+    as a child and waits on it, so the server's sockets belong to the child.
+    That child is the same server, and its sockets are included; no other
+    process's are.
+    """
 
     import psutil
 
     process = psutil.Process(pid)
-    return list(process.net_connections(kind="tcp"))
+    processes = [process]
+    if _IS_WINDOWS:
+        processes.extend(_venv_launcher_interpreters(process))
+    return [
+        connection
+        for member in processes
+        for connection in member.net_connections(kind="tcp")
+    ]
+
+
+def _venv_launcher_interpreters(process: Any) -> list[Any]:
+    """The base interpreters a Windows venv launcher ``process`` has started.
+
+    Recognised only when ``process`` runs ``<venv>\\Scripts\\python[w].exe``
+    beside a ``pyvenv.cfg``, and a child runs ``python[w].exe`` from the
+    ``home`` directory that file names. Any other child, or any other
+    recorded process, contributes nothing, so a listener stays unattributed.
+    """
+
+    import psutil
+
+    executable = Path(process.exe())
+    venv_root = executable.parent.parent
+    if (
+        executable.name.casefold() not in _WINDOWS_INTERPRETERS
+        or executable.parent.name.casefold() != "scripts"
+    ):
+        return []
+    home = _pyvenv_home(venv_root / "pyvenv.cfg")
+    if home is None:
+        return []
+    interpreters = []
+    for child in process.children():
+        try:
+            child_executable = Path(child.exe())
+        except psutil.Error:
+            continue
+        if (
+            child_executable.name.casefold() in _WINDOWS_INTERPRETERS
+            and _same_directory(child_executable.parent, home)
+        ):
+            interpreters.append(child)
+    return interpreters
+
+
+def _pyvenv_home(config: Path) -> Path | None:
+    """The ``home`` a venv's ``pyvenv.cfg`` declares, or None."""
+
+    try:
+        lines = config.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator and key.strip().casefold() == "home" and value.strip():
+            return Path(value.strip())
+    return None
+
+
+def _same_directory(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(
+        os.path.normpath(right)
+    )
 
 
 def _listener_is_owned_by(port: int, pid: int) -> bool:
