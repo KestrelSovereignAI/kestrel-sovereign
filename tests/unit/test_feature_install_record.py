@@ -10,15 +10,17 @@ Two halves, pinned here against the shared fake venv:
 
 * both install commands append the package to the host manifest, without
   rewriting what an operator wrote there;
-* ``kestrel update`` refuses, before it changes anything, to uninstall an
-  installed extension that nothing records (installed before the fix, or by
-  hand), and prints the entry that records it.
+* ``kestrel update`` refuses, before its ``uv sync`` changes anything, to
+  uninstall an installed extension that nothing records (installed before the
+  fix, or by hand), and prints the entry that records it. What the sync
+  removes is asked of uv itself.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import tomllib
 import types
 from pathlib import Path
@@ -244,15 +246,19 @@ def update(venv, tmp_path, monkeypatch):
     steps = []
     locked = {CORE, SDK}
 
+    def removals(_checkout):
+        return tuple(sorted(name for name in venv.installed if name not in locked))
+
     def uv_sync(_checkout):
         steps.append("uv sync")
-        for name in [name for name in venv.installed if name not in locked]:
+        for name in removals(_checkout):
             del venv.installed[name]
             venv.editable.pop(name, None)
         return 0, ""
 
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: checkout)
     monkeypatch.setattr(cli, "_git_head", lambda _: None)
+    monkeypatch.setattr(cli, "_uv_sync_removals", removals)
     monkeypatch.setattr(cli, "_run_uv_sync", uv_sync)
     monkeypatch.setattr(cli_lifecycle, "_run_feature_reconcile", lambda *a, **kw: 0)
     monkeypatch.setattr(cli_lifecycle, "_report_core_lock", lambda: None)
@@ -289,7 +295,7 @@ def test_an_update_refuses_to_uninstall_an_extension_nothing_records(
     err = capsys.readouterr().err
     assert "• extensions: REFUSED" in err
     assert f"    {VOICE} 0.4.0" in err
-    assert "Nothing was pulled, installed or restarted" in err
+    assert "Nothing was installed or restarted" in err
     # No manifest yet: the one command that writes it is named.
     assert "kestrel feature sync --capture" in err
 
@@ -348,42 +354,71 @@ def test_an_install_that_does_not_prune_is_not_checked(venv, project, update, mo
     assert update == ["pip install -e", "restart"]
 
 
-def test_an_unreadable_lock_is_not_read_as_an_empty_one(venv, project, update, tmp_path, capsys):
-    """Every installed extension would look unrecorded; say the lock is the problem."""
+def test_no_answer_from_uv_is_not_an_empty_one(venv, project, update, monkeypatch, capsys):
+    """Every installed extension would look kept; say uv is the problem."""
     venv.installed[VOICE] = "0.4.0"
-    (tmp_path / "kestrel-sovereign" / "uv.lock").write_text("not = [a lock", encoding="utf-8")
+
+    def refuse(_checkout):
+        raise cli_lifecycle.UvDryRunError("`uv sync --dry-run` exited 2: unexpected argument")
+
+    monkeypatch.setattr(cli, "_uv_sync_removals", refuse)
 
     assert _update() == 1
 
     assert update == []
     err = capsys.readouterr().err
-    assert "core's uv.lock would not read" in err
+    assert "• extensions: FAILED — `uv sync --dry-run` exited 2" in err
     assert "REFUSED" not in err
 
 
 # --- what survives an update ---------------------------------------------------
 
 
-def _unrecorded(project, *, locked=(), provisioned=()):
-    return [
+def _unrecorded(project, *, removals, provisioned=()):
+    asked = []
+
+    def provisioned_without(gone):
+        asked.append(gone)
+        return provisioned
+
+    found = [
         extension.package
         for extension in unrecorded_extensions(
-            _manifest(project), locked=locked, provisioned=provisioned,
+            _manifest(project), removals=removals, provisioned_without=provisioned_without,
         )
     ]
+    return found, asked
 
 
 def test_each_way_a_package_survives(venv, project):
     venv.installed[VOICE] = "0.4.0"
     venv.installed[TELEGRAM] = "0.1.10"
+    both = (TELEGRAM, VOICE)
 
-    assert _unrecorded(project) == [TELEGRAM, VOICE]
-    assert _unrecorded(project, locked=[VOICE]) == [TELEGRAM]
-    assert _unrecorded(project, provisioned=[TELEGRAM]) == [VOICE]
+    assert _unrecorded(project, removals=both)[0] == [TELEGRAM, VOICE]
+    # uv keeps it (its lock installs it).
+    assert _unrecorded(project, removals=(TELEGRAM,))[0] == [TELEGRAM]
+    # Reconcile provisions it for an allowlist.
+    assert _unrecorded(project, removals=both, provisioned=[TELEGRAM])[0] == [VOICE]
+    # The manifest declares it, spelled with inline extras.
     _manifest(project).write_text(
         f'[[feature]]\nname = "{TELEGRAM}[bot]"\npypi = ">=0.1"\n', encoding="utf-8",
     )
-    assert _unrecorded(project) == [VOICE]
+    assert _unrecorded(project, removals=both)[0] == [VOICE]
+
+
+def test_reconcile_is_asked_without_what_will_be_gone(venv, project):
+    """Its classes are resolved as reconcile will see the venv: without the
+    packages uv removes and the manifest does not restore."""
+    venv.installed[VOICE] = "0.4.0"
+    venv.installed[TELEGRAM] = "0.1.10"
+    _manifest(project).write_text(
+        f'[[feature]]\nname = "{TELEGRAM}"\npypi = ""\n', encoding="utf-8",
+    )
+
+    _, asked = _unrecorded(project, removals=(TELEGRAM, VOICE))
+
+    assert asked == [frozenset({VOICE})]
 
 
 def test_a_package_a_survivor_requires_comes_back_with_it(venv, project):
@@ -392,26 +427,68 @@ def test_a_package_a_survivor_requires_comes_back_with_it(venv, project):
     venv.installed[TELEGRAM] = "0.1.10"
     venv.installed_requires[TELEGRAM] = [f'{VOICE}>=0.4; extra == "speech"']
     manifest = _manifest(project)
+    both = (TELEGRAM, VOICE)
 
     manifest.write_text(f'[[feature]]\nname = "{TELEGRAM}"\npypi = ""\n', encoding="utf-8")
-    assert _unrecorded(project) == [VOICE]
+    assert _unrecorded(project, removals=both)[0] == [VOICE]
 
     manifest.write_text(
         f'[[feature]]\nname = "{TELEGRAM}"\npypi = ""\nextras = ["speech"]\n',
         encoding="utf-8",
     )
-    assert _unrecorded(project) == []
+    assert _unrecorded(project, removals=both)[0] == []
+
+
+def test_a_checkout_comes_back_only_from_the_manifest(venv, project):
+    """Reconcile, or a survivor's requirement, would bring it back from the index."""
+    venv.installed[VOICE] = "0.4.0"
+    venv.editable[VOICE] = "/src/kestrel-feature-voice"
+
+    assert _unrecorded(project, removals=(VOICE,), provisioned=[VOICE])[0] == [VOICE]
+
+    _manifest(project).write_text(
+        f'[[feature]]\nname = "{VOICE}"\neditable = "/src/kestrel-feature-voice"\n',
+        encoding="utf-8",
+    )
+    assert _unrecorded(project, removals=(VOICE,))[0] == []
 
 
 def test_an_editable_extension_is_recorded_on_its_checkout(venv, project):
     venv.installed[VOICE] = "0.4.0"
     venv.editable[VOICE] = "C:\\src\\kestrel-feature-voice"
 
-    (extension,) = unrecorded_extensions(_manifest(project), locked=(), provisioned=())
+    (extension,) = unrecorded_extensions(
+        _manifest(project), removals=(VOICE,), provisioned_without=lambda gone: (),
+    )
 
-    assert extension == UnrecordedExtension(VOICE, "0.4.0", "C:\\src\\kestrel-feature-voice")
+    assert extension.editable_path == "C:\\src\\kestrel-feature-voice"
     parsed = tomllib.loads(extension.entry())["feature"]
     assert parsed == [{"name": VOICE, "editable": "C:\\src\\kestrel-feature-voice"}]
+
+
+@pytest.mark.parametrize(
+    "from_index, expected",
+    [(True, {"name": VOICE, "pypi": ""}), (False, {"name": VOICE})],
+    ids=["index", "direct-url"],
+)
+def test_the_printed_entry_names_the_source_it_was_installed_from(from_index, expected):
+    """``pypi = ""`` would stop ``feature sync`` falling back to git for a
+    direct-URL install, so that one gets the entry that names no source."""
+    extension = UnrecordedExtension(VOICE, "0.4.0", None, from_index=from_index)
+
+    assert tomllib.loads(extension.entry())["feature"] == [expected]
+
+
+def test_a_git_installed_extension_is_printed_without_a_source(venv, project, monkeypatch):
+    """Provenance is read, not assumed: a direct URL is not an index install."""
+    venv.installed[VOICE] = "0.4.0"
+    monkeypatch.setattr(cli, "_from_index", lambda dist: dist != VOICE)
+
+    (extension,) = unrecorded_extensions(
+        _manifest(project), removals=(VOICE,), provisioned_without=lambda gone: (),
+    )
+
+    assert extension.from_index is False
 
 
 def test_an_extension_an_agent_allowlists_is_kept_by_reconcile(
@@ -431,4 +508,92 @@ def test_an_extension_an_agent_allowlists_is_kept_by_reconcile(
     assert _update() == 0
 
     assert update == ["uv sync", "restart"]
-    assert "each installed extension is in uv.lock" in capsys.readouterr().out
+    assert "every extension `uv sync` removes is reinstalled" in capsys.readouterr().out
+
+
+def test_a_class_only_the_removed_package_declares_is_not_provisioned(
+    venv, project, update, monkeypatch, capsys,
+):
+    """Not catalogued and found only through its own entry point: once uv removes
+    it, reconcile cannot resolve the class, so it is not reinstalled."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.feature_reconcile.compute_required_classes",
+        lambda multi_agent: ({"TelegramChannel"}, []),
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.discover_entrypoint_feature_dists",
+        lambda: {"TelegramChannel": TELEGRAM},
+    )
+    venv.installed[TELEGRAM] = "0.1.10"
+
+    assert _update() == 1
+
+    assert update == []
+    assert f"    {TELEGRAM} 0.1.10" in capsys.readouterr().err
+
+
+# --- asking uv what the sync removes --------------------------------------------
+
+
+def _uv_answers(monkeypatch, *, stdout="", returncode=0, stderr=""):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(cli_lifecycle.subprocess, "run", run)
+    return calls
+
+
+def _changes(*changes):
+    import json
+
+    return json.dumps({
+        "schema": {"version": "preview"},
+        "sync": {"changes": [
+            {"name": name, "version": version, "action": action}
+            for name, version, action in changes
+        ]},
+    })
+
+
+def test_uv_is_asked_exactly_as_the_sync_runs(monkeypatch, tmp_path):
+    calls = _uv_answers(monkeypatch, stdout=_changes())
+
+    assert cli_lifecycle._uv_sync_removals(tmp_path) == ()
+
+    ((argv, kwargs),) = calls
+    sync, env = cli_lifecycle._uv_sync_invocation()
+    assert argv == [*sync, "--dry-run", "--output-format", "json"]
+    assert kwargs["cwd"] == str(tmp_path)
+    assert kwargs["env"].get("VIRTUAL_ENV") == env.get("VIRTUAL_ENV")
+
+
+def test_a_version_change_is_not_a_removal(monkeypatch, tmp_path):
+    """Measured with uv 0.9.22: an upgrade is an uninstall and an install."""
+    _uv_answers(monkeypatch, stdout=_changes(
+        ("idna", "3.20", "uninstalled"),
+        ("Six", "1.16.0", "uninstalled"),
+        ("six", "1.17.0", "installed"),
+    ))
+
+    assert cli_lifecycle._uv_sync_removals(tmp_path) == ("idna",)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"returncode": 2, "stderr": "error: unexpected argument '--output-format'"},
+        {"stdout": "Would uninstall 1 package\n - six==1.17.0\n"},
+        {"stdout": '{"sync": {}}'},
+        {"stdout": '{"sync": {"changes": [{"name": "six"}]}}'},
+        {"stdout": '{"sync": {"changes": [{"name": "six", "action": null}]}}'},
+    ],
+    ids=["uv-fails", "not-json", "no-changes", "change-without-action", "null-action"],
+)
+def test_an_answer_that_is_not_one_raises(monkeypatch, tmp_path, answer):
+    _uv_answers(monkeypatch, **answer)
+
+    with pytest.raises(cli_lifecycle.UvDryRunError):
+        cli_lifecycle._uv_sync_removals(tmp_path)

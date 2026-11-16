@@ -3221,14 +3221,21 @@ class UnrecordedExtension:
     package: str
     version: str
     editable_path: Optional[str] = None
+    #: Installed from an index. False for a direct URL (a git ref, an archive)
+    #: and for an editable checkout.
+    from_index: bool = True
 
     def entry(self) -> str:
-        """The host manifest entry that records this package as it is installed."""
-        return _manifest_entry_text(
-            self.package,
-            editable=self.editable_path,
-            pypi=None if self.editable_path else "",
-        )
+        """The host manifest entry that records this package as it is installed.
+
+        A checkout is recorded as one; an index install as ``pypi = ""``; a
+        direct-URL install as the legacy entry that names no source, the one
+        ``feature sync`` may fall back to the registry's git URL for, as
+        :func:`record_feature_install` records a git fallback.
+        """
+        if self.editable_path:
+            return _manifest_entry_text(self.package, editable=self.editable_path)
+        return _manifest_entry_text(self.package, pypi="" if self.from_index else None)
 
 
 def _installed_closure(roots: dict) -> set:
@@ -3264,22 +3271,29 @@ def _installed_closure(roots: dict) -> set:
     return names
 
 
-def unrecorded_extensions(manifest: Path, *, locked, provisioned) -> tuple:
-    """Installed extension packages ``kestrel update`` removes and nothing reinstalls (#4127).
+def unrecorded_extensions(manifest: Path, *, removals, provisioned_without) -> tuple:
+    """Installed extensions ``uv sync`` removes and nothing reinstalls (#4127).
 
-    ``uv sync`` removes every package core's lock does not name. A package
-    survives the update when one of these brings it back:
+    *removals* are the packages the update's ``uv sync`` uninstalls, as uv
+    reports them (``cli_lifecycle._uv_sync_removals``). One of them comes back
+    when:
 
-    * *locked* — the lock ``uv sync`` installs names it;
     * the host *manifest* declares it, and ``feature sync`` restores it;
-    * *provisioned* — reconcile installs it for an agent's ``features``
-      allowlist (``_required_feature_packages``);
+    * reconcile installs it for an agent's ``features`` allowlist. Asked as
+      reconcile will run, after the sync and the restore:
+      ``provisioned_without(gone)`` answers the packages it provisions when the
+      distributions in *gone* are not installed, so a class only the removed
+      package itself declared does not count;
     * one of those requires it, so reinstalling that installs it too.
 
-    Every other extension distribution installed now (those whose entry points
-    ``feature sync --capture`` would record) is returned, in name order. Those
-    are installs nothing on the host records, typically made before ``feature
-    install`` recorded its installs: the update would uninstall each one and
+    A checkout only the manifest can bring back as it is: reinstalled any
+    other way, an editable install comes back from the index. So one counts
+    only when the manifest declares it.
+
+    Every other removed extension distribution (those whose entry points
+    ``feature sync --capture`` would record) is returned, in name order:
+    installs nothing on the host records, typically made before ``feature
+    install`` recorded its installs. The update would uninstall each one and
     say nothing. Reads only. Raises ``ValueError`` or ``OSError`` when the
     manifest exists and will not read.
     """
@@ -3290,18 +3304,25 @@ def unrecorded_extensions(manifest: Path, *, locked, provisioned) -> tuple:
         if manifest.exists()
         else {}
     )
-    roots = {canonical_package(package): () for package in provisioned}
-    roots.update(declared)
-    kept = {canonical_package(package) for package in locked} | _installed_closure(roots)
+    removed = {canonical_package(package) for package in removals}
+    restored = _installed_closure(declared)
+    provisioned = provisioned_without(frozenset(removed - restored))
+    reinstalled = restored | _installed_closure(
+        {canonical_package(package): () for package in provisioned}
+    )
     found = []
     for dist in cli._installed_extension_distributions():
         package = canonical_package(dist["dist"])
-        if package == CORE_DISTRIBUTION or package in kept:
+        if package == CORE_DISTRIBUTION or package not in removed:
+            continue
+        editable = dist["editable_path"]
+        if package in declared or (package in reinstalled and not editable):
             continue
         found.append(UnrecordedExtension(
             package=package,
             version=dist["version"] or "?",
-            editable_path=dist["editable_path"],
+            editable_path=editable,
+            from_index=cli._from_index(package),
         ))
     return tuple(found)
 
@@ -3446,7 +3467,9 @@ def record_feature_install(package: str, *, from_git: bool = False) -> Optional[
     name = canonical_package(package)
     entry = _manifest_entry_text(name, pypi=None if from_git else "")
     try:
-        path = _host_manifest_path(types.SimpleNamespace(manifest=None))
+        # Through `cli.`, as the install guard reads it: the file the guard
+        # held this install to is the file it is recorded in.
+        path = cli._host_manifest_path(types.SimpleNamespace(manifest=None))
     except (OSError, RuntimeError) as exc:
         # RuntimeError: the project directory's last fallback is ~/.kestrel,
         # and `Path.home()` raises it when no home directory can be found.
