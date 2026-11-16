@@ -317,14 +317,19 @@ async def test_inprocess_post_commit_physical_failure_retains_actual_outcome(sin
 
 @pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
 @pytest.mark.parametrize("middleware", [False, True])
-async def test_inprocess_signed_concurrent_close_preserves_read_deadline(single, protocol, middleware):
+@pytest.mark.parametrize("slow_start", [False, True])
+async def test_inprocess_signed_concurrent_close_preserves_read_deadline(single, protocol, middleware, slow_start):
+    import threading
+
     from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
     from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_evidence_carriers
     from tests.utils.original_failure import fail_original_file_read
+    from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
     p = single
     initial, entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    actual = []
+    actual, originals = [], []
+    read_timeout = 0.2
     if middleware:
         install_passthrough_middleware(p.app)
 
@@ -333,7 +338,13 @@ async def test_inprocess_signed_concurrent_close_preserves_read_deadline(single,
             self.app = app
 
         async def __call__(self, scope, receive, send):
+            exchange, = transport.exchanges
+            originals.append(exchange)
             try:
+                if slow_start:
+                    # Real startup may outlast the policy budget on a loaded
+                    # CI worker; it must not select the read-under-close phase.
+                    await asyncio.to_thread(threading.Event().wait, read_timeout * 2)
                 await self.app(scope, receive, send)
             finally:
                 entered.set()
@@ -344,44 +355,56 @@ async def test_inprocess_signed_concurrent_close_preserves_read_deadline(single,
     transport = p.publication.inprocess_http_transport(p.app)
 
     async def consume():
-        async with httpx.AsyncClient(transport=transport, timeout=0.2) as http:
+        async with httpx.AsyncClient(transport=transport, timeout=read_timeout) as http:
             client = await signed_sdk_client(p, http, protocol, streaming=True)
             async for _ in client.send_message(send(p.admission)):
                 initial.set()
 
-    reading, closing, exchange = create_owned_task(consume()), None, None
-    reading.add_done_callback(lambda _: initial.set())
+    reading, closing, exchange = None, None, None
     try:
-        await initial.wait()
-        assert not reading.done(), "Signed native request ended before its original initial event"
-        await asyncio.sleep(0)
-        exchange, = transport.exchanges
-        closing = create_owned_task(transport.aclose())
-        await entered.wait()
-        closed = await await_owned_task(closing)
-        assert execution_cleanup_debts(closed.error)
-        done, _ = await asyncio.wait((reading,), timeout=0.8)
-        assert reading in done, "Concurrent close stranded the original signed read beyond its deadline"
-        observed = await await_owned_task(reading)
-        assert any(isinstance(error, httpx.ReadTimeout) for error in execution_evidence_carriers(observed.error))
-        assert execution_cleanup_debts(observed.error)
-        assert len(await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks")) == 1
-        assert not exchange.source.producer_task.done() and not exchange.source.producer_task.cancelling()
+        with pinned_loop_clock() as clock:
+            reading = create_owned_task(consume())
+            reading.add_done_callback(lambda _: initial.set())
+            await await_within_hang_guard(initial.wait(), step="original signed initial event")
+            assert not reading.done(), "Signed native request ended before its original initial event"
+            await asyncio.sleep(0)
+            exchange, = transport.exchanges
+            closing = create_owned_task(transport.aclose())
+            await await_within_hang_guard(entered.wait(), step="original signed finalizer entry")
+            assert not reading.done() and not closing.done()
+            # Startup and real storage I/O do not spend this test's policy
+            # clock. Expire the original read/close budgets only in the phase
+            # under test, without releasing or cancelling the physical owner.
+            clock.advance(read_timeout)
+            await await_within_hang_guard(
+                asyncio.wait((reading, closing)), step="original read and close deadlines",
+            )
+            closed = await await_owned_task(closing)
+            assert execution_cleanup_debts(closed.error)
+            observed = await await_owned_task(reading)
+            assert any(isinstance(error, httpx.ReadTimeout) for error in execution_evidence_carriers(observed.error))
+            assert execution_cleanup_debts(observed.error)
+            assert len(await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks")) == 1
+            assert not exchange.source.producer_task.done() and not exchange.source.producer_task.cancelling()
     finally:
         release.set()
-        result = await await_owned_task(reading)
+        result = (await await_within_hang_guard(await_owned_task(reading), step="original signed reader retirement")
+                  if reading is not None else None)
         if closing is not None:
-            await await_owned_task(closing)
+            await await_within_hang_guard(await_owned_task(closing), step="original concurrent close retirement")
+        if exchange is None and originals:
+            exchange, = originals
         if exchange is not None:
-            async with asyncio.timeout(1):
-                await exchange.source.join_source_owners(closing=True)
+            await await_within_hang_guard(
+                exchange.source.join_source_owners(closing=True), step="original signed source retirement",
+            )
             retirement = None
             try:
                 await transport.aclose()
             except BaseException as error:
                 retirement = error
             assert len(actual) == 1
-            assert any(error is actual[0] for failure in (result.error, retirement)
+            assert any(error is actual[0] for failure in (result.error if result is not None else None, retirement)
                        for error in execution_evidence_carriers(failure))
             assert exchange.source.producer_task.done() and exchange.source.owner_task.done()
 
@@ -666,10 +689,11 @@ async def test_inprocess_signed_preentry_withdrawal_retires_original_upload_desc
 @pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
 @pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
 async def test_inprocess_signed_failed_close_admission_retains_late_physical_error(single, protocol, mode, eager):
-    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
     from kestrel_sovereign.execution_custody import execution_evidence_carriers
     from tests.utils.native_admission_fault import NativeAdmissionFault
     from tests.utils.original_failure import fail_original_file_read
+    from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
     p = single
     entered, release = asyncio.Event(), asyncio.Event()
@@ -699,17 +723,30 @@ async def test_inprocess_signed_failed_close_admission_retains_late_physical_err
         "response": [close_at_original_headers],
     })
     await http.__aenter__()
-    exchange = None
+    exchange, advancing = None, None
     admission_error = OSError("original signed source-close admission failed")
     fault = NativeAdmissionFault(
         lambda operation: getattr(getattr(operation, "cr_code", None), "co_qualname", None)
         == "_Exchange.retire", admission_error, mode, eager=eager,
     )
     try:
-        client = await signed_sdk_client(p, http, protocol)
-        with fault, pytest.raises(BaseException) as first:
-            async for _ in client.send_message(send(p.admission)):
-                pytest.fail("A failed original close admission delivered a normal signed reply")
+        with pinned_loop_clock() as clock:
+            async def expire_original_close():
+                await entered.wait()
+                clock.advance(0.2)
+
+            async def dispatch():
+                async for _ in client.send_message(send(p.admission)):
+                    pytest.fail("A failed original close admission delivered a normal signed reply")
+
+            advancing = create_owned_task(expire_original_close())
+            client = await signed_sdk_client(p, http, protocol)
+            with fault, pytest.raises(BaseException) as first:
+                await await_within_hang_guard(dispatch(), step="original signed header-close admission")
+            advanced = await await_within_hang_guard(
+                await_owned_task(advancing), step="original signed close deadline advance",
+            )
+            assert advanced.error is None and advanced.cancellation is None
         assert len(headers_seen) == 1, "Signed request failed before the intended header-close boundary"
         assert any(error is admission_error for error in execution_evidence_carriers(first.value))
         await entered.wait()
@@ -730,6 +767,12 @@ async def test_inprocess_signed_failed_close_admission_retains_late_physical_err
         assert not exchange.source.producer_task.cancelling()
     finally:
         release.set()
+        if advancing is not None:
+            if not advancing.done():
+                advancing.cancel("original signed close test ended before finalizer entry")
+            await await_owned_task(advancing)
+        if exchange is None and transport.exchanges:
+            exchange, = transport.exchanges
         if exchange is not None:
             async with asyncio.timeout(1):
                 await exchange.source.join_source_owners(closing=True)

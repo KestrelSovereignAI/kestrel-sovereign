@@ -610,6 +610,7 @@ async def test_body_failure_retirement_timeout_retains_both_explicit_originals(r
 async def test_concurrent_close_cannot_strand_original_read_past_its_deadline():
     from kestrel_sovereign.execution_custody import execution_cleanup_debts
     from tests.utils.original_failure import fail_original_file_read
+    from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
     initial, entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     actual = []
@@ -632,26 +633,36 @@ async def test_concurrent_close_cannot_strand_original_read_past_its_deadline():
                 async for _ in response.aiter_raw():
                     initial.set()
 
-    reading, closing, exchange = create_owned_task(consume()), None, None
+    reading, closing, exchange = None, None, None
     try:
-        await initial.wait()
-        await asyncio.sleep(0)
-        exchange, = transport.exchanges
-        closing = create_owned_task(transport.aclose())
-        await entered.wait()
-        closed = await await_owned_task(closing)
-        assert execution_cleanup_debts(closed.error)
-        done, _ = await asyncio.wait((reading,), timeout=0.08)
-        assert reading in done, "Concurrent close stranded the original read beyond its deadline"
-        observed = await await_owned_task(reading)
-        assert any(isinstance(error, httpx.ReadTimeout) for error in _explicit_control_chain(observed.error))
-        assert execution_cleanup_debts(observed.error)
-        assert not exchange.source.producer_task.done() and not exchange.source.producer_task.cancelling()
+        with pinned_loop_clock() as clock:
+            reading = create_owned_task(consume())
+            reading.add_done_callback(lambda _: initial.set())
+            await await_within_hang_guard(initial.wait(), step="original unsigned initial event")
+            assert not reading.done(), "Original unsigned read ended before its initial event"
+            await asyncio.sleep(0)
+            exchange, = transport.exchanges
+            closing = create_owned_task(transport.aclose())
+            await await_within_hang_guard(entered.wait(), step="original unsigned finalizer entry")
+            assert not reading.done() and not closing.done()
+            clock.advance(0.02)
+            await await_within_hang_guard(
+                asyncio.wait((reading, closing)), step="original unsigned read and close deadlines",
+            )
+            closed = await await_owned_task(closing)
+            assert execution_cleanup_debts(closed.error)
+            observed = await await_owned_task(reading)
+            assert any(isinstance(error, httpx.ReadTimeout) for error in _explicit_control_chain(observed.error))
+            assert execution_cleanup_debts(observed.error)
+            assert not exchange.source.producer_task.done() and not exchange.source.producer_task.cancelling()
     finally:
         release.set()
-        result = await await_owned_task(reading)
+        result = (await await_within_hang_guard(await_owned_task(reading), step="original unsigned reader retirement")
+                  if reading is not None else None)
         if closing is not None:
             await await_owned_task(closing)
+        if exchange is None and transport.exchanges:
+            exchange, = transport.exchanges
         if exchange is not None:
             async with asyncio.timeout(1):
                 await exchange.source.join_source_owners(closing=True)
@@ -661,7 +672,7 @@ async def test_concurrent_close_cannot_strand_original_read_past_its_deadline():
             except BaseException as error:
                 retirement = error
             assert len(actual) == 1
-            assert any(error is actual[0] for failure in (result.error, retirement)
+            assert any(error is actual[0] for failure in (result.error if result is not None else None, retirement)
                        for error in _explicit_control_chain(failure))
             assert exchange.source.producer_task.done() and exchange.source.owner_task.done()
 
