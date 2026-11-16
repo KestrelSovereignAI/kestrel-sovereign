@@ -40,7 +40,8 @@ import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 PASS = "pass"
 FAIL = "fail"
@@ -61,7 +62,7 @@ REFUSED_ENV = (
 # .env keys whose values are credentials. Their values are scrubbed from the
 # report and every copied log, because the CI run that publishes them is on a
 # public repository.
-_SECRET_KEY_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)", re.I)
+_SECRET_KEY_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)", re.IGNORECASE)
 # Credentials handed to the journey in its environment. The runner image's
 # own variables (PGPASSWORD=root, ...) are not ours, and scrubbing short
 # common values corrupts every log line that contains them.
@@ -88,7 +89,7 @@ class Outcome:
 @dataclasses.dataclass
 class Step:
     name: str
-    run: Callable[["Journey"], Outcome]
+    run: Callable[[Journey], Outcome]
     requires: tuple[str, ...] = ()
     gate: bool = True
 
@@ -276,7 +277,7 @@ def scrub_data(value: Any, scrub: Callable[[str], str]) -> Any:
 
 
 def run_steps(
-    journey: "Journey", steps: list[Step], into: list[StepResult] | None = None
+    journey: Journey, steps: list[Step], into: list[StepResult] | None = None
 ) -> list[StepResult]:
     """Run ``steps`` in order; a step whose requirement did not pass is skipped.
 
@@ -881,7 +882,7 @@ def step_update_while_stopped(j: Journey) -> Outcome:
         if j.roster and j.port_open(j.roster.host_port):
             return failed(f"could not stop before updating, even by force: {stopped.detail}")
     os.utime(j.project_dir / "pyproject.toml", None)
-    outcome, output = run_update(j, "--no-pull", "--no-restart")
+    outcome, _output = run_update(j, "--no-pull", "--no-restart")
     outcome.data["harness_forced_stop"] = forced
     restarted = step_host_start(j)
     if outcome.status == PASS and restarted.status != PASS:
