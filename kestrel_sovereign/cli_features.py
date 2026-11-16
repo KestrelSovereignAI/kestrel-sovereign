@@ -3248,12 +3248,16 @@ def _entry_for_source(package: str, editable_path: Optional[str], from_index: bo
     return _manifest_entry_text(package, pypi="" if from_index else None)
 
 
-def _installed_closure(roots: dict) -> set:
-    """*roots* (``{distribution: extras}``) and every distribution they require.
+def _installed_closure(roots: dict, *, through) -> set:
+    """*roots* (``{distribution: extras}``) and what reinstalling them brings back.
 
-    Read transitively from the copies installed now, each requirement under
-    the extras its requirer asked for. A package one of them requires comes
-    back when they are reinstalled, so it is recorded through them.
+    A requirement is followed only out of a package in *through*, the ones
+    the sync removes: reinstalled, such a package installs what it requires
+    (read from the copy installed now, under the extras its requirer asked
+    for). A package the sync keeps is held to the incoming lock, whose
+    requirements are not the installed copy's, so nothing is credited through
+    it: core's own installed requirements say nothing about the core the sync
+    puts in place.
     """
     from packaging.requirements import InvalidRequirement, Requirement
 
@@ -3268,6 +3272,8 @@ def _installed_closure(roots: dict) -> set:
             continue
         seen.add((package, extras))
         names.add(package)
+        if package not in through:
+            continue
         for line in cli._installed_requirements(package):
             try:
                 requirement = Requirement(line)
@@ -3315,10 +3321,10 @@ def unrecorded_extensions(manifest: Path, *, removals, provisioned_without) -> t
         else {}
     )
     removed = {canonical_package(package) for package in removals}
-    restored = _installed_closure(declared)
+    restored = _installed_closure(declared, through=removed)
     provisioned = provisioned_without(frozenset(removed - restored))
     reinstalled = restored | _installed_closure(
-        {canonical_package(package): () for package in provisioned}
+        {canonical_package(package): () for package in provisioned}, through=removed,
     )
     found = []
     for dist in cli._installed_extension_distributions():
@@ -3493,8 +3499,9 @@ def record_feature_install(package: str) -> Optional[Path]:
     already linked from a checkout leaves the checkout, and an entry naming the
     index would have the next sync replace it.
 
-    Appended, never rewritten: the operator's comments, order, windows and
-    other tables survive, as they would an entry added by hand. The text is
+    Appended: the operator's comments, order, windows and other tables
+    survive, as they would an entry added by hand, and the file is replaced in
+    one step (:func:`_rewrite_host_manifest`). The text is
     held to :func:`_load_host_manifest`'s rules before it is written, so the
     append cannot leave a manifest no reader will load. A manifest that
     already declares the package is left as it is, whatever source it names.
@@ -3536,13 +3543,41 @@ def record_feature_install(package: str) -> Optional[Path]:
             with open(path, "xb") as handle:
                 handle.write(text.encode("utf-8"))
         else:
-            with open(path, "ab") as handle:
-                handle.write(text[len(current):].encode("utf-8"))
+            _rewrite_host_manifest(path, text)
     except (OSError, ValueError) as exc:
         # ValueError covers a manifest that will not read, TOML that will not
         # parse (TOMLDecodeError) and text that is not UTF-8.
         raise FeatureRecordError(path, name, entry, str(exc)) from exc
     return path
+
+
+def _rewrite_host_manifest(path: Path, text: str) -> None:
+    """Replace the manifest at *path* with *text* in one step.
+
+    Written beside the file it replaces (a link's target, so the link
+    survives), with its mode, then renamed over it: a crash leaves the old
+    text or the new one, never a manifest no reader will load.
+    """
+    import shutil
+    import tempfile
+
+    target = Path(os.path.realpath(path))
+    handle, scratch = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent),
+    )
+    replaced = False
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(text.encode("utf-8"))
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copymode(target, scratch)
+        os.replace(scratch, target)
+        replaced = True
+    finally:
+        if not replaced:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(scratch)
 
 
 #: A line that opens a TOML table or array-of-tables element.
@@ -3623,9 +3658,7 @@ def forget_feature_install(package: str) -> Optional[Path]:
                 "its entries could not be told apart line by line; remove the "
                 "entry by hand"
             )
-        with open(path, "r+b") as handle:
-            handle.write(text.encode("utf-8"))
-            handle.truncate()
+        _rewrite_host_manifest(path, text)
     except (OSError, ValueError) as exc:
         # ValueError covers a manifest that will not read, TOML that will not
         # parse (TOMLDecodeError) and text that is not UTF-8.

@@ -1527,6 +1527,10 @@ class UvDryRunError(RuntimeError):
     """``uv sync --dry-run`` did not say what the sync would remove (#4127)."""
 
 
+class _AgentRegistryError(RuntimeError):
+    """The agent registry reconcile reads its allowlists from would not load."""
+
+
 #: The files uv reads a project's sync from, besides the sources it installs.
 _UV_PROJECT_FILES = ("pyproject.toml", "uv.lock", "uv.toml")
 
@@ -1534,11 +1538,13 @@ _UV_PROJECT_FILES = ("pyproject.toml", "uv.lock", "uv.toml")
 def _uv_project_at(checkout: Path, revision: str, into: Path) -> None:
     """Write the files ``uv sync`` reads from *checkout* at *revision* into *into*.
 
-    As they will land: a working tree with its own changes to one of them
-    keeps those across a pull that leaves the file alone and refuses one that
-    would change it (``core_lock.read_core_lock_landing`` reads the lock by the
-    same rule), so then every file is the one on disk. ``uv.toml`` is copied
-    only when there is one.
+    Each as it will land, decided for that file alone: one the working tree
+    has its own copy of (modified, untracked, or ignored) is the copy on disk,
+    since git carries a local change across a pull that leaves the file alone
+    and refuses one that would change it (``core_lock.read_core_lock_landing``
+    reads the lock by the same rule), and the uv the sync runs reads an
+    untracked or ignored one all the same. Every other file is the one
+    *revision* records. ``uv.toml`` is copied only when there is one.
     """
     def git(*args) -> subprocess.CompletedProcess:
         try:
@@ -1548,15 +1554,19 @@ def _uv_project_at(checkout: Path, revision: str, into: Path) -> None:
         except OSError as exc:
             raise UvDryRunError(f"git could not run in {checkout}: {exc}") from exc
 
-    status = git("status", "--porcelain", "--", *_UV_PROJECT_FILES)
-    if status.returncode != 0:
-        raise UvDryRunError(
-            f"`git status` failed in {checkout}: "
-            + status.stderr.decode("utf-8", "replace").strip()
-        )
-    local = bool(status.stdout.strip())
     for name in _UV_PROJECT_FILES:
-        if local:
+        # Named explicitly, so a `status.showUntrackedFiles` setting cannot
+        # hide an untracked copy.
+        status = git(
+            "status", "--porcelain", "--ignored=matching", "--untracked-files=all",
+            "--", name,
+        )
+        if status.returncode != 0:
+            raise UvDryRunError(
+                f"`git status` failed in {checkout}: "
+                + status.stderr.decode("utf-8", "replace").strip()
+            )
+        if status.stdout.strip():
             source = checkout / name
             if source.exists():
                 (into / name).write_bytes(source.read_bytes())
@@ -1878,13 +1888,21 @@ def _unrecorded_extension_gate(
     except (UvDryRunError, _GitFailedError) as exc:
         return unknown(str(exc))
     registry = load_registry()
+
+    def provisioned_without(gone):
+        try:
+            return _required_feature_packages(project_dir, registry, absent=gone)[0]
+        except (ValueError, OSError) as exc:
+            raise _AgentRegistryError(str(exc)) from exc
+
     try:
         found = unrecorded_extensions(
-            manifest_path,
-            removals=removals,
-            provisioned_without=lambda gone: _required_feature_packages(
-                project_dir, registry, absent=gone,
-            )[0],
+            manifest_path, removals=removals, provisioned_without=provisioned_without,
+        )
+    except _AgentRegistryError as exc:
+        return unknown(
+            f"the agent registry ({project_dir / MULTI_AGENT_CONFIG_FILENAME}) "
+            f"would not load ({exc})"
         )
     except (ValueError, OSError) as exc:
         return unknown(f"the host manifest {manifest_path} would not read ({exc})")

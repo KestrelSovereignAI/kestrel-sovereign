@@ -475,6 +475,20 @@ def test_a_package_a_survivor_requires_comes_back_with_it(venv, project):
     assert _unrecorded(project, removals=both)[0] == []
 
 
+def test_nothing_is_credited_through_a_package_the_sync_keeps(venv, project):
+    """Core is kept and held to the incoming lock, which uv says drops voice:
+    the requirement the installed core carries brings nothing back."""
+    venv.installed[VOICE] = "0.4.0"
+    venv.installed[TELEGRAM] = "0.1.10"
+    venv.installed_requires[TELEGRAM] = [f"{CORE}>=0.52"]
+    venv.installed_requires[CORE] = [f"{VOICE}>=0.4"]
+    _manifest(project).write_text(
+        f'[[feature]]\nname = "{TELEGRAM}"\npypi = ""\n', encoding="utf-8",
+    )
+
+    assert _unrecorded(project, removals=(TELEGRAM, VOICE))[0] == [VOICE]
+
+
 def test_a_checkout_comes_back_only_from_the_manifest(venv, project):
     """Reconcile, or a survivor's requirement, would bring it back from the index."""
     venv.installed[VOICE] = "0.4.0"
@@ -695,14 +709,33 @@ def test_uv_reads_the_project_as_the_revision_records_it(checkout, monkeypatch):
 
 
 def test_local_edits_to_the_project_files_are_what_lands(checkout, monkeypatch):
-    """As the lock preflight reads it: git carries the edits across the pull."""
+    """As the lock preflight reads it: git carries the edits across the pull.
+    File by file: the edited one is the disk's, the other the revision's."""
     repo, _old, new = checkout
     (repo / "uv.lock").write_text("# edited lock\n", encoding="utf-8")
     seen = _uv_sees(monkeypatch)
 
     cli_lifecycle._uv_sync_removals(repo, new)
 
-    assert seen == [{"pyproject.toml": "# old pyproject\n", "uv.lock": "# edited lock\n"}]
+    assert seen == [{"pyproject.toml": "# new pyproject\n", "uv.lock": "# edited lock\n"}]
+
+
+@pytest.mark.parametrize("ignored", [False, True], ids=["untracked", "ignored"])
+def test_a_local_uv_toml_is_read_and_moves_nothing_else(checkout, monkeypatch, ignored):
+    """The sync reads it whether git tracks it or not; the lock still lands."""
+    repo, _old, new = checkout
+    if ignored:
+        (repo / ".git" / "info" / "exclude").write_text("uv.toml\n", encoding="utf-8")
+    _git(repo, "config", "status.showUntrackedFiles", "no")
+    (repo / "uv.toml").write_text("# local uv settings\n", encoding="utf-8")
+    seen = _uv_sees(monkeypatch)
+
+    cli_lifecycle._uv_sync_removals(repo, new)
+
+    assert seen == [{
+        "pyproject.toml": "# new pyproject\n", "uv.lock": "# new lock\n",
+        "uv.toml": "# local uv settings\n",
+    }]
 
 
 def test_a_revision_without_a_lock_is_no_answer(checkout, monkeypatch):
@@ -816,3 +849,62 @@ def test_the_gate_asks_uv_about_the_revision_the_pull_lands(venv, project, monke
 
     assert rc == 0
     assert asked == [(tmp_path, "c0ffee")]
+
+
+
+def test_an_agent_registry_that_will_not_load_is_named(venv, project, monkeypatch, tmp_path, capsys):
+    """Not blamed on the manifest. Asked of the gate alone: every other gate
+    of the update loads the same registry first."""
+    venv.installed[VOICE] = "0.4.0"
+    monkeypatch.setattr(cli, "_uv_sync_removals", lambda checkout, revision=None: (VOICE,))
+
+    def broken(*_args, **_kwargs):
+        raise ValueError("agents.emma: port must be an integer")
+
+    monkeypatch.setattr(cli.MultiAgentConfig, "load", classmethod(broken))
+
+    rc = cli_lifecycle._unrecorded_extension_gate(
+        project, tmp_path, manifest=None, landing=lambda: None, continue_on_error=False,
+    )
+
+    assert rc == 1
+    (failed,) = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert "the agent registry" in failed and "port must be an integer" in failed
+    assert "host manifest" not in failed
+
+
+# --- the manifest is replaced in one step --------------------------------------
+
+
+def test_an_edit_keeps_a_linked_manifest_linked_and_its_mode(venv, project, tmp_path):
+    real = tmp_path / "shared" / "manifest.toml"
+    real.parent.mkdir()
+    real.write_text(AROUND, encoding="utf-8")
+    real.chmod(0o640)
+    _manifest(project).symlink_to(real)
+
+    record_feature_install(VOICE)
+    forget_feature_install(VOICE)
+    record_feature_install(VOICE)
+
+    assert _manifest(project).is_symlink()
+    assert VOICE in _declared(project)
+    assert real.stat().st_mode & 0o777 == 0o640
+    assert list(real.parent.iterdir()) == [real]
+
+
+def test_a_failed_replace_leaves_the_manifest_and_no_scratch(venv, project, monkeypatch):
+    import os
+
+    _manifest(project).write_text(AROUND, encoding="utf-8")
+
+    def refuse(*_args):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(os, "replace", refuse)
+
+    with pytest.raises(FeatureRecordError):
+        record_feature_install(VOICE)
+
+    assert _manifest(project).read_text(encoding="utf-8") == AROUND
+    assert [p.name for p in project.iterdir() if p.name.endswith(".tmp")] == []
