@@ -412,3 +412,23 @@ def test_an_editable_extension_is_recorded_on_its_checkout(venv, project):
     assert extension == UnrecordedExtension(VOICE, "0.4.0", "C:\\src\\kestrel-feature-voice")
     parsed = tomllib.loads(extension.entry())["feature"]
     assert parsed == [{"name": VOICE, "editable": "C:\\src\\kestrel-feature-voice"}]
+
+
+def test_an_extension_an_agent_allowlists_is_kept_by_reconcile(
+    venv, project, update, monkeypatch, capsys,
+):
+    """Reconcile reinstalls what an allowlist names, so the update goes ahead.
+
+    The allowlist is set where reconcile derives it, so no other gate meets
+    an agent this test does not otherwise model.
+    """
+    monkeypatch.setattr(
+        "kestrel_sovereign.feature_reconcile.compute_required_classes",
+        lambda multi_agent: ({"VoiceFeature"}, []),
+    )
+    venv.installed[VOICE] = "0.4.0"
+
+    assert _update() == 0
+
+    assert update == ["uv sync", "restart"]
+    assert "each installed extension is in uv.lock" in capsys.readouterr().out
