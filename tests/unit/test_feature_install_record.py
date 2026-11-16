@@ -147,7 +147,7 @@ OPERATOR_MANIFEST = (
     [OPERATOR_MANIFEST, OPERATOR_MANIFEST.rstrip("\n"), OPERATOR_MANIFEST.replace("\n", "\r\n"), ""],
     ids=["trailing-newline", "no-trailing-newline", "crlf", "empty"],
 )
-def test_an_install_appends_and_keeps_every_byte_already_there(project, existing):
+def test_an_install_appends_and_keeps_every_byte_already_there(venv, project, existing):
     manifest = _manifest(project)
     manifest.write_bytes(existing.encode("utf-8"))
 
@@ -167,7 +167,7 @@ def test_an_install_appends_and_keeps_every_byte_already_there(project, existing
     [VOICE, "voice", "Kestrel_Feature_Voice", f"{VOICE}[local]"],
     ids=["dist", "registry-name", "unnormalized", "inline-extras"],
 )
-def test_a_package_the_manifest_already_declares_is_left_alone(project, spelling):
+def test_a_package_the_manifest_already_declares_is_left_alone(venv, project, spelling):
     """Whatever source it names: the operator's declaration is theirs."""
     manifest = _manifest(project)
     text = f'[[feature]]\nname = "{spelling}"\neditable = "/src/voice"\n'
@@ -199,6 +199,21 @@ def test_the_install_is_recorded_in_the_manifest_its_guard_read(
     assert not _manifest(project).exists()
 
 
+def test_an_install_records_the_copy_installed_not_the_one_asked_for(venv, project):
+    """Already linked from a checkout, voice is "already satisfied": the install
+    leaves the link, so the entry names the checkout. ``pypi = ""`` would have
+    the next sync replace it from the index."""
+    venv.installed[VOICE] = "0.4.0"
+    venv.editable[VOICE] = "/src/kestrel-feature-voice"
+
+    assert cli.cmd_feature_install(argparse.Namespace(name="voice")) == 0
+
+    assert venv.editable[VOICE] == "/src/kestrel-feature-voice"
+    assert _declared(project)[VOICE] == {
+        "name": VOICE, "editable": "/src/kestrel-feature-voice", "pypi": None, "extras": [],
+    }
+
+
 def test_a_git_fallback_install_is_recorded_without_a_source(venv, project, capsys):
     """The legacy entry is the one ``feature sync`` falls back to git for."""
     venv.feature_on_index = False
@@ -214,7 +229,7 @@ def test_a_git_fallback_install_is_recorded_without_a_source(venv, project, caps
     ["this is = not [toml", 'feature = []\n', '[[feature]]\npypi = ""\n'],
     ids=["not-toml", "feature-is-not-an-array-of-tables", "entry-without-a-name"],
 )
-def test_a_manifest_that_cannot_take_the_entry_is_refused_unchanged(project, existing):
+def test_a_manifest_that_cannot_take_the_entry_is_refused_unchanged(venv, project, existing):
     manifest = _manifest(project)
     manifest.write_text(existing, encoding="utf-8")
 
@@ -267,7 +282,7 @@ def update(venv, tmp_path, monkeypatch):
     steps = []
     locked = {CORE, SDK}
 
-    def removals(_checkout):
+    def removals(_checkout, revision=None):
         return tuple(sorted(name for name in venv.installed if name not in locked))
 
     def uv_sync(_checkout):
@@ -316,7 +331,7 @@ def test_an_update_refuses_to_uninstall_an_extension_nothing_records(
     err = capsys.readouterr().err
     assert "• extensions: REFUSED" in err
     assert f"    {VOICE} 0.4.0" in err
-    assert "Nothing was installed or restarted" in err
+    assert "Nothing was pulled, installed or restarted" in err
     # No manifest yet: the one command that writes it is named.
     assert "kestrel feature sync --capture" in err
 
@@ -382,7 +397,7 @@ def test_no_answer_from_uv_is_not_an_empty_one(venv, project, update, monkeypatc
     def refuse(_checkout):
         raise cli_lifecycle.UvDryRunError("`uv sync --dry-run` exited 2: unexpected argument")
 
-    monkeypatch.setattr(cli, "_uv_sync_removals", refuse)
+    monkeypatch.setattr(cli, "_uv_sync_removals", lambda checkout, revision=None: refuse(checkout))
 
     assert _update() == 1
 
@@ -586,7 +601,7 @@ def test_uv_is_asked_exactly_as_the_sync_runs(monkeypatch, tmp_path):
 
     ((argv, kwargs),) = calls
     sync, env = cli_lifecycle._uv_sync_invocation()
-    assert argv == [*sync, "--dry-run", "--output-format", "json"]
+    assert argv == [*sync, "--dry-run", "--output-format", "json", "--project", str(tmp_path)]
     assert kwargs["cwd"] == str(tmp_path)
     assert kwargs["env"].get("VIRTUAL_ENV") == env.get("VIRTUAL_ENV")
 
@@ -620,3 +635,169 @@ def test_an_answer_that_is_not_one_raises(monkeypatch, tmp_path, answer):
 
     with pytest.raises(cli_lifecycle.UvDryRunError):
         cli_lifecycle._uv_sync_removals(tmp_path)
+
+
+# --- uv is asked about the revision the pull lands, before it lands ------------
+
+REAL_RUN = subprocess.run
+
+
+def _git(cwd, *args):
+    return REAL_RUN(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        cwd=cwd, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def checkout(tmp_path):
+    """A checkout whose next commit changes pyproject.toml and uv.lock."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "pyproject.toml").write_text("# old pyproject\n", encoding="utf-8")
+    (repo / "uv.lock").write_text("# old lock\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "old")
+    old = _git(repo, "rev-parse", "HEAD")
+    (repo / "pyproject.toml").write_text("# new pyproject\n", encoding="utf-8")
+    (repo / "uv.lock").write_text("# new lock\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "new")
+    new = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", old)
+    return repo, old, new
+
+
+def _uv_sees(monkeypatch):
+    """Real git; uv answers nothing, and records the project files it was shown."""
+    seen = []
+
+    def run(argv, **kwargs):
+        if argv[0] == "git":
+            return REAL_RUN(argv, **kwargs)
+        project = Path(argv[argv.index("--project") + 1])
+        seen.append({path.name: path.read_text() for path in project.iterdir()})
+        return subprocess.CompletedProcess(argv, 0, stdout=_changes(), stderr="")
+
+    monkeypatch.setattr(cli_lifecycle.subprocess, "run", run)
+    return seen
+
+
+def test_uv_reads_the_project_as_the_revision_records_it(checkout, monkeypatch):
+    repo, _old, new = checkout
+    seen = _uv_sees(monkeypatch)
+
+    assert cli_lifecycle._uv_sync_removals(repo, new) == ()
+
+    assert seen == [{"pyproject.toml": "# new pyproject\n", "uv.lock": "# new lock\n"}]
+    # Read from git: the checkout itself has not moved.
+    assert (repo / "uv.lock").read_text() == "# old lock\n"
+
+
+def test_local_edits_to_the_project_files_are_what_lands(checkout, monkeypatch):
+    """As the lock preflight reads it: git carries the edits across the pull."""
+    repo, _old, new = checkout
+    (repo / "uv.lock").write_text("# edited lock\n", encoding="utf-8")
+    seen = _uv_sees(monkeypatch)
+
+    cli_lifecycle._uv_sync_removals(repo, new)
+
+    assert seen == [{"pyproject.toml": "# old pyproject\n", "uv.lock": "# edited lock\n"}]
+
+
+def test_a_revision_without_a_lock_is_no_answer(checkout, monkeypatch):
+    repo, old, _new = checkout
+    _git(repo, "rm", "-q", "uv.lock")
+    _git(repo, "commit", "-qm", "no lock")
+    _uv_sees(monkeypatch)
+
+    with pytest.raises(cli_lifecycle.UvDryRunError, match="no uv.lock"):
+        cli_lifecycle._uv_sync_removals(repo, _git(repo, "rev-parse", "HEAD"))
+
+
+# --- the console's remove forgets what its install recorded ---------------------
+
+from kestrel_sovereign.cli_features import FeatureForgetError, forget_feature_install
+
+AROUND = (
+    "# Header comment.\n"
+    "[host_features]\n"
+    "default_enabled = false\n"
+    "\n"
+    "[[feature]]\n"
+    'name = "arize-phoenix"\n'
+    'pypi = ">=20,<21"\n'
+    "\n"
+)
+AFTER = (
+    "# The comment above the next entry is the next entry's.\n"
+    "[[feature]]\n"
+    'name = "kestrel-feature-github"\n'
+    'pypi = ""\n'
+)
+
+
+@pytest.mark.parametrize(
+    "spelling", [VOICE, "voice", f"{VOICE}[local]"], ids=["dist", "registry", "extras"],
+)
+def test_forgetting_removes_only_that_entry(venv, project, spelling):
+    entry = f'[[feature]]\nname = "{spelling}"\npypi = ""\n# a note on voice\n\n'
+    _manifest(project).write_text(AROUND + entry + AFTER, encoding="utf-8")
+
+    assert forget_feature_install(VOICE) == _manifest(project)
+
+    assert _manifest(project).read_text(encoding="utf-8") == AROUND + AFTER
+
+
+def test_install_then_forget_leaves_the_operators_text(venv, project):
+    _manifest(project).write_text(AROUND + AFTER, encoding="utf-8")
+    assert record_feature_install(VOICE) is not None
+
+    forget_feature_install(VOICE)
+
+    assert _manifest(project).read_text(encoding="utf-8").rstrip("\n") == (AROUND + AFTER).rstrip("\n")
+    assert VOICE not in _declared(project)
+
+
+@pytest.mark.parametrize("existing", [None, AROUND + AFTER], ids=["no-manifest", "not-declared"])
+def test_nothing_to_forget_changes_nothing(project, existing):
+    if existing is not None:
+        _manifest(project).write_text(existing, encoding="utf-8")
+
+    assert forget_feature_install(VOICE) is None
+
+    if existing is None:
+        assert not _manifest(project).exists()
+    else:
+        assert _manifest(project).read_text(encoding="utf-8") == existing
+
+
+def test_a_header_in_another_value_does_not_confuse_it(venv, project):
+    """Spans that do not parse alone are skipped; the result is still checked."""
+    github = (
+        '[[feature]]\nname = "kestrel-feature-github"\npypi = ""\n'
+        'note = """\n[[feature]]\nname = "x"\n"""\n'
+    )
+    _manifest(project).write_text(
+        github + f'[[feature]]\nname = "{VOICE}"\npypi = ""\n', encoding="utf-8",
+    )
+
+    assert forget_feature_install(VOICE) == _manifest(project)
+
+    assert _manifest(project).read_text(encoding="utf-8") == github
+
+
+def test_a_manifest_that_does_not_split_by_line_is_refused_unchanged(venv, project):
+    """A header-looking line inside the entry's own value cuts it short."""
+    text = (
+        '[[feature]]\nname = "kestrel-feature-github"\npypi = ""\n'
+        f'[[feature]]\nname = "{VOICE}"\npypi = ""\n'
+        'note = """\n[[feature]]\nname = "x"\n"""\n'
+    )
+    _manifest(project).write_text(text, encoding="utf-8")
+
+    with pytest.raises(FeatureForgetError) as raised:
+        forget_feature_install(VOICE)
+
+    assert _manifest(project).read_text(encoding="utf-8") == text
+    assert "reinstalls it unless" in raised.value.describe()

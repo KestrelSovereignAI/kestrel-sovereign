@@ -1527,7 +1527,54 @@ class UvDryRunError(RuntimeError):
     """``uv sync --dry-run`` did not say what the sync would remove (#4127)."""
 
 
-def _uv_sync_removals(project_dir: Path) -> Tuple[str, ...]:
+#: The files uv reads a project's sync from, besides the sources it installs.
+_UV_PROJECT_FILES = ("pyproject.toml", "uv.lock", "uv.toml")
+
+
+def _uv_project_at(checkout: Path, revision: str, into: Path) -> None:
+    """Write the files ``uv sync`` reads from *checkout* at *revision* into *into*.
+
+    As they will land: a working tree with its own changes to one of them
+    keeps those across a pull that leaves the file alone and refuses one that
+    would change it (``core_lock.read_core_lock_landing`` reads the lock by the
+    same rule), so then every file is the one on disk. ``uv.toml`` is copied
+    only when there is one.
+    """
+    def git(*args) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=str(checkout), capture_output=True, check=False,
+            )
+        except OSError as exc:
+            raise UvDryRunError(f"git could not run in {checkout}: {exc}") from exc
+
+    status = git("status", "--porcelain", "--", *_UV_PROJECT_FILES)
+    if status.returncode != 0:
+        raise UvDryRunError(
+            f"`git status` failed in {checkout}: "
+            + status.stderr.decode("utf-8", "replace").strip()
+        )
+    local = bool(status.stdout.strip())
+    for name in _UV_PROJECT_FILES:
+        if local:
+            source = checkout / name
+            if source.exists():
+                (into / name).write_bytes(source.read_bytes())
+            continue
+        if git("cat-file", "-e", f"{revision}:{name}").returncode != 0:
+            if name == "uv.toml":
+                continue
+            raise UvDryRunError(f"{checkout} has no {name} at {revision}")
+        blob = git("cat-file", "blob", f"{revision}:{name}")
+        if blob.returncode != 0:
+            raise UvDryRunError(
+                f"could not read {name} at {revision}: "
+                + blob.stderr.decode("utf-8", "replace").strip()
+            )
+        (into / name).write_bytes(blob.stdout)
+
+
+def _uv_sync_removals(project_dir: Path, revision: Optional[str] = None) -> Tuple[str, ...]:
     """The packages ``uv sync`` in *project_dir* would leave uninstalled, by canonical name.
 
     Asked of uv itself (``--dry-run --output-format json``), not worked out
@@ -1536,20 +1583,31 @@ def _uv_sync_removals(project_dir: Path) -> Tuple[str, ...]:
     through an extra is uninstalled like one it does not name at all. uv
     reports a version change as an uninstall and an install of the same name,
     so only a name it uninstalls and does not install again is removed.
-    Raises :class:`UvDryRunError` when uv fails or its answer is not that
-    shape: no answer is not an empty one.
+
+    With *revision*, asked of the project as *revision* records it
+    (:func:`_uv_project_at`), so the answer is about the sync a pull to it
+    will run, before the pull: uv reads a copy of the project files, and the
+    venv this process runs. Raises :class:`UvDryRunError` when uv fails or its
+    answer is not that shape: no answer is not an empty one.
     """
+    import tempfile
+
     from kestrel_sovereign.feature_reconcile import canonical_package
 
     cmd, env = _uv_sync_invocation()
-    argv = [*cmd, "--dry-run", "--output-format", "json"]
-    try:
-        result = subprocess.run(
-            argv, cwd=str(project_dir), capture_output=True, text=True,
-            check=False, env=env,
-        )
-    except OSError as exc:
-        raise UvDryRunError(f"`{shlex.join(argv)}` could not run: {exc}") from exc
+    with tempfile.TemporaryDirectory(prefix="kestrel-update-uv-") as scratch:
+        project = Path(project_dir)
+        if revision is not None:
+            project = Path(scratch)
+            _uv_project_at(Path(project_dir), revision, project)
+        argv = [*cmd, "--dry-run", "--output-format", "json", "--project", str(project)]
+        try:
+            result = subprocess.run(
+                argv, cwd=str(project_dir), capture_output=True, text=True,
+                check=False, env=env,
+            )
+        except OSError as exc:
+            raise UvDryRunError(f"`{shlex.join(argv)}` could not run: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
         raise UvDryRunError(
@@ -1779,23 +1837,25 @@ def _unrecorded_extension_gate(
     source_checkout: Path,
     *,
     manifest: Optional[str],
+    landing: Callable[[], Optional[str]],
     continue_on_error: bool,
 ) -> int:
     """Refuse a ``uv sync`` that would uninstall an extension nothing reinstalls (#4127).
 
-    Run immediately before the update's ``uv sync``, so the lock uv reads is
-    the one the sync installs: the pull has landed it. uv says what the sync
-    removes (:func:`_uv_sync_removals`); reconcile is asked which packages it
-    would still provision once those are gone. 0 when every removed extension
-    comes back (:func:`~kestrel_sovereign.cli_features.unrecorded_extensions`),
-    or when *continue_on_error* lets the update go on after naming the ones it
-    will remove. 1 otherwise, with each package and the entry that records it.
+    Run before the pull, while refusing leaves the host as it was. *landing*
+    answers the commit the install will run ``uv sync`` at (None: the checkout
+    as it is), and uv says what that sync removes (:func:`_uv_sync_removals`);
+    reconcile is asked which packages it would still provision once those are
+    gone. 0 when every removed extension comes back
+    (:func:`~kestrel_sovereign.cli_features.unrecorded_extensions`), or when
+    *continue_on_error* lets the update go on after naming the ones it will
+    remove. 1 otherwise, with each package and the entry that records it.
     """
     from kestrel_sovereign.cli_features import unrecorded_extensions
     from kestrel_sovereign.feature_registry import load_registry
 
     manifest_path = cli._host_manifest_path(argparse.Namespace(manifest=manifest))
-    untouched = "Nothing was installed or restarted."
+    untouched = "Nothing was pulled, installed or restarted."
 
     def unknown(reason: str) -> int:
         print(
@@ -1814,8 +1874,8 @@ def _unrecorded_extension_gate(
         return 1
 
     try:
-        removals = cli._uv_sync_removals(source_checkout)
-    except UvDryRunError as exc:
+        removals = cli._uv_sync_removals(source_checkout, landing())
+    except (UvDryRunError, _GitFailedError) as exc:
         return unknown(str(exc))
     registry = load_registry()
     try:
@@ -2645,6 +2705,33 @@ def cmd_update(args) -> int:
                     file=sys.stderr,
                 )
 
+    # Step 0.75: extensions nothing records (#4127). `uv sync` uninstalls what
+    # its lock does not install; the feature sync reinstalls what the host
+    # manifest declares and reconcile what an agent's allowlist names. An
+    # extension none of them records (installed before `feature install`
+    # recorded its installs, or by hand) is gone after the update, and nothing
+    # says so. Asked of uv, against the project as the pull will land it, while
+    # refusing still leaves the host as it was. Whatever --no-features says:
+    # the removal is the install's.
+    if (
+        install
+        and source_checkout is not None
+        and _install_uses_uv_sync(args, source_checkout)
+    ):
+        rc = _unrecorded_extension_gate(
+            project_dir,
+            source_checkout,
+            manifest=getattr(args, "manifest", None),
+            # The commit `uv sync` will run at: the one the pull lands, else
+            # the one the checks judged (None: the checkout as it is).
+            landing=lambda: (
+                incoming_revision.target().landing if pulling else judged_core_revision
+            ),
+            continue_on_error=continue_on_error,
+        )
+        if rc != 0:
+            return rc
+
     # Step 1: the pull: fast-forward the source checkout (NOT the data root,
     # which may be a non-git KESTREL_HOME) to the commit the checks above
     # judged, fetched once by them (#3832).
@@ -2786,23 +2873,6 @@ def cmd_update(args) -> int:
         else:
             if _install_uses_uv_sync(args, source_checkout):
                 cmd_label = "uv sync"
-                # Extensions nothing records (#4127). `uv sync` uninstalls
-                # what its lock does not install; the feature sync reinstalls
-                # what the host manifest declares and reconcile what an
-                # agent's allowlist names. An extension none of them records
-                # (installed before `feature install` recorded its installs,
-                # or by hand) is gone after the update, and nothing says so.
-                # Asked here, of uv, against the lock the pull landed, while
-                # refusing still leaves the venv as it was. Whatever
-                # --no-features says: the removal is this step's.
-                rc = _unrecorded_extension_gate(
-                    project_dir,
-                    source_checkout,
-                    manifest=getattr(args, "manifest", None),
-                    continue_on_error=continue_on_error,
-                )
-                if rc != 0:
-                    return rc
                 if dry_run:
                     print(
                         f"• install: would run `{cmd_label}` "

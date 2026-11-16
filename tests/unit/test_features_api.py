@@ -2597,6 +2597,52 @@ class TestRemoveFeature:
         command = mock_run.call_args.args[0]
         assert command[-2:] == ["-y", "kestrel-feature-multi"]
 
+    # -- the host manifest forgets what the console removed (#4127) -----------
+
+    @staticmethod
+    def _remove_multi(mock_pkg, mock_registry, mock_run, manifest_text):
+        mock_pkg.return_value = None
+        mock_registry.return_value = {"multi-pkg": FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature"], description="multi",
+        )}
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        manifest = cli._host_manifest_path(SimpleNamespace(manifest=None))
+        manifest.write_text(manifest_text, encoding="utf-8")
+        agent = _lifecycle_agent(features={"FirstFeature": _make_feature(name="FirstFeature")})
+        with TestClient(_make_app(agent), raise_server_exceptions=False) as client:
+            return client.post("/api/features/multi-pkg/remove"), manifest
+
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    def test_a_removed_package_is_no_longer_declared(self, mock_pkg, mock_registry, mock_run):
+        """Left declared, the next update or sync would install it again."""
+        keep = '[[feature]]\nname = "kestrel-feature-github"\npypi = ""\n'
+        resp, manifest = self._remove_multi(
+            mock_pkg, mock_registry, mock_run,
+            keep + '\n[[feature]]\nname = "kestrel-feature-multi"\npypi = ""\n',
+        )
+
+        assert resp.status_code == 200
+        assert manifest.read_text(encoding="utf-8") == keep + "\n"
+
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    def test_a_removal_the_manifest_cannot_forget_is_not_a_success(
+        self, mock_pkg, mock_registry, mock_run,
+    ):
+        text = (
+            '[[feature]]\nname = "kestrel-feature-multi"\npypi = ""\n'
+            'note = """\n[[feature]]\n"""\n'
+        )
+        resp, manifest = self._remove_multi(mock_pkg, mock_registry, mock_run, text)
+
+        assert resp.status_code == 500
+        assert "kestrel-feature-multi was uninstalled, but removing it" in resp.json()["detail"]
+        assert manifest.read_text(encoding="utf-8") == text
+
     @patch("kestrel_sovereign.endpoints.features.subprocess.run")
     @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_remove_by_class_cleans_every_loaded_package_member(self, mock_pkg, mock_run):

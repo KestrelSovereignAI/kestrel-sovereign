@@ -263,7 +263,7 @@ def update(venv, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_git_head", lambda _: None)
     monkeypatch.setattr(cli, "_run_uv_sync", lambda _: steps.append("uv sync") or (0, ""))
     # The recorded sync removes nothing, and its dry run says so (#4127).
-    monkeypatch.setattr(cli, "_uv_sync_removals", lambda _: ())
+    monkeypatch.setattr(cli, "_uv_sync_removals", lambda checkout, revision=None: ())
     monkeypatch.setattr(
         cli, "cmd_feature_sync", lambda args: steps.append("feature sync") or 0,
     )
@@ -403,7 +403,7 @@ def real_update(incoming, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     monkeypatch.setattr(cli, "_run_uv_sync", lambda _: steps.append("uv sync") or (0, ""))
     # The recorded sync removes nothing, and its dry run says so (#4127).
-    monkeypatch.setattr(cli, "_uv_sync_removals", lambda _: ())
+    monkeypatch.setattr(cli, "_uv_sync_removals", lambda checkout, revision=None: ())
     monkeypatch.setattr(
         cli, "cmd_feature_sync", lambda args: steps.append("feature sync") or 0,
     )

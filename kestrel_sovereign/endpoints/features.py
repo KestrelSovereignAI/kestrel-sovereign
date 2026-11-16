@@ -1177,6 +1177,20 @@ async def _remove_feature_locked(
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="Removal timed out")
 
+    # The install recorded it in the host manifest (#4127); left there, the
+    # next `kestrel update` or `feature sync` installs it again. Under the
+    # install lock, which serialises every console edit of that file: this one
+    # rewrites it, and an install's append landing between the read and the
+    # write would be lost. The install never takes the config lock held here.
+    from kestrel_sovereign.cli_features import FeatureForgetError, forget_feature_install
+
+    try:
+        async with _INSTALL_LOCK:
+            await asyncio.to_thread(forget_feature_install, package_spec)
+    except FeatureForgetError as exc:
+        logger.error("unrecording %s failed: %s", package_spec, exc)
+        raise HTTPException(status_code=500, detail=exc.describe())
+
     return {
         "status": "removed",
         "package": package_spec,

@@ -302,21 +302,19 @@ def cmd_feature_install(args) -> int:
     guard = CoreInstallGuard.snapshot()
 
     result = guard.run([package])
-    from_git = False
 
     if result.returncode != 0:
         # Try git URL as fallback
         if info.git:
             print(f"pip install failed, trying git: {info.git}")
             result = guard.run([f"git+{info.git}"])
-            from_git = True
 
     if result.returncode == 0:
         print(f"Installed {package}")
         # Recorded before the core check, which can raise: the package is in
         # the venv whatever core's state, and unrecorded the next update
         # uninstalls it (#4127).
-        record_rc = _report_feature_record(package, from_git=from_git)
+        record_rc = _report_feature_record(package)
         return _worst_rc(guard.verify(), record_rc)
     else:
         print(f"Failed to install {package}")
@@ -345,10 +343,10 @@ def cmd_feature_install(args) -> int:
         return guard.verify() or 1
 
 
-def _report_feature_record(package: str, *, from_git: bool) -> int:
+def _report_feature_record(package: str) -> int:
     """Record an installed *package* in the host manifest and say so; 1 if it could not."""
     try:
-        path = record_feature_install(package, from_git=from_git)
+        path = record_feature_install(package)
     except FeatureRecordError as exc:
         print(f"Error: {exc.describe()}", file=sys.stderr)
         return 1
@@ -3233,9 +3231,21 @@ class UnrecordedExtension:
         ``feature sync`` may fall back to the registry's git URL for, as
         :func:`record_feature_install` records a git fallback.
         """
-        if self.editable_path:
-            return _manifest_entry_text(self.package, editable=self.editable_path)
-        return _manifest_entry_text(self.package, pypi="" if self.from_index else None)
+        return _entry_for_source(self.package, self.editable_path, self.from_index)
+
+
+def _entry_for_source(package: str, editable_path: Optional[str], from_index: bool) -> str:
+    """The manifest entry that records *package* as installed from where it was.
+
+    The one rule both writers use (:func:`record_feature_install` and the
+    entry ``kestrel update`` prints for an unrecorded extension): a checkout
+    as an ``editable`` entry, an index install as ``pypi = ""``, anything else
+    (a git ref, an archive) as the legacy entry that names no source, the one
+    ``feature sync`` may fall back to the registry's git URL for.
+    """
+    if editable_path:
+        return _manifest_entry_text(package, editable=editable_path)
+    return _manifest_entry_text(package, pypi="" if from_index else None)
 
 
 def _installed_closure(roots: dict) -> set:
@@ -3411,7 +3421,17 @@ def _declared_packages(entries: list, registry: dict) -> dict:
     return declared
 
 
-class FeatureRecordError(Exception):
+class HostManifestEditError(Exception):
+    """The host manifest could not be changed to match what was just done to the venv."""
+
+    def __init__(self, path, package: str, reason: str):
+        super().__init__(f"{path}: {reason}")
+        self.path = path
+        self.package = package
+        self.reason = reason
+
+
+class FeatureRecordError(HostManifestEditError):
     """The host manifest could not record a package this host installed (#4127).
 
     Carries the entry, so the operator can be handed the exact text that would
@@ -3419,11 +3439,8 @@ class FeatureRecordError(Exception):
     """
 
     def __init__(self, path, package: str, entry: str, reason: str):
-        super().__init__(f"{path}: {reason}")
-        self.path = path
-        self.package = package
+        super().__init__(path, package, reason)
         self.entry = entry
-        self.reason = reason
 
     def describe(self) -> str:
         return (
@@ -3434,7 +3451,33 @@ class FeatureRecordError(Exception):
         )
 
 
-def record_feature_install(package: str, *, from_git: bool = False) -> Optional[Path]:
+class FeatureForgetError(HostManifestEditError):
+    """The host manifest still declares a package this host uninstalled (#4127)."""
+
+    def describe(self) -> str:
+        return (
+            f"{self.package} was uninstalled, but removing it from the host "
+            f"manifest {self.path} failed: {self.reason}. The next `kestrel "
+            "update` or `kestrel feature sync` reinstalls it unless the "
+            f"`[[feature]]` entry naming {self.package} is removed."
+        )
+
+
+def _host_manifest_for_edit(error) -> Path:
+    """The default host manifest's path, or ``error(path, reason)`` raised saying why not."""
+    import types
+
+    try:
+        # Through `cli.`, as the install guard reads it: the file the guard
+        # held an install to is the file it is recorded in.
+        return cli._host_manifest_path(types.SimpleNamespace(manifest=None))
+    except (OSError, RuntimeError) as exc:
+        # RuntimeError: the project directory's last fallback is ~/.kestrel,
+        # and `Path.home()` raises it when no home directory can be found.
+        raise error(DEFAULT_HOST_MANIFEST, f"it could not be located ({exc})") from exc
+
+
+def record_feature_install(package: str) -> Optional[Path]:
     """Declare *package*, just installed, in the host manifest (#4127).
 
     ``kestrel update``'s ``uv sync`` removes every package core's lock does not
@@ -3444,11 +3487,11 @@ def record_feature_install(package: str, *, from_git: bool = False) -> Optional[
     and the console's install endpoint) record what they installed here, so the
     manifest is the one record of what this host keeps.
 
-    The entry records the install as it was asked for: ``pypi = ""``, from the
-    index at no version the operator chose (core's lock and the install guard
-    still bound it). One installed by the registry's git fallback (*from_git*)
-    is the legacy entry that names no source, the one form ``feature sync``
-    falls back to git for.
+    The entry records the copy now installed, read from its provenance
+    (:func:`_entry_for_source`), not the install that was asked for: an
+    installer judges "already satisfied" by version, so asking for a package
+    already linked from a checkout leaves the checkout, and an entry naming the
+    index would have the next sync replace it.
 
     Appended, never rewritten: the operator's comments, order, windows and
     other tables survive, as they would an entry added by hand. The text is
@@ -3460,22 +3503,14 @@ def record_feature_install(package: str, *, from_git: bool = False) -> Optional[
     already there. Raises :class:`FeatureRecordError` when it could not record.
     """
     import tomllib
-    import types
 
     from kestrel_sovereign.feature_registry import load_registry
 
     name = canonical_package(package)
-    entry = _manifest_entry_text(name, pypi=None if from_git else "")
-    try:
-        # Through `cli.`, as the install guard reads it: the file the guard
-        # held this install to is the file it is recorded in.
-        path = cli._host_manifest_path(types.SimpleNamespace(manifest=None))
-    except (OSError, RuntimeError) as exc:
-        # RuntimeError: the project directory's last fallback is ~/.kestrel,
-        # and `Path.home()` raises it when no home directory can be found.
-        raise FeatureRecordError(
-            DEFAULT_HOST_MANIFEST, name, entry, f"it could not be located ({exc})",
-        ) from exc
+    entry = _entry_for_source(name, cli._editable_install_path(name), cli._from_index(name))
+    path = _host_manifest_for_edit(
+        lambda where, reason: FeatureRecordError(where, name, entry, reason),
+    )
     registry = load_registry()
     try:
         try:
@@ -3507,6 +3542,94 @@ def record_feature_install(package: str, *, from_git: bool = False) -> Optional[
         # ValueError covers a manifest that will not read, TOML that will not
         # parse (TOMLDecodeError) and text that is not UTF-8.
         raise FeatureRecordError(path, name, entry, str(exc)) from exc
+    return path
+
+
+#: A line that opens a TOML table or array-of-tables element.
+_TABLE_HEADER = re.compile(r"^\s*\[")
+#: A line that opens one ``[[feature]]`` entry.
+_FEATURE_HEADER = re.compile(r"^\s*\[\[\s*feature\s*\]\]\s*(#.*)?$")
+
+
+def forget_feature_install(package: str) -> Optional[Path]:
+    """Remove every host manifest entry that declares *package*, just uninstalled (#4127).
+
+    The inverse of :func:`record_feature_install`, for the console's remove:
+    left declared, the package the operator removed is reinstalled by the next
+    ``kestrel update`` or ``feature sync``, and an agent that loads every
+    installed feature starts it again.
+
+    Each entry's text is the run of lines from its ``[[feature]]`` header to
+    the next table header, less the comment lines directly above that header,
+    which belong to what follows. Everything else in the file stays as
+    written. The result is held to the file it came from before it is
+    written: the same entries less the ones removed, and the same other
+    tables. A file that does not split that way (a header inside a multi-line
+    value, say) is refused, never rewritten by guess.
+
+    Returns the manifest's path when an entry was removed, None when nothing
+    declared the package (or there is no manifest). Raises
+    :class:`FeatureForgetError` when it could not remove one.
+    """
+    import tomllib
+
+    from kestrel_sovereign.feature_registry import load_registry
+
+    name = canonical_package(package)
+    path = _host_manifest_for_edit(
+        lambda where, reason: FeatureForgetError(where, name, reason),
+    )
+    registry = load_registry()
+
+    def declares(entries) -> bool:
+        return name in _declared_packages(entries, registry)
+
+    try:
+        try:
+            current = path.read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            return None
+        before = tomllib.loads(current)
+        entries = _host_manifest_entries(before, path)
+        if not declares(entries):
+            return None
+        lines = current.splitlines(keepends=True)
+        headers = [i for i, line in enumerate(lines) if _TABLE_HEADER.match(line)]
+        drop: set = set()
+        for index in (i for i in headers if _FEATURE_HEADER.match(lines[i])):
+            end = next((h for h in headers if h > index), len(lines))
+            if end < len(lines):
+                # The comment lines directly above the next header are that
+                # table's, not this one's.
+                while end - 1 > index and lines[end - 1].lstrip().startswith("#"):
+                    end -= 1
+            try:
+                own = _host_manifest_entries(tomllib.loads("".join(lines[index:end])), path)
+            except ValueError:
+                # Not an entry on its own lines; the check below refuses the
+                # edit if that hid the one being removed.
+                continue
+            if declares(own):
+                drop.update(range(index, end))
+        text = "".join(line for i, line in enumerate(lines) if i not in drop)
+        after = tomllib.loads(text)
+        kept = [entry for entry in entries if not declares([entry])]
+
+        def others(data: dict) -> dict:
+            return {key: value for key, value in data.items() if key != "feature"}
+
+        if _host_manifest_entries(after, path) != kept or others(after) != others(before):
+            raise ValueError(
+                "its entries could not be told apart line by line; remove the "
+                "entry by hand"
+            )
+        with open(path, "r+b") as handle:
+            handle.write(text.encode("utf-8"))
+            handle.truncate()
+    except (OSError, ValueError) as exc:
+        # ValueError covers a manifest that will not read, TOML that will not
+        # parse (TOMLDecodeError) and text that is not UTF-8.
+        raise FeatureForgetError(path, name, str(exc)) from exc
     return path
 
 
