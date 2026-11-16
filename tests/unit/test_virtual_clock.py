@@ -10,6 +10,8 @@ import pytest
 from tests.utils.virtual_clock import (
     AdvanceableClock,
     AdvanceableClockLoop,
+    HANG_GUARD_SECONDS,
+    VirtualClockLoop,
     advanceable_loop_clock,
     await_within_hang_guard,
     observe_asyncio_waits,
@@ -96,6 +98,26 @@ async def test_wait_observer_cancellation_does_not_cancel_original_member():
         future.cancel()
         if waiter is not None:
             await asyncio.gather(waiter, return_exceptions=True)
+
+
+def test_resuming_virtual_loop_keeps_its_origin_and_original_pending_timer() -> None:
+    loop = VirtualClockLoop()
+    try:
+        loop.advance(3600)
+        before = loop.time()
+        fired = asyncio.Event()
+        loop.call_later(0.01, fired.set)
+        time.sleep(0.001)
+        assert loop.time() == before and not fired.is_set()
+
+        loop.resume()
+        assert before <= loop.time() < before + HANG_GUARD_SECONDS
+        loop.run_until_complete(await_within_hang_guard(
+            fired.wait(), step="the original timer after virtual-clock retirement",
+        ))
+        assert loop.time() >= before + 0.01
+    finally:
+        loop.close()
 
 
 def test_advanceable_clock_keeps_real_time_and_jumps_forward() -> None:
