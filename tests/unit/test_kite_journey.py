@@ -316,7 +316,7 @@ def test_telegram_token_step_fails_while_the_bot_is_not_connected(tmp_path, monk
     journey = _Recorder(tmp_path)
     journey.roster = kj.Roster(8888, "Kestrel", 8801)
     monkeypatch.setattr(journey, "request", lambda *a, **k: (200, {}))
-    monkeypatch.setattr(journey, "invoke", lambda text: (
+    monkeypatch.setattr(journey, "invoke", lambda text, timeout=None: (
         200, {"response": '{"connected": false, "next_step": "retrying"}'}, 0.1))
     monkeypatch.setattr(kj.time, "sleep", lambda s: None)
     clock = iter(range(0, 10_000, 30))
@@ -413,13 +413,14 @@ def test_telegram_token_finishes_onboarding_when_the_agent_says_to(tmp_path, mon
         '{"connected": true, "username": "KestrelCIBot"}',
     ])
 
-    def invoke(text):
+    def invoke(text, timeout=None):
         sent.append(text)
+        assert timeout == kj.COMMAND_TIMEOUT_SECONDS
         return 200, {"response": next(replies)}, 0.1
 
     monkeypatch.setattr(journey, "invoke", invoke)
     monkeypatch.setattr(kj.time, "sleep", lambda s: None)
     outcome = kj.step_telegram_token(journey)
     assert outcome.status == kj.PASS
-    assert sent == ["!telegram_status", "!skip-discovery", "!telegram_status"]
+    assert sent == ["!telegram status", "!skip-discovery", "!telegram status"]
     assert outcome.data["needed_skip_discovery"] is True

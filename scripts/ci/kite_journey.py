@@ -73,6 +73,11 @@ TELEGRAM_PACKAGE = "kestrel-channel-telegram"
 TELEGRAM_FEATURE_CLASS = "TelegramFeature"
 TELEGRAM_SERVICE_IMAGE = "kestrel-telegram-service"
 TELEGRAM_TOKEN_ENV = "TELEGRAM_TEST_BOT_TOKEN"
+# The feature's own command (service.py command_prefix). `!telegram_status` is
+# not a command: after onboarding it reaches the model as a prompt.
+TELEGRAM_STATUS_COMMAND = "!telegram status"
+# A direct command needs no model turn; anything slower is waiting on something.
+COMMAND_TIMEOUT_SECONDS = 60
 # What a new agent answers a !command with until its onboarding ends.
 BOOTSTRAP_REFUSAL = "Command unavailable during bootstrap"
 HOST_FEATURE_MANIFEST = ".kestrel-host-features.toml"
@@ -459,14 +464,14 @@ class Journey:
             time.sleep(2)
         return False
 
-    def invoke(self, text: str) -> tuple[int | None, Any, float]:
+    def invoke(self, text: str, timeout: float | None = None) -> tuple[int | None, Any, float]:
         assert self.roster is not None
         started = time.monotonic()
         status, body = self.request(
             "POST",
             f"/api/agents/{self.roster.agent_name}/api/agent/invoke",
             {"input": text},
-            timeout=self.budget(self.chat_timeout),
+            timeout=self.budget(self.chat_timeout if timeout is None else timeout),
         )
         return status, body, round(time.monotonic() - started, 1)
 
@@ -750,7 +755,7 @@ def step_telegram_loaded(j: Journey) -> Outcome:
         service_running = any(TELEGRAM_SERVICE_IMAGE in name for name in j.running_images())
         if not service_running:
             time.sleep(3)
-    cmd_status, cmd_body, _ = j.invoke("!telegram_status")
+    cmd_status, cmd_body, _ = j.invoke(TELEGRAM_STATUS_COMMAND, timeout=COMMAND_TIMEOUT_SECONDS)
     data = {
         "service_process": service_running,
         "telegram_status_http": cmd_status,
@@ -780,12 +785,12 @@ def step_telegram_token(j: Journey) -> Outcome:
     last = ""
     skipped_discovery = False
     while time.monotonic() < deadline:
-        cmd_status, cmd_body, _ = j.invoke("!telegram_status")
+        cmd_status, cmd_body, _ = j.invoke(TELEGRAM_STATUS_COMMAND, timeout=COMMAND_TIMEOUT_SECONDS)
         last = _response_text(cmd_body) or str(cmd_body)
         if BOOTSTRAP_REFUSAL in last and not skipped_discovery:
             # A new agent refuses commands until onboarding ends, and says to
             # run !skip-discovery to finish it: what a user would do next.
-            j.invoke("!skip-discovery")
+            j.invoke("!skip-discovery", timeout=COMMAND_TIMEOUT_SECONDS)
             skipped_discovery = True
             continue
         status_doc = json_object_in(last)
