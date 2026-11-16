@@ -223,14 +223,14 @@ def test_several_unknown_arguments_are_all_named():
 
 
 def test_a_tool_with_no_parameters_says_so():
-    tool = _SchemaTool("heartbeat_check")
+    tool = _SchemaTool("health_check")
 
     args, error = normalize_direct_tool_arguments(
         tool.name, tool, {"verbose": True, "task": "t"}
     )
 
     assert error == (
-        "heartbeat_check does not accept argument 'verbose'. "
+        "health_check does not accept argument 'verbose'. "
         "Valid parameters: none (call it with no arguments)."
     )
     assert normalize_direct_tool_arguments(tool.name, tool, {"task": "t"}) == ({}, None)

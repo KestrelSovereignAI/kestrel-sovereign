@@ -21,10 +21,11 @@ the ``/agent/health/*`` HTTP endpoints. Rows older than the
 ``[telemetry_retention]`` window are removed by the ``trash_retention``
 maintenance rail (see :func:`purge_health_log`).
 
-Legacy aliases ``!heartbeat``, ``!heartbeat-status``, ``!heartbeat-interval``
-are retained for one release and emit a deprecation warning when invoked;
-the old ``heartbeat_log`` table is untouched so historical queries keep
-working, but this feature no longer writes to it.
+The deprecated ``heartbeat_check`` / ``heartbeat_status`` /
+``heartbeat_interval`` aliases were removed (#4133). A typed ``!heartbeat``
+belongs to the built-in command handler (``HeartbeatRunner``), never to this
+feature. The old ``heartbeat_log`` table is untouched so historical queries
+keep working, but this feature does not write to it.
 
 The background task uses ``asyncio.create_task()`` and shuts down
 gracefully via the Feature lifecycle.
@@ -96,9 +97,6 @@ class HealthFeature(Feature):
     - ``!health``: run a manual liveness check and show results
     - ``!health-history``: show last N checks and uptime
     - ``!health-interval``: change the background check interval
-    - ``!heartbeat`` / ``!heartbeat-status`` / ``!heartbeat-interval``:
-      legacy aliases that log a deprecation warning and forward to the
-      ``!health*`` handlers.
     """
 
     @property
@@ -347,80 +345,6 @@ class HealthFeature(Feature):
                 f"→ {data['new_interval_seconds']}s"
             ),
             data={**data, "requested_seconds": seconds_val},
-        )
-
-    # =========================================================================
-    # Legacy !heartbeat* aliases (deprecation-warn + forward)
-    # =========================================================================
-
-    @tool(
-        name="heartbeat_check",
-        description="[deprecated] alias for !health — use health instead",
-        category=ToolCategory.SYSTEM,
-        command_prefix="!heartbeat",
-    )
-    async def heartbeat_check_alias(self) -> ToolResult:
-        self._warn_deprecated("!heartbeat", "!health")
-        result = self._wrap_health_result(await self._run_health())
-        return self._tag_alias(result, "!heartbeat")
-
-    @tool(
-        name="heartbeat_status",
-        description="[deprecated] alias for !health-history — use health_history instead",
-        category=ToolCategory.SYSTEM,
-        command_prefix="!heartbeat-status",
-    )
-    async def heartbeat_status_alias(self, limit: int = 10) -> ToolResult:
-        self._warn_deprecated("!heartbeat-status", "!health-history")
-        result = await self.health_history(limit=limit)
-        return self._tag_alias(result, "!heartbeat-status")
-
-    @tool(
-        name="heartbeat_interval",
-        description="[deprecated] alias for !health-interval — use health_interval instead",
-        category=ToolCategory.SYSTEM,
-        command_prefix="!heartbeat-interval",
-    )
-    async def heartbeat_interval_alias(self, seconds: int = 60) -> ToolResult:
-        self._warn_deprecated("!heartbeat-interval", "!health-interval")
-        result = await self.health_interval(seconds=seconds)
-        return self._tag_alias(result, "!heartbeat-interval")
-
-    @staticmethod
-    def _tag_alias(result: ToolResult, alias: str) -> ToolResult:
-        """Inject ``deprecated_alias`` into a forwarded ToolResult.
-
-        Preserve the alias marker across OK/PARTIAL/ERROR so the
-        LLM/audit payload can always tell that the deprecated alias
-        was used — including on input-validation errors raised by
-        the canonical tool. (Round 1 codex finding for #1082.)
-        """
-        merged_data = {**(result.data or {}), "deprecated_alias": alias}
-        status = result.status.value
-        if status == "ok":
-            return ToolResult.ok(
-                confirmation=result.confirmation,
-                data=merged_data,
-            )
-        if status == "partial":
-            return ToolResult.partial(
-                confirmation=result.confirmation,
-                error=result.error,
-                data=merged_data,
-            )
-        # ERROR: preserve the error string and surface the alias marker
-        # via data so traceability holds for the failure path too.
-        return ToolResult.failed(
-            result.error or "unknown error",
-            data=merged_data,
-        )
-
-    def _warn_deprecated(self, old: str, new: str) -> None:
-        logger.warning(
-            "Deprecated command %s used; switch to %s. The alias will be "
-            "removed in a future release.",
-            old,
-            new,
         )
 
     # =========================================================================
