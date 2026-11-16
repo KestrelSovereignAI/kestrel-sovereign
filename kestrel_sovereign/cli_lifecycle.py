@@ -1552,34 +1552,6 @@ def _run_uv_sync(project_dir: Path) -> Tuple[int, str]:
     return result.returncode, out
 
 
-def _install_with_launchers_aside(
-    run_install: Callable[[], Tuple[int, str]],
-) -> Tuple[int, str]:
-    """Run an install that may replace the ``kestrel.exe`` running it (#2923).
-
-    On Windows the running launcher is renamed aside first, so the install can
-    write a new one, and put back if the install leaves none. A no-op
-    elsewhere; see :mod:`kestrel_sovereign.windows_launchers`.
-    """
-    from kestrel_sovereign import windows_launchers
-
-    names = windows_launchers.console_script_names()
-    directory = windows_launchers.scripts_dir()
-    windows_launchers.remove_replaced(directory, names)
-    try:
-        moved = windows_launchers.move_aside(directory, names)
-    except OSError as exc:
-        return 1, (
-            f"could not move the running launcher aside for the install: {exc}\n"
-            "Close other `kestrel` commands from this venv and run `kestrel update` again."
-        )
-    try:
-        return run_install()
-    finally:
-        for path in windows_launchers.restore_missing(moved):
-            print(f"    restored {path.name}: the install did not replace it")
-
-
 def _run_uv_pip_install_editable(project_dir: Path, no_deps: bool) -> Tuple[int, str]:
     """Run ``uv pip install -e .`` against the venv that owns this
     process — NOT just whatever uv resolves on its own.
@@ -2226,6 +2198,18 @@ def cmd_update(args) -> int:
     print(f"  target: {target_label}{' [DRY-RUN]' if dry_run else ''}")
     print()
 
+    # Before anything changes (#2923): on Windows an install cannot replace a
+    # kestrel.exe that is running, and this command normally runs inside one.
+    # Refusing here, as pip does for `pip install --upgrade pip`, leaves the
+    # checkout unpulled and names the command that can do it.
+    if install and not dry_run:
+        from kestrel_sovereign import windows_launchers
+
+        in_use = windows_launchers.launchers_in_use()
+        if in_use:
+            print(windows_launchers.refusal(in_use, _update_argv(args)), file=sys.stderr)
+            return 2
+
     # Step 0: constitution adoption gate (#3517), before anything changes.
     # The pull is about to install a revision whose packaged constitution may
     # differ from the one every agent is anchored to; restarting onto it would
@@ -2590,9 +2574,7 @@ def cmd_update(args) -> int:
                         f"• install: {cmd_label} "
                         f"(detected uv.lock) ({source_checkout})"
                     )
-                    rc, out = _install_with_launchers_aside(
-                        lambda: cli._run_uv_sync(source_checkout)
-                    )
+                    rc, out = cli._run_uv_sync(source_checkout)
                     if rc != 0:
                         print(out.rstrip(), file=sys.stderr)
                         print(
@@ -2621,10 +2603,8 @@ def cmd_update(args) -> int:
                     )
                 else:
                     print(f"• install: {cmd_label} ({source_checkout})")
-                    rc, out = _install_with_launchers_aside(
-                        lambda: cli._run_uv_pip_install_editable(
-                            source_checkout, no_deps=no_deps,
-                        )
+                    rc, out = cli._run_uv_pip_install_editable(
+                        source_checkout, no_deps=no_deps,
                     )
                     if rc != 0:
                         print(out.rstrip(), file=sys.stderr)

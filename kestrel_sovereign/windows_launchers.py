@@ -1,45 +1,42 @@
-"""Let an install replace the ``kestrel.exe`` launcher that is running it (#2923).
+"""Refuse an update that cannot replace the ``kestrel.exe`` running it (#2923).
 
-On Windows a running executable cannot be deleted or overwritten, but it can
-be renamed. ``kestrel update`` runs inside ``kestrel.exe``, the console-script
-launcher, which waits on the interpreter it started for as long as the update
-runs. Any install that reinstalls ``kestrel-sovereign`` (``uv sync`` after a
-version bump, ``uv pip install -e .``) must replace that launcher, and failed
-with ``os error 32``. That happened on every such update, whether or not an
-agent was running: measured on windows-latest with the host stopped and its
-port closed.
+On Windows a running ``kestrel.exe`` (a uv console-script launcher) can be
+neither replaced, deleted nor renamed. Measured on windows-latest (Windows
+journey, run 43925328757): with no ``kestrel.exe`` running, the launcher
+renamed fine; while any ``kestrel`` command ran, the rename failed with
+``WinError 32``. ``kestrel update`` itself runs inside ``kestrel.exe``, and every
+install that reinstalls ``kestrel-sovereign`` (``uv sync`` after a version bump,
+``uv pip install -e .``) must replace that file, so it failed with ``os error
+32`` whether or not an agent was running. #2923 blamed the agent; it was the
+update's own launcher.
 
-So before the install, this module renames the distribution's launchers aside.
-The install then writes new ones in their place. If the install leaves no new
-launcher behind (a failure, an interrupt), the old one is put back, so the venv
-is never left without a ``kestrel`` command. A renamed copy that is still running
-cannot be deleted; the next update removes it.
+The launcher cannot step out of the way of its own process, so this does what
+pip does for ``pip install --upgrade pip`` on Windows: an update that would have
+to replace a launcher in use refuses before it changes anything, and names the
+command that can do it (``python -m kestrel_sovereign.cli update``, which holds
+no launcher open).
 
-Everywhere but Windows this is a no-op: POSIX replaces a running file in place.
+Everywhere but Windows this finds nothing: POSIX replaces a running file.
 """
 
 from __future__ import annotations
 
 import importlib.metadata
-import logging
 import os
+import subprocess
 import sys
-import time
-from dataclasses import dataclass
 from pathlib import Path
-
-logger = logging.getLogger(__name__)
+from typing import Callable, Sequence
 
 DISTRIBUTION = "kestrel-sovereign"
-_ASIDE_MARKER = ".exe.replaced-"
 # Read at call time, so tests can exercise the Windows path on any OS.
 _ENABLED = os.name == "nt"
 
-
-@dataclass(frozen=True)
-class MovedLauncher:
-    original: Path
-    aside: Path
+_DELETE = 0x00010000
+_FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004  # read | write | delete
+_OPEN_EXISTING = 3
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_SHARING_VIOLATION = 32
 
 
 def console_script_names(distribution: str = DISTRIBUTION) -> tuple[str, ...]:
@@ -53,61 +50,67 @@ def scripts_dir(prefix: str | os.PathLike[str] = sys.prefix) -> Path:
     return Path(prefix) / "Scripts"
 
 
-def move_aside(directory: Path, names: tuple[str, ...]) -> list[MovedLauncher]:
-    """Rename each ``<name>.exe`` in ``directory`` aside; what was moved.
+def launchers_in_use(
+    directory: Path | None = None,
+    names: Sequence[str] | None = None,
+    *,
+    held: Callable[[Path], bool] | None = None,
+) -> list[Path]:
+    """This distribution's launchers an install could not replace right now.
 
-    A rename that fails raises: an install that would then hit the lock is
-    better refused here, naming the file, than reported as ``os error 32``
-    from inside ``uv``.
+    Off Windows nothing is looked up and nothing is found.
     """
     if not _ENABLED:
         return []
-    moved: list[MovedLauncher] = []
-    stamp = f"{os.getpid()}-{time.time_ns()}"
-    try:
-        for name in names:
-            original = directory / f"{name}.exe"
-            if not original.exists():
-                continue
-            aside = directory / f"{name}{_ASIDE_MARKER}{stamp}"
-            original.rename(aside)
-            moved.append(MovedLauncher(original, aside))
-    except OSError:
-        restore_missing(moved)
-        raise
-    return moved
+    directory = scripts_dir() if directory is None else directory
+    names = console_script_names() if names is None else names
+    probe = _held_open_without_delete_sharing if held is None else held
+    launchers = [directory / f"{name}.exe" for name in names]
+    return [launcher for launcher in launchers if launcher.exists() and probe(launcher)]
 
 
-def restore_missing(moved: list[MovedLauncher]) -> list[Path]:
-    """Put back each launcher the install did not replace; the paths restored."""
-    restored = []
-    for launcher in moved:
-        if launcher.original.exists() or not launcher.aside.exists():
-            continue
-        launcher.aside.rename(launcher.original)
-        restored.append(launcher.original)
-    return restored
+def _held_open_without_delete_sharing(path: Path) -> bool:
+    """Whether some process holds ``path`` so that it cannot be renamed or deleted.
 
-
-def remove_replaced(directory: Path, names: tuple[str, ...]) -> tuple[list[Path], list[Path]]:
-    """Delete launchers an earlier update renamed aside: (removed, still in use).
-
-    One still in use is a process from that update still running; it is left
-    for the next update and reported, not treated as an error.
+    Opens the file for DELETE access, sharing everything: Windows grants it
+    only if every existing handle allows deletion, which is exactly what
+    replacing the file needs. Nothing is changed and the handle is closed.
     """
-    if not _ENABLED:
-        return [], []
-    removed: list[Path] = []
-    in_use: list[Path] = []
-    for name in names:
-        for aside in sorted(directory.glob(f"{name}{_ASIDE_MARKER}*")):
-            try:
-                aside.unlink()
-            except PermissionError:
-                in_use.append(aside)
-            else:
-                removed.append(aside)
-    if in_use:
-        logger.info("Kept %d replaced launcher(s) still in use: %s", len(in_use),
-                    ", ".join(p.name for p in in_use))
-    return removed, in_use
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateFileW(str(path), _DELETE, _FILE_SHARE_ALL, None,
+                                  _OPEN_EXISTING, 0, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        error = ctypes.get_last_error()
+        if error == _ERROR_SHARING_VIOLATION:
+            return True
+        if error == _ERROR_FILE_NOT_FOUND:
+            return False
+        raise ctypes.WinError(error)
+    kernel32.CloseHandle(handle)
+    return False
+
+
+def python_module_command(argv: Sequence[str]) -> str:
+    """The same ``kestrel`` command, run through this venv's interpreter."""
+    return subprocess.list2cmdline([sys.executable, "-m", "kestrel_sovereign.cli", *argv])
+
+
+def refusal(in_use: Sequence[Path], argv: Sequence[str]) -> str:
+    names = ", ".join(path.name for path in in_use)
+    return (
+        f"kestrel update: refusing to start: {names} is running, and Windows does not let an "
+        "install replace a running launcher, so the install step would fail "
+        "(os error 32) after the pull. Nothing has been changed.\n"
+        "Run the update through Python instead, which holds no launcher open:\n"
+        f"    {python_module_command(argv)}\n"
+        "If another `kestrel` command is also running (logs --follow, a shell), close it first."
+    )
