@@ -41,6 +41,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -77,7 +78,8 @@ TELEGRAM_TOKEN_ENV = "TELEGRAM_TEST_BOT_TOKEN"
 # The feature's own command (service.py command_prefix). `!telegram_status` is
 # not a command: after onboarding it reaches the model as a prompt.
 TELEGRAM_STATUS_COMMAND = "!telegram status"
-# A direct command needs no model turn; anything slower is waiting on something.
+# A direct command needs no model turn of its own, but it queues behind one
+# already running; anything slower than this is waiting on something.
 COMMAND_TIMEOUT_SECONDS = 60
 # What a new agent answers a !command with until its onboarding ends.
 BOOTSTRAP_REFUSAL = "Command unavailable during bootstrap"
@@ -772,42 +774,80 @@ def step_telegram_loaded(j: Journey) -> Outcome:
     return passed("feature loaded and its isolated service is running", **data)
 
 
-def invoke_approving(j: Journey, text: str, tool: str) -> tuple[int | None, Any, bool]:
+def invoke_approving(
+    j: Journey, text: str, tool: str, feature: str = TELEGRAM_FEATURE_CLASS
+) -> tuple[int | None, Any, bool]:
     """``text`` through the agent, approving its ``tool`` call the way the console does.
 
     A fresh agent asks for approval even on a read-only feature tool run as an
     explicit ``!command``, and over the HTTP API it then waits holding the
     conversation lock. The journey watches this agent's pending approvals and
-    approves that one request, once, as a person at the console would.
-    Returns (status, body, whether an approval was needed).
+    approves this call's request, once, as a person at the console would.
+
+    Only a request for ``feature``.``tool`` created after this call began is
+    this call's: an earlier one belongs to a call that already gave up, and
+    approving it leaves this one waiting (review round 2). The approval counts
+    only when the server says the request's caller is still waiting.
+
+    Returns (status, body, whether an approval was given). An error raised in
+    the worker, the journey deadline included, is raised here.
     """
     assert j.roster is not None
     result: dict[str, Any] = {}
 
     def run() -> None:
-        result["status"], result["body"], _ = j.invoke(text, timeout=COMMAND_TIMEOUT_SECONDS)
+        try:
+            result["status"], result["body"], _ = j.invoke(text, timeout=COMMAND_TIMEOUT_SECONDS)
+        except BaseException as exc:  # re-raised in the caller's thread below
+            result["error"] = exc
 
+    started = datetime.now(UTC) - timedelta(seconds=1)
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
     approved = False
+    tried: set[str] = set()
     deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
     base = f"/api/agents/{j.roster.agent_name}/api/security"
     while worker.is_alive() and time.monotonic() < deadline and not approved:
-        status, body = j.request("GET", f"{base}/pending", timeout=10)
-        pending = body.get("pending", []) if status == 200 and isinstance(body, dict) else []
-        for request in pending:
-            if request.get("tool") == tool:
-                j.request("POST", f"{base}/approve",
-                          {"approval_id": request["id"], "approved": True, "scope": "once"},
-                          timeout=10)
+        for request in own_pending_requests(j, base, feature, tool, started, tried):
+            tried.add(request["id"])
+            status, body = j.request(
+                "POST", f"{base}/approve",
+                {"approval_id": request["id"], "approved": True, "scope": "once"}, timeout=10)
+            if status == 200 and isinstance(body, dict) and not body.get("awaiter_gone"):
                 approved = True
                 break
-        else:
+        if not approved:
             time.sleep(1)
     worker.join(timeout=COMMAND_TIMEOUT_SECONDS)
+    if "error" in result:
+        raise result["error"]
     if worker.is_alive():
         return None, "the command did not finish after its approval", approved
     return result.get("status"), result.get("body"), approved
+
+
+def own_pending_requests(
+    j: Journey, base: str, feature: str, tool: str, since: datetime, tried: set[str]
+) -> list[dict[str, Any]]:
+    """Pending ``feature``.``tool`` requests created at or after ``since``, not yet tried."""
+    status, body = j.request("GET", f"{base}/pending", timeout=10)
+    if status != 200 or not isinstance(body, dict):
+        return []
+    mine = []
+    for request in body.get("pending", []):
+        if (request.get("tool") != tool or request.get("feature") != feature
+                or request.get("id") in tried):
+            continue
+        try:
+            created = datetime.fromisoformat(str(request.get("timestamp")))
+        except ValueError:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        if created >= since:
+            mine.append(request)
+    return mine
 
 
 def step_telegram_token(j: Journey) -> Outcome:

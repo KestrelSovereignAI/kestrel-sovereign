@@ -428,46 +428,84 @@ def test_telegram_token_finishes_onboarding_when_the_agent_says_to(tmp_path, mon
     assert outcome.data["needed_skip_discovery"] is True
 
 
-def test_a_pending_approval_for_the_tool_is_approved_once(tmp_path, monkeypatch):
-    """Run 43940650705: '!telegram status' waited on approval holding the lock."""
+def _approval_journey(tmp_path, monkeypatch, pending, *, approve_body=None):
+    """A journey whose agent queues ``pending`` and blocks until approved."""
     journey = _Recorder(tmp_path)
     journey.roster = kj.Roster(8888, "Kestrel", 8801)
     released = kj.threading.Event()
-    calls: list[tuple[str, str, object]] = []
+    polled = kj.threading.Event()
+    approvals: list[object] = []
 
     def request(method, path, body=None, timeout=30):
-        calls.append((method, path, body))
         if path.endswith("/pending"):
-            return 200, {"pending": [{"id": "ap1", "tool": "telegram_status"}]}
+            polled.set()
+            return 200, {"pending": pending()}
         if path.endswith("/approve"):
-            released.set()
-            return 200, {}
+            approvals.append(body)
+            reply = approve_body(body) if approve_body else {"success": True, "awaiter_gone": False}
+            if not reply.get("awaiter_gone"):
+                released.set()
+            return 200, reply
         raise AssertionError(path)
 
     def invoke(text, timeout=None):
-        released.wait(5)
+        assert polled.wait(5), "the helper never looked at the pending approvals"
+        released.wait(3)
         return 200, {"response": '{"connected": true}'}, 0.2
 
     monkeypatch.setattr(journey, "request", request)
     monkeypatch.setattr(journey, "invoke", invoke)
-    status, body, approved = kj.invoke_approving(journey, "!telegram status", "telegram_status")
+    monkeypatch.setattr(kj, "COMMAND_TIMEOUT_SECONDS", 5)
+    return journey, approvals
+
+
+def _req(rid, *, tool="telegram_status", feature="TelegramFeature", age_seconds=0.0):
+    created = kj.datetime.now(kj.timezone.utc) - kj.timedelta(seconds=age_seconds)
+    return {"id": rid, "tool": tool, "feature": feature, "timestamp": created.isoformat()}
+
+
+def test_this_calls_request_is_approved_once(tmp_path, monkeypatch):
+    """Run 43940650705: '!telegram status' waited on approval holding the lock."""
+    journey, approvals = _approval_journey(tmp_path, monkeypatch, lambda: [_req("ap1")])
+    status, _body, approved = kj.invoke_approving(journey, "!telegram status", "telegram_status")
 
     assert (status, approved) == (200, True)
-    approvals = [c for c in calls if c[1].endswith("/approve")]
-    assert approvals == [("POST", "/api/agents/Kestrel/api/security/approve",
-                          {"approval_id": "ap1", "approved": True, "scope": "once"})]
+    assert approvals == [{"approval_id": "ap1", "approved": True, "scope": "once"}]
 
 
-def test_an_approval_for_another_tool_is_left_alone(tmp_path, monkeypatch):
+def test_a_stale_request_from_an_earlier_call_is_not_approved(tmp_path, monkeypatch):
+    """Review round 2: approving the oldest match left this call's own waiting."""
+    journey, approvals = _approval_journey(
+        tmp_path, monkeypatch, lambda: [_req("old", age_seconds=120), _req("mine")])
+    kj.invoke_approving(journey, "!telegram status", "telegram_status")
+
+    assert [a["approval_id"] for a in approvals] == ["mine"]
+
+
+@pytest.mark.parametrize("other", [_req("x", tool="shell"), _req("y", feature="ShellFeature")],
+                         ids=["other-tool", "other-feature"])
+def test_a_request_for_anything_else_is_left_alone(tmp_path, monkeypatch, other):
+    journey, approvals = _approval_journey(tmp_path, monkeypatch, lambda: [other])
+    _status, _body, approved = kj.invoke_approving(journey, "!telegram status", "telegram_status")
+
+    assert approved is False and approvals == []
+
+
+def test_an_approval_whose_caller_is_gone_is_not_counted(tmp_path, monkeypatch):
+    """Review round 2: a 200 with awaiter_gone approved nothing that is still waiting."""
+    journey, approvals = _approval_journey(
+        tmp_path, monkeypatch, lambda: [_req("gone")],
+        approve_body=lambda body: {"success": True, "awaiter_gone": True})
+    _status, _body, approved = kj.invoke_approving(journey, "!telegram status", "telegram_status")
+
+    assert approved is False
+    assert [a["approval_id"] for a in approvals] == ["gone"]  # tried once, not again
+
+
+def test_the_journey_deadline_raised_in_the_worker_reaches_the_step(tmp_path):
+    """Review round 2: the deadline error was swallowed in the worker thread."""
     journey = _Recorder(tmp_path)
     journey.roster = kj.Roster(8888, "Kestrel", 8801)
-    calls: list[str] = []
-
-    def request(method, path, body=None, timeout=30):
-        calls.append(path)
-        return 200, {"pending": [{"id": "x", "tool": "shell"}]}
-
-    monkeypatch.setattr(journey, "request", request)
-    monkeypatch.setattr(journey, "invoke", lambda text, timeout=None: (200, {"response": "{}"}, 0.1))
-    _status, _body, approved = kj.invoke_approving(journey, "!telegram status", "telegram_status")
-    assert approved is False and not any(p.endswith("/approve") for p in calls)
+    journey.deadline = kj.time.monotonic()
+    with pytest.raises(kj.JourneyError, match="deadline"):
+        kj.invoke_approving(journey, "!telegram status", "telegram_status")
