@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -99,18 +100,66 @@ def _held_open_without_delete_sharing(path: Path) -> bool:
     return False
 
 
-def python_module_command(argv: Sequence[str]) -> str:
-    """The same ``kestrel`` command, run through this venv's interpreter."""
-    return subprocess.list2cmdline([sys.executable, "-m", "kestrel_sovereign.cli", *argv])
+def run_by_launcher(launchers: Sequence[Path]) -> bool:
+    """Whether this process runs under one of ``launchers``.
+
+    A uv launcher starts the venv's ``python.exe``, itself a launcher for the
+    base interpreter, so the ``kestrel.exe`` is an ancestor, not the parent.
+    """
+    import psutil
+
+    try:
+        ancestors = psutil.Process().parents()
+    except psutil.Error:
+        return False
+    for ancestor in ancestors:
+        try:
+            executable = ancestor.exe()
+        except psutil.Error:
+            continue
+        for launcher in launchers:
+            try:
+                if os.path.samefile(executable, launcher):
+                    return True
+            except OSError:
+                continue
+    return False
 
 
-def refusal(in_use: Sequence[Path], argv: Sequence[str]) -> str:
+_POWERSHELL_PLAIN = re.compile(r"[A-Za-z0-9_\-.=/:\\]+")
+
+
+def cmd_line(command: Sequence[str]) -> str:
+    """``command`` for cmd.exe: the program always quoted, so ``&`` or a space in it is literal."""
+    program, *rest = command
+    return " ".join([f'"{program}"', subprocess.list2cmdline(rest)]).rstrip()
+
+
+def powershell_line(command: Sequence[str]) -> str:
+    """``command`` for PowerShell, where a quoted program needs the call operator."""
+    def quote(part: str) -> str:
+        if _POWERSHELL_PLAIN.fullmatch(part):
+            return part
+        return "'" + part.replace("'", "''") + "'"
+
+    program, *rest = command
+    return " ".join(["&", "'" + program.replace("'", "''") + "'", *map(quote, rest)])
+
+
+def refusal(in_use: Sequence[Path], command: Sequence[str], *, run_by_launcher: bool) -> str:
     names = ", ".join(path.name for path in in_use)
+    if not run_by_launcher:
+        return (
+            f"kestrel update: refusing to start: another `kestrel` command from this venv "
+            f"is running ({names} is in use), and Windows does not let an install replace "
+            "a running launcher. Nothing has been changed.\n"
+            "Close that command (a shell, logs --follow, an ask), then run this update again."
+        )
     return (
-        f"kestrel update: refusing to start: {names} is running, and Windows does not let an "
-        "install replace a running launcher, so the install step would fail "
+        f"kestrel update: refusing to start: this command runs inside {names}, and Windows "
+        "does not let an install replace a running launcher, so the install would fail "
         "(os error 32) after the pull. Nothing has been changed.\n"
         "Run the update through Python instead, which holds no launcher open:\n"
-        f"    {python_module_command(argv)}\n"
-        "If another `kestrel` command is also running (logs --follow, a shell), close it first."
+        f"    cmd:         {cmd_line(command)}\n"
+        f"    PowerShell:  {powershell_line(command)}"
     )
