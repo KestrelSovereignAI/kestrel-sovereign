@@ -35,6 +35,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
@@ -755,8 +756,10 @@ def step_telegram_loaded(j: Journey) -> Outcome:
         service_running = any(TELEGRAM_SERVICE_IMAGE in name for name in j.running_images())
         if not service_running:
             time.sleep(3)
-    cmd_status, cmd_body, _ = j.invoke(TELEGRAM_STATUS_COMMAND, timeout=COMMAND_TIMEOUT_SECONDS)
+    cmd_status, cmd_body, needed_approval = invoke_approving(j, TELEGRAM_STATUS_COMMAND,
+                                                             "telegram_status")
     data = {
+        "needed_approval": needed_approval,
         "service_process": service_running,
         "telegram_status_http": cmd_status,
         "telegram_status": _response_text(cmd_body)[:600] or str(cmd_body)[:600],
@@ -767,6 +770,44 @@ def step_telegram_loaded(j: Journey) -> Outcome:
             "started (isolated venv service)", **data,
         )
     return passed("feature loaded and its isolated service is running", **data)
+
+
+def invoke_approving(j: Journey, text: str, tool: str) -> tuple[int | None, Any, bool]:
+    """``text`` through the agent, approving its ``tool`` call the way the console does.
+
+    A fresh agent asks for approval even on a read-only feature tool run as an
+    explicit ``!command``, and over the HTTP API it then waits holding the
+    conversation lock. The journey watches this agent's pending approvals and
+    approves that one request, once, as a person at the console would.
+    Returns (status, body, whether an approval was needed).
+    """
+    assert j.roster is not None
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        result["status"], result["body"], _ = j.invoke(text, timeout=COMMAND_TIMEOUT_SECONDS)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    approved = False
+    deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+    base = f"/api/agents/{j.roster.agent_name}/api/security"
+    while worker.is_alive() and time.monotonic() < deadline and not approved:
+        status, body = j.request("GET", f"{base}/pending", timeout=10)
+        pending = body.get("pending", []) if status == 200 and isinstance(body, dict) else []
+        for request in pending:
+            if request.get("tool") == tool:
+                j.request("POST", f"{base}/approve",
+                          {"approval_id": request["id"], "approved": True, "scope": "once"},
+                          timeout=10)
+                approved = True
+                break
+        else:
+            time.sleep(1)
+    worker.join(timeout=COMMAND_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        return None, "the command did not finish after its approval", approved
+    return result.get("status"), result.get("body"), approved
 
 
 def step_telegram_token(j: Journey) -> Outcome:
@@ -784,8 +825,11 @@ def step_telegram_token(j: Journey) -> Outcome:
     deadline = time.monotonic() + 120
     last = ""
     skipped_discovery = False
+    needed_approval = False
     while time.monotonic() < deadline:
-        cmd_status, cmd_body, _ = j.invoke(TELEGRAM_STATUS_COMMAND, timeout=COMMAND_TIMEOUT_SECONDS)
+        cmd_status, cmd_body, approval = invoke_approving(j, TELEGRAM_STATUS_COMMAND,
+                                                          "telegram_status")
+        needed_approval = needed_approval or approval
         last = _response_text(cmd_body) or str(cmd_body)
         if BOOTSTRAP_REFUSAL in last and not skipped_discovery:
             # A new agent refuses commands until onboarding ends, and says to
@@ -796,10 +840,11 @@ def step_telegram_token(j: Journey) -> Outcome:
         status_doc = json_object_in(last)
         if cmd_status == 200 and status_doc.get("connected") is True:
             return passed("bot connected", telegram_status=last[:600],
-                          needed_skip_discovery=skipped_discovery)
+                          needed_skip_discovery=skipped_discovery,
+                          needed_approval=needed_approval)
         time.sleep(5)
     return failed(f"bot never reported connected: {last[:1500]}",
-                  needed_skip_discovery=skipped_discovery)
+                  needed_skip_discovery=skipped_discovery, needed_approval=needed_approval)
 
 
 def force_stop_tree(pid_file: Path) -> None:

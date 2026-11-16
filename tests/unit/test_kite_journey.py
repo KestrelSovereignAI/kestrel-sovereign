@@ -316,8 +316,8 @@ def test_telegram_token_step_fails_while_the_bot_is_not_connected(tmp_path, monk
     journey = _Recorder(tmp_path)
     journey.roster = kj.Roster(8888, "Kestrel", 8801)
     monkeypatch.setattr(journey, "request", lambda *a, **k: (200, {}))
-    monkeypatch.setattr(journey, "invoke", lambda text, timeout=None: (
-        200, {"response": '{"connected": false, "next_step": "retrying"}'}, 0.1))
+    monkeypatch.setattr(kj, "invoke_approving", lambda j, text, tool: (
+        200, {"response": '{"connected": false, "next_step": "retrying"}'}, True))
     monkeypatch.setattr(kj.time, "sleep", lambda s: None)
     clock = iter(range(0, 10_000, 30))
     monkeypatch.setattr(kj.time, "monotonic", lambda: next(clock))
@@ -419,8 +419,55 @@ def test_telegram_token_finishes_onboarding_when_the_agent_says_to(tmp_path, mon
         return 200, {"response": next(replies)}, 0.1
 
     monkeypatch.setattr(journey, "invoke", invoke)
+    monkeypatch.setattr(kj, "invoke_approving", lambda j, text, tool: (*j.invoke(
+        text, timeout=kj.COMMAND_TIMEOUT_SECONDS)[:2], False))
     monkeypatch.setattr(kj.time, "sleep", lambda s: None)
     outcome = kj.step_telegram_token(journey)
     assert outcome.status == kj.PASS
     assert sent == ["!telegram status", "!skip-discovery", "!telegram status"]
     assert outcome.data["needed_skip_discovery"] is True
+
+
+def test_a_pending_approval_for_the_tool_is_approved_once(tmp_path, monkeypatch):
+    """Run 43940650705: '!telegram status' waited on approval holding the lock."""
+    journey = _Recorder(tmp_path)
+    journey.roster = kj.Roster(8888, "Kestrel", 8801)
+    released = kj.threading.Event()
+    calls: list[tuple[str, str, object]] = []
+
+    def request(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if path.endswith("/pending"):
+            return 200, {"pending": [{"id": "ap1", "tool": "telegram_status"}]}
+        if path.endswith("/approve"):
+            released.set()
+            return 200, {}
+        raise AssertionError(path)
+
+    def invoke(text, timeout=None):
+        released.wait(5)
+        return 200, {"response": '{"connected": true}'}, 0.2
+
+    monkeypatch.setattr(journey, "request", request)
+    monkeypatch.setattr(journey, "invoke", invoke)
+    status, body, approved = kj.invoke_approving(journey, "!telegram status", "telegram_status")
+
+    assert (status, approved) == (200, True)
+    approvals = [c for c in calls if c[1].endswith("/approve")]
+    assert approvals == [("POST", "/api/agents/Kestrel/api/security/approve",
+                          {"approval_id": "ap1", "approved": True, "scope": "once"})]
+
+
+def test_an_approval_for_another_tool_is_left_alone(tmp_path, monkeypatch):
+    journey = _Recorder(tmp_path)
+    journey.roster = kj.Roster(8888, "Kestrel", 8801)
+    calls: list[str] = []
+
+    def request(method, path, body=None, timeout=30):
+        calls.append(path)
+        return 200, {"pending": [{"id": "x", "tool": "shell"}]}
+
+    monkeypatch.setattr(journey, "request", request)
+    monkeypatch.setattr(journey, "invoke", lambda text, timeout=None: (200, {"response": "{}"}, 0.1))
+    _status, _body, approved = kj.invoke_approving(journey, "!telegram status", "telegram_status")
+    assert approved is False and not any(p.endswith("/approve") for p in calls)
