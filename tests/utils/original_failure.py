@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import NoReturn
 
 import aiosqlite
+import httpx
 
 from kestrel_sovereign.execution_custody import _explicit_control_chain, _native_source_originals, execution_cleanup_debts
 
@@ -22,6 +23,28 @@ def fail_original_file_read(observed: list[OSError]) -> NoReturn:
         raise AssertionError("A write-only native descriptor unexpectedly permitted a read")
     finally:
         os.close(descriptor)
+
+
+class OriginalUploadDescriptor(httpx.AsyncByteStream):
+    """An actual caller-owned descriptor and original HTTPX stream, not a mock."""
+
+    def __init__(self, original=None):
+        self.original = httpx.ByteStream(b"original") if original is None else original
+        self.descriptor = os.open(os.devnull, os.O_RDONLY)
+        self.entered = False
+        self.closed = False
+        self.closers = []
+
+    async def __aiter__(self):
+        self.entered = True
+        async for chunk in self.original:
+            yield chunk
+
+    async def aclose(self):
+        os.close(self.descriptor)
+        self.closed = True
+        self.closers.append(asyncio.current_task())
+        await self.original.aclose()
 
 
 @dataclass(frozen=True)

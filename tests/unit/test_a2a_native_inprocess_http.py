@@ -230,6 +230,74 @@ async def test_write_failure_wakes_original_http_reader_even_if_application_catc
     assert not transport.exchanges
 
 
+@pytest.mark.parametrize("stop_at", [None, "native-inprocess-http", "native-inprocess-http-upload"])
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+async def test_original_upload_descriptor_closes_even_if_stop_precedes_source_entry(stop_at, eager):
+    import os
+
+    from tests.utils.native_admission_fault import before_native_source_entry
+    from tests.utils.original_failure import OriginalUploadDescriptor
+
+    body, exchanges = OriginalUploadDescriptor(), []
+    reading, closing = None, None
+
+    def withdraw():
+        nonlocal closing
+        if not exchanges:
+            exchanges.extend(transport.exchanges)
+        if stop_at == "native-inprocess-http":
+            closing = create_owned_task(transport.aclose())
+        else:
+            reading.cancel("original caller withdrew before upload entry")
+
+    async def app(scope, receive, send):
+        if not exchanges:
+            exchanges.extend(transport.exchanges)
+        if stop_at is not None:
+            while (await receive()).get("more_body", False):
+                pass
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b"done"})
+
+    transport = transport_for(app)
+
+    async def consume():
+        async with httpx.AsyncClient(transport=transport, timeout=1) as client:
+            return await client.send(httpx.Request(
+                "POST", "https://native.test/native", headers={"Host": "native.test"}, stream=body,
+            ))
+
+    try:
+        with before_native_source_entry(stop_at, withdraw, eager=eager) as originals:
+            reading = create_owned_task(consume())
+            result = await await_owned_task(reading)
+            await transport.aclose()
+        assert len(originals) == int(stop_at is not None)
+        assert not body.entered
+        assert all(source.producer_task.done() and source.owner_task.done() for source in originals)
+        if stop_at == "native-inprocess-http-upload":
+            assert isinstance(result.error, asyncio.CancelledError)
+        elif stop_at == "native-inprocess-http":
+            assert result.error is not None
+            assert closing is not None and (await await_owned_task(closing)).error is None
+        else:
+            assert result.error is None and result.result.content == b"done"
+        if not body.closed:
+            os.fstat(body.descriptor)  # Verify the actual original resource still exists.
+        assert body.closed, "The original upload descriptor was not retired before successful transport close"
+        exchange, = exchanges
+        assert body.closers == [exchange.close_task if stop_at == "native-inprocess-http"
+                                else exchange.source.producer_task]
+        assert not transport.exchanges
+    finally:
+        if reading is not None:
+            await await_owned_task(reading)
+        if closing is not None:
+            await await_owned_task(closing)
+        if not body.closed:
+            await body.aclose()  # Failed test retains its exact original descriptor.
+
+
 async def test_response_backpressure_is_one_bounded_canonical_frame():
     advanced, finished = asyncio.Event(), asyncio.Event()
 
@@ -624,7 +692,7 @@ async def test_failed_close_admission_keeps_later_original_physical_source_error
     admission_error = OSError("original source-close admission failed")
     fault = NativeAdmissionFault(
         lambda operation: getattr(getattr(operation, "cr_code", None), "co_qualname", None)
-        == "OwnedAsyncIterator.aclose", admission_error, mode, eager=eager,
+        == "_Exchange.retire", admission_error, mode, eager=eager,
     )
     try:
         with fault, pytest.raises(BaseException) as first:

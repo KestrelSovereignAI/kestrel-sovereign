@@ -213,6 +213,41 @@ def test_start_force_overrides_ram(monkeypatch, tmp_path):
     assert cli_serve.read_state()["pid"] == 4242
 
 
+@pytest.mark.parametrize("launch", ["success", "missing-executable"])
+def test_start_retires_original_parent_log_handle_after_real_exec(monkeypatch, tmp_path, launch):
+    import sys
+
+    command = ([sys.executable, "-c", "print('owned-log-descriptor')"] if launch == "success"
+               else [str(tmp_path / "absent-owned-executable")])
+    monkeypatch.setattr(cli_serve, "memory_status", lambda: (16.0, 16.0, "GREEN"))
+    monkeypatch.setattr(cli_serve, "build_command", lambda *args: command)
+    original = cli_serve.subprocess.Popen
+    handles, children = [], []
+
+    def launch_original(*args, **kwargs):
+        handles.append(kwargs["stdout"])
+        child = original(*args, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(cli_serve.subprocess, "Popen", launch_original)
+    try:
+        if launch == "missing-executable":
+            with pytest.raises(FileNotFoundError):
+                cli_serve._start("owned", {}, 8001, timeout=1, wait=False, force=True)
+        else:
+            assert cli_serve._start("owned", {}, 8001, timeout=1, wait=False, force=True) == 0
+            assert children[0].wait(timeout=5) == 0
+            assert (cli_serve.log_dir() / "serve-owned.log").read_text() == "owned-log-descriptor\n"
+        assert len(handles) == 1 and handles[0].closed, "Launcher left its original parent log descriptor open"
+    finally:
+        for child in children:
+            child.wait(timeout=5)
+        for handle in handles:
+            if not handle.closed:
+                handle.close()  # Failed test still owns this exact real file.
+
+
 def test_cmd_up_refuses_when_already_running(monkeypatch):
     monkeypatch.setattr(cli_serve, "running_model",
                         lambda: {"name": "other", "pid": 7, "port": 8001})

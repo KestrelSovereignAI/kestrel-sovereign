@@ -4844,6 +4844,18 @@
       "type": "Release Note"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.66.2.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.66.2",
+      "type": "Release Note"
+    },
+    {
       "existing_code_refs": [
         "AGENTS.md",
         "kestrel_sovereign/llm/adapter.py",

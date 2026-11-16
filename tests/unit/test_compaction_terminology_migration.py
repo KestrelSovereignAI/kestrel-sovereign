@@ -20,22 +20,14 @@ import json
 
 import pytest
 
-from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.sqla.migrations import (
     migrate_compaction_terminology,
 )
 
 
-async def _db(tmp_path):
-    raw = SQLiteBackend(str(tmp_path / "compaction-migration-test.db"))
-    await raw.connect()
-    db = AsyncDatabase(raw)
-    # _init_schema creates conversation_history AND runs the migration
-    # once (startup wiring under test elsewhere); rows inserted after
-    # this exercise the function directly.
-    await db._init_schema()
-    return db
+@pytest.fixture
+async def db(tmp_path, sqlite_database_factory):
+    return await sqlite_database_factory(tmp_path / "compaction-migration-test.db")
 
 
 async def _insert(db, content, metadata):
@@ -54,8 +46,7 @@ async def _all_rows(db):
 
 
 @pytest.mark.asyncio
-async def test_rewrites_compaction_marker_metadata(tmp_path):
-    db = await _db(tmp_path)
+async def test_rewrites_compaction_marker_metadata(db):
     await _insert(
         db,
         "[COMPRESSED CONTEXT - 13 messages summarized]\n\nSummary.",
@@ -83,8 +74,7 @@ async def test_rewrites_compaction_marker_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_rewrites_hierarchical_marker_and_salvage_reason(tmp_path):
-    db = await _db(tmp_path)
+async def test_rewrites_hierarchical_marker_and_salvage_reason(db):
     await _insert(
         db,
         "[HIERARCHICAL COMPRESSION - 20 messages, 4 chunks]\n\nSummary.",
@@ -116,8 +106,7 @@ async def test_rewrites_hierarchical_marker_and_salvage_reason(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_leaves_unrelated_rows_alone(tmp_path):
-    db = await _db(tmp_path)
+async def test_leaves_unrelated_rows_alone(db):
     # Serializes to ``..."note": "discusses compression"...`` — matched
     # by the LIKE filter but no rewrite condition applies, so the
     # metadata must come back byte-identical.
@@ -135,8 +124,7 @@ async def test_leaves_unrelated_rows_alone(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_idempotent_second_run_is_noop(tmp_path):
-    db = await _db(tmp_path)
+async def test_idempotent_second_run_is_noop(db):
     await _insert(
         db,
         "[COMPRESSED CONTEXT - 3 messages summarized]",
@@ -153,8 +141,7 @@ async def test_idempotent_second_run_is_noop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tolerates_invalid_metadata_json(tmp_path):
-    db = await _db(tmp_path)
+async def test_tolerates_invalid_metadata_json(db):
     # Bypass _insert to write raw non-JSON metadata that matches the
     # LIKE filter — the migration must skip it, not raise.
     await db.execute(
@@ -172,14 +159,10 @@ async def test_tolerates_invalid_metadata_json(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_init_schema_runs_migration_on_startup(tmp_path):
+async def test_init_schema_runs_migration_on_startup(db):
     """The startup path itself rewrites legacy rows — a restart after
     upgrade is the only operator action required (carries to Frinz and
     other downstream deployments on dependency bump + restart)."""
-    raw = SQLiteBackend(str(tmp_path / "startup-test.db"))
-    await raw.connect()
-    db = AsyncDatabase(raw)
-    await db._init_schema()
     await _insert(
         db,
         "[COMPRESSED CONTEXT - 5 messages summarized]",

@@ -348,11 +348,11 @@ def _start(name: str, entry: dict[str, Any], port: int, *, timeout: int,
         env[str(k)] = str(v)
 
     print(f"Starting {name} on :{port} (est ~{est:.0f}GB, {avail:.0f}GB free)…")
-    log_fh = open(log_path, "ab")
-    proc = subprocess.Popen(
-        cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT,
-        start_new_session=True,  # detach so the server outlives this CLI call
-    )
+    with open(log_path, "ab") as log_fh:
+        proc = subprocess.Popen(
+            cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT,
+            start_new_session=True,  # detach so the server outlives this CLI call
+        )
     write_state({
         "name": name, "pid": proc.pid, "port": port,
         "log": str(log_path), "cmd": cmd, "started_at": int(time.time()),
