@@ -87,10 +87,16 @@ async def test_a_concrete_model_needs_no_discovery():
     route = _StubRoute(payload={"risk_level": 1, "reasoning": "ok"})
     svc = _service([_route("ollama:local", route, model=DISCOVERED_MODEL)])
 
-    async def must_not_run(use_cache: bool = True):
-        raise AssertionError("discovery ran for a concrete model")
+    ran: list[bool] = []
 
-    svc.discover_all_models = must_not_run
+    async def record(use_cache: bool = True):
+        # Recorded, not raised: the warm-up logs and swallows a discovery
+        # exception, so an assertion raised in here could never fail the test.
+        ran.append(use_cache)
+        return []
+
+    svc.discover_all_models = record
 
     verdict = await svc.get_audit_response(AUDITED_TEXT)
     assert verdict["risk_level"] == 1
+    assert ran == []
