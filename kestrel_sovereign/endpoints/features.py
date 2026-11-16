@@ -527,17 +527,6 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
             except subprocess.TimeoutExpired:
                 install_error = (504, "Installation timed out")
 
-            # The package is in the venv, so the host manifest has to say so:
-            # unrecorded, the next `kestrel update` uninstalls it (#4127).
-            # Inside the lock, which also serialises this append.
-            record_error: Optional[str] = None
-            if install_error is None:
-                try:
-                    await asyncio.to_thread(record_feature_install, package_spec)
-                except FeatureRecordError as exc:
-                    logger.error("recording %s failed: %s", package_spec, exc)
-                    record_error = exc.describe()
-
             # Detection half, on EVERY path — a failed or timed-out install is
             # not a reason to skip it. pip installs dependencies before the
             # requested package can fail, and a timeout kills the process
@@ -552,6 +541,18 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
             outcome = await asyncio.to_thread(
                 guard.resolve, timeout=INSTALL_TIMEOUT_SECONDS,
             )
+
+            # The package is in the venv, so the host manifest has to say so:
+            # unrecorded, the next `kestrel update` uninstalls it (#4127).
+            # After the drift check, which must run on every path, and inside
+            # the lock, which also serialises this edit of the manifest.
+            record_error: Optional[str] = None
+            if install_error is None:
+                try:
+                    await asyncio.to_thread(record_feature_install, package_spec)
+                except FeatureRecordError as exc:
+                    logger.error("recording %s failed: %s", package_spec, exc)
+                    record_error = exc.describe()
 
             # Inside the lock, deliberately. This reads LIVE environment state
             # (core's installed version), and a queued install is waiting to

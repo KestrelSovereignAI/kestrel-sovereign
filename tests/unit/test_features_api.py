@@ -2057,6 +2057,32 @@ class TestInstallFeature:
         assert venv.installed["kestrel-feature-test"] == "0.4.0"
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_console_install_records_only_after_the_drift_check(
+        self, mock_registry, monkeypatch,
+    ):
+        """The drift check runs on every path; nothing the record does may skip it."""
+        from kestrel_sovereign import cli_features
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        self._venv(monkeypatch, feature_requires=">=0.52")
+        order = []
+        real_resolve = cli_features.CoreInstallGuard.resolve
+        monkeypatch.setattr(
+            cli_features.CoreInstallGuard, "resolve",
+            lambda guard, **kw: order.append("resolve") or real_resolve(guard, **kw),
+        )
+        monkeypatch.setattr(
+            cli_features, "record_feature_install",
+            lambda package: order.append("record") or None,
+        )
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200
+        assert order == ["resolve", "record"]
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_install_reports_and_restores_a_replaced_core(self, mock_registry, monkeypatch):
         """An install that bypassed the pin cannot return a clean 'installed'.
 

@@ -1849,8 +1849,14 @@ def _unrecorded_extension_gate(
     manifest: Optional[str],
     landing: Callable[[], Optional[str]],
     continue_on_error: bool,
+    features: bool = True,
 ) -> int:
     """Refuse a ``uv sync`` that would uninstall an extension nothing reinstalls (#4127).
+
+    *features* False is ``--no-features``: neither the feature sync nor
+    reconcile runs, so a recorded extension the sync removes stays removed
+    until ``kestrel feature sync``. That is the flag's contract and not
+    refused, but it is said, by name, rather than reported as reinstalled.
 
     Run before the pull, while refusing leaves the host as it was. *landing*
     answers the commit the install will run ``uv sync`` at (None: the checkout
@@ -1906,11 +1912,33 @@ def _unrecorded_extension_gate(
         )
     except (ValueError, OSError) as exc:
         return unknown(f"the host manifest {manifest_path} would not read ({exc})")
-    if not found:
-        print(
-            "• extensions: every extension `uv sync` removes is reinstalled from "
-            "the host manifest or for an agent's allowlist"
+    if not features:
+        from kestrel_sovereign.feature_reconcile import CORE_DISTRIBUTION, canonical_package
+
+        unrecorded = {extension.package for extension in found}
+        dropped = sorted(
+            package
+            for package in (
+                canonical_package(dist["dist"])
+                for dist in cli._installed_extension_distributions()
+            )
+            if package in set(removals)
+            and package != CORE_DISTRIBUTION
+            and package not in unrecorded
         )
+        if dropped:
+            print(
+                f"• extensions: --no-features: `uv sync` removes {len(dropped)} "
+                "recorded extension(s) and this update reinstalls none of them; "
+                f"`kestrel feature sync` does: {', '.join(dropped)}",
+                file=sys.stderr,
+            )
+    if not found:
+        if features:
+            print(
+                "• extensions: every extension `uv sync` removes is reinstalled "
+                "from the host manifest or for an agent's allowlist"
+            )
         return 0
 
     print(
@@ -2746,6 +2774,7 @@ def cmd_update(args) -> int:
                 incoming_revision.target().landing if pulling else judged_core_revision
             ),
             continue_on_error=continue_on_error,
+            features=features,
         )
         if rc != 0:
             return rc

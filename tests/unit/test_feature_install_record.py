@@ -908,3 +908,33 @@ def test_a_failed_replace_leaves_the_manifest_and_no_scratch(venv, project, monk
 
     assert _manifest(project).read_text(encoding="utf-8") == AROUND
     assert [p.name for p in project.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_no_features_names_what_this_update_drops(venv, project, update, capsys):
+    """Neither the feature sync nor reconcile runs, so a recorded extension
+    stays removed until `kestrel feature sync`: said by name, not refused."""
+    _manifest(project).write_text(f'[[feature]]\nname = "{VOICE}"\npypi = ""\n', encoding="utf-8")
+    venv.installed[VOICE] = "0.4.0"
+
+    assert _update("--no-features") == 0
+
+    captured = capsys.readouterr()
+    assert "reinstalls none of them; `kestrel feature sync` does: kestrel-feature-voice" in captured.err
+    assert "is reinstalled" not in captured.out
+    assert VOICE not in venv.installed
+
+
+def test_a_registry_that_will_not_load_is_a_record_failure(venv, project, monkeypatch):
+    """Typed, so every caller's handling (and the console's drift check) holds."""
+    from kestrel_sovereign.feature_registry import RegistryValidationError
+
+    def broken():
+        raise RegistryValidationError("two rows claim kestrel-feature-voice")
+
+    monkeypatch.setattr("kestrel_sovereign.feature_registry.load_registry", broken)
+
+    with pytest.raises(FeatureRecordError, match="two rows claim"):
+        record_feature_install(VOICE)
+    with pytest.raises(FeatureForgetError, match="two rows claim"):
+        _manifest(project).write_text(f'[[feature]]\nname = "{VOICE}"\n', encoding="utf-8")
+        forget_feature_install(VOICE)

@@ -3518,8 +3518,8 @@ def record_feature_install(package: str) -> Optional[Path]:
     path = _host_manifest_for_edit(
         lambda where, reason: FeatureRecordError(where, name, entry, reason),
     )
-    registry = load_registry()
     try:
+        registry = load_registry()
         try:
             current = path.read_bytes().decode("utf-8")
         except FileNotFoundError:
@@ -3614,12 +3614,12 @@ def forget_feature_install(package: str) -> Optional[Path]:
     path = _host_manifest_for_edit(
         lambda where, reason: FeatureForgetError(where, name, reason),
     )
-    registry = load_registry()
 
     def declares(entries) -> bool:
         return name in _declared_packages(entries, registry)
 
     try:
+        registry = load_registry()
         try:
             current = path.read_bytes().decode("utf-8")
         except FileNotFoundError:
