@@ -63,6 +63,11 @@ REFUSED_ENV = (
 # report and every copied log, because the CI run that publishes them is on a
 # public repository.
 _SECRET_KEY_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)", re.I)
+# Credentials handed to the journey in its environment. The runner image's
+# own variables (PGPASSWORD=root, ...) are not ours, and scrubbing short
+# common values corrupts every log line that contains them.
+CREDENTIAL_ENV = ("OPENROUTER_API_KEY", "TELEGRAM_TEST_BOT_TOKEN")
+MIN_SECRET_LENGTH = 8
 
 TELEGRAM_PACKAGE = "kestrel-channel-telegram"
 TELEGRAM_FEATURE_CLASS = "TelegramFeature"
@@ -71,6 +76,7 @@ TELEGRAM_TOKEN_ENV = "TELEGRAM_TEST_BOT_TOKEN"
 HOST_FEATURE_MANIFEST = ".kestrel-host-features.toml"
 
 TAIL_LINES = 60
+TEARDOWN_RESERVE_SECONDS = 180
 
 
 @dataclasses.dataclass
@@ -156,6 +162,7 @@ def secret_values(dotenv: dict[str, str], extra: tuple[str, ...] = ()) -> list[s
     """Credential values to scrub, longest first so overlaps scrub fully."""
     found = {v for k, v in dotenv.items() if _SECRET_KEY_RE.search(k) and v}
     found.update(v for v in extra if v)
+    found = {v for v in found if len(v) >= MIN_SECRET_LENGTH}
     return sorted(found, key=len, reverse=True)
 
 
@@ -189,6 +196,23 @@ def feature_name_in_row(row: str) -> str:
         if re.fullmatch(r"[a-z][a-z0-9_]*", token) and "telegram" in token:
             return token
     return ""
+
+
+def json_object_in(text: str) -> dict[str, Any]:
+    """The first JSON object in ``text`` (a ``!command`` prints its result as JSON), or {}.
+
+    A substring test cannot read a status: the payload always carries the key
+    ``"connected"``, true or false.
+    """
+    start = text.find("{")
+    while start != -1:
+        try:
+            value, _end = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            start = text.find("{", start + 1)
+            continue
+        return value if isinstance(value, dict) else {}
+    return {}
 
 
 def mentions_pong(text: str) -> bool:
@@ -241,6 +265,17 @@ def add_manifest_entry(path: Path, package: str, pypi_window: str) -> bool:
     return True
 
 
+def scrub_data(value: Any, scrub: Callable[[str], str]) -> Any:
+    """``value`` with every string scrubbed, structure kept."""
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, dict):
+        return {key: scrub_data(item, scrub) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_data(item, scrub) for item in value]
+    return value
+
+
 def run_steps(
     journey: "Journey", steps: list[Step], into: list[StepResult] | None = None
 ) -> list[StepResult]:
@@ -261,13 +296,15 @@ def run_steps(
                 outcome = step.run(journey)
             except JourneyError as exc:
                 outcome = failed(str(exc))
+            except subprocess.TimeoutExpired as exc:
+                outcome = failed(f"timed out after {exc.timeout:.0f}s: {exc.cmd!r}"[:600])
         result = StepResult(
             name=step.name,
             status=outcome.status,
             gate=step.gate,
             seconds=round(time.monotonic() - started, 1),
             detail=journey.scrub(outcome.detail),
-            data=json.loads(journey.scrub(json.dumps(outcome.data))),
+            data=scrub_data(outcome.data, journey.scrub),
         )
         results[step.name] = result
         collected.append(result)
@@ -314,7 +351,8 @@ def render_markdown(results: list[StepResult], header: dict[str, str]) -> str:
 
 
 class Journey:
-    def __init__(self, project_dir: Path, chat_timeout: int, telegram_window: str):
+    def __init__(self, project_dir: Path, chat_timeout: int, telegram_window: str,
+                 deadline_seconds: float = 75 * 60):
         self.project_dir = project_dir
         self.chat_timeout = chat_timeout
         self.telegram_window = telegram_window
@@ -328,9 +366,20 @@ class Journey:
         self.telegram_installed = False
         # Credentials handed to the journey in its environment (the CI model
         # key, the Telegram token) before quickstart copies any into .env.
-        self._secrets: list[str] = secret_values(dict(os.environ))
+        # The job is killed at its timeout before `finally` can write the
+        # report, so every wait is held inside this one deadline instead.
+        self.deadline = time.monotonic() + deadline_seconds
+        self._secrets: list[str] = secret_values(
+            {}, tuple(os.environ.get(name, "") for name in CREDENTIAL_ENV))
 
     # -- output --------------------------------------------------------------
+
+    def budget(self, timeout: float) -> float:
+        """``timeout``, cut to what the deadline leaves after a teardown reserve."""
+        remaining = self.deadline - time.monotonic() - TEARDOWN_RESERVE_SECONDS
+        if remaining <= 0:
+            raise JourneyError("journey deadline reached")
+        return min(timeout, remaining)
 
     def log(self, message: str) -> None:
         print(console_safe(message, sys.stdout.encoding), flush=True)
@@ -358,7 +407,7 @@ class Journey:
             capture_output=True,
             encoding="utf-8",
             errors="backslashreplace",
-            timeout=timeout,
+            timeout=self.budget(timeout),
             check=False,
         )
 
@@ -415,7 +464,7 @@ class Journey:
             "POST",
             f"/api/agents/{self.roster.agent_name}/api/agent/invoke",
             {"input": text},
-            timeout=self.chat_timeout,
+            timeout=self.budget(self.chat_timeout),
         )
         return status, body, round(time.monotonic() - started, 1)
 
@@ -730,7 +779,8 @@ def step_telegram_token(j: Journey) -> Outcome:
     while time.monotonic() < deadline:
         cmd_status, cmd_body, _ = j.invoke("!telegram_status")
         last = _response_text(cmd_body) or str(cmd_body)
-        if cmd_status == 200 and "connected" in last.lower() and "not connected" not in last.lower():
+        status_doc = json_object_in(last)
+        if cmd_status == 200 and status_doc.get("connected") is True:
             return passed("bot connected", telegram_status=last[:600])
         time.sleep(5)
     return failed(f"bot never reported connected: {last[:1500]}")
@@ -774,6 +824,16 @@ def run_update(j: Journey, *args: str) -> tuple[Outcome, str]:
     and prints the command that can; the journey then runs exactly that.
     """
     label = "kestrel update " + " ".join(args)
+    outcome, output = _run_update_once(j, label, *args)
+    if outcome.status == PASS and j.telegram_installed and installed_version(TELEGRAM_PACKAGE) is None:
+        # #4127: uv sync prunes a feature `kestrel feature install` never recorded.
+        j.telegram_installed = False
+        return failed(f"{label} removed {TELEGRAM_PACKAGE}, which was installed before it "
+                      f"ran\n{tail(output)}", **outcome.data), output
+    return outcome, output
+
+
+def _run_update_once(j: Journey, label: str, *args: str) -> tuple[Outcome, str]:
     proc = j.kestrel_cli("update", *args, timeout=1800)
     output = (proc.stdout or "") + (proc.stderr or "")
     command = refusal_command(proc.stderr or "")
@@ -789,7 +849,8 @@ def run_update(j: Journey, *args: str) -> tuple[Outcome, str]:
     data["ran_instead"] = command
     rerun = subprocess.run(command if os.name == "nt" else shlex.split(command),
                            cwd=j.project_dir, stdin=subprocess.DEVNULL, capture_output=True,
-                           encoding="utf-8", errors="backslashreplace", timeout=1800, check=False)
+                           encoding="utf-8", errors="backslashreplace",
+                           timeout=j.budget(1800), check=False)
     outcome = j.cli_outcome(f"the refusal's command ({label})", rerun)
     data["file_lock"] = "os error 32" in (rerun.stdout or "") + (rerun.stderr or "")
     if outcome.status != PASS and j.roster is not None:
@@ -826,6 +887,9 @@ def step_update_while_stopped(j: Journey) -> Outcome:
     restarted = step_host_start(j)
     if outcome.status == PASS and restarted.status != PASS:
         return failed(f"updated, then the host would not start: {restarted.detail}")
+    if forced and outcome.status == PASS:
+        return failed(f"kestrel terminate failed, so the harness forced the stop; the update "
+                      f"then passed. Terminate: {stopped.detail}", **outcome.data)
     return outcome
 
 
@@ -844,9 +908,6 @@ def step_update_while_running(j: Journey) -> Outcome:
     if not j.wait_healthy(180):
         return failed(f"host not healthy after update\n{tail(output)}")
     telegram = installed_version(TELEGRAM_PACKAGE)
-    if j.telegram_installed and telegram is None:
-        return failed(f"kestrel update removed {TELEGRAM_PACKAGE}, which was installed "
-                      f"before it ran\n{tail(output)}")
     status, body, seconds = j.invoke("!help")
     if status != 200 or not _response_text(body).strip():
         return failed(f"agent did not respond after update: HTTP {status} {str(body)[:1500]}")
@@ -869,7 +930,12 @@ def listener_ownership(pid_file: Path, port: int) -> dict[str, Any]:
     except OSError as exc:
         recorded = f"unreadable: {exc}"
     owners = []
-    for conn in psutil.net_connections(kind="inet"):
+    try:
+        connections = psutil.net_connections(kind="inet")
+    except psutil.Error as exc:
+        # macOS refuses the system-wide table to a non-root user.
+        return {"pid_record": recorded, "error": f"{type(exc).__name__}: {exc}"}
+    for conn in connections:
         if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port:
             owners.append(conn.pid)
     detail = {}
@@ -929,7 +995,9 @@ def leftover_processes(j: Journey) -> list[str]:
     """Kestrel launchers and isolated services still running."""
     names = [
         name for name in j.running_images()
-        if TELEGRAM_SERVICE_IMAGE in name or Path(name.split()[0] if name else "").stem == "kestrel"
+        if TELEGRAM_SERVICE_IMAGE in name
+        # Windows lists the image (kestrel.exe); POSIX the argv (python .../bin/kestrel ...).
+        or any(Path(part).stem == "kestrel" for part in name.split()[:2])
     ]
     if j.host_process is not None and j.host_process.poll() is None:
         names.append(f"launcher pid {j.host_process.pid}")
@@ -1088,8 +1156,11 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         # A driver bug propagates, but not before the host is stopped and the
         # steps that did run are reported: that is what the run exists for.
-        run_steps(journey, [TEARDOWN], into=results)
-        write_report(journey, results, args.report, collect_artifacts(journey, args.artifacts))
+        try:
+            journey.deadline = time.monotonic() + TEARDOWN_RESERVE_SECONDS + 300
+            run_steps(journey, [TEARDOWN], into=results)
+        finally:
+            write_report(journey, results, args.report, collect_artifacts(journey, args.artifacts))
     return exit_status(results)
 
 

@@ -42,6 +42,8 @@ concurrency:
 env:
   PYTHON_VERSION: "3.13"
   OLLAMA_VERSION: "v0.40.14"
+  # GitHub's published digest for that release's ollama-windows-amd64.zip.
+  OLLAMA_ZIP_SHA256: "65d68cade6cf6375f398b518224f8c8a15e062387f38cf477abfc848de7e7e29"
   OLLAMA_CHAT_MODEL: ${{ inputs.chat_model || 'llama3.2:3b' }}
   OLLAMA_EMBED_MODEL: "nomic-embed-text"
   # No TTY on a runner. This selects the wizard's non-interactive prompter,
@@ -68,9 +70,6 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Configure git for private deps
-        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
-
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
 
@@ -84,6 +83,8 @@ jobs:
           $dir = Join-Path $env:RUNNER_TEMP "ollama"
           $zip = "$dir.zip"
           Invoke-WebRequest "https://github.com/ollama/ollama/releases/download/$env:OLLAMA_VERSION/ollama-windows-amd64.zip" -OutFile $zip
+          $digest = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($digest -ne $env:OLLAMA_ZIP_SHA256) { throw "ollama zip digest $digest does not match the pin" }
           Expand-Archive $zip -DestinationPath $dir
           "OLLAMA_EXE=$(Join-Path $dir 'ollama.exe')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 

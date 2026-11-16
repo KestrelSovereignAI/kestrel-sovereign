@@ -59,19 +59,35 @@ def test_credentials_from_dotenv_are_scrubbed_and_plain_config_is_not(tmp_path):
     env.write_text(
         'KESTREL_API_KEY="abc123secret"\n'
         "KESTREL_DATA_KEY=datakey999\n"
-        "TELEGRAM_BOT_TOKEN=123:tok\n"
+        "TELEGRAM_BOT_TOKEN=123456:tok\n"
         "KESTREL_DID_WEB_DOMAIN=localhost\n"
         "# KESTREL_API_KEY=commented\n",
         encoding="utf-8",
     )
     secrets = kj.secret_values(kj.read_dotenv(env))
-    text = "key abc123secret data datakey999 tok 123:tok domain localhost"
+    text = "key abc123secret data datakey999 tok 123456:tok domain localhost"
     assert kj.redact(text, secrets) == "key *** data *** tok *** domain localhost"
 
 
 def test_longer_secret_is_scrubbed_before_a_shorter_one_it_contains():
-    secrets = kj.secret_values({"A_KEY": "abc", "B_KEY": "abcdef"})
-    assert kj.redact("abcdef abc", secrets) == "*** ***"
+    secrets = kj.secret_values({"A_KEY": "abcdefgh", "B_KEY": "abcdefghijkl"})
+    assert kj.redact("abcdefghijkl abcdefgh", secrets) == "*** ***"
+
+
+def test_short_values_and_the_runner_images_variables_are_not_scrubbed(tmp_path, monkeypatch):
+    """Run 43928736742: PGPASSWORD=root on the image turned every `root` into ***."""
+    monkeypatch.setenv("PGPASSWORD", "root")
+    monkeypatch.setenv("SOME_TOKEN", "unrelated-but-long-enough")
+    journey = kj.Journey(tmp_path, 1, ">=0")
+    assert journey.scrub("INFO:root:project root unrelated-but-long-enough") == (
+        "INFO:root:project root unrelated-but-long-enough")
+
+
+def test_step_data_is_scrubbed_through_its_structure(tmp_path):
+    journey = _Recorder(tmp_path, secrets=("sk-secret-value",))
+    step = kj.Step("s", lambda j: kj.failed("x", nested={"list": ["sk-secret-value", 1, True]}))
+    (result,) = kj.run_steps(journey, [step])
+    assert result.data == {"nested": {"list": ["***", 1, True]}}
 
 
 def test_a_credential_from_the_environment_is_scrubbed_before_setup(tmp_path, monkeypatch):
@@ -83,11 +99,11 @@ def test_a_credential_from_the_environment_is_scrubbed_before_setup(tmp_path, mo
 
 
 def test_step_detail_and_data_are_scrubbed(tmp_path):
-    journey = _Recorder(tmp_path, secrets=("s3cret",))
-    step = kj.Step("leaky", lambda j: kj.failed("saw s3cret", echoed="s3cret"))
+    journey = _Recorder(tmp_path, secrets=("s3cret-value",))
+    step = kj.Step("leaky", lambda j: kj.failed("saw s3cret-value", echoed="s3cret-value"))
     (result,) = kj.run_steps(journey, [step])
-    assert "s3cret" not in result.detail
-    assert "s3cret" not in json.dumps(result.data)
+    assert "s3cret-value" not in result.detail
+    assert "s3cret-value" not in json.dumps(result.data)
 
 
 # -- roster ----------------------------------------------------------------------
@@ -278,3 +294,107 @@ def test_every_requirement_names_an_earlier_step():
     for step in kj.STEPS:
         assert set(step.requires) <= seen, step.name
         seen.add(step.name)
+
+
+# -- review round 1 ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, connected",
+    [
+        ('{"connected": false, "healthy": false, "next_step": "set the token"}', False),
+        ('```json\n{"connected": true, "username": "kite_bot"}\n```', True),
+        ("not json at all", None),
+    ],
+)
+def test_the_telegram_status_is_read_not_substring_matched(text, connected):
+    assert kj.json_object_in(text).get("connected") is connected
+
+
+def test_telegram_token_step_fails_while_the_bot_is_not_connected(tmp_path, monkeypatch):
+    monkeypatch.setenv(kj.TELEGRAM_TOKEN_ENV, "123456789:token-value")
+    journey = _Recorder(tmp_path)
+    journey.roster = kj.Roster(8888, "Kestrel", 8801)
+    monkeypatch.setattr(journey, "request", lambda *a, **k: (200, {}))
+    monkeypatch.setattr(journey, "invoke", lambda text: (
+        200, {"response": '{"connected": false, "next_step": "retrying"}'}, 0.1))
+    monkeypatch.setattr(kj.time, "sleep", lambda s: None)
+    clock = iter(range(0, 10_000, 30))
+    monkeypatch.setattr(kj.time, "monotonic", lambda: next(clock))
+    assert kj.step_telegram_token(journey).status == kj.FAIL
+
+
+def test_the_update_that_removes_a_feature_is_the_one_that_fails(tmp_path, monkeypatch):
+    journey = _Recorder(tmp_path)
+    journey.telegram_installed = True
+    monkeypatch.setattr(kj, "_run_update_once", lambda j, label, *a: (kj.passed("ok"), "- telegram"))
+    monkeypatch.setattr(kj, "installed_version", lambda package: None)
+
+    outcome, _ = kj.run_update(journey, "--no-pull")
+    assert outcome.status == kj.FAIL and "removed" in outcome.detail
+    assert journey.telegram_installed is False  # the next update is not blamed
+
+
+def test_a_forced_stop_never_lets_update_while_stopped_pass(tmp_path, monkeypatch):
+    journey = _Recorder(tmp_path)
+    journey.roster = kj.Roster(8888, "Kestrel", 8801)
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    monkeypatch.setattr(kj, "step_terminate", lambda j: kj.failed("terminate left :8888"))
+    monkeypatch.setattr(kj, "force_stop_tree", lambda pid_file: None)
+    monkeypatch.setattr(journey, "port_open", lambda port: False)
+    monkeypatch.setattr(kj, "run_update", lambda j, *a: (kj.passed("updated"), ""))
+    monkeypatch.setattr(kj, "step_host_start", lambda j: kj.passed("started"))
+
+    outcome = kj.step_update_while_stopped(journey)
+    assert outcome.status == kj.FAIL and "forced the stop" in outcome.detail
+
+
+def test_past_the_deadline_a_step_fails_instead_of_waiting(tmp_path):
+    journey = _Recorder(tmp_path)
+    journey.deadline = kj.time.monotonic()
+    step = kj.Step("slow", lambda j: kj.passed(str(j.budget(900))))
+    (result,) = kj.run_steps(journey, [step])
+    assert result.status == kj.FAIL and "deadline" in result.detail
+
+
+def test_a_subprocess_timeout_is_a_step_failure(tmp_path):
+    def slow(_j):
+        raise kj.subprocess.TimeoutExpired(["kestrel", "update"], 30)
+
+    (result,) = kj.run_steps(_Recorder(tmp_path), [kj.Step("update", slow)])
+    assert result.status == kj.FAIL and "timed out" in result.detail
+
+
+def test_the_report_is_written_even_when_teardown_raises(tmp_path, monkeypatch):
+    for name in list(kj.os.environ):
+        if name in kj.REFUSED_ENV:
+            monkeypatch.delenv(name)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(kj, "STEPS", [kj.Step("only", lambda j: kj.passed("ok"))])
+
+    def boom(_j):
+        raise KeyError("teardown bug")
+
+    monkeypatch.setattr(kj, "TEARDOWN", kj.Step("terminate", boom))
+    report = tmp_path / "out" / "report.json"
+    with pytest.raises(KeyError):
+        kj.main(["--report", str(report), "--artifacts", str(tmp_path / "art")])
+    assert json.loads(report.read_text(encoding="utf-8"))["steps"][0]["name"] == "only"
+
+
+def test_a_posix_kestrel_command_line_counts_as_a_leftover(tmp_path, monkeypatch):
+    journey = _Recorder(tmp_path)
+    monkeypatch.setattr(journey, "running_images", lambda: [
+        "/v/bin/python /v/bin/kestrel logs --follow", "/usr/bin/python3 other.py"])
+    assert kj.leftover_processes(journey) == ["/v/bin/python /v/bin/kestrel logs --follow"]
+
+
+def test_ownership_reports_a_refused_process_table(tmp_path, monkeypatch):
+    import psutil
+
+    def refuse(kind="inet"):
+        raise psutil.AccessDenied(0)
+
+    monkeypatch.setattr(psutil, "net_connections", refuse)
+    data = kj.listener_ownership(tmp_path / "missing.pid", 8888)
+    assert "AccessDenied" in data["error"]
