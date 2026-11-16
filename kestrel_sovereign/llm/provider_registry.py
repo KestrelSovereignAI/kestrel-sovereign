@@ -483,7 +483,9 @@ class ProviderRegistry:
                     "oauth_credentials_file (ANTHROPIC_API_KEY for API-key routes; "
                     "ANTHROPIC_AUTH_TOKEN or a credentials file for OAuth)"
                 )
-            adapter = adapter_cls()
+            # The route's name keys the response headers the adapter records
+            # (#4114); it comes from this configuration, never the credential.
+            adapter = adapter_cls(route=f"{vendor}:{route}")
             if oauth_manager is not None:
                 adapter._oauth_token_manager = oauth_manager
                 # Name the credential this route bound to. Every agent builds

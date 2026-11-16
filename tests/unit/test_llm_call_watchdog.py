@@ -299,7 +299,7 @@ def test_a_long_non_streaming_anthropic_answer_is_not_cut_while_it_arrives():
 
     loop = _VirtualClockLoop()
     answer = _run(loop, LLMCallWatchdog(BOUND).call(
-        _anthropic_final_message(client(loop, False), {})
+        _anthropic_final_message(client(loop, False), {}, route=None)
     ))
     assert answer == "final message"
     assert loop.time() == 400
@@ -307,7 +307,7 @@ def test_a_long_non_streaming_anthropic_answer_is_not_cut_while_it_arrives():
     loop = _VirtualClockLoop()
     with pytest.raises(LLMCallInactivityTimeout):
         _run(loop, LLMCallWatchdog(BOUND).call(
-            _anthropic_final_message(client(loop, True), {})
+            _anthropic_final_message(client(loop, True), {}, route=None)
         ))
 
 

@@ -128,6 +128,7 @@ async def test_actual_anthropic_closer_keeps_original_stream_and_receipts(
         async with _anthropic_stream_with_retry(
             client,
             {"model": "local-protocol-input", "max_tokens": 1, "messages": [{"role": "user", "content": "fixture"}]},
+            route=None,
             retry_open=retry_open,
         ) as stream:
             streams.append(stream)
@@ -303,6 +304,7 @@ async def test_post_open_admission_keeps_actual_acquired_result_and_cleanup(
             async with _anthropic_stream_with_retry(
                 client,
                 {"model": "local-protocol-input", "max_tokens": 1, "messages": [{"role": "user", "content": "fixture"}]},
+                route=None,
                 retry_open=retry_open,
             ):
                 pytest.fail("retired post-open admission published acquired SDK stream")

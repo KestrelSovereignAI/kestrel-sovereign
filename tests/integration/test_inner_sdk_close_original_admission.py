@@ -55,7 +55,7 @@ async def test_inner_sdk_close_keeps_accepted_original_before_publication_failur
         if door == "context":
             async with _anthropic_stream_with_retry(sdk,
                 {"model": "local-protocol-input", "max_tokens": 1,
-                 "messages": [{"role": "user", "content": "fixture"}]}, retry_open=False,
+                 "messages": [{"role": "user", "content": "fixture"}]}, route=None, retry_open=False,
             ) as stream:
                 responses.append(stream.response)
                 resources.append(stream)

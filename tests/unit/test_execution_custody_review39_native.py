@@ -195,7 +195,7 @@ async def test_native_anthropic_acquisition_closes_before_denial_is_reported():
     async def acquire():
         with bind_execution_custody(fence):
             async with _anthropic_stream_with_retry(client, {"model": "offline", "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hello"}]}):
+                "messages": [{"role": "user", "content": "hello"}]}, route=None):
                 pytest.fail("denied native acquisition was disclosed")
     task = asyncio.create_task(acquire())
     try:

@@ -60,6 +60,7 @@ from .output_ceiling import (
     reported_usage,
     response_stop_reason,
 )
+from .rate_limit_headers import RATE_LIMIT_HEADERS_KEY, response_rate_limit_headers
 from .generation_gate import UnfinishedAfterInlineToolsError
 from .discovery_deadline import discovery_route_deadline_seconds
 from .model_discovery import ModelDiscoveryMixin, discovery_call
@@ -4674,6 +4675,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         stop_reason = response_stop_reason(response)
         if stop_reason is not None:
             record_metadata.setdefault("stop_reason", stop_reason)
+        # #4114: the provider's rate-limit headers, as the adapter copied them
+        # off this response with the time it observed them. Absent when none
+        # matched; both the row and the ``llm.usage`` line carry the same.
+        rate_limit_headers = response_rate_limit_headers(response)
+        if rate_limit_headers is not None:
+            record_metadata.setdefault(RATE_LIMIT_HEADERS_KEY, rate_limit_headers)
 
         tracked_tokens = total_tokens
         if tracked_tokens is None and (
@@ -5225,6 +5232,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             if modality != "chat":
                 usage_log["modality"] = modality
                 usage_log["caller"] = caller
+            if RATE_LIMIT_HEADERS_KEY in record_metadata:
+                usage_log[RATE_LIMIT_HEADERS_KEY] = record_metadata[RATE_LIMIT_HEADERS_KEY]
             logger.info("llm.usage: %s", json.dumps(usage_log, default=str))
         except Exception as log_err:
             if is_execution_control_error(log_err):
