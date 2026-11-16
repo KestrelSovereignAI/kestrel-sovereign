@@ -27,7 +27,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 
 DISTRIBUTION = "kestrel-sovereign"
 # Read at call time, so tests can exercise the Windows path on any OS.
