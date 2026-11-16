@@ -10,7 +10,6 @@ the Windows behaviour itself is proven by the journey harness.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -18,7 +17,11 @@ from unittest.mock import patch
 import pytest
 
 from kestrel_sovereign import cli, cli_lifecycle, windows_launchers
-from tests.unit.test_cli_update import _ns, stub_project_dir  # noqa: F401 (fixture)
+from tests.unit import test_cli_update
+from tests.unit.test_cli_update import _ns
+
+# The update tests' fixture, rebound here so pytest collects it for this module.
+stub_project_dir = test_cli_update.stub_project_dir
 
 
 @pytest.fixture
