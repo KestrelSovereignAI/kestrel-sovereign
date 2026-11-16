@@ -801,3 +801,18 @@ def test_a_manifest_that_does_not_split_by_line_is_refused_unchanged(venv, proje
 
     assert _manifest(project).read_text(encoding="utf-8") == text
     assert "reinstalls it unless" in raised.value.describe()
+
+
+def test_the_gate_asks_uv_about_the_revision_the_pull_lands(venv, project, monkeypatch, tmp_path):
+    asked = []
+    monkeypatch.setattr(
+        cli, "_uv_sync_removals",
+        lambda checkout, revision=None: asked.append((checkout, revision)) or (),
+    )
+
+    rc = cli_lifecycle._unrecorded_extension_gate(
+        project, tmp_path, manifest=None, landing=lambda: "c0ffee", continue_on_error=False,
+    )
+
+    assert rc == 0
+    assert asked == [(tmp_path, "c0ffee")]
