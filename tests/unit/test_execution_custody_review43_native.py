@@ -88,7 +88,7 @@ async def test_anthropic_owns_native_body_before_sdk_reads(operation, status, ki
     adapter = AnthropicAdapter()
     async def invoke():
         if operation == "stream_open":
-            async with _anthropic_stream_with_retry(client, {"model": "offline", "max_tokens": 1, "messages": []}, retry_open=False) as stream:
+            async with _anthropic_stream_with_retry(client, {"model": "offline", "max_tokens": 1, "messages": []}, route=None, retry_open=False) as stream:
                 async for _ in stream:
                     pass
         elif operation == "ceiling":

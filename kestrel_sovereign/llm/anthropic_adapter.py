@@ -52,6 +52,14 @@ from .output_ceiling import (
     output_limit_cut_notice,
     reported_token_limit,
 )
+from .rate_limit_headers import (
+    RESPONSE_HEADER_NAMES,
+    ResponseHeaders,
+    attach_rate_limit_headers,
+    attempt_line,
+    names_line,
+    read_response_headers,
+)
 from contextlib import asynccontextmanager
 
 from .retry import with_retry
@@ -92,8 +100,77 @@ def anthropic_model_info(model_data: Any) -> ModelInfo:
     )
 
 
+class ResponseHeaderSlot:
+    """Where one call's successful stream open leaves the copy of its
+    response headers (#4114), for the adapter to attach to the response it
+    builds. Each successful open replaces the copy, so it is always the one
+    from the response the call actually read."""
+
+    __slots__ = ("captured",)
+
+    def __init__(self) -> None:
+        self.captured: Optional[ResponseHeaders] = None
+
+
+def _capture_response_headers(
+    response: Any, *, route: Optional[str],
+) -> Optional[ResponseHeaders]:
+    """Copy what may be kept of one response's headers (#4114).
+
+    The one helper both points in ``_anthropic_stream_with_retry`` call, an
+    opened stream and a failed open, so what is kept cannot differ between
+    them. It copies strings and keeps no reference to ``response``. When the
+    route's set of header names is new to this process, or has changed, one
+    names-only line records them.
+    """
+    captured = read_response_headers(response)
+    if captured is not None and RESPONSE_HEADER_NAMES.changed(route, captured.names):
+        logger.info("llm.response_header_names: %s", names_line(route, captured.names))
+    return captured
+
+
+def _record_failed_open_headers(error: Exception, *, route: Optional[str]) -> None:
+    """Record the matched headers of a failed open's response, if any, as one
+    ``llm.attempt_headers:`` line. It runs before ``with_retry`` decides
+    anything, so a retried, declined or non-retryable failure is recorded
+    alike. Nothing is taken from the error's message or body. Never raises:
+    the provider's error is what the caller must see."""
+    try:
+        captured = _capture_response_headers(getattr(error, "response", None), route=route)
+        if captured is None:
+            return
+        status = getattr(error, "status_code", None)
+        line = attempt_line(route, captured, status if type(status) is int else None)
+        if line is not None:
+            logger.info("llm.attempt_headers: %s", line)
+    except Exception as capture_error:  # noqa: BLE001 - never replaces the provider's error
+        logger.warning(
+            "Could not record the response headers of a failed %s stream open: %s",
+            route, type(capture_error).__name__,
+        )
+
+
+def _record_opened_headers(stream: Any, *, route: Optional[str]) -> Optional[ResponseHeaders]:
+    """Copy what may be kept of an opened stream's response headers. An
+    ordinary error in the copy is logged and yields ``None``: it never fails,
+    delays or retries the call. Control errors propagate."""
+    try:
+        return _capture_response_headers(getattr(stream, "response", None), route=route)
+    except Exception as capture_error:
+        if is_execution_control_error(capture_error):
+            raise
+        logger.warning(
+            "Could not record the response headers of a %s stream: %s",
+            route, type(capture_error).__name__,
+        )
+        return None
+
+
 @asynccontextmanager
-async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
+async def _anthropic_stream_with_retry(
+    client, api_params, *, route: Optional[str], retry_open=True,
+    response_headers: Optional[ResponseHeaderSlot] = None,
+):
     """Open an Anthropic streaming response, retrying the OPEN on transient
     errors — especially a 429 throttle on the plan/OAuth route.
 
@@ -104,6 +181,12 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
     wrapped in ``with_retry`` (unlike non-streaming ``get_response`` and the
     OpenAI adapter), which is why a plan throttle silently billed the API.
     Mid-stream failures are not retried — partial text has already shipped.
+
+    Every open attempt's response headers are copied (#4114), keyed by
+    ``route``, the ``<vendor>:<route>`` name the adapter was built for. An
+    opened stream's copy is left in ``response_headers``; a failed open's
+    matched headers are logged, and its error is re-raised as the same
+    object.
     """
     async def _enter():
         from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
@@ -111,7 +194,14 @@ async def _anthropic_stream_with_retry(client, api_params, *, retry_open=True):
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
             cm = client.messages.stream(**api_params)
-            stream = await cm.__aenter__()
+            try:
+                stream = await cm.__aenter__()
+            except Exception as open_error:
+                _record_failed_open_headers(open_error, route=route)
+                raise
+            captured = _record_opened_headers(stream, route=route)
+            if response_headers is not None:
+                response_headers.captured = captured
             retain_native_execution_stream_close(stream)
             responses.handles.clear()
             return cm, stream
@@ -226,7 +316,10 @@ async def _next_stream_event(
     return event
 
 
-async def _anthropic_final_message(client, api_params):
+async def _anthropic_final_message(
+    client, api_params, *, route: Optional[str],
+    response_headers: Optional[ResponseHeaderSlot] = None,
+):
     """One complete (non-incremental) Anthropic response, carried over a stream.
 
     ``max_tokens`` is the model's own output ceiling (#3300) — 128,000 on
@@ -247,11 +340,17 @@ async def _anthropic_final_message(client, api_params):
     so is each chunk of its body, which carries the pings of thinking that is
     not displayed (#3357). An inactivity bound around this call therefore
     measures provider silence, not the length of the answer.
+
+    ``route`` and ``response_headers`` are passed to the stream open
+    (:func:`_anthropic_stream_with_retry`, #4114).
     """
     async def _once():
         # The outer retry still owns this whole non-incremental request; do
         # not multiply its retry budget with a second open retry policy.
-        async with _anthropic_stream_with_retry(client, api_params, retry_open=False) as stream:
+        async with _anthropic_stream_with_retry(
+            client, api_params, route=route, retry_open=False,
+            response_headers=response_headers,
+        ) as stream:
             _report_body_progress(stream)
             async for _event in stream:
                 report_call_progress()
@@ -606,8 +705,14 @@ class AnthropicAdapter(LLMAdapter):
     # abort can still flush partial usage via the service's usage_sink (#1684).
     supports_partial_usage_flush: bool = True
 
-    def __init__(self) -> None:
+    def __init__(self, *, route: Optional[str] = None) -> None:
         super().__init__()
+        # The ``<vendor>:<route>`` name this adapter serves, as the provider
+        # registry configured it and as ``llm.usage`` records carry it under
+        # ``provider``. It keys the response headers this adapter records
+        # (#4114), and is never derived from the client, its URL or its
+        # credential. ``None`` for an adapter built outside the registry.
+        self._route = route
         # Output ceilings the provider reported, keyed by wire model id
         # (#3300). Filled by model discovery (``list_models``) and, for a
         # model discovery has not described, by one Models API lookup on
@@ -1466,8 +1571,12 @@ class AnthropicAdapter(LLMAdapter):
                 client, model, api_params, kwargs, cancel_token,
             )
 
+            response_headers = ResponseHeaderSlot()
             response = await await_or_cancelled(
-                _anthropic_final_message(client, api_params),
+                _anthropic_final_message(
+                    client, api_params, route=self._route,
+                    response_headers=response_headers,
+                ),
                 cancel_token,
             )
 
@@ -1536,7 +1645,7 @@ class AnthropicAdapter(LLMAdapter):
             if notice is not None:
                 content = join_output_ceiling_notice(content, notice)
 
-            return attach_stop_reason(LLMResponse(
+            return attach_rate_limit_headers(attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
@@ -1545,7 +1654,7 @@ class AnthropicAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), stop_reason)
+            ), stop_reason), response_headers.captured)
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
@@ -1697,7 +1806,11 @@ class AnthropicAdapter(LLMAdapter):
                 else ThinkingContentSplitter(provider="anthropic")
             )
 
-            async with _anthropic_stream_with_retry(client, api_params) as stream:
+            response_headers = ResponseHeaderSlot()
+            async with _anthropic_stream_with_retry(
+                client, api_params, route=self._route,
+                response_headers=response_headers,
+            ) as stream:
                 stream_iter = stream.__aiter__()
                 while True:
                     try:
@@ -1907,7 +2020,7 @@ class AnthropicAdapter(LLMAdapter):
             # dropped their token usage entirely, a silent billing undercount.
             # Consumers read this only for tool_calls / usage; visible content
             # was already streamed as chunks.
-            yield attach_stop_reason(LLMResponse(
+            yield attach_rate_limit_headers(attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=parsed_tool_calls,
                 raw=None,
@@ -1916,7 +2029,7 @@ class AnthropicAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), stop_reason)
+            ), stop_reason), response_headers.captured)
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):

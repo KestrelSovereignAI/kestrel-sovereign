@@ -469,8 +469,8 @@ async def test_anthropic_implicit_sdk_close_is_physically_joined(final_message):
     params = {"model": "offline", "max_tokens": 1, "messages": [{"role": "user", "content": "hello"}]}
     async def consume():
         if final_message:
-            return await _anthropic_final_message(client, params)
-        async with _anthropic_stream_with_retry(client, params) as stream:
+            return await _anthropic_final_message(client, params, route=None)
+        async with _anthropic_stream_with_retry(client, params, route=None) as stream:
             async for _ in stream:
                 pass
     task = asyncio.create_task(consume())
