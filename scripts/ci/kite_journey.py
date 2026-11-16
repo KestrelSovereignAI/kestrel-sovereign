@@ -39,9 +39,9 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
 
 PASS = "pass"
 FAIL = "fail"
