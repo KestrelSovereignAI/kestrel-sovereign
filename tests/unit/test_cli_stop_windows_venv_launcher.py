@@ -11,6 +11,7 @@ record 1520, port 8888 owned by 3684, a base ``python.exe`` whose parent is
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,6 +77,7 @@ def test_a_listener_owned_by_the_launchers_interpreter_belongs_to_the_host(venv,
     assert cli_stop._listener_is_owned_by(PORT, 1520) is True
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
 def test_a_home_reached_through_a_link_still_matches_the_interpreter(tmp_path, monkeypatch):
     """uv's pyvenv.cfg names a minor-version junction; the image resolves past it.
 
@@ -193,3 +195,24 @@ def test_pyvenv_home(tmp_path, text, expected):
     cfg = tmp_path / "pyvenv.cfg"
     cfg.write_text(text, encoding="utf-8")
     assert cli_stop._pyvenv_home(cfg) == expected
+
+
+def test_a_recorded_process_whose_image_is_unreadable_keeps_its_own_sockets(monkeypatch):
+    """psutil.AccessDenied on exe() must not refuse a host that owns its socket."""
+    direct = _FakeProcess(Path("C:/py/python.exe"), connections=[_listener()],
+                          exe_error=psutil.AccessDenied(1520))
+    _patch_processes(monkeypatch, {1520: direct})
+
+    assert cli_stop._listener_is_owned_by(PORT, 1520) is True
+
+
+def test_an_undecodable_pyvenv_cfg_has_no_home(tmp_path):
+    cfg = tmp_path / "pyvenv.cfg"
+    cfg.write_bytes(b"home = C:\\\xff\xfe\n")
+    assert cli_stop._pyvenv_home(cfg) is None
+
+
+def test_a_bom_before_home_is_read(tmp_path):
+    cfg = tmp_path / "pyvenv.cfg"
+    cfg.write_bytes(b"\xef\xbb\xbfhome = C:\\Py\n")
+    assert cli_stop._pyvenv_home(cfg) == Path("C:\\Py")

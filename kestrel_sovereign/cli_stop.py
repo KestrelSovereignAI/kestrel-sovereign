@@ -184,11 +184,19 @@ def _venv_launcher_interpreters(process: Any) -> list[Any]:
     beside a ``pyvenv.cfg``, and a child runs ``python[w].exe`` from the
     ``home`` directory that file names. Any other child, or any other
     recorded process, contributes nothing, so a listener stays unattributed.
+
+    A host started before ``uv python upgrade`` moved the junction ``home``
+    names is refused until it restarts: its interpreter no longer sits there.
     """
 
     import psutil
 
-    executable = Path(process.exe())
+    try:
+        executable = Path(process.exe())
+    except psutil.AccessDenied:
+        # Not knowing the image leaves the recorded process's own sockets as
+        # the only evidence, exactly as before launchers were considered.
+        return []
     venv_root = executable.parent.parent
     if (
         executable.name.casefold() not in _WINDOWS_INTERPRETERS
@@ -216,8 +224,8 @@ def _pyvenv_home(config: Path) -> Path | None:
     """The ``home`` a venv's ``pyvenv.cfg`` declares, or None."""
 
     try:
-        lines = config.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        lines = config.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeDecodeError):
         return None
     for line in lines:
         key, separator, value = line.partition("=")
