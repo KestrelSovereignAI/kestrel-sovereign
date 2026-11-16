@@ -1,8 +1,8 @@
 """
 Unit tests for the Kestrel ProcessManager.
 
-Tests process lifecycle, agent registration, status tracking,
-and log reading — all without spawning real subprocesses.
+Tests process lifecycle, agent registration, status tracking, and log reading.
+The scoped real-process cases own and join their original children and pipes.
 """
 
 import json
@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -54,6 +55,38 @@ from kestrel_sovereign.host_features.storage import (
 # -----------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------
+
+@pytest.fixture
+def owned_detached_process(monkeypatch):
+    """Retain native Popen custody for only this test's detached children.
+
+    Production intentionally returns a durable PID to its exiting launcher.
+    These tests are not exiting launchers: they must retain and join the real
+    child rather than dropping its Popen object while it is still running.
+    """
+    original_popen = subprocess.Popen
+
+    def retire(child):
+        if child.poll() is None:
+            child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Recover only this original child, and still fail the test if
+            # ordinary termination did not physically finish in its budget.
+            child.kill()
+            child.wait(timeout=5)
+            raise
+
+    with ExitStack() as stack:
+        def launch(*args, **kwargs):
+            child = original_popen(*args, **kwargs)
+            stack.callback(retire, child)
+            return child
+
+        monkeypatch.setattr(process_manager.subprocess, "Popen", launch)
+        yield
+
 
 @pytest.fixture
 def project_dir(tmp_path, monkeypatch):
@@ -1934,17 +1967,17 @@ class TestPumpStdout:
         import sys
         log_file = tmp_path / "agent.log"
         marker = "PUMP_TEST_MARKER_42"
-        process = subprocess.Popen(
+        with subprocess.Popen(
             [sys.executable, "-c", f"print('{marker}'); print('second-line')"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             bufsize=1,
-        )
-        # Run pump synchronously (not the daemon thread) so we can assert deterministically
-        ProcessManager._pump_stdout(process, log_file, "[agent:test] ")
-        process.wait(timeout=5)
+        ) as process:
+            # The caller owns the pipe; the pump only borrows it.
+            ProcessManager._pump_stdout(process, log_file, "[agent:test] ")
+            process.wait(timeout=5)
 
         # File contains both lines verbatim
         log_text = log_file.read_text(encoding="utf-8")
@@ -1963,16 +1996,17 @@ class TestPumpStdout:
         import subprocess
         import sys
         log_file = tmp_path / "does" / "not" / "exist" / "agent.log"  # parent dirs missing
-        process = subprocess.Popen(
+        with subprocess.Popen(
             [sys.executable, "-c", "print('payload')"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
-        )
-        # Should not raise — pump catches the open() failure and logs a warning
-        ProcessManager._pump_stdout(process, log_file, "[agent:bad] ")
-        process.wait(timeout=5)
+        ) as process:
+            # Even when the pump cannot open its sink, this caller must close
+            # its original pipe after the real child finishes.
+            ProcessManager._pump_stdout(process, log_file, "[agent:bad] ")
+            process.wait(timeout=5)
 
 
 class TestSpawnUnbuffered:
@@ -2209,7 +2243,7 @@ class TestSpawnDetached:
         assert captured["env"]["PYTHONUNBUFFERED"] == "1"
 
     def test_spawn_detached_writes_to_log_file_after_parent_exits(
-        self, pm, tmp_path,
+        self, pm, tmp_path, owned_detached_process,
     ):
         """End-to-end: spawn a real subprocess that writes a line,
         let our process method return (simulating launcher exit by
@@ -2236,7 +2270,7 @@ class TestSpawnDetached:
             f"sys.stdout.flush(); "
             f"time.sleep(5)",
         ]
-        pid = pm._spawn_detached(
+        pm._spawn_detached(
             cmd=cmd, env={"PATH": "/usr/bin"},
             log_file=log_file, pid_file=pid_file,
         )
@@ -2251,21 +2285,12 @@ class TestSpawnDetached:
             ):
                 break
             time.sleep(0.05)
-        try:
-            assert log_file.exists()
-            content = log_file.read_text(encoding="utf-8")
-            assert marker in content, (
-                f"Detached spawn must persist child stdout to {log_file} "
-                f"without a pump thread. Got content: {content!r}"
-            )
-        finally:
-            # Clean up the still-running test child.
-            try:
-                import os
-                import signal
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
+        assert log_file.exists()
+        content = log_file.read_text(encoding="utf-8")
+        assert marker in content, (
+            f"Detached spawn must persist child stdout to {log_file} "
+            f"without a pump thread. Got content: {content!r}"
+        )
 
     def test_spawn_detached_appends_does_not_truncate(self, pm, tmp_path):
         """Repeated launches must append to the same log file, not
@@ -2510,14 +2535,14 @@ class TestLogRotation:
             process_manager.rotate_log_file(tmp_path / "host.log", backups=0)
 
     def test_detached_launch_rotates_a_full_log_before_the_child_writes(
-        self, pm, tmp_path
+        self, pm, tmp_path, owned_detached_process,
     ):
         log = self._sized(
             tmp_path / "host.log",
             process_manager.LOG_ROTATION_MAX_BYTES,
             "previous lifetime\n",
         )
-        pid = pm._spawn_detached(
+        pm._spawn_detached(
             cmd=[sys.executable, "-c", "print('new lifetime')"],
             env={"PATH": os.environ.get("PATH", "")},
             log_file=log,
@@ -2527,8 +2552,6 @@ class TestLogRotation:
         while "new lifetime" not in (log.read_text() if log.exists() else ""):
             assert time.monotonic() < deadline, "the child never wrote"
             time.sleep(0.05)
-        ProcessManager._reap_if_child(pid)
-
         assert log.read_text() == "new lifetime\n"
         assert (tmp_path / "host.log.1").read_text().startswith("previous lifetime")
 
