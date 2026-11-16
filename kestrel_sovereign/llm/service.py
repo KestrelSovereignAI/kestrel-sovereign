@@ -5671,6 +5671,13 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 else:
                     target_selector = pref_model
 
+        # Resolve ``model = "auto"`` routes before the walk, as generation does
+        # (#2069). Every quickstart vendor is seeded ``auto``, which resolves
+        # only from the discovery cache, and the genesis self-audit runs during
+        # inception, before any generation has warmed it: without this a fresh
+        # install with a working model failed inception on every route.
+        # ``local_only`` keeps a local-only audit's warm-up off cloud vendors.
+        await self._ensure_models_discovered(force_local_only=local_only)
         available_providers = self._available_providers()
         if local_only:
             available_providers = [p for p in available_providers if p.get("is_local")]
