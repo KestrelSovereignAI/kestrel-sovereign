@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -80,7 +84,7 @@ def _rehearsal(tmp_path: Path) -> "local.Rehearsal":
 
 def test_harness_is_removed_when_no_port_was_ever_assigned(tmp_path, monkeypatch):
     rehearsal = _rehearsal(tmp_path)
-    monkeypatch.setattr(local.subprocess, "run", pytest.fail)
+    monkeypatch.setattr(local, "run_child", pytest.fail)
     assert rehearsal.cleanup() is True
     assert not rehearsal.harness_dir.exists()
 
@@ -92,28 +96,121 @@ def test_harness_survives_an_inconclusive_port_check(tmp_path, monkeypatch, prob
     rehearsal.python = ["python"]
     calls = []
 
-    class _Done:
-        returncode = probe_rc
-
-    def fake_run(argv, **kwargs):
+    def fake_run_child(argv, **kwargs):
         calls.append(argv)
-        return _Done()
+        return probe_rc
 
-    monkeypatch.setattr(local.subprocess, "run", fake_run)
+    monkeypatch.setattr(local, "run_child", fake_run_child)
     assert rehearsal.cleanup() is removed
     assert rehearsal.harness_dir.exists() is not removed
     assert calls and "clean_install_local_cleanup.py" in calls[0][1]
 
 
+def test_an_interrupt_during_the_cleanup_probe_keeps_and_names_the_harness(
+    tmp_path, monkeypatch, capsys
+):
+    rehearsal = _rehearsal(tmp_path)
+    rehearsal.ports_ready = True
+    rehearsal.python = ["python"]
+
+    def interrupted(argv, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(local, "run_child", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        rehearsal.cleanup()
+    assert rehearsal.harness_dir.exists()
+    assert str(rehearsal.harness_dir) in capsys.readouterr().err
+
+
 def test_a_failed_step_names_the_command(tmp_path, monkeypatch):
     rehearsal = _rehearsal(tmp_path)
-
-    class _Failed:
-        returncode = 3
-
-    monkeypatch.setattr(local.subprocess, "run", lambda *a, **k: _Failed())
+    monkeypatch.setattr(local, "run_child", lambda *a, **k: 3)
     with pytest.raises(local.StepFailed, match="uv sync exited 3"):
         rehearsal.run(["uv", "sync"])
+
+
+# -- interrupts and termination (review round 1) ----------------------------------
+
+
+class _InterruptedOnce:
+    """A child whose first wait() is interrupted, as Ctrl-C does to the parent."""
+
+    def __init__(self, interrupt: BaseException):
+        self.interrupt = interrupt
+        self.waits = 0
+        self.killed = False
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self.waits == 1:
+            raise self.interrupt
+        return 0
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(143)])
+def test_the_running_step_finishes_before_an_interrupt_propagates(
+    tmp_path, monkeypatch, interrupt
+):
+    child = _InterruptedOnce(interrupt)
+    monkeypatch.setattr(local.subprocess, "Popen", lambda *a, **k: child)
+    with pytest.raises(type(interrupt)):
+        local.run_child(["verify"], cwd=tmp_path, env={})
+    assert child.waits == 2
+    assert child.killed is False
+
+
+def test_a_termination_signal_becomes_system_exit_with_the_shell_status():
+    with pytest.raises(SystemExit) as raised:
+        local._raise_exit(signal.SIGTERM, None)
+    assert raised.value.code == 128 + signal.SIGTERM
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal delivery")
+def test_sigterm_mid_install_still_removes_the_harness(tmp_path):
+    """End to end: the runner itself, a ``uv`` that hangs, then SIGTERM."""
+    root = tmp_path / "checkout"
+    (root / "scripts" / "ci").mkdir(parents=True)
+    shutil.copy(_SCRIPT, root / "scripts" / "ci" / "clean_install_local.py")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    uv = fake_bin / "uv"
+    uv.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n", encoding="utf-8")
+    uv.chmod(0o755)
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("KESTREL_") and k != "DATABASE_URL"
+    }
+    env.update(PATH=f"{fake_bin}{os.pathsep}{env.get('PATH', '')}", TMPDIR=str(temp_root))
+    proc = subprocess.Popen(
+        [sys.executable, str(root / "scripts" / "ci" / "clean_install_local.py")],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 20
+    while not any(temp_root.glob("kestrel-clean-install-*")):
+        assert time.monotonic() < deadline, "runner never created its harness"
+        time.sleep(0.05)
+    time.sleep(0.5)  # let the runner reach its wait on the hanging uv
+    proc.send_signal(signal.SIGTERM)
+    # The hanging uv is not this runner's to kill (bash would not kill it
+    # either); stop it so the runner's wait returns.
+    for pid_line in subprocess.run(
+        ["pgrep", "-f", str(uv)], capture_output=True, text=True, check=False
+    ).stdout.split():
+        os.kill(int(pid_line), signal.SIGTERM)
+    assert proc.wait(timeout=20) == 128 + signal.SIGTERM
+    assert not any(temp_root.glob("kestrel-clean-install-*"))
+
+
+@pytest.mark.parametrize("value, expected", [("", "3.13"), ("3.12", "3.12")])
+def test_an_empty_python_version_means_the_default(value, expected):
+    assert local.python_version_from({"KESTREL_PY_VERSION": value}) == expected
+    assert local.python_version_from({}) == "3.13"
 
 
 def test_main_refuses_before_creating_a_harness(monkeypatch, capsys):

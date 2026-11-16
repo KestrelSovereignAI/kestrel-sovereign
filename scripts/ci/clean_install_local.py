@@ -27,6 +27,7 @@ import argparse
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -133,9 +134,9 @@ class Rehearsal:
         self.ports_ready = False
 
     def run(self, argv: Sequence[str]) -> None:
-        result = subprocess.run(list(argv), cwd=self.root, env=self.env, check=False)
-        if result.returncode != 0:
-            raise StepFailed(f"{' '.join(argv)} exited {result.returncode}")
+        returncode = run_child(argv, cwd=self.root, env=self.env)
+        if returncode != 0:
+            raise StepFailed(f"{' '.join(argv)} exited {returncode}")
 
     def install(self) -> None:
         self.run(["uv", "python", "install", self.python_version])
@@ -179,20 +180,72 @@ class Rehearsal:
     def cleanup(self) -> bool:
         """Remove the harness unless a process may still be using it."""
         if self.ports_ready:
-            probe = subprocess.run(
-                [*self.python, "scripts/ci/clean_install_local_cleanup.py",
-                 "--root", str(self.root), "--check-ports"],
-                cwd=self.root, env=self.env, check=False,
-            )
-            if probe.returncode != 0:
-                print(
-                    f"warning: preserving clean-install harness {self.harness_dir}; "
-                    "verify and stop its processes before removing it",
-                    file=sys.stderr,
+            try:
+                returncode = run_child(
+                    [*self.python, "scripts/ci/clean_install_local_cleanup.py",
+                     "--root", str(self.root), "--check-ports"],
+                    cwd=self.root, env=self.env,
                 )
+            except (KeyboardInterrupt, SystemExit):
+                self._warn_preserved()
+                raise
+            if returncode != 0:
+                self._warn_preserved()
                 return False
         shutil.rmtree(self.harness_dir)
         return True
+
+    def _warn_preserved(self) -> None:
+        print(
+            f"warning: preserving clean-install harness {self.harness_dir}; "
+            "verify and stop its processes before removing it",
+            file=sys.stderr,
+        )
+
+
+def run_child(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str]) -> int:
+    """Run ``argv`` to completion and return its exit status.
+
+    An interrupt (Ctrl-C) or termination of this runner does not cut the
+    running step short, as bash does not cut its foreground command short:
+    the step finishes its own teardown (the verifier stops the host it
+    started) before the runner's cleanup begins. ``subprocess.run`` instead
+    kills the child 0.25 s into a KeyboardInterrupt. The interrupt is
+    re-raised once the child has exited.
+    """
+    proc = subprocess.Popen(list(argv), cwd=cwd, env=dict(env))
+    try:
+        return proc.wait()
+    except (KeyboardInterrupt, SystemExit):
+        while True:
+            try:
+                proc.wait()
+                break
+            except KeyboardInterrupt:
+                continue
+        raise
+
+
+def _raise_exit(signum: int, _frame: object) -> None:
+    """Turn a termination signal into SystemExit, so ``finally`` cleanup runs.
+
+    Python's default SIGTERM/SIGHUP handling ends the process without running
+    ``finally``; bash's ``trap ... EXIT`` ran on both. Exit status 128+signum
+    is the shell convention for death by signal.
+    """
+    raise SystemExit(128 + signum)
+
+
+def install_termination_handlers() -> None:
+    for name in ("SIGTERM", "SIGHUP"):  # SIGHUP does not exist on Windows
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            signal.signal(signum, _raise_exit)
+
+
+def python_version_from(environ: Mapping[str, str]) -> str:
+    """``KESTREL_PY_VERSION``, treating empty as unset (bash ``${VAR:-default}``)."""
+    return environ.get("KESTREL_PY_VERSION") or DEFAULT_PYTHON_VERSION
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -207,7 +260,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    python_version = os.environ.get("KESTREL_PY_VERSION", DEFAULT_PYTHON_VERSION)
+    python_version = python_version_from(os.environ)
+    install_termination_handlers()
     harness_dir = Path(tempfile.mkdtemp(prefix="kestrel-clean-install-"))
     rehearsal = Rehearsal(
         REPO_ROOT, args.method, python_version, child_env(os.environ, harness_dir), harness_dir
