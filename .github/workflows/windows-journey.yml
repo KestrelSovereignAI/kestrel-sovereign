@@ -1,0 +1,131 @@
+name: Windows Journey (Kite)
+
+# Walks a fresh Windows install the way a new user does: quickstart, chat,
+# add the Telegram channel, stop and start, `kestrel update` with the agent
+# up, stop. Reports one result per step. The clean-install gate stops at
+# /health, skips the genesis audit and runs the CLI as `python -m`, so none
+# of this is covered there.
+#
+# Two model setups, because users have both:
+#   openrouter  a cloud key, as quickstart detects from OPENROUTER_API_KEY.
+#               Pushes to the journey branch and manual runs default to it.
+#               The repo secret is a dedicated key with its own spend cap.
+#   ollama      a local model on a CPU-only machine, like most Windows
+#               laptops. Downloads Ollama (~1.5 GB) and pulls two models, so
+#               it runs weekly and on demand only.
+# Not a required check.
+on:
+  push:
+    branches: ["ci/windows-journey"]
+  schedule:
+    # Tuesdays, off the Monday weekly-analysis slot. Runs both setups.
+    - cron: "17 10 * * 2"
+  workflow_dispatch:
+    inputs:
+      llm:
+        description: Model setup to walk the journey with
+        type: choice
+        options: [openrouter, ollama]
+        default: openrouter
+      chat_model:
+        description: Ollama model to pull (ollama only)
+        default: "llama3.2:3b"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-journey-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  OLLAMA_VERSION: "v0.40.14"
+  # GitHub's published digest for that release's ollama-windows-amd64.zip.
+  OLLAMA_ZIP_SHA256: "65d68cade6cf6375f398b518224f8c8a15e062387f38cf477abfc848de7e7e29"
+  OLLAMA_CHAT_MODEL: ${{ inputs.chat_model || 'llama3.2:3b' }}
+  OLLAMA_EMBED_MODEL: "nomic-embed-text"
+  # No TTY on a runner. This selects the wizard's non-interactive prompter,
+  # which accepts the defaults a user would press Enter through. Unlike the
+  # clean-install gate, the journey sets NOTHING else: no test-instance
+  # flag, no audit skip, no reachability skip. It takes the user's path.
+  KESTREL_NONINTERACTIVE: "1"
+
+jobs:
+  journey:
+    name: journey (${{ matrix.llm }})
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        llm: ${{ fromJSON(github.event_name == 'schedule' && '["openrouter","ollama"]' || format('["{0}"]', inputs.llm || 'openrouter')) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies (uv sync)
+        run: uv sync
+
+      - name: Download Ollama
+        if: matrix.llm == 'ollama'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "ollama"
+          $zip = "$dir.zip"
+          Invoke-WebRequest "https://github.com/ollama/ollama/releases/download/$env:OLLAMA_VERSION/ollama-windows-amd64.zip" -OutFile $zip
+          $digest = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($digest -ne $env:OLLAMA_ZIP_SHA256) { throw "ollama zip digest $digest does not match the pin" }
+          Expand-Archive $zip -DestinationPath $dir
+          "OLLAMA_EXE=$(Join-Path $dir 'ollama.exe')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # Ollama is served from THIS step: the Windows runner ends a step's
+      # background processes with the step (an earlier run found the server
+      # gone before the journey began). As a Windows user's tray app does, it
+      # listens on 127.0.0.1:11434.
+      - name: Walk the journey
+        shell: pwsh
+        env:
+          LLM_SETUP: ${{ matrix.llm }}
+          OPENROUTER_API_KEY: ${{ matrix.llm == 'openrouter' && secrets.OPENROUTER_API_KEY || '' }}
+          TELEGRAM_TEST_BOT_TOKEN: ${{ secrets.TELEGRAM_TEST_BOT_TOKEN }}
+        run: |
+          if ($env:LLM_SETUP -eq "ollama") {
+            Start-Process -FilePath $env:OLLAMA_EXE -ArgumentList "serve" -WindowStyle Hidden `
+              -RedirectStandardOutput "$env:RUNNER_TEMP\ollama.out.log" `
+              -RedirectStandardError "$env:RUNNER_TEMP\ollama.err.log"
+            $up = $false
+            for ($i = 0; $i -lt 60 -and -not $up; $i++) {
+              try { Invoke-RestMethod "http://127.0.0.1:11434/api/version" | Out-Null; $up = $true }
+              catch { Start-Sleep -Seconds 2 }
+            }
+            if (-not $up) { throw "ollama serve did not come up" }
+            & $env:OLLAMA_EXE pull $env:OLLAMA_CHAT_MODEL
+            if ($LASTEXITCODE -ne 0) { throw "pull $env:OLLAMA_CHAT_MODEL failed" }
+            & $env:OLLAMA_EXE pull $env:OLLAMA_EMBED_MODEL
+            if ($LASTEXITCODE -ne 0) { throw "pull $env:OLLAMA_EMBED_MODEL failed" }
+          } elseif (-not $env:OPENROUTER_API_KEY) {
+            throw "the openrouter journey needs the OPENROUTER_API_KEY repo secret"
+          }
+          uv run python scripts/ci/kite_journey.py --report "$env:RUNNER_TEMP/journey/report.json" --artifacts "$env:RUNNER_TEMP/journey/artifacts"
+          exit $LASTEXITCODE
+
+      - name: Upload journey report and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-journey-${{ matrix.llm }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/journey
+            ${{ runner.temp }}/ollama.*.log
+          retention-days: 14
+          if-no-files-found: warn

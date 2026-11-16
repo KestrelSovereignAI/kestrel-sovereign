@@ -357,6 +357,29 @@ agent or serve as evidence that a real agent passed genesis. Live acceptance
 requires a configured auditor's completed low/medium-risk result and the
 normal durable integrity checks for the exact governing source.
 
+### Windows journey
+
+The clean-install gate stops at `/health`, skips the genesis audit, and runs
+the CLI as `python -m kestrel_sovereign.cli`. The **Windows journey**
+(`.github/workflows/windows-journey.yml`, driver `scripts/ci/kite_journey.py`)
+takes the path a new Windows user takes instead. It uses the real `kestrel.exe`
+and runs quickstart with no test-instance or audit-skip flags. It then checks:
+
+- a real model answer, `!help` and `kestrel ask`;
+- installing the Telegram channel and its isolated service;
+- `stop`, `terminate` and start;
+- `kestrel update` with the host down and then up;
+- that `terminate` leaves no listener or service behind.
+
+It records one result per step, with logs as artifacts. Credentials are
+scrubbed from both.
+
+It runs with a cloud key (`OPENROUTER_API_KEY`, a dedicated capped repo
+secret) on manual dispatch, and with both a cloud key and a local Ollama on a
+CPU-only runner weekly. The local setup downloads about 1.5 GB, so it is kept
+off the per-push path. It is not a required check. The driver refuses to run
+in a checkout that already has an install.
+
 ## Troubleshooting
 
 ### "Docker credential store not available"
