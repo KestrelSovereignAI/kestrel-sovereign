@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-11-15
-**Scope:** 3834 tracked files (2947 `.py`, 378 `.md`, 509 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-11-16
+**Scope:** 3843 tracked files (2955 `.py`, 379 `.md`, 509 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1073,7 +1073,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/adapter.py** — Framework-side LLM adapter base.
   - `def response_usage_available(response)`; `def provider_usage_cost(usage)`; `class ReportedUsage`; `class ToolCallWithExtraContent`; `class InlineToolOutcome`; `class ToolInputSuspensionResponse`; `def inline_tool_dispatch_id(outcome)`; `def tool_call_history_entry(tool_call)`; `…`
 - **kestrel_sovereign/llm/anthropic_adapter.py** — Anthropic Claude Adapter
-  - `def anthropic_model_info(model_data)`; `class AnthropicAdapter`
+  - `def anthropic_model_info(model_data)`; `class ResponseHeaderSlot`; `class AnthropicAdapter`
 - **kestrel_sovereign/llm/anthropic_oauth.py** — Claude subscription (Claude Pro/Max) OAuth token lifecycle.
   - `class OAuthCredentials`; `def parse_credentials(raw)`; `async def refresh_anthropic_token(refresh_token)`; `class CredentialSource`; `class FileCredentialSource`; `class KeychainCredentialSource`; `def discover_claude_code_source()`; `class ClaudeOAuthTokenManager`
 - **kestrel_sovereign/llm/call_progress.py** — Progress an LLM call reports while its answer arrives (#3552, #3357).
@@ -1179,6 +1179,8 @@ Repo entry points and standard project files.
   - `class OverrideSource`; `class ProviderPolicyConfigError`; `class ProviderPolicyRefusal`; `class OverrideProvenance`; `def agent_provenance()`; `def system_provenance()`; `def provenance_for_caller(caller)`; `def config_provenance()`; `…`
 - **kestrel_sovereign/llm/provider_registry.py** — Provider Registry for LLM Service.
   - `class ProviderInitializationError`; `class ProviderRegistry`; `def provider_cache_body(provider)`
+- **kestrel_sovereign/llm/rate_limit_headers.py** — Rate-limit response headers, copied off a provider response (#4114).
+  - `def is_rate_limit_header(name)`; `def has_kept_shape(value)`; `def withheld_value_descriptor(value)`; `def observation_time()`; `class ResponseHeaders`; `def read_response_headers(response)`; `class HeaderNameLedger`; `def names_line(route, names)`; `…`
 - **kestrel_sovereign/llm/remote_backend.py** — Readiness-gated private inference routing for :class:`LLMService`.
   - `class RemoteRouteSnapshot`; `class RemoteBackendMixin`
 - **kestrel_sovereign/llm/retry.py** — Retry Utilities for LLM Adapters
@@ -1911,6 +1913,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/visual_computer/worker_profile_data/broker-seccomp.json** — (configuration)
 - **kestrel_sovereign/visual_computer/worker_profile_data/browser-host.json** — (configuration)
 - **kestrel_sovereign/visual_computer/worker_profile_data/browser-seccomp.json** — (configuration)
+- **kestrel_sovereign/visual_computer/worker_publication.py** — Exclusive publication of complete records in an owned worker directory.
+  - `def publish_record(path, content)`
 - **kestrel_sovereign/visual_computer/worker_stream.py** — Join the original worker stream close without treating peer loss as debt.
   - `async def join_original_writer_close(writer)`
 - **kestrel_sovereign/waits/__init__.py** — Generic wait engine — one poll loop for every feature's blocking wait.
@@ -2157,7 +2161,7 @@ Repo entry points and standard project files.
 - **docker/visual-browser/sandbox_probe.py** — Synthetic, offline substrate check; not an agent or a computer-use driver.
   - `def refuse_owned_peers(fixture)`; `async def probe(fixture)`
 - **docker/visual-browser/two_domain_worker.py** — Offline browser domain: the existing controller/parser, Unix IPC only.
-  - `def configuration(value)`; `def initialize(raw)`; `async def serve(controller, secret)`; `async def original_playwright()`; `async def main(lifecycle)`
+  - `def configuration(value)`; `def initialize(raw)`; `async def serve(controller, secret, admission)`; `async def original_playwright()`; `async def main(lifecycle)`
 - **docker/visual-browser/wire.py** — Bounded private IPC; credentials arrive on stdin, never in argv or env.
   - `def decode(data)`; `def encode(value)`
 - **docker/visual-browser/worker.py** — Private offline browser worker, reached only through authenticated Unix IPC.
@@ -2512,6 +2516,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.54.2.md** — 0.54.2 — attended feature-recovery startup boundary — Candidate release notes; publication and downstream acceptance are separate gates, not established by this file.
 - **docs/releases/v0.64.1.md** — 0.64.1 — cold tool-effect imports — Candidate release notes; publication, deployment health and downstream acceptance remain separate gates.
 - **docs/releases/v0.64.2.md** — 0.64.2 — truthful shutdown deadline observations — Candidate release notes; publication and deployment remain separate gates.
+- **docs/research/4097-plan-allowance-step0.md** — Plan allowance, step 0: what the anthropic:plan route and the Claude CLI report — **Issue:** #4097, step 0 only.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
@@ -3359,6 +3364,8 @@ Repo entry points and standard project files.
   - `async def test_original_prompt_consumer_preserves_guidance_control(tmp_path, monkeypatch, streaming, carrier)`
 - **tests/integration/test_native_retirement.py** — Observe ACTUAL native PG ACK/reset owners, never fabricated receipts.
   - `async def test_transaction_revalidates_after_actual_native_entry_wait(native_pg, monkeypatch, wait_kind, cutoff)`; `async def test_inherited_operational_transaction_roots_actual_child_body(native_pg)`; `async def test_late_observer_is_refused_before_native_transaction_entry(native_pg, monkeypatch, lease_kind)`; `async def test_join_tracks_real_commit_then_reset_not_arbitrary_provider_tail(native_pg, monkeypatch, cancel_observer)`; `async def test_open_body_is_retained_debt_not_an_unbounded_native_join(native_pg)`; `async def test_late_observer_on_inherited_operational_lease_cannot_miss_accepted_commit(native_pg, monkeypatch)`; `async def test_script_observation_cannot_hide_raw_transaction_control(native_pg, raw_transaction)`; `async def test_native_resource_roots_its_actual_body_task_until_physical_retirement(native_pg)`; `…`
+- **tests/integration/test_native_subagent_permission.py** — HTTP/model/feature-subagent admission precedes an actual owned process.
+  - `def owned_script_task(script)`; `class OriginalSubagentTurnObserver`; `class NativeSubagentHTTP`; `async def native_subagent_http(tmp_path, monkeypatch, native_permission_case)`; `async def test_native_http_feature_subagent_obeys_leaf_permission(native_subagent_http, permission)`; `async def test_native_http_subagent_one_shot_and_invalid_decisions(native_subagent_http, approved)`; `async def test_native_http_subagent_cleanup_joins_the_original_pending_approval(native_subagent_http)`
 - **tests/integration/test_observability_original_control.py** — Actual observability DELETE uncertainty survives the independent sweep.
   - `async def test_public_observability_purge_retains_original_native_delete(native_pg, monkeypatch, failed_table)`
 - **tests/integration/test_observability_privacy_gating_backends.py** — Fail-closed observability privacy gates on SQLite and PostgreSQL (#3920).
@@ -5249,6 +5256,8 @@ Repo entry points and standard project files.
   - `async def test_real_sdk_close_refusal_retains_inventory_and_closes_independent_peer(tmp_path, monkeypatch, refusal)`; `async def test_public_usage_close_retains_original_database_after_native_refusal(tmp_path, monkeypatch)`; `async def test_refused_writer_wrapper_does_not_close_original_writers_database(tmp_path, monkeypatch)`; `async def test_actual_sdk_failed_close_ack_keeps_unpublished_service_fatal(tmp_path, monkeypatch)`
 - **tests/unit/test_llm_provider_capabilities.py** — —
   - `class BareAdapter`; `class DictCapabilitiesAdapter`; `def test_provider_capabilities_to_dict_uses_wire_values()`; `def test_adapter_capabilities_normalizes_plugin_dicts()`; `def test_base_adapter_capabilities_are_conservative()`; `def test_llm_service_route_dicts_include_capabilities()`; `def test_llm_service_embedding_provider_follows_active_route()`; `def test_llm_service_embedding_provider_degrades_when_active_route_cannot_embed()`; `…`
+- **tests/unit/test_llm_rate_limit_headers.py** — #4114 (#4097, PR 1 of 3): the provider's rate-limit response headers are recorded on every Anthropic stream open.
+  - `def names_ledger(monkeypatch)`; `def capture_clock(monkeypatch)`; `def no_jitter(monkeypatch)`; `def test_names_are_matched_without_case_on_the_ruled_pattern(name, matched)`; `def test_short_numbers_dates_and_durations_are_kept(value)`; `def test_every_other_value_is_withheld(value)`; `def test_a_withheld_value_leaves_only_its_shape()`; `def test_matched_values_are_kept_and_every_other_value_is_not(capture_clock)`; `…`
 - **tests/unit/test_llm_service.py** — Unit tests for LLMService core methods.
   - `def mock_config()`; `def mock_mandate_config()`; `def mock_openai_client()`; `def mock_adapter()`; `def mock_provider_registry(mock_openai_client, mock_adapter)`; `async def llm_service(mock_config, mock_mandate_config, mock_provider_registry)`; `class TestModelPreference`; `class TestCoreGeneration`; `…`
 - **tests/unit/test_llm_service_attach.py** — Unit tests for LLMService.attach_to_agent.
@@ -6043,6 +6052,8 @@ Repo entry points and standard project files.
   - `async def test_admission_snapshot_atomically_fences_actual_text_factory(dispatcher_components, monkeypatch, tmp_path)`
 - **tests/unit/test_sqlite_observer_retirement.py** — Native success/error controls for the SQLite observer-retirement fixture.
   - `def test_original_observer_closes_after_success_or_body_error(tmp_path, body_error)`
+- **tests/unit/test_sqlite_slow_transaction.py** — A slow SQLite transaction names the task that held the writer slot (#4081).
+  - `async def test_slow_transaction_names_its_holder(tmp_path, caplog)`; `async def test_a_slow_transaction_that_rolls_back_says_so(tmp_path, caplog)`; `async def test_the_opener_stack_carries_no_source_lines(tmp_path, caplog)`; `async def test_a_cancelled_transaction_is_timed_through_its_rollback(tmp_path, caplog, monkeypatch)`; `async def test_a_quickly_cancelled_transaction_with_a_quick_rollback_logs_nothing(tmp_path, caplog)`; `async def test_a_transaction_cancelled_waiting_for_the_slot_names_its_rollback(tmp_path, caplog)`; `async def test_refused_rollback_is_not_reported_as_released(tmp_path, caplog)`; `async def test_failed_handed_off_rollback_is_not_reported_as_released(tmp_path, caplog)`; `…`
 - **tests/unit/test_sse_approval_events.py** — Tests that the /agent/notifications/sse endpoint forwards events from the agent's event bus (e.g.
   - `def clean_sse_connections()`; `async def test_approval_request_event_is_forwarded_to_sse_stream()`; `async def test_listener_is_registered_and_cleaned_up()`; `async def test_agent_without_event_bus_does_not_crash()`
 - **tests/unit/test_sse_connection_limits.py** — Unit tests for SSE connection limits (issue #145).
@@ -6063,6 +6074,8 @@ Repo entry points and standard project files.
   - `async def test_streaming_stop_hook_carries_user_message_and_response_text_no_tools(native_tool_effect_agent)`; `async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fired(native_tool_effect_agent)`; `async def test_streaming_stop_hook_captures_chained_tool_iterations(native_tool_effect_agent)`; `async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatch(native_tool_effect_agent)`; `async def test_streaming_stop_hook_skipped_when_no_hooks_manager(native_tool_effect_agent)`; `async def test_orchestrator_response_accepts_tool_results_out_param(native_tool_effect_agent)`; `def test_handle_orchestrator_response_signature_has_tool_results_kwarg()`
 - **tests/unit/test_stop_owner_heartbeat.py** — Stop-owner liveness survives event-loop stalls (#3889).
   - `async def test_a_stall_longer_than_the_lease_in_one_turn_spares_another_agents_turn(tmp_path)`; `async def test_a_dead_heartbeat_lets_the_lease_expire_and_fences_within_it(tmp_path, monkeypatch)`; `async def test_a_heartbeat_that_died_while_idle_is_restarted_before_the_next_turn(tmp_path, monkeypatch, caplog)`; `async def test_a_restarted_heartbeat_that_does_not_renew_refuses_the_turn_by_name(tmp_path, monkeypatch, restarted)`; `async def test_server_health_reports_a_restart_that_cannot_renew_until_it_does(tmp_path, monkeypatch)`; `async def test_a_restarted_heartbeat_that_died_before_renewing_is_restarted_without_traffic(tmp_path, monkeypatch, caplog)`; `async def test_a_failed_restart_stays_unhealthy_through_the_next_restart_until_a_renewal(tmp_path, monkeypatch, preempt_sample)`; `async def test_a_heartbeat_thread_that_cannot_be_started_is_named_until_one_renews(tmp_path, monkeypatch)`; `…`
+- **tests/unit/test_stop_owner_renewal_phases.py** — A Stop owner renewal names where its time went (#4081).
+  - `async def test_fence_reason_names_slot_wait(tmp_path, caplog)`; `async def test_fence_reason_names_commit(tmp_path, caplog, monkeypatch)`; `async def test_fence_reason_names_write_on_row_lock(db_backend, caplog)`; `async def test_fence_reason_names_open_while_postgres_connects(db_backend, caplog, monkeypatch)`; `async def test_fence_line_reports_observation_gap(tmp_path, caplog, monkeypatch)`; `async def test_a_slow_renewal_logs_every_phase_and_a_quick_one_nothing(caplog)`; `def test_an_unknown_renewal_phase_is_refused()`
 - **tests/unit/test_stop_receipts.py** — Durability and fail-closed evidence gates for cooperative Stop (#3152).
   - `async def test_receipt_store_roundtrips_exact_evidence_on_available_backends(db_backend)`; `async def test_operation_binding_is_first_sight_on_available_backends(db_backend)`; `async def test_acknowledged_turn_stop_is_queryable_by_durable_target(tmp_path)`; `async def test_opaque_stop_identities_are_blinded_in_claims_and_receipts(tmp_path)`; `async def test_public_turn_receipt_blinds_remapped_private_request_id(tmp_path)`; `async def test_receipt_survives_sqlite_connection_restart(tmp_path)`; `async def test_cascade_persists_one_ordered_outcome_per_target_across_restart(tmp_path)`; `async def test_exact_replay_preserves_original_durable_outcome(tmp_path)`; `…`
 - **tests/unit/test_stop_retirement_budget.py** — A bounded Stop drain cannot accept an unbounded or invalid clock budget.
@@ -6278,7 +6291,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_turn_scope.py** — Turn-scoped context crosses every task boundary through one registry (#3114).
   - `def test_every_turn_scoped_value_is_declared_at_its_definition_site()`; `def test_registry_refuses_two_writers_for_one_value()`; `def contextlib_null()`; `async def test_orchestrator_executor_carries_turn_id_and_chain_to_reader_task()`; `async def test_every_var_the_turn_publishes_is_declared_and_carried()`; `async def test_off_turn_executor_manufactures_nothing()`; `async def test_todo_add_on_reader_task_stamps_the_owning_turn_id()`; `async def test_outbound_a2a_chain_provider_sees_the_turn_chain_on_reader_task()`; `…`
 - **tests/unit/test_two_domain_browser_ownership.py** — Scripted server/writer faults with real original asyncio Task ownership.
-  - `class ScriptedServer`; `class ScriptedWriter`; `class ScriptedController`; `async def test_original_browser_server_open_is_joined_before_withdrawal_settles(monkeypatch)`; `async def test_original_browser_writer_close_error_still_joins_actual_writer(monkeypatch, arrival)`; `async def test_original_playwright_startup_failure_joins_original_pump_and_init(monkeypatch, failure)`; `async def test_review21_original_endpoint_peer_close_does_not_poison_browser_retirement(monkeypatch, tmp_path, peer_close)`; `async def test_review21_terminal_original_close_future_is_joined(peer_error)`; `…`
+  - `class ScriptedServer`; `class ScriptedWriter`; `class ScriptedController`; `def scripted_readiness_publication(monkeypatch)`; `async def test_original_browser_server_open_is_joined_before_withdrawal_settles(monkeypatch)`; `async def test_original_browser_writer_close_error_still_joins_actual_writer(monkeypatch, arrival)`; `async def test_original_playwright_startup_failure_joins_original_pump_and_init(monkeypatch, failure)`; `async def test_review21_original_endpoint_peer_close_does_not_poison_browser_retirement(monkeypatch, tmp_path, peer_close)`; `…`
+- **tests/unit/test_two_domain_startup_publication.py** — Scripted listener I/O, real original Tasks; NOT native worker acceptance.
+  - `def startup(monkeypatch, tmp_path)`; `async def test_admission_follows_both_original_listener_returns_and_chmods(startup)`; `async def test_lifecycle_retirement_during_startup_cannot_publish_ready(startup)`; `async def test_original_expired_startup_deadline_is_not_restarted_for_listeners(startup)`; `async def test_startup_failure_publishes_nothing_and_joins_originals(startup, failure)`; `async def test_withdrawal_joins_delayed_second_listener_without_publishing(startup)`
 - **tests/unit/test_typed_parts.py** — Typed component parts (#1914).
   - `def test_emit_part_no_collector_is_noop()`; `def test_emit_and_drain_roundtrip()`; `def test_collector_resets_between_turns()`; `def test_emit_part_rejects_invalid_type()`; `def test_emit_part_rejects_non_serializable()`; `def test_emit_part_rejects_oversized()`; `def test_emit_part_rejects_non_finite_numbers()`; `def test_build_part_sentinel_rejects_non_finite()`; `…`
 - **tests/unit/test_ui_capabilities.py** — Tests for UI capability derivation from enabled features (#2041).
@@ -6385,6 +6400,8 @@ Repo entry points and standard project files.
   - `class TestFrictionCalculator`; `class TestContextPressureCalculator`; `class TestInteractionDepthCalculator`; `class TestSessionContinuityCalculator`; `class TestMemoryHealthCalculator`; `class TestWellnessFeature`; `class TestOverallScoreCalculation`; `class TestGracefulDegradation`
 - **tests/unit/test_wellness_telemetry_guard.py** — Telemetry-Only Guard Tests for Operational Wellness.
   - `class TestWellnessTelemetryOnlyFlag`; `class TestWellnessNotInSystemPrompt`; `class TestWellnessNotInContext`; `class TestWellnessToolsAreReadOnly`; `class TestWellnessExportDoesNotInject`; `class TestCouncilConditionDocumented`
+- **tests/unit/test_worker_record_publication.py** — Real temporary-file publication only; no worker role or native startup.
+  - `def test_record_is_complete_and_has_exact_mode_at_first_visibility(tmp_path, monkeypatch, mode)`; `def test_partial_original_write_never_exposes_final_name(tmp_path, monkeypatch)`; `def test_existing_record_or_stage_is_never_replaced_or_removed(tmp_path, collision)`; `def test_failed_stage_or_publication_exposes_no_record_and_cleans_own_stage(tmp_path, monkeypatch, operation)`; `def test_invalid_mode_refuses_before_creating_any_record(tmp_path)`; `def test_final_name_cannot_also_be_its_private_stage(tmp_path)`
 - **tests/unit/test_workflow_executor.py** — Workflows execute real decorated tools through native primary task storage.
   - `async def inspect_workflow_input(feature)`; `async def manager(native_a2a_backend_factory, native_tool_effect_agent)`; `def workflow_host(manager)`; `class WorkflowProvider`; `class ModelProvider`; `class MemoryProvider`; `class WalletProvider`; `def providers(manager, workflow_host)`; `…`
 - **tests/unit/test_workflow_features.py** — Metadata-only workflow-to-Feature ownership resolution.
@@ -6492,7 +6509,7 @@ Repo entry points and standard project files.
 - **tests/unit/visual_computer/test_two_domain_setup_publication.py** — Original Host/SQLite flow with scripted native status/cleanup I/O only.
   - `async def scripted_native(local_setup, monkeypatch)`; `async def test_original_status_and_active_ack_precede_foreground_borrows(scripted_native, monkeypatch)`; `async def test_invalid_status_or_missing_active_ack_settles_after_original_cleanup(scripted_native, monkeypatch, failure)`; `async def test_refusal_after_active_save_fences_failed_setup_before_settlement(scripted_native, monkeypatch)`; `async def scripted_daemon_maps(local_setup, monkeypatch, measured_created_browser_profile, measured_created_broker_profile)`; `async def test_v2_original_setup_rejects_bad_metadata_at_its_original_boundary(scripted_daemon_maps, failure)`
 - **tests/unit/visual_computer/test_two_domain_worker_profile.py** — Pure profile and scripted broker-fault proofs, not native conformance.
-  - `def settings()`; `def child_settings(role)`; `def test_closed_roles_profiles_and_absent_extensions()`; `def test_broker_bootstrap_refuses_noncanonical_shapes(changed)`; `def test_lane_child_receives_only_its_original_role_key()`; `def test_anchored_ipc_replacement_refuses_before_returning_connect_path(monkeypatch, replacement)`; `def test_search_only_ipc_anchor_uses_opath_without_directory_read(monkeypatch)`; `async def test_full_lane_never_calls_accept_or_allocates_another_slot()`; `…`
+  - `def settings()`; `def child_settings(role)`; `def test_closed_roles_profiles_and_absent_extensions()`; `def test_broker_atomic_publication_uses_only_no_follow_linkat_policy()`; `def test_broker_bootstrap_refuses_noncanonical_shapes(changed)`; `def test_lane_child_receives_only_its_original_role_key()`; `def test_anchored_ipc_replacement_refuses_before_returning_connect_path(monkeypatch, replacement)`; `def test_search_only_ipc_anchor_uses_opath_without_directory_read(monkeypatch)`; `…`
 - **tests/unit/visual_computer/test_ui_pending_control_contract.py** — Original pending-control host/auth/native SQLite contract; controlled SDK, not Docker.
   - `async def test_original_pending_control_refuses_other_stop_and_reconciles_same_id(visual_host, harness, monkeypatch, tmp_path, …)`
 - **tests/unit/visual_computer/test_unused_local_setup_retirement.py** — Unused issued setup follows the existing encrypted no-acquisition CAS.
