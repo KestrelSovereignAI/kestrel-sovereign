@@ -227,21 +227,19 @@ def _pyvenv_home(config: Path) -> Path | None:
 
 
 def _same_directory(left: Path, right: Path) -> bool:
-    """Whether two paths name one directory once links are resolved.
+    """Whether two paths name one directory, by file identity, not spelling.
 
     uv's ``pyvenv.cfg`` ``home`` names a minor-version junction
     (``cpython-3.13-windows-...``) while the running interpreter's image
     resolves to the patch-version directory it points at
     (``cpython-3.13.18-windows-...``); a textual comparison never matches.
+    Identity also absorbs 8.3 short names, case, and mapped or ``subst``
+    drives. A path that does not exist matches nothing.
     """
     try:
-        left_real = os.path.realpath(left, strict=True)
-        right_real = os.path.realpath(right, strict=True)
+        return os.path.samefile(left, right)
     except OSError:
         return False
-    return os.path.normcase(left_real) == os.path.normcase(
-        right_real
-    )
 
 
 def _listener_is_owned_by(port: int, pid: int) -> bool:
