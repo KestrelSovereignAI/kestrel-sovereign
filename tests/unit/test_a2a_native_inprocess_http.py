@@ -79,12 +79,14 @@ async def test_read_deadline_retires_original_cooperative_application(phase):
 
 
 async def test_write_deadline_retains_actual_request_stream_and_original_failure():
-    closed = []
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
+    release, closed = asyncio.Event(), []
 
     class SlowBody(httpx.AsyncByteStream):
         async def __aiter__(self):
-            await asyncio.sleep(60)
-            yield b"never"
+            await release.wait()
+            yield b"late"
 
         async def aclose(self):
             closed.append(self)
@@ -94,17 +96,138 @@ async def test_write_deadline_retains_actual_request_stream_and_original_failure
 
     body = SlowBody()
     transport = transport_for(app)
-    with pytest.raises(BaseException) as failure:
-        async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(0.05, write=0.005)) as client:
-            # `stream=` is HTTPX's explicit original transport handle. Passing
-            # an AsyncIterable as `content=` creates HTTPX's own wrapper, whose
-            # public aclose does not promise to close that iterable's interior.
-            await client.send(httpx.Request(
-                "POST", "https://native.test/native", headers={"Host": "native.test"}, stream=body,
-            ))
-    assert any(isinstance(error, httpx.WriteTimeout) for error in _explicit_control_chain(failure.value))
+    exchange = None
+    try:
+        with pytest.raises(BaseException) as failure:
+            async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(0.05, write=0.005)) as client:
+                # `stream=` retains HTTPX's original stream, not its opaque
+                # AsyncIterable wrapper. A finite write is NOT permission to
+                # cancel this producer or claim that it already closed.
+                await client.send(httpx.Request(
+                    "POST", "https://native.test/native", headers={"Host": "native.test"}, stream=body,
+                ))
+        assert any(isinstance(error, httpx.WriteTimeout) for error in _explicit_control_chain(failure.value))
+        assert execution_cleanup_debts(failure.value)
+        exchange, = transport.exchanges
+        assert not closed and not exchange.request_source.producer_task.cancelling()
+        assert not exchange.request_source.producer_task.done()
+    finally:
+        release.set()
+        if exchange is not None:
+            await exchange.source.join_source_owners(closing=True)
+        with pytest.raises(BaseException) as retired:
+            await transport.aclose()
+        assert any(isinstance(error, httpx.WriteTimeout) for error in _explicit_control_chain(retired.value))
     assert closed == [body]
-    assert all(exchange.source.producer_task.done() for exchange in transport.exchanges)
+    assert exchange.source.producer_task.done() and exchange.request_source.producer_task.done()
+    assert not transport.exchanges
+
+
+async def test_streaming_upload_and_response_share_bounded_demand_not_one_physical_task():
+    release, advanced, entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    originals, closed = [], []
+
+    class OriginalBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            originals.append(asyncio.current_task())
+            entered.set()
+            yield b"first"
+            await release.wait()
+            yield b"second"
+            advanced.set()
+
+        async def aclose(self):
+            closed.append(asyncio.current_task())
+
+    async def app(scope, receive, send):
+        assert (await receive())["body"] == b"first"
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b"initial", "more_body": True})
+        assert (await receive())["body"] == b"second"
+        assert not advanced.is_set()  # The SAME input frame still awaits ACK.
+        assert await receive() == {"type": "http.request", "body": b"", "more_body": False}
+        await send({"type": "http.response.body", "body": b"terminal"})
+
+    transport = transport_for(app)
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=1) as client:
+            response = await client.send(httpx.Request(
+                "POST", "https://native.test/native", headers={"Host": "native.test"}, stream=OriginalBody(),
+            ), stream=True)
+            try:
+                body = response.aiter_raw()
+                assert await anext(body) == b"initial"
+                assert entered.is_set() and not advanced.is_set()
+                exchange, = transport.exchanges
+                assert exchange.request_source.producer_task is originals[0]
+                assert originals[0] is not exchange.source.producer_task
+                release.set()
+                assert [chunk async for chunk in body] == [b"terminal"]
+            finally:
+                await response.aclose()
+    finally:
+        release.set()
+    assert advanced.is_set() and len(originals) == 1
+    assert closed == originals  # The original public stream closes on ITS task.
+    assert not originals[0].cancelling() and originals[0].done()
+    assert not transport.exchanges
+
+
+async def test_write_failure_wakes_original_http_reader_even_if_application_catches_it():
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_evidence_carriers
+
+    release, swallowed = asyncio.Event(), asyncio.Event()
+    originals, closed = [], []
+
+    class OriginalBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            originals.append(asyncio.current_task())
+            await release.wait()
+            yield b"late"
+
+        async def aclose(self):
+            closed.append(asyncio.current_task())
+
+    async def app(scope, receive, send):
+        try:
+            await receive()
+        except httpx.WriteTimeout:
+            swallowed.set()
+            await release.wait()
+
+    transport = transport_for(app)
+
+    async def consume():
+        async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(0.5, write=0.02)) as client:
+            await client.send(httpx.Request(
+                "POST", "https://native.test/native", headers={"Host": "native.test"}, stream=OriginalBody(),
+            ))
+
+    reading, exchange = create_owned_task(consume()), None
+    try:
+        done, _ = await asyncio.wait((reading,), timeout=0.1)
+        assert reading in done, "The HTTP reader waited for a recipient's error projection or cleanup"
+        result = await await_owned_task(reading)
+        exchange, = transport.exchanges
+        write = await exchange.request_read.observe()
+        assert isinstance(write.error, httpx.WriteTimeout)
+        assert any(error is write.error for error in execution_evidence_carriers(result.error))
+        assert execution_cleanup_debts(result.error)
+        assert swallowed.is_set() and not closed
+        assert not originals[0].done() and not originals[0].cancelling()
+    finally:
+        release.set()
+        await await_owned_task(reading)
+        if exchange is None:
+            exchange = next(iter(transport.exchanges), None)
+        if exchange is not None:
+            await exchange.source.join_source_owners(closing=True)
+            with pytest.raises(BaseException):
+                await transport.aclose()
+        else:
+            await transport.aclose()
+    assert closed == originals and originals[0].done()
+    assert not transport.exchanges
 
 
 async def test_response_backpressure_is_one_bounded_canonical_frame():

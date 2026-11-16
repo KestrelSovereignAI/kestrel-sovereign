@@ -14,6 +14,7 @@ startup via ``AsyncDatabase._init_schema``, so idempotency is contractual.
 import json
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
@@ -22,12 +23,17 @@ from kestrel_sovereign.storage.sqla.migrations import (
 )
 
 
-async def _db(tmp_path):
+@pytest_asyncio.fixture
+async def db(tmp_path):
     raw = SQLiteBackend(str(tmp_path / "canonical-session-migration.db"))
-    await raw.connect()
-    db = AsyncDatabase(raw)
-    await db._init_schema()
-    return db
+    database = AsyncDatabase(raw)
+    try:
+        await raw.connect()
+        await database._init_schema()
+        yield database
+    finally:
+        await database.close()
+        assert not raw.is_connected, "Migration fixture still owns its original SQLite connection"
 
 
 async def _insert(db, role, content, metadata, agent_id="test-agent"):
@@ -55,8 +61,7 @@ async def _session_ids(db):
 
 
 @pytest.mark.asyncio
-async def test_relinks_integer_session_id_to_marker_uuid(tmp_path):
-    db = await _db(tmp_path)
+async def test_relinks_integer_session_id_to_marker_uuid(db):
     uuid = "e1fd6fe5-885e-4d8b-9aaa-000000000001"
     marker_id = await _insert(
         db, "system", "", {"new_session": True, "session_id": uuid}
@@ -74,8 +79,7 @@ async def test_relinks_integer_session_id_to_marker_uuid(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_leaves_legacy_timegap_anchor_alone(tmp_path):
-    db = await _db(tmp_path)
+async def test_leaves_legacy_timegap_anchor_alone(db):
     # A plain first message (NOT a new_session marker) — its row-id is a
     # legitimate legacy session key with no UUID to map to.
     anchor_id = await _insert(db, "user", "first", {"session_id": "0"})
@@ -88,8 +92,7 @@ async def test_leaves_legacy_timegap_anchor_alone(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_leaves_uuid_session_ids_alone(tmp_path):
-    db = await _db(tmp_path)
+async def test_leaves_uuid_session_ids_alone(db):
     uuid = "722e2ba0-0000-0000-0000-000000000002"
     marker_id = await _insert(
         db, "system", "", {"new_session": True, "session_id": uuid}
@@ -104,8 +107,7 @@ async def test_leaves_uuid_session_ids_alone(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_remaps_conversation_title(tmp_path):
-    db = await _db(tmp_path)
+async def test_remaps_conversation_title(db):
     uuid = "53519af8-0000-0000-0000-000000000003"
     marker_id = await _insert(
         db, "system", "", {"new_session": True, "session_id": uuid}
@@ -125,8 +127,7 @@ async def test_remaps_conversation_title(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_title_collision_drops_integer_keeps_uuid(tmp_path):
-    db = await _db(tmp_path)
+async def test_title_collision_drops_integer_keeps_uuid(db):
     uuid = "60402f43-0000-0000-0000-000000000004"
     marker_id = await _insert(
         db, "system", "", {"new_session": True, "session_id": uuid}
@@ -150,8 +151,7 @@ async def test_title_collision_drops_integer_keeps_uuid(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_idempotent_second_run_is_noop(tmp_path):
-    db = await _db(tmp_path)
+async def test_idempotent_second_run_is_noop(db):
     uuid = "e81797a9-0000-0000-0000-000000000005"
     marker_id = await _insert(
         db, "system", "", {"new_session": True, "session_id": uuid}
@@ -168,12 +168,11 @@ async def test_idempotent_second_run_is_noop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_skips_marker_that_inherited_prior_session_uuid(tmp_path):
+async def test_skips_marker_that_inherited_prior_session_uuid(db):
     """A legacy new_session marker written without an explicit id could
     INHERIT the previous still-active session's UUID via the time-gap
     heuristic. The migration must NOT map the marker's row-id to that
     inherited UUID — doing so would merge two distinct conversations."""
-    db = await _db(tmp_path)
     shared_uuid = "abababab-0000-0000-0000-000000000007"
     # Conversation A owns the UUID (earliest row carrying it).
     await _insert(db, "user", "A1", {"session_id": shared_uuid})
@@ -192,13 +191,12 @@ async def test_skips_marker_that_inherited_prior_session_uuid(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_relinks_double_marker_same_session(tmp_path):
+async def test_relinks_double_marker_same_session(db):
     """Two back-to-back new_session markers can share a UUID (the second
     inherited it from the first, with NO content row in between) — that is
     ONE session, not a prior conversation. Continued turns keyed by the
     second marker's row-id must relink to the shared UUID (the live-Emma
     1313/1314 MCP case)."""
-    db = await _db(tmp_path)
     shared_uuid = "e1fd6fe5-885e-43b2-b6e2-cfbea64f66a2"
     await _insert(db, "system", "", {"new_session": True, "session_id": shared_uuid})
     marker2 = await _insert(
@@ -215,12 +213,11 @@ async def test_relinks_double_marker_same_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_skips_duplicate_uuid_markers_each_with_own_content(tmp_path):
+async def test_skips_duplicate_uuid_markers_each_with_own_content(db):
     """codex: two markers share a UUID but EACH already has its own continued
     messages keyed by its integer row-id (two distinct conversations that
     collided on the UUID via the inheritance bug). The migration must NOT
     relink either — that would merge the two conversations."""
-    db = await _db(tmp_path)
     shared_uuid = "dddddddd-0000-0000-0000-00000000000c"
     m1 = await _insert(db, "system", "", {"new_session": True, "session_id": shared_uuid})
     c1 = await _insert(db, "user", "conv1", {"session_id": str(m1)})
@@ -236,12 +233,11 @@ async def test_skips_duplicate_uuid_markers_each_with_own_content(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_skips_two_marker_collision_uuid_then_integer(tmp_path):
+async def test_skips_two_marker_collision_uuid_then_integer(db):
     """The live-Emma 4152cc73 shape: marker A mints the UUID and owns turns
     filed UNDER the UUID; minutes later marker B inherits the same UUID and
     owns turns filed under B's integer row-id. Two distinct conversations
     share the UUID — the migration must NOT merge B's turns into A."""
-    db = await _db(tmp_path)
     uuid = "ababcdcd-0000-0000-0000-00000000000e"
     marker_a = await _insert(db, "system", "", {"new_session": True, "session_id": uuid})
     a1 = await _insert(db, "user", "convA-1", {"session_id": uuid})
@@ -259,12 +255,11 @@ async def test_skips_two_marker_collision_uuid_then_integer(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_empty_inherited_marker_title_not_remapped(tmp_path):
+async def test_empty_inherited_marker_title_not_remapped(db):
     """codex: when a UUID already has orphan (prior) content and a later
     inherited marker is still empty, the empty marker must NOT be mapped —
     otherwise its own conversation_titles row would be moved onto the prior
     UUID-owned conversation."""
-    db = await _db(tmp_path)
     uuid = "f0f0f0f0-0000-0000-0000-000000000010"
     # Orphan/prior conversation owns the UUID directly (no preceding marker).
     await _insert(db, "user", "prior", {"session_id": uuid})
@@ -284,11 +279,10 @@ async def test_empty_inherited_marker_title_not_remapped(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_empty_inherited_marker_over_marker_owned_content_keeps_title(tmp_path):
+async def test_empty_inherited_marker_over_marker_owned_content_keeps_title(db):
     """codex (symmetric to the orphan case): marker A owns the UUID with its
     own UUID-keyed turns; a later marker B inherits the UUID but is empty.
     B's title must stay under B's own key — not move onto A's conversation."""
-    db = await _db(tmp_path)
     uuid = "b0b0b0b0-0000-0000-0000-000000000011"
     await _insert(db, "system", "", {"new_session": True, "session_id": uuid})  # marker A
     await _insert(db, "user", "A owns this", {"session_id": uuid})               # A content
@@ -306,10 +300,9 @@ async def test_empty_inherited_marker_over_marker_owned_content_keeps_title(tmp_
 
 
 @pytest.mark.asyncio
-async def test_collision_analysis_is_agent_scoped(tmp_path):
+async def test_collision_analysis_is_agent_scoped(db):
     """codex: a UUID reused across two agents (imported/restored data) is NOT
     a collision — each agent's session must still consolidate independently."""
-    db = await _db(tmp_path)
     uuid = "5a5a5a5a-0000-0000-0000-00000000000f"
     # Agent A: marker + integer-keyed continuation.
     ma = await _insert(db, "system", "", {"new_session": True, "session_id": uuid}, agent_id="agent-A")
@@ -328,12 +321,11 @@ async def test_collision_analysis_is_agent_scoped(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_consolidates_single_marker_mixed_key_session(tmp_path):
+async def test_consolidates_single_marker_mixed_key_session(db):
     """codex: a SINGLE-marker session whose turns are split between the
     canonical UUID and the marker's integer row-id is ONE conversation (one
     client wrote the UUID, the UI wrote the integer). It must consolidate —
     the integer-keyed rows relink to the UUID."""
-    db = await _db(tmp_path)
     uuid = "cccccccc-0000-0000-0000-00000000000d"
     marker = await _insert(db, "system", "", {"new_session": True, "session_id": uuid})
     # Some turns already carry the canonical UUID (after the marker)...
@@ -349,11 +341,7 @@ async def test_consolidates_single_marker_mixed_key_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_init_schema_runs_migration_on_startup(tmp_path):
-    raw = SQLiteBackend(str(tmp_path / "startup-canonical.db"))
-    await raw.connect()
-    db = AsyncDatabase(raw)
-    await db._init_schema()
+async def test_init_schema_runs_migration_on_startup(db):
     uuid = "aaaaaaaa-0000-0000-0000-000000000006"
     marker_id = await _insert(
         db, "system", "", {"new_session": True, "session_id": uuid}
