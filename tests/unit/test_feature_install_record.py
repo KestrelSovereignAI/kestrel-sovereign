@@ -596,12 +596,13 @@ def _uv_answers(monkeypatch, *, stdout="", returncode=0, stderr=""):
     return calls
 
 
-def _changes(*changes):
+def _changes(*changes, venv_action="check"):
+    """uv 0.9.22's ``uv sync --dry-run --output-format json``, trimmed to what is read."""
     import json
 
     return json.dumps({
         "schema": {"version": "preview"},
-        "sync": {"changes": [
+        "sync": {"action": venv_action, "changes": [
             {"name": name, "version": version, "action": action}
             for name, version, action in changes
         ]},
@@ -639,10 +640,19 @@ def test_a_version_change_is_not_a_removal(monkeypatch, tmp_path):
         {"returncode": 1, "stdout": _changes(), "stderr": "error: lock is out of date"},
         {"stdout": "Would uninstall 1 package\n - six==1.17.0\n"},
         {"stdout": '{"sync": {}}'},
-        {"stdout": '{"sync": {"changes": [{"name": "six"}]}}'},
-        {"stdout": '{"sync": {"changes": [{"name": "six", "action": null}]}}'},
+        {"stdout": '{"sync": {"action": "check", "changes": [{"name": "six"}]}}'},
+        {"stdout": '{"sync": {"action": "check", "changes": [{"name": "six", "action": null}]}}'},
+        {"stdout": '{"sync": {"changes": []}}'},
+        # Measured with uv 0.9.22: a venv whose interpreter the project's
+        # requires-python excludes is replaced, and the dry run lists nothing.
+        {"stdout": _changes(venv_action="replace")},
+        {"stdout": _changes(("six", "1.17.0", "removed"))},
     ],
-    ids=["uv-fails", "fails-with-an-answer", "not-json", "no-changes", "change-without-action", "null-action"],
+    ids=[
+        "uv-fails", "fails-with-an-answer", "not-json", "no-changes",
+        "change-without-action", "null-action", "no-venv-action", "venv-replaced",
+        "unknown-change-action",
+    ],
 )
 def test_an_answer_that_is_not_one_raises(monkeypatch, tmp_path, answer):
     _uv_answers(monkeypatch, **answer)
@@ -938,3 +948,23 @@ def test_a_registry_that_will_not_load_is_a_record_failure(venv, project, monkey
     with pytest.raises(FeatureForgetError, match="two rows claim"):
         _manifest(project).write_text(f'[[feature]]\nname = "{VOICE}"\n', encoding="utf-8")
         forget_feature_install(VOICE)
+
+
+
+def test_an_entrys_own_leading_comments_go_with_it(venv, project):
+    """The comment lines directly above a header are its table's, both ways."""
+    text = (
+        "# The file's header, apart from any entry.\n"
+        "\n"
+        "# Why voice is pinned: kept with voice.\n"
+        f'[[feature]]\nname = "{VOICE}"\npypi = ""\n'
+        "\n"
+        + AFTER
+    )
+    _manifest(project).write_text(text, encoding="utf-8")
+
+    forget_feature_install(VOICE)
+
+    assert _manifest(project).read_text(encoding="utf-8") == (
+        "# The file's header, apart from any entry.\n\n" + AFTER
+    )

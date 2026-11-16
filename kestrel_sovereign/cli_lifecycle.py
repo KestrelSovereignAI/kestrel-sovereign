@@ -1531,6 +1531,11 @@ class _AgentRegistryError(RuntimeError):
     """The agent registry reconcile reads its allowlists from would not load."""
 
 
+#: What uv's dry run may say it does to a package (uv 0.9.22 reports a version
+#: change as an uninstall and an install). Any other word is not understood,
+#: and the dry run is refused rather than read as "nothing removed".
+_UV_CHANGE_ACTIONS = frozenset({"installed", "uninstalled", "reinstalled"})
+
 #: The files uv reads a project's sync from, besides the sources it installs.
 _UV_PROJECT_FILES = ("pyproject.toml", "uv.lock", "uv.toml")
 
@@ -1594,6 +1599,12 @@ def _uv_sync_removals(project_dir: Path, revision: Optional[str] = None) -> Tupl
     reports a version change as an uninstall and an install of the same name,
     so only a name it uninstalls and does not install again is removed.
 
+    Only a sync that keeps the venv (``sync.action == "check"``) is answered
+    package by package. One that replaces it (a release whose
+    ``requires-python`` the venv's interpreter no longer meets, say) removes
+    everything its lock does not install while listing no changes at all, so
+    it is refused; so is any change action this reader does not know.
+
     With *revision*, asked of the project as *revision* records it
     (:func:`_uv_project_at`), so the answer is about the sync a pull to it
     will run, before the pull: uv reads a copy of the project files, and the
@@ -1624,14 +1635,27 @@ def _uv_sync_removals(project_dir: Path, revision: Optional[str] = None) -> Tupl
             f"`{shlex.join(argv)}` exited {result.returncode}: " + " / ".join(detail)
         )
     try:
-        changes = json.loads(result.stdout)["sync"]["changes"]
-        actions = [(canonical_package(c["name"]), c["action"]) for c in changes]
+        sync = json.loads(result.stdout)["sync"]
+        venv_action = sync["action"]
+        actions = [(canonical_package(c["name"]), c["action"]) for c in sync["changes"]]
     except (ValueError, KeyError, TypeError) as exc:
         raise UvDryRunError(
             f"`{shlex.join(argv)}` did not report its changes as expected ({exc!r})"
         ) from exc
-    if not all(isinstance(action, str) for _, action in actions):
-        raise UvDryRunError(f"`{shlex.join(argv)}` reported a change with no action")
+    if venv_action != "check":
+        raise UvDryRunError(
+            f"`{shlex.join(argv)}` says the sync would {venv_action!r} the venv rather "
+            "than update it, which removes every package its lock does not install "
+            "and lists none of them"
+        )
+    unknown = sorted({repr(action) for _, action in actions} - {
+        repr(action) for action in _UV_CHANGE_ACTIONS
+    })
+    if unknown:
+        raise UvDryRunError(
+            f"`{shlex.join(argv)}` reported change action(s) this kestrel does not "
+            f"understand: {', '.join(unknown)}"
+        )
     installed = {name for name, action in actions if action != "uninstalled"}
     return tuple(sorted(
         {name for name, action in actions if action == "uninstalled"} - installed

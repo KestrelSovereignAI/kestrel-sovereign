@@ -3594,9 +3594,10 @@ def forget_feature_install(package: str) -> Optional[Path]:
     ``kestrel update`` or ``feature sync``, and an agent that loads every
     installed feature starts it again.
 
-    Each entry's text is the run of lines from its ``[[feature]]`` header to
-    the next table header, less the comment lines directly above that header,
-    which belong to what follows. Everything else in the file stays as
+    Each entry's text is the comment lines directly above its ``[[feature]]``
+    header, then the run of lines from that header to the next table header,
+    less the comment lines directly above that one, which belong to what
+    follows. Everything else in the file stays as
     written. The result is held to the file it came from before it is
     written: the same entries less the ones removed, and the same other
     tables. A file that does not split that way (a header inside a multi-line
@@ -3632,6 +3633,10 @@ def forget_feature_install(package: str) -> Optional[Path]:
         headers = [i for i, line in enumerate(lines) if _TABLE_HEADER.match(line)]
         drop: set = set()
         for index in (i for i in headers if _FEATURE_HEADER.match(lines[i])):
+            start = index
+            # The comment lines directly above a header are its table's.
+            while start > 0 and lines[start - 1].lstrip().startswith("#"):
+                start -= 1
             end = next((h for h in headers if h > index), len(lines))
             if end < len(lines):
                 # The comment lines directly above the next header are that
@@ -3645,7 +3650,7 @@ def forget_feature_install(package: str) -> Optional[Path]:
                 # edit if that hid the one being removed.
                 continue
             if declares(own):
-                drop.update(range(index, end))
+                drop.update(range(start, end))
         text = "".join(line for i, line in enumerate(lines) if i not in drop)
         after = tomllib.loads(text)
         kept = [entry for entry in entries if not declares([entry])]
