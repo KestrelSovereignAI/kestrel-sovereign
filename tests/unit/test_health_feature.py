@@ -1404,54 +1404,26 @@ class TestHeartbeatInterval:
         assert result.data["requested_seconds"] == 9999
 
 
-class TestDeprecatedAliasTraceability:
-    """Round 1 codex finding: deprecated alias marker must survive
-    every status (OK / PARTIAL / ERROR) so the LLM/audit payload
-    always shows the alias was used."""
+class TestHeartbeatAliasesRemoved:
+    """#4133: the deprecated ``heartbeat_*`` aliases are gone.
 
-    @pytest_asyncio.fixture
-    async def feature(self):
-        db = _make_db(table_exists_map={"health_log": True})
-        agent = _make_agent(db=db)
-        feat = HealthFeature(agent)
-        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
-            await feat.initialize()
-            yield feat
-            feat._running = False
+    A typed ``!heartbeat`` is the built-in command handler's (HeartbeatRunner,
+    an LLM turn), and built-ins win dispatch, so the feature alias that claimed
+    the same prefix was never reachable as a command. No HealthFeature tool may
+    claim a ``heartbeat`` name or a ``!heartbeat`` prefix again.
+    """
 
     @pytest.mark.asyncio
-    async def test_heartbeat_check_alias_tags_ok(self, feature):
-        from kestrel_sdk.tools.result import ToolResultStatus
-        result = await feature.heartbeat_check_alias()
-        assert result.status is ToolResultStatus.OK
-        assert result.data["deprecated_alias"] == "!heartbeat"
+    async def test_no_heartbeat_tool_or_prefix(self):
+        feat = HealthFeature(_make_agent(db=_make_db()))
+        tools = feat.get_tools()
 
-    @pytest.mark.asyncio
-    async def test_heartbeat_status_alias_tags_error_on_invalid_limit(self, feature):
-        """ERROR forwarding must preserve the alias marker."""
-        from kestrel_sdk.tools.result import ToolResultStatus
-        result = await feature.heartbeat_status_alias(limit="abc")
-        assert result.status is ToolResultStatus.ERROR
-        assert result.data is not None
-        assert result.data.get("deprecated_alias") == "!heartbeat-status"
-
-    @pytest.mark.asyncio
-    async def test_heartbeat_interval_alias_tags_partial_on_clamp(self, feature):
-        """PARTIAL forwarding preserves the alias marker."""
-        from kestrel_sdk.tools.result import ToolResultStatus
-        with patch("asyncio.create_task", side_effect=_close_suppressed_background, return_value=_make_awaitable_task()):
-            result = await feature.heartbeat_interval_alias(seconds=1)
-        assert result.status is ToolResultStatus.PARTIAL
-        assert result.data["deprecated_alias"] == "!heartbeat-interval"
-        assert result.data["requested_seconds"] == 1
-
-    @pytest.mark.asyncio
-    async def test_heartbeat_interval_alias_tags_error_on_bad_input(self, feature):
-        from kestrel_sdk.tools.result import ToolResultStatus
-        result = await feature.heartbeat_interval_alias(seconds="not-a-number")
-        assert result.status is ToolResultStatus.ERROR
-        assert result.data is not None
-        assert result.data.get("deprecated_alias") == "!heartbeat-interval"
+        assert [t.name for t in tools if "heartbeat" in t.name] == []
+        assert [
+            t.schema.command_prefix
+            for t in tools
+            if (t.schema.command_prefix or "").startswith("!heartbeat")
+        ] == []
 
 
 # ============================================================================
@@ -1619,11 +1591,7 @@ class TestToolDiscovery:
         assert "health_check" in tool_names
         assert "health_history" in tool_names
         assert "health_interval" in tool_names
-        # Deprecated !heartbeat* aliases retained for one release (see #753).
-        assert "heartbeat_check" in tool_names
-        assert "heartbeat_status" in tool_names
-        assert "heartbeat_interval" in tool_names
-        assert len(tool_names) == 6
+        assert len(tool_names) == 3
 
         feat._running = False
 
@@ -1654,10 +1622,6 @@ class TestToolDiscovery:
         assert "!health" in prefixes
         assert "!health-history" in prefixes
         assert "!health-interval" in prefixes
-        # Deprecated aliases (warn on use)
-        assert "!heartbeat" in prefixes
-        assert "!heartbeat-status" in prefixes
-        assert "!heartbeat-interval" in prefixes
 
         feat._running = False
 

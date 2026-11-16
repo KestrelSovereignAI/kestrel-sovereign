@@ -11,7 +11,6 @@ from kestrel_sovereign.features.security.feature import SecurityFeature
 from kestrel_sovereign.features.constitution import ConstitutionFeature
 from kestrel_sovereign.features.cli.feature import CliFeature
 from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
-from kestrel_sovereign.features.health.feature import HealthFeature
 from kestrel_sovereign.features.web_search.feature import WebSearchFeature
 
 
@@ -65,12 +64,6 @@ def test_bootstrap_descriptions_carry_conventions():
 
     rename = _desc(BootstrapFeature.rename_agent)
     assert "1-64" in rename
-
-
-def test_heartbeat_aliases_steer_to_canonical():
-    assert "use health instead" in _desc(HealthFeature.heartbeat_check_alias)
-    assert "use health_history instead" in _desc(HealthFeature.heartbeat_status_alias)
-    assert "use health_interval instead" in _desc(HealthFeature.heartbeat_interval_alias)
 
 
 def test_web_search_description_documents_max_results_and_disabled():

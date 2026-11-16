@@ -401,9 +401,6 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `health_check` | `!health` | `system` |  | 21 | `enabled` |
 | `health_history` | `!health-history` | `system` | `limit` | 57 | `enabled` |
 | `health_interval` | `!health-interval` | `system` | `seconds` | 54 | `enabled` |
-| `heartbeat_check` | `!heartbeat` | `system` |  | 24 | `enabled` |
-| `heartbeat_interval` | `!heartbeat-interval` | `system` | `seconds` | 46 | `enabled` |
-| `heartbeat_status` | `!heartbeat-status` | `system` | `limit` | 45 | `enabled` |
 
 ### `identity` (IdentityFeature)
 
@@ -1050,9 +1047,6 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!health` | `health` |  | Run a manual liveness check and show results |
 | `!health-history` | `health` | `[limit]` | Show recent liveness-check history and uptime |
 | `!health-interval` | `health` | `[seconds]` | Change the liveness-check interval |
-| `!heartbeat` | `health` |  | [deprecated] alias for !health — use health instead |
-| `!heartbeat-interval` | `health` | `[seconds]` | [deprecated] alias for !health-interval — use health_interval instead |
-| `!heartbeat-status` | `health` | `[limit]` | [deprecated] alias for !health-history — use health_history instead |
 | `!identity assess` | `identity` |  | Assess the current LLM substrate's capabilities and compare with agent requirements. Helps understand limitations when migrating. |
 | `!identity export` | `identity` | `[storage_tier] [sign] [include_wallet]` | Export the agent's complete identity to a portable, signed package. This creates a JSON package containing DID, constitution, memories, personality, relationships, and skills that can be imported to another substrate. storage_tier must be one of 'local' (default), 'ipfs', or 'filecoin'; an unrecognized value is rejected (it is NOT silently downgraded to local). |
 | `!identity history` | `identity` |  | View the agent's migration history - all substrate changes with timestamps, verification scores, and audit trail. |
