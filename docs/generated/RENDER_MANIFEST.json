@@ -1790,7 +1790,7 @@
     {
       "existing_code_refs": [
         "run_tests.py",
-        "scripts/ci/clean_install_local.sh",
+        "scripts/ci/clean_install_local.py",
         "server.py",
         "tests/e2e/playwright.config.cjs",
         "tests/shared/postgres_worker_isolation.py",

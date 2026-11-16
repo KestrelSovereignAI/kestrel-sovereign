@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from kestrel_sovereign.multi_agent.process_manager import PidRecord, PidStatus
@@ -109,7 +110,7 @@ def test_inherited_database_url_is_rejected_before_setup(tmp_path):
     }
     env["KESTREL_DATABASE_URL"] = "postgresql://example.invalid/no-connect"
     result = subprocess.run(
-        ["bash", str(_ROOT / "scripts" / "ci" / "clean_install_local.sh"), "wheel"],
+        [sys.executable, str(_ROOT / "scripts" / "ci" / "clean_install_local.py"), "wheel"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
