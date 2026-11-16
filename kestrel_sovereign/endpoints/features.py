@@ -465,7 +465,11 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     # resolve core from the index and replace the running (often editable) core
     # with a wheel copy. Installing from the console is not a safer path than
     # installing from the CLI (issue #2949).
-    from kestrel_sovereign.cli_features import CoreInstallGuard
+    from kestrel_sovereign.cli_features import (
+        CoreInstallGuard,
+        FeatureRecordError,
+        record_feature_install,
+    )
 
     package_spec = pkg_info.package
 
@@ -523,6 +527,17 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
             except subprocess.TimeoutExpired:
                 install_error = (504, "Installation timed out")
 
+            # The package is in the venv, so the host manifest has to say so:
+            # unrecorded, the next `kestrel update` uninstalls it (#4127).
+            # Inside the lock, which also serialises this append.
+            record_error: Optional[str] = None
+            if install_error is None:
+                try:
+                    await asyncio.to_thread(record_feature_install, package_spec)
+                except FeatureRecordError as exc:
+                    logger.error("recording %s failed: %s", package_spec, exc)
+                    record_error = exc.describe()
+
             # Detection half, on EVERY path — a failed or timed-out install is
             # not a reason to skip it. pip installs dependencies before the
             # requested package can fail, and a timeout kills the process
@@ -555,11 +570,11 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
                 unsatisfied = await asyncio.to_thread(
                     _core_requirement_unsatisfied, package_spec,
                 )
-            return install_error, outcome, unsatisfied
+            return install_error, outcome, unsatisfied, record_error
         finally:
             _INSTALL_LOCK.release()
 
-    install_error, outcome, unsatisfied = await asyncio.shield(
+    install_error, outcome, unsatisfied, record_error = await asyncio.shield(
         asyncio.create_task(_guarded_install())
     )
 
@@ -580,6 +595,15 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
         raise HTTPException(
             status_code=500,
             detail=f"Package '{package_spec}' installed, but {outcome.describe()}",
+        )
+
+    if record_error is not None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                record_error if outcome.drift is None
+                else f"{record_error}\n{outcome.describe()}"
+            ),
         )
 
     if outcome.drift is None:

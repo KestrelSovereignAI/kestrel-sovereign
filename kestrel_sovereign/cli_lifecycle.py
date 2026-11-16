@@ -1649,6 +1649,181 @@ def _editable_git_pull(checkout: Path, allow_dirty: bool) -> Tuple[int, str]:
     return rc, out
 
 
+def _required_feature_packages(project_dir: Path, registry: dict):
+    """The packages reconcile provisions for the agents' ``features`` allowlists.
+
+    ``required = union(each local agent's allowlist) + MANDATORY_FEATURES``,
+    each class resolved to the package that provides it. Returns
+    ``(pkg_infos, class_to_pkg, unresolved, load_all)`` as
+    :func:`~kestrel_sovereign.feature_reconcile.resolve_packages` and
+    :func:`~kestrel_sovereign.feature_reconcile.compute_required_classes`
+    answer them. Shared by reconcile and by the update's check for extensions
+    nothing records (#4127), so both read one answer to "which packages do the
+    allowlists keep".
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+
+    ma_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
+    multi_agent = cli.MultiAgentConfig.load(ma_path)
+    required_classes, load_all = fr.compute_required_classes(multi_agent)
+
+    # Live discovery is the source of truth: resolve allowlist classes against
+    # what the venv ACTUALLY provides (installed entry-point packages + in-tree
+    # bundled classes) before falling back to the static catalog. Otherwise a
+    # real, loadable feature the catalog simply hasn't listed yet would be
+    # mis-reported as an unresolvable error (issue #1788).
+    try:
+        from kestrel_sovereign.features import (
+            discover_entrypoint_feature_dists,
+            discover_local_feature_class_names,
+        )
+        entrypoint_dists = discover_entrypoint_feature_dists()
+        local_core_classes = discover_local_feature_class_names()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"  note: live feature discovery failed ({exc}); "
+            "resolving against the static registry only"
+        )
+        entrypoint_dists, local_core_classes = {}, set()
+
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        required_classes, registry,
+        entrypoint_dists=entrypoint_dists,
+        local_core_classes=local_core_classes,
+    )
+    return pkg_infos, class_to_pkg, unresolved, load_all
+
+
+def _install_uses_uv_sync(args, source_checkout: Path) -> bool:
+    """Whether the update's install step runs ``uv sync`` (which prunes) in *source_checkout*.
+
+    ``--uv-sync`` / ``--no-uv-sync`` decide when given; otherwise a checkout
+    with a ``uv.lock`` is an editable + lockfile workflow, refreshed by
+    ``uv sync``, and one without is refreshed by ``uv pip install -e .``.
+    """
+    explicit = getattr(args, "uv_sync", None)
+    if explicit is True or explicit is False:
+        return explicit
+    return (source_checkout / "uv.lock").exists()
+
+
+def _unrecorded_extension_gate(
+    project_dir: Path,
+    source_checkout: Path,
+    *,
+    manifest: Optional[str],
+    landing: Callable[[], Optional[str]],
+    continue_on_error: bool,
+) -> int:
+    """Refuse an update whose ``uv sync`` would uninstall an extension nothing records (#4127).
+
+    *landing* answers the commit the install will run ``uv sync`` at (None:
+    the checkout as it is); the lock is read there, before the pull, as the
+    preflight reads it. 0 when every installed extension survives
+    (:func:`~kestrel_sovereign.cli_features.unrecorded_extensions`), or when
+    *continue_on_error* lets the update go on after saying which ones it will
+    remove. 1 otherwise, with each package and the entry that records it.
+    """
+    from kestrel_sovereign.cli_features import unrecorded_extensions
+    from kestrel_sovereign.core_lock import (
+        CoreLockError,
+        load_core_lock,
+        read_core_lock_landing,
+    )
+    from kestrel_sovereign.feature_registry import load_registry
+
+    manifest_path = cli._host_manifest_path(argparse.Namespace(manifest=manifest))
+
+    def unknown(reason: str) -> int:
+        print(
+            f"• extensions: FAILED — {reason}, so which installed extensions "
+            "`uv sync` would uninstall is unknown.",
+            file=sys.stderr,
+        )
+        if continue_on_error:
+            print("• extensions: continuing (--continue-on-error)", file=sys.stderr)
+            return 0
+        print(
+            "  Nothing was pulled, installed or restarted. (--continue-on-error "
+            "updates anyway.)",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        revision = landing()
+        lock = (
+            read_core_lock_landing(source_checkout, revision)
+            if revision is not None
+            else load_core_lock(source_checkout)
+        )
+    except _GitFailedError as exc:
+        return unknown(str(exc))
+    except CoreLockError as exc:
+        return unknown(f"core's uv.lock would not read ({exc})")
+    provisioned = _required_feature_packages(project_dir, load_registry())[0]
+    try:
+        found = unrecorded_extensions(
+            manifest_path,
+            locked=lock.names() if lock is not None else (),
+            provisioned=provisioned,
+        )
+    except (ValueError, OSError) as exc:
+        return unknown(f"the host manifest {manifest_path} would not read ({exc})")
+    if not found:
+        print(
+            "• extensions: each installed extension is in uv.lock, the host "
+            "manifest or an agent's allowlist"
+        )
+        return 0
+
+    print(
+        f"• extensions: {'WARNING' if continue_on_error else 'REFUSED'} — "
+        f"`uv sync` would uninstall {len(found)} extension package(s) that "
+        "nothing on this host records, and nothing would reinstall them:",
+        file=sys.stderr,
+    )
+    for extension in found:
+        where = f" (editable: {extension.editable_path})" if extension.editable_path else ""
+        print(f"    {extension.package} {extension.version}{where}", file=sys.stderr)
+    print(
+        "  They are not in core's uv.lock, not in the host manifest "
+        f"({manifest_path}) and not provided for any agent's `features` "
+        "allowlist (#4127).",
+        file=sys.stderr,
+    )
+    if continue_on_error:
+        print(
+            "• extensions: continuing (--continue-on-error); the update will "
+            "uninstall them",
+            file=sys.stderr,
+        )
+        return 0
+    print(
+        "  Nothing was pulled, installed or restarted. Record them, then re-run "
+        "`kestrel update`:",
+        file=sys.stderr,
+    )
+    if manifest_path.exists():
+        print(f"  append these entries to {manifest_path}:", file=sys.stderr)
+    else:
+        print(
+            "    kestrel feature sync --capture     # writes a manifest of "
+            "everything installed",
+            file=sys.stderr,
+        )
+        print(f"  or create {manifest_path} with these entries:", file=sys.stderr)
+    for extension in found:
+        print("", file=sys.stderr)
+        for line in extension.entry().splitlines():
+            print(f"    {line}", file=sys.stderr)
+    print(
+        "\n  (--continue-on-error updates anyway and uninstalls them.)",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _run_feature_reconcile(
     project_dir: Path,
     *,
@@ -1690,34 +1865,9 @@ def _run_feature_reconcile(
     import importlib.metadata as md
 
     # 1. Derive WHAT the host needs from multi_agent.toml.
-    ma_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
-    multi_agent = cli.MultiAgentConfig.load(ma_path)
-    required_classes, load_all = fr.compute_required_classes(multi_agent)
-
     registry = load_registry()
-    # Live discovery is the source of truth: resolve allowlist classes against
-    # what the venv ACTUALLY provides (installed entry-point packages + in-tree
-    # bundled classes) before falling back to the static catalog. Otherwise a
-    # real, loadable feature the catalog simply hasn't listed yet would be
-    # mis-reported as an unresolvable error (issue #1788).
-    try:
-        from kestrel_sovereign.features import (
-            discover_entrypoint_feature_dists,
-            discover_local_feature_class_names,
-        )
-        entrypoint_dists = discover_entrypoint_feature_dists()
-        local_core_classes = discover_local_feature_class_names()
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"  note: live feature discovery failed ({exc}); "
-            "resolving against the static registry only"
-        )
-        entrypoint_dists, local_core_classes = {}, set()
-
-    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
-        required_classes, registry,
-        entrypoint_dists=entrypoint_dists,
-        local_core_classes=local_core_classes,
+    pkg_infos, class_to_pkg, unresolved, load_all = _required_feature_packages(
+        project_dir, registry,
     )
 
     if unresolved:
@@ -2438,6 +2588,33 @@ def cmd_update(args) -> int:
                     file=sys.stderr,
                 )
 
+    # Step 0.75: extensions nothing records (#4127). `uv sync` uninstalls
+    # every package its lock does not name; the feature sync reinstalls what
+    # the host manifest declares and reconcile what an agent's allowlist names.
+    # An extension none of them records (installed before `feature install`
+    # recorded its installs, or by hand) is gone after the update, and nothing
+    # says so. Refused now, while refusing still leaves the host as it was,
+    # with the entries that record each one. Whatever --no-features says: the
+    # prune is the install's, and only a record can bring a package back.
+    if (
+        install
+        and source_checkout is not None
+        and _install_uses_uv_sync(args, source_checkout)
+    ):
+        rc = _unrecorded_extension_gate(
+            project_dir,
+            source_checkout,
+            manifest=getattr(args, "manifest", None),
+            # The commit `uv sync` will run at: the one the pull lands, else
+            # the one the checks judged (None: the checkout as it is).
+            landing=lambda: (
+                incoming_revision.target().landing if pulling else judged_core_revision
+            ),
+            continue_on_error=continue_on_error,
+        )
+        if rc != 0:
+            return rc
+
     # Step 1: the pull: fast-forward the source checkout (NOT the data root,
     # which may be a non-git KESTREL_HOME) to the commit the checks above
     # judged, fetched once by them (#3832).
@@ -2568,7 +2745,6 @@ def cmd_update(args) -> int:
     # root. ``--uv-sync`` / ``--no-uv-sync`` lets the operator pin
     # explicitly. PyPI installs (no source checkout) skip the step
     # entirely — there's no editable env to refresh.
-    explicit_uv_sync = getattr(args, "uv_sync", None)
     installed = False
     if install:
         if source_checkout is None:
@@ -2578,16 +2754,7 @@ def cmd_update(args) -> int:
                 "to update a PyPI install)"
             )
         else:
-            if explicit_uv_sync is True:
-                use_uv_sync = True
-            elif explicit_uv_sync is False:
-                use_uv_sync = False
-            else:
-                # Auto-detect: an editable + uv.lock workflow uses
-                # `uv sync` to refresh deps.
-                use_uv_sync = (source_checkout / "uv.lock").exists()
-
-            if use_uv_sync:
+            if _install_uses_uv_sync(args, source_checkout):
                 cmd_label = "uv sync"
                 if dry_run:
                     print(

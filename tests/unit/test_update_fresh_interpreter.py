@@ -69,6 +69,10 @@ def steps(checkout, manifest, monkeypatch):
         cli, "_run_sync_preflight", lambda path, **kw: calls.append(_preflight(kw)) or 0,
     )
     monkeypatch.setattr(
+        cli_lifecycle, "_unrecorded_extension_gate",
+        lambda *a, landing, **kw: calls.append(_extensions(landing)) or 0,
+    )
+    monkeypatch.setattr(
         cli, "_run_git_fast_forward", lambda *_: calls.append("pull") or (0, "")
     )
     monkeypatch.setattr(
@@ -92,6 +96,11 @@ def _preflight(kw):
     """A preflight step, named by the commit of the core it was handed (#3832)."""
     (judged,) = kw.values()
     return ("preflight", judged.revision)
+
+
+def _extensions(landing):
+    """The unrecorded-extension check, named by the commit it reads the lock at (#4127)."""
+    return ("extensions", landing())
 
 
 def _record_continuation(monkeypatch, calls, rc=0):
@@ -120,7 +129,8 @@ def test_after_the_install_nothing_more_runs_in_this_process(steps, monkeypatch)
     assert _update() == 0
 
     assert steps == [
-        "fetch", ("preflight", INCOMING), "pull", "uv sync", "continue",
+        "fetch", ("preflight", INCOMING), ("extensions", INCOMING), "pull",
+        "uv sync", "continue",
     ]
     (argv,) = seen
     assert argv[-3:] == ["--no-pull", "--no-install", "--after-install"]
@@ -154,7 +164,7 @@ def test_a_dry_run_never_hands_off_and_still_checks_the_incoming_lock(
 
     # Read-only: the remote-tracking refs as last fetched, no fetch; the
     # reconcile step previews its plan.
-    assert steps == [("preflight", INCOMING), "reconcile"]
+    assert steps == [("preflight", INCOMING), ("extensions", INCOMING), "reconcile"]
 
 
 def test_a_refused_preflight_stops_the_update_before_the_pull(steps, monkeypatch):
@@ -168,6 +178,19 @@ def test_a_refused_preflight_stops_the_update_before_the_pull(steps, monkeypatch
     assert steps == ["fetch", ("preflight", INCOMING)]
 
 
+def test_a_refused_extension_check_stops_the_update_before_the_pull(steps, monkeypatch):
+    """An extension nothing records is refused while nothing has changed (#4127)."""
+    _record_continuation(monkeypatch, steps)
+    monkeypatch.setattr(
+        cli_lifecycle, "_unrecorded_extension_gate",
+        lambda *a, landing, **kw: steps.append(_extensions(landing)) or 1,
+    )
+
+    assert _update() == 1
+
+    assert steps == ["fetch", ("preflight", INCOMING), ("extensions", INCOMING)]
+
+
 def test_without_a_pull_the_preflight_reads_the_lock_at_head(steps, monkeypatch):
     """The sync is handed the checkout at HEAD and pulls nothing (#3832)."""
     head = "4ead" + "0" * 36
@@ -176,7 +199,7 @@ def test_without_a_pull_the_preflight_reads_the_lock_at_head(steps, monkeypatch)
 
     assert _update("--no-pull") == 0
 
-    assert steps[:2] == [("preflight", head), "uv sync"]
+    assert steps[:3] == [("preflight", head), ("extensions", head), "uv sync"]
 
 
 @pytest.mark.parametrize(
@@ -198,7 +221,7 @@ def test_a_pull_that_brings_nothing_has_its_lock_read_at_head(
 
     assert _update() == 0
 
-    assert steps[:3] == ["fetch", ("preflight", head), "pull"]
+    assert steps[:4] == ["fetch", ("preflight", head), ("extensions", head), "pull"]
 
 
 def test_an_empty_manifest_has_nothing_to_preflight(steps, manifest, monkeypatch):
@@ -207,7 +230,7 @@ def test_an_empty_manifest_has_nothing_to_preflight(steps, manifest, monkeypatch
 
     assert _update() == 0
 
-    assert steps == ["fetch", "pull", "uv sync", "continue"]
+    assert steps == ["fetch", ("extensions", INCOMING), "pull", "uv sync", "continue"]
 
 
 def test_the_phases_run_every_step_once_in_order(steps):
@@ -215,8 +238,8 @@ def test_the_phases_run_every_step_once_in_order(steps):
     assert _update("--allow-dirty", "--startup-timeout", "75.5") == 0
 
     assert steps == [
-        "fetch", ("preflight", INCOMING), "pull", "uv sync",
-        "feature sync", "reconcile", "restart",
+        "fetch", ("preflight", INCOMING), ("extensions", INCOMING), "pull",
+        "uv sync", "feature sync", "reconcile", "restart",
     ]
 
 

@@ -302,16 +302,22 @@ def cmd_feature_install(args) -> int:
     guard = CoreInstallGuard.snapshot()
 
     result = guard.run([package])
+    from_git = False
 
     if result.returncode != 0:
         # Try git URL as fallback
         if info.git:
             print(f"pip install failed, trying git: {info.git}")
             result = guard.run([f"git+{info.git}"])
+            from_git = True
 
     if result.returncode == 0:
         print(f"Installed {package}")
-        return guard.verify()
+        # Recorded before the core check, which can raise: the package is in
+        # the venv whatever core's state, and unrecorded the next update
+        # uninstalls it (#4127).
+        record_rc = _report_feature_record(package, from_git=from_git)
+        return _worst_rc(guard.verify(), record_rc)
     else:
         print(f"Failed to install {package}")
         if result.stderr:
@@ -337,6 +343,23 @@ def cmd_feature_install(args) -> int:
         # to tell "this package did not install" from "the venv's core is not
         # the declared one", because only the second forbids a restart.
         return guard.verify() or 1
+
+
+def _report_feature_record(package: str, *, from_git: bool) -> int:
+    """Record an installed *package* in the host manifest and say so; 1 if it could not."""
+    try:
+        path = record_feature_install(package, from_git=from_git)
+    except FeatureRecordError as exc:
+        print(f"Error: {exc.describe()}", file=sys.stderr)
+        return 1
+    if path is None:
+        print(f"  The host manifest already declares {canonical_package(package)}.")
+    else:
+        print(
+            f"  Recorded {canonical_package(package)} in {path}, so `kestrel "
+            "update` reinstalls it after `uv sync`."
+        )
+    return 0
 
 
 def _file_url_to_path(url: str) -> str:
@@ -879,14 +902,21 @@ def _load_host_manifest(path: Path) -> list:
 
     Raises ``ValueError`` on a malformed entry so the caller can report it.
     """
-    try:
-        import tomllib  # Python 3.11+
-    except ModuleNotFoundError:  # pragma: no cover - 3.10 and earlier
-        import tomli as tomllib  # type: ignore
+    import tomllib
 
     with open(path, "rb") as f:
         data = tomllib.load(f)
+    return _host_manifest_entries(data, path)
 
+
+def _host_manifest_entries(data: dict, path: Path) -> list:
+    """The validated entries of *data*, a host manifest parsed from *path*.
+
+    :func:`_load_host_manifest`'s rules, applied to TOML already parsed, so a
+    writer can hold text it is about to write to exactly the rules every
+    reader of the file applies (:func:`record_feature_install`). *path* is
+    where the text lives, or will: relative checkouts resolve beside it.
+    """
     entries = data.get("feature", [])
     if not isinstance(entries, list):
         raise ValueError("manifest '[[feature]]' must be an array of tables")
@@ -3184,6 +3214,98 @@ def run_sync_preflight(
     return 1 if result.refuses else 0
 
 
+@dataclass(frozen=True)
+class UnrecordedExtension:
+    """An installed extension package nothing on this host would reinstall (#4127)."""
+
+    package: str
+    version: str
+    editable_path: Optional[str] = None
+
+    def entry(self) -> str:
+        """The host manifest entry that records this package as it is installed."""
+        return _manifest_entry_text(
+            self.package,
+            editable=self.editable_path,
+            pypi=None if self.editable_path else "",
+        )
+
+
+def _installed_closure(roots: dict) -> set:
+    """*roots* (``{distribution: extras}``) and every distribution they require.
+
+    Read transitively from the copies installed now, each requirement under
+    the extras its requirer asked for. A package one of them requires comes
+    back when they are reinstalled, so it is recorded through them.
+    """
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    from kestrel_sovereign.feature_reconcile import requirement_applies
+
+    names: set = set()
+    seen: set = set()
+    pending = [(canonical_package(package), tuple(extras)) for package, extras in roots.items()]
+    while pending:
+        package, extras = pending.pop()
+        if (package, extras) in seen:
+            continue
+        seen.add((package, extras))
+        names.add(package)
+        for line in cli._installed_requirements(package):
+            try:
+                requirement = Requirement(line)
+            except InvalidRequirement:
+                # No installer accepts the line, so it brings nothing back.
+                continue
+            if requirement_applies(requirement, extras):
+                pending.append(
+                    (canonical_package(requirement.name), tuple(sorted(requirement.extras)))
+                )
+    return names
+
+
+def unrecorded_extensions(manifest: Path, *, locked, provisioned) -> tuple:
+    """Installed extension packages ``kestrel update`` removes and nothing reinstalls (#4127).
+
+    ``uv sync`` removes every package core's lock does not name. A package
+    survives the update when one of these brings it back:
+
+    * *locked* — the lock ``uv sync`` installs names it;
+    * the host *manifest* declares it, and ``feature sync`` restores it;
+    * *provisioned* — reconcile installs it for an agent's ``features``
+      allowlist (``_required_feature_packages``);
+    * one of those requires it, so reinstalling that installs it too.
+
+    Every other extension distribution installed now (those whose entry points
+    ``feature sync --capture`` would record) is returned, in name order. Those
+    are installs nothing on the host records, typically made before ``feature
+    install`` recorded its installs: the update would uninstall each one and
+    say nothing. Reads only. Raises ``ValueError`` or ``OSError`` when the
+    manifest exists and will not read.
+    """
+    from kestrel_sovereign.feature_registry import load_registry
+
+    declared = (
+        _declared_packages(_load_host_manifest(manifest), load_registry())
+        if manifest.exists()
+        else {}
+    )
+    roots = {canonical_package(package): () for package in provisioned}
+    roots.update(declared)
+    kept = {canonical_package(package) for package in locked} | _installed_closure(roots)
+    found = []
+    for dist in cli._installed_extension_distributions():
+        package = canonical_package(dist["dist"])
+        if package == CORE_DISTRIBUTION or package in kept:
+            continue
+        found.append(UnrecordedExtension(
+            package=package,
+            version=dist["version"] or "?",
+            editable_path=dist["editable_path"],
+        ))
+    return tuple(found)
+
+
 def _capture_host_manifest(path: Path) -> int:
     """Snapshot currently-installed extension packages into a manifest.
 
@@ -3200,41 +3322,169 @@ def _capture_host_manifest(path: Path) -> int:
     """
     dists = cli._installed_extension_distributions()
 
-    lines = [
-        "# Host-local feature manifest for `kestrel feature sync`.",
-        "# Lists the extension packages THIS host should keep installed so they",
-        "# can be restored after `uv sync` (or any rebuild) prunes them.",
-        "#",
-        "# Regenerate with:  kestrel feature sync --capture",
-        "# Restore with:     kestrel feature sync",
-        "",
-    ]
-
-    captured = 0
+    sections = []
     core = cli._core_install_shape()
     if core.is_editable:
-        captured += 1
-        lines.extend([
-            "# The core distribution. Declared so feature installs cannot",
-            "# quietly resolve it from PyPI over the editable checkout.",
-            "[[feature]]",
-            f"name = {_toml_basic_string(CORE_DISTRIBUTION)}",
-            f"editable = {_toml_basic_string(core.editable_path)}",
-            "",
-        ])
+        sections.append(
+            "# The core distribution. Declared so feature installs cannot\n"
+            "# quietly resolve it from PyPI over the editable checkout.\n"
+            + _manifest_entry_text(CORE_DISTRIBUTION, editable=core.editable_path)
+        )
 
     for d in dists:
         if d["dist"] == CORE_DISTRIBUTION:
             continue  # already emitted above
-        captured += 1
-        lines.append("[[feature]]")
-        lines.append(f'name = {_toml_basic_string(d["dist"])}')
-        if d["editable_path"]:
-            lines.append(f'editable = {_toml_basic_string(d["editable_path"])}')
-        lines.append("")
+        sections.append(_manifest_entry_text(d["dist"], editable=d["editable_path"]))
 
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return captured
+    path.write_text(
+        _HOST_MANIFEST_HEADER + "\n" + "\n".join(sections), encoding="utf-8",
+    )
+    return len(sections)
+
+
+#: The comment every writer opens a new host manifest with.
+_HOST_MANIFEST_HEADER = (
+    "# Host-local feature manifest for `kestrel feature sync`.\n"
+    "# Lists the extension packages THIS host should keep installed so they\n"
+    "# can be restored after `uv sync` (or any rebuild) prunes them.\n"
+    "# `kestrel feature install` appends an entry for each package it installs.\n"
+    "#\n"
+    "# Regenerate with:  kestrel feature sync --capture\n"
+    "# Restore with:     kestrel feature sync\n"
+)
+
+
+def _manifest_entry_text(
+    name: str, *, editable: Optional[str] = None, pypi: Optional[str] = None,
+) -> str:
+    """One ``[[feature]]`` table, as every writer of the host manifest renders it.
+
+    ``editable`` and ``pypi`` are the two sources :func:`_load_host_manifest`
+    accepts, and exclusive; neither is the legacy "from wherever" entry.
+    """
+    if editable and pypi is not None:
+        raise ValueError(f"{name}: a manifest entry has one source, not two")
+    lines = ["[[feature]]", f"name = {_toml_basic_string(name)}"]
+    if editable:
+        lines.append(f"editable = {_toml_basic_string(editable)}")
+    if pypi is not None:
+        lines.append(f"pypi = {_toml_basic_string(pypi)}")
+    return "\n".join(lines) + "\n"
+
+
+def _declared_packages(entries: list, registry: dict) -> dict:
+    """``{distribution: extras}`` for each package the manifest *entries* declare.
+
+    Keyed as the preflight keys them (:func:`_manifest_dist_name` over the
+    source index): a name may carry its extras inline
+    (``kestrel-feature-parametric-self[local]``), and the distribution is the
+    part before them. The extras are both spellings' union.
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+
+    declared: dict = {}
+    for package, entry in fr.build_source_index(entries, registry).items():
+        extras = (*fr.requested_extras(package), *entry.extras)
+        name = _manifest_dist_name(package)
+        declared[name] = tuple(sorted({*declared.get(name, ()), *extras}))
+    return declared
+
+
+class FeatureRecordError(Exception):
+    """The host manifest could not record a package this host installed (#4127).
+
+    Carries the entry, so the operator can be handed the exact text that would
+    have kept ``kestrel update`` from uninstalling the package.
+    """
+
+    def __init__(self, path, package: str, entry: str, reason: str):
+        super().__init__(f"{path}: {reason}")
+        self.path = path
+        self.package = package
+        self.entry = entry
+        self.reason = reason
+
+    def describe(self) -> str:
+        return (
+            f"{self.package} is installed, but recording it in the host manifest "
+            f"{self.path} failed: {self.reason}. The next `kestrel update` will "
+            f"uninstall it unless the manifest lists it. Add this entry:\n"
+            f"{self.entry}"
+        )
+
+
+def record_feature_install(package: str, *, from_git: bool = False) -> Optional[Path]:
+    """Declare *package*, just installed, in the host manifest (#4127).
+
+    ``kestrel update``'s ``uv sync`` removes every package core's lock does not
+    name, and what ``feature sync`` then restores is what the host manifest
+    lists. An install the manifest never heard of was therefore removed by the
+    next update, silently. Both install commands (``kestrel feature install``
+    and the console's install endpoint) record what they installed here, so the
+    manifest is the one record of what this host keeps.
+
+    The entry records the install as it was asked for: ``pypi = ""``, from the
+    index at no version the operator chose (core's lock and the install guard
+    still bound it). One installed by the registry's git fallback (*from_git*)
+    is the legacy entry that names no source, the one form ``feature sync``
+    falls back to git for.
+
+    Appended, never rewritten: the operator's comments, order, windows and
+    other tables survive, as they would an entry added by hand. The text is
+    held to :func:`_load_host_manifest`'s rules before it is written, so the
+    append cannot leave a manifest no reader will load. A manifest that
+    already declares the package is left as it is, whatever source it names.
+
+    Returns the manifest's path when an entry was appended, None when one was
+    already there. Raises :class:`FeatureRecordError` when it could not record.
+    """
+    import tomllib
+    import types
+
+    from kestrel_sovereign.feature_registry import load_registry
+
+    name = canonical_package(package)
+    entry = _manifest_entry_text(name, pypi=None if from_git else "")
+    try:
+        path = _host_manifest_path(types.SimpleNamespace(manifest=None))
+    except (OSError, RuntimeError) as exc:
+        # RuntimeError: the project directory's last fallback is ~/.kestrel,
+        # and `Path.home()` raises it when no home directory can be found.
+        raise FeatureRecordError(
+            DEFAULT_HOST_MANIFEST, name, entry, f"it could not be located ({exc})",
+        ) from exc
+    registry = load_registry()
+    try:
+        try:
+            current = path.read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            current = None
+        if current is None:
+            text = _HOST_MANIFEST_HEADER + "\n" + entry
+        else:
+            existing = _host_manifest_entries(tomllib.loads(current), path)
+            if name in _declared_packages(existing, registry):
+                return None
+            separator = "" if not current or current.endswith("\n") else "\n"
+            text = current + separator + "\n" + entry
+        written = _declared_packages(
+            _host_manifest_entries(tomllib.loads(text), path), registry,
+        )
+        if name not in written:
+            raise ValueError(f"the appended entry would not declare {name}")
+        if current is None:
+            # Exclusive: a manifest that appeared since the read is not ours to
+            # replace.
+            with open(path, "xb") as handle:
+                handle.write(text.encode("utf-8"))
+        else:
+            with open(path, "ab") as handle:
+                handle.write(text[len(current):].encode("utf-8"))
+    except (OSError, ValueError) as exc:
+        # ValueError covers a manifest that will not read, TOML that will not
+        # parse (TOMLDecodeError) and text that is not UTF-8.
+        raise FeatureRecordError(path, name, entry, str(exc)) from exc
+    return path
 
 
 def _registry_info_for(label: str, registry: dict):

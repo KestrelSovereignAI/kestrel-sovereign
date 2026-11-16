@@ -2011,6 +2011,51 @@ class TestInstallFeature:
         assert venv.installed["kestrel-feature-test"] == "0.4.0"
         assert venv.editable[CORE] == "/src/core"
 
+    # -- the host manifest records the install (#4127) ------------------------
+    #
+    # `kestrel update`'s `uv sync` removes every package core's lock does not
+    # name, and `feature sync` restores only what the host manifest declares.
+    # The console is the CLI's other door, so it records what it installed too.
+
+    @staticmethod
+    def _host_manifest():
+        return cli._host_manifest_path(SimpleNamespace(manifest=None))
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_console_install_is_recorded_in_the_host_manifest(
+        self, mock_registry, monkeypatch,
+    ):
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        self._venv(monkeypatch, feature_requires=">=0.52")
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200
+        declared = {
+            entry["name"]: entry for entry in cli._load_host_manifest(self._host_manifest())
+        }
+        assert declared["kestrel-feature-test"]["pypi"] == ""
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_console_install_that_cannot_be_recorded_is_not_a_success(
+        self, mock_registry, monkeypatch,
+    ):
+        """Installed and unrecorded: the next update removes it, so say so."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch, feature_requires=">=0.52")
+        # Every reader loads it (it declares nothing); no entry can join it.
+        self._host_manifest().write_text("feature = []\n", encoding="utf-8")
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "kestrel-feature-test is installed, but recording it" in detail
+        assert 'name = "kestrel-feature-test"' in detail
+        assert venv.installed["kestrel-feature-test"] == "0.4.0"
+
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_install_reports_and_restores_a_replaced_core(self, mock_registry, monkeypatch):
         """An install that bypassed the pin cannot return a clean 'installed'.
