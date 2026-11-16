@@ -72,7 +72,11 @@ class VirtualClock:
 
 class VirtualClockLoop(asyncio.SelectorEventLoop):
     """An event loop whose ``time()`` only moves when a test advances it, so
-    ``asyncio.timeout`` deadlines are measured against virtual seconds."""
+    ``asyncio.timeout`` deadlines are measured against virtual seconds.
+
+    ``resume`` ends the pinned phase for real I/O retirement, without jumping
+    the clock or changing already-armed deadlines.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -83,6 +87,14 @@ class VirtualClockLoop(asyncio.SelectorEventLoop):
 
     def advance(self, seconds: float) -> None:
         self._clock.advance(seconds)
+
+    def resume(self) -> None:
+        """Continue from this exact virtual instant at normal monotonic speed."""
+        virtual_now = self.time()
+        real_now = asyncio.BaseEventLoop.time(self)
+        self._clock = AdvanceableClock(
+            lambda: virtual_now + asyncio.BaseEventLoop.time(self) - real_now
+        )
 
 
 @contextmanager

@@ -100,6 +100,9 @@ def loop(monkeypatch):
     try:
         yield loop
     finally:
+        # Body deadlines stay fully virtual. Original native worker retirement
+        # needs a progressing clock for real I/O polls, even after STOP was ACKed.
+        loop.resume()
         try:
             databases = [service._usage_db.backend for service in services if service._usage_db is not None]
             loop.run_until_complete(resources.aclose())
