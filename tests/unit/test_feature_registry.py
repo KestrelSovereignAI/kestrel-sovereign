@@ -224,6 +224,29 @@ description = "Ambiguous"
         with pytest.raises(RegistryValidationError, match="missing required"):
             load_registry(path)
 
+    @pytest.mark.parametrize(
+        "package, short_name, feature_class",
+        [
+            ("kestrel-channel-whatsapp", "channel_whatsapp", "WhatsAppFeature"),
+            # Published on PyPI since 0.1.0 but absent from the catalog, so
+            # `kestrel feature install/info` answered "Unknown feature" and
+            # `kestrel feature list` never showed it (Windows journey, 11-16).
+            ("kestrel-channel-telegram", "channel_telegram", "TelegramFeature"),
+        ],
+    )
+    def test_published_channel_packages_are_in_the_catalog(
+        self, package, short_name, feature_class
+    ):
+        from kestrel_sovereign.feature_reconcile import resolve_registry_name
+
+        registry = load_registry()
+        for name in (short_name, package, feature_class):
+            assert resolve_registry_name(name, registry) == short_name, name
+        info = registry[short_name]
+        assert info.boundary is PackageBoundary.FEATURE_PACKAGE
+        assert info.features == [feature_class]
+        assert info.core is False
+
 
 class TestResolveStatus:
     """Tests for runtime status resolution."""

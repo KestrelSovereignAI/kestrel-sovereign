@@ -479,6 +479,16 @@ tags = ["communication", "messaging", "whatsapp", "channels"]
 icon = "message-square"
 core = false
 
+[channel_telegram]
+boundary = "feature-package"
+package = "kestrel-channel-telegram"
+git = "https://github.com/KestrelSovereignAI/kestrel-channel-telegram.git"
+features = ["TelegramFeature"]
+description = "Telegram transport for the channels feature: the agent owns a bot (@BotFather token)"
+tags = ["communication", "messaging", "telegram", "channels"]
+icon = "message-square"
+core = false
+
 [spawn]
 boundary = "bundled"
 package = "kestrel-sovereign"
