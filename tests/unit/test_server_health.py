@@ -2067,6 +2067,7 @@ def test_every_cause_has_a_report_path_and_a_phrase():
     had failed when it had not.
     """
     import re
+    from pathlib import Path
 
     from kestrel_sovereign.agent.constitution import (
         SafeModeCause,
@@ -2074,7 +2075,7 @@ def test_every_cause_has_a_report_path_and_a_phrase():
     )
     import kestrel_sovereign.server as server_module
 
-    src = open(server_module.__file__).read()
+    src = Path(server_module.__file__).read_text(encoding="utf-8")
     dispatch = dict(
         re.findall(r'"(\w+)": "(\w+)"', src.split("_CAUSE_FAILURES")[1].split("}")[0])
     )

@@ -63,6 +63,9 @@ class _Exchange:
         self.request_stream = request.stream
         self.read_timeout = _deadline(request, "read")
         self.write_timeout = _deadline(request, "write")
+        self.request_stream_close = self.request_stream.aclose
+        self.request_acquired = False
+        self.request_retirement_registered = False
         self.disconnected = asyncio.Event()
         self.response_finished = False
         self.source: OwnedAsyncIterator[_ResponseStart | _RequestFailure | bytes] | None = None
@@ -75,12 +78,19 @@ class _Exchange:
         self.close_opening: BaseException | None = None
         self.retirement_deadline: float | None = None
 
+    def acquire_request(self, resources: SourceAcquisition):
+        resources.retain(self.request_stream, self.request_stream_close)
+        # Admission alone is NOT resource custody. Publish this receipt only
+        # after registration, before the next fallible aiter/advancement.
+        self.request_acquired = True
+        return self.request_stream
+
     async def pull_request(self) -> Message:
         """A finite write observation, not the physical input iterator's task."""
         self.transport.require_binding(self.scope)
         if self.request_source is None:
             self.request_source = await create_owned_iterator(
-                source_factory=lambda resources: self.request_stream,
+                source_factory=self.acquire_request,
                 operation="native-inprocess-http-upload",
             )
         try:
@@ -132,16 +142,40 @@ class _Exchange:
 
     async def retire_request(self) -> None:
         errors = []
-        try:
-            if self.request_source is None:
-                await self.request_stream.aclose()
-            else:
+        if self.request_source is not None:
+            try:
                 await self.request_source.aclose()
-        except BaseException as error:
-            errors.append(error)
+            except BaseException as error:
+                errors.append(error)
+        if not self.request_acquired:
+            # A stopped or refused input owner may never enter its factory.
+            # Its ORIGINAL parent still owns this untransferred public stream.
+            # Canonical retirement attempts the same retained closer once and
+            # validates its actual result; it is not a replacement owner.
+            resources = SourceAcquisition()
+            resources.retain(self.request_stream, self.request_stream_close)
+            errors.extend(await resources.retire())
         if self.request_read is not None:
             outcome = await self.request_read.observe()
             errors.extend((outcome.error, outcome.cancellation))
+        terminal = execution_observation_error(*errors)
+        if terminal is not None:
+            raise terminal
+
+    async def retire(self) -> None:
+        errors = []
+        if self.source is not None:
+            try:
+                await self.source.aclose()
+            except BaseException as error:
+                errors.append(error)
+        if not self.request_retirement_registered:
+            # The SAME admission/entry distinction applies to the outer ASGI
+            # source. The one original exchange closer owns this case too.
+            try:
+                await self.retire_request()
+            except BaseException as error:
+                errors.append(error)
         terminal = execution_observation_error(*errors)
         if terminal is not None:
             raise terminal
@@ -151,6 +185,7 @@ class _Exchange:
         # a stream which the app never read. A stream that WAS acquired is
         # iterated and closed only by its own canonical source owner.
         resources.retain(self.request_stream, self.retire_request)
+        self.request_retirement_registered = True
         response_started = False
 
         async def produce(emit):
@@ -233,10 +268,9 @@ class _Exchange:
         return value
 
     async def close(self) -> None:
-        if self.source is None:
-            return
         self.disconnected.set()
-        self.source.request_stop()
+        if self.source is not None:
+            self.source.request_stop()
         if self.request_source is not None:
             self.request_source.request_stop()
         if self.close_admission is None:
@@ -245,13 +279,13 @@ class _Exchange:
                 self.retirement_deadline = asyncio.get_running_loop().time() + self.read_timeout
             try:
                 self.close_task = create_owned_task(
-                    self.source.aclose(), admission=self.close_admission,
+                    self.retire(), admission=self.close_admission,
                     retirement_resource=self, retain_originals=True,
                 )
             except BaseException as error:
                 self.close_opening = error
                 self.close_task = self.close_admission.task
-        sources = (self.source,) if self.request_source is None else (self.source, self.request_source)
+        sources = tuple(source for source in (self.source, self.request_source) if source is not None)
         source_tasks = tuple(task for source in sources for task in (source.producer_task, source.owner_task))
         if self.request_read is not None and self.request_read.task is not None:
             source_tasks = (*source_tasks, self.request_read.task)
@@ -361,8 +395,6 @@ class _NativeInProcessHTTPTransport(httpx.AsyncBaseTransport):
             retain_native_execution_stream_close(response)
             return response
         except BaseException as original:
-            if exchange.source is None:
-                self.exchanges.discard(exchange)
             try:
                 await exchange.close()
             except BaseException as retirement:

@@ -14,26 +14,14 @@ startup via ``AsyncDatabase._init_schema``, so idempotency is contractual.
 import json
 
 import pytest
-import pytest_asyncio
-
-from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.sqla.migrations import (
     migrate_canonical_session_ids,
 )
 
 
-@pytest_asyncio.fixture
-async def db(tmp_path):
-    raw = SQLiteBackend(str(tmp_path / "canonical-session-migration.db"))
-    database = AsyncDatabase(raw)
-    try:
-        await raw.connect()
-        await database._init_schema()
-        yield database
-    finally:
-        await database.close()
-        assert not raw.is_connected, "Migration fixture still owns its original SQLite connection"
+@pytest.fixture
+async def db(tmp_path, sqlite_database_factory):
+    return await sqlite_database_factory(tmp_path / "canonical-session-migration.db")
 
 
 async def _insert(db, role, content, metadata, agent_id="test-agent"):

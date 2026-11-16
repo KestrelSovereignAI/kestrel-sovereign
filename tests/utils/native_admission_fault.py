@@ -1,6 +1,7 @@
 """One local original Task admission fault; never a replacement native owner."""
 import asyncio
 import inspect
+from contextlib import contextmanager
 
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 
@@ -10,6 +11,32 @@ def create_admission_task(task_type, coroutine, *, loop, eager, **kwargs):
     if eager:
         return task_type(coroutine, loop=loop, eager_start=True, **kwargs)
     return task_type(coroutine, loop=loop, **kwargs)
+
+
+@contextmanager
+def before_native_source_entry(operation_name, withdraw, *, eager=False):
+    """Arrange withdrawal at original construction, without replacing its body."""
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    sources = []
+
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        frame = getattr(operation, "cr_frame", None)
+        source = frame.f_locals.get("self") if frame is not None else None
+        if (getattr(getattr(operation, "cr_code", None), "co_qualname", None)
+                == "OwnedAsyncIterator.__init__.<locals>.run_owned"
+                and operation_name is not None and getattr(source, "_operation", None) == operation_name):
+            sources.append(source)
+            withdraw()
+        return (previous(loop, coroutine, **kwargs) if previous else
+                create_admission_task(asyncio.Task, coroutine, loop=loop, eager=eager, **kwargs))
+
+    loop.set_task_factory(factory)
+    try:
+        yield sources
+    finally:
+        loop.set_task_factory(previous)
 
 
 class NativeAdmissionFault:

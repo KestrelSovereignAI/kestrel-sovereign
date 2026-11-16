@@ -2392,9 +2392,11 @@ async def test_nested_subagent_rename_from_app_server_task_does_not_deadlock(
         async with lock.policy_span():
             executor = agent._make_inline_tool_executor("sess-nested")
             await harness.start()
-            return await asyncio.wait_for(harness.dispatch(
-                executor, binding.name, {"new_name": "NestedRenamed"},
-            ), timeout=5.0)
+            # wait_for would create an unadmitted Task with copied turn
+            # context. Keep the original native owner; the harness admits
+            # and owns its actual app-server callback children separately.
+            async with asyncio.timeout(5.0):
+                return await harness.dispatch(executor, binding.name, {"new_name": "NestedRenamed"})
 
     try:
         if mode is PrivacyMode.EPHEMERAL:

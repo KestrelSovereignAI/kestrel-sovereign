@@ -737,6 +737,11 @@ The exact receive operation and physical source outcomes remain owned through
 close, including allocation/publication failures and late cleanup errors.
 An application that never receives the upload does not start its iterator;
 its original public stream closer still runs during source retirement.
+Task admission alone does not transfer that stream's custody. Each source
+publishes its registration receipt before advancing an iterator. If Stop or
+admission failure prevents entry, the original parent retains the closer.
+The one exchange close operation also owns outer ASGI-source pre-entry cases;
+it neither drops those streams nor admits a replacement retirement attempt.
 Early response/client closure signals disconnect and withdraws source demand.
 The bridge advertises ASGI HTTP2.0: after withdrawal it admits no further
 frames, but lets the original application observe `http.disconnect` and unwind

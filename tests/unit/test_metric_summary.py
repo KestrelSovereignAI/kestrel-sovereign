@@ -12,20 +12,18 @@ import pytest
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
     ObservabilityStore,
 )
-from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
-async def _store(tmp_path, name):
-    backend = SQLiteBackend(str(tmp_path / name))
-    await backend.connect()
-    store = ObservabilityStore(backend)
+@pytest.fixture
+async def store(tmp_path, sqlite_database_factory):
+    database = await sqlite_database_factory(tmp_path / "metric-summary.db")
+    store = ObservabilityStore(database.backend, owns_backend=False)
     await store.initialize()
     return store
 
 
 @pytest.mark.asyncio
-async def test_metric_summary_counts_aggregates_and_carries_forensic_metadata(tmp_path):
-    store = await _store(tmp_path, "metric-summary.db")
+async def test_metric_summary_counts_aggregates_and_carries_forensic_metadata(store):
 
     # Two persist failures on emma, one on meridian...
     await store.log_metric(
@@ -73,8 +71,7 @@ async def test_metric_summary_counts_aggregates_and_carries_forensic_metadata(tm
 
 
 @pytest.mark.asyncio
-async def test_metric_summary_filters_by_agent(tmp_path):
-    store = await _store(tmp_path, "metric-summary-agent.db")
+async def test_metric_summary_filters_by_agent(store):
     for agent in ("did:test:emma", "did:test:emma", "did:test:meridian"):
         await store.log_metric(
             agent_name=agent,
@@ -91,8 +88,7 @@ async def test_metric_summary_filters_by_agent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_metric_summary_empty_when_metric_never_emitted(tmp_path):
-    store = await _store(tmp_path, "metric-summary-empty.db")
+async def test_metric_summary_empty_when_metric_never_emitted(store):
     await store.log_metric(
         agent_name="did:test:emma",
         metric_name="some_other_metric",
@@ -111,11 +107,10 @@ async def test_metric_summary_empty_when_metric_never_emitted(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_metric_summary_finds_rare_metric_amid_high_volume_other(tmp_path):
+async def test_metric_summary_finds_rare_metric_amid_high_volume_other(store):
     # Regression: a rare forensic metric must be found even when a high-volume
     # metric is emitted more recently and exceeds the fetch limit. The metric
     # name is filtered in SQL, so the limit bounds THIS metric's rows, not all.
-    store = await _store(tmp_path, "metric-summary-rare.db")
 
     # One rare persist failure FIRST (oldest)...
     await store.log_metric(
@@ -144,8 +139,7 @@ async def test_metric_summary_finds_rare_metric_amid_high_volume_other(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_metric_summary_truncated_flag_when_window_exceeds_limit(tmp_path):
-    store = await _store(tmp_path, "metric-summary-trunc.db")
+async def test_metric_summary_truncated_flag_when_window_exceeds_limit(store):
     for i in range(5):
         await store.log_metric(
             agent_name="did:test:emma",
