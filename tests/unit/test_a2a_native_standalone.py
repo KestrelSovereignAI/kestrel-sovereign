@@ -387,6 +387,189 @@ async def test_inprocess_signed_concurrent_close_preserves_read_deadline(single,
 
 
 @pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("middleware", [False, True])
+@pytest.mark.parametrize("phase", ["iterator-finally", "stream-close"])
+async def test_inprocess_signed_upload_keeps_original_failure_after_protocol_conversion(
+    single, protocol, middleware, phase,
+):
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from tests.utils.original_failure import fail_original_file_read
+
+    p, actual, originals, closed = single, [], [], []
+    if middleware:
+        install_passthrough_middleware(p.app)
+
+    class OriginalBody(httpx.AsyncByteStream):
+        def __init__(self, original):
+            self.original = original
+
+        async def __aiter__(self):
+            originals.append(asyncio.current_task())
+            try:
+                async for chunk in self.original:
+                    yield chunk
+            finally:
+                if phase == "iterator-finally":
+                    fail_original_file_read(actual)
+
+        async def aclose(self):
+            closed.append(asyncio.current_task())
+            await self.original.aclose()
+            if phase == "stream-close":
+                fail_original_file_read(actual)
+
+    async def stream_request(request):
+        request.stream = OriginalBody(request.stream)
+
+    transport = p.publication.inprocess_http_transport(p.app)
+
+    async def consume():
+        async with httpx.AsyncClient(transport=transport, timeout=1, event_hooks={"request": [stream_request]}) as http:
+            client = await signed_sdk_client(p, http, protocol)
+            return [event async for event in client.send_message(send(p.admission))]
+
+    result = await await_owned_task(create_owned_task(consume()))
+    retirement = None
+    try:
+        await transport.aclose()
+    except BaseException as error:
+        retirement = error
+    assert len(actual) == 1
+    assert any(error is actual[0] for failure in (result.error, retirement)
+               for error in execution_evidence_carriers(failure)), "Protocol conversion erased the physical upload failure"
+    assert len(originals) == 1 and closed == originals
+    assert originals[0].done() and not originals[0].cancelling()
+    assert not transport.exchanges
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("middleware", [False, True])
+async def test_inprocess_signed_write_deadline_does_not_cancel_held_upload_finally(single, protocol, middleware):
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_evidence_carriers
+    from tests.utils.original_failure import fail_original_file_read
+
+    p = single
+    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    actual, originals, closed = [], [], []
+    if middleware:
+        install_passthrough_middleware(p.app)
+
+    class HeldBody(httpx.AsyncByteStream):
+        def __init__(self, original):
+            self.original = original
+
+        async def __aiter__(self):
+            originals.append(asyncio.current_task())
+            try:
+                async for chunk in self.original:
+                    yield chunk
+            finally:
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    # The red implementation cancels the physical task here.
+                    # Preserve the real finally so the test can join it too.
+                    await release.wait()
+                    raise
+                finally:
+                    finished.set()
+                fail_original_file_read(actual)
+
+        async def aclose(self):
+            closed.append(asyncio.current_task())
+            await self.original.aclose()
+
+    async def stream_request(request):
+        request.stream = HeldBody(request.stream)
+
+    transport = p.publication.inprocess_http_transport(p.app)
+
+    async def consume():
+        async with httpx.AsyncClient(
+            transport=transport, timeout=httpx.Timeout(0.5, write=0.02),
+            event_hooks={"request": [stream_request]},
+        ) as http:
+            client = await signed_sdk_client(p, http, protocol)
+            return [event async for event in client.send_message(send(p.admission))]
+
+    reading, result, exchange = create_owned_task(consume()), None, None
+    reading.add_done_callback(lambda _: entered.set())
+    try:
+        await entered.wait()
+        assert originals, (await await_owned_task(reading)).error
+        exchange, = transport.exchanges
+        done, _ = await asyncio.wait((reading,), timeout=0.1)
+        assert reading in done, "Write observation waited on the original opaque upload finalizer"
+        result = await await_owned_task(reading)
+        assert any(isinstance(error, httpx.WriteTimeout) for error in execution_evidence_carriers(result.error))
+        assert execution_cleanup_debts(result.error)
+        assert not originals[0].done() and not originals[0].cancelling()
+        assert not finished.is_set() and not closed
+        assert await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    finally:
+        release.set()
+        result = await await_owned_task(reading)
+        if exchange is not None:
+            async with asyncio.timeout(1):
+                await exchange.source.join_source_owners(closing=True)
+        retirement = None
+        try:
+            await transport.aclose()
+        except BaseException as error:
+            retirement = error
+        if exchange is not None and result.error is not None and actual:
+            assert any(error is actual[0] for failure in (result.error, retirement)
+                       for error in execution_evidence_carriers(failure))
+        assert all(task.done() for task in originals)
+    assert len(actual) == 1 and closed == originals
+    assert not transport.exchanges
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
+@pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
+@pytest.mark.parametrize("target", ["receive", "upload-owner", "upload-watcher"])
+@pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
+async def test_inprocess_signed_upload_admission_failure_is_not_only_a_protocol_error(single, protocol, mode, target, eager):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from tests.utils.native_admission_fault import NativeAdmissionFault
+    from tests.utils.original_failure import fail_original_file_read
+
+    p, actual = single, []
+    try:
+        fail_original_file_read(actual)
+    except OSError:
+        pass
+    failure, = actual
+
+    def original_operation(operation):
+        name = getattr(getattr(operation, "cr_code", None), "co_qualname", None)
+        if target == "receive":
+            return name == "_Exchange.pull_request"
+        names = {
+            "upload-owner": "OwnedAsyncIterator.__init__.<locals>.run_owned",
+            "upload-watcher": "OwnedAsyncIterator._watch_owner_cancellation",
+        }
+        frame = getattr(operation, "cr_frame", None)
+        return (name == names[target] and frame is not None
+                and getattr(frame.f_locals.get("self"), "_operation", None) == "native-inprocess-http-upload")
+
+    transport = p.publication.inprocess_http_transport(p.app)
+    fault = NativeAdmissionFault(original_operation, failure, mode, eager=eager)
+    async with httpx.AsyncClient(transport=transport, timeout=1) as http:
+        client = await signed_sdk_client(p, http, protocol)
+        with fault, pytest.raises(BaseException) as observed:
+            async for _ in client.send_message(send(p.admission)):
+                pytest.fail("An upload admission failure delivered a normal signed reply")
+    assert any(error is failure for error in execution_evidence_carriers(observed.value))
+    fault.assert_terminal_unstarted()
+    assert await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
+    assert not transport.exchanges
+
+
+@pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
 @pytest.mark.parametrize("mode", ["refuse", "publish-before", "publish-after"])
 @pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
 async def test_inprocess_signed_failed_close_admission_retains_late_physical_error(single, protocol, mode, eager):

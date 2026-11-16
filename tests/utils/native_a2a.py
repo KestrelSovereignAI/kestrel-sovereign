@@ -11,7 +11,10 @@ import pytest_asyncio
 
 from kestrel_sovereign.storage.db.postgres import PostgresBackend
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from tests.utils.postgres_schema import disposable_postgres_schema, with_search_path
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.postgres_schema import (
+    disposable_postgres_schema, pgvector_schema, quoted_search_path, with_search_path,
+)
 
 
 def signing_identity(did):
@@ -74,12 +77,16 @@ async def native_a2a_backend_factory(request, tmp_path):
     url = os.environ.get("TEST_POSTGRES_URL")
     if not url:
         pytest.skip("TEST_POSTGRES_URL is required for the PostgreSQL contract")
-    admin = PostgresBackend(url, min_pool_size=1, max_pool_size=2)
-    await admin.connect()
+    async def no_schema_ddl(db):
+        """The admin connection must not migrate a reused database's tables."""
+
+    admin = await AsyncDatabase.postgres(url, schema_initializer=no_schema_ddl)
     try:
+        vector_schema = await pgvector_schema(admin)
         async with disposable_postgres_schema(admin, "native_a2a_context") as schema:
             yield lambda: PostgresBackend(
-                with_search_path(url, schema), min_pool_size=1, max_pool_size=2
+                with_search_path(url, quoted_search_path(schema, vector_schema)),
+                min_pool_size=1, max_pool_size=2,
             )
     finally:
         await admin.close()

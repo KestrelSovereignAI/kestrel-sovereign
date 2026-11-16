@@ -727,6 +727,16 @@ allocation before `send`. The SDK still owns A2A parsing, messages and errors.
 Both HTTPX `read` and `write` timeouts must be finite and nonnegative; each
 actual response read/request-body read enforces its corresponding inactivity
 deadline. Use an outer operation deadline when a whole-exchange bound is needed.
+Request uploads also stream. Their original iterator and public stream closer
+run on one separate canonical source owner, with at most one input frame awaiting
+ACK. ASGI `receive` borrows a finite write observation through one retained
+operation; it never injects timeout cancellation into the original upload or
+its opaque finalizer. A failed receive is delivered through the same bounded
+response handoff before a recipient can project it into a protocol error.
+The exact receive operation and physical source outcomes remain owned through
+close, including allocation/publication failures and late cleanup errors.
+An application that never receives the upload does not start its iterator;
+its original public stream closer still runs during source retirement.
 Early response/client closure signals disconnect and withdraws source demand.
 The bridge advertises ASGI HTTP2.0: after withdrawal it admits no further
 frames, but lets the original application observe `http.disconnect` and unwind
@@ -735,8 +745,9 @@ application that ignores disconnect can keep running; that is pending physical
 debt, not proof that its body or cleanup stopped. Closed sends yield to preserve
 the observer's bound even for a repeatedly sending application. See the
 [ASGI disconnect contract](https://asgi.readthedocs.io/en/stable/specs/www.html#disconnect-receive-event).
-One original close task joins the original application and source owners, using
-one nonrenewing retirement budget equal to the request's read timeout. Slow
+One original close task joins the original application and input/output source
+owners. It uses one nonrenewing retirement budget: the read timeout normally,
+or the write timeout starting at an upload write-deadline failure. Slow
 opaque cleanup is retained as private debt with those exact original tasks,
 never reported as a successful close or interrupted by a replacement cancel.
 The host must retain and retry closing that transport after the originals settle

@@ -18,11 +18,13 @@ from starlette.types import ASGIApp, Message, Scope
 
 from kestrel_sovereign._async_ownership import (
     OwnedAsyncIterator,
+    OwnedOperation,
     OwnedTaskAdmission,
     await_owned_task,
     create_owned_iterator,
     create_owned_task,
     pending_owned_retirement_error,
+    raise_owned_outcome,
     wait_owned_tasks_until,
 )
 from kestrel_sovereign.execution_custody import (
@@ -35,6 +37,13 @@ from kestrel_sovereign.execution_custody import (
 class _ResponseStart:
     status: int
     headers: tuple[tuple[bytes, bytes], ...]
+
+
+@dataclass(frozen=True)
+class _RequestFailure:
+    """Deliver the original receive operation, never a protocol error projection."""
+
+    operation: OwnedOperation
 
 
 def _deadline(request: httpx.Request, key: str) -> float:
@@ -51,39 +60,98 @@ class _Exchange:
 
     def __init__(self, transport: _NativeInProcessHTTPTransport, request: httpx.Request, scope: Scope):
         self.transport, self.request, self.scope = transport, request, scope
+        self.request_stream = request.stream
         self.read_timeout = _deadline(request, "read")
         self.write_timeout = _deadline(request, "write")
         self.disconnected = asyncio.Event()
         self.response_finished = False
-        self.source: OwnedAsyncIterator[_ResponseStart | bytes] | None = None
+        self.source: OwnedAsyncIterator[_ResponseStart | _RequestFailure | bytes] | None = None
+        self.request_source: OwnedAsyncIterator[bytes] | None = None
+        self.request_read: OwnedOperation | None = None
+        self.request_complete = False
+        self.receiving = False
         self.close_admission: OwnedTaskAdmission | None = None
         self.close_task: asyncio.Task | None = None
         self.close_opening: BaseException | None = None
         self.retirement_deadline: float | None = None
 
-    def acquire(self, resources: SourceAcquisition) -> CallbackSource[_ResponseStart | bytes]:
-        body = resources.retain_iterable(self.request.stream)
-        request_complete = False
-        response_started = False
+    async def pull_request(self) -> Message:
+        """A finite write observation, not the physical input iterator's task."""
+        self.transport.require_binding(self.scope)
+        if self.request_source is None:
+            self.request_source = await create_owned_iterator(
+                source_factory=lambda resources: self.request_stream,
+                operation="native-inprocess-http-upload",
+            )
+        try:
+            async with asyncio.timeout(self.write_timeout):
+                chunk = await self.request_source.__anext__(defer_cancellation=False)
+        except StopAsyncIteration:
+            self.transport.require_binding(self.scope)
+            self.request_complete = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        except TimeoutError as error:
+            if self.retirement_deadline is None:
+                self.retirement_deadline = asyncio.get_running_loop().time() + self.write_timeout
+            raise httpx.WriteTimeout("Native ASGI request body deadline exceeded", request=self.request) from error
+        if not isinstance(chunk, bytes):
+            raise TypeError("Native ASGI request body chunks must be bytes")
+        self.transport.require_binding(self.scope)
+        return {"type": "http.request", "body": chunk, "more_body": True}
 
-        async def receive() -> Message:
-            nonlocal request_complete
+    async def receive(self, emit) -> Message:
+        if self.receiving:
+            raise RuntimeError("Native ASGI request body requires one receive observer")
+        self.receiving = True
+        try:
             if self.disconnected.is_set():
                 return {"type": "http.disconnect"}
-            if request_complete:
+            if self.request_complete:
                 await self.disconnected.wait()
                 return {"type": "http.disconnect"}
-            try:
-                async with asyncio.timeout(self.write_timeout):
-                    chunk = await anext(body)
-            except StopAsyncIteration:
-                request_complete = True
-                return {"type": "http.request", "body": b"", "more_body": False}
-            except TimeoutError as error:
-                raise httpx.WriteTimeout("Native ASGI request body deadline exceeded", request=self.request) from error
-            if not isinstance(chunk, bytes):
-                raise TypeError("Native ASGI request body chunks must be bytes")
-            return {"type": "http.request", "body": chunk, "more_body": True}
+            if self.request_read is None:
+                self.request_read = OwnedOperation(
+                    self.pull_request(), retirement_resource=self, retain_originals=True,
+                    name="native-inprocess-http-receive",
+                )
+            outcome = await self.request_read.observe(defer_cancellation=False)
+            if outcome.error is not None or outcome.cancellation is not None:
+                if self.request_source is not None:
+                    self.request_source.request_stop()
+                # A recipient may catch receive errors and send a protocol
+                # error reply. Wake the HTTP observer FIRST with the actual
+                # retained operation via the SAME bounded frame handoff. Its
+                # physical failure cannot disappear into that projection.
+                await emit(_RequestFailure(self.request_read))
+                return raise_owned_outcome(outcome, operation="native-inprocess-http-receive",
+                                           retain_originals=True, retain_observer_cancellations=True)
+            self.request_read = None  # This exact successful owner was joined.
+            return outcome.result
+        finally:
+            self.receiving = False
+
+    async def retire_request(self) -> None:
+        errors = []
+        try:
+            if self.request_source is None:
+                await self.request_stream.aclose()
+            else:
+                await self.request_source.aclose()
+        except BaseException as error:
+            errors.append(error)
+        if self.request_read is not None:
+            outcome = await self.request_read.observe()
+            errors.extend((outcome.error, outcome.cancellation))
+        terminal = execution_observation_error(*errors)
+        if terminal is not None:
+            raise terminal
+
+    def acquire(self, resources: SourceAcquisition) -> CallbackSource[_ResponseStart | _RequestFailure | bytes]:
+        # The original app owner retires the original input source, including
+        # a stream which the app never read. A stream that WAS acquired is
+        # iterated and closed only by its own canonical source owner.
+        resources.retain(self.request_stream, self.retire_request)
+        response_started = False
 
         async def produce(emit):
             async def publish(frame: _ResponseStart | bytes) -> bool:
@@ -135,6 +203,9 @@ class _Exchange:
             # Routers mutate their per-dispatch scope (e.g. Mount rewrites
             # root_path). Revalidate the retained ingress route, not that
             # mutable child scope, on each outward frame/read.
+            async def receive() -> Message:
+                return await self.receive(emit)
+
             await self.transport.application(dict(self.scope), receive, send)
             if (not response_started or not self.response_finished) and not self.disconnected.is_set():
                 raise RuntimeError("Native ASGI application returned an incomplete response")
@@ -154,6 +225,11 @@ class _Exchange:
         except TimeoutError as error:
             raise httpx.ReadTimeout("Native ASGI response deadline exceeded", request=self.request) from error
         self.transport.require_binding(self.scope)
+        if isinstance(value, _RequestFailure):
+            outcome = await value.operation.observe()
+            raise_owned_outcome(outcome, operation="native-inprocess-http-receive",
+                                retain_originals=True, retain_observer_cancellations=True)
+            raise RuntimeError("Native ASGI upload failure has no original failure")
         return value
 
     async def close(self) -> None:
@@ -161,9 +237,12 @@ class _Exchange:
             return
         self.disconnected.set()
         self.source.request_stop()
+        if self.request_source is not None:
+            self.request_source.request_stop()
         if self.close_admission is None:
             self.close_admission = OwnedTaskAdmission()
-            self.retirement_deadline = asyncio.get_running_loop().time() + self.read_timeout
+            if self.retirement_deadline is None:
+                self.retirement_deadline = asyncio.get_running_loop().time() + self.read_timeout
             try:
                 self.close_task = create_owned_task(
                     self.source.aclose(), admission=self.close_admission,
@@ -172,7 +251,10 @@ class _Exchange:
             except BaseException as error:
                 self.close_opening = error
                 self.close_task = self.close_admission.task
-        source_tasks = (self.source.producer_task, self.source.owner_task)
+        sources = (self.source,) if self.request_source is None else (self.source, self.request_source)
+        source_tasks = tuple(task for source in sources for task in (source.producer_task, source.owner_task))
+        if self.request_read is not None and self.request_read.task is not None:
+            source_tasks = (*source_tasks, self.request_read.task)
         original_tasks = ((self.close_task, *source_tasks)
                           if self.close_task is not None else source_tasks)
         observed = await wait_owned_tasks_until(original_tasks, deadline=self.retirement_deadline)
@@ -180,18 +262,25 @@ class _Exchange:
             self, original_tasks,
             message="Original native ASGI source retirement is still pending",
         )
+        request_outcome = None
+        if self.request_read is not None and (self.request_read.task is None or self.request_read.task.done()):
+            request_outcome = await self.request_read.observe()
+        request_error = (execution_observation_error(request_outcome.error, request_outcome.cancellation)
+                         if request_outcome is not None else None)
         if debt is not None:
             raise execution_observation_error(
-                self.close_opening, self.source.terminal_error, observed.cancellation, debt,
+                self.close_opening, *(source.terminal_error for source in sources), request_error,
+                observed.cancellation, debt,
             )
         # An accepted close task can fail publication before its body runs, or
         # allocation can refuse it entirely. The SAME source owners can still
         # finish their original cleanup. Harvest those outcomes independently
         # so a later physical failure never disappears behind admission failure.
-        source = await self.source.join_source_owners(closing=True)
+        source_outcomes = [await source.join_source_owners(closing=True) for source in sources]
         outcome = await await_owned_task(self.close_task) if self.close_task is not None else None
         terminal = execution_observation_error(
-            self.close_opening, source.error, source.cancellation,
+            self.close_opening, *(error for source in source_outcomes for error in (source.error, source.cancellation)),
+            request_error,
             outcome.error if outcome is not None else None,
             outcome.cancellation if outcome is not None else None,
             observed.cancellation,
