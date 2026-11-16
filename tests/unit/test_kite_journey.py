@@ -460,7 +460,7 @@ def _approval_journey(tmp_path, monkeypatch, pending, *, approve_body=None):
 
 
 def _req(rid, *, tool="telegram_status", feature="TelegramFeature", age_seconds=0.0):
-    created = kj.datetime.now(kj.timezone.utc) - kj.timedelta(seconds=age_seconds)
+    created = kj.datetime.now(kj.UTC) - kj.timedelta(seconds=age_seconds)
     return {"id": rid, "tool": tool, "feature": feature, "timestamp": created.isoformat()}
 
 

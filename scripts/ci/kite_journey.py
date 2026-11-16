@@ -798,7 +798,7 @@ def invoke_approving(
     def run() -> None:
         try:
             result["status"], result["body"], _ = j.invoke(text, timeout=COMMAND_TIMEOUT_SECONDS)
-        except BaseException as exc:  # re-raised in the caller's thread below
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller's thread below
             result["error"] = exc
 
     started = datetime.now(UTC) - timedelta(seconds=1)
