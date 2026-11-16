@@ -191,20 +191,42 @@ def test_sigterm_mid_install_still_removes_the_harness(tmp_path):
         [sys.executable, str(root / "scripts" / "ci" / "clean_install_local.py")],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 20
-    while not any(temp_root.glob("kestrel-clean-install-*")):
-        assert time.monotonic() < deadline, "runner never created its harness"
-        time.sleep(0.05)
-    time.sleep(0.5)  # let the runner reach its wait on the hanging uv
-    proc.send_signal(signal.SIGTERM)
-    # The hanging uv is not this runner's to kill (bash would not kill it
-    # either); stop it so the runner's wait returns.
-    for pid_line in subprocess.run(
-        ["pgrep", "-f", str(uv)], capture_output=True, text=True, check=False
-    ).stdout.split():
-        os.kill(int(pid_line), signal.SIGTERM)
-    assert proc.wait(timeout=20) == 128 + signal.SIGTERM
-    assert not any(temp_root.glob("kestrel-clean-install-*"))
+
+    def fake_uv_pids() -> list[int]:
+        found = subprocess.run(["pgrep", "-f", str(uv)], capture_output=True, text=True,
+                               check=False).stdout.split()
+        return [int(pid) for pid in found]
+
+    try:
+        deadline = time.monotonic() + 20
+        while not fake_uv_pids():  # the runner is now waiting on its step
+            assert time.monotonic() < deadline, "runner never started its first step"
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        # The hanging uv is not this runner's to kill (bash would not kill it
+        # either); stop it so the runner's wait returns.
+        for pid in fake_uv_pids():
+            os.kill(pid, signal.SIGTERM)
+        assert proc.wait(timeout=20) == 128 + signal.SIGTERM
+        assert not any(temp_root.glob("kestrel-clean-install-*"))
+    finally:
+        for pid in fake_uv_pids():
+            os.kill(pid, signal.SIGKILL)
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_a_signal_ignored_at_start_stays_ignored(monkeypatch):
+    """Under nohup SIGHUP is ignored; a handler would make every step die of it."""
+    installed: dict[int, object] = {}
+    ignored = signal.SIGTERM  # present on every platform
+    monkeypatch.setattr(local.signal, "getsignal",
+                        lambda s: signal.SIG_IGN if s == ignored else signal.SIG_DFL)
+    monkeypatch.setattr(local.signal, "signal", lambda s, h: installed.__setitem__(s, h))
+    local.install_termination_handlers()
+    assert ignored not in installed
+    if hasattr(signal, "SIGHUP"):
+        assert installed[signal.SIGHUP] is local._raise_exit
 
 
 @pytest.mark.parametrize("value, expected", [("", "3.13"), ("3.12", "3.12")])

@@ -237,9 +237,15 @@ def _raise_exit(signum: int, _frame: object) -> None:
 
 
 def install_termination_handlers() -> None:
-    for name in ("SIGTERM", "SIGHUP"):  # SIGHUP does not exist on Windows
+    """Handle SIGTERM, SIGHUP and (Windows) Ctrl-Break, unless ignored at start.
+
+    A signal ignored when the runner starts stays ignored, as bash leaves it:
+    under ``nohup`` SIGHUP is ignored, and replacing that with a handler would
+    reset it to "die" in every step the runner starts.
+    """
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):  # per-platform; getattr skips absent
         signum = getattr(signal, name, None)
-        if signum is not None:
+        if signum is not None and signal.getsignal(signum) is signal.SIG_DFL:
             signal.signal(signum, _raise_exit)
 
 
