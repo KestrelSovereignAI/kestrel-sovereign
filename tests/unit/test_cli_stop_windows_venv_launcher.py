@@ -93,6 +93,15 @@ def test_children_of_a_process_that_is_not_a_venv_launcher_are_ignored(venv, mon
     assert cli_stop._listener_is_owned_by(PORT, 1520) is False
 
 
+def test_a_python_beside_a_pyvenv_cfg_but_outside_scripts_is_not_a_launcher(venv, monkeypatch):
+    elsewhere = venv.launcher.parent.parent / "Tools" / "python.exe"
+    interpreter = _FakeProcess(venv.interpreter, connections=[_listener()])
+    not_a_launcher = _FakeProcess(elsewhere, children=[interpreter])
+    _patch_processes(monkeypatch, {1520: not_a_launcher})
+
+    assert cli_stop._listener_is_owned_by(PORT, 1520) is False
+
+
 def test_a_launcher_without_pyvenv_cfg_attributes_nothing(venv, monkeypatch):
     (venv.launcher.parent.parent / "pyvenv.cfg").unlink()
     interpreter = _FakeProcess(venv.interpreter, connections=[_listener()])
