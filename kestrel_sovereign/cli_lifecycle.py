@@ -2032,17 +2032,24 @@ def _update_argv(args) -> list:
     return ["update", *options, *positionals]
 
 
+def _python_module_command(argv: list) -> list:
+    """``kestrel <argv>`` through this venv's interpreter, holding no launcher open.
+
+    ``-P`` keeps the working directory off ``sys.path``, as it is for the
+    console script: ``-m`` would otherwise put it first, and a command run
+    from inside another checkout would run that checkout's code.
+    """
+    return [sys.executable, "-P", "-m", "kestrel_sovereign.cli", *argv]
+
+
 def _run_update_continuation(argv: list) -> int:
     """Run ``kestrel <argv>`` in a fresh interpreter of this venv; its exit status.
 
     Inherits this process's stdio, environment and working directory, so the
     operator sees one continuous update and the child resolves the project the
-    same way this process did. ``-P`` keeps that working directory off
-    ``sys.path``, as it is for the console script: ``-m`` would otherwise put
-    it first, and an update run from inside another checkout would continue
-    in that checkout's code.
+    same way this process did (see :func:`_python_module_command`).
     """
-    command = [sys.executable, "-P", "-m", "kestrel_sovereign.cli", *argv]
+    command = _python_module_command(argv)
     try:
         result = subprocess.run(command, check=False)
     except OSError as exc:
@@ -2197,6 +2204,36 @@ def cmd_update(args) -> int:
     )
     print(f"  target: {target_label}{' [DRY-RUN]' if dry_run else ''}")
     print()
+
+    # Before anything changes (#2923): on Windows an install cannot replace a
+    # kestrel.exe that is running, and this command normally runs inside one.
+    # Refusing here, as pip does for `pip install --upgrade pip`, leaves the
+    # checkout unpulled and names the command that can do it.
+    # Both the install and the feature sync can reinstall core (the sync
+    # through the core install guard), so either one needs a replaceable
+    # launcher.
+    if not dry_run and ((install and source_checkout is not None) or features):
+        from kestrel_sovereign import windows_launchers
+
+        try:
+            in_use = windows_launchers.launchers_in_use()
+        except OSError as exc:
+            print(
+                "kestrel update: refusing to start: could not check whether this "
+                f"venv's kestrel.exe can be replaced: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        if in_use:
+            print(
+                windows_launchers.refusal(
+                    in_use,
+                    _python_module_command(_update_argv(args)),
+                    run_by_launcher=windows_launchers.run_by_launcher(in_use),
+                ),
+                file=sys.stderr,
+            )
+            return 2
 
     # Step 0: constitution adoption gate (#3517), before anything changes.
     # The pull is about to install a revision whose packaged constitution may
