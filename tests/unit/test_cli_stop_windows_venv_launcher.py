@@ -76,6 +76,40 @@ def test_a_listener_owned_by_the_launchers_interpreter_belongs_to_the_host(venv,
     assert cli_stop._listener_is_owned_by(PORT, 1520) is True
 
 
+def test_a_home_reached_through_a_link_still_matches_the_interpreter(tmp_path, monkeypatch):
+    """uv's pyvenv.cfg names a minor-version junction; the image resolves past it.
+
+    Run 43922732579 on windows-latest: home ``cpython-3.13-windows-x86_64-none``,
+    interpreter image ``cpython-3.13.18-windows-x86_64-none\\python.exe``. A
+    symlink stands in for the junction here.
+    """
+    real = tmp_path / "uv-python" / "cpython-3.13.18-windows-x86_64-none"
+    real.mkdir(parents=True)
+    (real / "python.exe").write_bytes(b"")
+    link = tmp_path / "uv-python" / "cpython-3.13-windows-x86_64-none"
+    link.symlink_to(real, target_is_directory=True)
+    root = tmp_path / "checkout" / ".venv"
+    (root / "Scripts").mkdir(parents=True)
+    (root / "pyvenv.cfg").write_text(f"home = {link}\n", encoding="utf-8")
+
+    interpreter = _FakeProcess(real / "python.exe", connections=[_listener()])
+    launcher = _FakeProcess(root / "Scripts" / "python.exe", children=[interpreter])
+    _patch_processes(monkeypatch, {1520: launcher})
+
+    assert cli_stop._listener_is_owned_by(PORT, 1520) is True
+
+
+def test_a_home_that_does_not_exist_matches_nothing(venv, monkeypatch):
+    (venv.launcher.parent.parent / "pyvenv.cfg").write_text(
+        f"home = {venv.base / 'gone'}\n", encoding="utf-8"
+    )
+    interpreter = _FakeProcess(venv.interpreter, connections=[_listener()])
+    launcher = _FakeProcess(venv.launcher, children=[interpreter])
+    _patch_processes(monkeypatch, {1520: launcher})
+
+    assert cli_stop._listener_is_owned_by(PORT, 1520) is False
+
+
 def test_a_child_running_anything_but_the_base_interpreter_is_not_the_host(venv, monkeypatch):
     stranger = _FakeProcess(venv.base / "evil.exe", connections=[_listener()])
     other_python = _FakeProcess(Path("C:/Other/Python313/python.exe"), connections=[_listener()])
