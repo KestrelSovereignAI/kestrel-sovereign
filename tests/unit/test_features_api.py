@@ -2011,6 +2011,77 @@ class TestInstallFeature:
         assert venv.installed["kestrel-feature-test"] == "0.4.0"
         assert venv.editable[CORE] == "/src/core"
 
+    # -- the host manifest records the install (#4127) ------------------------
+    #
+    # `kestrel update`'s `uv sync` removes every package core's lock does not
+    # name, and `feature sync` restores only what the host manifest declares.
+    # The console is the CLI's other door, so it records what it installed too.
+
+    @staticmethod
+    def _host_manifest():
+        return cli._host_manifest_path(SimpleNamespace(manifest=None))
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_console_install_is_recorded_in_the_host_manifest(
+        self, mock_registry, monkeypatch,
+    ):
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        self._venv(monkeypatch, feature_requires=">=0.52")
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200
+        declared = {
+            entry["name"]: entry for entry in cli._load_host_manifest(self._host_manifest())
+        }
+        assert declared["kestrel-feature-test"]["pypi"] == ""
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_console_install_that_cannot_be_recorded_is_not_a_success(
+        self, mock_registry, monkeypatch,
+    ):
+        """Installed and unrecorded: the next update removes it, so say so."""
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        venv = self._venv(monkeypatch, feature_requires=">=0.52")
+        # Every reader loads it (it declares nothing); no entry can join it.
+        self._host_manifest().write_text("feature = []\n", encoding="utf-8")
+
+        with TestClient(_make_app(_make_agent()), raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert "kestrel-feature-test is installed, but recording it" in detail
+        assert 'name = "kestrel-feature-test"' in detail
+        assert venv.installed["kestrel-feature-test"] == "0.4.0"
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_a_console_install_records_only_after_the_drift_check(
+        self, mock_registry, monkeypatch,
+    ):
+        """The drift check runs on every path; nothing the record does may skip it."""
+        from kestrel_sovereign import cli_features
+
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        self._venv(monkeypatch, feature_requires=">=0.52")
+        order = []
+        real_resolve = cli_features.CoreInstallGuard.resolve
+        monkeypatch.setattr(
+            cli_features.CoreInstallGuard, "resolve",
+            lambda guard, **kw: order.append("resolve") or real_resolve(guard, **kw),
+        )
+        monkeypatch.setattr(
+            cli_features, "record_feature_install",
+            lambda package: order.append("record") or None,
+        )
+
+        with TestClient(_make_app(_make_agent())) as client:
+            resp = client.post("/api/features/test-pkg/install")
+
+        assert resp.status_code == 200
+        assert order == ["resolve", "record"]
+
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_install_reports_and_restores_a_replaced_core(self, mock_registry, monkeypatch):
         """An install that bypassed the pin cannot return a clean 'installed'.
@@ -2551,6 +2622,52 @@ class TestRemoveFeature:
         assert "SecondFeature" not in agent.features
         command = mock_run.call_args.args[0]
         assert command[-2:] == ["-y", "kestrel-feature-multi"]
+
+    # -- the host manifest forgets what the console removed (#4127) -----------
+
+    @staticmethod
+    def _remove_multi(mock_pkg, mock_registry, mock_run, manifest_text):
+        mock_pkg.return_value = None
+        mock_registry.return_value = {"multi-pkg": FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature"], description="multi",
+        )}
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        manifest = cli._host_manifest_path(SimpleNamespace(manifest=None))
+        manifest.write_text(manifest_text, encoding="utf-8")
+        agent = _lifecycle_agent(features={"FirstFeature": _make_feature(name="FirstFeature")})
+        with TestClient(_make_app(agent), raise_server_exceptions=False) as client:
+            return client.post("/api/features/multi-pkg/remove"), manifest
+
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    def test_a_removed_package_is_no_longer_declared(self, mock_pkg, mock_registry, mock_run):
+        """Left declared, the next update or sync would install it again."""
+        keep = '[[feature]]\nname = "kestrel-feature-github"\npypi = ""\n'
+        resp, manifest = self._remove_multi(
+            mock_pkg, mock_registry, mock_run,
+            keep + '\n[[feature]]\nname = "kestrel-feature-multi"\npypi = ""\n',
+        )
+
+        assert resp.status_code == 200
+        assert manifest.read_text(encoding="utf-8") == keep + "\n"
+
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    def test_a_removal_the_manifest_cannot_forget_is_not_a_success(
+        self, mock_pkg, mock_registry, mock_run,
+    ):
+        text = (
+            '[[feature]]\nname = "kestrel-feature-multi"\npypi = ""\n'
+            'note = """\n[[feature]]\n"""\n'
+        )
+        resp, manifest = self._remove_multi(mock_pkg, mock_registry, mock_run, text)
+
+        assert resp.status_code == 500
+        assert "kestrel-feature-multi was uninstalled, but removing it" in resp.json()["detail"]
+        assert manifest.read_text(encoding="utf-8") == text
 
     @patch("kestrel_sovereign.endpoints.features.subprocess.run")
     @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")

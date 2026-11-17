@@ -1463,17 +1463,22 @@ def test_an_unreadable_host_manifest_refuses_an_install_held_to_a_lock(
 
 
 def test_without_a_lock_the_host_manifest_is_never_read(
-    monkeypatch, fake_registry, tmp_path,
+    monkeypatch, fake_registry, tmp_path, capsys,
 ):
-    """No lock, nothing for the declarations to decide: installs run as before."""
+    """No lock, nothing for the declarations to decide: installs run as before.
+
+    Recording the install in that manifest is another matter (#4127): it
+    cannot be appended to, so the command fails naming it, after the install.
+    """
     venv = _venv(_checkout(tmp_path, lock=None))
     _host_manifest(tmp_path, "this is = not [toml")
     use_fake_uv(monkeypatch, venv)
 
     rc = cli.cmd_feature_install(argparse.Namespace(name="voice"))
 
-    assert rc == 0
     assert venv.installed[VOICE] == "0.4.0"
+    assert rc == 1
+    assert "recording it in the host manifest" in capsys.readouterr().err
 
 
 # --- where the host manifest is: the project directory, never the cwd -------

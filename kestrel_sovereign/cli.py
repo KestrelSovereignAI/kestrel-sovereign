@@ -2412,6 +2412,7 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _resolve_pull_target,
     _git_reattach_if_safely_detached,
     _run_uv_sync,
+    _uv_sync_removals,
     _run_uv_pip_install_editable,
     _run_sync_preflight,
     _run_update_continuation,

@@ -42,7 +42,9 @@ def stub_project_dir(tmp_path, monkeypatch):
     and reads its lock; that has its own tests (``test_sync_preflight.py``),
     so here the fetch is a no-op, the pull brings no new revision, and the
     preflight agrees. The pull then fast-forwards to the upstream as fetched
-    (#3832), which is where HEAD already is, and stays."""
+    (#3832), which is where HEAD already is, and stays. The check for
+    extensions nothing records (#4127) likewise has its own tests
+    (``test_feature_install_record.py``) and finds none here."""
     (tmp_path / ".git").mkdir()
     (tmp_path / "pyproject.toml").touch()
     monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
@@ -57,6 +59,7 @@ def stub_project_dir(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cli, "_git_head", lambda _: UPSTREAM)
     monkeypatch.setattr(cli, "_run_sync_preflight", lambda *a, **kw: 0)
+    monkeypatch.setattr(cli_lifecycle, "_unrecorded_extension_gate", lambda *a, **kw: 0)
     return tmp_path
 
 
