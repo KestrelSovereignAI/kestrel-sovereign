@@ -30,7 +30,7 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from kestrel_sdk.tools.base import ToolCategory
@@ -40,6 +40,7 @@ from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.logging_config import exception_log_summary, exception_frames
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
+from kestrel_sovereign.features.storage_access import hides_persisted_user_content
 
 from .atomic_file import (
     file_digest as _strategy_digest,
@@ -63,7 +64,13 @@ from .blocker_reconcile import (
     resolve_blocker_reference,
     split_issue_reference,
 )
-from .decision_index import decision_entries, project_decisions
+from .decision_index import (
+    DecisionSupersession,
+    decision_entries,
+    project_decisions,
+    supersede_entries,
+    supersession_of,
+)
 from .github_integration import get_github_self_repo
 from .issue_selection import (
     EXCLUDED_TALON_WORKSPACE_UNCONFIRMED,
@@ -403,6 +410,11 @@ class StrategicMemoryFeature(Feature):
         # turn, keyed by their digest: the file is read at every turn start,
         # and parsed again only when its bytes changed (#3900).
         self._turn_decisions: Optional[Tuple[str, List[Dict[str, Any]]]] = None
+        # Held by every decision projection, and by a supersession from its
+        # file write through its re-projection. A projection that read the
+        # entries before a supersession was written would otherwise land
+        # after it, and put the decision back to current (#4154).
+        self._decision_index_lock = asyncio.Lock()
 
     @property
     def tool_description(self) -> str:
@@ -942,6 +954,10 @@ class StrategicMemoryFeature(Feature):
                 return value
         return None
 
+    def _decision_graph_store(self) -> Any:
+        storage = getattr(self.agent, "storage", None)
+        return getattr(storage, "graph", None) if storage else None
+
     async def _reindex_decisions(self) -> Dict[str, Any]:
         """Project STRATEGY.yaml decisions into the graph.
 
@@ -953,6 +969,17 @@ class StrategicMemoryFeature(Feature):
         index — otherwise ``recall_decisions`` returns decisions absent from the
         canonical file, which is the opposite of a derived index.
         """
+        async with self._decision_index_lock:
+            return await self._project_decision_index()
+
+    async def _project_decision_index(
+        self, changed: Collection[str] = ()
+    ) -> Dict[str, Any]:
+        """The projection :meth:`_reindex_decisions` runs, under its lock.
+
+        ``changed`` names nodes whose entries the caller has just rewritten
+        (see :func:`project_decisions`).
+        """
         agent_id = self._projection_agent_id()
         if not agent_id:
             logger.warning(
@@ -962,15 +989,141 @@ class StrategicMemoryFeature(Feature):
                     "skipped_reason": "no_agent_identity"}
         entries = decision_entries(self._data)
         try:
-            storage = getattr(self.agent, "storage", None)
-            graph_store = getattr(storage, "graph", None) if storage else None
-            report = await project_decisions(graph_store, agent_id, entries)
+            report = await project_decisions(
+                self._decision_graph_store(), agent_id, entries, changed=changed
+            )
         except Exception as e:  # noqa: BLE001 - the index is best-effort
             logger.warning("decision index projection failed: %s", e)
             return {"projected": 0, "skipped": 0, "failed": len(entries)}
         if report.get("failed") or report.get("skipped_reason"):
             logger.info("decision index: %s", report)
         return report
+
+    async def supersede_decision(
+        self,
+        node_id: str,
+        superseded_by: str,
+        *,
+        superseded_at: str,
+        reason: Optional[str] = None,
+    ) -> DecisionSupersession:
+        """Record in STRATEGY.yaml that decision ``node_id`` was superseded.
+
+        The graph path's way in: ``mark_superseded`` calls this for a decision
+        projected from this file, because the file is where the decision lives
+        and a supersession only the graph held would be undone by the next
+        reindex (#4154). The change goes through the same digest-checked,
+        atomic write as every other STRATEGY.yaml change, and the node is then
+        re-projected from what was written. Not a tool.
+
+        When the write is refused or fails, nothing is recorded anywhere: the
+        in-memory copy is put back as it was, so no later save can carry a
+        supersession this one did not write. A privacy mode that forbids
+        durable writes refuses it before anything is written.
+
+        A file edited since this feature last read or wrote it is refused, not
+        re-read and written again as the other STRATEGY.yaml changes are. The
+        caller decided this supersession on the decisions the graph showed,
+        which were projected from that read; the edit may give the same
+        decision a supersession of its own, and writing over it would replace
+        the operator's answer with one decided without seeing it. Instead the
+        file is re-read and its decisions re-projected, so the caller can see
+        the edit and supersede again if it still holds.
+        """
+        agent_id = self._projection_agent_id()
+        if not agent_id:
+            return DecisionSupersession(
+                recorded=False,
+                error="the agent exposes no agent_id/did/id to find the decision by",
+            )
+
+        def mark(strategy: Dict[str, Any]) -> None:
+            decisions = strategy.get("decisions")
+            if not isinstance(decisions, list):
+                raise _StrategyFileConflict(
+                    "its 'decisions' section is "
+                    + ("missing" if decisions is None else f"a {type(decisions).__name__}")
+                    + ", not a list holding this decision"
+                )
+            if not supersede_entries(
+                decisions,
+                agent_id,
+                node_id,
+                superseded_by=superseded_by,
+                superseded_at=superseded_at,
+                reason=reason,
+            ):
+                raise _StrategyFileConflict(
+                    f"it holds no decision that projects to {node_id}"
+                )
+
+        async with self._decision_index_lock:
+            # Checked after the lock is held and with no await before the
+            # write, so a mode change cannot land between the two. The graph
+            # path this replaces was refused in these modes by the graph
+            # wrapper (#2672); writing the file instead must not turn that
+            # into a durable record of a volatile session.
+            if hides_persisted_user_content(self.agent):
+                return DecisionSupersession(
+                    recorded=False,
+                    error=(
+                        "the current privacy mode forbids durable writes, and "
+                        "STRATEGY.yaml is a durable file"
+                    ),
+                )
+            data_before = copy.deepcopy(self._data)
+            outcome = self._apply_and_save(mark, reapply=False)
+            if not outcome.persisted:
+                self._data = data_before
+                error = outcome.error or "STRATEGY.yaml was not written"
+                reread = outcome.refused and self._reread_strategy()
+                if reread:
+                    # The file wins: the node follows the edit, whatever it
+                    # says about this decision, and a disagreement is logged.
+                    await self._project_decision_index()
+                    error += (
+                        f" {self.STRATEGY_FILENAME} has been re-read and its "
+                        "decisions re-indexed, so recall_decisions shows it as "
+                        "it now stands; supersede again if that still holds."
+                    )
+                return DecisionSupersession(
+                    recorded=False,
+                    error=error,
+                    conflict=outcome.refused,
+                    reread=reread,
+                )
+            await self._project_decision_index(changed={node_id})
+            projected = await self._node_follows_file(
+                node_id,
+                {
+                    "superseded_by": superseded_by,
+                    "superseded_at": superseded_at,
+                    "superseded_reason": reason,
+                },
+            )
+        return DecisionSupersession(recorded=True, projected=projected)
+
+    async def _node_follows_file(
+        self, node_id: str, supersession: Dict[str, Any]
+    ) -> bool:
+        """Whether the graph node now carries ``supersession``, read back.
+
+        Read back rather than inferred from the projection's counts, which
+        cover every decision and so cannot say whether this one landed.
+        """
+        graph_store = self._decision_graph_store()
+        if graph_store is None:
+            return False
+        try:
+            node = await graph_store.get_node(node_id)
+        except Exception as e:  # noqa: BLE001 - the index is best-effort
+            if is_execution_control_error(e):
+                raise
+            logger.warning("could not read back decision %s: %s", node_id, e)
+            return False
+        if node is None:
+            return False
+        return supersession_of(node.properties or {}) == supersession_of(supersession)
 
     async def recent_decisions(self, earliest: date) -> RecentDecisions:
         """Decisions dated ``earliest`` or later, read from STRATEGY.yaml now.
@@ -1154,6 +1307,78 @@ class StrategicMemoryFeature(Feature):
         outcome.reloaded = True
         return outcome
 
+    def _apply_and_save(
+        self,
+        mutation: Callable[[Dict[str, Any]], None],
+        *,
+        reapply: bool = True,
+    ) -> _SaveOutcome:
+        """Apply ``mutation`` in memory and save; if that is refused, apply it
+        to STRATEGY.yaml as it now stands and write that (#2273).
+
+        ``mutation`` must raise :class:`_StrategyFileConflict` rather than
+        apply to data that lacks the shape it needs. On a refusal the
+        in-memory copy may hold the change; the caller decides what to put
+        back.
+
+        ``reapply=False`` keeps the refusal instead, for a change that is only
+        right against the copy it was decided on: applied again to a file
+        someone else has since edited, it could overwrite that edit's own
+        answer to the same question (#4154).
+        """
+        try:
+            mutation(self._data)
+        except _StrategyFileConflict as e:
+            outcome = self._refused_save(
+                "this change does not apply to "
+                f"{self._strategy_path or self.STRATEGY_FILENAME}: {e}"
+            )
+        else:
+            outcome = self._save()
+        if (
+            reapply
+            and outcome.refused
+            and self._strategy_path is not None
+            and HAS_YAML
+        ):
+            outcome = self._reload_and_reapply(mutation)
+        return outcome
+
+    def _reread_strategy(self) -> bool:
+        """Make the in-memory copy STRATEGY.yaml as it now stands, if it changed.
+
+        Returns whether it did. Only a file that still parses as a mapping
+        replaces the copy: a removed or unreadable file is left for the next
+        write to refuse, as :meth:`_reload_and_reapply` does, rather than read
+        as an empty brief. Like every reload, this drops in-memory changes the
+        file never received.
+        """
+        path = self._strategy_path
+        if path is None or not HAS_YAML:
+            return False
+        try:
+            raw = _read_strategy_bytes(path)
+            if raw is None:
+                logger.warning(
+                    "%s was removed after it was loaded; keeping the copy read "
+                    "before",
+                    path,
+                )
+                return False
+            digest = _strategy_digest(raw)
+            if digest == self._disk_digest:
+                return False
+            fresh = _parse_strategy(raw, path)
+        except OSError as e:
+            logger.warning("could not re-read %s: %s", path, e)
+            return False
+        except _StrategyFileConflict as e:
+            logger.warning("could not re-read %s: %s", path, e)
+            return False
+        self._data = fresh
+        self._disk_digest = digest
+        return True
+
     def _persisted_result(
         self,
         confirmation: str,
@@ -1175,17 +1400,7 @@ class StrategicMemoryFeature(Feature):
         - Persisted -> OK.
         """
         before = copy.deepcopy(self._data)
-        try:
-            mutation(self._data)
-        except _StrategyFileConflict as e:
-            outcome = self._refused_save(
-                "this change does not apply to "
-                f"{self._strategy_path or self.STRATEGY_FILENAME}: {e}"
-            )
-        else:
-            outcome = self._save()
-        if outcome.refused and self._strategy_path is not None and HAS_YAML:
-            outcome = self._reload_and_reapply(mutation)
+        outcome = self._apply_and_save(mutation)
         reloaded = {"reloaded_from_disk": True} if outcome.reloaded else {}
         if outcome.no_path:
             return ToolResult.failed(
