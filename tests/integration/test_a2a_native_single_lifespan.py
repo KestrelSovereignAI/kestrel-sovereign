@@ -19,6 +19,40 @@ from kestrel_sovereign.testing.native_shutdown_budget import (
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 
+@pytest.mark.parametrize("fleet_selector", ["environment", "configuration"])
+@pytest.mark.parametrize("mode", ["isolated", "automatic"])
+async def test_fleet_lifespan_rejects_standalone_peer_policy_before_resources(
+    tmp_path, monkeypatch, fleet_selector, mode,
+):
+    from kestrel_sovereign.features.peers.directory import (
+        PeerDirectoryConfigurationError,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_API_KEY", "isolated-native-fleet-refusal")
+    monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
+    monkeypatch.setenv("KESTREL_BASE_URL", "https://fleet.native.test")
+    monkeypatch.setenv("KESTREL_A2A_PUSH_ENABLED", "false")
+    monkeypatch.setenv("KESTREL_A2A_PEER_POLICY", mode)
+    configuration = tmp_path / "multi_agent.toml"
+    monkeypatch.setenv("KESTREL_MULTI_AGENT_CONFIG", str(configuration))
+    if fleet_selector == "environment":
+        monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    else:
+        monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
+        configuration.write_text("[host]\nport = 8765\n\n[agents]\n", encoding="utf-8")
+    app = FastAPI()
+    expected = "only supported by standalone" if mode == "isolated" else "must be 'isolated'"
+    with pytest.raises(PeerDirectoryConfigurationError, match=expected):
+        async with server.lifespan(app):
+            pytest.fail("Fleet startup silently accepted a standalone peer policy")
+    assert app.state.fleet_host is True
+    assert getattr(app.state, "agent_manager", None) is None
+    assert getattr(app.state, "distributed_invocation_registry", None) is None
+
+
 @pytest.mark.parametrize("push", ["false", "true"])
 @pytest.mark.parametrize("peer_policy", ["injected", "isolated"])
 async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_close(
