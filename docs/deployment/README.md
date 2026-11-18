@@ -41,6 +41,17 @@ the CLI is a thin wrapper over `DeployManager` and the build/secrets ports.
 
 Run `uv run kestrel deploy --help` for the full flag set.
 
+The durable single-agent production profile explicitly selects
+`KESTREL_A2A_PEER_POLICY=isolated`: its signed native discovery card is published,
+but no inbound sender or outbound peer is trusted. This is not a privacy mode
+or a replacement identity. It keeps the original runtime, database custody,
+native authorization checks and readiness gate. Missing peer configuration
+does **not** select isolation automatically. Combining this policy with an
+injected directory/resolver, a discovered host directory, `KESTREL_HOST_URL`,
+any `KESTREL_A2A_PEER_IDENTITY_*` setting or `KESTREL_A2A_FEDERATED_DID` refuses
+startup, even when a conflicting setting is empty or false. Fleet and tenant
+embeddings must retain their own explicit scoped peer policy instead.
+
 A profile deploy succeeds only when the new revision passes the post-deploy
 readiness gate (`GET <service_url>` + `[manager].health_check_path` returning
 2xx/3xx within `health_check_timeout_seconds`, and not reporting

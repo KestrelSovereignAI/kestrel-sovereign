@@ -223,6 +223,7 @@ def test_prod_profile_declares_explicit_native_a2a_authority(live_config):
     assert env["KESTREL_A2A_DISCOVERY_AGENT"] == env["KESTREL_EXPECTED_DID"]
     assert env["KESTREL_A2A_DISCOVERY_AGENT"] == "${KESTREL_PROD_EXPECTED_DID}"
     assert env["KESTREL_A2A_PUSH_ENABLED"] == "false"
+    assert env["KESTREL_A2A_PEER_POLICY"] == "isolated"
 
 
 def test_prod_publication_resolves_the_existing_pinned_identity(live_config, monkeypatch):

@@ -39,6 +39,54 @@ if TYPE_CHECKING:
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
+def configure_single_agent_native_peer_policy(
+    recipient, environment: Mapping[str, str], *, router, requester,
+):
+    """Install only an explicitly selected, non-conflicting isolated policy.
+
+    No configured mode leaves the embedding's original dependencies intact,
+    including malformed or revoked ones: the native authority still refuses
+    them. Isolation never replaces an injected or process/host-scoped policy.
+    """
+    from kestrel_sovereign.a2a.did_registry import ProcessA2ADidResolver
+    from kestrel_sovereign.features.peers.directory import (
+        IsolatedPeerDirectory,
+        PeerDirectoryConfigurationError,
+    )
+
+    mode = environment.get("KESTREL_A2A_PEER_POLICY")
+    if mode is None:
+        return router, requester
+    if mode != "isolated":
+        raise PeerDirectoryConfigurationError(
+            "KESTREL_A2A_PEER_POLICY must be 'isolated' when configured"
+        )
+    conflicting_environment = any(
+        key.startswith("KESTREL_A2A_PEER_IDENTITY_")
+        or key in {"KESTREL_A2A_FEDERATED_DID", "KESTREL_HOST_URL"}
+        for key in environment
+    )
+    if conflicting_environment or any(
+        value is not None
+        for value in (
+            router, requester,
+            getattr(recipient, "peer_directory_router", None),
+            getattr(recipient, "peer_requester", None),
+            getattr(recipient, "a2a_did_resolver", None),
+            getattr(recipient, "_a2a_process_did_resolver", None),
+            getattr(recipient, "a2a_inbound_sender_authorizer", None),
+        )
+    ):
+        raise PeerDirectoryConfigurationError(
+            "Isolated A2A peer policy conflicts with configured peer authority"
+        )
+    directory = IsolatedPeerDirectory(resolve_scoped_agent_did(recipient))
+    resolver = ProcessA2ADidResolver((), federated_fallback=False)
+    recipient.a2a_did_resolver = resolver.resolve
+    recipient._a2a_process_did_resolver = resolver
+    return directory, directory.requester
+
+
 class _SingleAgentNativeRequest:
     """Keep one resolved sender document in its original request lifetime."""
 

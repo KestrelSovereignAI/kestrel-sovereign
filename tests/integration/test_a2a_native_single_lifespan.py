@@ -4,22 +4,25 @@ import asyncio
 
 import httpx
 import pytest
-from kestrel_sdk.native_a2a.types import AgentCard
 from fastapi import FastAPI
 from google.protobuf.json_format import ParseDict
+from kestrel_sdk.native_a2a.types import AgentCard
 
 from kestrel_sovereign import server
 from kestrel_sovereign.a2a.did_registry import ProcessA2ADidResolver
 from kestrel_sovereign.a2a.native_card import verify_native_agent_card
 from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.testing.native_shutdown_budget import (
+    reserve_native_shutdown_budget,
+)
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
-from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
 
 
 @pytest.mark.parametrize("push", ["false", "true"])
+@pytest.mark.parametrize("peer_policy", ["injected", "isolated"])
 async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_close(
-    tmp_path, monkeypatch, push,
+    tmp_path, monkeypatch, push, peer_policy,
 ):
     from kestrel_sovereign.llm import service as service_module
 
@@ -36,6 +39,9 @@ async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_
     monkeypatch.setenv("KESTREL_BASE_URL", "https://single.native.test")
     monkeypatch.setenv("KESTREL_A2A_DISCOVERY_AGENT", "single")
     monkeypatch.setenv("KESTREL_A2A_PUSH_ENABLED", push)
+    monkeypatch.delenv("KESTREL_A2A_PEER_POLICY", raising=False)
+    if peer_policy == "isolated":
+        monkeypatch.setenv("KESTREL_A2A_PEER_POLICY", "isolated")
     monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
     monkeypatch.delenv("LIGHTHOUSE_API_KEY", raising=False)
@@ -60,19 +66,27 @@ async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_
     def construct(**kwargs):
         # Supply the embedding's actual scoped dependencies at construction;
         # initialize(), READY and every publication/retirement body run intact.
-        agent = original_constructor(
-            **kwargs,
-            allowed_features=set(),
-            peer_directory_router=ExplicitDirectory(),
-            peer_requester=PeerRequester(credentials.agent_did, object()),
-        )
-        agent.a2a_did_resolver = ProcessA2ADidResolver(()).resolve
+        if peer_policy == "injected":
+            agent = original_constructor(
+                **kwargs,
+                allowed_features=set(),
+                peer_directory_router=ExplicitDirectory(),
+                peer_requester=PeerRequester(credentials.agent_did, object()),
+            )
+            agent.a2a_did_resolver = ProcessA2ADidResolver(()).resolve
+        else:
+            # Real standalone feature initialization, with no injected
+            # directory, requester, signing documents or resolver.
+            agent = original_constructor(**kwargs, allowed_features={"PeersFeature"})
         candidates.append(agent)
         return agent
 
     monkeypatch.setattr(server, "KestrelAgent", construct)
     app = FastAPI()
     async with server.lifespan(app):
+        assert getattr(app.state, "startup_error", None) is None, (
+            "configured standalone peer policy must permit actual native startup"
+        )
         assert len(candidates) == 1 and app.state.agent is candidates[0]
         agent = candidates[0]
         # CI's worker-retirement reservation can exceed the complete default

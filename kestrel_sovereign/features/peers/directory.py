@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -136,12 +136,12 @@ class PeerDirectoryRouter(Protocol):
 
     async def resolve_peer(
         self, requester: PeerRequester, peer_name_or_slug: str,
-    ) -> Optional[PeerIdentity]:
+    ) -> PeerIdentity | None:
         """Resolve an automatic-directory name/slug, or return ``None``."""
 
     async def resolve_peer_by_agent_id(
         self, requester: PeerRequester, agent_id: str,
-    ) -> Optional[PeerIdentity]:
+    ) -> PeerIdentity | None:
         """Reauthorize one persisted automatic peer by its stable identity.
 
         This method is intentionally for feature-owned retained state only
@@ -168,6 +168,47 @@ class PeerDirectoryRouter(Protocol):
 
     def open_a2a_session(self, requester: PeerRequester, peer: PeerIdentity):
         """Open an authorized official-SDK session for a stable peer binding."""
+
+
+class IsolatedPeerDirectory:
+    """An explicitly selected standalone scope with no authorized peers.
+
+    The host creates this scope; missing or revoked directory configuration
+    must never select it implicitly. It performs no discovery or transport.
+    """
+
+    def __init__(self, recipient_id: str) -> None:
+        self.requester = PeerRequester(recipient_id, self)
+
+    def _require_requester(self, requester: PeerRequester) -> None:
+        if requester is not self.requester:
+            raise PeerAccessDeniedError("Requester does not own the isolated peer scope")
+
+    async def list_peers(self, requester: PeerRequester) -> Sequence[PeerIdentity]:
+        self._require_requester(requester)
+        return ()
+
+    async def resolve_peer(
+        self, requester: PeerRequester, peer_name_or_slug: str,
+    ) -> PeerIdentity | None:
+        self._require_requester(requester)
+        raise PeerNotFoundError("Isolated peer policy has no authorized peers")
+
+    async def resolve_peer_by_agent_id(
+        self, requester: PeerRequester, agent_id: str,
+    ) -> PeerIdentity | None:
+        self._require_requester(requester)
+        raise PeerNotFoundError("Isolated peer policy has no authorized peers")
+
+    async def authorize_inbound_sender(
+        self, requester: PeerRequester, sender_id: str,
+    ) -> bool:
+        self._require_requester(requester)
+        return False
+
+    def open_a2a_session(self, requester: PeerRequester, peer: PeerIdentity):
+        self._require_requester(requester)
+        raise PeerNotFoundError("Isolated peer policy has no authorized peers")
 
 
 
@@ -359,7 +400,7 @@ class LocalHostPeerDirectory:
     @execution_work_operation
     async def resolve_peer(
         self, requester: PeerRequester, peer_name_or_slug: str,
-    ) -> Optional[PeerIdentity]:
+    ) -> PeerIdentity | None:
         if not isinstance(peer_name_or_slug, str) or not peer_name_or_slug.strip():
             return None
         needle = peer_name_or_slug.casefold()
@@ -374,7 +415,7 @@ class LocalHostPeerDirectory:
     @execution_work_operation
     async def resolve_peer_by_agent_id(
         self, requester: PeerRequester, agent_id: str,
-    ) -> Optional[PeerIdentity]:
+    ) -> PeerIdentity | None:
         """Resolve persisted identity through the current local directory.
 
         The caller supplies this value only from feature-owned durable state;
