@@ -31,6 +31,9 @@ from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
     require_execution_work,
 )
+from kestrel_sovereign.features.peers.directory import (
+    resolve_agent_peer_directory_context,
+)
 from kestrel_sovereign.features.storage_access import resolve_scoped_agent_did
 from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 
@@ -78,6 +81,7 @@ def _configure_single_agent_native_peer_policy(
 
     if validate_native_peer_policy(environment, fleet_host=False) is None:
         return router, requester
+    effective = resolve_agent_peer_directory_context(recipient)
     conflicting_environment = any(
         key.startswith("KESTREL_A2A_PEER_IDENTITY_")
         or key in {"KESTREL_A2A_FEDERATED_DID", "KESTREL_HOST_URL"}
@@ -86,7 +90,7 @@ def _configure_single_agent_native_peer_policy(
     if conflicting_environment or any(
         value is not None
         for value in (
-            router, requester,
+            router, requester, effective.router, effective.requester,
             getattr(recipient, "peer_directory_router", None),
             getattr(recipient, "peer_requester", None),
             getattr(recipient, "a2a_did_resolver", None),
@@ -99,6 +103,17 @@ def _configure_single_agent_native_peer_policy(
         )
     directory = IsolatedPeerDirectory(resolve_scoped_agent_did(recipient))
     resolver = ProcessA2ADidResolver((), federated_fallback=False)
+    if effective.feature is not None:
+        install = getattr(effective.feature, "install_isolated_peer_directory", None)
+        if not callable(install):
+            raise PeerDirectoryConfigurationError("Peers feature cannot bind isolated policy")
+        install(directory)
+        bound = resolve_agent_peer_directory_context(recipient)
+        if (
+            bound.feature is not effective.feature or bound.router is not directory
+            or bound.requester is not directory.requester
+        ):
+            raise PeerDirectoryConfigurationError("Isolated policy was not bound to its feature owner")
     recipient.peer_directory_router = directory
     recipient.peer_requester = directory.requester
     recipient.a2a_did_resolver = resolver.resolve
@@ -231,10 +246,14 @@ class SingleAgentNativeAuthority:
         if runtime is not None and not isinstance(runtime, ExecutionCustody):
             raise TypeError("Native runtime requires its original execution custody")
         require_execution_work(recipient)
+        effective = resolve_agent_peer_directory_context(recipient)
+        if effective.router is not router or effective.requester is not requester:
+            raise ValueError("Native runtime requires its effective feature-owned peer scope")
         self.runtime = runtime
         self.ready = ready
         self.resolver, self.authorizer = resolver, authorizer
         self.router, self.requester = router, requester
+        self._directory_feature = effective.feature
         self.proof_policy, self.clock = proof_policy, clock
         self._lifecycle = AsyncReaderWriterLock()
         self._publication: NativeA2APublication | None = None
@@ -282,6 +301,13 @@ class SingleAgentNativeAuthority:
             raise HTTPException(
                 status_code=403, detail="Native recipient runtime changed"
             )
+        effective = resolve_agent_peer_directory_context(self.recipient)
+        if (
+            effective.feature is not self._directory_feature
+            or effective.router is not self.router
+            or effective.requester is not self.requester
+        ):
+            raise HTTPException(status_code=403, detail="Native recipient peer directory changed")
 
     def require_current(self):
         self._require_runtime()
@@ -449,6 +475,7 @@ async def prepare_single_agent_native_publication(
     configuration = NativeHostingConfiguration.from_environment(environment)
     if configuration is None:
         return None
+    require_execution_work(recipient)
     _configure_single_agent_native_peer_policy(
         recipient, environment,
         router=getattr(recipient, "peer_directory_router", None),

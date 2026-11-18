@@ -132,6 +132,23 @@ async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_
         assert publication is not None and publication.is_published, (
             "actual standalone startup did not publish its native contract"
         )
+        if peer_policy == "isolated":
+            from kestrel_sovereign.features.peers.directory import (
+                resolve_agent_peer_directory_context,
+            )
+
+            effective = resolve_agent_peer_directory_context(agent)
+            assert effective.feature is not None
+            assert effective.router is agent.peer_directory_router
+            assert effective.requester is agent.peer_requester
+            assert await effective.router.list_peers(effective.requester) == ()
+            # The ordinary public local-host refresh path must not replace an
+            # explicitly isolated feature with newly discovered peer trust.
+            refreshed = effective.feature.refresh_local_host_peer_directory(
+                host_url="https://unselected-parent.test", transport_key="unused",
+            )
+            assert refreshed[0] is effective.router
+            assert refreshed[1] is effective.requester
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="https://single.native.test"
         ) as client:
