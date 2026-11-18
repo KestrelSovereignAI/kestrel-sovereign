@@ -27,6 +27,9 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
 
 
+MCP_TASK_SCHEMA_REVISION = 2
+
+
 class MCPTaskConflict(NativeStoreConflict):
     """The original reservation cannot admit this change."""
 
@@ -85,6 +88,22 @@ class MCPTaskRecord:
         return json.loads(self._payload)['envelope']
 
     @property
+    def control(self) -> dict:
+        """Detached private lifetime history; never an execution credential."""
+        envelope = self.envelope
+        return envelope.get('control', {'inputs': {}, 'mutations': {}}) if envelope else {
+            'inputs': {}, 'mutations': {}}
+
+    @property
+    def pending_inputs(self) -> dict:
+        observation = self.observation
+        if observation is None or observation['status'] != 'input_required':
+            return {}
+        consumed = {key for receipt in self.control['mutations'].values()
+            for key in receipt['intent']['params'].get('inputResponses', {})}
+        return {key: value for key, value in observation['inputRequests'].items() if key not in consumed}
+
+    @property
     def observation(self) -> dict | None:
         envelope = self.envelope
         return envelope.get('observation') if envelope is not None else None
@@ -100,6 +119,23 @@ class MCPTaskIssuance:
 class MCPTaskReservation:
     record: MCPTaskRecord
     issuance: MCPTaskIssuance | None = field(default=None, repr=False)
+
+    @property
+    def fresh(self) -> bool:
+        return self.issuance is not None
+
+
+@dataclass(frozen=True)
+class MCPTaskMutationIssuance:
+    record: MCPTaskRecord
+    operation_id: str = field(repr=False)
+    secret: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class MCPTaskMutationReservation:
+    record: MCPTaskRecord
+    issuance: MCPTaskMutationIssuance | None = field(default=None, repr=False)
 
     @property
     def fresh(self) -> bool:
@@ -155,14 +191,16 @@ class MCPTaskStore(UnifiedStoreBase):
             binary = 'BYTEA' if self.is_postgres else 'BLOB'
             with repository_initialization_errors(integrity_error=MCPTaskIntegrityError,
                     unknown_message='MCP Task initialization requires reconciliation'):
+                # Keep the original shared lock across schema revisions.
+                # Revision1 retained only snapshots and cannot prove lifetime history.
                 async with self.database.migration_lock('kestrel-mcp-task-schema-v1'):
                     await self.database.execute('CREATE TABLE IF NOT EXISTS mcp_task_schema (singleton BIGINT PRIMARY KEY, revision BIGINT NOT NULL)')
                     revision = await self.database.fetchone('SELECT revision FROM mcp_task_schema WHERE singleton=1')
                     if revision is None:
                         await self.database.execute(f'CREATE TABLE mcp_task_keys (scope TEXT PRIMARY KEY, key_id TEXT NOT NULL UNIQUE, wrapped_key {binary} NOT NULL, revision BIGINT NOT NULL)')
                         await self.database.execute(f"CREATE TABLE mcp_task_records (scope TEXT NOT NULL, handle TEXT NOT NULL, operation_digest TEXT NOT NULL, binding_digest TEXT NOT NULL, remote_digest TEXT, revision BIGINT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('ISSUING','ATTACHED','SETTLED','NOT_SENT')), claim_hash TEXT, payload_limit BIGINT NOT NULL, payload {binary} NOT NULL, PRIMARY KEY(scope,handle), UNIQUE(scope,operation_digest), UNIQUE(scope,remote_digest), FOREIGN KEY(scope) REFERENCES mcp_task_keys(scope))")
-                        await self.database.execute('INSERT INTO mcp_task_schema(singleton,revision) VALUES (1,1)')
-                    elif revision != (1,):
+                        await self.database.execute('INSERT INTO mcp_task_schema(singleton,revision) VALUES (1,?)', (MCP_TASK_SCHEMA_REVISION,))
+                    elif revision != (MCP_TASK_SCHEMA_REVISION,):
                         raise MCPTaskIntegrityError('Unsupported MCP Task schema revision')
                     await self.database.fetchone('SELECT scope,key_id,wrapped_key,revision FROM mcp_task_keys WHERE 1=0')
                     await self.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload FROM mcp_task_records WHERE 1=0')
@@ -204,7 +242,8 @@ class MCPTaskStore(UnifiedStoreBase):
             return
         member = 'refusal' if phase == 'NOT_SENT' else 'native'
         remote_bound = task_id is not None
-        allowed = ({'version', 'native'}, {'version', 'native', 'observation'}) if remote_bound else ({'version', member},)
+        allowed = ({'version', 'native'}, {'version', 'native', 'observation'},
+            {'version', 'native', 'control'}, {'version', 'native', 'observation', 'control'}) if remote_bound else ({'version', member},)
         if (type(envelope) is not dict or set(envelope) not in allowed
                 or type(envelope['version']) is not int or envelope['version'] != 1
                 or type(envelope[member]) is not dict):
@@ -221,6 +260,7 @@ class MCPTaskStore(UnifiedStoreBase):
                     raise ValueError('MCP Task phase must match its confirmed observation')
             elif phase != 'ATTACHED':
                 raise ValueError('Settled remote Tasks require a terminal observation')
+            MCPTaskStore._control(task_id, envelope)
         elif phase == 'ATTACHED':
             raise ValueError('Attached MCP Tasks require their remote identity')
 
@@ -235,6 +275,68 @@ class MCPTaskStore(UnifiedStoreBase):
         if member is not None and type(observation.get(member)) is not dict:
             raise ValueError('MCP Task observation requires its native status payload')
         return observation['status'] in {'completed','failed','cancelled'}
+
+    @staticmethod
+    def _control(task_id, envelope):
+        control = envelope.get('control', {'inputs': {}, 'mutations': {}})
+        if (type(control) is not dict or set(control) != {'inputs', 'mutations'}
+                or type(control['inputs']) is not dict or type(control['mutations']) is not dict
+                or any(not isinstance(key, str) or type(request) is not dict
+                    for key, request in control['inputs'].items())):
+            raise ValueError('Invalid MCP Task input history')
+        consumed = set()
+        for operation, receipt in control['mutations'].items():
+            _binding_text(operation)
+            if type(receipt) is not dict or set(receipt) != {'intent', 'claim_hash', 'acknowledgement'}:
+                raise ValueError('Invalid MCP Task mutation receipt')
+            intent, ack, claim_hash = receipt['intent'], receipt['acknowledgement'], receipt['claim_hash']
+            if (type(intent) is not dict or set(intent) != {'method', 'params'}
+                    or intent['method'] not in ('tasks/update', 'tasks/cancel')
+                    or type(intent['params']) is not dict or intent['params'].get('taskId') != task_id):
+                raise ValueError('Invalid MCP Task mutation intent')
+            params = intent['params']
+            if intent['method'] == 'tasks/update':
+                responses = params.get('inputResponses')
+                if (set(params) != {'taskId', 'inputResponses'} or type(responses) is not dict
+                        or not responses or any(not isinstance(key, str) or type(value) is not dict
+                            for key, value in responses.items())
+                        or not set(responses) <= set(control['inputs']) or consumed.intersection(responses)):
+                    raise ValueError('Invalid MCP Task consumed input history')
+                consumed.update(responses)
+            elif set(params) != {'taskId'}:
+                raise ValueError('Invalid MCP Task cancellation intent')
+            if ack is None:
+                if not _is_digest(claim_hash):
+                    raise ValueError('Invalid MCP Task pending mutation claim')
+            elif claim_hash is not None or type(ack) is not dict or ack.get('resultType') != 'complete':
+                raise ValueError('Invalid MCP Task mutation acknowledgement')
+        observation = envelope.get('observation')
+        if observation is not None and observation['status'] == 'input_required':
+            for key, request in observation['inputRequests'].items():
+                if (not isinstance(key, str) or type(request) is not dict or key not in control['inputs']
+                        or not MCPTaskStore._same_json(request, control['inputs'][key])):
+                    raise ValueError('MCP Task snapshot does not match its original input history')
+        return control
+
+    @staticmethod
+    def _same_json(first, second):
+        return encode_inline_json(first, sort_keys=True) == encode_inline_json(second, sort_keys=True)
+
+    @staticmethod
+    def _snapshot(value):
+        return json.loads(encode_inline_json(value))
+
+    @staticmethod
+    def _retain_inputs(envelope, observation):
+        if observation['status'] != 'input_required':
+            return
+        control = envelope.setdefault('control', {'inputs': {}, 'mutations': {}})
+        for key, request in observation['inputRequests'].items():
+            if not isinstance(key, str) or type(request) is not dict:
+                raise ValueError('MCP Task input requests require opaque string keys and objects')
+            if key in control['inputs'] and not MCPTaskStore._same_json(control['inputs'][key], request):
+                raise MCPTaskConflict('MCP Task input key was reused for another request')
+            control['inputs'][key] = request
 
     def _encode(self, binding, columns, task_id, envelope):
         self._envelope(columns[6], task_id, envelope)
@@ -278,7 +380,14 @@ class MCPTaskStore(UnifiedStoreBase):
     async def _all(self):
         # Open every retained row before trusting phase/uniqueness projections.
         rows = await self.database.fetchall('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload FROM mcp_task_records WHERE scope=? ORDER BY handle', (self.scope,))
-        return [(self._open(row), row) for row in rows]
+        records = [(self._open(row), row) for row in rows]
+        operations = set()
+        for record, _ in records:
+            for operation in (record.binding.operation_id, *record.control['mutations']):
+                if operation in operations:
+                    raise MCPTaskIntegrityError('MCP Task operation has conflicting original custody')
+                operations.add(operation)
+        return records
 
     async def _lock(self):
         changed = await self.database.execute('UPDATE mcp_task_keys SET revision=revision+1 WHERE scope=?', (self.scope,))
@@ -321,6 +430,8 @@ class MCPTaskStore(UnifiedStoreBase):
             else:
                 existing = None
             if existing is None:
+                if any(binding.operation_id in record.control['mutations'] for record, _ in records):
+                    raise MCPTaskConflict('MCP Task original operation already owns a mutation')
                 if len(records) >= self.max_records:
                     raise MCPTaskConflict('MCP Task retained record capacity is exhausted')
                 if sum(record.phase in {'ISSUING','ATTACHED'} for record, _ in records) >= self.max_active:
@@ -345,6 +456,7 @@ class MCPTaskStore(UnifiedStoreBase):
             raise MCPTaskConflict('MCP Task requires its original issuance claim')
         expected = issuance.record
         self._binding_digest(expected.binding)
+        envelope = self._snapshot(envelope)
         claim_hash = hashlib.sha256(issuance.secret.encode()).hexdigest()
         async with self.write_transaction():
             await self._lock()
@@ -375,6 +487,110 @@ class MCPTaskStore(UnifiedStoreBase):
         self._envelope('ATTACHED', remote_task_id, envelope)
         return await self._finish(issuance, 'ATTACHED', remote_task_id, envelope)
 
+    async def _persist(self, actual, row, phase, envelope):
+        columns = (*row[:5], actual.revision + 1, phase, None, actual.payload_limit)
+        raw, ciphertext = self._encode(actual.binding, columns, actual.remote_task_id, envelope)
+        changed = await self.database.execute('UPDATE mcp_task_records SET revision=?,phase=?,payload=? WHERE scope=? AND handle=? AND revision=? AND phase=?',
+            (actual.revision + 1, phase, ciphertext, self.scope, actual.handle, actual.revision, actual.phase))
+        if changed != 1:
+            raise MCPTaskConflict('MCP Task original custody write was not stored')
+        return MCPTaskRecord(actual.handle, actual.revision + 1, phase, actual.payload_limit, actual.binding, raw)
+
+    def _expected(self, expected):
+        if (type(expected) is not MCPTaskRecord or type(expected.revision) is not int
+                or expected.revision < 0 or not isinstance(expected.handle, str)):
+            raise MCPTaskConflict('MCP Task requires its original custody record')
+        self._binding_digest(expected.binding)
+
+    @staticmethod
+    def _select(records, expected):
+        selected = [(record, row) for record, row in records if record.handle == expected.handle]
+        if len(selected) != 1 or selected[0][0].binding != expected.binding:
+            raise MCPTaskConflict('MCP Task original custody is absent or has another binding')
+        return selected[0]
+
+    async def reserve_mutation(self, expected: MCPTaskRecord, *, operation_id: str,
+                               kind: Literal['update', 'cancel'], input_responses: dict | None = None
+                               ) -> MCPTaskMutationReservation:
+        """Consume an authorized intent before wire, never recover its secret.
+
+        This private repository establishes no permission. The host must bind
+        operation_id to a fresh actual governed leaf and validate native input.
+        Even an unknown/no-send outcome keeps all admitted identities consumed.
+        """
+        self._ready()
+        self._expected(expected)
+        _binding_text(operation_id)
+        if kind not in ('update', 'cancel') or (kind == 'cancel' and input_responses is not None):
+            raise ValueError('Invalid MCP Task mutation kind or responses')
+        responses = self._snapshot(input_responses)
+        if kind == 'update' and (type(responses) is not dict or not responses
+                or any(not isinstance(key, str) or type(value) is not dict for key, value in responses.items())):
+            raise ValueError('MCP Task update requires nonempty native input responses')
+        async with self.write_transaction():
+            await self._lock()
+            records = await self._all()
+            actual, row = self._select(records, expected)
+            if actual.remote_task_id is None:
+                raise MCPTaskConflict('MCP Task mutation requires original remote custody')
+            params = {'taskId': actual.remote_task_id}
+            if kind == 'update':
+                params['inputResponses'] = responses
+            intent = {'method': 'tasks/' + kind, 'params': params}
+            control = actual.control
+            for record, _ in records:
+                if record.binding.operation_id == operation_id or (
+                        record.handle != actual.handle and operation_id in record.control['mutations']):
+                    raise MCPTaskConflict('MCP Task mutation operation already has original custody')
+            previous = control['mutations'].get(operation_id)
+            if previous is not None:
+                if not self._same_json(previous['intent'], intent):
+                    raise MCPTaskConflict('MCP Task original mutation has another intent')
+                existing = actual
+            else:
+                existing = None
+                if actual.phase != 'ATTACHED' or actual.revision != expected.revision:
+                    raise MCPTaskConflict('MCP Task mutation revision is no longer current')
+                if kind == 'update' and not set(responses) <= set(actual.pending_inputs):
+                    raise MCPTaskConflict('MCP Task original input is absent or already consumed')
+                secret = secrets.token_urlsafe(32)
+                control['mutations'][operation_id] = {'intent': intent,
+                    'claim_hash': hashlib.sha256(secret.encode()).hexdigest(), 'acknowledgement': None}
+                envelope = actual.envelope
+                envelope['control'] = control
+                result = await self._persist(actual, row, actual.phase, envelope)
+        if existing is not None:
+            return MCPTaskMutationReservation(existing)
+        return MCPTaskMutationReservation(result, MCPTaskMutationIssuance(result, operation_id, secret))
+
+    async def acknowledge_mutation(self, issuance: MCPTaskMutationIssuance, acknowledgement: dict) -> MCPTaskRecord:
+        """Retain an exact native acknowledgement, never infer task completion."""
+        self._ready()
+        if (type(issuance) is not MCPTaskMutationIssuance or not isinstance(issuance.secret, str)
+                or len(issuance.secret) != 43):
+            raise MCPTaskConflict('MCP Task requires its original mutation claim')
+        self._expected(issuance.record)
+        _binding_text(issuance.operation_id)
+        ack = self._snapshot(acknowledgement)
+        if type(ack) is not dict or ack.get('resultType') != 'complete':
+            raise ValueError('MCP Task requires a native mutation acknowledgement')
+        claim_hash = hashlib.sha256(issuance.secret.encode()).hexdigest()
+        async with self.write_transaction():
+            await self._lock()
+            actual, row = self._select(await self._all(), issuance.record)
+            envelope = actual.envelope
+            if actual.remote_task_id is None:
+                raise MCPTaskConflict('MCP Task original mutation custody is absent')
+            control = actual.control
+            receipt = control['mutations'].get(issuance.operation_id)
+            if (receipt is None or receipt['claim_hash'] is None
+                    or not hmac.compare_digest(receipt['claim_hash'], claim_hash)):
+                raise MCPTaskConflict('MCP Task mutation claim is absent or already finished')
+            receipt['acknowledgement'], receipt['claim_hash'] = ack, None
+            envelope['control'] = control
+            result = await self._persist(actual, row, actual.phase, envelope)
+        return result
+
     async def observe(self, expected: MCPTaskRecord, observation: dict) -> MCPTaskRecord:
         """Retain a feature-validated native get result, never an inferred finish.
 
@@ -386,6 +602,7 @@ class MCPTaskStore(UnifiedStoreBase):
                 or type(expected.revision) is not int or expected.revision < 0):
             raise MCPTaskConflict('MCP Task observation requires original attached custody')
         self._binding_digest(expected.binding)
+        observation = self._snapshot(observation)
         async with self.write_transaction():
             await self._lock()
             selected = [(record, row) for record, row in await self._all() if record.handle == expected.handle]
@@ -399,13 +616,8 @@ class MCPTaskStore(UnifiedStoreBase):
             phase = 'SETTLED' if terminal else 'ATTACHED'
             envelope = actual.envelope
             envelope['observation'] = observation
-            columns = (*row[:5], actual.revision + 1, phase, None, actual.payload_limit)
-            raw, ciphertext = self._encode(actual.binding, columns, actual.remote_task_id, envelope)
-            changed = await self.database.execute('UPDATE mcp_task_records SET revision=?,phase=?,payload=? WHERE scope=? AND handle=? AND revision=? AND phase=\'ATTACHED\'',
-                (actual.revision + 1, phase, ciphertext, self.scope, actual.handle, actual.revision))
-            if changed != 1:
-                raise MCPTaskConflict('MCP Task observation was already consumed')
-            result = MCPTaskRecord(actual.handle, actual.revision + 1, phase, actual.payload_limit, actual.binding, raw)
+            self._retain_inputs(envelope, observation)
+            result = await self._persist(actual, row, phase, envelope)
         return result
 
     async def settle_initial(self, issuance: MCPTaskIssuance, *,

@@ -1,6 +1,7 @@
 """Canonical owned resources and native commit faults for MCP Task tests."""
 
-from contextlib import AsyncExitStack
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -71,3 +72,71 @@ def claim(task_id='remote-private-task'):
 
 async def attach(store, issuance, task_id='remote-private-task'):
     return await store.attach_task(issuance, remote_task_id=task_id, envelope=claim(task_id))
+
+
+def observation(status='working', **changes):
+    value = {**claim()['native'], 'resultType': 'complete', 'status': status}
+    if status == 'input_required':
+        value['inputRequests'] = {'private-key': {'method': 'elicitation/create', 'params': {
+            'mode': 'form', 'message': 'Private input?', 'requestedSchema': {'type': 'object'}}}}
+    elif status == 'completed':
+        value['result'] = {'resultType': 'complete', 'content': [], 'isError': True,
+            'structuredContent': {'private': 'private-terminal-content'}}
+    elif status == 'failed':
+        value['error'] = {'code': -32603, 'message': 'private-protocol-error'}
+    value.update(changes)
+    return value
+
+
+async def attached(store):
+    reserved = await store.reserve(binding())
+    return await attach(store, reserved.issuance)
+
+
+async def rotate_task_root(custody):
+    """Rotate one actual Task root and cut over its owned key file."""
+    from kestrel_sovereign.security.key_rotation import KeyRotationService
+
+    store = custody.store
+    # The generic registry also owns these required master-key stores. Empty
+    # genuine tables represent this otherwise unused fresh test database.
+    await store.database.execute('CREATE TABLE conversation_history (id INTEGER PRIMARY KEY, content TEXT, rendered_content TEXT, agent_id TEXT, metadata TEXT)')
+    binary = 'BYTEA' if store.is_postgres else 'BLOB'
+    await store.database.execute(f'CREATE TABLE files (content_hash TEXT PRIMARY KEY, content {binary}, metadata TEXT)')
+    next_key = custody.tmp_path / 'rotated-key'
+    next_key.write_bytes(Fernet.generate_key())
+    next_key.chmod(0o600)
+    service = KeyRotationService(SimpleNamespace(database=store.database))
+    await service.initialize()
+    try:
+        rotation = await service.start_rotation(new_key_file=str(next_key))
+        await service.drain_rotations()
+        status = await service.get_status(rotation)
+    finally:
+        await service.shutdown()
+    custody.key.write_bytes(next_key.read_bytes())
+    return status
+
+
+@asynccontextmanager
+async def paused_task_write(store, monkeypatch, operation):
+    """Hold actual SQL admission; join its original owner before unpatching."""
+    from kestrel_sovereign._async_ownership import OwnedOperation, raise_owned_outcome
+
+    gate = SimpleNamespace(entered=asyncio.Event(), release=asyncio.Event(), result=None)
+    native_lock = store._lock
+
+    async def hold_lock():
+        await native_lock()
+        gate.entered.set()
+        await gate.release.wait()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, '_lock', hold_lock)
+        owner = OwnedOperation(operation, retain_originals=True)
+        try:
+            yield gate
+        finally:
+            gate.release.set()
+            outcome = await owner.observe(retain_cancellations=True)
+            gate.result = raise_owned_outcome(outcome, operation='original Task test write', retain_originals=True)
