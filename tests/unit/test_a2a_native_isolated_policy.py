@@ -10,7 +10,7 @@ from kestrel_sdk.native_a2a.client.errors import A2AClientError
 from starlette.exceptions import HTTPException
 
 from kestrel_sovereign.a2a.native_standalone import (
-    configure_single_agent_native_peer_policy,
+    _configure_single_agent_native_peer_policy,
     open_process_native_peer_session,
 )
 from kestrel_sovereign.features.peers.directory import (
@@ -35,7 +35,7 @@ from tests.utils.native_a2a_security import send, signed_context
 
 
 def configure(recipient, environment, *, router=None, requester=None):
-    return configure_single_agent_native_peer_policy(
+    return _configure_single_agent_native_peer_policy(
         recipient, environment, router=router, requester=requester,
     )
 
@@ -132,8 +132,11 @@ async def test_copied_requester_cannot_spend_isolated_scope():
         directory.open_a2a_session(forged, PeerIdentity("did:kestrel:p", "p", "p"))
 
 
-@pytest_asyncio.fixture
-async def isolated_single(single_candidate):
+@pytest_asyncio.fixture(params=["server", "direct"])
+async def isolated_single(single_candidate, request):
+    from kestrel_sovereign.a2a.native_standalone import (
+        prepare_single_agent_native_publication,
+    )
     from kestrel_sovereign.server import _onboard_single_agent_native
 
     p = single_candidate
@@ -142,7 +145,11 @@ async def isolated_single(single_candidate):
         "a2a_inbound_sender_authorizer",
     ):
         setattr(p.recipient, attribute, None)
-    publication = await _onboard_single_agent_native(p.app, p.recipient, {
+    publish = (
+        _onboard_single_agent_native if request.param == "server"
+        else prepare_single_agent_native_publication
+    )
+    publication = await publish(p.app, p.recipient, {
         "KESTREL_BASE_URL": "http://single.native.test",
         "KESTREL_A2A_PUSH_ENABLED": "false",
         "KESTREL_A2A_PEER_POLICY": "isolated",
@@ -195,8 +202,12 @@ async def test_isolated_process_egress_refuses_before_any_transport(isolated_sin
     assert await p.admission.backend.fetch_all("SELECT id FROM a2a_tasks") == []
 
 
+@pytest.mark.parametrize("entrypoint", ["server", "direct"])
 @pytest.mark.parametrize("mode", [None, "", "automatic"])
-async def test_server_does_not_infer_isolation_or_publish_on_bad_mode(single_candidate, mode):
+async def test_server_does_not_infer_isolation_or_publish_on_bad_mode(single_candidate, mode, entrypoint):
+    from kestrel_sovereign.a2a.native_standalone import (
+        prepare_single_agent_native_publication,
+    )
     from kestrel_sovereign.server import _onboard_single_agent_native
 
     p = single_candidate
@@ -212,8 +223,12 @@ async def test_server_does_not_infer_isolation_or_publish_on_bad_mode(single_can
     if mode is not None:
         environment["KESTREL_A2A_PEER_POLICY"] = mode
     expected = "explicit scoped peer policy" if mode is None else "must be 'isolated'"
+    publish = (
+        _onboard_single_agent_native if entrypoint == "server"
+        else prepare_single_agent_native_publication
+    )
     with pytest.raises((ValueError, PeerDirectoryConfigurationError), match=expected):
-        await _onboard_single_agent_native(p.app, p.recipient, environment)
+        await publish(p.app, p.recipient, environment)
     assert not hasattr(p.recipient, "_native_a2a_runtime_authority")
     assert p.app.routes == []
 
@@ -245,3 +260,26 @@ async def test_hosted_entrypoints_refuse_standalone_policy_before_recipient_acce
             await prepare_hosted_native_publication(app, manager, "test", recipient, environment)
     assert tuple(app.routes) == original_routes
     assert not hasattr(app.state, "native_a2a_http")
+
+
+async def test_direct_standalone_publication_cannot_ignore_isolated_policy(single_candidate):
+    from kestrel_sovereign.a2a.native_standalone import (
+        prepare_single_agent_native_publication,
+    )
+
+    p = single_candidate
+    try:
+        # The fixture has a real initialized scoped TaskManager and an explicit
+        # directory/resolver/authorizer that permits its signed test principal.
+        # A library embedding must not publish that trust under an isolated
+        # declaration, even without the server onboarding wrapper.
+        with pytest.raises(PeerDirectoryConfigurationError, match="conflicts"):
+            await prepare_single_agent_native_publication(p.app, p.recipient, {
+                "KESTREL_BASE_URL": "http://single.native.test",
+                "KESTREL_A2A_PUSH_ENABLED": "false",
+                "KESTREL_A2A_PEER_POLICY": "isolated",
+            })
+    finally:
+        owner = getattr(p.recipient, "_native_a2a_runtime_authority", None)
+        if owner is not None:
+            await owner.close()

@@ -51,6 +51,9 @@ injected directory/resolver, a discovered host directory, `KESTREL_HOST_URL`,
 any `KESTREL_A2A_PEER_IDENTITY_*` setting or `KESTREL_A2A_FEDERATED_DID` refuses
 startup, even when a conflicting setting is empty or false. Fleet and tenant
 embeddings must retain their own explicit scoped peer policy instead.
+Standalone policy installation belongs to the canonical
+`prepare_single_agent_native_publication` factory, not only the HTTP server
+wrapper. Direct library embeddings obey the same isolation/conflict contract.
 
 A profile deploy succeeds only when the new revision passes the post-deploy
 readiness gate (`GET <service_url>` + `[manager].health_check_path` returning
