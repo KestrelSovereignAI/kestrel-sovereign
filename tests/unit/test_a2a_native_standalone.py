@@ -129,7 +129,7 @@ async def single(single_candidate, request):
         await owner.close()
 
 
-async def signed_sdk_client(p, http, protocol, *, streaming=False):
+async def signed_sdk_client(p, http, protocol, *, streaming=False, clock=lambda: NOW):
     """Use the official codec, original proof interceptor and live signed card."""
     card = await p.publication.get_card()
     interceptor = NativeSenderInterceptor(
@@ -140,7 +140,7 @@ async def signed_sdk_client(p, http, protocol, *, streaming=False):
         policy=p.owner.proof_policy,
         classical_kid="key-1",
         pq_kid="key-2",
-        clock=lambda: NOW,
+        clock=clock,
         nonce=lambda: uuid4().hex,
     )
     return ClientFactory(
