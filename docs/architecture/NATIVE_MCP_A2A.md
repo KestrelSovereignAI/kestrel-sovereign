@@ -535,6 +535,39 @@ provider handles these requirements, do not advertise Tasks. Surface a server's
 required-capability error clearly instead of accepting work whose result cannot
 be retrieved.
 
+Core's internal `MCPTaskStore` supplies encrypted pre-dispatch reservations and
+immutable remote bindings. It does not register a capability, host API or wait
+provider. Only a newly committed reservation returns an issuance credential;
+restart reads never recover it or authorize another initial call. Unconfirmed
+submissions remain charged to active capacity without lease expiry. Confirmed
+ordinary results or proven pre-wire refusals release that active slot while
+retaining the consumed operation identity. Attached tasks remain charged until
+`observe` durably records a feature-validated terminal `tasks/get` result. The
+native creation claim and remote identity remain immutable; the latest detailed
+observation is encrypted alongside them. Terminal results remain privately
+readable after restart, and their operation and remote identity stay consumed.
+Observation uses strict revision CAS, including for identical repeats; a lost
+acknowledgment reconciles through an exact read. Capacity follows authenticated
+committed state, so a terminal write that committed releases capacity even when
+the original acknowledgment was lost. An exception alone proves no settlement.
+
+The host must bind actual governed leaf admission, original principal/session,
+server resource, authorization identity and tool contract before dispatch, and
+revalidate current authority before every subsequent operation. For MRTR, the
+original issuance credential must follow the authorized continuation through
+host-private encrypted input custody, never through operator projections.
+That handoff, authorized polling/mutation, input-key consumption and wait
+registration remain required integration work. Repository tests alone do not
+establish these host guarantees or enable Tasks.
+
+Custody retains records without automatic deletion. Configured active, retained
+record and per-record payload budgets refuse new admission; existing records
+retain their admitted payload budget and can progress after limits are lowered.
+All retained routing and CAS projections are authenticated before admission;
+this does not protect against database deletion or rollback. Master-key rotation
+rewraps the per-agent random root through the canonical rotation registry,
+preserving keyed identities and private payloads.
+
 When `tasks/get` reports `input_required`, classify its `inputRequests` using
 the same machine/operator rules and policy below. Respond through
 `tasks/update(taskId, inputResponses)`, then resume observing status. This path

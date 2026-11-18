@@ -462,6 +462,15 @@ class KeyRotationService:
             "optional": True,
             "require_all": True,
         },
+        {
+            # Task reservations keep stable keyed identities through rotation.
+            "table": "mcp_task_keys",
+            "content_column": "wrapped_key",
+            "id_column": "key_id",
+            "agent_id_column": None,
+            "optional": True,
+            "require_all": True,
+        },
     ]
 
     async def _entry_available(self, entry: Dict[str, Any]) -> bool:
