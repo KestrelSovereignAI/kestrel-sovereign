@@ -124,9 +124,18 @@ Two details in that line are load-bearing, both found the hard way:
   swallow the prompt as one more tool name. The review then runs with no
   instructions and returns something plausible.
 
-**Run the review on the strongest model available, and prove it.** A gate is
-only as strong as its reviewer, and substituting a weaker one silently makes
-the gate weaker without making it look weaker. Probe first — five seconds:
+**Run the review on the current Opus by default, and escalate only with a
+reason.** The default reviewer is the current Opus (`claude-opus-5-5` as of
+2026-11-18). The strongest model is not the default: Fable costs far more, and
+a rule that reaches for it on every diff spends it on diffs that don't need it.
+Escalate to Fable when you can name the reason: a security or tenancy
+boundary, a large or cross-repo diff, or an Opus verdict you have grounds to
+doubt. For a design question, ask Meridian, the architect, who takes rulings
+on Fable. When you escalate, state the reason in the turn output.
+
+What still matters is not dropping *below* the default: a weaker reviewer
+silently makes the gate weaker without making it look weaker. Probe the model
+you mean to use first — five seconds:
 
 ```bash
 claude -p --model <model> -- "Reply with exactly: PROBE_OK" </dev/null
@@ -140,7 +149,7 @@ different question, the two have disagreed, and on 2026-09-07 a 1269-line diff
 was reviewed on `claude-opus-4-6` because `claude-opus-5` was believed
 unavailable when a probe would have returned `PROBE_OK` for it.
 
-If you do end up on a weaker model, that is a gate condition to declare in the
+If you do end up below the default, that is a gate condition to declare in the
 turn output alongside the verdict — not a detail to mention afterwards.
 
 **As of 2026-09-06 the Codex CLI is unavailable, so use the Claude form.** This
