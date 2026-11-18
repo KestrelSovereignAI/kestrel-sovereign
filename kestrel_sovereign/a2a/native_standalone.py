@@ -61,7 +61,7 @@ def validate_native_peer_policy(
     return mode
 
 
-def configure_single_agent_native_peer_policy(
+def _configure_single_agent_native_peer_policy(
     recipient, environment: Mapping[str, str], *, router, requester,
 ):
     """Install only an explicitly selected, non-conflicting isolated policy.
@@ -99,8 +99,18 @@ def configure_single_agent_native_peer_policy(
         )
     directory = IsolatedPeerDirectory(resolve_scoped_agent_did(recipient))
     resolver = ProcessA2ADidResolver((), federated_fallback=False)
+    recipient.peer_directory_router = directory
+    recipient.peer_requester = directory.requester
     recipient.a2a_did_resolver = resolver.resolve
     recipient._a2a_process_did_resolver = resolver
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        install_a2a_inbound_sender_authorizer,
+    )
+
+    mark_a2a_inbound_scoped_policy(recipient, required=True)
+    install_a2a_inbound_sender_authorizer(
+        None, recipient=recipient, sender_id_resolver=resolver.directory_agent_id,
+    )
     return directory, directory.requester
 
 
@@ -420,11 +430,13 @@ async def prepare_single_agent_native_publication(
     *,
     clock: Callable[[], float] = time.time,
 ):
-    """Publish one ready runtime using an already installed explicit peer policy.
+    """Publish one ready runtime under its explicit peer policy.
 
-    The server or embedding host owns resolver and policy installation. An
-    absent public base URL keeps operator-only startup independent of them.
-    A configured failure never silently changes capabilities or routing.
+    Embeddings install their original scoped dependencies when no policy mode
+    is declared. Only explicit isolation constructs a new deny-all policy here,
+    refusing all preinstalled/conflicting trust. The server is not a second
+    isolation owner. No public base URL keeps operator-only startup independent
+    of peer dependencies; configured failures never silently change capability.
     """
     from kestrel_sovereign.a2a.native_publication import (
         NativeA2APublication,
@@ -432,9 +444,16 @@ async def prepare_single_agent_native_publication(
         native_publication_registry,
     )
 
+    environment = dict(environment)
+    validate_native_peer_policy(environment, fleet_host=False)
     configuration = NativeHostingConfiguration.from_environment(environment)
     if configuration is None:
         return None
+    _configure_single_agent_native_peer_policy(
+        recipient, environment,
+        router=getattr(recipient, "peer_directory_router", None),
+        requester=getattr(recipient, "peer_requester", None),
+    )
     routing_key = configuration.discovery_routing_key
     if routing_key is None:
         routing_key = resolve_scoped_agent_did(recipient)

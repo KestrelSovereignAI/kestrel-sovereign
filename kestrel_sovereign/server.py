@@ -1537,22 +1537,20 @@ async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
     )
     from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
     from kestrel_sovereign.a2a.native_standalone import (
-        configure_single_agent_native_peer_policy,
         prepare_single_agent_native_publication,
+        validate_native_peer_policy,
     )
 
     environment = dict(os.environ if environment is None else environment)
+    peer_policy = validate_native_peer_policy(environment, fleet_host=False)
     if NativeHostingConfiguration.from_environment(environment) is None:
         return None
     router, requester = _hosted_peer_directory_context(
         app, agent, preserve_directory=True
     )
-    router, requester = configure_single_agent_native_peer_policy(
-        agent, environment, router=router, requester=requester,
-    )
     agent.peer_directory_router, agent.peer_requester = router, requester
     mark_a2a_inbound_scoped_policy(agent, required=True)
-    if getattr(agent, "a2a_inbound_sender_authorizer", None) is None:
+    if peer_policy is None and getattr(agent, "a2a_inbound_sender_authorizer", None) is None:
         process_resolver = getattr(agent, "_a2a_process_did_resolver", None)
         sender_id_resolver = (
             process_resolver.directory_agent_id if process_resolver is not None
