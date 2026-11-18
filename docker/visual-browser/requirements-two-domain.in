@@ -1,6 +1,6 @@
 # Normal full Core closure. Resolve on the exact pinned Linux/ARM64 base's
 # measured interpreter, then bind the exact Core wheel and every artifact hash.
-kestrel-sovereign==0.66.4
+kestrel-sovereign==0.66.5
 kestrel-sovereign-sdk==0.54.0
 playwright==1.63.0
 # GHSA-45c3-73f7-pv4m is fixed in dnspython 2.9.0.
