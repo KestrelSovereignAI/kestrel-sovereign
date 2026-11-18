@@ -2,7 +2,6 @@
 
 import asyncio
 from dataclasses import replace
-from types import SimpleNamespace
 
 from cryptography.fernet import Fernet
 import pytest
@@ -12,9 +11,9 @@ from kestrel_sovereign.execution_custody import execution_commit_outcome, execut
 from kestrel_sovereign.mcp_task_store import (
     MCPTaskConflict, MCPTaskIntegrityError,
 )
-from kestrel_sovereign.security.key_rotation import KeyRotationService, RotationStatus
+from kestrel_sovereign.security.key_rotation import RotationStatus
 from kestrel_sovereign.storage.db.interface import TransactionError
-from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack
+from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack, rotate_task_root
 
 
 @pytest.mark.asyncio
@@ -199,26 +198,10 @@ async def test_actual_key_rotation_rewraps_task_root_and_preserves_remote_custod
     attached = await attach(store, reserved.issuance)
     before = await store.database.fetchall('SELECT * FROM mcp_task_records')
     wrapped_before = await store.database.fetchone('SELECT wrapped_key FROM mcp_task_keys')
-    # The generic registry also owns these required master-key stores. Empty
-    # genuine tables represent this otherwise unused fresh test database.
-    await store.database.execute('CREATE TABLE conversation_history (id INTEGER PRIMARY KEY, content TEXT, rendered_content TEXT, agent_id TEXT, metadata TEXT)')
-    binary = 'BYTEA' if store.is_postgres else 'BLOB'
-    await store.database.execute(f'CREATE TABLE files (content_hash TEXT PRIMARY KEY, content {binary}, metadata TEXT)')
-    next_key = custody.tmp_path / 'rotated-key'
-    next_key.write_bytes(Fernet.generate_key())
-    next_key.chmod(0o600)
-    service = KeyRotationService(SimpleNamespace(database=store.database))
-    await service.initialize()
-    try:
-        rotation = await service.start_rotation(new_key_file=str(next_key))
-        await service.drain_rotations()
-        status = await service.get_status(rotation)
-        assert status.status == RotationStatus.COMPLETED and status.records_processed == 1
-    finally:
-        await service.shutdown()
+    status = await rotate_task_root(custody)
+    assert status.status == RotationStatus.COMPLETED and status.records_processed == 1
     assert await store.database.fetchall('SELECT * FROM mcp_task_records') == before
     assert await store.database.fetchone('SELECT wrapped_key FROM mcp_task_keys') != wrapped_before
-    custody.key.write_bytes(next_key.read_bytes())
     restarted = await custody.reopen()
     assert await restarted.read(binding(), attached.handle) == attached
     assert not (await restarted.reserve(binding())).fresh

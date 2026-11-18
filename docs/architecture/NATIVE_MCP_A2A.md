@@ -556,7 +556,7 @@ server resource, authorization identity and tool contract before dispatch, and
 revalidate current authority before every subsequent operation. For MRTR, the
 original issuance credential must follow the authorized continuation through
 host-private encrypted input custody, never through operator projections.
-That handoff, authorized polling/mutation, input-key consumption and wait
+That handoff, authorized polling/mutation, user-facing Task input and wait
 registration remain required integration work. Repository tests alone do not
 establish these host guarantees or enable Tasks.
 
@@ -567,6 +567,33 @@ All retained routing and CAS projections are authenticated before admission;
 this does not protect against database deletion or rollback. Master-key rotation
 rewraps the per-agent random root through the canonical rotation registry,
 preserving keyed identities and private payloads.
+
+Task schema revision 2 additionally retains lifetime input identities and mutation
+receipts inside the same encrypted record. Repeated identical input snapshots
+deduplicate, including after a response acknowledgement; a changed request under
+an old key is refused across gaps and fresh connections. Only the current
+unconsumed keys can enter an update. Before releasing update/cancel wire authority,
+`reserve_mutation` commits the exact native semantic intent, consumes its actual
+governed leaf operation ID across the agent's Tasks, and returns a fresh secret
+once. Duplicate/restart reads never return another secret. Uncertain dispatch,
+server errors and lost commit acknowledgements never reopen an input or intent.
+Initial claims/results, observations, responses and acknowledgements are copied
+before transaction awaits. The host still supplies actual authority and complete
+original-schema validation.
+
+`acknowledge_mutation` verifies that original mutation's credential against current
+custody and preserves concurrent observations and other responses. It records only
+a native acknowledgement; cancellation remains cooperative and does not release
+active capacity. A subsequent native terminal observation does. Acknowledgement
+may arrive after that observation, without regressing its phase or result.
+The unused revision-1 prototype is refused unchanged: its overwritten snapshots
+cannot establish lifetime history. No migration invents that missing history.
+
+Creation, latest observation and all lifetime history share the original admitted
+payload budget. Exhaustion can refuse a new input/cancel intent, acknowledgement,
+or larger terminal observation; it preserves the last durable state and consumed
+identities. This is bounded custody, not a promise of unlimited rounds or reserved
+cancellation space. No automatic history deletion or unjournaled dispatch is used.
 
 When `tasks/get` reports `input_required`, classify its `inputRequests` using
 the same machine/operator rules and policy below. Respond through

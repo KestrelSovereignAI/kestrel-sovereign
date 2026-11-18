@@ -9,26 +9,8 @@ import pytest
 from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers
 from kestrel_sovereign.mcp_task_store import MCPTaskConflict
 from kestrel_sovereign.storage.db.interface import TransactionError
-from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack
+from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack, observation, attached
 
-
-def observation(status='working', **changes):
-    value = {**claim()['native'], 'resultType': 'complete', 'status': status}
-    if status == 'input_required':
-        value['inputRequests'] = {'private-key': {'method': 'elicitation/create', 'params': {
-            'mode': 'form', 'message': 'Private input?', 'requestedSchema': {'type': 'object'}}}}
-    elif status == 'completed':
-        value['result'] = {'resultType': 'complete', 'content': [], 'isError': True,
-            'structuredContent': {'private': 'private-terminal-content'}}
-    elif status == 'failed':
-        value['error'] = {'code': -32603, 'message': 'private-protocol-error'}
-    value.update(changes)
-    return value
-
-
-async def attached(store):
-    reserved = await store.reserve(binding())
-    return await attach(store, reserved.issuance)
 
 
 @pytest.mark.asyncio
