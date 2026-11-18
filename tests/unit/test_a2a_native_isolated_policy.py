@@ -216,3 +216,32 @@ async def test_server_does_not_infer_isolation_or_publish_on_bad_mode(single_can
         await _onboard_single_agent_native(p.app, p.recipient, environment)
     assert not hasattr(p.recipient, "_native_a2a_runtime_authority")
     assert p.app.routes == []
+
+
+@pytest.mark.parametrize("mode", ["isolated", "automatic"])
+@pytest.mark.parametrize("entrypoint", ["registration", "publication"])
+async def test_hosted_entrypoints_refuse_standalone_policy_before_recipient_access(
+    monkeypatch, mode, entrypoint,
+):
+    from fastapi import FastAPI
+
+    from kestrel_sovereign.a2a.native_publication import (
+        prepare_hosted_native_publication,
+    )
+    from kestrel_sovereign.server import _onboard_host_registered_agent
+
+    environment = {"KESTREL_A2A_PEER_POLICY": mode}
+    monkeypatch.setenv("KESTREL_A2A_PEER_POLICY", mode)
+    app = FastAPI()
+    original_routes = tuple(app.routes)
+    # These are deliberately unusable inputs: incompatible host configuration
+    # must refuse BEFORE reading a recipient, installing trust or owning work.
+    manager, recipient = object(), object()
+    expected = "only supported by standalone" if mode == "isolated" else "must be 'isolated'"
+    with pytest.raises(PeerDirectoryConfigurationError, match=expected):
+        if entrypoint == "registration":
+            await _onboard_host_registered_agent(app, manager, "test", recipient)
+        else:
+            await prepare_hosted_native_publication(app, manager, "test", recipient, environment)
+    assert tuple(app.routes) == original_routes
+    assert not hasattr(app.state, "native_a2a_http")

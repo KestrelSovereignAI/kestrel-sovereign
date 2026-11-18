@@ -39,6 +39,28 @@ if TYPE_CHECKING:
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
+def validate_native_peer_policy(
+    environment: Mapping[str, str], *, fleet_host: bool,
+) -> str | None:
+    """Parse the one explicit standalone policy; fleet authority is incompatible."""
+    from kestrel_sovereign.features.peers.directory import (
+        PeerDirectoryConfigurationError,
+    )
+
+    mode = environment.get("KESTREL_A2A_PEER_POLICY")
+    if mode is None:
+        return None
+    if mode != "isolated":
+        raise PeerDirectoryConfigurationError(
+            "KESTREL_A2A_PEER_POLICY must be 'isolated' when configured"
+        )
+    if fleet_host:
+        raise PeerDirectoryConfigurationError(
+            "Isolated A2A peer policy is only supported by standalone native hosts"
+        )
+    return mode
+
+
 def configure_single_agent_native_peer_policy(
     recipient, environment: Mapping[str, str], *, router, requester,
 ):
@@ -54,13 +76,8 @@ def configure_single_agent_native_peer_policy(
         PeerDirectoryConfigurationError,
     )
 
-    mode = environment.get("KESTREL_A2A_PEER_POLICY")
-    if mode is None:
+    if validate_native_peer_policy(environment, fleet_host=False) is None:
         return router, requester
-    if mode != "isolated":
-        raise PeerDirectoryConfigurationError(
-            "KESTREL_A2A_PEER_POLICY must be 'isolated' when configured"
-        )
     conflicting_environment = any(
         key.startswith("KESTREL_A2A_PEER_IDENTITY_")
         or key in {"KESTREL_A2A_FEDERATED_DID", "KESTREL_HOST_URL"}

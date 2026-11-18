@@ -1610,6 +1610,9 @@ async def _onboard_host_registered_agent(
     incompletely integrated tenant. Feature-route gates resolve through the
     manager and therefore remain closed until the later registration commit.
     """
+    from kestrel_sovereign.a2a.native_standalone import validate_native_peer_policy
+
+    validate_native_peer_policy(os.environ, fleet_host=True)
     from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
     from kestrel_sovereign.a2a.inbound_authorization import (
         install_a2a_inbound_sender_authorizer,
@@ -3493,6 +3496,10 @@ async def _lifespan_startup(app: FastAPI):
     app.state.fleet_host = fleet_host
     if fleet_host:
         _require_multi_agent_host_api_key(os.environ)
+    if "KESTREL_A2A_PEER_POLICY" in os.environ:
+        from kestrel_sovereign.a2a.native_standalone import validate_native_peer_policy
+
+        validate_native_peer_policy(os.environ, fleet_host=fleet_host)
 
     await _initialize_stop_receipts(app)
 

@@ -333,6 +333,9 @@ async def prepare_hosted_native_publication(
     environment: Mapping[str, str],
 ) -> NativeA2APublication | None:
     """The startup/cold-onboarding seam; no public routes exist until commit."""
+    from kestrel_sovereign.a2a.native_standalone import validate_native_peer_policy
+
+    validate_native_peer_policy(environment, fleet_host=True)
     configuration = NativeHostingConfiguration.from_environment(environment)
     if configuration is None:
         return None
