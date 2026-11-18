@@ -434,3 +434,40 @@ def test_isolation_refuses_unbindable_feature_without_installing_agent_trust(bro
         configure(agent, {"KESTREL_A2A_PEER_POLICY": "isolated"})
     assert not hasattr(agent, "peer_directory_router")
     assert not hasattr(agent, "a2a_did_resolver")
+
+
+@pytest.mark.parametrize("entrypoint", ["server", "direct"])
+async def test_isolation_preserves_revoked_injection_until_conflict_refusal(
+    single_candidate, entrypoint,
+):
+    from kestrel_sovereign.a2a.native_standalone import (
+        prepare_single_agent_native_publication,
+    )
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+    from kestrel_sovereign.server import _onboard_single_agent_native
+
+    p = single_candidate
+    original_router = p.recipient.peer_directory_router
+    original_requester = p.recipient.peer_requester
+    p.recipient.a2a_did_resolver = p.recipient.a2a_inbound_sender_authorizer = None
+    feature = PeersFeature(p.recipient)
+    await feature.initialize()
+    feature._peer_router = feature._peer_requester = feature._host_url = None
+    p.recipient.features = {"PeersFeature": feature}
+    publish = (
+        _onboard_single_agent_native if entrypoint == "server"
+        else prepare_single_agent_native_publication
+    )
+    try:
+        with pytest.raises(PeerDirectoryConfigurationError, match="conflicts"):
+            await publish(p.app, p.recipient, {
+                "KESTREL_BASE_URL": "http://single.native.test",
+                "KESTREL_A2A_PUSH_ENABLED": "false",
+                "KESTREL_A2A_PEER_POLICY": "isolated",
+            })
+    finally:
+        owner = getattr(p.recipient, "_native_a2a_runtime_authority", None)
+        if owner is not None:
+            await owner.close()
+    assert p.recipient.peer_directory_router is original_router
+    assert p.recipient.peer_requester is original_requester
