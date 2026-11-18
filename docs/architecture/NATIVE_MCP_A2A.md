@@ -542,7 +542,14 @@ restart reads never recover it or authorize another initial call. Unconfirmed
 submissions remain charged to active capacity without lease expiry. Confirmed
 ordinary results or proven pre-wire refusals release that active slot while
 retaining the consumed operation identity. Attached tasks remain charged until
-a later observation lifecycle implements confirmed terminal settlement.
+`observe` durably records a feature-validated terminal `tasks/get` result. The
+native creation claim and remote identity remain immutable; the latest detailed
+observation is encrypted alongside them. Terminal results remain privately
+readable after restart, and their operation and remote identity stay consumed.
+Observation uses strict revision CAS, including for identical repeats; a lost
+acknowledgment reconciles through an exact read. Capacity follows authenticated
+committed state, so a terminal write that committed releases capacity even when
+the original acknowledgment was lost. An exception alone proves no settlement.
 
 The host must bind actual governed leaf admission, original principal/session,
 server resource, authorization identity and tool contract before dispatch, and

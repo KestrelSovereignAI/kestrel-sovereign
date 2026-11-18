@@ -84,6 +84,11 @@ class MCPTaskRecord:
         """Return a detached private claim/result, never a public wait payload."""
         return json.loads(self._payload)['envelope']
 
+    @property
+    def observation(self) -> dict | None:
+        envelope = self.envelope
+        return envelope.get('observation') if envelope is not None else None
+
 
 @dataclass(frozen=True)
 class MCPTaskIssuance:
@@ -198,16 +203,38 @@ class MCPTaskStore(UnifiedStoreBase):
                 raise ValueError('Unsubmitted MCP Task custody cannot have a result')
             return
         member = 'refusal' if phase == 'NOT_SENT' else 'native'
-        if (type(envelope) is not dict or set(envelope) != {'version', member}
+        remote_bound = task_id is not None
+        allowed = ({'version', 'native'}, {'version', 'native', 'observation'}) if remote_bound else ({'version', member},)
+        if (type(envelope) is not dict or set(envelope) not in allowed
                 or type(envelope['version']) is not int or envelope['version'] != 1
                 or type(envelope[member]) is not dict):
             raise ValueError('MCP Task custody requires a versioned private JSON envelope')
-        if phase == 'ATTACHED':
+        if remote_bound:
             if (not isinstance(task_id, str) or envelope['native'].get('taskId') != task_id
-                    or envelope['native'].get('resultType') != 'task'):
+                    or envelope['native'].get('resultType') != 'task'
+                    or phase not in {'ATTACHED','SETTLED'}):
                 raise ValueError('MCP Task claim must bind its exact native task ID')
-        elif task_id is not None:
-            raise ValueError('Initial settlement cannot replace a remote Task binding')
+            observation = envelope.get('observation')
+            if 'observation' in envelope:
+                terminal = MCPTaskStore._observation(task_id, observation)
+                if terminal != (phase == 'SETTLED'):
+                    raise ValueError('MCP Task phase must match its confirmed observation')
+            elif phase != 'ATTACHED':
+                raise ValueError('Settled remote Tasks require a terminal observation')
+        elif phase == 'ATTACHED':
+            raise ValueError('Attached MCP Tasks require their remote identity')
+
+    @staticmethod
+    def _observation(task_id, observation):
+        if (type(observation) is not dict or observation.get('taskId') != task_id
+                or observation.get('resultType') != 'complete'
+                or not isinstance(observation.get('status'), str)
+                or observation.get('status') not in {'working','input_required','completed','failed','cancelled'}):
+            raise ValueError('MCP Task observation must bind its exact native identity and status')
+        member = {'input_required': 'inputRequests', 'completed': 'result', 'failed': 'error'}.get(observation['status'])
+        if member is not None and type(observation.get(member)) is not dict:
+            raise ValueError('MCP Task observation requires its native status payload')
+        return observation['status'] in {'completed','failed','cancelled'}
 
     def _encode(self, binding, columns, task_id, envelope):
         self._envelope(columns[6], task_id, envelope)
@@ -225,7 +252,8 @@ class MCPTaskStore(UnifiedStoreBase):
                 or phase not in {'ISSUING','ATTACHED','SETTLED','NOT_SENT'}
                 or ((phase == 'ISSUING') != (claim_hash is not None))
                 or (claim_hash is not None and not _is_digest(claim_hash))
-                or ((phase == 'ATTACHED') != (remote is not None))
+                or (phase == 'ATTACHED' and remote is None)
+                or (phase in {'ISSUING','NOT_SENT'} and remote is not None)
                 or type(limit) is not int or limit <= 0 or len(ciphertext) > 4 * limit + 128):
             raise MCPTaskIntegrityError('Invalid MCP Task custody record')
         try:
@@ -342,8 +370,43 @@ class MCPTaskStore(UnifiedStoreBase):
 
     async def attach_task(self, issuance: MCPTaskIssuance, *, remote_task_id: str, envelope: dict) -> MCPTaskRecord:
         """Bind a feature-validated native claim without exposing its raw payload."""
+        if type(envelope) is not dict or set(envelope) != {'version','native'}:
+            raise ValueError('Initial MCP Task attachment requires only its native creation claim')
         self._envelope('ATTACHED', remote_task_id, envelope)
         return await self._finish(issuance, 'ATTACHED', remote_task_id, envelope)
+
+    async def observe(self, expected: MCPTaskRecord, observation: dict) -> MCPTaskRecord:
+        """Retain a feature-validated native get result, never an inferred finish.
+
+        The host authorizes the observer independently. This is strict CAS,
+        including for identical repeats; uncertainty reconciles through read.
+        """
+        self._ready()
+        if (type(expected) is not MCPTaskRecord or expected.phase != 'ATTACHED'
+                or type(expected.revision) is not int or expected.revision < 0):
+            raise MCPTaskConflict('MCP Task observation requires original attached custody')
+        self._binding_digest(expected.binding)
+        async with self.write_transaction():
+            await self._lock()
+            selected = [(record, row) for record, row in await self._all() if record.handle == expected.handle]
+            if len(selected) != 1:
+                raise MCPTaskConflict('MCP Task original observation custody is absent')
+            actual, row = selected[0]
+            if (actual.binding != expected.binding or actual.revision != expected.revision
+                    or actual.phase != 'ATTACHED'):
+                raise MCPTaskConflict('MCP Task observation revision is no longer current')
+            terminal = self._observation(actual.remote_task_id, observation)
+            phase = 'SETTLED' if terminal else 'ATTACHED'
+            envelope = actual.envelope
+            envelope['observation'] = observation
+            columns = (*row[:5], actual.revision + 1, phase, None, actual.payload_limit)
+            raw, ciphertext = self._encode(actual.binding, columns, actual.remote_task_id, envelope)
+            changed = await self.database.execute('UPDATE mcp_task_records SET revision=?,phase=?,payload=? WHERE scope=? AND handle=? AND revision=? AND phase=\'ATTACHED\'',
+                (actual.revision + 1, phase, ciphertext, self.scope, actual.handle, actual.revision))
+            if changed != 1:
+                raise MCPTaskConflict('MCP Task observation was already consumed')
+            result = MCPTaskRecord(actual.handle, actual.revision + 1, phase, actual.payload_limit, actual.binding, raw)
+        return result
 
     async def settle_initial(self, issuance: MCPTaskIssuance, *,
                              disposition: Literal['SETTLED','NOT_SENT'], envelope: dict) -> MCPTaskRecord:
