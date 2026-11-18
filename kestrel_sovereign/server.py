@@ -1525,18 +1525,21 @@ async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
     peer_policy = validate_native_peer_policy(environment, fleet_host=False)
     if NativeHostingConfiguration.from_environment(environment) is None:
         return None
-    router, requester = _hosted_peer_directory_context(
-        app, agent, preserve_directory=True
-    )
-    agent.peer_directory_router, agent.peer_requester = router, requester
-    mark_a2a_inbound_scoped_policy(agent, required=True)
-    if peer_policy is None and getattr(agent, "a2a_inbound_sender_authorizer", None) is None:
-        process_resolver = getattr(agent, "_a2a_process_did_resolver", None)
-        sender_id_resolver = (
-            process_resolver.directory_agent_id if process_resolver is not None
-            else lambda signing_did: signing_did
+    if peer_policy is None:
+        router, requester = _hosted_peer_directory_context(
+            app, agent, preserve_directory=True
         )
-        install_a2a_inbound_sender_authorizer(None, recipient=agent, sender_id_resolver=sender_id_resolver)
+        agent.peer_directory_router, agent.peer_requester = router, requester
+        mark_a2a_inbound_scoped_policy(agent, required=True)
+        if getattr(agent, "a2a_inbound_sender_authorizer", None) is None:
+            process_resolver = getattr(agent, "_a2a_process_did_resolver", None)
+            sender_id_resolver = (
+                process_resolver.directory_agent_id if process_resolver is not None
+                else lambda signing_did: signing_did
+            )
+            install_a2a_inbound_sender_authorizer(None, recipient=agent, sender_id_resolver=sender_id_resolver)
+    # Isolation must validate the untouched candidate, including revoked
+    # injection evidence. Only the canonical factory may install its scope.
     publication = await prepare_single_agent_native_publication(app, agent, environment)
     from kestrel_sovereign.features.peers.directory import (
         PEER_CONNECT_TIMEOUT,
@@ -1544,6 +1547,7 @@ async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
         LocalHostPeerDirectory,
     )
 
+    router = getattr(agent, "peer_directory_router", None)
     process_resolver = getattr(agent, "_a2a_process_did_resolver", None)
     if (process_resolver is not None and isinstance(router, LocalHostPeerDirectory)
             and not router.has_native_session_factory):

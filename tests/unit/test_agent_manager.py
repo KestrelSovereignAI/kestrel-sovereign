@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -14559,7 +14559,7 @@ class TestCreateAgent:
         child_did = "did:test:existing-cold-identity"
         identity_db = tmp_path / "agent_data" / child_name / "kestrel_prime.db"
         identity_db.parent.mkdir(parents=True)
-        with sqlite3.connect(identity_db) as connection:
+        with closing(sqlite3.connect(identity_db)) as connection, connection:
             connection.execute(
                 "CREATE TABLE graph_nodes ("
                 "node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, "
@@ -15693,7 +15693,7 @@ class TestSpawnAgent:
         )
         identity_db = local.resolve_data_dir(tmp_path) / "kestrel_prime.db"
         identity_db.parent.mkdir(parents=True)
-        with sqlite3.connect(identity_db) as connection:
+        with closing(sqlite3.connect(identity_db)) as connection, connection:
             connection.execute(
                 "CREATE TABLE graph_nodes ("
                 "node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, "
@@ -15771,7 +15771,7 @@ class TestSpawnAgent:
         )
         identity_db = local.resolve_data_dir(tmp_path) / "kestrel_prime.db"
         identity_db.parent.mkdir(parents=True)
-        with sqlite3.connect(identity_db) as connection:
+        with closing(sqlite3.connect(identity_db)) as connection, connection:
             connection.execute(
                 "CREATE TABLE graph_nodes ("
                 "node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, "
