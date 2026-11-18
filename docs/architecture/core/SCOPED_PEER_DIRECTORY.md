@@ -33,6 +33,19 @@ work. Kestrel neither parses it nor accepts a tool-supplied user ID, tenant ID,
 or replacement scope. An injected router without this requester context fails
 feature initialization.
 
+After initialization the Peers feature owns the effective directory.
+`resolve_agent_peer_directory_context` is the shared resolver used by server
+onboarding and standalone native authority; constructor fields are only the
+injection seam when no Peers feature exists. A missing, malformed or revoked
+feature context never falls back to stale constructor fields. Multiple peer
+directory owners are a configuration error, including feature subclasses.
+
+Explicit standalone isolation installs the same canonical deny-all directory
+into the feature and the native runtime, rather than leaving outbound tools on
+another scope. Ordinary local-host refresh cannot replace that isolated scope.
+The native authority also verifies the original effective feature/context at
+runtime, so replacing a feature scope cannot preserve a stale published owner.
+
 Providers must authorize every one of these operations, not only the initial
 listing:
 

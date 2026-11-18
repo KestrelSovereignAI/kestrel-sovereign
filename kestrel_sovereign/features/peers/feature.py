@@ -25,6 +25,7 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.directory import (
+    IsolatedPeerDirectory,
     LocalHostPeerDirectory,
     PeerAccessDeniedError,
     PeerDirectoryConfigurationError,
@@ -313,6 +314,23 @@ class PeersFeature(Feature):
         self._peer_requester = None
         self._install_local_host_router()
         return self._peer_directory_context()
+
+    def install_isolated_peer_directory(self, directory: IsolatedPeerDirectory) -> None:
+        """Bind explicit deny-all policy to the actual outbound directory owner.
+
+        This never replaces an existing scope and cannot install trusted peers.
+        Native bootstrap validates conflicting configuration before this call.
+        """
+        from kestrel_sovereign.features.storage_access import resolve_scoped_agent_did
+
+        if not isinstance(directory, IsolatedPeerDirectory):
+            raise PeerDirectoryConfigurationError("Isolation requires its canonical deny-all directory")
+        if self._peer_directory_context() is not None:
+            raise PeerDirectoryConfigurationError("Isolated peer policy conflicts with feature authority")
+        if directory.requester.identity != resolve_scoped_agent_did(self.agent):
+            raise PeerDirectoryConfigurationError("Isolated directory belongs to another recipient")
+        self._peer_router = directory
+        self._peer_requester = directory.requester
 
     @execution_work_operation
     async def _resolve_automatic_peer(

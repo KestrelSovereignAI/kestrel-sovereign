@@ -1420,33 +1420,16 @@ def _hosted_peer_directory_context(
 
     Agents without a Peers feature retain the explicit construction-injection
     seam. A present Peers feature is authoritative: a missing or malformed
-    live context is returned as ``(None, None)`` and makes its hosted policy
-    reject inbound delivery instead of silently falling back to stale attrs.
+    live context rejects delivery instead of falling back to stale attrs.
     """
 
-    features = getattr(agent, "features", None)
-    peer_feature = (
-        features.get("PeersFeature")
-        if hasattr(features, "get")
-        else None
-    )
-    if peer_feature is None and features is not None:
-        values = features.values() if hasattr(features, "values") else features
-        peer_feature = next(
-            (
-                feature
-                for feature in values
-                if feature.__class__.__name__ == "PeersFeature"
-            ),
-            None,
-        )
+    from kestrel_sovereign.features.peers.directory import resolve_agent_peer_directory_context
+
+    effective = resolve_agent_peer_directory_context(agent)
+    peer_feature = effective.feature
     if peer_feature is not None:
-        context = getattr(peer_feature, "hosted_peer_directory_context", None)
-        if not callable(context):
-            return None, None
-        resolved = context()
-        if resolved is not None:
-            router, requester = resolved
+        if effective.router is not None:
+            router, requester = effective.router, effective.requester
             from kestrel_sovereign.features.peers.directory import (
                 LocalHostPeerDirectory,
             )
@@ -1494,10 +1477,7 @@ def _hosted_peer_directory_context(
             native_session_factory=native_session_factory,
         )
         return refreshed if refreshed is not None else (None, None)
-    return (
-        getattr(agent, "peer_directory_router", None),
-        getattr(agent, "peer_requester", None),
-    )
+    return effective.router, effective.requester
 
 
 async def _prepare_native_mcp(app: FastAPI, agent, routing_key: str, environment=None, *, manager=None):

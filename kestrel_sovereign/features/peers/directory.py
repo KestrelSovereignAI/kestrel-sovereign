@@ -170,6 +170,58 @@ class PeerDirectoryRouter(Protocol):
         """Open an authorized official-SDK session for a stable peer binding."""
 
 
+@dataclass(frozen=True)
+class AgentPeerDirectoryContext:
+    """A view of the existing owner, not an authority or replacement scope."""
+
+    feature: object | None
+    router: object | None
+    requester: object | None
+
+
+def resolve_agent_peer_directory_context(agent) -> AgentPeerDirectoryContext:
+    """Resolve the ONE effective directory, including feature-owned discovery.
+
+    Constructor fields are only authoritative when no Peers feature owns the
+    context. A broken/revoked feature never falls back to those stale fields.
+    """
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    features = getattr(agent, "features", None)
+    candidates = []
+    named = features.get("PeersFeature") if hasattr(features, "get") else None
+    if named is not None:
+        candidates.append(named)
+    if features is not None:
+        values = features.values() if hasattr(features, "values") else features
+        for feature in values:
+            if (
+                isinstance(feature, PeersFeature)
+                or feature.__class__.__name__ == "PeersFeature"
+            ) and all(feature is not existing for existing in candidates):
+                candidates.append(feature)
+    if len(candidates) > 1:
+        raise PeerDirectoryConfigurationError("Agent has multiple peer directory owners")
+    if not candidates:
+        return AgentPeerDirectoryContext(
+            None, getattr(agent, "peer_directory_router", None),
+            getattr(agent, "peer_requester", None),
+        )
+    feature = candidates[0]
+    context = getattr(feature, "hosted_peer_directory_context", None)
+    if not callable(context):
+        raise PeerDirectoryConfigurationError("Peers feature has no live directory context")
+    resolved = context()
+    if resolved is None:
+        return AgentPeerDirectoryContext(feature, None, None)
+    if not isinstance(resolved, (tuple, list)) or len(resolved) != 2:
+        raise PeerDirectoryConfigurationError("Peers feature returned a malformed directory context")
+    router, requester = resolved
+    if router is None or not isinstance(requester, PeerRequester):
+        raise PeerDirectoryConfigurationError("Peers feature returned an incomplete directory context")
+    return AgentPeerDirectoryContext(feature, router, requester)
+
+
 class IsolatedPeerDirectory:
     """An explicitly selected standalone scope with no authorized peers.
 

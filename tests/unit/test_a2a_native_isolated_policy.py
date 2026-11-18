@@ -21,6 +21,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerIdentity,
     PeerNotFoundError,
     PeerRequester,
+    resolve_agent_peer_directory_context,
 )
 from tests.unit.test_a2a_native_standalone import (
     signed_sdk_client,
@@ -132,7 +133,7 @@ async def test_copied_requester_cannot_spend_isolated_scope():
         directory.open_a2a_session(forged, PeerIdentity("did:kestrel:p", "p", "p"))
 
 
-@pytest_asyncio.fixture(params=["server", "direct"])
+@pytest_asyncio.fixture(params=["server", "direct", "server-feature", "direct-feature"])
 async def isolated_single(single_candidate, request):
     from kestrel_sovereign.a2a.native_standalone import (
         prepare_single_agent_native_publication,
@@ -145,8 +146,14 @@ async def isolated_single(single_candidate, request):
         "a2a_inbound_sender_authorizer",
     ):
         setattr(p.recipient, attribute, None)
+    if request.param.endswith("-feature"):
+        from kestrel_sovereign.features.peers.feature import PeersFeature
+
+        feature = PeersFeature(p.recipient)
+        await feature.initialize()
+        p.recipient.features = {"PeersFeature": feature}
     publish = (
-        _onboard_single_agent_native if request.param == "server"
+        _onboard_single_agent_native if request.param.startswith("server")
         else prepare_single_agent_native_publication
     )
     publication = await publish(p.app, p.recipient, {
@@ -174,10 +181,22 @@ async def test_real_signed_sdk_sender_is_refused_without_creating_task(isolated_
     assert p.publication.is_published
 
 
-@pytest.mark.parametrize("changed", ["peer_directory_router", "a2a_did_resolver"])
+@pytest.mark.parametrize("changed", ["peer_directory_router", "a2a_did_resolver", "feature-context"])
 async def test_isolated_publication_still_refuses_runtime_replacement(isolated_single, changed):
     p = isolated_single
-    setattr(p.recipient, changed, object())
+    if changed == "feature-context":
+        from kestrel_sovereign.features.peers.feature import PeersFeature
+
+        feature = getattr(p.recipient, "features", {}).get("PeersFeature")
+        if feature is None:
+            feature = PeersFeature(p.recipient)
+            feature._peer_router = p.recipient.peer_directory_router
+            feature._peer_requester = p.recipient.peer_requester
+            p.recipient.features = {"PeersFeature": feature}
+        else:
+            feature._peer_requester = PeerRequester(p.recipient.did, object())
+    else:
+        setattr(p.recipient, changed, object())
     params = send(p.admission)
     selected = SimpleNamespace(**(vars(p.admission) | {"guard": p.publication._guard}))
     context = signed_context(selected, params)
@@ -283,3 +302,135 @@ async def test_direct_standalone_publication_cannot_ignore_isolated_policy(singl
         owner = getattr(p.recipient, "_native_a2a_runtime_authority", None)
         if owner is not None:
             await owner.close()
+
+
+async def test_direct_isolation_refuses_actual_feature_owned_directory(single_candidate, monkeypatch):
+    from kestrel_sovereign.a2a.native_standalone import (
+        prepare_single_agent_native_publication,
+    )
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = single_candidate
+    for attribute in (
+        "peer_directory_router", "peer_requester", "a2a_did_resolver",
+        "a2a_inbound_sender_authorizer",
+    ):
+        setattr(p.recipient, attribute, None)
+    monkeypatch.setenv("KESTREL_HOST_URL", "https://existing-parent.test")
+    feature = PeersFeature(p.recipient)
+    await feature.initialize()
+    p.recipient.features = {"PeersFeature": feature}
+    context = feature.hosted_peer_directory_context()
+    assert context is not None and isinstance(context[0], LocalHostPeerDirectory)
+
+    def existing_transport(_requester, _peer):
+        pytest.fail("Conflicting policy validation must not attempt peer transport")
+
+    context[0].bind_native_session_factory(existing_transport)
+    assert p.recipient.peer_directory_router is None
+    assert p.recipient.peer_requester is None
+    try:
+        with pytest.raises(PeerDirectoryConfigurationError, match="conflicts"):
+            await prepare_single_agent_native_publication(p.app, p.recipient, {
+                "KESTREL_BASE_URL": "http://single.native.test",
+                "KESTREL_A2A_PUSH_ENABLED": "false",
+                "KESTREL_A2A_PEER_POLICY": "isolated",
+            })
+    finally:
+        owner = getattr(p.recipient, "_native_a2a_runtime_authority", None)
+        if owner is not None:
+            await owner.close()
+
+
+@pytest.mark.parametrize("collection", ["mapping", "sequence", "subclass"])
+def test_effective_feature_scope_never_falls_back_to_constructor_fields(collection):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    class DerivedPeers(PeersFeature):
+        pass
+
+    stale_router = object()
+    stale_requester = PeerRequester("did:kestrel:scope", object())
+    agent = SimpleNamespace(
+        did="did:kestrel:scope", peer_directory_router=stale_router,
+        peer_requester=stale_requester,
+    )
+    feature = (DerivedPeers if collection == "subclass" else PeersFeature)(agent)
+    feature._peer_router = feature._peer_requester = feature._host_url = None
+    agent.features = {"PeersFeature": feature} if collection == "mapping" else [feature]
+    effective = resolve_agent_peer_directory_context(agent)
+    assert effective.feature is feature
+    assert effective.router is effective.requester is None
+    assert agent.peer_directory_router is stale_router
+    assert agent.peer_requester is stale_requester
+
+
+def test_multiple_feature_owners_are_not_an_implicit_scope_choice():
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    agent = SimpleNamespace(did="did:kestrel:scope")
+    first, second = PeersFeature(agent), PeersFeature(agent)
+    agent.features = {"PeersFeature": first, "second": second}
+    with pytest.raises(PeerDirectoryConfigurationError, match="multiple peer directory owners"):
+        resolve_agent_peer_directory_context(agent)
+
+
+@pytest.mark.parametrize("context", [None, "missing", (None, None), (object(), object()), (object(),)])
+def test_malformed_effective_feature_context_never_uses_stale_attributes(context):
+    if context is None:
+        feature = SimpleNamespace(hosted_peer_directory_context=None)
+    else:
+        feature = SimpleNamespace(hosted_peer_directory_context=lambda: context)
+    agent = SimpleNamespace(
+        did="did:kestrel:scope", features={"PeersFeature": feature},
+        peer_directory_router=object(), peer_requester=PeerRequester("did:kestrel:scope", object()),
+    )
+    with pytest.raises(PeerDirectoryConfigurationError, match="(no live|malformed|incomplete)"):
+        resolve_agent_peer_directory_context(agent)
+
+
+@pytest.mark.parametrize("fault", ["nonisolated", "other-recipient", "existing"])
+def test_feature_isolation_binding_cannot_replace_or_invent_peer_authority(fault):
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    agent = SimpleNamespace(did="did:kestrel:scope")
+    feature = PeersFeature(agent)
+    feature._peer_router = feature._peer_requester = feature._host_url = None
+    directory = IsolatedPeerDirectory(agent.did)
+    if fault == "nonisolated":
+        directory = LocalHostPeerDirectory("https://parent.test")
+    elif fault == "other-recipient":
+        directory = IsolatedPeerDirectory("did:kestrel:other")
+    else:
+        feature._peer_router = LocalHostPeerDirectory("https://parent.test")
+        feature._peer_requester = PeerRequester(agent.did, object())
+    original = (feature._peer_router, feature._peer_requester)
+    with pytest.raises(PeerDirectoryConfigurationError):
+        feature.install_isolated_peer_directory(directory)
+    assert feature._peer_router is original[0]
+    assert feature._peer_requester is original[1]
+
+
+async def test_closed_native_owner_refuses_before_resolving_feature_state(isolated_single):
+    p = isolated_single
+    await p.owner.close()
+
+    def unavailable():
+        pytest.fail("Retired native authority touched feature context")
+
+    p.recipient.features = {"PeersFeature": SimpleNamespace(hosted_peer_directory_context=unavailable)}
+    with pytest.raises(HTTPException) as refused:
+        p.owner.require_current()
+    assert refused.value.status_code == 403
+
+
+@pytest.mark.parametrize("broken_bind", ["missing", "no-effect"])
+def test_isolation_refuses_unbindable_feature_without_installing_agent_trust(broken_bind):
+    feature = SimpleNamespace(hosted_peer_directory_context=lambda: None)
+    if broken_bind == "no-effect":
+        feature.install_isolated_peer_directory = lambda _directory: None
+    agent = SimpleNamespace(did="did:kestrel:scope", features={"PeersFeature": feature})
+    with pytest.raises(PeerDirectoryConfigurationError, match="(cannot bind|not bound)"):
+        configure(agent, {"KESTREL_A2A_PEER_POLICY": "isolated"})
+    assert not hasattr(agent, "peer_directory_router")
+    assert not hasattr(agent, "a2a_did_resolver")
