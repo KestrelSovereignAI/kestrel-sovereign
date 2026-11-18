@@ -60,7 +60,7 @@ async def rotation_store(tmp_path, monkeypatch, request):
 
 
 async def reject_writes(db, table, failure):
-    assert table in {"artifact_keys", "files", "conversation_history"}
+    assert table in {"artifact_keys", "files", "conversation_history", "mcp_input_scopes"}
     if db.backend_type == "sqlite":
         action = "SELECT RAISE(ABORT, 'update denied');" if failure == "raise" else "SELECT RAISE(IGNORE);"
         await db.execute(f"CREATE TRIGGER rotation_unavailable BEFORE UPDATE ON {table} BEGIN {action} END")

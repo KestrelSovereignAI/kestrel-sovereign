@@ -19,13 +19,16 @@ from uuid import uuid4
 
 from kestrel_sdk.resources import ResourceError
 from kestrel_sdk.security.aead import AEADCipher
-from kestrel_sdk.security.encryption import get_agent_key
+from kestrel_sdk.security.encryption import get_agent_key, get_fernet
 from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sovereign.a2a.media import encode_inline_json
 from kestrel_sovereign.a2a.stores.unified.base import NativeStoreConflict, UnifiedStoreBase
 from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
+
+MCP_INPUT_SCHEMA_REVISION = 2
+MCP_INPUT_WRAP_VERSION = 2
 
 
 class MCPInputConflict(NativeStoreConflict):
@@ -34,6 +37,11 @@ class MCPInputConflict(NativeStoreConflict):
 
 class MCPInputIntegrityError(ResourceError):
     """The original continuation cannot safely be opened."""
+
+
+def mcp_input_envelope_aad(scope: str) -> bytes:
+    """One scope/version context for initialization, migration and rotation."""
+    return encode_inline_json(['mcp-input-root', MCP_INPUT_WRAP_VERSION, scope])
 
 
 def _text(value: str) -> None:
@@ -131,7 +139,9 @@ class MCPInputStore(UnifiedStoreBase):
                 return
             if self.database.owns_open_transaction is not False:
                 raise MCPInputConflict('MCP input initialization requires its own transaction')
-            cipher = AEADCipher(get_agent_key(self.agent_did, 'service-keys'))
+            cipher = get_fernet()
+            if cipher is None:
+                raise MCPInputIntegrityError('MCP input custody requires encryption')
             binary = 'BYTEA' if self.is_postgres else 'BLOB'
             if not (self.is_postgres or self.is_sqlite):
                 raise ValueError('MCP input custody requires SQLite or PostgreSQL')
@@ -141,27 +151,46 @@ class MCPInputStore(UnifiedStoreBase):
                     await self.database.execute('CREATE TABLE IF NOT EXISTS mcp_input_schema (singleton BIGINT PRIMARY KEY, revision BIGINT NOT NULL)')
                     revision = await self.database.fetchone('SELECT revision FROM mcp_input_schema WHERE singleton=1')
                     if revision is None:
-                        await self.database.execute(f'CREATE TABLE mcp_input_scopes (scope TEXT PRIMARY KEY, wrapped_key {binary} NOT NULL, revision BIGINT NOT NULL, observed_at DOUBLE PRECISION)')
+                        await self.database.execute(f'CREATE TABLE mcp_input_scopes (scope TEXT PRIMARY KEY, wrapped_key {binary} NOT NULL, revision BIGINT NOT NULL, observed_at DOUBLE PRECISION, wrap_version BIGINT NOT NULL)')
                         await self.database.execute(f"CREATE TABLE mcp_inputs (scope TEXT NOT NULL, request_id TEXT NOT NULL, operation_digest TEXT NOT NULL, reader_digest TEXT NOT NULL, binding_digest TEXT NOT NULL, revision BIGINT NOT NULL, state TEXT NOT NULL CHECK(state IN ('WAITING','RESPONDING','RESOLVED','NON_RESUMABLE','UNKNOWN')), expires_at DOUBLE PRECISION NOT NULL, claim_hash TEXT, reservation_id TEXT NOT NULL, predecessor_id TEXT, payload {binary} NOT NULL, PRIMARY KEY(scope,request_id), UNIQUE(scope,operation_digest), UNIQUE(scope,predecessor_id), FOREIGN KEY(scope,predecessor_id) REFERENCES mcp_inputs(scope,request_id), FOREIGN KEY(scope) REFERENCES mcp_input_scopes(scope))")
                         await self.database.execute('CREATE INDEX mcp_inputs_reader ON mcp_inputs(scope,reader_digest,state)')
                         await self.database.execute('CREATE TABLE mcp_input_decisions (scope TEXT NOT NULL, decision_id TEXT NOT NULL, operation_digest TEXT NOT NULL, input_digest TEXT NOT NULL, reason TEXT NOT NULL, decided_at DOUBLE PRECISION NOT NULL, PRIMARY KEY(scope,decision_id), FOREIGN KEY(scope) REFERENCES mcp_input_scopes(scope))')
-                        await self.database.execute('INSERT INTO mcp_input_schema(singleton,revision) VALUES (1,1)')
-                    elif revision != (1,):
+                        await self.database.execute('INSERT INTO mcp_input_schema(singleton,revision) VALUES (1,?)', (MCP_INPUT_SCHEMA_REVISION,))
+                    elif revision == (1,):
+                        await self.database.execute('ALTER TABLE mcp_input_scopes ADD COLUMN wrap_version BIGINT NOT NULL DEFAULT 1')
+                        changed = await self.database.execute('UPDATE mcp_input_schema SET revision=? WHERE singleton=1 AND revision=1', (MCP_INPUT_SCHEMA_REVISION,))
+                        if changed != 1:
+                            raise MCPInputIntegrityError('MCP input schema migration was not stored')
+                    elif revision != (MCP_INPUT_SCHEMA_REVISION,):
                         raise MCPInputIntegrityError('Unsupported MCP input schema revision')
-                    await self.database.fetchone('SELECT scope,wrapped_key,revision,observed_at FROM mcp_input_scopes WHERE 1=0')
+                    await self.database.fetchone('SELECT scope,wrapped_key,revision,observed_at,wrap_version FROM mcp_input_scopes WHERE 1=0')
                     await self.database.fetchone('SELECT scope,request_id,operation_digest,reader_digest,binding_digest,revision,state,expires_at,claim_hash,reservation_id,predecessor_id,payload FROM mcp_inputs WHERE 1=0')
                     await self.database.fetchone('SELECT scope,decision_id,operation_digest,input_digest,reason,decided_at FROM mcp_input_decisions WHERE 1=0')
-                    row = await self.database.fetchone('SELECT wrapped_key FROM mcp_input_scopes WHERE scope=?', (self.scope,))
+                    row = await self.database.fetchone('SELECT wrapped_key,wrap_version FROM mcp_input_scopes WHERE scope=?', (self.scope,))
                     dependent = await self.database.fetchone('SELECT 1 FROM mcp_inputs WHERE scope=? LIMIT 1', (self.scope,))
                     if dependent is None:
                         dependent = await self.database.fetchone('SELECT 1 FROM mcp_input_decisions WHERE scope=? LIMIT 1', (self.scope,))
-                    root, envelope = resolve_envelope_key(cipher, bytes(row[0]) if row else None,
+                    if row is not None and (type(row[1]) is not int or row[1] not in {1, MCP_INPUT_WRAP_VERSION}):
+                        raise MCPInputIntegrityError('Unsupported MCP input envelope version')
+                    legacy = row is not None and row[1] == 1
+                    opening_cipher = AEADCipher(get_agent_key(self.agent_did, 'service-keys')) if legacy else cipher
+                    root, envelope = resolve_envelope_key(opening_cipher, bytes(row[0]) if row else None,
                         has_dependents=dependent is not None, integrity_error=MCPInputIntegrityError,
                         missing_message='Original MCP input envelope is missing',
                         unavailable_message='Original MCP input encryption key is unavailable',
-                        invalid_message='Invalid MCP input envelope')
+                        invalid_message='Invalid MCP input envelope',
+                        aad=None if legacy else mcp_input_envelope_aad(self.scope))
+                    if legacy:
+                        # A finite migration of the known original format, never
+                        # a decryption fallback for an already migrated scope.
+                        envelope = cipher.encrypt(root, aad=mcp_input_envelope_aad(self.scope))
+                        changed = await self.database.execute('UPDATE mcp_input_scopes SET wrapped_key=?,wrap_version=? WHERE scope=? AND wrap_version=1', (envelope, MCP_INPUT_WRAP_VERSION, self.scope))
+                    elif envelope is not None:
+                        changed = await self.database.execute('INSERT INTO mcp_input_scopes(scope,wrapped_key,revision,wrap_version) VALUES (?,?,0,?)', (self.scope, envelope, MCP_INPUT_WRAP_VERSION))
                     if envelope is not None:
-                        await self.database.execute('INSERT INTO mcp_input_scopes(scope,wrapped_key,revision) VALUES (?,?,0)', (self.scope, envelope))
+                        stored = await self.database.fetchone('SELECT wrapped_key,wrap_version FROM mcp_input_scopes WHERE scope=?', (self.scope,))
+                        if changed != 1 or stored is None or bytes(stored[0]) != envelope or stored[1] != MCP_INPUT_WRAP_VERSION:
+                            raise MCPInputIntegrityError('Original MCP input envelope migration was not stored')
             self._root = root
 
     def _binding_digest(self, binding):

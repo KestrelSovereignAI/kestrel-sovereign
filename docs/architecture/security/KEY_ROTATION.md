@@ -51,8 +51,11 @@ The encrypted-table registry in
 - `conversation_history.content` and `rendered_content`, with per-agent key
   derivation when `agent_id` is present;
 - encrypted `files.content` rows; legacy plaintext files are skipped;
-- `artifact_keys.wrapped_key`, when the artifact envelope table exists in the
-  same database. An existing envelope table must contain valid key rows.
+- wrapped roots in `artifact_keys`, `tool_effect_keys`,
+  `visual_computer_keys` and `mcp_task_keys`, when their tables exist in the
+  same database. An existing envelope table must contain valid key rows;
+- version-2 `mcp_input_scopes.wrapped_key` roots, authenticated to their
+  original agent scope during opening, rotation and resumed verification.
 
 `ArtifactsFeature` uses this rotation boundary for its encrypted saved-output
 repository in the agent's database. Stop the host before rotating its key and
@@ -62,6 +65,22 @@ compromised envelope root. Graph properties, external backups and unregistered
 stores are outside this service's coverage. In particular, encrypted channel
 messages and agent identity resources are not registered; coverage and safe
 cutover are tracked in [#3728](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3728).
+
+## MCP input-envelope migration
+
+Before rotating, initialize every original agent's input store under its
+original data key. Input schema revision 2 records a wrapping version per scope.
+Initialization opens a version-1 root with the original agent-purpose key and
+rewraps the same random root under the global master with scope/version AEAD
+context. It overwrites the old envelope, preserving checkpoint ciphertext,
+HMAC identities, admission counters and response claims. A version-2 root never
+tries the old purpose key. Missing or invalid original keys cannot be replaced.
+
+Both start and resume validate the complete registry before journal changes or
+work launch. An absent version column, unmigrated scope or unsupported wrapping
+version refuses rotation with a migration-required diagnostic. The service does
+not initialize agents or change their schemas itself. Migration requires the
+original agent identity and key; the scope hash is not a substitute for either.
 
 ## Journal and failure behavior
 
@@ -79,11 +98,19 @@ Every selected encrypted row must succeed. A decrypt, malformed mandatory
 root, or write-verification failure stops the run and saves `FAILED`; the
 service does not silently skip failed encrypted records and report completion.
 Cancellation leaves an `IN_PROGRESS` journal. `shutdown()` cancels and joins
-owned tasks before storage closes.
+owned tasks before storage closes. Completed tasks remain owned until observed.
+Drain surfaces original native control, commit and retirement failures after
+joining every accepted owner; a FAILED journal is not a replacement for that
+evidence. Only a plain cancellation authenticated as this drain's own shutdown
+request is suppressed. Independent source cancellation and observer withdrawal
+remain observable.
 
 Resume the same failed or interrupted journal using its original new-key file
 while the original old key remains configured. The service checks both key
-fingerprints and rebuilds the processed count from committed progress receipts.
+fingerprints, rebuilds the processed count from committed progress receipts and
+refreshes the total from the current complete registry, including input roots
+that older journals did not count. Already-rotated roots are verified with the
+same scope context under the new key before their progress receipt is accepted.
 Correct the recorded failure before retrying; supplying an unrelated key does
 not repair it.
 

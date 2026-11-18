@@ -109,3 +109,37 @@ class OriginalFailure:
             assert any(native is resource and original is not None and original.done()
                        and (task is None or original is task)
                        for native, original in execution_cleanup_debts(terminal)), "retirement lost its exact native resource/original settled Task"
+
+
+@contextmanager
+def lost_original_database_commit_ack(monkeypatch, store, *, accept_commit=None):
+    """Fail a genuine driver COMMIT acknowledgment after its actual success."""
+    originals = []
+    with monkeypatch.context() as patch:
+        if store.is_sqlite:
+            import aiosqlite
+            native_execute = aiosqlite.Connection._execute
+
+            async def lost_sqlite_ack(connection, function, *args, **kwargs):
+                result = await native_execute(connection, function, *args, **kwargs)
+                committed = function.__name__ == 'commit' or (
+                    function.__name__ == 'execute' and args
+                    and isinstance(args[0], str) and args[0].strip().upper() == 'COMMIT')
+                if not originals and committed and (accept_commit is None or await accept_commit()):
+                    fail_original_file_read(originals)
+                return result
+
+            patch.setattr(aiosqlite.Connection, '_execute', lost_sqlite_ack)
+        else:
+            import asyncpg
+            native_exit = asyncpg.transaction.Transaction.__aexit__
+
+            async def lost_postgres_ack(transaction, error_type, error, traceback):
+                result = await native_exit(transaction, error_type, error, traceback)
+                if (error_type is None and not transaction._nested and not originals
+                        and (accept_commit is None or await accept_commit())):
+                    fail_original_file_read(originals)
+                return result
+
+            patch.setattr(asyncpg.transaction.Transaction, '__aexit__', lost_postgres_ack)
+        yield originals
