@@ -9,7 +9,8 @@ from cryptography.fernet import Fernet
 import pytest
 import pytest_asyncio
 
-from kestrel_sovereign.execution_custody import execution_commit_outcome
+from kestrel_sdk.security.aead import AEADCipher
+from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers
 from kestrel_sovereign.mcp_task_store import (
     MCPTaskBinding, MCPTaskConflict, MCPTaskIntegrityError, MCPTaskStore,
 )
@@ -189,21 +190,40 @@ async def test_duplicate_remote_identity_and_oversize_claim_never_reopen_initial
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('column,value', [
-    ('handle', 'changed'), ('operation_digest', 'd' * 64), ('binding_digest', 'd' * 64),
-    ('remote_digest', 'd' * 64), ('revision', 200), ('phase', 'SETTLED'),
-    ('claim_hash', 'd' * 64), ('payload_limit', 5000), ('payload', b'damaged'),
+@pytest.mark.parametrize('column,value,authenticated', [
+    ('handle', 'changed', False), ('operation_digest', 'd' * 64, False),
+    ('binding_digest', 'd' * 64, False), ('remote_digest', 'd' * 64, False),
+    ('revision', 200, False), ('phase', 'SETTLED', False),
+    ('claim_hash', 'd' * 64, False), ('payload_limit', 5000, False), ('payload', b'damaged', False),
+    ('operation_digest', 'd' * 64, True), ('binding_digest', 'd' * 64, True),
+    ('remote_digest', 'd' * 64, True),
 ])
-async def test_every_retained_routing_or_cas_column_is_authenticated_before_new_admission(custody, column, value):
+async def test_every_retained_routing_or_cas_column_is_authenticated_before_new_admission(custody, column, value, authenticated):
     store = custody.store
     reserved = await store.reserve(binding())
-    await attach(store, reserved.issuance)
+    if column != 'claim_hash':
+        await attach(store, reserved.issuance)
+    # A live ISSUING hash remains structurally valid, so its change must fail
+    # authentication rather than the ATTACHED phase's null-hash invariant.
+    ciphertext = None
+    if authenticated:
+        columns = 'scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload'
+        row = list(await store.database.fetchone(f'SELECT {columns} FROM mcp_task_records'))
+        cipher = AEADCipher(store._root)
+        raw = cipher.decrypt(bytes(row[-1]), aad=store._aad(row[:-1]))
+        row[columns.split(',').index(column)] = value
+        ciphertext = cipher.encrypt(raw, aad=store._aad(row[:-1]))
+        assert cipher.decrypt(ciphertext, aad=store._aad(row[:-1])) == raw
     # Column names are the parametrized constant allowlist above, never input.
-    await store.database.execute(f'UPDATE mcp_task_records SET {column}=?', (value,))
-    with pytest.raises((MCPTaskIntegrityError, TransactionError)):
+    if authenticated:
+        await store.database.execute(f'UPDATE mcp_task_records SET {column}=?,payload=?', (value, ciphertext))
+    else:
+        await store.database.execute(f'UPDATE mcp_task_records SET {column}=?', (value,))
+    match = 'custody indexes are invalid' if authenticated else None
+    with pytest.raises((MCPTaskIntegrityError, TransactionError), match=match):
         await store.reserve(binding(operation_id='new'))
     assert await store.database.fetchone('SELECT COUNT(*) FROM mcp_task_records') == (1,)
-    with pytest.raises(MCPTaskIntegrityError):
+    with pytest.raises(MCPTaskIntegrityError, match=match):
         await store.list_attached()
 
 
@@ -324,7 +344,9 @@ async def test_native_commit_ack_loss_preserves_uncertainty_without_reissuing(cu
                 await store.reserve(binding())
             else:
                 await attach(store, issuance)
-        assert originals and execution_commit_outcome(caught.value) == 'unknown'
+        assert len(originals) == 1 and execution_commit_outcome(caught.value) == 'unknown'
+        assert any(error is originals[0] for error in execution_evidence_carriers(caught.value)), (
+            'The native commit failure lost its original injected source')
     restarted = await custody.reopen()
     recovered = await restarted.lookup(binding())
     assert recovered is not None and recovered.phase == ('ISSUING' if operation == 'reserve' else 'ATTACHED')
