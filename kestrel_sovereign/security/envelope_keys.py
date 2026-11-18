@@ -22,6 +22,7 @@ def resolve_envelope_key(
     missing_message: str,
     unavailable_message: str,
     invalid_message: str,
+    aad: bytes | None = None,
 ) -> tuple[bytes, bytes | None]:
     """Return the stable root and a new envelope only for an empty namespace.
 
@@ -33,10 +34,10 @@ def resolve_envelope_key(
         if has_dependents:
             raise integrity_error(missing_message)
         key = secrets.token_bytes(KEY_SIZE)
-        return key, cipher.encrypt(key)
+        return key, cipher.encrypt(key, aad=aad)
 
     try:
-        key = cipher.decrypt(wrapped_key)
+        key = cipher.decrypt(wrapped_key, aad=aad)
     except DecryptionError:
         raise integrity_error(unavailable_message) from None
     if len(key) != KEY_SIZE:

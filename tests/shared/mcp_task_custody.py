@@ -1,6 +1,6 @@
 """Canonical owned resources and native commit faults for MCP Task tests."""
 
-from contextlib import AsyncExitStack, contextmanager
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -10,6 +10,7 @@ import pytest_asyncio
 
 from kestrel_sovereign.mcp_task_store import MCPTaskBinding, MCPTaskStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.original_failure import lost_original_database_commit_ack as lost_commit_ack
 
 
 @pytest_asyncio.fixture(params=['sqlite', pytest.param('postgres', marks=pytest.mark.native_postgres)])
@@ -70,37 +71,3 @@ def claim(task_id='remote-private-task'):
 
 async def attach(store, issuance, task_id='remote-private-task'):
     return await store.attach_task(issuance, remote_task_id=task_id, envelope=claim(task_id))
-
-
-@contextmanager
-def lost_commit_ack(monkeypatch, store):
-    """Fail a genuine driver COMMIT acknowledgment after its actual success."""
-    from tests.utils.original_failure import fail_original_file_read
-    originals = []
-    with monkeypatch.context() as patch:
-        if store.is_sqlite:
-            import aiosqlite
-            native_execute = aiosqlite.Connection._execute
-
-            async def lost_sqlite_ack(connection, function, *args, **kwargs):
-                result = await native_execute(connection, function, *args, **kwargs)
-                committed = function.__name__ == 'commit' or (
-                    function.__name__ == 'execute' and args
-                    and isinstance(args[0], str) and args[0].strip().upper() == 'COMMIT')
-                if not originals and committed:
-                    fail_original_file_read(originals)
-                return result
-
-            patch.setattr(aiosqlite.Connection, '_execute', lost_sqlite_ack)
-        else:
-            import asyncpg
-            native_exit = asyncpg.transaction.Transaction.__aexit__
-
-            async def lost_postgres_ack(transaction, error_type, error, traceback):
-                result = await native_exit(transaction, error_type, error, traceback)
-                if error_type is None and not transaction._nested and not originals:
-                    fail_original_file_read(originals)
-                return result
-
-            patch.setattr(asyncpg.transaction.Transaction, '__aexit__', lost_postgres_ack)
-        yield originals

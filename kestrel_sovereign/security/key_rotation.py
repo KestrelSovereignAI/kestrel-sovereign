@@ -27,10 +27,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from kestrel_sdk.security.aead import AEADCipher
 
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission, await_owned_task, cancel_owned_task, create_owned_task,
+    is_owned_task_cancellation,
+)
+from kestrel_sovereign.execution_custody import execution_observation_error, is_execution_control_error
+from kestrel_sovereign.mcp_input_store import MCP_INPUT_WRAP_VERSION, mcp_input_envelope_aad
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
 from kestrel_sovereign.security.encryption import (
     # get_fernet is not called in this module's own code: it is a patch seam.
@@ -275,6 +281,7 @@ class KeyRotationService:
         """
         if any(not task.done() for task in self._rotation_tasks):
             raise RuntimeError("A rotation is already running; wait for its owner to finish")
+        await self.drain_rotations()
         existing = await self._get_in_progress_rotation(excluding_id=resume_id)
         if existing:
             raise RuntimeError(
@@ -336,10 +343,14 @@ class KeyRotationService:
 
             if _hash_key(old_key) != rotation.old_key_hash:
                 raise ValueError("Current key does not match rotation's old key")
+            total = await self._count_encrypted_records()
             # Progress rows commit atomically with their ciphertext. Counters may
             # lag after cancellation, so recover them from that durable journal.
             row = await self.storage.database.fetchone(
                 "SELECT COUNT(*) FROM rotation_progress WHERE rotation_id = ?", (rotation_id,))
+            if row[0] > total:
+                raise RuntimeError('Rotation progress exceeds the current registered corpus')
+            rotation.records_total = total
             rotation.records_processed = row[0]
             rotation.status = RotationStatus.IN_PROGRESS
             rotation.completed_at = None
@@ -359,9 +370,15 @@ class KeyRotationService:
         rotation_id: str,
     ) -> asyncio.Task[None]:
         """Own background rotation tasks so shutdown cannot orphan DB writes."""
-        task = asyncio.create_task(coro, name=f"key-rotation-{rotation_id}")
+        admission = OwnedTaskAdmission()
+        try:
+            task = create_owned_task(coro, name=f"key-rotation-{rotation_id}",
+                retain_originals=True, admission=admission)
+        except BaseException:
+            if admission.task is not None:
+                self._rotation_tasks.add(admission.task)
+            raise
         self._rotation_tasks.add(task)
-        task.add_done_callback(self._rotation_tasks.discard)
         return task
 
     async def drain_rotations(self, *, cancel: bool = False) -> None:
@@ -370,12 +387,29 @@ class KeyRotationService:
         if not tasks:
             return
 
+        requested = set()
         if cancel:
             for task in tasks:
-                task.cancel()
-
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self._rotation_tasks.difference_update(tasks)
+                if not task.done() and not task.cancelling() and cancel_owned_task(task):
+                    requested.add(task)
+        failures, observed = [], set()
+        for task in tasks:
+            try:
+                outcome = await await_owned_task(task, retain_cancellations=True)
+            except BaseException as error:
+                failures.append(error)
+                continue
+            observed.add(task)
+            if outcome.cancellation is not None:
+                failures.append(outcome.cancellation)
+            error = outcome.error
+            if error is not None and not (task in requested
+                    and is_owned_task_cancellation(task, error)
+                    and not is_execution_control_error(error)):
+                failures.append(error)
+        self._rotation_tasks.difference_update(observed)
+        if failures:
+            raise execution_observation_error(*failures)
 
     async def shutdown(self) -> None:
         """
@@ -471,6 +505,17 @@ class KeyRotationService:
             "optional": True,
             "require_all": True,
         },
+        {
+            "table": "mcp_input_scopes",
+            "content_column": "wrapped_key",
+            "id_column": "scope",
+            "agent_id_column": None,
+            "optional": True,
+            "require_all": True,
+            "version_column": "wrap_version",
+            "required_version": MCP_INPUT_WRAP_VERSION,
+            "aad_for_id": mcp_input_envelope_aad,
+        },
     ]
 
     async def _entry_available(self, entry: Dict[str, Any]) -> bool:
@@ -497,6 +542,9 @@ class KeyRotationService:
         including existing AEAD ciphertext, rather than trusting a prefix.
         """
         try:
+            # Includes older resumed journals: validate the complete registry
+            # before touching ciphertext, not only when its last table is met.
+            await self._count_encrypted_records()
             for entry in self.ENCRYPTED_TABLES:
                 if not await self._entry_available(entry):
                     continue
@@ -509,6 +557,9 @@ class KeyRotationService:
                     optional_content=entry.get("optional_content", False),
                     progress_alias=entry.get("progress_alias"),
                     require_all=entry.get("require_all", False),
+                    version_column=entry.get('version_column'),
+                    required_version=entry.get('required_version'),
+                    aad_for_id=entry.get('aad_for_id'),
                 )
 
             # Rotation complete
@@ -521,12 +572,21 @@ class KeyRotationService:
                 f"{rotation.records_processed} records rotated"
             )
 
-        except Exception as e:
+        except BaseException as e:
+            if isinstance(e, asyncio.CancelledError) and not is_execution_control_error(e):
+                raise
+            if not isinstance(e, Exception) and not is_execution_control_error(e):
+                raise
             rotation.status = RotationStatus.FAILED
             rotation.error_message = str(e)
             rotation.completed_at = datetime.now(timezone.utc)
-            await self._save_rotation(rotation)
+            try:
+                await self._save_rotation(rotation)
+            except BaseException as journal_error:
+                raise execution_observation_error(e, journal_error)
             logger.error(f"Key rotation {rotation.id} failed: {e}")
+            if is_execution_control_error(e):
+                raise
 
     async def _rotate_table(
         self,
@@ -540,6 +600,9 @@ class KeyRotationService:
         optional_content: bool = False,
         progress_alias: Optional[str] = None,
         require_all: bool = False,
+        version_column: str | None = None,
+        required_version: int | None = None,
+        aad_for_id: Callable[[str], bytes] | None = None,
     ):
         """Rotate encryption for a single table.
 
@@ -585,6 +648,7 @@ class KeyRotationService:
             table=table, content_column=content_column, id_column=id_column,
             agent_id_column=agent_id_column, require_all=require_all,
             optional_content=optional_content,
+            version_column=version_column, required_version=required_version,
         )
 
         # Pre-build the global cipher pair; per-agent ciphers are derived per row
@@ -600,10 +664,11 @@ class KeyRotationService:
             agent_id = row[2] if safe_agent_col else None
 
             record_id_str = str(record_id)
+            aad = aad_for_id(record_id_str) if aad_for_id is not None else None
             if record_id_str in already_rotated:
                 if require_all:
                     value = encrypted_content.encode() if isinstance(encrypted_content, str) else encrypted_content
-                    new_global.decrypt(value)
+                    new_global.decrypt(value, aad=aad)
                 continue
 
             # Pick the right NEW cipher (encrypt side). For per-agent tables
@@ -636,14 +701,14 @@ class KeyRotationService:
                 last_err: Optional[Exception] = None
                 for cand in decrypt_candidates:
                     try:
-                        decrypted = cand.decrypt(ct_bytes)
+                        decrypted = cand.decrypt(ct_bytes, aad=aad)
                         break
                     except Exception as inner:
                         last_err = inner
                 if decrypted is None:
                     raise last_err if last_err else RuntimeError("no decrypt candidate")
 
-                new_ct_bytes = new_cipher.encrypt(decrypted)
+                new_ct_bytes = new_cipher.encrypt(decrypted, aad=aad)
                 new_value = new_ct_bytes.decode() if was_str else new_ct_bytes
 
                 # UPDATE + progress INSERT atomic
@@ -686,6 +751,7 @@ class KeyRotationService:
         self, *, table: str, content_column: str, id_column: str,
         agent_id_column: str | None = None, require_all: bool = False,
         optional_content: bool = False,
+        version_column: str | None = None, required_version: int | None = None,
     ) -> list:
         """Use the runtime's encryption marker for both counting and rotation.
 
@@ -696,6 +762,13 @@ class KeyRotationService:
         safe_tbl = safe_table_name(table)
         safe_col = safe_column_name(content_column)
         safe_id = safe_column_name(id_column)
+        if version_column is not None:
+            version = safe_column_name(version_column)
+            if not await self.storage.database.column_exists(table, version_column):
+                raise RuntimeError(f'{table} requires original-agent envelope migration before key rotation')
+            versions = await self.storage.database.fetchall(f'SELECT {version} FROM {safe_tbl}')
+            if any(type(row[0]) is not int or row[0] != required_version for row in versions):
+                raise RuntimeError(f'{table} requires original-agent envelope migration before key rotation')
         agent = safe_column_name(agent_id_column) if agent_id_column else "NULL"
         columns = f"{safe_id}, {safe_col}, {agent}"
         if not require_all:
@@ -732,6 +805,8 @@ class KeyRotationService:
                 id_column=entry["id_column"], agent_id_column=entry.get("agent_id_column"),
                 require_all=entry.get("require_all", False),
                 optional_content=entry.get("optional_content", False),
+                version_column=entry.get('version_column'),
+                required_version=entry.get('required_version'),
             ))
         return total
 
