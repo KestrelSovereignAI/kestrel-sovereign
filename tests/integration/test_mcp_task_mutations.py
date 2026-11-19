@@ -11,7 +11,9 @@ from kestrel_sovereign.execution_custody import execution_commit_outcome, execut
 from kestrel_sovereign.mcp_task_store import MCPTaskConflict, MCPTaskIntegrityError
 from kestrel_sovereign.security.key_rotation import RotationStatus
 from kestrel_sovereign.storage.db.interface import TransactionError
+from kestrel_sovereign.mcp_task_submission import MCPTaskInteractiveOrigin
 from tests.shared.mcp_task_custody import (
+    submission,
     custody as custody, binding, claim, attach, attached, observation, lost_commit_ack, rotate_task_root, paused_task_write,
 )
 from tests.integration.test_key_rotation_recovery import reject_writes
@@ -102,7 +104,7 @@ async def test_original_binding_revision_and_consumption_govern_new_mutation_cus
         assert await store.read(binding(), current.handle) == current
         return
     if case == 'foreign':
-        current = replace(current, binding=binding(principal_id='other'))
+        current = replace(current, binding=binding(origin=MCPTaskInteractiveOrigin('d' * 64, 'private-session')))
     elif case == 'stale':
         await store.observe(current, inputs(key={'method': 'roots/list'}))
     elif case == 'forged':
@@ -114,7 +116,7 @@ async def test_original_binding_revision_and_consumption_govern_new_mutation_cus
         current = admitted.record
     if case == 'initial-over-mutation':
         with pytest.raises(MCPTaskConflict, match='already owns a mutation'):
-            await store.reserve(binding(operation_id='prior'))
+            await store.reserve(binding(operation_id='prior'), submission())
         assert await store.read(binding(), current.handle) == current
         return
     operation = binding().operation_id if case == 'initial-leaf' else ('prior' if case == 'changed-intent' else 'new-leaf')
@@ -132,7 +134,7 @@ async def test_native_writers_cannot_reuse_inputs_or_a_governed_operation_across
         other = current
         second_operation = 'competing-leaf'
     else:
-        fresh = await first.reserve(binding(operation_id='other-original'))
+        fresh = await first.reserve(binding(operation_id='other-original'), submission())
         other = await attach(first, fresh.issuance, 'other-remote')
         other = await first.observe(other, observation('input_required', taskId='other-remote', inputRequests={'key': {'method': 'roots/list'}}))
         second_operation = 'one-leaf'
@@ -158,14 +160,14 @@ async def test_cancel_ack_is_only_intent_and_never_releases_active_capacity(cust
     acked = await store.acknowledge_mutation(cancel.issuance, {'resultType': 'complete'})
     assert acked.phase == 'ATTACHED' and acked.observation is None
     with pytest.raises(MCPTaskConflict, match='active capacity'):
-        await store.reserve(binding(operation_id='replacement'))
+        await store.reserve(binding(operation_id='replacement'), submission())
     assert not (await store.reserve_mutation(original, operation_id='cancel-leaf', kind='cancel')).fresh
     new_intent = await store.reserve_mutation(acked, operation_id='explicit-new-cancel', kind='cancel')
     final = await store.observe(new_intent.record, observation('cancelled'))
     with pytest.raises(MCPTaskConflict):
         await store.reserve_mutation(final, operation_id='terminal-new-cancel', kind='cancel')
     assert not (await store.reserve_mutation(original, operation_id='cancel-leaf', kind='cancel')).fresh
-    assert (await store.reserve(binding(operation_id='replacement'))).fresh
+    assert (await store.reserve(binding(operation_id='replacement'), submission())).fresh
 
 
 @pytest.mark.asyncio
@@ -263,10 +265,10 @@ async def test_original_mutation_integrity_schema_boundary_and_key_rotation(cust
         with pytest.raises(MCPTaskConflict):
             await store.acknowledge_mutation(replace(reserved.issuance, secret='x' * 43), {'resultType': 'complete'})
     elif case == 'schema1':
-        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload FROM mcp_task_records'))
-        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[-1]), aad=store._aad(row[:-1])))
+        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest FROM mcp_task_records'))
+        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:12]))))
         del raw['envelope']['control']
-        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad(row[:-1]))
+        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad((*row[:9], *row[10:12])))
         await store.database.execute('UPDATE mcp_task_records SET payload=?', (ciphertext,))
         before = await store.database.fetchall('SELECT * FROM mcp_task_records')
         await store.database.execute('UPDATE mcp_task_schema SET revision=1')
@@ -281,8 +283,8 @@ async def test_original_mutation_integrity_schema_boundary_and_key_rotation(cust
         assert await restarted.read(binding(), reserved.record.handle) == reserved.record
         assert not (await restarted.reserve_mutation(current, operation_id='original-mutation', kind='update', input_responses={'key': response()})).fresh
     else:
-        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload FROM mcp_task_records'))
-        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[-1]), aad=store._aad(row[:-1])))
+        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest FROM mcp_task_records'))
+        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:12]))))
         control = raw['envelope']['control']
         receipt = control['mutations']['original-mutation']
         if case == 'intent':
@@ -293,14 +295,14 @@ async def test_original_mutation_integrity_schema_boundary_and_key_rotation(cust
             receipt['acknowledgement'] = {'resultType': 'complete'}
         else:
             receipt['claim_hash'] = 'invalid'
-        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad(row[:-1]))
+        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad((*row[:9], *row[10:12])))
         await store.database.execute('UPDATE mcp_task_records SET payload=? WHERE scope=? AND handle=?', (ciphertext, store.scope, current.handle))
         with pytest.raises(MCPTaskIntegrityError):
             await store.read(binding(), current.handle)
         # The native transaction wraps ordinary integrity failures while
         # retaining their original cause; do not replace that contract.
         with pytest.raises(TransactionError, match='Invalid private MCP Task payload') as rejected:
-            await store.reserve(binding(operation_id='cannot-hide-corrupt-history'))
+            await store.reserve(binding(operation_id='cannot-hide-corrupt-history'), submission())
         assert isinstance(rejected.value.__cause__, MCPTaskIntegrityError)
 
 
@@ -308,7 +310,7 @@ async def test_original_mutation_integrity_schema_boundary_and_key_rotation(cust
 @pytest.mark.parametrize('outcome', ['attach', 'settle'])
 async def test_initial_json_cannot_change_across_its_original_native_lock_wait(custody, monkeypatch, outcome):
     store = custody.store
-    issuance = (await store.reserve(binding())).issuance
+    issuance = (await store.reserve(binding(), submission())).issuance
     envelope = claim() if outcome == 'attach' else {'version': 1, 'native': {'resultType': 'complete', 'content': []}}
     original = json.loads(json.dumps(envelope))
     operation = (store.attach_task(issuance, remote_task_id='remote-private-task', envelope=envelope)

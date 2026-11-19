@@ -9,7 +9,8 @@ import pytest
 from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers
 from kestrel_sovereign.mcp_task_store import MCPTaskConflict
 from kestrel_sovereign.storage.db.interface import TransactionError
-from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack, observation, attached
+from kestrel_sovereign.mcp_task_submission import MCPTaskInteractiveOrigin
+from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack, observation, attached, submission
 
 
 
@@ -29,9 +30,9 @@ async def test_nonterminal_observation_preserves_original_claim_across_connectio
     assert current.observation['status'] == status
     restarted = await custody.reopen(max_active=1, max_records=1, max_payload_bytes=1)
     assert await restarted.read(binding(), original.handle) == current
-    assert await restarted.list_attached() == (current,)
+    assert await restarted.list_remote_tasks() == (current,)
     with pytest.raises(MCPTaskConflict, match='capacity'):
-        await restarted.reserve(binding(operation_id='unconfirmed-replacement'))
+        await restarted.reserve(binding(operation_id='unconfirmed-replacement'), submission())
 
 
 @pytest.mark.asyncio
@@ -43,10 +44,10 @@ async def test_confirmed_terminal_observation_releases_active_slot_and_keeps_rem
     assert result.phase == 'SETTLED' and result.envelope['native'] == claim()['native']
     assert result.observation == observation(status)
     restarted = await custody.reopen(max_active=1)
-    assert await restarted.list_attached() == ()
+    assert await restarted.list_remote_tasks() == (result,)
     assert await restarted.read(binding(), result.handle) == result
-    assert not (await restarted.reserve(binding())).fresh
-    fresh = await restarted.reserve(binding(operation_id='other', principal_id='other', session_id='other'))
+    assert not (await restarted.reserve(binding(), submission())).fresh
+    fresh = await restarted.reserve(binding(operation_id='other', origin=MCPTaskInteractiveOrigin('d' * 64, 'other')), submission(origin=(binding(operation_id='other', origin=MCPTaskInteractiveOrigin('d' * 64, 'other'))).origin))
     with pytest.raises(MCPTaskConflict, match='remote identity'):
         await attach(restarted, fresh.issuance)
     rows = repr(await store.database.fetchall('SELECT * FROM mcp_task_records'))
@@ -72,7 +73,8 @@ async def test_invalid_native_observation_cannot_change_current_custody(custody,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('field,value', [
-    ('principal_id', 'other'), ('session_id', 'other'), ('operation_id', 'other'),
+    ('origin', MCPTaskInteractiveOrigin('d' * 64, 'private-session')),
+    ('origin', MCPTaskInteractiveOrigin('f' * 64, 'other')), ('operation_id', 'other'),
     ('connection_id', 'd' * 64), ('authorization_id', 'd' * 64), ('contract_digest', 'd' * 64),
 ])
 async def test_reader_labels_cannot_retarget_an_observation(custody, field, value):
@@ -119,7 +121,7 @@ async def test_oversize_observation_does_not_release_capacity_and_lowered_budget
         await store.observe(original, oversized)
     assert await store.read(binding(), original.handle) == original
     with pytest.raises(MCPTaskConflict, match='active capacity'):
-        await store.reserve(binding(operation_id='new'))
+        await store.reserve(binding(operation_id='new'), submission())
     lowered = await custody.reopen(max_active=1, max_records=1, max_payload_bytes=1)
     final = await lowered.observe(original, observation('completed'))
     assert final.phase == 'SETTLED'
@@ -138,7 +140,7 @@ async def test_original_commit_ack_loss_recovers_terminal_result_and_actual_capa
     recovered = await restarted.read(binding(), original.handle)
     assert recovered.phase == 'SETTLED' and recovered.observation == observation('completed')
     assert recovered.envelope['native'] == original.envelope['native']
-    assert (await restarted.reserve(binding(operation_id='next'))).fresh
+    assert (await restarted.reserve(binding(operation_id='next'), submission())).fresh
     with pytest.raises(MCPTaskConflict):
         await restarted.observe(original, observation('completed'))
 
@@ -146,7 +148,7 @@ async def test_original_commit_ack_loss_recovers_terminal_result_and_actual_capa
 @pytest.mark.asyncio
 async def test_attach_cannot_smuggle_observation_or_unbound_initial_settlement(custody):
     store = custody.store
-    reserved = await store.reserve(binding())
+    reserved = await store.reserve(binding(), submission())
     with pytest.raises(ValueError):
         await store.attach_task(reserved.issuance, remote_task_id='remote-private-task',
             envelope={**claim(), 'observation': observation()})

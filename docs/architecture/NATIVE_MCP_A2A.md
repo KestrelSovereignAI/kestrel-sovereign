@@ -568,7 +568,7 @@ this does not protect against database deletion or rollback. Master-key rotation
 rewraps the per-agent random root through the canonical rotation registry,
 preserving keyed identities and private payloads.
 
-Task schema revision 2 additionally retains lifetime input identities and mutation
+Task custody additionally retains lifetime input identities and mutation
 receipts inside the same encrypted record. Repeated identical input snapshots
 deduplicate, including after a response acknowledgement; a changed request under
 an old key is refused across gaps and fresh connections. Only the current
@@ -586,8 +586,8 @@ custody and preserves concurrent observations and other responses. It records on
 a native acknowledgement; cancellation remains cooperative and does not release
 active capacity. A subsequent native terminal observation does. Acknowledgement
 may arrive after that observation, without regressing its phase or result.
-The unused revision-1 prototype is refused unchanged: its overwritten snapshots
-cannot establish lifetime history. No migration invents that missing history.
+The unused revision-1 prototype cannot establish lifetime history. No migration
+invents that missing history; current prototype revision refusals are listed below.
 
 Creation, latest observation and all lifetime history share the original admitted
 payload budget. Exhaustion can refuse a new input/cancel intent, acknowledgement,
@@ -686,6 +686,41 @@ state-only MRTR retries. Unattended turns do not acquire interactive authority
 through a continuation. Reject stale/wrong-agent/wrong-operation human responses
 and keep secrets out of conversations. Exercise state-only and operator-required
 paths against the real turn scheduler, including #3439's lock-contention case.
+
+### Original Task submission custody
+
+The optional Task repository uses prototype schema 3. It refuses revisions 1
+and 2 when initialized; the disabled Task host does not initialize it during
+ordinary startup. Binding, operation, remote-identity and row-AAD domains are
+version 2. Existing envelope-key rotation remains unchanged.
+
+Each initial reservation requires sealed original arguments, exact contract
+bytes and typed delivery provenance before any request can be sent. A separate
+immutable encrypted submission column has its own retained size limit and
+keyed digest bound to its original operation, authenticated by the routing row.
+Reservation detaches these original bytes before any transaction await.
+Result transitions never rewrite
+these columns or consume their budget. Inventory authenticates routing metadata;
+`open_submission` also authenticates and validates the original private bytes
+and contract digest. Neither operation grants execution permission.
+
+Origins distinguish request-authenticated interactive attribution from bounded
+service attribution. Service namespace digests describe Core's actual ambient
+operation context, rather than claiming to identify a journal row. A service
+origin has no invented principal or chat. An explicitly bound anonymous caller
+is refused even when ambient provenance names a signal or service; provenance
+cannot promote that caller. App delivery requires interactive
+attribution and an original physical View token; stored tokens cannot adopt a
+new iframe after restart. The host must independently prove every origin,
+connection, authorization generation and delivery borrow.
+
+`list_remote_tasks` retains remote Tasks in both ATTACHED and SETTLED phases so
+terminal waits can reconcile. Initial issuance secrets remain unrecoverable.
+Schema 3 fixes the permitted service kinds and reserved-session policy used to
+validate retained origins. Changing those policies requires a deliberate stored
+format decision so an older authenticated origin cannot strand the agent scope.
+The atomic Task/Input claim handoff is a separate schema change; no unused
+INPUT_WAITING phase or continuation replay path is enabled by this repository.
 
 ### Registered native Task actions
 
