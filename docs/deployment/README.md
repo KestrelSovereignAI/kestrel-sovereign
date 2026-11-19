@@ -66,6 +66,14 @@ names the revision, URL, and failed gate, and is left in place for
 inspection — nothing is rolled back automatically. `unknown` means no probe
 could run (for example, the provider returned no URL) and is also a failure.
 
+An update preserves the fetched service's traffic, database attachments,
+service account and other unmanaged settings, but clears its previous revision
+name. Cloud Run generates a new revision identity rather than attempting to
+change an existing immutable revision. Existing explicit traffic allocations
+remain explicit; this does not switch traffic to the latest revision. When
+staging at zero traffic, validate the new revision's tagged URL and original
+identity before deliberately changing the serving allocation.
+
 ## GitHub deployment identity
 
 The deployment workflow uses the shared `.github/actions/gcp-deploy-auth`

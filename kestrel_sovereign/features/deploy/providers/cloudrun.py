@@ -25,6 +25,9 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
     traffic split, annotations — is left intact rather than reset out-of-band
     (F174).
     """
+    # A fetched template can name an existing immutable revision. Omit that
+    # identity so Cloud Run generates a name for the new configuration (#4170).
+    service.template.revision = ""
     service.template.containers = [container]
     service.template.scaling.min_instance_count = profile.min_instances
     service.template.scaling.max_instance_count = profile.max_instances

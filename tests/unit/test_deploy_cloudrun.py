@@ -22,7 +22,10 @@ from kestrel_sovereign.features.deploy.models import (
     DeployManagerError,
     DeployProviderType,
 )
-from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
+from kestrel_sovereign.features.deploy.providers.cloudrun import (
+    CloudRunProvider,
+    _apply_managed_template,
+)
 
 
 @pytest.fixture
@@ -86,6 +89,66 @@ class TestCloudRunProviderInit:
             with pytest.raises(DeployManagerError) as exc_info:
                 CloudRunProvider()
             assert "GCP_PROJECT_ID is required" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "previous_revision",
+    ("", "kestrel-dev-00001-abc", "kestrel-dev-operator-canary"),
+)
+def test_managed_template_omits_previous_revision_without_resetting_custody(
+    deployment_profile, previous_revision
+):
+    """A fetched immutable name is not the next revision's requested identity."""
+    from google.cloud.run_v2 import Container, Service
+
+    existing = Service(
+        name="projects/test-project/locations/us-central1/services/kestrel-dev",
+        labels={"team": "platform"},
+        annotations={"operator.example/owner": "existing"},
+        template={
+            "revision": previous_revision,
+            "labels": {"custody": "original"},
+            "annotations": {"operator.example/policy": "preserve"},
+            "service_account": "runtime@test-project.iam.gserviceaccount.com",
+            "vpc_access": {
+                "connector": "projects/test-project/locations/us-central1/connectors/original"
+            },
+            "volumes": [{
+                "name": "cloudsql",
+                "cloud_sql_instance": {"instances": ["test-project:us-central1:primary"]},
+            }],
+            "containers": [{"image": "gcr.io/test-project/kestrel:previous"}],
+        },
+        traffic=[{
+            "type_": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+            "revision": "kestrel-dev-00001-abc",
+            "percent": 100,
+            "tag": "current",
+        }],
+    )
+    original = Service(existing)
+    container = Container(image="gcr.io/test-project/kestrel:v0.66.5")
+
+    _apply_managed_template(existing, container, deployment_profile)
+
+    assert existing.template.revision == "", "must not reuse an immutable revision name"
+    assert "revision" not in {
+        descriptor.name for descriptor, _ in existing.template._pb.ListFields()
+    }, "Cloud Run must receive an omitted revision identity"
+    assert existing.name == original.name
+    assert existing.labels == original.labels
+    assert existing.annotations == original.annotations
+    assert existing.traffic == original.traffic
+    assert existing.template.labels == original.template.labels
+    assert existing.template.annotations == original.template.annotations
+    assert existing.template.service_account == original.template.service_account
+    assert existing.template.vpc_access == original.template.vpc_access
+    assert existing.template.volumes == original.template.volumes
+    assert existing.template.containers == [container]
+    assert existing.template.scaling.min_instance_count == deployment_profile.min_instances
+    assert existing.template.scaling.max_instance_count == deployment_profile.max_instances
+    assert existing.template.timeout.total_seconds() == deployment_profile.timeout
+    assert existing.template.max_instance_request_concurrency == deployment_profile.concurrency
 
 
 class TestCloudRunProviderDeploy:
@@ -322,8 +385,12 @@ class TestCloudRunProviderDeploy:
         mock_client.update_service.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "previous_revision",
+        ("", "kestrel-dev-00001-abc", "kestrel-dev-operator-canary"),
+    )
     async def test_deploy_update_preserves_out_of_band_settings(
-        self, mock_services_client, deployment_profile
+        self, mock_services_client, deployment_profile, previous_revision
     ):
         """F174: updating an existing service must read-modify-write the FETCHED
         service so fields Kestrel doesn't manage (service_account, labels, …)
@@ -335,6 +402,7 @@ class TestCloudRunProviderDeploy:
         mock_services_client.return_value = mock_client
 
         existing = Service()
+        existing.template.revision = previous_revision
         existing.template.service_account = (
             "custom-sa@test-project.iam.gserviceaccount.com"
         )
@@ -362,6 +430,7 @@ class TestCloudRunProviderDeploy:
         # Mutated the fetched service in place (read-modify-write), preserving
         # out-of-band settings.
         assert sent is existing
+        assert sent.template.revision == "", "provider must not submit a stale revision identity"
         assert sent.template.service_account == (
             "custom-sa@test-project.iam.gserviceaccount.com"
         )
