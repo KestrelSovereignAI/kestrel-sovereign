@@ -350,7 +350,7 @@ phoenix = [
 # packages (#462). google-cloud-run stays here because the framework's
 # deploy feature still owns CloudRunProvider directly.
 cloud = [
-    "google-cloud-run>=0.10.0",
+    "google-cloud-run>=0.15.0",
     "azure-mgmt-appcontainers>=3.0.0",
     "azure-identity>=1.15.0",
 ]

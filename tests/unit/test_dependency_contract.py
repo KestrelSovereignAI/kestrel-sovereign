@@ -558,3 +558,29 @@ def test_native_provider_completion_release_is_required():
     assert Version("0.3.0") not in providers.specifier
     for name, floor in (("openai", "3.46.0"), ("google-genai", "2.34.0")):
         _assert_requirement_floor(dependencies[name], Version(floor))
+
+
+def test_cloud_run_requires_readiness_probe_sdk_contract():
+    """Preserving every probe requires the actual SDK readiness_probe field."""
+    floor = Version("0.15.0")
+    (declared,) = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["optional-dependencies"]["cloud"]
+        if canonicalize_name(Requirement(raw).name) == "google-cloud-run"
+    ]
+    (locked_requirement,) = [
+        requirement
+        for requirement in _locked_root_package(_lock())["metadata"]["requires-dist"]
+        if requirement["name"] == "google-cloud-run"
+        and requirement.get("marker") == "extra == 'cloud'"
+    ]
+    for requirement in (
+        declared,
+        Requirement("google-cloud-run" + locked_requirement["specifier"]),
+    ):
+        _assert_requirement_floor(requirement, floor)
+        assert Version("0.14.0") not in requirement.specifier
+    (locked,) = [
+        package for package in _lock()["package"] if package["name"] == "google-cloud-run"
+    ]
+    assert Version(locked["version"]) >= floor
