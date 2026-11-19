@@ -151,13 +151,13 @@ async def test_every_retained_routing_or_cas_column_is_authenticated_before_new_
     # authentication rather than the ATTACHED phase's null-hash invariant.
     ciphertext = None
     if authenticated:
-        columns = 'scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest'
+        columns = 'scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest'
         row = list(await store.database.fetchone(f'SELECT {columns} FROM mcp_task_records'))
         cipher = AEADCipher(store._root)
-        raw = cipher.decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:12])))
+        raw = cipher.decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:13])))
         row[columns.split(',').index(column)] = value
-        ciphertext = cipher.encrypt(raw, aad=store._aad((*row[:9], *row[10:12])))
-        assert cipher.decrypt(ciphertext, aad=store._aad((*row[:9], *row[10:12]))) == raw
+        ciphertext = cipher.encrypt(raw, aad=store._aad((*row[:9], *row[10:13])))
+        assert cipher.decrypt(ciphertext, aad=store._aad((*row[:9], *row[10:13]))) == raw
     # Column names are the parametrized constant allowlist above, never input.
     if authenticated:
         await store.database.execute(f'UPDATE mcp_task_records SET {column}=?,payload=?', (value, ciphertext))
