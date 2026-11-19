@@ -27,14 +27,17 @@ from kestrel_sovereign.execution_custody import (
 
 def test_public_owned_tail_api_is_exact_canonical_identity_and_signature():
     names = {
+        "OwnedOperation",
         "OwnedTaskAdmission",
         "OwnedTaskOutcome",
+        "OwnedTaskRetirement",
         "await_owned_operation",
         "await_owned_task",
         "create_owned_task",
         "owned_task_error",
         "pending_owned_retirement_error",
         "raise_owned_outcome",
+        "reconcile_owned_task_admission",
         "run_blocking_operation",
         "wait_owned_tasks_until",
     }

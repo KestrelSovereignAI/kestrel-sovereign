@@ -17,7 +17,7 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, ExitStack, a
 from dataclasses import dataclass, field
 from functools import wraps
 from types import TracebackType
-from typing import Generic, TypeVar, cast
+from typing import Generic, Literal, TypeVar, cast
 from weakref import WeakKeyDictionary
 
 from kestrel_sdk.native_a2a.utils.source_lifetime import SourceFactory
@@ -322,11 +322,59 @@ class OwnedTaskAdmission:
     _wrapper_started: bool = field(default=False, repr=False)
     _canonical_error: BaseException | None = field(default=None, repr=False)
     _start_refused: bool = field(default=False, repr=False)
+    _creation_started: bool = field(default=False, repr=False)
+    _nonacceptance_proven: bool = field(default=False, repr=False)
 
     @property
     def dispatch_refused(self) -> bool:
         """The exact canonical wrapper can only retire its sealed failed gate."""
         return self._start_refused and self._canonical_wrapper_only
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedTaskRetirement:
+    """Read-only physical observation of one original admission.
+
+    Completion is not business success, resource authority, or an instruction to
+    release a lease. UNKNOWN retains the original receipt and any physical debt.
+    Only ``reconcile_owned_task_admission`` produces a canonical observation.
+    """
+
+    admission: OwnedTaskAdmission
+    task: asyncio.Task | None
+    state: Literal["unknown", "nonacceptance", "pending", "complete"]
+    error: BaseException | None
+
+
+def _require_fresh_owned_task_admission(admission):
+    if (type(admission) is not OwnedTaskAdmission or admission.task is not None
+            or admission._acceptance_unknown or admission._creation_started):
+        raise TypeError("owned admission requires a fresh original receipt")
+
+
+def reconcile_owned_task_admission(admission: OwnedTaskAdmission) -> OwnedTaskRetirement:
+    """Observe the original receipt without allocating, cancelling, or closing.
+
+    A fresh receipt is not a refusal. Native completion uses the same canonical
+    error capture as every existing join; an unfinished physical tail or lost
+    capture cannot become an ACK merely because its enclosing Task is done.
+    """
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
+    if type(admission) is not OwnedTaskAdmission:
+        raise TypeError("physical reconciliation requires an original admission receipt")
+    task = admission.task
+    if (not admission._creation_started or admission._acceptance_unknown
+            or (task is not None and not isinstance(task, _NATIVE_TASK))):
+        return OwnedTaskRetirement(admission, task, "unknown", admission.error)
+    if task is None:
+        state = "nonacceptance" if admission._nonacceptance_proven else "unknown"
+        return OwnedTaskRetirement(admission, None, state, admission.error)
+    if not task.done():
+        return OwnedTaskRetirement(admission, task, "pending", admission.error)
+    error = owned_task_error(task)
+    state = "unknown" if execution_cleanup_debts(error) else "complete"
+    return OwnedTaskRetirement(admission, task, state, error)
 
 
 def cancel_owned_task(task: asyncio.Task) -> bool:
@@ -577,11 +625,12 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         return terminal
 
     creation_attempted = False
+    receipt_started = False
     owner_loop = task_factory = None
     try:
-        if (type(admission) is not OwnedTaskAdmission or admission.task is not None
-                or admission._acceptance_unknown):
-            raise TypeError("owned admission requires a fresh original receipt")
+        _require_fresh_owned_task_admission(admission)
+        admission._creation_started = True
+        receipt_started = True
         admission._retain_originals = retain_originals
         if on_completion is not None:
             publisher_call = getattr(on_completion, '__call__', None)
@@ -659,14 +708,21 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 if query_error is not None:
                     from kestrel_sovereign.execution_custody import execution_observation_error
                     error = execution_observation_error(error, query_error)
-                raise owned_task_admission_error(
+                failure = owned_task_admission_error(
                     retirement_resource if retirement_resource is not None else admission,
                     admission, error,
                 )
+                admission.error = failure
+                raise failure
         wrapper.close()
         close = getattr(operation, "close", None)
         if callable(close):
             close()
+        if (receipt_started and admission.task is None
+                and not admission._acceptance_unknown):
+            # Set only after the original unstarted payload was actually closed.
+            admission._nonacceptance_proven = True
+            admission.error = error
         if retirement_resource is not None:
             from kestrel_sovereign.execution_custody import execution_terminal_error
             debt = RuntimeError("original native closer admission refused")
@@ -1035,8 +1091,19 @@ class OwnedOperation:
     """
 
     def __init__(self, operation, *, retirement_resource=None,
-                 retain_originals=False, name=None, context=None, owner_factory=None):
-        admission = OwnedTaskAdmission()
+                 retain_originals=False, name=None, context=None, owner_factory=None,
+                 admission=None):
+        # Resource owners can reserve this exact receipt before construction.
+        # Keep it even when acceptance cannot identify a returned native Task.
+        self._admission = OwnedTaskAdmission() if admission is None else admission
+        admission = self._admission
+        try:
+            _require_fresh_owned_task_admission(admission)
+        except TypeError:
+            close = getattr(operation, "close", None)
+            if callable(close):
+                close()
+            raise
         self._opening = None
         factory_returned = False
         try:
@@ -1081,9 +1148,7 @@ class OwnedOperation:
         if self._opening is None:
             return await await_owned_task(self._task, **observation)
         # Do not cancel a failed start gate into a substitute CancelledError.
-        outcome = await await_owned_task(
-            self._task, pending_cancellation=observation.get("pending_cancellation"),
-            retain_cancellations=observation.get("retain_cancellations", False))
+        outcome = await await_owned_task(self._task, **observation)
         return OwnedTaskOutcome(
             outcome.result,
             execution_observation_error(self._opening, outcome.error),
