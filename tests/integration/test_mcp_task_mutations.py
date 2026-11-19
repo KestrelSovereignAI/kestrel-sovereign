@@ -115,7 +115,7 @@ async def test_original_binding_revision_and_consumption_govern_new_mutation_cus
         admitted = await store.reserve_mutation(current, operation_id='prior', kind='update', input_responses={'key': response(True)})
         current = admitted.record
     if case == 'initial-over-mutation':
-        with pytest.raises(MCPTaskConflict, match='already owns a mutation'):
+        with pytest.raises(MCPTaskConflict, match='already owns retained work'):
             await store.reserve(binding(operation_id='prior'), submission())
         assert await store.read(binding(), current.handle) == current
         return
@@ -265,10 +265,10 @@ async def test_original_mutation_integrity_schema_boundary_and_key_rotation(cust
         with pytest.raises(MCPTaskConflict):
             await store.acknowledge_mutation(replace(reserved.issuance, secret='x' * 43), {'resultType': 'complete'})
     elif case == 'schema1':
-        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest FROM mcp_task_records'))
-        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:12]))))
+        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest FROM mcp_task_records'))
+        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:13]))))
         del raw['envelope']['control']
-        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad((*row[:9], *row[10:12])))
+        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad((*row[:9], *row[10:13])))
         await store.database.execute('UPDATE mcp_task_records SET payload=?', (ciphertext,))
         before = await store.database.fetchall('SELECT * FROM mcp_task_records')
         await store.database.execute('UPDATE mcp_task_schema SET revision=1')
@@ -283,8 +283,8 @@ async def test_original_mutation_integrity_schema_boundary_and_key_rotation(cust
         assert await restarted.read(binding(), reserved.record.handle) == reserved.record
         assert not (await restarted.reserve_mutation(current, operation_id='original-mutation', kind='update', input_responses={'key': response()})).fresh
     else:
-        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest FROM mcp_task_records'))
-        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:12]))))
+        row = list(await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest FROM mcp_task_records'))
+        raw = json.loads(AEADCipher(store._root).decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:13]))))
         control = raw['envelope']['control']
         receipt = control['mutations']['original-mutation']
         if case == 'intent':
@@ -295,7 +295,7 @@ async def test_original_mutation_integrity_schema_boundary_and_key_rotation(cust
             receipt['acknowledgement'] = {'resultType': 'complete'}
         else:
             receipt['claim_hash'] = 'invalid'
-        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad((*row[:9], *row[10:12])))
+        ciphertext = AEADCipher(store._root).encrypt(json.dumps(raw).encode(), aad=store._aad((*row[:9], *row[10:13])))
         await store.database.execute('UPDATE mcp_task_records SET payload=? WHERE scope=? AND handle=?', (ciphertext, store.scope, current.handle))
         with pytest.raises(MCPTaskIntegrityError):
             await store.read(binding(), current.handle)

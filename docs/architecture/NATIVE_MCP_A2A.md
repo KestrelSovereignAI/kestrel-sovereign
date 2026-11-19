@@ -705,18 +705,19 @@ paths against the real turn scheduler, including #3439's lock-contention case.
 
 ### Original Task submission custody
 
-The optional Task repository uses prototype schema 3. It refuses revisions 1
-and 2 when initialized; the disabled Task host does not initialize it during
-ordinary startup. Binding, operation, remote-identity and row-AAD domains are
-version 2. Existing envelope-key rotation remains unchanged.
+The optional Task repository uses prototype schema 4. It refuses revisions 1
+through 3 when initialized; the disabled Task host does not initialize it during
+ordinary startup. The routing AAD uses version 3 and includes its optional input
+lineage. Binding, operation, remote and submission identities keep version 2.
+Existing envelope-key rotation remains unchanged.
 
 Each initial reservation requires sealed original arguments, exact contract
 bytes and typed delivery provenance before any request can be sent. A separate
 immutable encrypted submission column has its own retained size limit and
 keyed digest bound to its original operation, authenticated by the routing row.
-Reservation detaches these original bytes before any transaction await.
-Result transitions never rewrite
-these columns or consume their budget. Inventory authenticates routing metadata;
+Reservation detaches the original binding, nested origin and submission before
+any transaction await. Result transitions never rewrite these columns or consume
+their budget. Inventory authenticates routing metadata;
 `open_submission` also authenticates and validates the original private bytes
 and contract digest. Neither operation grants execution permission.
 
@@ -732,11 +733,48 @@ connection, authorization generation and delivery borrow.
 
 `list_remote_tasks` retains remote Tasks in both ATTACHED and SETTLED phases so
 terminal waits can reconcile. Initial issuance secrets remain unrecoverable.
-Schema 3 fixes the permitted service kinds and reserved-session policy used to
+The stored format fixes the permitted service kinds and reserved-session policy used to
 validate retained origins. Changing those policies requires a deliberate stored
 format decision so an older authenticated origin cannot strand the agent scope.
-The atomic Task/Input claim handoff is a separate schema change; no unused
-INPUT_WAITING phase or continuation replay path is enabled by this repository.
+
+### Joint Task and Input custody
+
+`MCPTaskInputCustody` requires both initialized canonical stores, the exact same
+primary database object and backend, and the same original agent DID/scope.
+Their encrypted roots remain independent. Each joint write locks Input admission
+before Task admission. Input cryptography and private before-images are prepared
+outside the transaction; its SQL-only apply compares that authenticated image.
+Task rows are opened under their own lock and root. Neither store's credentials
+grant permission to execute a tool.
+
+Before any remote Task is created, `suspend` atomically creates the linked Input
+and consumes the actual Task issuance into INPUT_WAITING. The first input uses
+the original effect claim; every successor proves its genuine previous response
+and the same reservation. The Task-root lineage digest is unique per scope,
+authenticated by the row, assigned once, and preserved by every later update.
+The Input's encrypted binding points back to the same Task. Ordinary Input
+creation/response APIs refuse these links even when the Task host is disabled.
+
+`resume` consumes WAITING into RESPONDING and moves the linked Task back to
+ISSUING in the same transaction. It records the fresh actual continuation effect
+claim across the lifetime set of initial, continuation and native mutation IDs.
+Both new credentials are released only after one clean commit acknowledgement.
+A lost or cancelled acknowledgement returns neither credential; an uncertain
+ISSUING record is retained and cannot be reclaimed or automatically replayed.
+After wire success, the host must settle the Task before its Input response.
+
+`close_expired` proves the exact linked local wait has expired against Input's
+monotonic admitted time. One commit sets that Input NON_RESUMABLE and the Task
+INPUT_CLOSED, releasing active Task capacity. It sends no wire request, creates
+no native result, and infers nothing from remote TTL. An issuing or attached
+Task cannot take this exit. Private retained inventory includes uncertain and
+input-held work for owner reconstruction; remote inventory keeps its existing
+ATTACHED/SETTLED meaning.
+
+This coordinator is private storage. Actual Input-host routing, fresh original
+tool governance and connection ownership, observer/wait-provider integration,
+Apps delivery and native/browser acceptance remain required before Tasks is
+advertised. It does not enable Tasks or implement a compatibility adapter.
 
 ### Registered native Task actions
 

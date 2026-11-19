@@ -161,6 +161,7 @@ async def test_submission_budget_refuses_new_work_but_never_reclaims_existing_cu
 @pytest.mark.asyncio
 @pytest.mark.parametrize('column,value', [
     ('submission_limit', 10000), ('submission_digest', 'd' * 64),
+    ('input_lineage_digest', 'e' * 64),
 ])
 async def test_submission_routing_metadata_is_authenticated_before_any_new_admission(custody, column, value):
     store = custody.store
@@ -199,7 +200,7 @@ async def test_untrusted_record_fields_cannot_replace_the_sql_opened_submission(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('revision', [1, 2])
+@pytest.mark.parametrize('revision', [1, 2, 3])
 async def test_prototype_revision_refuses_without_migrating_original_rows(custody, revision):
     store = custody.store
     await store.reserve(binding(), submission())
@@ -217,10 +218,10 @@ async def test_authenticated_submission_still_requires_original_contract_digest_
     store = custody.store
     original = submission()
     reserved = await store.reserve(binding(), original)
-    columns = 'scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest'
+    columns = 'scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest'
     row = list(await store.database.fetchone(f'SELECT {columns} FROM mcp_task_records'))
     cipher = AEADCipher(store._root)
-    payload = cipher.decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:12])))
+    payload = cipher.decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:13])))
     if damage == 'contract':
         altered = submission(contract=b'authenticated-but-wrong-original-descriptor')
         row[11] = store._digest('mcp-task-submission-v2',
@@ -231,7 +232,7 @@ async def test_authenticated_submission_still_requires_original_contract_digest_
         altered = original
         row[10] = len(original.canonical_json) - 1
     # A valid native AEAD frame alone cannot make false semantic evidence true.
-    routing = cipher.encrypt(payload, aad=store._aad((*row[:9], *row[10:12])))
+    routing = cipher.encrypt(payload, aad=store._aad((*row[:9], *row[10:13])))
     private = cipher.encrypt(altered.canonical_json,
         aad=store._submission_aad(row[1], row[3], row[10], row[11]))
     await store.database.execute('UPDATE mcp_task_records SET payload=?,submission_limit=?,submission_digest=?,submission=?',
@@ -246,9 +247,9 @@ async def test_authenticated_missing_origin_is_a_custody_integrity_error(custody
 
     store = custody.store
     reserved = await store.reserve(binding(), submission())
-    row = await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest FROM mcp_task_records')
+    row = await store.database.fetchone('SELECT scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest FROM mcp_task_records')
     cipher = AEADCipher(store._root)
-    aad = store._aad((*row[:9], *row[10:12]))
+    aad = store._aad((*row[:9], *row[10:13]))
     value = json.loads(cipher.decrypt(bytes(row[9]), aad=aad))
     del value['binding']['origin']
     await store.database.execute('UPDATE mcp_task_records SET payload=?',

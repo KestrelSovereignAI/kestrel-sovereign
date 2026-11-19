@@ -31,10 +31,10 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
 
 
-MCP_TASK_SCHEMA_REVISION = 3
+MCP_TASK_SCHEMA_REVISION = 4
 
 _ROW_COLUMNS = ('scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,'
-    'claim_hash,payload_limit,payload,submission_limit,submission_digest')
+    'claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest')
 
 
 class MCPTaskConflict(NativeStoreConflict):
@@ -79,6 +79,17 @@ class MCPTaskRecord:
     _payload: bytes = field(repr=False)
     submission_limit: int = field(repr=False)
     submission_digest: str = field(repr=False)
+    input_lineage_digest: str | None = field(default=None, repr=False)
+
+    @property
+    def continuity(self) -> dict:
+        """Detached original-method input lineage; never a wire credential."""
+        return json.loads(self._payload)['continuity']
+
+    @property
+    def current_operation_id(self) -> str:
+        operations = self.continuity['operations']
+        return operations[-1] if operations else self.binding.operation_id
 
     @property
     def remote_task_id(self) -> str | None:
@@ -115,6 +126,14 @@ class MCPTaskRecord:
 class MCPTaskIssuance:
     record: MCPTaskRecord
     secret: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _IssuanceIdentity:
+    handle: str
+    revision: int
+    binding: MCPTaskBinding
+    claim_hash: str
 
 
 @dataclass(frozen=True)
@@ -196,13 +215,13 @@ class MCPTaskStore(UnifiedStoreBase):
             with repository_initialization_errors(integrity_error=MCPTaskIntegrityError,
                     unknown_message='MCP Task initialization requires reconciliation'):
                 # Keep the original shared lock across schema revisions.
-                # Prototypes1/2 cannot prove original submissions and typed origins.
+                # Prototypes1-3 cannot prove joint input lineage and issuance.
                 async with self.database.migration_lock('kestrel-mcp-task-schema-v1'):
                     await self.database.execute('CREATE TABLE IF NOT EXISTS mcp_task_schema (singleton BIGINT PRIMARY KEY, revision BIGINT NOT NULL)')
                     revision = await self.database.fetchone('SELECT revision FROM mcp_task_schema WHERE singleton=1')
                     if revision is None:
                         await self.database.execute(f'CREATE TABLE mcp_task_keys (scope TEXT PRIMARY KEY, key_id TEXT NOT NULL UNIQUE, wrapped_key {binary} NOT NULL, revision BIGINT NOT NULL)')
-                        await self.database.execute(f"CREATE TABLE mcp_task_records (scope TEXT NOT NULL, handle TEXT NOT NULL, operation_digest TEXT NOT NULL, binding_digest TEXT NOT NULL, remote_digest TEXT, revision BIGINT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('ISSUING','ATTACHED','SETTLED','NOT_SENT')), claim_hash TEXT, payload_limit BIGINT NOT NULL, payload {binary} NOT NULL, submission_limit BIGINT NOT NULL, submission_digest TEXT NOT NULL, submission {binary} NOT NULL, PRIMARY KEY(scope,handle), UNIQUE(scope,operation_digest), UNIQUE(scope,remote_digest), FOREIGN KEY(scope) REFERENCES mcp_task_keys(scope))")
+                        await self.database.execute(f"CREATE TABLE mcp_task_records (scope TEXT NOT NULL, handle TEXT NOT NULL, operation_digest TEXT NOT NULL, binding_digest TEXT NOT NULL, remote_digest TEXT, revision BIGINT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('ISSUING','INPUT_WAITING','INPUT_CLOSED','ATTACHED','SETTLED','NOT_SENT')), claim_hash TEXT, payload_limit BIGINT NOT NULL, payload {binary} NOT NULL, submission_limit BIGINT NOT NULL, submission_digest TEXT NOT NULL, input_lineage_digest TEXT, submission {binary} NOT NULL, PRIMARY KEY(scope,handle), UNIQUE(scope,operation_digest), UNIQUE(scope,remote_digest), UNIQUE(scope,input_lineage_digest), FOREIGN KEY(scope) REFERENCES mcp_task_keys(scope))")
                         await self.database.execute('INSERT INTO mcp_task_schema(singleton,revision) VALUES (1,?)', (MCP_TASK_SCHEMA_REVISION,))
                     elif revision != (MCP_TASK_SCHEMA_REVISION,):
                         raise MCPTaskIntegrityError('Unsupported MCP Task schema revision')
@@ -236,11 +255,11 @@ class MCPTaskStore(UnifiedStoreBase):
         return self._digest('mcp-task-remote-v2', [binding.connection_id, binding.authorization_id, task_id])
 
     def _aad(self, columns):
-        return encode_inline_json(['mcp-task-v2', *columns])
+        return encode_inline_json(['mcp-task-v3', *columns])
 
     @staticmethod
     def _envelope(phase, task_id, envelope):
-        if phase == 'ISSUING':
+        if phase in {'ISSUING', 'INPUT_WAITING', 'INPUT_CLOSED'}:
             if task_id is not None or envelope is not None:
                 raise ValueError('Unsubmitted MCP Task custody cannot have a result')
             return
@@ -342,48 +361,90 @@ class MCPTaskStore(UnifiedStoreBase):
                 raise MCPTaskConflict('MCP Task input key was reused for another request')
             control['inputs'][key] = request
 
-    def _encode(self, binding, columns, task_id, envelope):
+    def _continuity(self, binding, phase, lineage_digest, value):
+        if (type(value) is not dict or set(value) != {'operations', 'input'}
+                or type(value['operations']) is not list):
+            raise ValueError('Invalid original MCP Task input continuity')
+        operations, link = value['operations'], value['input']
+        for operation in operations:
+            _binding_text(operation)
+        if len(set(operations)) != len(operations) or binding.operation_id in operations:
+            raise ValueError('MCP Task continuation operation was already consumed')
+        if lineage_digest is None:
+            if operations or link is not None or phase in {'INPUT_WAITING', 'INPUT_CLOSED'}:
+                raise ValueError('MCP Task input continuity requires its original lineage')
+            return
+        if (not _is_digest(lineage_digest) or type(binding.origin) is not MCPTaskInteractiveOrigin
+                or type(link) is not dict or set(link) != {'request_id', 'reservation_id', 'operation_id'}):
+            raise ValueError('MCP Task input requires its original interactive lineage')
+        for value in link.values():
+            _binding_text(value)
+        if not hmac.compare_digest(lineage_digest,
+                self._digest('mcp-task-input-lineage-v1', link['reservation_id'])):
+            raise ValueError('MCP Task input lineage has another reservation')
+        if phase in {'INPUT_WAITING', 'INPUT_CLOSED'}:
+            previous = operations[-1] if operations else binding.operation_id
+        else:
+            if not operations:
+                raise ValueError('MCP Task input has not admitted an original continuation')
+            previous = operations[-2] if len(operations) > 1 else binding.operation_id
+        if link['operation_id'] != previous:
+            raise ValueError('MCP Task input has another original operation')
+
+    def _encode(self, binding, columns, task_id, envelope, *, continuity=None):
         self._envelope(columns[6], task_id, envelope)
-        raw = encode_inline_json({'binding': asdict(binding), 'remote_task_id': task_id, 'envelope': envelope})
+        if ((columns[6] == 'ISSUING') != (columns[7] is not None)
+                or columns[7] is not None and not _is_digest(columns[7])):
+            raise ValueError('Invalid MCP Task issuance state')
+        continuity = {'operations': [], 'input': None} if continuity is None else continuity
+        self._continuity(binding, columns[6], columns[11], continuity)
+        if set(continuity['operations']).intersection(
+                envelope.get('control', {}).get('mutations', {}) if envelope else ()):
+            raise ValueError('MCP Task continuation operation already owns a mutation')
+        raw = encode_inline_json({'binding': asdict(binding), 'remote_task_id': task_id,
+            'envelope': envelope, 'continuity': continuity})
         if len(raw) > columns[8]:
             raise ValueError('MCP Task custody exceeded its storage budget')
         return raw, AEADCipher(self._root).encrypt(raw, aad=self._aad(columns))
 
     def _open(self, row) -> MCPTaskRecord:
-        scope, handle, operation, digest, remote, revision, phase, claim_hash, limit, ciphertext, submission_limit, submission_digest = row
+        scope, handle, operation, digest, remote, revision, phase, claim_hash, limit, ciphertext, submission_limit, submission_digest, lineage_digest = row
         if (scope != self.scope or not isinstance(handle, str) or not handle
                 or not _is_digest(operation) or not _is_digest(digest)
                 or (remote is not None and not _is_digest(remote))
                 or type(revision) is not int or revision < 0
-                or phase not in {'ISSUING','ATTACHED','SETTLED','NOT_SENT'}
+                or phase not in {'ISSUING','INPUT_WAITING','INPUT_CLOSED','ATTACHED','SETTLED','NOT_SENT'}
                 or ((phase == 'ISSUING') != (claim_hash is not None))
                 or (claim_hash is not None and not _is_digest(claim_hash))
                 or (phase == 'ATTACHED' and remote is None)
-                or (phase in {'ISSUING','NOT_SENT'} and remote is not None)
+                or (phase in {'ISSUING','INPUT_WAITING','INPUT_CLOSED','NOT_SENT'} and remote is not None)
                 or type(limit) is not int or limit <= 0 or type(ciphertext) is not bytes
                 or len(ciphertext) > 4 * limit + 128
                 or type(submission_limit) is not int or submission_limit <= 0
-                or not _is_digest(submission_digest)):
+                or not _is_digest(submission_digest)
+                or lineage_digest is not None and not _is_digest(lineage_digest)):
             raise MCPTaskIntegrityError('Invalid MCP Task custody record')
         try:
-            raw = AEADCipher(self._root).decrypt(bytes(ciphertext), aad=self._aad((*row[:9], *row[10:12])))
+            raw = AEADCipher(self._root).decrypt(bytes(ciphertext), aad=self._aad((*row[:9], *row[10:13])))
         except DecryptionError:
             raise MCPTaskIntegrityError('Original MCP Task custody cannot be opened') from None
         try:
             value = json.loads(raw)
             if (len(raw) > limit or type(value) is not dict
-                    or set(value) != {'binding','remote_task_id','envelope'}):
+                    or set(value) != {'binding','remote_task_id','envelope','continuity'}):
                 raise ValueError('Invalid private payload')
             binding_value = value['binding']
             binding = MCPTaskBinding(**{**binding_value, 'origin': decode_origin(binding_value['origin'])})
             self._envelope(phase, value['remote_task_id'], value['envelope'])
+            self._continuity(binding, phase, lineage_digest, value['continuity'])
         except (ValueError, TypeError, KeyError, RecursionError):
             raise MCPTaskIntegrityError('Invalid private MCP Task payload') from None
         if (binding.agent_did != self.agent_did or digest != self._binding_digest(binding)
                 or operation != self._digest('mcp-task-operation-v2', binding.operation_id)
                 or remote != self._remote_digest(binding, value['remote_task_id'])):
             raise MCPTaskIntegrityError('Original MCP Task custody indexes are invalid')
-        return MCPTaskRecord(handle, revision, phase, limit, binding, raw, submission_limit, submission_digest)
+        return MCPTaskRecord(handle, revision, phase, limit, binding, raw, submission_limit,
+            submission_digest, lineage_digest)
 
     def _submission_digest(self, binding, submission):
         if type(submission) is not MCPTaskSubmission:
@@ -414,15 +475,15 @@ class MCPTaskStore(UnifiedStoreBase):
             (self.scope, expected.handle))
         if row is None:
             raise MCPTaskConflict('MCP Task original submission is absent')
-        actual = self._open(row[:12])
+        actual = self._open(row[:13])
         if actual.binding != expected.binding:
             raise MCPTaskConflict('MCP Task original submission belongs to another binding')
-        if type(row[12]) is not bytes:
+        if type(row[13]) is not bytes:
             raise MCPTaskIntegrityError('Invalid stored MCP Task submission')
-        if len(row[12]) > 4 * actual.submission_limit + 128:
+        if len(row[13]) > 4 * actual.submission_limit + 128:
             raise MCPTaskIntegrityError('Stored MCP Task submission exceeded its storage budget')
         try:
-            raw = AEADCipher(self._root).decrypt(bytes(row[12]), aad=self._submission_aad(
+            raw = AEADCipher(self._root).decrypt(bytes(row[13]), aad=self._submission_aad(
                 actual.handle, row[3], actual.submission_limit, actual.submission_digest))
             submission = MCPTaskSubmission(raw)
             if (len(raw) > actual.submission_limit
@@ -438,7 +499,7 @@ class MCPTaskStore(UnifiedStoreBase):
         records = [(self._open(row), row) for row in rows]
         operations = set()
         for record, _ in records:
-            for operation in (record.binding.operation_id, *record.control['mutations']):
+            for operation in (record.binding.operation_id, *record.continuity['operations'], *record.control['mutations']):
                 if operation in operations:
                     raise MCPTaskIntegrityError('MCP Task operation has conflicting original custody')
                 operations.add(operation)
@@ -471,6 +532,22 @@ class MCPTaskStore(UnifiedStoreBase):
         return tuple(record for record, _ in await self._all()
             if record.phase in {'ATTACHED', 'SETTLED'} and record.remote_task_id is not None)
 
+    async def list_retained(self) -> tuple[MCPTaskRecord, ...]:
+        """Private owner reconstruction, including uncertain and input-held work."""
+        self._ready()
+        return tuple(record for record, _ in await self._all())
+
+    @staticmethod
+    def _operation_owner(records, operation_id):
+        for record, _ in records:
+            if operation_id == record.binding.operation_id:
+                return record, 'initial'
+            if operation_id in record.continuity['operations']:
+                return record, 'continuation'
+            if operation_id in record.control['mutations']:
+                return record, 'mutation'
+        return None
+
     async def reserve(self, binding: MCPTaskBinding, submission: MCPTaskSubmission) -> MCPTaskReservation:
         self._ready()
         if type(binding) is MCPTaskBinding:
@@ -492,22 +569,22 @@ class MCPTaskStore(UnifiedStoreBase):
             else:
                 existing = None
             if existing is None:
-                if any(binding.operation_id in record.control['mutations'] for record, _ in records):
-                    raise MCPTaskConflict('MCP Task original operation already owns a mutation')
+                if self._operation_owner(records, binding.operation_id) is not None:
+                    raise MCPTaskConflict('MCP Task original operation already owns retained work')
                 if len(records) >= self.max_records:
                     raise MCPTaskConflict('MCP Task retained record capacity is exhausted')
-                if sum(record.phase in {'ISSUING','ATTACHED'} for record, _ in records) >= self.max_active:
+                if sum(record.phase in {'ISSUING','INPUT_WAITING','ATTACHED'} for record, _ in records) >= self.max_active:
                     raise MCPTaskConflict('MCP Task active capacity is exhausted')
                 if len(submission.canonical_json) > self.max_submission_bytes:
                     raise ValueError('MCP Task submission exceeded its storage budget')
                 handle, secret = str(uuid4()), secrets.token_urlsafe(32)
                 columns = (self.scope, handle, self._digest('mcp-task-operation-v2', binding.operation_id),
                     digest, None, 0, 'ISSUING', hashlib.sha256(secret.encode()).hexdigest(), self.max_payload_bytes,
-                    self.max_submission_bytes, submission_digest)
+                    self.max_submission_bytes, submission_digest, None)
                 raw, ciphertext = self._encode(binding, columns, None, None)
                 sealed_submission = AEADCipher(self._root).encrypt(submission.canonical_json,
                     aad=self._submission_aad(handle, digest, self.max_submission_bytes, submission_digest))
-                changed = await self.database.execute(f'INSERT INTO mcp_task_records({_ROW_COLUMNS},submission) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                changed = await self.database.execute(f'INSERT INTO mcp_task_records({_ROW_COLUMNS},submission) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (*columns[:9], ciphertext, *columns[9:], sealed_submission))
                 if changed != 1:
                     raise MCPTaskIntegrityError('Original MCP Task reservation was not stored')
@@ -517,37 +594,48 @@ class MCPTaskStore(UnifiedStoreBase):
             return MCPTaskReservation(existing)
         return MCPTaskReservation(record, MCPTaskIssuance(record, secret))
 
-    async def _finish(self, issuance, phase, task_id, envelope):
-        self._ready()
+    def _issuance_identity(self, issuance):
         if (type(issuance) is not MCPTaskIssuance or type(issuance.record) is not MCPTaskRecord
                 or issuance.record.phase != 'ISSUING' or not isinstance(issuance.secret, str)
                 or len(issuance.secret) != 43):
             raise MCPTaskConflict('MCP Task requires its original issuance claim')
-        expected = issuance.record
-        self._binding_digest(expected.binding)
+        self._expected(issuance.record)
+        binding = replace(issuance.record.binding,
+            origin=decode_origin(asdict(issuance.record.binding.origin)))
+        return _IssuanceIdentity(issuance.record.handle, issuance.record.revision,
+            binding, hashlib.sha256(issuance.secret.encode()).hexdigest())
+
+    @staticmethod
+    def _select_issuance(records, expected):
+        selected = [(record, row) for record, row in records if record.handle == expected.handle]
+        if len(selected) != 1:
+            raise MCPTaskConflict('MCP Task original issuance is absent')
+        actual, row = selected[0]
+        if (actual.binding != expected.binding or actual.revision != expected.revision
+                or actual.phase != 'ISSUING' or not hmac.compare_digest(row[7], expected.claim_hash)):
+            raise MCPTaskConflict('MCP Task issuance is no longer current')
+        return actual, row
+
+    async def _finish(self, issuance, phase, task_id, envelope):
+        self._ready()
+        expected = self._issuance_identity(issuance)
         envelope = self._snapshot(envelope)
-        claim_hash = hashlib.sha256(issuance.secret.encode()).hexdigest()
         async with self.write_transaction():
             await self._lock()
             records = await self._all()
-            selected = [(record, row) for record, row in records if record.handle == expected.handle]
-            if len(selected) != 1:
-                raise MCPTaskConflict('MCP Task original issuance is absent')
-            actual, row = selected[0]
-            if (actual.binding != expected.binding or actual.revision != expected.revision
-                    or actual.phase != 'ISSUING' or not hmac.compare_digest(row[7], claim_hash)):
-                raise MCPTaskConflict('MCP Task issuance is no longer current')
+            actual, row = self._select_issuance(records, expected)
             remote = self._remote_digest(actual.binding, task_id)
             if remote is not None and any(other[4] == remote for _, other in records):
                 raise MCPTaskConflict('MCP Task remote identity already has original custody')
-            columns = (*row[:4], remote, actual.revision + 1, phase, None, actual.payload_limit, *row[10:12])
-            raw, ciphertext = self._encode(actual.binding, columns, task_id, envelope)
+            columns = (*row[:4], remote, actual.revision + 1, phase, None, actual.payload_limit, *row[10:13])
+            raw, ciphertext = self._encode(actual.binding, columns, task_id, envelope,
+                continuity=actual.continuity)
             changed = await self.database.execute('UPDATE mcp_task_records SET remote_digest=?,revision=?,phase=?,claim_hash=NULL,payload=? WHERE scope=? AND handle=? AND revision=? AND phase=\'ISSUING\' AND claim_hash=?',
-                (remote, actual.revision + 1, phase, ciphertext, self.scope, actual.handle, actual.revision, claim_hash))
+                (remote, actual.revision + 1, phase, ciphertext, self.scope, actual.handle, actual.revision, expected.claim_hash))
             if changed != 1:
                 raise MCPTaskConflict('MCP Task issuance was already consumed')
             result = MCPTaskRecord(actual.handle, actual.revision + 1, phase, actual.payload_limit, actual.binding, raw,
-                actual.submission_limit, actual.submission_digest)
+                actual.submission_limit, actual.submission_digest, actual.input_lineage_digest)
         return result
 
     async def attach_task(self, issuance: MCPTaskIssuance, *, remote_task_id: str, envelope: dict) -> MCPTaskRecord:
@@ -557,15 +645,32 @@ class MCPTaskStore(UnifiedStoreBase):
         self._envelope('ATTACHED', remote_task_id, envelope)
         return await self._finish(issuance, 'ATTACHED', remote_task_id, envelope)
 
-    async def _persist(self, actual, row, phase, envelope):
-        columns = (*row[:5], actual.revision + 1, phase, None, actual.payload_limit, *row[10:12])
-        raw, ciphertext = self._encode(actual.binding, columns, actual.remote_task_id, envelope)
-        changed = await self.database.execute('UPDATE mcp_task_records SET revision=?,phase=?,payload=? WHERE scope=? AND handle=? AND revision=? AND phase=?',
-            (actual.revision + 1, phase, ciphertext, self.scope, actual.handle, actual.revision, actual.phase))
+    async def _persist(self, actual, row, phase, envelope, *, continuity=None,
+                       claim_hash=None, input_lineage_digest=None):
+        lineage = actual.input_lineage_digest
+        assigning_lineage = lineage is None and input_lineage_digest is not None
+        if input_lineage_digest is not None:
+            if lineage is not None and lineage != input_lineage_digest:
+                raise MCPTaskConflict('MCP Task original input lineage cannot change')
+            lineage = input_lineage_digest
+        continuity = actual.continuity if continuity is None else continuity
+        columns = (*row[:5], actual.revision + 1, phase, claim_hash, actual.payload_limit,
+            *row[10:12], lineage)
+        raw, ciphertext = self._encode(actual.binding, columns, actual.remote_task_id, envelope,
+            continuity=continuity)
+        assignments = 'revision=?,phase=?,claim_hash=?,payload=?'
+        parameters = (actual.revision + 1, phase, claim_hash, ciphertext)
+        predicate = "scope=? AND handle=? AND revision=? AND phase=? AND COALESCE(claim_hash,'')=?"
+        if assigning_lineage:
+            assignments += ',input_lineage_digest=?'
+            parameters += (lineage,)
+            predicate += ' AND input_lineage_digest IS NULL'
+        changed = await self.database.execute(f'UPDATE mcp_task_records SET {assignments} WHERE {predicate}',
+            (*parameters, self.scope, actual.handle, actual.revision, actual.phase, row[7] or ''))
         if changed != 1:
             raise MCPTaskConflict('MCP Task original custody write was not stored')
         return MCPTaskRecord(actual.handle, actual.revision + 1, phase, actual.payload_limit, actual.binding, raw,
-            actual.submission_limit, actual.submission_digest)
+            actual.submission_limit, actual.submission_digest, lineage)
 
     def _expected(self, expected):
         if (type(expected) is not MCPTaskRecord or type(expected.revision) is not int
@@ -609,10 +714,9 @@ class MCPTaskStore(UnifiedStoreBase):
                 params['inputResponses'] = responses
             intent = {'method': 'tasks/' + kind, 'params': params}
             control = actual.control
-            for record, _ in records:
-                if record.binding.operation_id == operation_id or (
-                        record.handle != actual.handle and operation_id in record.control['mutations']):
-                    raise MCPTaskConflict('MCP Task mutation operation already has original custody')
+            owner = self._operation_owner(records, operation_id)
+            if owner is not None and (owner[0].handle != actual.handle or owner[1] != 'mutation'):
+                raise MCPTaskConflict('MCP Task mutation operation already has original custody')
             previous = control['mutations'].get(operation_id)
             if previous is not None:
                 if not self._same_json(previous['intent'], intent):
