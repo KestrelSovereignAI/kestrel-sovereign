@@ -640,6 +640,22 @@ Core's optional `mcp-input` host owns encrypted checkpoint custody and fresh
 authenticated readers at `/api/mcp/inputs`. The MCP 0.17 tool-call path can
 persist a form checkpoint and return an audited `mcp_input` part containing only
 its reference and original chat selector. Neither is an authorization grant.
+The Input store uses one prepare/apply pair for each creation and response:
+preparation detaches caller values before any read await and authenticates and
+seals that evidence outside the transaction;
+the SQL-only apply half requires that exact store's open transaction. A response
+or successor compares the authenticated before-image, including its ciphertext,
+so it cannot overwrite a changed checkpoint at an unchanged public revision.
+Public methods release their result only after the owning commit acknowledges.
+
+An optional `custody` binding identifies a Task owner. It is included in the
+binding digest and private payload when present; ordinary Input bindings omit
+it and retain their schema-2 bytes. Ordinary creation and response paths refuse
+Task links, including caller records that strip the link or substitute a private
+payload. A successor must prove its actual SQL-opened predecessor. These private
+primitives prepare the atomic Task/Input handoff; they neither implement that
+joint coordinator nor enable Tasks, and they grant no tool authority.
+
 The original effect turn records the pending input through its existing nested
 turn state and refuses another admission before approvals or network I/O.
 Both orchestrator modes return a waiting message without another model call.
