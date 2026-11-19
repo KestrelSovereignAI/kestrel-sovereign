@@ -126,6 +126,7 @@ def test_managed_template_omits_previous_revision_without_resetting_custody(
                 "volume_mounts": [{"name": "cloudsql", "mount_path": "/cloudsql"}],
                 "startup_probe": {"tcp_socket": {"port": 8080}},
                 "liveness_probe": {"http_get": {"path": "/health", "port": 8080}},
+                "readiness_probe": {"grpc": {"port": 8080}},
                 "resources": {
                     "limits": {"cpu": "1", "memory": "1Gi", "nvidia.com/gpu": "1"},
                     "cpu_idle": False,
@@ -175,6 +176,7 @@ def test_managed_template_omits_previous_revision_without_resetting_custody(
     assert actual.volume_mounts == previous.volume_mounts
     assert actual.startup_probe == previous.startup_probe
     assert actual.liveness_probe == previous.liveness_probe
+    assert actual.readiness_probe == previous.readiness_probe
     assert actual.resources.cpu_idle is False
     assert actual.resources.startup_cpu_boost is True
     assert dict(actual.resources.limits) == {
@@ -185,9 +187,10 @@ def test_managed_template_omits_previous_revision_without_resetting_custody(
     assert existing.template.max_instance_request_concurrency == deployment_profile.concurrency
 
 
-@pytest.mark.parametrize('kind', ['startup_probe', 'liveness_probe'])
+@pytest.mark.parametrize('kind', ['startup_probe', 'liveness_probe', 'readiness_probe'])
+@pytest.mark.parametrize('action', ['http_get', 'tcp_socket', 'grpc'])
 def test_managed_port_conflict_with_existing_probe_refuses_without_mutation(
-    deployment_profile, kind
+    deployment_profile, kind, action
 ):
     from google.cloud.run_v2 import Container, Service
 
@@ -196,7 +199,7 @@ def test_managed_port_conflict_with_existing_probe_refuses_without_mutation(
         'containers': [{
             'image': 'example/original',
             'ports': [{'container_port': 8080}],
-            kind: {'http_get': {'path': '/health', 'port': 8080}},
+            kind: {action: {'port': 8080}},
         }],
     })
     before = Service.serialize(service)
@@ -377,6 +380,42 @@ class TestCloudRunProviderDeploy:
             await provider.deploy(
                 image="gcr.io/test-project/kestrel:v1",
                 service_name="kestrel-dev", profile=deployment_profile)
+
+        client.update_service.assert_not_called()
+        client.create_service.assert_not_called()
+        assert Service.serialize(existing) == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', ['startup_probe', 'liveness_probe', 'readiness_probe'])
+    @pytest.mark.parametrize('action', ['http_get', 'tcp_socket', 'grpc'])
+    async def test_update_refuses_probe_port_conflict_before_dispatch(
+        self, deployment_profile, kind, action
+    ):
+        from google.cloud.run_v2 import Service
+
+        client = MagicMock()
+        existing = Service(
+            name="projects/test-project/locations/us-central1/services/kestrel-dev",
+            template={
+                "revision": "kestrel-dev-original",
+                "containers": [{
+                    "image": "example/original",
+                    "ports": [{"container_port": 8080}],
+                    kind: {action: {"port": 8080}},
+                }],
+            },
+        )
+        before = Service.serialize(existing)
+        client.get_service.return_value = existing
+        provider = CloudRunProvider(project_id="test-project")
+        provider._services_client = client
+
+        with pytest.raises(DeployManagerError, match="probe port conflicts"):
+            await provider.deploy(
+                image="gcr.io/test-project/kestrel:v1",
+                service_name="kestrel-dev",
+                profile=replace(deployment_profile, port=9090),
+            )
 
         client.update_service.assert_not_called()
         client.create_service.assert_not_called()
