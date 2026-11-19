@@ -4,6 +4,7 @@
 
 import { Modal, Toast } from './ui.js';
 import API from './api.js';
+import { nativeActionLabel } from './native-action.js';
 import { subscribeSSE } from './chat.js';
 import {
     extractUpgradeRequired,
@@ -297,17 +298,18 @@ export const Security = {
                         <p style="margin: 0 0 0.5rem 0;">
                             <strong>Tool:</strong> ${this._escapeHtml(data.tool)}
                         </p>
+                        ${data.native_action ? `<p class="native-action-target"><strong>Action:</strong> ${this._escapeHtml(nativeActionLabel(data.native_action))}</p>` : ''}
                         ${argsHtml}
                         <p style="margin-top: 1rem; color: var(--text-secondary); font-size: 0.875rem;">
                             Choose how to handle this permission:
                         </p>
-                        <p style="margin: 0.5rem 0 0; color: var(--warning); font-size: 0.8125rem;">
+                        ${data.native_action ? '' : `<p style="margin: 0.5rem 0 0; color: var(--warning); font-size: 0.8125rem;">
                             Auto Mode approves this request and future non-denied requests.
                             <strong>Auto: Session</strong> lasts until the session is reset;
                             <strong>Auto: Always</strong> persists across page refresh and server
                             restart until you turn it off. Constitutional, honesty, and security
                             hooks can still flag or block.
-                        </p>
+                        </p>`}
                         ${upgradeBannerHtml(upgrade)}
                     </div>
                 `,
@@ -357,7 +359,7 @@ export const Security = {
                         type: 'danger',
                         onClick: () => this._enableGlobalAutoFromModal('always', wrappedResolve, approvalModal)
                     }
-                ],
+                ].filter((_, index) => !data.native_action || index < 2),
                 onClose: () => wrappedResolve({ approved: false, scope: 'once' })
             });
             if (approvalModal.isCurrent()) this._activeApprovalModal = approvalModal;
@@ -726,6 +728,7 @@ export const Security = {
                 ">
                     <div class="pending-info">
                         <strong style="font-size: 0.9rem;">${this._escapeHtml(req.feature)}.${this._escapeHtml(req.tool)}</strong>
+                        ${req.native_action ? `<div class="native-action-target">${this._escapeHtml(nativeActionLabel(req.native_action))}</div>` : ''}
                         <span class="pending-time" style="
                             display: block;
                             font-size: 0.75rem;

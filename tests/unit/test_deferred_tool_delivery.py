@@ -14,7 +14,7 @@ from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.llm.response import LLMResponse, ToolCall
 from kestrel_sdk.native_a2a.types import TaskState
 from kestrel_sdk.tools import (
-    DeferredToolResult, ToolCategory, ToolPublicationContext, ToolResult, ToolSchema,
+    DeferredToolResult, NativeAction, ToolCategory, ToolPublicationContext, ToolResult, ToolSchema,
 )
 from kestrel_sdk.features.base import Feature as SDKFeature, tool as feature_tool
 from kestrel_sovereign.a2a.projections import embedded_json_value
@@ -94,6 +94,14 @@ class DeferredTool:
     schema = ToolSchema(name=name, description="Owned delivery test",
         category=ToolCategory.UTILITY, parameters=[])
 
+    @property
+    def native_actions(self):
+        return {'cancel': NativeAction('cancel', 'tasks/cancel',
+            b'{"type":"object","additionalProperties":false}', self.native_cancel)}
+
+    async def native_cancel(self, context, params):
+        return await self.execute(**params)
+
     def __init__(self):
         self.executions = []
         self.publications = []
@@ -144,12 +152,17 @@ class Boundary:
 
     async def invoke(self, path):
         operation_id = uuid4().hex
+        if path == 'native':
+            from tests.unit.test_governed_native_actions import context_for
+            return await self.binding.invoke_action('cancel', {},
+                native_action=context_for(self.binding), session_id='deferred-owned-session',
+                operation_id=operation_id)
         if path == "named":
             return await self.host.execute_named_tool(self.binding.name, {},
-                session_id="deferred-owned-session", source="owned-test", operation_id=operation_id)
+                session_id="deferred-owned-session", source="external", operation_id=operation_id)
         if path == "bound":
             return await self.binding.invoke({}, session_id="deferred-owned-session",
-                source="owned-test", operation_id=operation_id)
+                source="external", operation_id=operation_id)
         return await _drive_native(self.host, lambda: self.host._dispatch_tool_call(
             ToolCall(id="owned-call", name=self.binding.name, arguments={}),
             features_by_tool_name={}, known_tools=self.host._known_tool_names(),
@@ -335,6 +348,24 @@ async def test_replaced_post_hook_response_withholds_private_parts(boundary, pat
         assert peer.tool.executions == [{}] and not peer.tool.publications
         assert result == ToolResult.ok("Replacement").to_dict()
         assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
+
+
+@pytest.mark.parametrize('boundary', ['handle'], indirect=True)
+@pytest.mark.parametrize('replacement', ['none', 'reviewed'])
+async def test_native_post_policy_replacement_controls_actual_deferred_publication(boundary, replacement):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    peer = boundary
+    peer.policy.replace_with_none = replacement == 'none'
+    peer.policy.replace = replacement == 'reviewed'
+    peer.policy.release.set()
+    with part_collector():
+        result, = await asyncio.gather(peer.invoke('native'), return_exceptions=True)
+        assert peer.tool.executions == [{}], repr(result)
+        assert not peer.tool.publications, 'Native policy replacement must withhold the original private publisher'
+        if replacement == 'none':
+            assert isinstance(result, ResourceOutcomeUnknown)
+        else:
+            assert result == ToolResult.ok('Replacement').to_dict()
 
 
 @pytest.mark.parametrize("path", ["chat", "named", "bound"])
@@ -1572,10 +1603,10 @@ async def test_bound_delivery_failure_keeps_original_external_intent_fenced(
     with part_collector(host=b.host, session_id="deferred-owned-session"):
         with pytest.raises(ResourceOutcomeUnknown):
             await b.binding.invoke({}, session_id="deferred-owned-session",
-                source="owned-test", operation_id=operation_id)
+                source="external", operation_id=operation_id)
         with pytest.raises(ToolEffectReconciliationRequired):
             await b.binding.invoke({}, session_id="deferred-owned-session",
-                source="owned-test", operation_id=operation_id)
+                source="external", operation_id=operation_id)
     assert witness.read_text() == "actual-effect\n"
     assert [tuple(row) for row in await b.backend.fetch_all(
         "SELECT state FROM tool_effect_claims")] == [("RETURNED_OK",)]

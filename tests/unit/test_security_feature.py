@@ -2175,7 +2175,7 @@ class TestSecurityFeature:
 
         result = await feature.approve_request("req-race-1", scope="once")
         assert result.status is ToolResultStatus.ERROR
-        assert "no longer pending" in result.error.lower()
+        assert "request not found or expired" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_security_audit_filters_sensitive_fields_from_data(self):

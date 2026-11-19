@@ -6,7 +6,7 @@ skips the CORE initializers for a database already at the runtime revision,
 so no existing database received the columns, and the required dispatch audit
 #3999 introduced failed every tool call.
 
-CORE is now revision 6, and revision 5 has an additive online upgrade: under
+CORE is now revision 7, and revisions 5/6 have additive online upgrades: under
 the schema lease, ``TaskManager.initialize`` re-runs the idempotent CORE
 initializers and advances the stored row. No row is converted; every other
 stored revision still requires the offline migration.
@@ -72,7 +72,7 @@ async def _store_before_3995(factory, *, core_revision: int):
         await manager.initialize()
         for index in ("idx_tool_dispatches_dispatch", "idx_tool_dispatches_parent"):
             await backend.execute(f"DROP INDEX IF EXISTS {index}")
-        for column in ("parent_dispatch_id", "dispatch_id"):
+        for column in ("native_action", "parent_dispatch_id", "dispatch_id"):
             await backend.execute(
                 f"ALTER TABLE a2a_tool_dispatches DROP COLUMN {column}"
             )

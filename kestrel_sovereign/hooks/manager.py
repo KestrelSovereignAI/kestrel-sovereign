@@ -7,7 +7,8 @@ hooks are called in priority order with proper timeout handling.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, fields, replace
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.hooks.base import (
@@ -17,6 +18,7 @@ from kestrel_sdk.hooks.base import (
     HookOutput,
     PermissionDecision,
 )
+from kestrel_sdk.tools import NativeActionContext
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,81 @@ class FailedHookDenial(HookOutput):
 #: it on the output the deciding hook returned, as it already records the
 #: chain's accumulated warnings there. Read it with :func:`deciding_hook`.
 DECIDING_HOOK_ATTRIBUTE = "deciding_hook"
+
+
+class _NativePostHookInput(HookInput):
+    """Separate identity/params while preserving the shared post-result slot.
+
+    Result replacement is the existing parallel post-hook contract. Sharing
+    that slot also prevents a later no-op observer from restoring an older
+    payload after another observer withheld it.
+    """
+
+    @classmethod
+    def from_input(cls, original):
+        values = {item.name: getattr(original, item.name)
+                  for item in fields(HookInput) if item.init}
+        values['tool_input'] = deepcopy(original.tool_input)
+        view = cls(**values)
+        view._response_owner = original
+        view.__dict__.pop('_detached_response', None)
+        return view
+
+    @property
+    def tool_response(self):
+        owner = self.__dict__.get('_response_owner')
+        return owner.tool_response if owner is not None else self.__dict__.get('_detached_response')
+
+    @tool_response.setter
+    def tool_response(self, value):
+        owner = self.__dict__.get('_response_owner')
+        if owner is None:
+            self._detached_response = value
+        else:
+            owner.tool_response = value
+
+
+class _NativeHookIdentity:
+    """Pin content-free action identity independently of mutable hook input."""
+
+    def __init__(self, input):
+        self.context = (NativeActionContext(**input.native_action.to_dict())
+                        if input.native_action is not None else None)
+        self.tool, self.feature = input.tool_name, input.feature_name
+        self.pinned = None
+
+    def pin(self, input):
+        if self.context is None:
+            input.native_action = None
+        else:
+            self.pinned = NativeActionContext(**self.context.to_dict())
+            input.native_action = self.pinned
+            input.tool_name, input.feature_name = self.tool, self.feature
+
+    def prepare(self, input, *, share_response=False):
+        if self.context is not None and share_response:
+            return _NativePostHookInput.from_input(input)
+        return (replace(input, tool_input=deepcopy(input.tool_input))
+                if self.context is not None else input)
+
+    def accept_parameters(self, input, hook_input):
+        if self.context is not None:
+            input.tool_input = deepcopy(hook_input.tool_input)
+
+    def changed(self, input):
+        if self.context is None:
+            return input.native_action is not None
+        return (input.native_action is not self.pinned
+                or input.tool_name != self.tool or input.feature_name != self.feature
+                or any(type(getattr(self.pinned, key)) is not type(value)
+                       or getattr(self.pinned, key) != value
+                       for key, value in self.context.to_dict().items()))
+
+    def deny(self, input, hook):
+        self.pin(input)
+        output = HookOutput.deny('Native action identity changed during governance')
+        setattr(output, DECIDING_HOOK_ATTRIBUTE, hook.name)
+        return output
 
 
 def deciding_hook(output: Any) -> Optional[str]:
@@ -408,7 +485,11 @@ class HooksManager:
 
         from .decision_gate import evaluate_blocking_decision
 
+        native_identity = _NativeHookIdentity(input)
+
         for hook in matching_hooks:
+            hook_input = native_identity.prepare(input)
+            native_identity.pin(hook_input)
             try:
                 # Hooks that block on human input (approvals, prompts)
                 # are not bounded by the manager's watchdog — bounding a
@@ -416,14 +497,18 @@ class HooksManager:
                 # the actual cause of the "approval modal disappears
                 # after 5 seconds" bug. The hook owns its own lifecycle.
                 if getattr(hook, "awaits_user_input", False):
-                    output = await hook.execute(input)
+                    output = await hook.execute(hook_input)
                 else:
                     # Keep the hook on its original owned task. On Python
                     # 3.11 wait_for creates a hidden child and can replace a
                     # cancellation-resistant child's stronger native receipt
                     # with the wrapper's ordinary cancellation.
                     async with asyncio.timeout(hook.timeout):
-                        output = await hook.execute(input)
+                        output = await hook.execute(hook_input)
+
+                native_identity.accept_parameters(input, hook_input)
+                if native_identity.changed(hook_input):
+                    return native_identity.deny(input, hook)
 
                 logger.debug(
                     f"Hook '{hook.name}' returned: "
@@ -490,6 +575,9 @@ class HooksManager:
                 )
                 if is_execution_control_error(error):
                     raise
+                native_identity.accept_parameters(input, hook_input)
+                if native_identity.changed(hook_input):
+                    return native_identity.deny(input, hook)
                 # FAIL CLOSED for enforcing hooks: a deny-capable hook that times
                 # out must not silently become "allowed" — that turns a block
                 # into a pass (#1723). Enforcement is the CAPTURED turn-start
@@ -515,6 +603,9 @@ class HooksManager:
                 )
                 if is_execution_control_error(e):
                     raise
+                native_identity.accept_parameters(input, hook_input)
+                if native_identity.changed(hook_input):
+                    return native_identity.deny(input, hook)
                 # FAIL CLOSED for enforcing hooks: a crashed deny-capable hook
                 # (e.g. an approval hook whose queue backend raised) must deny,
                 # not allow (#1723). Enforcement is the CAPTURED turn-start
@@ -533,7 +624,9 @@ class HooksManager:
                 continue
 
         result = HookOutput.allow()
-        if accumulated_updated_input is not None:
+        if native_identity.context is not None:
+            result.updated_input = deepcopy(input.tool_input)
+        elif accumulated_updated_input is not None:
             result.updated_input = accumulated_updated_input
         if accumulated_warnings:
             result.warning_message = " | ".join(accumulated_warnings)
@@ -571,12 +664,19 @@ class HooksManager:
             return []
 
         async def execute_with_timeout(hook: Hook) -> Optional[HookOutput]:
+            # A physical observer gets its own identity slot. It cannot replace
+            # another observer's context while the parallel group is awaiting.
+            native_identity = _NativeHookIdentity(input)
+            hook_input = native_identity.prepare(input, share_response=True)
+            native_identity.pin(hook_input)
             try:
                 if getattr(hook, "awaits_user_input", False):
-                    output = await hook.execute(input)
+                    output = await hook.execute(hook_input)
                 else:
                     async with asyncio.timeout(hook.timeout):
-                        output = await hook.execute(input)
+                        output = await hook.execute(hook_input)
+                if native_identity.changed(hook_input):
+                    return native_identity.deny(hook_input, hook)
                 if require_complete and not isinstance(output, HookOutput):
                     raise TypeError("Required hook returned no valid output")
                 return output
@@ -586,6 +686,8 @@ class HooksManager:
                 )
                 if is_execution_control_error(error):
                     raise
+                if native_identity.changed(hook_input):
+                    return native_identity.deny(hook_input, hook)
                 logger.warning(f"Hook '{hook.name}' timed out (parallel)")
                 if require_complete or _hook_is_enforcing(hook):
                     return _deny_for_failed_hook(hook, "timed out", [], None)
@@ -596,6 +698,8 @@ class HooksManager:
                 )
                 if is_execution_control_error(e):
                     raise
+                if native_identity.changed(hook_input):
+                    return native_identity.deny(hook_input, hook)
                 logger.error(f"Hook '{hook.name}' failed (parallel): {e}")
                 if require_complete or _hook_is_enforcing(hook):
                     return _deny_for_failed_hook(hook, "raised " + type(e).__name__, [], None)

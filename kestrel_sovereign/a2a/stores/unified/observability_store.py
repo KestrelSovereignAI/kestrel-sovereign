@@ -189,6 +189,7 @@ class ToolDispatchEntry:
     result_size_bytes: Optional[int]
     dispatch_id: Optional[str] = None
     parent_dispatch_id: Optional[str] = None
+    native_action: Optional[dict[str, Any]] = None
 
 
 ToolCallLogEntry = ToolDispatchEntry
@@ -460,13 +461,15 @@ class ObservabilityStore(UnifiedStoreBase):
                 latency_ms INTEGER NOT NULL,
                 result_size_bytes INTEGER,
                 dispatch_id TEXT,
-                parent_dispatch_id TEXT
+                parent_dispatch_id TEXT,
+                native_action {json_type}
             )
         """)
         await self.add_column_if_missing("a2a_tool_dispatches", "dispatch_id", "TEXT")
         await self.add_column_if_missing(
             "a2a_tool_dispatches", "parent_dispatch_id", "TEXT"
         )
+        await self.add_column_if_missing('a2a_tool_dispatches', 'native_action', json_type)
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_agent_turn "
             "ON a2a_tool_dispatches(agent_did, turn_id, id)"
@@ -496,15 +499,21 @@ class ObservabilityStore(UnifiedStoreBase):
         """Write the canonical dispatch row; required callers observe failures."""
         private = private_capability_tool_name(entry.tool_name)
         try:
+            native_action = None
+            if entry.native_action is not None:
+                from kestrel_sdk.tools import NativeActionContext
+                # This fixed identity shape is already bounded by the SDK.
+                # Argument redaction/preview limits must not alter its labels.
+                native_action = NativeActionContext(**entry.native_action).to_dict()
             await self._backend.execute(
                 """
                 INSERT INTO a2a_tool_dispatches (
                     agent_did, session_id, turn_id, ts, tool_name, adapter,
                     args_redacted, result_status, error_class, error_message,
                     latency_ms, result_size_bytes, dispatch_id,
-                    parent_dispatch_id
+                    parent_dispatch_id, native_action
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.agent_did,
@@ -526,6 +535,9 @@ class ObservabilityStore(UnifiedStoreBase):
                     entry.result_size_bytes,
                     entry.dispatch_id or generate_id(),
                     entry.parent_dispatch_id,
+                    json_dumps(self._privacy_gate_metadata(
+                        {'_private_capability': True} if private else native_action))
+                    if native_action is not None else None,
                 ),
             )
         except Exception as exc:
@@ -633,7 +645,7 @@ class ObservabilityStore(UnifiedStoreBase):
             SELECT
                 id, agent_did, session_id, turn_id, ts, tool_name, adapter,
                 args_redacted, result_status, error_class, error_message,
-                latency_ms, result_size_bytes, dispatch_id, parent_dispatch_id
+                latency_ms, result_size_bytes, dispatch_id, parent_dispatch_id, native_action
             FROM a2a_tool_dispatches
             WHERE agent_did = ? AND result_status != 'success'
             ORDER BY id DESC
@@ -658,6 +670,7 @@ class ObservabilityStore(UnifiedStoreBase):
                 "result_size_bytes": row[12],
                 "dispatch_id": row[13],
                 "parent_dispatch_id": row[14],
+                'native_action': json_loads(row[15]) if row[15] else None,
             }
             for row in rows
         ]

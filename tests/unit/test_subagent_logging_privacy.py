@@ -491,14 +491,20 @@ async def test_chat_path_subagent_refusal_reason_is_logged_as_summary(debug_capl
     assert "reason chars=" in line, line
 
 
+def _direct_tool_double(**execute_options):
+    tool = MagicMock(spec=AgentTool)
+    tool.name = "send_email"
+    tool.native_actions = {}
+    tool.execute = AsyncMock(**execute_options)
+    return tool
+
+
 @pytest.mark.asyncio
 async def test_chat_path_tool_refusal_reason_is_logged_as_summary(debug_caplog, *, native_tool_effect_agent):
     hooks = _DecidingHooks({
         HookEvent.PRE_TOOL_USE: HookOutput.deny(f"to={REASON_MARKER}"),
     })
-    tool_ = MagicMock(spec=AgentTool)
-    tool_.name = "send_email"
-    tool_.execute = AsyncMock(return_value={"success": True})
+    tool_ = _direct_tool_double(return_value={"success": True})
 
     result = await _dispatch_direct((await _chat_host(hooks, native_tool_effect_agent=native_tool_effect_agent)), tool_)
 
@@ -512,9 +518,7 @@ async def test_chat_path_tool_refusal_reason_is_logged_as_summary(debug_caplog, 
 
 @pytest.mark.asyncio
 async def test_chat_path_direct_tool_failure_is_logged_by_class(debug_caplog, *, native_tool_effect_agent):
-    tool_ = MagicMock(spec=AgentTool)
-    tool_.name = "send_email"
-    tool_.execute = AsyncMock(side_effect=ValueError(f"bad {ERROR_MARKER}"))
+    tool_ = _direct_tool_double(side_effect=ValueError(f"bad {ERROR_MARKER}"))
 
     with pytest.raises(ResourceOutcomeUnknown) as caught:
         await _dispatch_direct((await _chat_host(_DecidingHooks(), native_tool_effect_agent=native_tool_effect_agent)), tool_)

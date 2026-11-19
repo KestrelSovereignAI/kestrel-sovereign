@@ -758,10 +758,10 @@ async def test_pending_input_fences_the_original_parent_turn_before_another_tool
         with caller_context_scope(request.state.caller), part_collector(host=b.agent, session_id='original-chat'):
             async def operation():
                 first = await registered.binding.invoke({'marker': 'original-marker'},
-                    session_id='original-chat', operation_id=uuid4().hex, source='chat')
+                    session_id='original-chat', operation_id=uuid4().hex, source='external')
                 try:
                     await registered.binding.invoke({'marker': 'original-marker'},
-                        session_id='original-chat', operation_id=uuid4().hex, source='chat')
+                        session_id='original-chat', operation_id=uuid4().hex, source='external')
                 except ResourceConflict:
                     pass
                 return first

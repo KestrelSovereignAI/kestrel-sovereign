@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 # audit log as a scheduler tick. This is a public contract: a feature calling
 # ``execute_named_tool`` from a lifecycle hook passes this session id.
 FEATURE_LIFECYCLE_SESSION_ID = "feature-lifecycle"
-NON_INTERACTIVE_SESSION_IDS = frozenset({"scheduler", FEATURE_LIFECYCLE_SESSION_ID})
+MCP_TASK_SERVICE_SESSION_ID = 'mcp-task-service'
+NON_INTERACTIVE_SESSION_IDS = frozenset({"scheduler", FEATURE_LIFECYCLE_SESSION_ID, MCP_TASK_SERVICE_SESSION_ID})
 
 
 def reserved_session_id(session_id: object) -> Optional[str]:
@@ -136,7 +137,7 @@ class SecurityHook(Hook):
         level = await self.permission_store.get_permission(feature_name, tool_name)
 
         # Prepare args summary for audit log (truncate for privacy)
-        args_summary = self._summarize_args(input.tool_input)
+        args_summary = summarize_args(input.tool_input, native_action=input.native_action)
 
         # This hook runs on PRE_SUBAGENT_CALL as well as PRE_TOOL_USE. Both
         # used to write "tool_execution", which made a feature-as-subagent
@@ -229,6 +230,7 @@ class SecurityHook(Hook):
                 # in security_audit_search missed exactly the case it was
                 # added for (#3107 review round 2 fixed one door, not both).
                 audit_action=audit_action,
+                **({'native_action': input.native_action} if input.native_action is not None else {}),
             )
 
             if not approved:

@@ -13,6 +13,7 @@ from kestrel_sovereign.tools.effect_journal import (
 )
 from kestrel_sovereign.tool_effect_store import ToolEffectClaim
 from kestrel_sovereign._async_ownership import OwnedTaskHandoff
+from kestrel_sdk.tools import NativeActionContext
 
 
 def _operation_namespace():
@@ -61,6 +62,7 @@ class ToolEffectOperation:
     tool_name: str
     arguments: dict
     session_id: str
+    native_action: NativeActionContext | None = None
 
 
 @asynccontextmanager
@@ -92,11 +94,14 @@ async def _journal_operation(owner, *, namespace, client_key, request):
 async def journal_tool_operation(owner, operation: ToolEffectOperation):
     """Admit inside the existing request lifecycle, before approval or effect."""
     caller = current_caller_context() or CallerContext.anonymous()
+    request = dict(owner=operation.owner, tool=operation.tool_name,
+                   arguments=operation.arguments, session_id=operation.session_id)
+    if operation.native_action is not None:
+        request['native_action'] = operation.native_action.to_dict()
     async with _journal_operation(owner,
         namespace=[operation.namespace, caller.role.value, caller.auth_method.value, caller.identity],
         client_key=operation.operation_id,
-        request=dict(owner=operation.owner, tool=operation.tool_name,
-            arguments=operation.arguments, session_id=operation.session_id)):
+        request=request):
         yield
 
 

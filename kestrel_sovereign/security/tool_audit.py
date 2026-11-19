@@ -33,6 +33,7 @@ from kestrel_sovereign.logging_config import (
 )
 
 if TYPE_CHECKING:
+    from kestrel_sdk.tools import NativeActionContext
     from kestrel_sovereign.agent.tool_allowlist import AllowlistEvidence
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ async def record_tool_rejection(
     action: str = ACTION_TOOL_VALIDATION,
     args: Optional[dict] = None,
     evidence: Optional["AllowlistEvidence"] = None,
+    native_action: Optional[NativeActionContext] = None,
 ) -> bool:
     """Record one refused tool call in ``security_audit_log``.
 
@@ -90,6 +92,8 @@ async def record_tool_rejection(
             written (the audit table is plaintext SQLite).
         evidence: What the allowlist held when the call was refused. Written
             between the reason and the arguments, and logged.
+        native_action: Host-owned identity, summarized without argument values
+            or the ordinary argument-preview limit.
 
     Returns:
         True when a row was written, False when the audit store was
@@ -104,7 +108,8 @@ async def record_tool_rejection(
         # Before ``args=``: the audit read path parses the JSON that follows
         # it, and this text is prose it keeps verbatim.
         summary = f"{summary} | {evidence_text}"
-    args_summary = summarize_args(args)
+    args_summary = summarize_args(args, **({'native_action': native_action}
+                                          if native_action is not None else {}))
     if args_summary:
         summary = f"{summary} | args={args_summary}"
 

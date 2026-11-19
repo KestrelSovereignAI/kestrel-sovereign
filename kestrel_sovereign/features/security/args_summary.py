@@ -375,13 +375,18 @@ def _remask_text(summary: str) -> str:
         return "(summary could not be re-masked; not shown)"
 
 
-def summarize_args(args: Optional[dict], max_length: int = 500) -> Optional[str]:
+def summarize_args(args: Optional[dict], max_length: int = 500, *, native_action=None) -> Optional[str]:
     """Return a masked, truncated JSON summary of ``args`` for the audit log.
 
     Returns ``None`` for empty/falsey args. Sensitive values are masked
     *before* serialization, so even the failure/truncation paths never emit a
-    raw secret. The result is capped at ``max_length`` characters.
+    raw secret. Ordinary argument summaries are capped at ``max_length``.
+    Native actions serialize their content-free identity projection in full:
+    cutting or generic key masking would destroy its target/revision evidence.
     """
+    if native_action is not None:
+        from kestrel_sovereign.tools.native_action import action_audit
+        return json.dumps(action_audit(native_action, args), allow_nan=False)
     if not args:
         return None
     try:
