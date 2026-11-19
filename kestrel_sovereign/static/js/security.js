@@ -117,12 +117,8 @@ export const Security = {
         }
         this._seenApprovalIds.add(data.id);
 
-        if (this.globalAutoMode) {
-            this.submitApproval(data.id, true, 'once', { suppressToast: true })
-                .catch((err) => console.error('Failed to auto-submit approval:', err));
-            return;
-        }
-
+        // The server applies Auto before queueing. A queued request still
+        // requires a decision, including ALWAYS_ASK tools while Auto is on.
         this.pendingApprovals.set(data.id, data);
         this.updatePendingBadge(this.pendingApprovals.size);
 
@@ -304,7 +300,8 @@ export const Security = {
                             Choose how to handle this permission:
                         </p>
                         ${data.native_action ? '' : `<p style="margin: 0.5rem 0 0; color: var(--warning); font-size: 0.8125rem;">
-                            Auto Mode approves this request and future non-denied requests.
+                            Choosing Auto approves this request once and enables server approval
+                            for eligible future requests. Explicit Deny blocks; Always Ask still prompts.
                             <strong>Auto: Session</strong> lasts until the session is reset;
                             <strong>Auto: Always</strong> persists across page refresh and server
                             restart until you turn it off. Constitutional, honesty, and security
@@ -346,8 +343,8 @@ export const Security = {
                     },
                     {
                         // Global Auto, session tier (orange). Distinct from the
-                        // per-tool "Always" above: this skips approval for ALL
-                        // non-denied tools, not just this one.
+                        // per-tool "Always" above: server Auto covers eligible
+                        // future calls; Always Ask and Deny remain in force.
                         label: `${kicon('shield')} Auto: Session`,
                         type: 'primary',
                         onClick: () => this._enableGlobalAutoFromModal('session', wrappedResolve, approvalModal)
@@ -923,7 +920,7 @@ export const Security = {
                     + 'Click to turn off.';
             } else {
                 button.innerHTML = `${kicon('shield')} Auto Mode: Off`;
-                button.title = 'Turn on global Auto for non-denied tools (session or always).';
+                button.title = 'Enable server Auto for eligible tools (session or always). Always Ask still prompts.';
             }
         });
     },
@@ -961,7 +958,8 @@ export const Security = {
                 title: 'Enable Global Auto Mode',
                 content: `
                     <p style="margin: 0 0 0.75rem 0; color: var(--text-secondary);">
-                        Auto Mode skips approval popups for every non-denied tool.
+                        Auto Mode lets the server approve eligible tool requests.
+                        Explicit Deny blocks; Always Ask still prompts.
                         Constitutional, honesty, and security hooks still get the
                         first chance to flag or block — this is not a guarantee
                         that every risk has been detected.

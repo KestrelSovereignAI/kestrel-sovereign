@@ -36,7 +36,7 @@ test('native Task actions render escaped identity and only single-use decisions'
     assert.ok(target.textContent.includes('tasks/cancel'));
     assert.ok(target.textContent.includes('<img src=x onerror=alert(1)>'));
     assert.equal(target.querySelector('img'), null);
-    assert.ok(!modal.textContent.includes('Auto Mode approves'));
+    assert.ok(!modal.textContent.includes('Choosing Auto'));
     const button = [...modal.querySelectorAll('.modal-footer .modal-btn')].find(b => b.textContent === 'This Time');
     button.click();
     assert.deepEqual(await pending, { approved: true, scope: 'once' });

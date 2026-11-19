@@ -88,11 +88,11 @@ test.describe('#748 security approval popup', () => {
         await expect(page.locator('.modal-btn:has-text("Deny")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("This Time")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("This Session")')).toBeVisible();
-        await expect(page.locator('.modal-btn:has-text("Always")')).toBeVisible();
+        await expect(page.getByRole('button', { name: 'Always', exact: true })).toBeVisible();
         // Global Auto now offers both tiers: session (orange) and always (red).
         await expect(page.locator('.modal-btn:has-text("Auto: Session")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("Auto: Always")')).toBeVisible();
-        await expect(modalBody).toContainText('Auto Mode approves this request');
+        await expect(modalBody).toContainText('Always Ask still prompts');
         expect((await page.locator('.modal-btn').allTextContents()).map((text) => text.trim())).toEqual([
             'Deny',
             'This Time',
@@ -255,7 +255,7 @@ test.describe('#748 security approval popup', () => {
         await expect(page.locator('.toast-item').filter({ hasText: 'Approval was withdrawn' })).toHaveCount(0);
     });
 
-    test('Auto mode silently approves later approval requests without another popup', async ({ page }) => {
+    test('server-queued requests still require an explicit decision while Auto is on', async ({ page }) => {
         await page.route('**/agent/notifications/sse**', async (route) => {
             await route.fulfill({
                 status: 200,
@@ -308,6 +308,16 @@ test.describe('#748 security approval popup', () => {
             window.Security.handleApprovalRequest(payload);
         }, { ...APPROVAL_PAYLOAD, id: 'auto-later-1' });
 
+        await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 5000 });
+        await expect(page.locator('.modal-header h3')).toContainText('Permission Required');
+        expect(approveCalls).toEqual([]);
+        // A redelivered queued event retains one original explicit decision.
+        await page.evaluate((payload) => {
+            window.Security.handleApprovalRequest(payload);
+        }, { ...APPROVAL_PAYLOAD, id: 'auto-later-1' });
+        await expect(page.locator('#modal-overlay')).toHaveCount(1);
+        expect(approveCalls).toEqual([]);
+        await page.click('.modal-btn:has-text("This Time")');
         await expect.poll(() => approveCalls.length, { timeout: 5000 }).toBe(1);
         expect(approveCalls[0]).toMatchObject({
             approval_id: 'auto-later-1',
@@ -315,8 +325,7 @@ test.describe('#748 security approval popup', () => {
             scope: 'once',
         });
         await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
-        await expect(page.locator('.toast-item').filter({ hasText: 'Permission Required' })).toHaveCount(0);
-        await expect(page.locator('.toast-item').filter({ hasText: 'Approved (once)' })).toHaveCount(0);
+        await expect(page.locator('.toast-item').filter({ hasText: 'Approved (once)' })).toBeVisible();
         await expect(page.locator('.toast-item').filter({ hasText: 'Failed to submit decision' })).toHaveCount(0);
     });
 
@@ -364,7 +373,7 @@ test.describe('#748 security approval popup', () => {
         // Clicking the toolbar opens the tier chooser rather than toggling blindly.
         await page.click('#chat-auto-mode-btn');
         await expect(page.locator('.modal-btn:has-text("This Session")')).toBeVisible();
-        await expect(page.locator('.modal-btn:has-text("Always")')).toBeVisible();
+        await expect(page.getByRole('button', { name: 'Always', exact: true })).toBeVisible();
 
         // Choose the persistent tier.
         await page.click('.modal-btn:has-text("Always")');
