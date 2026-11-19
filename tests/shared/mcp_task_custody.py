@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
+import hashlib
 from types import SimpleNamespace
 
 from cryptography.fernet import Fernet
@@ -10,6 +11,11 @@ import pytest
 import pytest_asyncio
 
 from kestrel_sovereign.mcp_task_store import MCPTaskBinding, MCPTaskStore
+from kestrel_sovereign.mcp_task_submission import (
+    MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskSubmission,
+)
+
+CONTRACT = b'{"connection":"owned","protocol":"2026-07-28","tool":{"inputSchema":{"type":"object"},"name":"private-native-tool"},"url":null}'
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from tests.utils.original_failure import lost_original_database_commit_ack as lost_commit_ack
 
@@ -47,7 +53,7 @@ async def custody(tmp_path, monkeypatch, request):
             db = await database()
             cleanup.push_async_callback(db.close)
             options = dict(agent_did='did:test:task-owner', max_active=2,
-                max_records=8, max_payload_bytes=4096)
+                max_records=8, max_payload_bytes=4096, max_submission_bytes=4096)
             options.update(changes)
             store = MCPTaskStore(db, **options)
             await store.initialize()
@@ -58,8 +64,17 @@ async def custody(tmp_path, monkeypatch, request):
 
 
 def binding(**changes):
-    return replace(MCPTaskBinding('did:test:task-owner', 'private-operator', 'private-session',
-        'original-leaf-claim', 'a' * 64, 'b' * 64, 'private-native-tool', 'c' * 64), **changes)
+    return replace(MCPTaskBinding('did:test:task-owner',
+        MCPTaskInteractiveOrigin('f' * 64, 'private-session'),
+        'original-leaf-claim', 'a' * 64, 'b' * 64, 'private-native-tool', hashlib.sha256(CONTRACT).hexdigest()), **changes)
+
+
+def submission(*, origin=None, arguments=None, contract=CONTRACT):
+    origin = binding().origin if origin is None else origin
+    delivery = (MCPTaskDelivery('chat', origin.session_id) if origin.session_id is not None
+        else MCPTaskDelivery('internal'))
+    return MCPTaskSubmission.seal(arguments={'private-answer': 'original-private-value'}
+        if arguments is None else arguments, contract=contract, delivery=delivery)
 
 
 def claim(task_id='remote-private-task'):
@@ -89,7 +104,7 @@ def observation(status='working', **changes):
 
 
 async def attached(store):
-    reserved = await store.reserve(binding())
+    reserved = await store.reserve(binding(), submission())
     return await attach(store, reserved.issuance)
 
 

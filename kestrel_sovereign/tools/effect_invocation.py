@@ -3,6 +3,7 @@
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
+import hashlib
 import inspect
 
 from kestrel_sovereign.auth import CallerContext, CallerRole, current_caller_context
@@ -14,6 +15,25 @@ from kestrel_sovereign.tools.effect_journal import (
 from kestrel_sovereign.tool_effect_store import ToolEffectClaim
 from kestrel_sovereign._async_ownership import OwnedTaskHandoff
 from kestrel_sdk.tools import NativeActionContext
+
+
+SERVICE_OPERATION_KINDS = frozenset({'signal', 'caller', 'service', 'internal', 'invocation'})
+
+
+def current_service_operation_attribution() -> tuple[str, str]:
+    """Describe the actual ambient namespace; this is never journal authority."""
+    from kestrel_sovereign.a2a.media import encode_inline_json
+
+    caller = current_caller_context()
+    if caller is not None and caller.role == CallerRole.ANONYMOUS:
+        raise ToolEffectJournalUnavailable('Anonymous operations cannot own MCP Tasks')
+    namespace = _operation_namespace()
+    if namespace[0] == 'anonymous':
+        raise ToolEffectJournalUnavailable('Anonymous operations cannot own MCP Tasks')
+    kind = namespace[0] if namespace[0] in SERVICE_OPERATION_KINDS else 'invocation'
+    digest = hashlib.sha256(encode_inline_json(
+        ['mcp-task-service-origin-v1', namespace], sort_keys=True)).hexdigest()
+    return kind, digest
 
 
 def _operation_namespace():
