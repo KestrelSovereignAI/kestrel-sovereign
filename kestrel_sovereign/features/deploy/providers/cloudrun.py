@@ -20,15 +20,38 @@ logger = logging.getLogger(__name__)
 def _apply_managed_template(service: Any, container: Any, profile: DeploymentProfile) -> None:
     """Write the revision-template fields Kestrel manages onto ``service``.
 
-    ONLY these fields are (re)written. On update the caller passes the fetched
-    existing service, so everything else — service_account, vpc_access, labels,
-    traffic split, annotations — is left intact rather than reset out-of-band
-    (F174).
+    Preserve unmanaged configuration at every nested level, including mounts,
+    probes, command/args, port protocol and resource flags. This single-image
+    interface cannot select an ingress container from a sidecar deployment.
     """
+    count = len(service.template.containers)
+    if count > 1:
+        raise DeployManagerError("Cloud Run profile updates require a single-container service")
+    if len(container.ports) != 1:
+        raise DeployManagerError("Cloud Run profiles require one explicit ingress port")
+    if count == 1:
+        current = service.template.containers[0]
+        if len(current.ports) > 1:
+            raise DeployManagerError("Cloud Run profile updates require one ingress port")
+        port = container.ports[0].container_port
+        for probe in (current.startup_probe, current.liveness_probe):
+            if any(value and value != port for value in (
+                    probe.http_get.port, probe.tcp_socket.port, probe.grpc.port)):
+                raise DeployManagerError(
+                    "Existing Cloud Run probe port conflicts with the configured ingress port")
     # A fetched template can name an existing immutable revision. Omit that
     # identity so Cloud Run generates a name for the new configuration (#4170).
     service.template.revision = ""
-    service.template.containers = [container]
+    if count == 1:
+        current.image = container.image
+        current.env = container.env
+        if current.ports:
+            current.ports[0].container_port = container.ports[0].container_port
+        else:
+            current.ports = container.ports
+        current.resources.limits.update(container.resources.limits)
+    else:
+        service.template.containers = [container]
     service.template.scaling.min_instance_count = profile.min_instances
     service.template.scaling.max_instance_count = profile.max_instances
     service.template.timeout = f"{profile.timeout}s"

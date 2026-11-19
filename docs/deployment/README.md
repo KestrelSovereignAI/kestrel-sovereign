@@ -74,6 +74,16 @@ remain explicit; this does not switch traffic to the latest revision. When
 staging at zero traffic, validate the new revision's tagged URL and original
 identity before deliberately changing the serving allocation.
 
+Preservation includes the existing container's volume mounts, startup/liveness
+probes, command/arguments, name, ingress protocol and unmanaged resource limits
+and flags. A database volume definition without its `/cloudsql` container mount
+does not provide a usable socket. The profile changes only its managed image,
+environment, ingress port, CPU/memory limits and template scaling/timeouts.
+An existing multi-container service or conflicting explicit probe port is
+refused before dispatch; reconcile that configuration explicitly. Hosted unit
+tests retain the `cloud` extra so provider regressions execute instead of
+silently skipping their entire module.
+
 ## GitHub deployment identity
 
 The deployment workflow uses the shared `.github/actions/gcp-deploy-auth`
