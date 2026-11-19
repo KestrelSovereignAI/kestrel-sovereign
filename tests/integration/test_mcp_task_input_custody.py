@@ -60,6 +60,82 @@ async def waiting(joint):
     return reserved, record
 
 
+def unsent_refusal():
+    return {'version': 1, 'refusal': {'reason': 'dispatch_not_started'}}
+
+
+@pytest.mark.asyncio
+async def test_unsent_retirement_consumes_both_claims_and_preserves_original_submission(joint):
+    reserved, pending = await waiting(joint)
+    claimed, issued = await joint.bridge.resume(pending, {'form': {'action': 'accept'}},
+        operation_id='owned-unsent-continuation', now=101)
+    original = await joint.tasks.database.fetchone(
+        'SELECT submission_limit,submission_digest,submission,input_lineage_digest FROM mcp_task_records')
+    task, closed_input = await joint.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal())
+    assert task.phase == 'NOT_SENT' and task.envelope == unsent_refusal()
+    assert closed_input.state == 'NON_RESUMABLE' and closed_input.revision == claimed.record.revision + 1
+    assert closed_input.responses == claimed.record.responses and closed_input.continuation is None
+    assert await joint.tasks.open_submission(task) == submission()
+    assert await joint.tasks.database.fetchone(
+        'SELECT submission_limit,submission_digest,submission,input_lineage_digest FROM mcp_task_records') == original
+    with pytest.raises(MCPInputConflict):
+        await joint.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal())
+    assert not (await joint.tasks.reserve(binding(), submission())).fresh
+    fresh = await joint.reopen()
+    assert (await fresh.inputs.read(pending.binding, pending.request_id)) == closed_input
+    assert (await fresh.tasks.read(binding(), reserved.record.handle)) == task
+
+
+@pytest.mark.asyncio
+async def test_unsent_retirement_cannot_close_another_genuine_response_claim(joint):
+    _, first = await waiting(joint)
+    second = await joint.tasks.reserve(binding(operation_id='other-original-operation'), submission())
+    other = await joint.bridge.suspend(second.issuance, input_binding('other-original-operation'),
+        checkpoint(), now=100, expires_at=1000)
+    claimed, issued = await joint.bridge.resume(first, {}, operation_id='first-response', now=101)
+    other_claim, _ = await joint.bridge.resume(other, {}, operation_id='second-response', now=101)
+    before_inputs = await joint.inputs.database.fetchall('SELECT * FROM mcp_inputs ORDER BY request_id')
+    before_tasks = await joint.tasks.database.fetchall('SELECT * FROM mcp_task_records ORDER BY handle')
+    with pytest.raises(MCPTaskConflict):
+        await joint.bridge.retire_unsent(issued, other_claim, envelope=unsent_refusal())
+    assert await joint.inputs.database.fetchall('SELECT * FROM mcp_inputs ORDER BY request_id') == before_inputs
+    assert await joint.tasks.database.fetchall('SELECT * FROM mcp_task_records ORDER BY handle') == before_tasks
+    assert (await joint.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal()))[0].phase == 'NOT_SENT'
+
+
+@pytest.mark.asyncio
+async def test_two_native_retirement_writers_have_one_original_pair_winner(joint):
+    _, pending = await waiting(joint)
+    claimed, issued = await joint.bridge.resume(pending, {}, operation_id='one-pair', now=101)
+    other = await joint.reopen()
+    outcomes = await asyncio.gather(
+        joint.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal()),
+        other.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal()),
+        return_exceptions=True)
+    assert sum(isinstance(value, tuple) for value in outcomes) == 1
+    assert sum(isinstance(value, (MCPInputConflict, MCPTaskConflict)) for value in outcomes) == 1
+    task = await joint.tasks.read(binding(), issued.record.handle)
+    closed = await joint.inputs.read(pending.binding, pending.request_id)
+    assert task.phase == 'NOT_SENT' and closed.state == 'NON_RESUMABLE'
+    assert closed.revision == claimed.record.revision + 1
+
+
+@pytest.mark.asyncio
+async def test_retirement_holds_the_input_row_before_acquiring_the_task_scope(joint, monkeypatch):
+    _, pending = await waiting(joint)
+    claim, issuance = await joint.bridge.resume(pending, {}, operation_id='owned-lock-order', now=101)
+    lock = joint.tasks._lock
+    async def observed_original_lock():
+        assert joint.tasks.database.owns_open_transaction is True
+        row = await joint.inputs.database.fetchone('SELECT state FROM mcp_inputs WHERE request_id=?',
+            (pending.request_id,))
+        assert row == ('NON_RESUMABLE',), 'Task lock preceded the original Input retirement'
+        await lock()
+    monkeypatch.setattr(joint.tasks, '_lock', observed_original_lock)
+    closed, _ = await joint.bridge.retire_unsent(issuance, claim, envelope=unsent_refusal())
+    assert closed.phase == 'NOT_SENT'
+
+
 @pytest.mark.asyncio
 async def test_joint_wait_and_resume_keep_original_submission_and_mint_one_pair_after_commit(joint):
     assert joint.tasks.database is joint.inputs.database
@@ -207,13 +283,15 @@ async def test_two_real_connections_cannot_both_resume_the_same_wait(joint):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('operation', ['suspend', 'resume', 'close'])
+@pytest.mark.parametrize('operation', ['suspend', 'resume', 'close', 'retire'])
 async def test_native_lost_joint_commit_ack_returns_no_credentials_and_never_replays(joint, monkeypatch, operation):
     if operation == 'suspend':
         reserved = await joint.tasks.reserve(binding(), submission())
         pending = None
     else:
         reserved, pending = await waiting(joint)
+    if operation == 'retire':
+        claimed, issued = await joint.bridge.resume(pending, {}, operation_id='retired-operation', now=101)
     current = await joint.tasks.read(binding(), reserved.record.handle)
     returned = None
     with lost_commit_ack(monkeypatch, joint.inputs) as originals:
@@ -223,6 +301,8 @@ async def test_native_lost_joint_commit_ack_returns_no_credentials_and_never_rep
                     now=100, expires_at=1000)
             elif operation == 'resume':
                 returned = await joint.bridge.resume(pending, {}, operation_id='lost-ack-operation', now=101)
+            elif operation == 'retire':
+                returned = await joint.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal())
             else:
                 returned = await joint.bridge.close_expired(current, now=1000)
         assert returned is None and len(originals) == 1
@@ -231,7 +311,7 @@ async def test_native_lost_joint_commit_ack_returns_no_credentials_and_never_rep
     fresh = await joint.reopen()
     actual = await fresh.tasks.read(binding(), current.handle)
     expected = {'suspend': ('INPUT_WAITING', 'WAITING'), 'resume': ('ISSUING', 'RESPONDING'),
-        'close': ('INPUT_CLOSED', 'NON_RESUMABLE')}[operation]
+        'close': ('INPUT_CLOSED', 'NON_RESUMABLE'), 'retire': ('NOT_SENT', 'NON_RESUMABLE')}[operation]
     assert actual.phase == expected[0]
     request_id = actual.continuity['input']['request_id']
     retained = await fresh.inputs.read_for(binding().origin.principal_digest,
@@ -360,13 +440,15 @@ async def test_actual_store_identity_is_rechecked_after_input_preparation(joint,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('operation', ['suspend', 'resume', 'close'])
+@pytest.mark.parametrize('operation', ['suspend', 'resume', 'close', 'retire'])
 async def test_genuine_failure_after_input_write_rolls_back_both_stores(joint, monkeypatch, operation):
     if operation == 'suspend':
         reserved = await joint.tasks.reserve(binding(), submission())
         pending = None
     else:
         reserved, pending = await waiting(joint)
+    if operation == 'retire':
+        claimed, issued = await joint.bridge.resume(pending, {}, operation_id='failed-retirement', now=101)
     current = await joint.tasks.read(binding(), reserved.record.handle)
     input_before = await joint.inputs.database.fetchall('SELECT * FROM mcp_inputs')
     task_before = await joint.tasks.database.fetchall('SELECT * FROM mcp_task_records')
@@ -384,6 +466,8 @@ async def test_genuine_failure_after_input_write_rolls_back_both_stores(joint, m
                 await joint.bridge.suspend(reserved.issuance, input_binding(), checkpoint(), now=100, expires_at=1000)
             elif operation == 'resume':
                 await joint.bridge.resume(pending, {}, operation_id='failed-continuation', now=101)
+            elif operation == 'retire':
+                await joint.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal())
             else:
                 await joint.bridge.close_expired(current, now=1000)
         assert len(errors) == 1 and any(error is errors[0] for error in execution_evidence_carriers(caught.value))
@@ -392,13 +476,15 @@ async def test_genuine_failure_after_input_write_rolls_back_both_stores(joint, m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('operation', ['suspend', 'resume', 'close'])
+@pytest.mark.parametrize('operation', ['suspend', 'resume', 'close', 'retire'])
 async def test_cancellation_before_joint_commit_joins_real_rollback_without_credentials(joint, monkeypatch, operation):
     if operation == 'suspend':
         reserved = await joint.tasks.reserve(binding(), submission())
         pending = None
     else:
         reserved, pending = await waiting(joint)
+    if operation == 'retire':
+        claimed, issued = await joint.bridge.resume(pending, {}, operation_id='cancelled-retirement', now=101)
     current = await joint.tasks.read(binding(), reserved.record.handle)
     before_input = await joint.inputs.database.fetchall('SELECT * FROM mcp_inputs')
     before_task = await joint.tasks.database.fetchall('SELECT * FROM mcp_task_records')
@@ -415,6 +501,8 @@ async def test_cancellation_before_joint_commit_joins_real_rollback_without_cred
             return await joint.bridge.suspend(reserved.issuance, input_binding(), checkpoint(), now=100, expires_at=1000)
         if operation == 'resume':
             return await joint.bridge.resume(pending, {}, operation_id='cancelled-continuation', now=101)
+        if operation == 'retire':
+            return await joint.bridge.retire_unsent(issued, claimed, envelope=unsent_refusal())
         return await joint.bridge.close_expired(current, now=1000)
 
     with monkeypatch.context() as patch:
@@ -448,7 +536,7 @@ async def test_authenticated_input_cannot_point_to_a_different_tasks_wait(joint)
     await joint.inputs.database.execute('UPDATE mcp_inputs SET binding_digest=?,payload=? WHERE request_id=?',
         (digest, encrypted, pending.request_id))
     actual = await joint.inputs.read(changed, pending.request_id)
-    with pytest.raises(MCPTaskConflict, match='original waiting Task'):
+    with pytest.raises(MCPTaskConflict, match='original Task lineage'):
         await joint.bridge.resume(actual, {}, operation_id='cross-linked-response', now=101)
     assert (await joint.inputs.read(changed, pending.request_id)).state == 'WAITING'
     assert (await joint.tasks.read(binding(), first.record.handle)).phase == 'INPUT_WAITING'

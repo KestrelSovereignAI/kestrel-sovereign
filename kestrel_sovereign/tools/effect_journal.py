@@ -321,6 +321,36 @@ _current_registration: ContextVar[_ToolEffectRegistration | None] = ContextVar(
 )
 
 
+@dataclass(eq=False, repr=False)
+class _ToolEffectExecution:
+    owner: Any
+    turn: ToolEffectTurn
+    claim: ToolEffectClaim
+    witness: object
+    arguments_json: bytes
+    task: asyncio.Task
+    live: bool = True
+
+
+# Unlike the turn/claim relation, this proof belongs only to the actual handler
+# Task. A foreign reader's turn-scope handoff must never recreate it.
+_current_execution: ContextVar[_ToolEffectExecution | None] = ContextVar(
+    'kestrel_tool_effect_execution', default=None,
+)
+
+
+def current_tool_effect_execution(owner: Any) -> _ToolEffectExecution:
+    """Require the exact running handler, rather than a journal description."""
+    frame = _current_execution.get()
+    if (frame is None or not frame.live or frame.owner is not owner
+            or frame.task is not asyncio.current_task()
+            or _current_turn.get() is not frame.turn or _current_claim.get() is not frame.claim):
+        raise ToolEffectJournalUnavailable('Original registered tool handler is not running')
+    frame.turn.require_live(owner)
+    require_execution_work(owner)
+    return frame
+
+
 @contextmanager
 def bind_tool_effect_registration(owner, generation, validate):
     """Retain an original native provider through approval and owned handoff."""
@@ -420,6 +450,7 @@ async def execute_tool_effect(
     validate_registration: Callable[[], None] | None = None,
     expected_generation: int | None = None,
     execution_lifetime: Callable[[], AbstractAsyncContextManager] | None = None,
+    witness: object | None = None,
 ) -> Any:
     """Claim durably and revalidate the registration selected before hooks.
 
@@ -432,6 +463,7 @@ async def execute_tool_effect(
     turn.require_live(owner)
     turn.require_effect_admission()
     turn.privacy_lock.require_native_scope(turn.privacy_scope)
+    arguments_json = encode_inline_json(arguments, sort_keys=True) if witness is not None else None
     # This is a live execution query, not an error-classification dependency.
     # Importing the agent package during journal initialization loops through
     # streaming -> effect_invocation -> this unfinished module.
@@ -489,8 +521,16 @@ async def execute_tool_effect(
                             if inspect.iscoroutine(validation):
                                 validation.close()
                             raise TypeError('Tool registration validation must complete synchronously')
-                    started = True
-                    result = await execute()
+                    frame = (_ToolEffectExecution(owner, turn, claim, witness,
+                        arguments_json, asyncio.current_task()) if witness is not None else None)
+                    execution_token = _current_execution.set(frame)
+                    try:
+                        started = True
+                        result = await execute()
+                    finally:
+                        if frame is not None:
+                            frame.live = False
+                        _current_execution.reset(execution_token)
                     returned = True
                     returned_error = (
                         isinstance(result, ToolResult) and result.status == ToolResultStatus.ERROR

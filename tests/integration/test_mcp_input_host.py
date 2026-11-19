@@ -56,6 +56,31 @@ async def answer(boundary, row, *, principal='key', session='original-chat', res
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+async def test_unlinked_input_failure_never_borrows_a_retirement_reader(apps_boundary, monkeypatch):
+    b = apps_boundary
+    await pause(b)
+    host = b.feature._input_host
+    read = host.store.read_for
+    observed = []
+    async def actual_owned_record(*args, **kwargs):
+        result = await read(*args, **kwargs)
+        observed.append(result)
+        return result
+    monkeypatch.setattr(host.store, 'read_for', actual_owned_record)
+    assert (await pending(b)).status_code == 200
+    record = observed[-1]
+    assert record.binding.custody is None
+    failure = None
+    result = None
+    try:
+        result = await host.current_record(record,
+            retirement_error=ResourceConflict('Original ordinary Input continuation was refused'))
+    except BaseException as observation:
+        failure = observation
+    assert failure is None and result is None, 'Ordinary Input error handling borrowed another private reader'
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
 async def test_unsolicited_input_audit_retains_privacy_until_native_commit(apps_boundary, monkeypatch):
     b = apps_boundary
     host = b.feature._input_host
@@ -857,3 +882,56 @@ async def test_descriptive_origin_cannot_persist_input_without_actual_core_admis
         pass
     assert await b.feature._input_host.store.database.fetchone('SELECT COUNT(*) FROM mcp_inputs') == (0,), (
         'A descriptive origin wrote a checkpoint before the host required its actual native admission')
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+@pytest.mark.parametrize('session', ['scheduler', ' scheduler ', 'mcp-task-service', ' mcp-task-service '])
+async def test_reserved_service_labels_never_create_human_input_waits(apps_boundary, session):
+    b = apps_boundary
+    response = await b.client.post('/api/owned-initial', headers=b.headers('key'),
+        json={'marker': 'owned-reserved-session', 'session_id': session})
+    assert response.status_code == 200, response.text
+    assert not any(part.get('type') == 'mcp_input' for part in response.json().get('parts', [])), (
+        'Reserved service label was promoted into an interactive operator wait')
+    assert await b.feature._input_host.store.database.fetchone('SELECT COUNT(*) FROM mcp_inputs') == (0,)
+    assert b.markers == []
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+async def test_copied_task_cannot_use_an_input_origin_while_its_real_handler_is_running(
+        apps_boundary, monkeypatch):
+    from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
+    from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
+
+    b = apps_boundary
+    host = b.feature._input_host
+    origin, suspend = host.origin, host.suspend
+    probes, admitted = [], []
+
+    def observed_origin():
+        description = origin()
+        if not probes:
+            async def child():
+                try:
+                    description.require_current()
+                except (ToolEffectJournalUnavailable, HostCapabilityAccessDenied):
+                    admitted.append(False)
+                else:
+                    admitted.append(True)
+            probes.append(asyncio.create_task(child()))
+        return description
+
+    async def suspend_after_child(*args, **kwargs):
+        # The parent handler awaits the real copied task before entering its
+        # actual native SQL suspension, so its proof is still live here.
+        await asyncio.gather(*probes)
+        return await suspend(*args, **kwargs)
+
+    monkeypatch.setattr(host, 'origin', observed_origin)
+    monkeypatch.setattr(host, 'suspend', suspend_after_child)
+    try:
+        await pause(b)
+        assert admitted == [False], 'Copied task reused its parent input origin'
+        assert await host.store.database.fetchone('SELECT COUNT(*) FROM mcp_inputs') == (1,)
+    finally:
+        await asyncio.gather(*probes, return_exceptions=True)

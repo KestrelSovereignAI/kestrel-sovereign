@@ -8,7 +8,7 @@ from dataclasses import asdict, replace
 import hashlib
 import secrets
 
-from kestrel_sovereign.mcp_input_store import MCPInputBinding, MCPInputRecord, MCPInputStore
+from kestrel_sovereign.mcp_input_store import MCPInputBinding, MCPInputClaim, MCPInputRecord, MCPInputStore
 from kestrel_sovereign.mcp_task_store import (
     MCPTaskConflict, MCPTaskIssuance, MCPTaskRecord, MCPTaskStore,
 )
@@ -44,12 +44,16 @@ class MCPTaskInputCustody:
                 or binding.contract_digest != task.binding.contract_digest):
             raise MCPTaskConflict('MCP input does not belong to its original Task attribution and contract')
 
-    def _waiting_link(self, task, record):
+    def _input_link(self, task, record):
         self._binding(task, record)
         expected = {'request_id': record.request_id, 'reservation_id': record.reservation_id,
             'operation_id': record.binding.operation_id}
-        if (task.phase != 'INPUT_WAITING' or task.continuity['input'] != expected
-                or task.current_operation_id != record.binding.operation_id):
+        if task.continuity['input'] != expected:
+            raise MCPTaskConflict('MCP input has another original Task lineage')
+
+    def _waiting_link(self, task, record):
+        self._input_link(task, record)
+        if (task.phase != 'INPUT_WAITING' or task.current_operation_id != record.binding.operation_id):
             raise MCPTaskConflict('MCP input has another original waiting Task revision')
 
     async def suspend(self, issuance: MCPTaskIssuance, binding: MCPInputBinding,
@@ -119,6 +123,23 @@ class MCPTaskInputCustody:
             resumed = await self.tasks._persist(actual, row, 'ISSUING', None,
                 continuity=continuity, claim_hash=claim_hash)
         return claimed, MCPTaskIssuance(resumed, secret)
+
+    async def retire_unsent(self, issuance: MCPTaskIssuance, claim: MCPInputClaim, *,
+                            envelope: dict) -> tuple[MCPTaskRecord, MCPInputRecord]:
+        """Retire both original claims; the host independently proves no send."""
+        self._require()
+        expected = self.tasks._issuance_identity(issuance)
+        envelope = self.tasks._snapshot(envelope)
+        prepared = await self.inputs._prepare_settlement(claim, state='NON_RESUMABLE')
+        self._require()
+        async with self.inputs.write_transaction():
+            closed_input = await self.inputs._apply_settlement(prepared)
+            await self.tasks._lock()
+            records = await self.tasks._all()
+            actual, row = self.tasks._select_issuance(records, expected)
+            self._input_link(actual, closed_input)
+            closed_task = await self.tasks._persist(actual, row, 'NOT_SENT', envelope)
+        return closed_task, closed_input
 
     async def close_expired(self, expected: MCPTaskRecord, *, now: float) -> MCPTaskRecord:
         self._require()

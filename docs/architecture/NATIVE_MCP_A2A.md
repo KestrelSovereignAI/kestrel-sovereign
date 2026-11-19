@@ -771,10 +771,50 @@ Task cannot take this exit. Private retained inventory includes uncertain and
 input-held work for owner reconstruction; remote inventory keeps its existing
 ATTACHED/SETTLED meaning.
 
-This coordinator is private storage. Actual Input-host routing, fresh original
-tool governance and connection ownership, observer/wait-provider integration,
-Apps delivery and native/browser acceptance remain required before Tasks is
-advertised. It does not enable Tasks or implement a compatibility adapter.
+This coordinator is private storage; the following host composes its actual
+Input routing. Observer/wait-provider integration, Apps delivery and full
+native/browser acceptance remain required before Tasks is advertised.
+
+### Governed initial Task and Input host
+
+`MCPTaskHost` requires the actual Input host, primary effect database, active
+native feature, raw durable privacy policy and current registered handler.
+The journal's private execution frame pins the actual asyncio Task, live
+turn/claim and engine-selected tool registration at both mounted dispatch
+producers. It is deliberately not carried by turn-scope re-presentation.
+Copied tasks, returned handlers, witnessless nested effects and a different
+current mounted tool cannot borrow that selection.
+
+Core seals decided arguments before the journal's first admission await. The
+Task host uses those bytes, its actual origin producer, the canonical contract
+and the admitted OAuth authorization generation. It reserves bounded owner
+retention before storage or wire. Its per-row payload admission also measures
+continuation and future native-history headroom through the store's canonical
+encoder. No Task handle, checkpoint argument copy or issuance secret replaces
+fresh original tool permission.
+
+The authenticated Input reader retains its actual SQL row. A linked response
+requires the current private Task round, opens immutable original submission
+bytes and consumes both claims atomically; Task acknowledgement precedes Input
+settlement. Native complete/error results, creation claims and InputRequired
+results remain distinct. A known failed joint suspension retains the actual
+InputRequired result as a local disposition, never a fabricated completion.
+Uncertain wire or commit outcomes keep custody; native commit/control errors
+survive unchanged. Read-only reservation reconciliation never recovers a secret
+or resends the tool. Completed owner holds transfer to the actual engine
+execution until POST policy, required audit and deferred publication finish.
+Each acknowledged claim is retained before a later authority check can throw.
+A continuation proven never sent retires Task and Input claims together as
+NOT_SENT and NON_RESUMABLE in one transaction. This local disposition is never
+a remote completion; errors after a continuation starts remain uncertain.
+
+The Feature's private runtime composes from the same confirmed registration
+batch and the published SDK extension surface. Its owned local maintenance
+closes expired linked waits and reconciles custody without a principal or
+remote Task I/O. Public configuration and `supports_mcp_task_host` remain off.
+The official SDK TTL normalization issue #3866, observation/provider/actions,
+pending Apps/final delivery and complete native/browser acceptance still gate
+activation. MCP remains on the published official SDK without a runtime patch.
 
 ### Registered native Task actions
 

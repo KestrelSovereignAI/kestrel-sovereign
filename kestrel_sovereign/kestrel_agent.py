@@ -140,6 +140,7 @@ from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.mcp_apps import MCPAppsHostMixin
 from kestrel_sovereign.mcp_oauth import MCPOAuthHostMixin
 from kestrel_sovereign.mcp_input import MCPInputHostMixin
+from kestrel_sovereign.mcp_tasks import MCPTaskHostMixin
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
@@ -1096,6 +1097,7 @@ class KestrelAgent(
     MCPAppsHostMixin,
     MCPOAuthHostMixin,
     MCPInputHostMixin,
+    MCPTaskHostMixin,
 ):
     """
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.

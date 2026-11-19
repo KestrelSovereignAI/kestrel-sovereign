@@ -111,6 +111,14 @@ async def test_prepared_writes_require_their_actual_owner_and_an_open_transactio
         with pytest.raises(MCPInputConflict, match='owning transaction'):
             await other._apply_response(response)
     assert (await store.read(record.binding, record.request_id)).state == 'WAITING'
+    claim = await store.claim_response(record, {}, now=101)
+    settlement = await store._prepare_settlement(claim, state='NON_RESUMABLE')
+    with pytest.raises(MCPInputConflict, match='owning transaction'):
+        await store._apply_settlement(settlement)
+    async with other.write_transaction():
+        with pytest.raises(MCPInputConflict, match='owning transaction'):
+            await other._apply_settlement(settlement)
+    assert (await store.read(record.binding, record.request_id)).state == 'RESPONDING'
 
 
 @pytest.mark.asyncio
@@ -130,6 +138,7 @@ async def test_apply_halves_do_not_enter_crypto_or_ordinary_read_helpers(custody
         checkpoint(), now=102, expires_at=1000, predecessor=claim)
     async with store.write_transaction():
         await store._apply_create(successor)
+    assert (await store.settle(claim, state='NON_RESUMABLE')).state == 'NON_RESUMABLE'
 
 
 @pytest.mark.asyncio
@@ -230,7 +239,8 @@ async def test_original_creation_and_response_bytes_are_detached_before_write_aw
 async def test_public_producers_use_both_canonical_preparation_and_transaction_apply(custody, monkeypatch):
     store, _, _ = custody
     calls = []
-    for name in ('_prepare_create', '_apply_create', '_prepare_response', '_apply_response'):
+    for name in ('_prepare_create', '_apply_create', '_prepare_response', '_apply_response',
+                 '_prepare_settlement', '_apply_settlement'):
         original = getattr(store, name)
 
         async def observed(*args, _name=name, _original=original, **kwargs):
@@ -240,9 +250,48 @@ async def test_public_producers_use_both_canonical_preparation_and_transaction_a
         monkeypatch.setattr(store, name, observed)
     record = await create(store)
     assert calls == [('_prepare_create', False), ('_apply_create', True)], 'Public creation must apply its canonical prepared write'
-    await store.claim_response(record, {}, now=101)
+    claim = await store.claim_response(record, {}, now=101)
     assert calls == [('_prepare_create', False), ('_apply_create', True),
         ('_prepare_response', False), ('_apply_response', True)], 'Public writes must use the canonical prepare/apply pair'
+    await store.settle(claim, state='NON_RESUMABLE')
+    assert calls[-2:] == [('_prepare_settlement', False), ('_apply_settlement', True)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('state', ['RESOLVED', 'NON_RESUMABLE', 'UNKNOWN'])
+async def test_settlement_cas_cannot_overwrite_a_different_authenticated_before_image(custody, state):
+    store, _, _ = custody
+    record = await create(store)
+    claim = await store.claim_response(record, {'form': {'action': 'accept'}}, now=101)
+    prepared = await store._prepare_settlement(claim, state=state)
+    actual = claim.record
+    replacement = {**actual.payload, 'changed-authenticated-checkpoint': True}
+    ciphertext = store._encode(actual.binding, actual.request_id, actual.revision, 'RESPONDING',
+        actual.expires_at, hashlib.sha256(claim.secret.encode()).hexdigest(), replacement,
+        actual.responses, reservation_id=actual.reservation_id, predecessor_id=actual.predecessor_id)
+    await store.database.execute('UPDATE mcp_inputs SET payload=?', (ciphertext,))
+    with pytest.raises(MCPInputConflict, match='no longer current'):
+        async with store.write_transaction():
+            await store._apply_settlement(prepared)
+    unchanged = await store.read(actual.binding, actual.request_id)
+    assert unchanged.state == 'RESPONDING' and unchanged.payload == replacement
+
+
+@pytest.mark.asyncio
+async def test_settlement_detaches_expected_claim_and_continuation_before_await(custody, monkeypatch):
+    store, _, _ = custody
+    record = await create(store)
+    claim = await store.claim_response(record, {}, now=101)
+    continuation = {'owned-local-result': {'value': 'original'}}
+    read = store._read_for
+    async def mutate_after_capture(*args, **kwargs):
+        continuation.clear()
+        object.__setattr__(claim.record, 'revision', 999)
+        return await read(*args, **kwargs)
+    monkeypatch.setattr(store, '_read_for', mutate_after_capture)
+    result = await store.settle(claim, state='RESOLVED', continuation=continuation)
+    assert result.revision == 2
+    assert result.continuation == {'owned-local-result': {'value': 'original'}}
 
 
 @pytest.mark.asyncio

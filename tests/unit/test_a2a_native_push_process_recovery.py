@@ -297,14 +297,21 @@ async def test_bounded_recovery_rotates_past_a_live_owner_and_keeps_foreign_scop
     config = await value.register(native, creator_id="did:creator")
     store = value.configurations
     live_config = await store.create(stored_config(task, "live-config"), creator_id="did:creator")
-    live = replace(store.prepare_delivery(live_config, executor_id="live-runtime"), attempt_id="00-live")
+    # A proper prefix of every lowest-starting UUID hex ID also precedes it
+    # under PostgreSQL's locale collation, which can ignore the hyphen.
+    live = replace(store.prepare_delivery(live_config, executor_id="live-runtime"), attempt_id="0")
+    assert await value.backend.fetch_val(
+        "SELECT CAST(? AS TEXT) < CAST(? AS TEXT)", (live.attempt_id, "0" * 32)
+    ), "The live fixture must precede every generated attempt ID in database order"
     assert await store.admit_delivery(live)
     async with native_push_child(value, outbound_tls, tmp_path) as (process, report, log):
         assert report["event"] == "native-response-close"
         dead_id = await value.backend.fetch_val(
             "SELECT attempt_id FROM a2a_push_delivery_attempts WHERE generation = ?", (config.generation,)
         )
-        assert dead_id > live.attempt_id
+        assert await value.backend.fetch_val(
+            "SELECT CAST(? AS TEXT) < CAST(? AS TEXT)", (live.attempt_id, dead_id)
+        )
         process.kill()
         assert await process.wait() == -signal.SIGKILL
         assert recorded_process_exited(log, report["owner"], require_kernel_session=True)

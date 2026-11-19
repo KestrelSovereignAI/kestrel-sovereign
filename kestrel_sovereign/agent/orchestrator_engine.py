@@ -2161,17 +2161,20 @@ class OrchestratorEngineMixin:
             return _UnconfirmedToolResult(payload)
 
         with tool_call_scope(self, call_context):
-            return await _run_tool_execution(
-                self, run, execution=execution, dispatch_meta=dispatch_meta,
-                session_id=session_id, on_failure=failed,
-                on_terminal=lambda error: _record_terminal_tool_dispatch(
-                    self, error, execution, dispatch_meta,
-                    tool_name=tool_name,
-                    adapter=f"named:{source}:" + self._tool_call_adapter(tool_name, {}),
-                    args=dispatch_meta.get("arguments", args), session_id=session_id,
-                    dispatch_start=dispatch_start, dispatch_id=call_context.ledger_id),
-                recover_audited=_capture is not None,
-            )
+            try:
+                return await _run_tool_execution(
+                    self, run, execution=execution, dispatch_meta=dispatch_meta,
+                    session_id=session_id, on_failure=failed,
+                    on_terminal=lambda error: _record_terminal_tool_dispatch(
+                        self, error, execution, dispatch_meta,
+                        tool_name=tool_name,
+                        adapter=f"named:{source}:" + self._tool_call_adapter(tool_name, {}),
+                        args=dispatch_meta.get("arguments", args), session_id=session_id,
+                        dispatch_start=dispatch_start, dispatch_id=call_context.ledger_id),
+                    recover_audited=_capture is not None,
+                )
+            finally:
+                execution.release_owner_lease(self)
 
     async def _dispatch_named_tool(
         self,
@@ -2212,6 +2215,7 @@ class OrchestratorEngineMixin:
             # any enabled feature" on invocation.) The shared input-guardrail /
             # PRE+POST hook / permission flow below then applies uniformly.
             found_tool = self._direct_tools[tool_name]
+            execution.capture_registration(self, tool_name, found_tool)
             direct_tool_feature_name = self._security_feature_name_for_tool(
                 tool_name
             )
@@ -2388,6 +2392,9 @@ class OrchestratorEngineMixin:
         effective_args = post_hook_args
         if argument_guard is not None:
             await argument_guard(effective_args, found_tool.schema)
+        effective_args = deepcopy(effective_args)
+        execution.arguments = effective_args
+        dispatch_meta['arguments'] = effective_args
 
         # --- Execute the tool ---
         # Deliberately no span here (#2639): the observability hook's
@@ -2405,7 +2412,7 @@ class OrchestratorEngineMixin:
         result = await execute_tool_effect(self, registration=[feature_name, tool_name],
             arguments=effective_args, execute=execute_registered,
             expected_generation=selected_generation, validate_registration=registration_validator,
-            execution_lifetime=execution_lifetime)
+            execution_lifetime=execution_lifetime, witness=execution)
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
@@ -3735,6 +3742,7 @@ class OrchestratorEngineMixin:
         tool = tool if tool is not None else self._direct_tools[tool_name]
         from kestrel_sovereign.agent.tool_allowlist import registry_generation
 
+        execution.capture_registration(self, tool_name, tool, bound_tool)
         selected_generation = registry_generation(self)
         hook_feature_name = (
             feature_name or self._security_feature_name_for_tool(tool_name)
@@ -3831,6 +3839,9 @@ class OrchestratorEngineMixin:
                 rewrite_error = hook_rewrite_argument_error(tool_name, t, effective_args)
                 if rewrite_error is not None:
                     raise ToolArgumentRewriteError(rewrite_error)
+            effective_args = deepcopy(effective_args)
+            execution.arguments = effective_args
+            dispatch_meta['arguments'] = effective_args
             async def execute_registered():
                 execution.started = True
                 result = (await native.declaration.handler(snapshot_action_context(native.context),
@@ -3847,7 +3858,8 @@ class OrchestratorEngineMixin:
             return await execute_tool_effect(self, registration=registration,
                 arguments=effective_args, execute=execute_registered,
                 expected_generation=selected_generation,
-                validate_registration=bound_tool.require_current if bound_tool is not None else registration_validator)
+                validate_registration=bound_tool.require_current if bound_tool is not None else registration_validator,
+                witness=execution)
 
         async def run():
             from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects
@@ -3908,18 +3920,21 @@ class OrchestratorEngineMixin:
                 status="timeout" if isinstance(e, TimeoutError) else "error",
             )
 
-        return await _run_tool_execution(
-            self, run, execution=execution, dispatch_meta=dispatch_meta,
-            session_id=session_id, on_failure=failed,
-            on_terminal=lambda error: _record_terminal_tool_dispatch(
-                self, error, execution, dispatch_meta,
-                tool_name=tool_name,
-                adapter=(f"{bound_tool.owner}.{tool_name}" if bound_tool is not None
-                    else self._tool_call_adapter(tool_name, {})),
-                args=dispatch_meta.get("arguments", args), session_id=session_id,
-                dispatch_start=dispatch_start,
-                dispatch_id=call_context.ledger_id if call_context is not None else None),
-        )
+        try:
+            return await _run_tool_execution(
+                self, run, execution=execution, dispatch_meta=dispatch_meta,
+                session_id=session_id, on_failure=failed,
+                on_terminal=lambda error: _record_terminal_tool_dispatch(
+                    self, error, execution, dispatch_meta,
+                    tool_name=tool_name,
+                    adapter=(f"{bound_tool.owner}.{tool_name}" if bound_tool is not None
+                        else self._tool_call_adapter(tool_name, {})),
+                    args=dispatch_meta.get("arguments", args), session_id=session_id,
+                    dispatch_start=dispatch_start,
+                    dispatch_id=call_context.ledger_id if call_context is not None else None),
+            )
+        finally:
+            execution.release_owner_lease(self)
 
     # ------------------------------------------------------------------
     # Tool concurrency batching

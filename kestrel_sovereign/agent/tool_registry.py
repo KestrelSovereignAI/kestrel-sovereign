@@ -12,7 +12,7 @@ import logging
 import re
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Dict, List
 from uuid import uuid4
 
@@ -67,7 +67,7 @@ def _capture_tool_feature_registration(host, tool, feature=None):
     return require_current
 
 
-@dataclass
+@dataclass(repr=False)
 class _ToolExecution:
     """Caller-local execution facts, independent of a tool's business result."""
 
@@ -80,6 +80,40 @@ class _ToolExecution:
     arguments: dict | None = None
     native_action: NativeActionContext | None = None
     action_declaration: NativeAction | None = None
+    registration: object | None = None
+    tool: Any = None
+    tool_name: str | None = None
+    owner: str | None = None
+    owner_lease: object | None = None
+
+    def capture_registration(self, agent, tool_name, tool, binding=None):
+        """Snapshot the engine's own selection, before any awaited approval."""
+        self.tool, self.tool_name = tool, tool_name
+        if binding is not None:
+            self.owner, self.registration = binding.owner, binding.registration
+        else:
+            self.owner = agent._tool_to_feature.get(tool_name)
+            self.registration = agent._explored_features.get(self.owner)
+
+    def release_owner_lease(self, agent):
+        if self.owner_lease is not None:
+            agent._release_task_owner_hold(self.owner_lease)
+            self.owner_lease = None
+
+
+@dataclass(eq=False, repr=False)
+class _OwnerRegistration:
+    owner: str
+    registration_id: str
+    task_holds: set = field(default_factory=set)
+
+
+@dataclass(eq=False, repr=False)
+class _TaskOwnerHold:
+    agent: Any
+    registration: _OwnerRegistration
+    handle: str | None = None
+    released: bool = False
 
 
 async def _record_incomplete_tool_dispatch(host, execution, *, tool_name, adapter,
@@ -610,8 +644,8 @@ class ToolRegistryMixin:
         # Commit, with nothing that can raise in between. The epoch insert goes
         # first because it is the first to hash ``owner`` (an unhashable owner
         # is the one failure left), and a dict insert that fails changes nothing.
-        registration = object()
         registration_id = uuid4().hex
+        registration = _OwnerRegistration(owner, registration_id)
         self._explored_features[owner] = registration
         if pin:
             self._pinned_features.add(owner)
@@ -686,6 +720,39 @@ class ToolRegistryMixin:
         enforce_tool_result_contract(feature)
         self.register_dynamic_tools(feature.tool_name, feature.get_tools())
 
+    def _acquire_task_owner_hold(self, binding, *, max_holds: int,
+                                 max_held_tools: int) -> _TaskOwnerHold:
+        """Bound LRU retention on the actual registration; never grant work."""
+        if (type(binding) is not _GovernedToolBinding or binding.agent is not self
+                or type(binding.registration) is not _OwnerRegistration):
+            raise ResourceConflict('Task retention requires the original registered tool')
+        binding.require_current()
+        if (type(max_holds) is not int or max_holds <= 0
+                or type(max_held_tools) is not int or not 0 < max_held_tools < self.MAX_DIRECT_TOOLS):
+            raise ValueError('Task owner budgets require positive limits and direct-tool headroom')
+        registrations = [registration for registration in self._explored_features.values()
+            if type(registration) is _OwnerRegistration]
+        if sum(len(registration.task_holds) for registration in registrations) >= max_holds:
+            raise ResourceConflict('Task owner hold capacity is exhausted')
+        pinned = self._pinned_features
+        held_owners = {registration.owner for registration in registrations
+            if registration.task_holds and registration.owner not in pinned}
+        if binding.owner not in pinned:
+            held_owners.add(binding.owner)
+        if sum(owner in held_owners for owner in self._tool_to_feature.values()) > max_held_tools:
+            raise ResourceConflict('Task owner tools would exhaust registry headroom')
+        hold = _TaskOwnerHold(self, binding.registration)
+        binding.registration.task_holds.add(hold)
+        return hold
+
+    def _release_task_owner_hold(self, hold: _TaskOwnerHold) -> None:
+        """Release once, including after explicit retirement of the old epoch."""
+        if type(hold) is not _TaskOwnerHold or hold.agent is not self:
+            raise TypeError('Task owner hold belongs to another registry')
+        if not hold.released:
+            hold.registration.task_holds.discard(hold)
+            hold.released = True
+
     def _maybe_evict_direct_tools(self) -> None:
         """Evict least-recently-explored feature's tools if over limit.
 
@@ -704,6 +771,10 @@ class ToolRegistryMixin:
         collision-renamed one unmounts the only copy, and exploration runs
         mid-turn, so the next call to a tool that just answered was refused as
         not in the allowlist.
+
+        Active Task custody can independently retain the original registration.
+        Both the hold count and the tools of held unpinned owners are bounded
+        before admission; explicit unmount still invalidates that epoch.
 
         When every older owner is pinned or held, the owner whose registration
         overflowed the cap is the oldest evictable one, so it goes: an explored
@@ -733,13 +804,19 @@ class ToolRegistryMixin:
 
         while len(self._direct_tools) > self.MAX_DIRECT_TOOLS:
             # Find oldest UNPINNED feature the live turn is not holding.
-            held = []
+            held, turn_held, task_held = [], [], []
             oldest = None
             for owner in self._explored_features:
                 if owner in pinned:
                     continue
                 if _held_by_live_turn(owner):
                     held.append(owner)
+                    turn_held.append(owner)
+                    continue
+                registration = self._explored_features[owner]
+                if type(registration) is _OwnerRegistration and registration.task_holds:
+                    held.append(owner)
+                    task_held.append(owner)
                     continue
                 oldest = owner
                 break
@@ -750,12 +827,13 @@ class ToolRegistryMixin:
                 # first registration after its turn ends; a pinned one never.
                 logging.warning(
                     "[DYNAMIC-TOOLS] Cannot evict: all %d explored owners "
-                    "are pinned or hold a tool this turn used (pinned: %s; "
-                    "held by this turn: %s). Direct-tool count %d exceeds "
+                    "are pinned or held by active work (pinned: %s; "
+                    "held by this turn: %s; held by Tasks: %s). Direct-tool count %d exceeds "
                     "cap %d.",
                     len(self._explored_features),
                     sorted(pinned),
-                    sorted(held),
+                    sorted(turn_held),
+                    sorted(task_held),
                     len(self._direct_tools),
                     self.MAX_DIRECT_TOOLS,
                 )
@@ -783,8 +861,8 @@ class ToolRegistryMixin:
                 # the owner being registered right now: say so out loud.
                 logging.warning(
                     "[DYNAMIC-TOOLS] Evicted %d tool(s) from %s in place of "
-                    "owner(s) holding a tool this turn used (%s): %s%s",
-                    len(to_remove), oldest, ", ".join(held),
+                    "held owner(s) (turn: %s; Tasks: %s): %s%s",
+                    len(to_remove), oldest, ", ".join(turn_held), ", ".join(task_held),
                     ", ".join(preview), tail,
                 )
             else:
