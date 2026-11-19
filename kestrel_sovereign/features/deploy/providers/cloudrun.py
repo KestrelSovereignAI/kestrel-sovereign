@@ -34,7 +34,7 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
         if len(current.ports) > 1:
             raise DeployManagerError("Cloud Run profile updates require one ingress port")
         port = container.ports[0].container_port
-        for probe in (current.startup_probe, current.liveness_probe):
+        for probe in (current.startup_probe, current.liveness_probe, current.readiness_probe):
             if any(value and value != port for value in (
                     probe.http_get.port, probe.tcp_socket.port, probe.grpc.port)):
                 raise DeployManagerError(

@@ -74,8 +74,8 @@ remain explicit; this does not switch traffic to the latest revision. When
 staging at zero traffic, validate the new revision's tagged URL and original
 identity before deliberately changing the serving allocation.
 
-Preservation includes the existing container's volume mounts, startup/liveness
-probes, command/arguments, name, ingress protocol and unmanaged resource limits
+Preservation includes the existing container's volume mounts, startup/liveness/
+readiness probes, command/arguments, name, ingress protocol and unmanaged resource limits
 and flags. A database volume definition without its `/cloudsql` container mount
 does not provide a usable socket. The profile changes only its managed image,
 environment, ingress port, CPU/memory limits and template scaling/timeouts.
