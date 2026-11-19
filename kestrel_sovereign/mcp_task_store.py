@@ -33,6 +33,12 @@ from kestrel_sovereign.storage.initialization_errors import repository_initializ
 
 MCP_TASK_SCHEMA_REVISION = 4
 
+
+def task_routing_payload(binding, task_id, envelope, continuity):
+    """Canonical routing bytes, also used to measure host admission headroom."""
+    return encode_inline_json({'binding': asdict(binding), 'remote_task_id': task_id,
+        'envelope': envelope, 'continuity': continuity})
+
 _ROW_COLUMNS = ('scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,'
     'claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest')
 
@@ -401,8 +407,7 @@ class MCPTaskStore(UnifiedStoreBase):
         if set(continuity['operations']).intersection(
                 envelope.get('control', {}).get('mutations', {}) if envelope else ()):
             raise ValueError('MCP Task continuation operation already owns a mutation')
-        raw = encode_inline_json({'binding': asdict(binding), 'remote_task_id': task_id,
-            'envelope': envelope, 'continuity': continuity})
+        raw = task_routing_payload(binding, task_id, envelope, continuity)
         if len(raw) > columns[8]:
             raise ValueError('MCP Task custody exceeded its storage budget')
         return raw, AEADCipher(self._root).encrypt(raw, aad=self._aad(columns))

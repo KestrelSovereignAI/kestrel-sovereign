@@ -265,7 +265,7 @@ class TestMidTurnEviction:
                 if r.levelno == logging.WARNING and "Evicted" in r.getMessage()
             ]
             assert "from mcp:new in place of" in warning
-            assert "(mcp:files)" in warning
+            assert "turn: mcp:files" in warning
             assert "new_a, new_b" in warning
 
         await drive_native(mcp_agent, exercise)

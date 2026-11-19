@@ -182,6 +182,17 @@ class _PreparedExpiry:
     now: float
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedSettlement:
+    owner: object
+    record: MCPInputRecord
+    reader_digest: str
+    binding_digest: str
+    claim_hash: str
+    ciphertext: bytes
+    before: tuple
+
+
 class MCPInputStore(UnifiedStoreBase):
     """Borrow primary storage and atomically consume each waiting revision."""
 
@@ -564,8 +575,8 @@ class MCPInputStore(UnifiedStoreBase):
             raise MCPInputConflict('MCP input requires its original response claim')
         return record, self._binding_digest(record.binding), hashlib.sha256(claim.secret.encode()).hexdigest()
 
-    async def settle(self, claim: MCPInputClaim, *, state: str, continuation: dict | None = None) -> MCPInputRecord:
-        """Record the original claim's outcome; uncertain work never reopens."""
+    async def _prepare_settlement(self, claim: MCPInputClaim, *, state: str,
+                                  continuation: dict | None = None) -> _PreparedSettlement:
         record, digest, claim_hash = self._claim_identity(claim)
         if state not in {'RESOLVED','NON_RESUMABLE','UNKNOWN'}:
             raise MCPInputConflict('MCP input settlement requires a terminal state')
@@ -573,17 +584,31 @@ class MCPInputStore(UnifiedStoreBase):
             if type(continuation) is not dict or state != 'RESOLVED':
                 raise TypeError('MCP input checkpoint must be a JSON object')
             continuation = json.loads(encode_inline_json(continuation))
-        actual = await self.read(record.binding, record.request_id)
-        if (actual.state != 'RESPONDING' or actual.revision != record.revision
+        actual, before = await self._read_for(record.binding.principal_id,
+            record.binding.session_id, record.request_id)
+        if (actual.binding != record.binding or actual.state != 'RESPONDING'
+                or actual.revision != record.revision
                 or actual.expires_at != record.expires_at):
             raise MCPInputConflict('MCP input response claim is no longer current')
-        revision = actual.revision + 1
-        digest = self._binding_digest(actual.binding)
-        ciphertext = self._encode(actual.binding, actual.request_id, revision, state,
+        settled, ciphertext = self._prepare_record(actual.binding, actual.request_id,
+            actual.revision + 1, state,
             actual.expires_at, None, actual.payload, actual.responses, continuation,
             reservation_id=actual.reservation_id, predecessor_id=actual.predecessor_id)
+        return _PreparedSettlement(self, settled,
+            self._reader_digest(actual.binding.principal_id, actual.binding.session_id),
+            digest, claim_hash, ciphertext, before)
+
+    async def _apply_settlement(self, prepared: _PreparedSettlement) -> MCPInputRecord:
+        self._require_apply(prepared, _PreparedSettlement)
+        record, before = prepared.record, prepared.before
+        changed = await self.database.execute("UPDATE mcp_inputs SET revision=?,state=?,claim_hash=NULL,payload=? WHERE scope=? AND request_id=? AND reader_digest=? AND binding_digest=? AND revision=? AND state='RESPONDING' AND claim_hash=? AND expires_at=? AND reservation_id=? AND COALESCE(predecessor_id,'')=? AND payload=?", (record.revision, record.state, prepared.ciphertext, self.scope, record.request_id, prepared.reader_digest, prepared.binding_digest, before[1], prepared.claim_hash, before[3], before[5], before[6] or '', before[7]))
+        if changed != 1:
+            raise MCPInputConflict('MCP input response claim is no longer current')
+        return record
+
+    async def settle(self, claim: MCPInputClaim, *, state: str, continuation: dict | None = None) -> MCPInputRecord:
+        """Record the original claim's outcome; uncertain work never reopens."""
+        prepared = await self._prepare_settlement(claim, state=state, continuation=continuation)
         async with self.write_transaction():
-            changed = await self.database.execute("UPDATE mcp_inputs SET revision=?,state=?,claim_hash=NULL,payload=? WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='RESPONDING' AND claim_hash=?", (revision, state, ciphertext, self.scope, actual.request_id, digest, actual.revision, claim_hash))
-            if changed != 1:
-                raise MCPInputConflict('MCP input response claim is no longer current')
-        return await self.read(actual.binding, actual.request_id)
+            result = await self._apply_settlement(prepared)
+        return result

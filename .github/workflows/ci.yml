@@ -478,6 +478,7 @@ jobs:
           uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
           tests/integration/test_mcp_apps_host.py
           tests/integration/test_mcp_input_host.py
+          tests/integration/test_mcp_task_host.py
           tests/integration/test_mcp_permission_host_restart.py
           tests/integration/test_mcp_permission_unknown_restart.py
           tests/integration/test_tool_effect_host_boot.py

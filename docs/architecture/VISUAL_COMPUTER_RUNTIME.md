@@ -395,7 +395,9 @@ The public SDK dependency is declared in `pyproject.toml` and resolved in
 the corresponding complete package hashes.
 The Core pin in both worker requirements files must match the project version.
 Build the ordinary Core wheel and regenerate the target dependency lock with
-that wheel's exact hash before building worker images. The version test checks
+that wheel's exact hash before building worker images. Constrain shared package
+versions to `uv.lock`; the pinned browser image owns its Playwright/pyee pair.
+The worker dependency test rejects unrelated drift from Core's tested lock. The version test checks
 both requirements files so a Core release cannot silently keep an older wheel.
 
 The closed v2 profile and `core-sdk046-two-domain-v2` schema identity refer to

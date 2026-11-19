@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
 from uuid import uuid4
+from weakref import ref
 
 from fastapi import APIRouter, HTTPException, Request
 from kestrel_sdk.operator import OperatorContext
@@ -22,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.responses import JSONResponse
 
 from kestrel_sovereign.auth import caller_context_scope, caller_identity_digest, current_caller_context
-from kestrel_sovereign.execution_custody import require_execution_work
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.mcp_input_store import (
     MCPInputBinding, MCPInputClaim, MCPInputConflict, MCPInputRecord, MCPInputStore,
 )
@@ -35,7 +36,7 @@ from kestrel_sovereign.security.request_body import read_json_model
 from kestrel_sovereign.security.private_delivery import AuthorizedCapabilityResponse
 from kestrel_sovereign.security.request_auth import RequestAuthenticationService, current_request_authentication
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
-from kestrel_sovereign.tools.effect_journal import current_tool_effect_state, require_persistent_tool_effects
+from kestrel_sovereign.tools.effect_journal import current_tool_effect_execution, require_persistent_tool_effects
 
 
 class MCPInputHostPolicy(BaseModel):
@@ -76,6 +77,8 @@ class _Reader:
     authentication: object
     request: object = field(repr=False)
     borrowed: AsyncExitStack = field(repr=False)
+    record: MCPInputRecord | None = field(default=None, repr=False)
+    task_settled: bool = False
     response_claim: MCPInputClaim | None = field(default=None, repr=False)
     app_view: object = field(default=None, repr=False)
     app_transport: object = field(default=None, repr=False)
@@ -144,16 +147,16 @@ class MCPInputHost:
         self._runtime = runtime
 
     def origin(self) -> MCPInputOrigin:
-        """Capture an actual admitted effect, never a caller-supplied label."""
+        """Capture the running registered handler, never an ambient claim."""
         from kestrel_sovereign.agent.turn_lifecycle import current_turn_is_signal_driven
-        from kestrel_sovereign.features.security.hooks import NON_INTERACTIVE_SESSION_IDS
+        from kestrel_sovereign.features.security.hooks import reserved_session_id
 
         self.require_current()
-        turn, claim = current_tool_effect_state(self.agent)
-        if turn is None or claim is None or claim.attempt is not turn.attempt:
+        execution = current_tool_effect_execution(self.agent)
+        turn, claim = execution.turn, execution.claim
+        if claim.attempt is not turn.attempt:
             raise HostCapabilityAccessDenied('Original governed MCP dispatch is required')
-        turn.require_live(self.agent)
-        require_execution_work(self.agent)
+        original_execution = ref(execution)
         session = self.agent.get_turn_bound_session_id()
         if session is None:
             from kestrel_sovereign.agent.parts import current_part_collector, current_tool_publication_context
@@ -174,16 +177,15 @@ class MCPInputHost:
         authentication = current_request_authentication()
         caller = current_caller_context()
         interactive = (isinstance(session, str) and bool(session.strip())
-            and session not in NON_INTERACTIVE_SESSION_IDS and not current_turn_is_signal_driven()
+            and reserved_session_id(session) is None and not current_turn_is_signal_driven()
             and authentication is not None and caller is authentication.caller)
 
         def check():
             self.require_current()
-            actual_turn, actual_claim = current_tool_effect_state(self.agent)
-            if actual_turn is not turn or actual_claim is not claim:
+            actual = current_tool_effect_execution(self.agent)
+            if (actual is not original_execution() or actual.turn is not turn
+                    or actual.claim is not claim):
                 raise HostCapabilityAccessDenied('Original MCP dispatch changed')
-            turn.require_live(self.agent)
-            require_execution_work(self.agent)
             if interactive:
                 authentication.require_current()
                 if current_caller_context() is not authentication.caller:
@@ -230,8 +232,13 @@ class MCPInputHost:
         now = self.authority.clock().timestamp()
         reader = self._reader.get()
         predecessor = reader.response_claim if reader is not None else None
-        record = await self.store.create(binding, payload, now=now,
-            expires_at=now + self.policy.retention_seconds, predecessor=predecessor)
+        task_round = self._task_round()
+        if task_round is None:
+            record = await self.store.create(binding, payload, now=now,
+                expires_at=now + self.policy.retention_seconds, predecessor=predecessor)
+        else:
+            record = await task_round.suspend(binding, payload, now=now,
+                expires_at=now + self.policy.retention_seconds, predecessor=predecessor)
         self._revalidate_origin(origin)
         from kestrel_sovereign.tools.effect_journal import record_tool_effect_input_required
         record_tool_effect_input_required(self.agent, record.request_id)
@@ -245,6 +252,12 @@ class MCPInputHost:
         reader.check()
         return reader
 
+    def _task_round(self):
+        for host in getattr(self.agent, '_mcp_task_hosts', ()):
+            if not host.retired and host.input_host is self:
+                return host.current_round()
+        return None
+
     async def claim_response(self, record: MCPInputRecord, responses: dict) -> MCPInputClaim:
         origin = self.origin()
         reader = self._require_reader()
@@ -253,9 +266,16 @@ class MCPInputHost:
             raise HostCapabilityAccessDenied('Original MCP input response owner changed')
         if reader.response_claim is not None:
             raise MCPInputConflict('Original MCP input response already owns a claim')
-        claim = await self.store.claim_response(record, responses, now=self.authority.clock().timestamp())
-        origin.require_current()
+        if record.binding.custody is not None:
+            task_round = self._task_round()
+            if record is not reader.record or task_round is None:
+                raise ResourceConflict('Original linked Input requires its active Task handler')
+            claim = await task_round.claim_response(record, responses,
+                operation_id=origin.operation_id, now=self.authority.clock().timestamp())
+        else:
+            claim = await self.store.claim_response(record, responses, now=self.authority.clock().timestamp())
         reader.response_claim = claim
+        origin.require_current()
         return claim
 
     async def settle_response(self, claim: MCPInputClaim, *, state: str, continuation: dict):
@@ -263,11 +283,18 @@ class MCPInputHost:
         if (claim.record.binding.principal_id != reader.context.principal_id
                 or claim.record.binding.session_id != reader.session_id):
             raise HostCapabilityAccessDenied('Original MCP input response owner changed')
+        if claim.record.binding.custody is not None and (
+                reader.response_claim is not claim or not reader.task_settled):
+            raise ResourceOutcomeUnknown('Original Task custody must settle before its Input response')
         result = await self.store.settle(claim, state=state, continuation=continuation)
         reader.check()
         return result
 
-    async def current_record(self, record: MCPInputRecord):
+    async def current_record(self, record: MCPInputRecord, *,
+                             retirement_error: BaseException | None = None):
+        if retirement_error is not None and (
+                is_execution_control_error(retirement_error) or record.binding.custody is None):
+            return None
         reader = self._require_reader()
         result = await self.store.read_for(reader.context.principal_id, reader.session_id, record.request_id)
         reader.check()
@@ -403,6 +430,7 @@ class MCPInputHost:
                         or row.expires_at <= owner.authority.clock().timestamp()):
                     raise MCPInputConflict('MCP input waiting revision is unavailable')
                 reader.check()
+                reader.record = row
                 result = await owner._runtime.respond(row, value.responses, operation_id=value.operation_id)
                 reader.check()
                 return JSONResponse(result)
