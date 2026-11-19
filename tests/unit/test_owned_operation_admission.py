@@ -16,6 +16,16 @@ from kestrel_sovereign import async_ownership as public
 from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_evidence_carriers
 
 
+def _refusing_completion_task_type(refusal):
+    class RefuseOriginalCompletion(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "close_unstarted":
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+
+    return RefuseOriginalCompletion
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_factory", [False, True])
 async def test_operation_uses_callers_preallocated_original_admission(use_factory):
@@ -64,11 +74,7 @@ async def test_failed_opening_preserves_borrowed_observer_withdrawal(borrowed):
     business_entered = []
     accepted = []
 
-    class RefuseOriginalCompletion(asyncio.Task):
-        def add_done_callback(self, callback, *, context=None):
-            if getattr(callback, "__name__", "") == "close_unstarted":
-                raise refusal
-            return super().add_done_callback(callback, context=context)
+    RefuseOriginalCompletion = _refusing_completion_task_type(refusal)
 
     def factory(loop, wrapper, **kwargs):
         async def outer():
@@ -306,3 +312,132 @@ async def test_nonacceptance_keeps_original_unstarted_resource_debt():
     finally:
         payload.close()
         foreign_loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("early_cancel", [False, True])
+async def test_reconciliation_keeps_explicit_receipt_when_task_metadata_is_denied(early_cancel):
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    receipt, resource = OwnedTaskAdmission(), object()
+    entered = []
+
+    class DenyMetadata(asyncio.Task):
+        def __setattr__(self, name, value):
+            if name in {"_kestrel_owned_admission", "_kestrel_owned_terminal_error"}:
+                raise RuntimeError("diagnostic Task metadata publication denied")
+            super().__setattr__(name, value)
+
+    def factory(loop, operation, **kwargs):
+        return DenyMetadata(operation, loop=loop, **kwargs)
+
+    async def original():
+        entered.append(asyncio.current_task())
+
+    operation = None
+    try:
+        loop.set_task_factory(factory)
+        operation = OwnedOperation(original(), admission=receipt, retirement_resource=resource)
+        loop.set_task_factory(previous)
+        assert operation.task is receipt.task
+        if early_cancel:
+            operation.task.cancel("before original first step")
+        await await_owned_task(operation.task)
+        snapshot = public.reconcile_owned_task_admission(receipt)
+        assert snapshot.state == "unknown"
+        assert (resource, operation.task) in execution_cleanup_debts(snapshot.error)
+        assert not entered
+    finally:
+        loop.set_task_factory(previous)
+        if operation is not None and operation.task is not None:
+            await await_owned_task(operation.task)
+
+
+@pytest.mark.asyncio
+async def test_returning_failed_gated_factory_retains_same_resource_receipt():
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    receipt, resource = OwnedTaskAdmission(), object()
+    refusal = RuntimeError("original completion subscription refused")
+    task_type = _refusing_completion_task_type(refusal)
+
+    async def original():
+        raise AssertionError("failed gate dispatched business body")
+
+    def native_factory(loop, operation, **kwargs):
+        return task_type(operation, loop=loop, **kwargs)
+
+    def owner_factory(operation, context, admission, retirement_resource):
+        try:
+            return create_owned_task(operation, admission=admission,
+                                     retirement_resource=retirement_resource)
+        except RuntimeError:
+            return admission.task
+
+    operation = None
+    try:
+        loop.set_task_factory(native_factory)
+        operation = OwnedOperation(original(), admission=receipt,
+                                   retirement_resource=resource, owner_factory=owner_factory)
+        loop.set_task_factory(previous)
+        await await_owned_task(operation.task)
+        snapshot = public.reconcile_owned_task_admission(receipt)
+        assert snapshot.state == "unknown"
+        assert (resource, operation.task) in execution_cleanup_debts(snapshot.error)
+        assert refusal in execution_evidence_carriers(snapshot.error)
+    finally:
+        loop.set_task_factory(previous)
+        if operation is not None and operation.task is not None:
+            await await_owned_task(operation.task)
+
+
+@pytest.mark.asyncio
+async def test_factory_refusal_before_native_creation_consumes_receipt():
+    receipt = OwnedTaskAdmission()
+    refusal = RuntimeError("owner factory refused before native creation")
+
+    async def original():
+        raise AssertionError("refusing factory dispatched work")
+
+    def factory(operation, context, admission, retirement_resource):
+        operation.close()
+        raise refusal
+
+    first = OwnedOperation(original(), admission=receipt, owner_factory=factory)
+    assert first.task is None
+    second_payload = original()
+    second = None
+    try:
+        with pytest.raises(TypeError, match="fresh original receipt"):
+            second = OwnedOperation(second_payload, admission=receipt)
+        assert second_payload.cr_frame is None
+    finally:
+        if second is not None and second.task is not None:
+            await await_owned_task(second.task)
+        else:
+            second_payload.close()
+
+
+@pytest.mark.asyncio
+async def test_constructor_claim_precedes_reentrant_factory_dispatch():
+    receipt = OwnedTaskAdmission()
+    nested = []
+    refused = []
+
+    async def original():
+        return "only an original, separately admitted body may execute"
+
+    def factory(operation, context, admission, retirement_resource):
+        operation.close()
+        try:
+            nested.append(OwnedOperation(original(), admission=receipt))
+        except TypeError:
+            refused.append(True)
+        raise RuntimeError("outer factory refused")
+
+    outer = OwnedOperation(original(), admission=receipt, owner_factory=factory)
+    try:
+        assert refused == [True] and not nested
+        assert outer.task is None
+    finally:
+        for operation in nested:
+            if operation.task is not None:
+                await await_owned_task(operation.task)

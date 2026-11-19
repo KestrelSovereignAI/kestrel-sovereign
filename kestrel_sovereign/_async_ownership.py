@@ -324,6 +324,8 @@ class OwnedTaskAdmission:
     _start_refused: bool = field(default=False, repr=False)
     _creation_started: bool = field(default=False, repr=False)
     _nonacceptance_proven: bool = field(default=False, repr=False)
+    _operation_claimed: bool = field(default=False, repr=False)
+    _operation_admitting: bool = field(default=False, repr=False)
 
     @property
     def dispatch_refused(self) -> bool:
@@ -346,9 +348,11 @@ class OwnedTaskRetirement:
     error: BaseException | None
 
 
-def _require_fresh_owned_task_admission(admission):
+def _require_fresh_owned_task_admission(admission, *, for_operation=False):
     if (type(admission) is not OwnedTaskAdmission or admission.task is not None
-            or admission._acceptance_unknown or admission._creation_started):
+            or admission._acceptance_unknown or admission._creation_started
+            or (admission._operation_claimed
+                and (for_operation or not admission._operation_admitting))):
         raise TypeError("owned admission requires a fresh original receipt")
 
 
@@ -370,9 +374,9 @@ def reconcile_owned_task_admission(admission: OwnedTaskAdmission) -> OwnedTaskRe
     if task is None:
         state = "nonacceptance" if admission._nonacceptance_proven else "unknown"
         return OwnedTaskRetirement(admission, None, state, admission.error)
-    if not task.done():
+    if not _NATIVE_TASK.done(task):
         return OwnedTaskRetirement(admission, task, "pending", admission.error)
-    error = owned_task_error(task)
+    error = owned_task_error(task, admission=admission)
     state = "unknown" if execution_cleanup_debts(error) else "complete"
     return OwnedTaskRetirement(admission, task, state, error)
 
@@ -602,7 +606,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 # This is the first callback installed by the original creator.
                 # Snapshot the physical outcome before a foreign await consumes
                 # asyncio's original CancelledError, including outer epilogues.
-                owned_task_error(_task)
+                owned_task_error(_task, admission=admission)
 
     def fail_start(task, opening):
         from kestrel_sovereign.execution_custody import (
@@ -1101,14 +1105,15 @@ class OwnedOperation:
         self._admission = OwnedTaskAdmission() if admission is None else admission
         admission = self._admission
         try:
-            _require_fresh_owned_task_admission(admission)
+            _require_fresh_owned_task_admission(admission, for_operation=True)
         except TypeError:
             close = getattr(operation, "close", None)
             if callable(close):
                 close()
             raise
         self._opening = None
-        factory_returned = False
+        admission._operation_claimed = True
+        admission._operation_admitting = True
         try:
             if owner_factory is None:
                 self._task = create_owned_task(
@@ -1118,9 +1123,8 @@ class OwnedOperation:
                 )
             else:
                 self._task = owner_factory(operation, context, admission, retirement_resource)
-                factory_returned = True
                 if (not isinstance(self._task, _NATIVE_TASK) or self._task is not admission.task
-                        or getattr(self._task, '_kestrel_owned_admission', None) is not admission):
+                        or not admission._creation_started):
                     raise TypeError("original operation factory did not retain its native admission")
                 opening = admission.error
                 if opening is not None:
@@ -1128,11 +1132,15 @@ class OwnedOperation:
         except BaseException as failure:
             # Only a native Task is an accepted physical owner. A malformed
             # factory publication cannot turn an arbitrary value into a receipt.
-            accepted = (admission if isinstance(admission.task, _NATIVE_TASK)
-                and (not factory_returned or getattr(admission.task, '_kestrel_owned_admission', None) is admission)
-                else OwnedTaskAdmission())
+            accepted = (admission if admission._creation_started
+                and isinstance(admission.task, _NATIVE_TASK) else OwnedTaskAdmission())
             self._opening = owned_task_admission_error(retirement_resource, accepted, failure)
             self._task = accepted.task
+        finally:
+            admission._operation_admitting = False
+        # One publication path covers throwing AND returning failed factories.
+        # Task metadata may be unavailable; this original receipt is retained.
+        if self._opening is not None:
             if self._task is not None:
                 self._opening = _retain_owned_admission_error(
                     self._task, self._opening, admission=admission,
@@ -1786,7 +1794,7 @@ async def native_source_lifetime(acquire: SourceFactory[_T]) -> AsyncIterator[_N
         raise terminal
 
 
-def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
+def owned_task_error(task: asyncio.Future[_T], *, admission=None) -> BaseException | None:
     """Retain the first terminal error across every owner of the same task.
 
     Asyncio consumes a cancelled task's original exception on first retrieval.
@@ -1798,21 +1806,26 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
     remains readable, but this join does not invent cross-owner source caching.
     """
     from kestrel_sovereign.execution_custody import execution_observation_error, execution_terminal_error
-    admission = getattr(task, "_kestrel_owned_admission", None)
-    if type(admission) is not OwnedTaskAdmission or admission.task is not task:
-        admission = None
+    if admission is None:
+        admission = getattr(task, "_kestrel_owned_admission", None)
+        if type(admission) is not OwnedTaskAdmission or admission.task is not task:
+            admission = None
+    elif type(admission) is not OwnedTaskAdmission or admission.task is not task:
+        raise TypeError("terminal observation requires this Task's original admission")
+    native = isinstance(task, _NATIVE_TASK)
+    if not (_NATIVE_TASK.done(task) if native else task.done()):
+        raise RuntimeError("owned task has not reached terminal state")
     if admission is not None and admission._terminal_error is not _TASK_ERROR_UNSET:
         return admission._terminal_error
-    if not task.done():
-        raise RuntimeError("owned task has not reached terminal state")
     cached = getattr(task, "_kestrel_owned_terminal_error", _TASK_ERROR_UNSET)
-    if admission is None and cached is not _TASK_ERROR_UNSET and task.cancelled():
+    cancelled = _NATIVE_TASK.cancelled(task) if native else task.cancelled()
+    if admission is None and cached is not _TASK_ERROR_UNSET and cancelled:
         # A Task/Future admitted elsewhere has no original Core receipt to
         # reconcile. Its retained terminal observation is already the only
         # original cancellation; retrieving asyncio again manufactures one.
         return cached
     try:
-        physical = task.exception()
+        physical = _NATIVE_TASK.exception(task) if native else task.exception()
     except asyncio.CancelledError as cancellation:
         physical = cancellation
     bare_cancellation = (
@@ -1839,7 +1852,7 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
             and (not admission._completion_capture_registered
                  or (not admission._canonical_wrapper_only and bare_cancellation))
             and not (admission._canonical_wrapper_only and not admission._wrapper_started)
-            and task.cancelled() and physical is not cached):
+            and cancelled and physical is not cached):
         from kestrel_sdk.resources import ResourceOutcomeUnknown
         # A foreign observer can consume an independent physical C even when
         # our callback was registered. Its exact lost graph is unrecoverable. Keep
