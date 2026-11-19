@@ -694,6 +694,8 @@ tool's static action declarations with its existing atomic registration batch.
 `invoke_action` selects only that captured handler and the original tool's
 permission target; an action is not a second model tool or a caller-supplied
 execution callback. Registration replacement expires the retained binding.
+Core accepts `external`, `mcp-app` and `mcp-input` on ordinary binding invocations;
+`mcp-task` is reserved for the separate native action entry point.
 
 The immutable context contains the local Task handle, remote ID digest,
 registration, original Task contract digest, revision and attribution labels.
@@ -709,8 +711,11 @@ decisions are preserved. Identity replacement is a denial.
 Action approvals accept only `once`. Neither persistent scopes, remembered
 ordinary-command patterns nor the approval UI can widen ordinary tool
 permissions through an action approval. Original tool DENY still blocks the
-action. `mcp-task-service` is reserved for unattended hook and journal labels;
-ASK there produces `no_approver`, not an invented conversation or human wait.
+action. `mcp-task-service` is reserved for unattended hook and journal labels.
+Existing global Auto policy may resolve ASK to AUTO. A service action that
+still requires approval produces `no_approver` without creating a conversation
+or human wait. Server-queued approvals always require an explicit UI decision;
+the browser's cached Auto state cannot approve them.
 
 Task actions have a distinct durable operation namespace. Their identity is
 included in request and effect digests, so identical parameters for different

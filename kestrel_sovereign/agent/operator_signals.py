@@ -767,9 +767,10 @@ def _auto_mode_notice(scope: str) -> str:
         return (
             "Operator context: auto-mode is now enabled persistently (the "
             "'always' tier). The operator has given standing consent for "
-            "multi-agent workflows and non-denied tool calls to proceed "
+            "multi-agent workflows and eligible tool calls to proceed "
             "without additional approval prompts when earlier constitutional, "
-            "honesty, and security checks do not flag the action. This consent "
+            "honesty, and security checks do not flag the action. Explicit "
+            "Deny still blocks and Always Ask still requires approval. This consent "
             "survives session resets and server restarts until explicitly "
             "revoked."
         )
@@ -777,9 +778,10 @@ def _auto_mode_notice(scope: str) -> str:
         return (
             "Operator context: auto-mode is now enabled for this server "
             "session. The operator has given standing consent for "
-            "multi-agent workflows and non-denied tool calls to proceed "
+            "multi-agent workflows and eligible tool calls to proceed "
             "without additional approval prompts when earlier constitutional, "
-            "honesty, and security checks do not flag the action."
+            "honesty, and security checks do not flag the action. Explicit "
+            "Deny still blocks and Always Ask still requires approval."
         )
     return (
         "Operator context: auto-mode is now disabled. Standing consent for "
