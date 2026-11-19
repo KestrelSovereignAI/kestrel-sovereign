@@ -4,20 +4,23 @@ type: Developer Guide
 
 # Public asynchronous-tail ownership
 
-`kestrel_sovereign.async_ownership` exposes ten identity aliases of Core's
+`kestrel_sovereign.async_ownership` exposes identity aliases of Core's
 canonical ownership implementation. There is no second task owner, wrapper,
 retry policy, or altered default:
 
 | Symbol | Contract |
 | --- | --- |
+| `OwnedOperation` | Retain one original operation and its admission across repeated or finite borrowed observations; an explicit fresh receipt can be reserved before construction. |
 | `OwnedTaskAdmission` | Fresh caller-local receipt of the exact accepted native Task, written before callback publication; not a second registry or work grant. |
 | `OwnedTaskOutcome` | Original result, failure, and caller-cancellation observation. |
+| `OwnedTaskRetirement` | Read-only snapshot of one exact admission: unknown, proven task nonacceptance, pending, or complete with its original error. |
 | `await_owned_operation` | Admit and physically join one asynchronous operation at an existing unbounded join boundary, including failed task publication. |
 | `await_owned_task` | Observe the same original task despite repeated caller cancellation; existing borrowing and forwarding options retain their semantics. |
 | `create_owned_task` | Create one gated original Task, retaining the exact accepted Task on an explicit admission receipt if later publication fails; true allocation refusal closes the unstarted original coroutine. |
 | `owned_task_error` | Harvest a terminal original Task's error without replacing its original cancellation or explicit evidence; an unfinished Task is not a terminal outcome. |
 | `pending_owned_retirement_error` | Snapshot unfinished original Tasks as resource-bound retirement debt without cancelling, replacing, or acknowledging them. |
 | `raise_owned_outcome` | Select the original outcome with canonical control/cancellation precedence; finite owners may request `retain_originals=True`. |
+| `reconcile_owned_task_admission` | Observe the canonical receipt without allocating, cancelling, retrying, closing, or releasing any resource or budget. |
 | `run_blocking_operation` | Finish one blocking operation, including its synchronous finalizer, before propagating caller cancellation. |
 | `wait_owned_tasks_until` | Observe exact original Tasks until one finite absolute loop-clock deadline, retaining caller withdrawal and returning explicit done/pending sets without cancelling pending producers. |
 
@@ -102,6 +105,24 @@ physical owners may still finish and close their own resources. Their later
 completion does not erase the original UNKNOWN admission or make lifecycle
 completion successful; the original close-completion API continues to report
 the retained failure.
+
+`OwnedOperation(..., admission=receipt)` consumes the same fresh receipt that
+its owner reserved before construction, including when a custom factory cannot
+identify an accepted Task. Consumed receipts cannot be reused for a new attempt.
+Failed opening does not turn `observe(defer_cancellation=False)` into an unbounded
+join: the original operation retains its finalizer while the borrowed caller can
+withdraw. The default observation remains an unbounded join.
+
+`reconcile_owned_task_admission` reports UNKNOWN for a fresh unused receipt,
+ambiguous acceptance, lost completion capture, or an original unretired physical
+resource. `task is None` alone is never proven nonacceptance. That state requires
+an observed refusal and actual close of the unstarted payload. Nonacceptance
+proves only that this Task attempt was not accepted; it cannot acknowledge close
+of a pre-existing external resource. Complete means the exact original Task's
+completion was captured, not that its business operation succeeded. Original
+errors remain attached to the observation. These snapshots do not lend execution
+authority, retire a database lease, decrement accounting, or implement the
+cross-task resource-loan policy; physical custodians still own those obligations.
 
 ## Task completion is not process-tree drain
 
