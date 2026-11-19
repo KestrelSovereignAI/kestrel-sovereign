@@ -64,9 +64,12 @@ class MCPInputBinding:
     connection_id: str
     contract_digest: str
     method: str
+    custody: str | None = None
 
     def __post_init__(self):
-        for value in asdict(self).values():
+        for name, value in asdict(self).items():
+            if name == 'custody' and value is None:
+                continue
             _text(value)
         if not self.agent_did.startswith('did:'):
             raise ValueError('MCP input binding requires an agent DID')
@@ -74,6 +77,14 @@ class MCPInputBinding:
             raise ValueError('MCP input binding has an unsupported operation')
         if len(self.contract_digest) != 64 or any(c not in '0123456789abcdef' for c in self.contract_digest):
             raise ValueError('MCP input binding requires the original contract digest')
+
+
+def _binding_value(binding: MCPInputBinding) -> dict:
+    """Keep ordinary schema-2 binding bytes unchanged; bind every Task link."""
+    value = asdict(binding)
+    if value['custody'] is None:
+        del value['custody']
+    return value
 
 
 @dataclass(frozen=True)
@@ -101,10 +112,55 @@ class MCPInputRecord:
         return json.loads(self._payload)['continuation']
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _InputExpectation:
+    request_id: str
+    revision: int
+    state: str
+    expires_at: float
+    binding: MCPInputBinding
+
+
+def _expectation(record: MCPInputRecord) -> _InputExpectation:
+    """Capture comparison metadata once; caller payloads never grant authority."""
+    if type(record) is not MCPInputRecord or type(record.binding) is not MCPInputBinding:
+        raise MCPInputConflict('MCP input requires its original checkpoint identity')
+    _text(record.request_id)
+    _time(record.expires_at)
+    if type(record.revision) is not int or record.revision < 0:
+        raise MCPInputConflict('MCP input requires its original checkpoint revision')
+    return _InputExpectation(record.request_id, record.revision, record.state, record.expires_at,
+        MCPInputBinding(**_binding_value(record.binding)))
+
+
 @dataclass(frozen=True)
 class MCPInputClaim:
     record: MCPInputRecord
     secret: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedCreate:
+    owner: object
+    record: MCPInputRecord
+    operation_digest: str
+    reader_digest: str
+    binding_digest: str
+    ciphertext: bytes
+    now: float
+    predecessor: tuple | None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedResponse:
+    owner: object
+    claim: MCPInputClaim
+    reader_digest: str
+    binding_digest: str
+    claim_hash: str
+    ciphertext: bytes
+    before: tuple
+    now: float
 
 
 class MCPInputStore(UnifiedStoreBase):
@@ -197,7 +253,7 @@ class MCPInputStore(UnifiedStoreBase):
         self._ready()
         if type(binding) is not MCPInputBinding or binding.agent_did != self.agent_did:
             raise MCPInputConflict('MCP input binding belongs to another agent')
-        return hmac.new(self._root, encode_inline_json(asdict(binding), sort_keys=True), hashlib.sha256).hexdigest()
+        return hmac.new(self._root, encode_inline_json(_binding_value(binding), sort_keys=True), hashlib.sha256).hexdigest()
 
     def _aad(self, request_id, digest, revision, state, expires_at, claim_hash, reservation_id, predecessor_id):
         return encode_inline_json(['mcp-input-v1', self.scope, request_id, digest,
@@ -215,7 +271,7 @@ class MCPInputStore(UnifiedStoreBase):
         if (type(payload) is not dict or (responses is not None and type(responses) is not dict)
                 or (continuation is not None and (type(continuation) is not dict or state != 'RESOLVED'))):
             raise TypeError('MCP input checkpoint must be a JSON object')
-        raw = encode_inline_json({'binding': asdict(binding), 'checkpoint': payload, 'responses': responses,
+        raw = encode_inline_json({'binding': _binding_value(binding), 'checkpoint': payload, 'responses': responses,
             'continuation': continuation})
         if len(raw) > self.max_payload_bytes:
             raise ValueError('MCP input checkpoint exceeded its storage budget')
@@ -233,6 +289,10 @@ class MCPInputStore(UnifiedStoreBase):
 
     async def read_for(self, principal_id: str, session_id: str, request_id: str) -> MCPInputRecord:
         """Read only after the host independently authenticates this reader."""
+        record, _ = await self._read_for(principal_id, session_id, request_id)
+        return record
+
+    async def _read_for(self, principal_id, session_id, request_id):
         reader_digest = self._reader_digest(principal_id, session_id)
         _text(request_id)
         row = await self.database.fetchone('SELECT binding_digest,revision,state,expires_at,claim_hash,reservation_id,predecessor_id,payload FROM mcp_inputs WHERE scope=? AND request_id=? AND reader_digest=?', (self.scope, request_id, reader_digest))
@@ -268,8 +328,8 @@ class MCPInputStore(UnifiedStoreBase):
         if (binding.principal_id != principal_id or binding.session_id != session_id
                 or not hmac.compare_digest(self._binding_digest(binding), digest)):
             raise MCPInputIntegrityError('Original MCP input reader binding is invalid')
-        return MCPInputRecord(request_id, revision, state, expires_at, binding, raw,
-            reservation_id, predecessor_id)
+        return (MCPInputRecord(request_id, revision, state, expires_at, binding, raw,
+            reservation_id, predecessor_id), tuple(row))
 
     async def list_for(self, principal_id: str, session_id: str, *, now: float) -> tuple[MCPInputRecord, ...]:
         """Expose waiting/uncertain metadata to the independently authorized UI."""
@@ -315,8 +375,13 @@ class MCPInputStore(UnifiedStoreBase):
             raise MCPInputIntegrityError('Original MCP input admission time is invalid')
         return float(row[0])
 
-    async def create(self, binding: MCPInputBinding, payload: dict, *, expires_at: float,
-                     now: float, predecessor: MCPInputClaim | None = None) -> MCPInputRecord:
+    def _require_apply(self, prepared, expected_type):
+        if (type(prepared) is not expected_type or prepared.owner is not self or self._root is None
+                or self.database.owns_open_transaction is not True):
+            raise MCPInputConflict('MCP input prepared write requires its owning transaction')
+
+    async def _prepare_create(self, binding: MCPInputBinding, payload: dict, *, expires_at: float,
+                              now: float, predecessor: MCPInputClaim | None = None) -> _PreparedCreate:
         self._ready()
         _time(now)
         _time(expires_at)
@@ -324,72 +389,129 @@ class MCPInputStore(UnifiedStoreBase):
             raise MCPInputConflict('MCP input checkpoint has already expired')
         expires_at = float(expires_at)
         request_id = str(uuid4())
+        if type(binding) is MCPInputBinding:
+            binding = MCPInputBinding(**_binding_value(binding))
         digest = self._binding_digest(binding)
+        if type(payload) is not dict:
+            raise TypeError('MCP input checkpoint must be a JSON object')
+        payload = json.loads(encode_inline_json(payload))
         operation_digest = hmac.new(self._root, encode_inline_json(
             ['mcp-input-operation-v1', binding.operation_id]), hashlib.sha256).hexdigest()
         reader_digest = self._reader_digest(binding.principal_id, binding.session_id)
-        reservation_id, predecessor_id = request_id, None
+        reservation_id, predecessor_id, predecessor_guard = request_id, None, None
         if predecessor is not None:
             parent, parent_digest, parent_hash = self._claim_identity(predecessor)
-            old_binding, new_binding = asdict(parent.binding), asdict(binding)
+            original, before = await self._read_for(parent.binding.principal_id,
+                parent.binding.session_id, parent.request_id)
+            old_binding, new_binding = _binding_value(original.binding), _binding_value(binding)
             old_binding.pop('operation_id')
             new_binding.pop('operation_id')
-            if old_binding != new_binding or parent.binding.operation_id == binding.operation_id:
+            if (original.binding != parent.binding or original.state != 'RESPONDING'
+                    or original.revision != parent.revision or not hmac.compare_digest(before[4], parent_hash)
+                    or old_binding != new_binding or parent.binding.operation_id == binding.operation_id):
                 raise MCPInputConflict('MCP input successor changed its original response binding')
-            original = await self.read(parent.binding, parent.request_id)
             reservation_id, predecessor_id = original.reservation_id, original.request_id
+            predecessor_guard = (parent.request_id, parent_digest, parent_hash, before)
         ciphertext = self._encode(binding, request_id, 0, 'WAITING', expires_at, None, payload,
             reservation_id=reservation_id, predecessor_id=predecessor_id)
-        async with self.write_transaction():
-            admitted_at = await self._lock_admission(now)
-            if expires_at <= admitted_at:
-                raise MCPInputConflict('MCP input checkpoint has already expired')
-            count = await self.database.fetchone("SELECT COUNT(DISTINCT reservation_id) FROM mcp_inputs WHERE scope=? AND (state='RESPONDING' OR (state='WAITING' AND expires_at>?))", (self.scope, admitted_at))
-            if predecessor is not None:
-                # Revalidate and lock the exact authenticated native claim
-                # through successor commit; no public helper joins this write.
-                locked = await self.database.execute("UPDATE mcp_inputs SET revision=revision WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='RESPONDING' AND claim_hash=? AND reservation_id=?", (self.scope, parent.request_id, parent_digest, parent.revision, parent_hash, reservation_id))
-                if locked != 1:
-                    raise MCPInputConflict('MCP input successor requires its original live response claim')
-            if predecessor is None and count[0] >= self.max_pending:
-                raise MCPInputConflict('MCP input pending capacity is exhausted')
-            changed = await self.database.execute("INSERT INTO mcp_inputs(scope,request_id,operation_digest,reader_digest,binding_digest,revision,state,expires_at,claim_hash,reservation_id,predecessor_id,payload) VALUES (?,?,?,?,?,0,'WAITING',?,NULL,?,?,?) ON CONFLICT DO NOTHING", (self.scope, request_id, operation_digest, reader_digest, digest, expires_at, reservation_id, predecessor_id, ciphertext))
-            if changed != 1:
-                raise MCPInputConflict('MCP input original operation or predecessor already has a checkpoint')
-        return await self.read(binding, request_id)
+        raw = AEADCipher(self._root).decrypt(ciphertext,
+            aad=self._aad(request_id, digest, 0, 'WAITING', expires_at, None, reservation_id, predecessor_id))
+        record = MCPInputRecord(request_id, 0, 'WAITING', expires_at, binding, raw,
+            reservation_id, predecessor_id)
+        return _PreparedCreate(self, record, operation_digest, reader_digest, digest, ciphertext,
+            float(now), predecessor_guard)
 
-    async def claim_response(self, expected: MCPInputRecord, responses: dict, *, now: float) -> MCPInputClaim:
-        """Persist validated responses before any continuation wire request."""
+    async def _apply_create(self, prepared: _PreparedCreate) -> MCPInputRecord:
+        """SQL-only half, shared by ordinary creation and the joint Task commit."""
+        self._require_apply(prepared, _PreparedCreate)
+        record = prepared.record
+        admitted_at = await self._lock_admission(prepared.now)
+        if record.expires_at <= admitted_at:
+            raise MCPInputConflict('MCP input checkpoint has already expired')
+        count = await self.database.fetchone("SELECT COUNT(DISTINCT reservation_id) FROM mcp_inputs WHERE scope=? AND (state='RESPONDING' OR (state='WAITING' AND expires_at>?))", (self.scope, admitted_at))
+        if prepared.predecessor is not None:
+            request_id, digest, claim_hash, before = prepared.predecessor
+            locked = await self.database.execute("UPDATE mcp_inputs SET revision=revision WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='RESPONDING' AND claim_hash=? AND expires_at=? AND reservation_id=? AND COALESCE(predecessor_id,'')=? AND payload=?", (self.scope, request_id, digest, before[1], claim_hash, before[3], before[5], before[6] or '', before[7]))
+            if locked != 1:
+                raise MCPInputConflict('MCP input successor requires its original live response claim')
+        elif count[0] >= self.max_pending:
+            raise MCPInputConflict('MCP input pending capacity is exhausted')
+        changed = await self.database.execute("INSERT INTO mcp_inputs(scope,request_id,operation_digest,reader_digest,binding_digest,revision,state,expires_at,claim_hash,reservation_id,predecessor_id,payload) VALUES (?,?,?,?,?,0,'WAITING',?,NULL,?,?,?) ON CONFLICT DO NOTHING", (self.scope, record.request_id, prepared.operation_digest, prepared.reader_digest, prepared.binding_digest, record.expires_at, record.reservation_id, record.predecessor_id, prepared.ciphertext))
+        if changed != 1:
+            raise MCPInputConflict('MCP input original operation or predecessor already has a checkpoint')
+        return record
+
+    async def create(self, binding: MCPInputBinding, payload: dict, *, expires_at: float,
+                     now: float, predecessor: MCPInputClaim | None = None) -> MCPInputRecord:
+        self._ready()
+        if type(binding) is not MCPInputBinding:
+            raise MCPInputConflict('MCP input requires its original binding')
+        if binding.custody is not None:
+            raise MCPInputConflict('Task-linked MCP input requires its joint custody owner')
+        prepared = await self._prepare_create(binding, payload, expires_at=expires_at,
+            now=now, predecessor=predecessor)
+        async with self.write_transaction():
+            result = await self._apply_create(prepared)
+        return result
+
+    async def _prepare_response(self, expected: MCPInputRecord, responses: dict, *, now: float) -> _PreparedResponse:
         self._ready()
         _time(now)
-        if type(expected) is not MCPInputRecord or expected.state != 'WAITING' or expected.expires_at <= now:
+        expected = _expectation(expected)
+        if expected.state != 'WAITING' or expected.expires_at <= now:
             raise MCPInputConflict('MCP input is no longer waiting or has expired')
         if type(responses) is not dict:
             raise TypeError('MCP input responses must be a JSON object')
-        actual = await self.read(expected.binding, expected.request_id)
-        if (actual.state != 'WAITING' or actual.revision != expected.revision
-                or actual.expires_at != expected.expires_at):
+        responses = json.loads(encode_inline_json(responses))
+        self._binding_digest(expected.binding)
+        actual, before = await self._read_for(expected.binding.principal_id,
+            expected.binding.session_id, expected.request_id)
+        if (actual.binding != expected.binding or actual.state != 'WAITING'
+                or actual.revision != expected.revision or actual.expires_at != expected.expires_at):
             raise MCPInputConflict('MCP input waiting revision was already consumed')
+        digest = before[0]
         secret = secrets.token_urlsafe(32)
         claim_hash = hashlib.sha256(secret.encode()).hexdigest()
-        revision = expected.revision + 1
-        digest = self._binding_digest(expected.binding)
-        ciphertext = self._encode(expected.binding, expected.request_id, revision,
-            'RESPONDING', expected.expires_at, claim_hash, actual.payload, responses,
+        revision = actual.revision + 1
+        ciphertext = self._encode(actual.binding, actual.request_id, revision,
+            'RESPONDING', actual.expires_at, claim_hash, actual.payload, responses,
             reservation_id=actual.reservation_id, predecessor_id=actual.predecessor_id)
+        raw = AEADCipher(self._root).decrypt(ciphertext, aad=self._aad(actual.request_id,
+            digest, revision, 'RESPONDING', actual.expires_at, claim_hash,
+            actual.reservation_id, actual.predecessor_id))
+        record = MCPInputRecord(actual.request_id, revision, 'RESPONDING', actual.expires_at,
+            actual.binding, raw, actual.reservation_id, actual.predecessor_id)
+        return _PreparedResponse(self, MCPInputClaim(record, secret),
+            self._reader_digest(actual.binding.principal_id, actual.binding.session_id),
+            digest, claim_hash, ciphertext, before, float(now))
+
+    async def _apply_response(self, prepared: _PreparedResponse) -> MCPInputClaim:
+        """Consume the exact authenticated before-image inside the owning commit."""
+        self._require_apply(prepared, _PreparedResponse)
+        admitted_at = await self._lock_admission(prepared.now)
+        record, before = prepared.claim.record, prepared.before
+        changed = await self.database.execute("UPDATE mcp_inputs SET revision=?,state='RESPONDING',claim_hash=?,payload=? WHERE scope=? AND request_id=? AND reader_digest=? AND binding_digest=? AND revision=? AND state='WAITING' AND claim_hash IS NULL AND expires_at=? AND expires_at>? AND reservation_id=? AND COALESCE(predecessor_id,'')=? AND payload=?", (record.revision, prepared.claim_hash, prepared.ciphertext, self.scope, record.request_id, prepared.reader_digest, prepared.binding_digest, before[1], record.expires_at, admitted_at, record.reservation_id, record.predecessor_id or '', before[7]))
+        if changed != 1:
+            raise MCPInputConflict('MCP input waiting revision was already consumed')
+        return prepared.claim
+
+    async def claim_response(self, expected: MCPInputRecord, responses: dict, *, now: float) -> MCPInputClaim:
+        """Persist validated responses before any continuation wire request."""
+        prepared = await self._prepare_response(expected, responses, now=now)
+        if prepared.claim.record.binding.custody is not None:
+            raise MCPInputConflict('Task-linked MCP input requires its joint custody owner')
         async with self.write_transaction():
-            admitted_at = await self._lock_admission(now)
-            changed = await self.database.execute("UPDATE mcp_inputs SET revision=?,state='RESPONDING',claim_hash=?,payload=? WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='WAITING' AND expires_at=? AND expires_at>?", (revision, claim_hash, ciphertext, self.scope, expected.request_id, digest, expected.revision, expected.expires_at, admitted_at))
-            if changed != 1:
-                raise MCPInputConflict('MCP input waiting revision was already consumed')
-        return MCPInputClaim(await self.read(expected.binding, expected.request_id), secret)
+            result = await self._apply_response(prepared)
+        return result
 
     def _claim_identity(self, claim: MCPInputClaim):
         self._ready()
-        if (type(claim) is not MCPInputClaim or claim.record.state != 'RESPONDING'
+        if (type(claim) is not MCPInputClaim
                 or not isinstance(claim.secret, str) or len(claim.secret) != 43):
             raise MCPInputConflict('MCP input requires its original response claim')
-        record = claim.record
+        record = _expectation(claim.record)
+        if record.state != 'RESPONDING':
+            raise MCPInputConflict('MCP input requires its original response claim')
         return record, self._binding_digest(record.binding), hashlib.sha256(claim.secret.encode()).hexdigest()
 
     async def settle(self, claim: MCPInputClaim, *, state: str, continuation: dict | None = None) -> MCPInputRecord:
@@ -397,16 +519,21 @@ class MCPInputStore(UnifiedStoreBase):
         record, digest, claim_hash = self._claim_identity(claim)
         if state not in {'RESOLVED','NON_RESUMABLE','UNKNOWN'}:
             raise MCPInputConflict('MCP input settlement requires a terminal state')
+        if continuation is not None:
+            if type(continuation) is not dict or state != 'RESOLVED':
+                raise TypeError('MCP input checkpoint must be a JSON object')
+            continuation = json.loads(encode_inline_json(continuation))
         actual = await self.read(record.binding, record.request_id)
         if (actual.state != 'RESPONDING' or actual.revision != record.revision
                 or actual.expires_at != record.expires_at):
             raise MCPInputConflict('MCP input response claim is no longer current')
-        revision = record.revision + 1
-        ciphertext = self._encode(record.binding, record.request_id, revision, state,
-            record.expires_at, None, actual.payload, actual.responses, continuation,
+        revision = actual.revision + 1
+        digest = self._binding_digest(actual.binding)
+        ciphertext = self._encode(actual.binding, actual.request_id, revision, state,
+            actual.expires_at, None, actual.payload, actual.responses, continuation,
             reservation_id=actual.reservation_id, predecessor_id=actual.predecessor_id)
         async with self.write_transaction():
-            changed = await self.database.execute("UPDATE mcp_inputs SET revision=?,state=?,claim_hash=NULL,payload=? WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='RESPONDING' AND claim_hash=?", (revision, state, ciphertext, self.scope, record.request_id, digest, record.revision, claim_hash))
+            changed = await self.database.execute("UPDATE mcp_inputs SET revision=?,state=?,claim_hash=NULL,payload=? WHERE scope=? AND request_id=? AND binding_digest=? AND revision=? AND state='RESPONDING' AND claim_hash=?", (revision, state, ciphertext, self.scope, actual.request_id, digest, actual.revision, claim_hash))
             if changed != 1:
                 raise MCPInputConflict('MCP input response claim is no longer current')
-        return await self.read(record.binding, record.request_id)
+        return await self.read(actual.binding, actual.request_id)
