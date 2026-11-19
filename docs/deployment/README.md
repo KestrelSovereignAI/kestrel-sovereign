@@ -84,6 +84,10 @@ refused before dispatch; reconcile that configuration explicitly. Hosted unit
 tests retain the `cloud` extra so provider regressions execute instead of
 silently skipping their entire module.
 
+The `cloud` extra requires `google-cloud-run>=0.15.0`, whose container message
+includes readiness probes. Older SDKs cannot preserve and validate that field;
+the declared minimum and resolved lock must agree with the provider contract.
+
 ## GitHub deployment identity
 
 The deployment workflow uses the shared `.github/actions/gcp-deploy-auth`
