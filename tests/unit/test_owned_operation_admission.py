@@ -13,6 +13,7 @@ from kestrel_sovereign._async_ownership import (
     create_owned_task,
 )
 from kestrel_sovereign import async_ownership as public
+from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_evidence_carriers
 
 
 @pytest.mark.asyncio
@@ -54,7 +55,8 @@ async def test_operation_uses_callers_preallocated_original_admission(use_factor
 
 
 @pytest.mark.asyncio
-async def test_failed_opening_preserves_borrowed_observer_withdrawal():
+@pytest.mark.parametrize("borrowed", [True, False])
+async def test_failed_opening_preserves_borrowed_observer_withdrawal(borrowed):
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
     finalizer_entered, release_finalizer = asyncio.Event(), asyncio.Event()
@@ -94,16 +96,22 @@ async def test_failed_opening_preserves_borrowed_observer_withdrawal():
         await finalizer_entered.wait()
         assert not business_entered and not operation.task.done()
 
-        observer = asyncio.create_task(operation.observe(defer_cancellation=False))
+        observer = asyncio.create_task(operation.observe(
+            defer_cancellation=not borrowed,
+            cancel_on_caller_cancellation=not borrowed,
+        ))
         await asyncio.sleep(0)
         observer.cancel("finite observer withdrew")
         # A test hang bound, not a resource-retirement deadline. The original
         # finalizer must remain blocked even after the borrowed observer leaves.
         done, _ = await asyncio.wait({observer}, timeout=0.2)
-        assert observer in done, "failed opening silently changed a borrowed observer to must-join"
-        observed = await await_owned_task(observer)
-        assert isinstance(observed.error, asyncio.CancelledError)
-        assert observed.error.args == ("finite observer withdrew",)
+        if borrowed:
+            assert observer in done, "failed opening silently changed a borrowed observer to must-join"
+            observed = await await_owned_task(observer)
+            assert isinstance(observed.error, asyncio.CancelledError)
+            assert observed.error.args == ("finite observer withdrew",)
+        else:
+            assert observer not in done, "failed opening forwarded withdrawal into original finalizer"
         assert not operation.task.done() and not release_finalizer.is_set()
     finally:
         loop.set_task_factory(previous)
@@ -243,3 +251,58 @@ async def test_completed_task_cannot_ack_its_unretired_physical_resource():
     retirement = public.reconcile_owned_task_admission(admission)
     assert retirement.state == "unknown"
     assert retirement.error is outcome.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_resource", [False, True])
+@pytest.mark.parametrize("body_fails", [False, True])
+async def test_factory_publication_failure_is_on_original_retirement_receipt(with_resource, body_fails):
+    admission = OwnedTaskAdmission()
+    resource = object() if with_resource else None
+    publication = RuntimeError("accepted owner's factory failed publication")
+    body_error = LookupError("original accepted body failed") if body_fails else None
+
+    async def original():
+        if body_error is not None:
+            raise body_error
+
+    def factory(operation, context, receipt, retirement_resource):
+        create_owned_task(operation, context=context, admission=receipt,
+                          retirement_resource=retirement_resource)
+        raise publication
+
+    operation = OwnedOperation(original(), admission=admission,
+                               retirement_resource=resource, owner_factory=factory)
+    assert operation.task is admission.task
+    await await_owned_task(operation.task)
+    retirement = public.reconcile_owned_task_admission(admission)
+    carriers = execution_evidence_carriers(retirement.error)
+    assert publication in carriers
+    if body_error is not None:
+        assert body_error in carriers
+    assert retirement.state == ("unknown" if with_resource else "complete")
+    if with_resource:
+        assert (resource, operation.task) in execution_cleanup_debts(retirement.error)
+
+
+@pytest.mark.asyncio
+async def test_nonacceptance_keeps_original_unstarted_resource_debt():
+    admission, resource = OwnedTaskAdmission(), object()
+    foreign_loop = asyncio.new_event_loop()
+
+    async def original():
+        raise AssertionError("refused native closer entered")
+
+    payload = original()
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            create_owned_task(payload, admission=admission, loop=foreign_loop,
+                              retirement_resource=resource)
+        assert payload.cr_frame is None
+        retirement = public.reconcile_owned_task_admission(admission)
+        assert retirement.state == "nonacceptance"
+        assert retirement.error is caught.value
+        assert execution_cleanup_debts(retirement.error) == ((resource, None),)
+    finally:
+        payload.close()
+        foreign_loop.close()

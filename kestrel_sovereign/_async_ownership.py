@@ -731,10 +731,13 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             # must retain it even though no accepted Task exists to harvest.
             debt.__cause__ = error
             debt._kestrel_native_retirement_debts = ((retirement_resource, None),)
-            raise execution_terminal_error(
+            failure = execution_terminal_error(
                 error, debt, retain_originals=True,
                 isolate_control_originals=True,
             )
+            if receipt_started:
+                admission.error = failure
+            raise failure
         raise
     admission.task = task
     admission._canonical_wrapper_only = isinstance(task, _NATIVE_TASK) and _NATIVE_TASK.get_coro(task) is wrapper
@@ -1130,6 +1133,12 @@ class OwnedOperation:
                 else OwnedTaskAdmission())
             self._opening = owned_task_admission_error(retirement_resource, accepted, failure)
             self._task = accepted.task
+            if self._task is not None:
+                self._opening = _retain_owned_admission_error(
+                    self._task, self._opening, admission=admission,
+                )
+            else:
+                admission.error = self._opening
 
     @property
     def task(self):
@@ -1148,7 +1157,11 @@ class OwnedOperation:
         if self._opening is None:
             return await await_owned_task(self._task, **observation)
         # Do not cancel a failed start gate into a substitute CancelledError.
-        outcome = await await_owned_task(self._task, **observation)
+        # A failed opening already owns unwinding. Observer withdrawal must
+        # neither cancel that finalizer nor silently change borrowed timing.
+        outcome = await await_owned_task(
+            self._task, **{**observation, "cancel_on_caller_cancellation": False},
+        )
         return OwnedTaskOutcome(
             outcome.result,
             execution_observation_error(self._opening, outcome.error),
