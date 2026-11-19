@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
+from copy import deepcopy
+from kestrel_sdk.tools import NativeActionContext
+from kestrel_sovereign.tools.native_action import snapshot_action_context
 
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
@@ -88,10 +91,11 @@ class ApprovalRequest:
     # Terminal decision failure belongs to the original waiter. Never serialized.
     awaiter_error: BaseException | None = field(default=None, repr=False)
     decision_operation: Optional["OwnedOperation"] = field(default=None, repr=False)
+    native_action: NativeActionContext | None = None
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
-        return {
+        value = {
             "id": self.id,
             "feature_name": self.feature_name,
             "tool_name": self.tool_name,
@@ -101,6 +105,9 @@ class ApprovalRequest:
             "status": self.status.value,
             "user_decision": self.user_decision,
         }
+        if self.native_action is not None:
+            value['native_action'] = self.native_action.to_dict()
+        return value
 
 
 @dataclass(frozen=True)
@@ -269,6 +276,7 @@ class ApprovalQueue:
         *,
         allow_blocking: bool = True,
         audit_action: str = "tool_execution",
+        native_action: NativeActionContext | None = None,
     ) -> tuple[bool, str]:
         """
         Queue a request and wait for user decision.
@@ -310,6 +318,9 @@ class ApprovalQueue:
               (or a user-chosen approve scope returned with approved=False)
               as a user denial (#1542).
         """
+        if native_action is not None:
+            native_action = snapshot_action_context(native_action)
+            tool_args = deepcopy(tool_args)
         always_ask = False
         if self._permission_store is not None:
             try:
@@ -326,7 +337,7 @@ class ApprovalQueue:
                         tool_name=tool_name,
                         action=audit_action,
                         decision="auto_denied",
-                        args_summary=summarize_args(tool_args),
+                        args_summary=summarize_args(tool_args, native_action=native_action),
                     )
                     logger.info(
                         "ApprovalQueue denied %s.%s from explicit policy",
@@ -347,7 +358,7 @@ class ApprovalQueue:
                             tool_name=tool_name,
                             action=audit_action,
                             decision="auto_allowed",
-                            args_summary=summarize_args(tool_args),
+                            args_summary=summarize_args(tool_args, native_action=native_action),
                         )
                     else:
                         await self._permission_store.log_decision(
@@ -356,7 +367,7 @@ class ApprovalQueue:
                             action=audit_action,
                             decision="auto_mode_allowed",
                             user_choice="constitutional_honesty_unflagged",
-                            args_summary=summarize_args(tool_args),
+                            args_summary=summarize_args(tool_args, native_action=native_action),
                         )
                     logger.info(
                         "ApprovalQueue auto-mode approved %s.%s without prompting",
@@ -383,7 +394,7 @@ class ApprovalQueue:
         # human is queued. A match means the Sovereign pre-authorised this
         # exact pattern for this agent+repo; we write the full audit row
         # *before* returning so the invocation can never run silently.
-        if self._auto_approve_policy is not None and not always_ask:
+        if native_action is None and self._auto_approve_policy is not None and not always_ask:
             try:
                 from .permissions import PermissionLevel
 
@@ -495,6 +506,7 @@ class ApprovalQueue:
                 approved=False,
                 scope="no_approver",
                 audit_action=audit_action,
+                native_action=native_action,
             )
             logger.warning(
                 "ApprovalQueue: %s.%s requires approval but no interactive "
@@ -516,6 +528,7 @@ class ApprovalQueue:
             created_at=datetime.now(timezone.utc),
             timeout_seconds=timeout,
             audit_action=audit_action,
+            native_action=native_action,
         )
 
         self._pending[request.id] = request
@@ -595,6 +608,7 @@ class ApprovalQueue:
                     approved=False,
                     scope="timeout",
                     audit_action=audit_action,
+                    native_action=native_action,
                 )
                 return (False, "timeout")
 
@@ -694,6 +708,7 @@ class ApprovalQueue:
         approved: bool,
         scope: str,
         audit_action: str = "tool_execution",
+        native_action: NativeActionContext | None = None,
     ) -> Optional[str]:
         """Persist the user's scope choice and write an audit row.
 
@@ -708,6 +723,8 @@ class ApprovalQueue:
         caller in features like ``code_edit``, ``compute``, ``keys``,
         ``reflection``) all benefit without having to repeat the logic.
         """
+        if native_action is not None and approved and scope != 'once':
+            raise ValueError('Native actions accept only once approvals')
         if self._permission_store is None:
             return None
 
@@ -750,7 +767,7 @@ class ApprovalQueue:
             else:
                 decision = "user_denied"
 
-            args_summary = summarize_args(tool_args)
+            args_summary = summarize_args(tool_args, native_action=native_action)
             await self._permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
@@ -803,6 +820,10 @@ class ApprovalQueue:
                 error="request not found or expired",
             )
 
+        if request.native_action is not None and approved and scope != 'once':
+            return DecisionResult(in_memory=False, persisted=False,
+                                  error='Native actions accept only once approvals')
+
         # Idempotency / CAS: a request that already has a decision must
         # not accept another one. Without this guard, callers that race
         # (UI double-click, polling responder ticking faster than the
@@ -850,6 +871,7 @@ class ApprovalQueue:
                 feature_name=request.feature_name, tool_name=request.tool_name,
                 tool_args=request.tool_args, approved=approved, scope=scope,
                 audit_action=request.audit_action,
+                native_action=request.native_action,
             ), retain_originals=True, name="approval-decision-persistence",
         )
         outcome = await request.decision_operation.observe(

@@ -84,6 +84,7 @@ class PendingApprovalResponse(BaseModel):
     # reviews before clicking. This is what replaces CLI typing.
     action_summary: str = ""
     command_preview: str = ""
+    native_action: Optional[Dict[str, Any]] = None
 
 
 class PendingListResponse(BaseModel):
@@ -336,6 +337,7 @@ async def get_pending_approvals(request: Request):
                 command_preview=_command_preview(
                     r.feature_name, r.tool_name, r.tool_args
                 ),
+                native_action=r.native_action.to_dict() if r.native_action is not None else None,
             )
             for r in pending
         ],
@@ -447,6 +449,10 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
         ),
         None,
     )
+
+    if data.approved and pending_req is not None and pending_req.native_action is not None and (
+            data.scope != 'once' or data.remember):
+        raise HTTPException(status_code=400, detail='Native actions accept only once approvals')
 
     decision = await security.approval_queue.submit_decision(
         data.approval_id, data.approved, data.scope

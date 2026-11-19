@@ -81,6 +81,7 @@ def _make_security_feature():
                 tool_name="write",
                 tool_args={"path": "/tmp/demo"},
                 created_at=datetime(2026, 3, 17, 12, 0, tzinfo=timezone.utc),
+                native_action=None,
             )
         ]
     )

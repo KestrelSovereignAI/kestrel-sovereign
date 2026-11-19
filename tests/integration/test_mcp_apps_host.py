@@ -261,7 +261,7 @@ async def apps_boundary(tmp_path, monkeypatch, native_tool_effect_agent, request
             with caller_context_scope(request.state.caller), part_collector(host=agent, session_id=value["session_id"]):
                 try:
                     return await initial.binding.invoke({"marker": value["marker"]},
-                        session_id=value["session_id"], source="chat", operation_id=uuid4().hex)
+                        session_id=value["session_id"], source="external", operation_id=uuid4().hex)
                 except ResourceOutcomeUnknown:
                     return JSONResponse({"error": "outcome_unknown_do_not_replay"}, status_code=503)
 

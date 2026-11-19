@@ -687,6 +687,46 @@ through a continuation. Reject stale/wrong-agent/wrong-operation human responses
 and keep secrets out of conversations. Exercise state-only and operator-required
 paths against the real turn scheduler, including #3439's lock-contention case.
 
+### Registered native Task actions
+
+SDK 0.55 supplies `NativeAction` and `NativeActionContext`. Core captures a
+tool's static action declarations with its existing atomic registration batch.
+`invoke_action` selects only that captured handler and the original tool's
+permission target; an action is not a second model tool or a caller-supplied
+execution callback. Registration replacement expires the retained binding.
+
+The immutable context contains the local Task handle, remote ID digest,
+registration, original Task contract digest, revision and attribution labels.
+It carries no raw remote Task ID, parameters or execution authority. The Task
+host must independently retain and verify original target custody and fresh
+authority. Parameters use the existing hook input and rewrite slot. Core
+validates them against the captured action schema before and after hooks,
+without coercion or external schema retrieval. Each physical hook receives a
+detached parameter view and identity; retaining an earlier hook input or output
+cannot change values while a later approval waits. Empty rewrites and in-place
+decisions are preserved. Identity replacement is a denial.
+
+Action approvals accept only `once`. Neither persistent scopes, remembered
+ordinary-command patterns nor the approval UI can widen ordinary tool
+permissions through an action approval. Original tool DENY still blocks the
+action. `mcp-task-service` is reserved for unattended hook and journal labels;
+ASK there produces `no_approver`, not an invented conversation or human wait.
+
+Task actions have a distinct durable operation namespace. Their identity is
+included in request and effect digests, so identical parameters for different
+Tasks remain distinct. Required dispatch rows carry action identity on success,
+denial, validation failure and incomplete execution. Plaintext audit projections
+contain identity and parameter keys, never private form answers or remote IDs.
+The nullable action column migrates existing SQLite and PostgreSQL rows and
+obeys the same privacy gate as other dispatch evidence. An unconfirmed handler
+or audit outcome never authorizes replay.
+
+This dispatch foundation does not instantiate the Task host, enable polling,
+advertise the extension or establish provider and Apps acceptance. Those remain
+the separate #3684 host gates, together with the published official MCP SDK's
+Task TTL validation defect. Genuine MRTR input and native Task input continue
+to have separate wire semantics and custody.
+
 ## A2A 1.0 cutover
 
 Use official SDK types and serializers. A2A 1.0 uses protobuf JSON conventions:

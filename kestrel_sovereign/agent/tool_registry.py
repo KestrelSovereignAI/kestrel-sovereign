@@ -18,7 +18,8 @@ from uuid import uuid4
 
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 
-from kestrel_sdk.tools import GovernedToolBinding
+from kestrel_sdk.tools import GovernedToolBinding, NativeAction, NativeActionContext
+from kestrel_sovereign.tools.native_action import capture_native_actions, snapshot_action_context
 
 from kestrel_sovereign.agent.tool_allowlist import (
     KnownToolNames,
@@ -77,6 +78,8 @@ class _ToolExecution:
     audit_attempted: bool = False
     audit_error: BaseException | None = None
     arguments: dict | None = None
+    native_action: NativeActionContext | None = None
+    action_declaration: NativeAction | None = None
 
 
 async def _record_incomplete_tool_dispatch(host, execution, *, tool_name, adapter,
@@ -116,6 +119,8 @@ class _GovernedToolBinding:
     tool: Any
     security_feature: str
     validate_feature_registration: Callable[[], None] | None = None
+    native_actions: tuple[NativeAction, ...] = ()
+    registration_id: str = ''
 
     @property
     def is_current(self) -> bool:
@@ -140,6 +145,26 @@ class _GovernedToolBinding:
 
     async def invoke(self, arguments: Dict[str, Any], *, session_id: str, operation_id: str,
                      source: str = "external") -> Any:
+        return await self._invoke(arguments, session_id=session_id,
+                                  operation_id=operation_id, source=source)
+
+    async def invoke_action(self, name: str, arguments: Dict[str, Any], *,
+            native_action: NativeActionContext, session_id: str, operation_id: str,
+            source: str = 'mcp-task') -> Any:
+        self.require_current()
+        context = snapshot_action_context(native_action)
+        declaration = next((action for action in self.native_actions if action.name == name), None)
+        if (declaration is None or context.action != name or context.method != declaration.method
+                or context.owner != self.owner or context.tool_name != self.name
+                or context.registration_id != self.registration_id):
+            raise ResourceConflict('Native action does not match the original tool registration')
+        if source != 'mcp-task':
+            raise ValueError('Native Task actions require their own invocation namespace')
+        return await self._invoke(arguments, session_id=session_id, operation_id=operation_id,
+                                  source=source, context=context, declaration=declaration)
+
+    async def _invoke(self, arguments, *, session_id, operation_id, source,
+                      context=None, declaration=None):
         from kestrel_sovereign.agent.invocation import validate_invocation_id
         from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation
         from kestrel_sovereign.llm.adapter import ToolCall
@@ -152,9 +177,14 @@ class _GovernedToolBinding:
             raise ValueError("A tool invocation requires a session_id")
         if not isinstance(source, str) or not source.strip():
             raise ValueError("A tool invocation requires a source")
+        namespaces = {'external': 'mcp_app', 'mcp-app': 'mcp_app', 'mcp-input': 'mcp_input'}
+        if context is not None:
+            namespaces['mcp-task'] = 'mcp_task'
+        if source not in namespaces:
+            raise ValueError('Unsupported governed tool invocation source')
         operation_id = validate_invocation_id(operation_id)
         call = ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments))
-        execution = _ToolExecution()
+        execution = _ToolExecution(native_action=context, action_declaration=declaration)
         dispatch_start = time.time()
         from kestrel_sovereign._async_ownership import OwnedTaskOutcome, raise_owned_outcome
         from kestrel_sovereign.execution_custody import is_execution_control_error
@@ -176,8 +206,8 @@ class _GovernedToolBinding:
             ),
             name="bound-tool-invocation", cancel_on_caller_cancellation=True,
             finalize=finalize,
-            tool_operation=ToolEffectOperation('mcp_input' if source == 'mcp-input' else 'mcp_app', operation_id, self.owner,
-                self.name, deepcopy(call.arguments), session_id),
+            tool_operation=ToolEffectOperation(namespaces[source], operation_id, self.owner,
+                self.name, deepcopy(call.arguments), session_id, native_action=context),
         )
         error = outcome.error
         if isinstance(error, Exception) and not is_execution_control_error(error) and (
@@ -575,22 +605,24 @@ class ToolRegistryMixin:
             tool_def["function"]["name"] = name
             visible = getattr(schema, "model_visible", True) is not False
             claimed.add(name)
-            prepared.append((name, tool, tool_def, visible))
+            actions = capture_native_actions(tool)
+            prepared.append((name, tool, tool_def, visible, actions))
         # Commit, with nothing that can raise in between. The epoch insert goes
         # first because it is the first to hash ``owner`` (an unhashable owner
         # is the one failure left), and a dict insert that fails changes nothing.
         registration = object()
+        registration_id = uuid4().hex
         self._explored_features[owner] = registration
         if pin:
             self._pinned_features.add(owner)
-        for name, tool, tool_def, visible in prepared:
+        for name, tool, tool_def, visible, _ in prepared:
             self._direct_tools[name] = tool
             if visible:
                 self._direct_tool_defs.append(tool_def)
             self._tool_to_feature[name] = owner
         bump_registry_generation(self)
         self._maybe_evict_direct_tools()
-        retained = [(name, tool) for name, tool, _, _ in prepared
+        retained = [(name, tool, actions) for name, tool, _, _, actions in prepared
                     if self._direct_tools.get(name) is tool]
         registered = len(retained)
         logging.info(
@@ -598,12 +630,13 @@ class ToolRegistryMixin:
             f"tools for '{owner}'. Total: {len(self._direct_tools)}"
         )
         if on_registered is not None:
-            for name, tool in retained:
+            for name, tool, actions in retained:
                 on_registered(tool, _GovernedToolBinding(
                     self, name, owner, registration, tool,
                     self._security_feature_name_for_tool(name),
                     validate_feature_registration=_capture_tool_feature_registration(
                         self, tool, self._feature_for_tool_owner(owner)),
+                    native_actions=actions, registration_id=registration_id,
                 ))
         return registered
 

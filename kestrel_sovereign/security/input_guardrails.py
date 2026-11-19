@@ -160,6 +160,8 @@ def validate_tool_arguments(
     tool_name: str,
     arguments: Dict[str, Any],
     known_tools: Optional[Set[str]] = None,
+    *,
+    redact_paths: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """
     Validate tool call arguments before execution.
@@ -175,6 +177,7 @@ def validate_tool_arguments(
         arguments: Parsed arguments dict from the LLM response.
         known_tools: Optional set of allowed tool names. If None,
                      the allowlist check is skipped.
+        redact_paths: Keep private native form keys out of diagnostics.
 
     Returns:
         Tuple of (is_valid, error_message). error_message is None if valid.
@@ -199,6 +202,8 @@ def validate_tool_arguments(
                 f"Tool '{tool_name}' argument '{key}' has invalid type "
                 f"{type(value).__name__}"
             )
+            if redact_paths:
+                error = f"Tool '{tool_name}' arguments contain an invalid JSON type"
             logger.warning(f"Tool validation failed: {error}")
             return False, error
 
@@ -228,6 +233,8 @@ def validate_tool_arguments(
                 f"Tool '{tool_name}' argument '{path}' exceeds maximum length "
                 f"({len(value)} > {MAX_TOOL_ARG_LENGTH})"
             )
+            if redact_paths:
+                error = f"Tool '{tool_name}' arguments exceed the maximum string length"
             logger.warning(f"Tool validation failed: {error}")
             return False, error
         if isinstance(value, (dict, list)):

@@ -337,7 +337,7 @@ class _BoundPath(_OrchestratorPath):
             on_registered=lambda _mounted, binding: bindings.append(binding),
         )
         [binding] = bindings
-        return await binding.invoke(dict(arguments), session_id=SESSION, source="parity", operation_id=uuid4().hex)
+        return await binding.invoke(dict(arguments), session_id=SESSION, source="external", operation_id=uuid4().hex)
 
 
 class _NamedPath(_OrchestratorPath):

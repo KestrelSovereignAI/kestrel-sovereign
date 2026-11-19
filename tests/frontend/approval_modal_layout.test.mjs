@@ -25,6 +25,23 @@ const { Modal, Toast, setOverlayRoot } = await import('../../kestrel_sovereign/s
 const { default: API } = await import('../../kestrel_sovereign/static/js/api.js');
 const { Security } = await import('../../kestrel_sovereign/static/js/security.js');
 
+test('native Task actions render escaped identity and only single-use decisions', async () => {
+    const pending = Security.showApprovalModal({
+        id: 'native-task-approval', feature: 'MCPAgent', tool: 'original_tool', args: {},
+        native_action: { action: 'cancel', method: 'tasks/cancel', task_handle: '<img src=x onerror=alert(1)>' },
+    });
+    const modal = document.querySelector('.modal-overlay');
+    assert.equal(modal.querySelectorAll('.modal-footer .modal-btn').length, 2);
+    const target = modal.querySelector('.native-action-target');
+    assert.ok(target.textContent.includes('tasks/cancel'));
+    assert.ok(target.textContent.includes('<img src=x onerror=alert(1)>'));
+    assert.equal(target.querySelector('img'), null);
+    assert.ok(!modal.textContent.includes('Auto Mode approves'));
+    const button = [...modal.querySelectorAll('.modal-footer .modal-btn')].find(b => b.textContent === 'This Time');
+    button.click();
+    assert.deepEqual(await pending, { approved: true, scope: 'once' });
+});
+
 function normStyle(el) {
     return (el.getAttribute('style') || '').replace(/\s+/g, ' ');
 }

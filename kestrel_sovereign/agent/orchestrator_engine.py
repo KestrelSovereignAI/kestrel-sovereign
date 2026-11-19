@@ -42,6 +42,9 @@ from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
 from kestrel_sdk.tools import DeferredToolResult
 from kestrel_sdk.tools.base import ToolSchema
+from kestrel_sovereign.tools.native_action import (
+    NativeActionInvocation, action_audit, action_parameter_audit, snapshot_action_context,
+)
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskHandoff,
@@ -1583,6 +1586,8 @@ class OrchestratorEngineMixin:
             tool_name=tool_name,
             tool_input=args,
             feature_name=feature_name,
+            native_action=(snapshot_action_context(execution_witness.native_action)
+                if execution_witness is not None and execution_witness.native_action is not None else None),
         )
 
         hook_output = await self.hooks_manager.execute_hooks(
@@ -1637,6 +1642,8 @@ class OrchestratorEngineMixin:
             feature_name=feature_name,
             tool_response=result if isinstance(result, dict) else {"result": str(result)},
             execution_time_ms=exec_duration_ms,
+            native_action=(snapshot_action_context(execution_witness.native_action)
+                if execution_witness is not None and execution_witness.native_action is not None else None),
         )
         return await _complete_post_tool_result(
             self, result, post_hook_input,
@@ -3008,8 +3015,10 @@ class OrchestratorEngineMixin:
             return result
 
         # Validate tool arguments before execution
+        native_context = bound_execution.native_action if bound_execution is not None else None
         is_valid, validation_error = validate_tool_arguments(
-            tool_name, args, known_tools=known_tools
+            tool_name, args, known_tools=known_tools,
+            **({'redact_paths': True} if native_context is not None else {}),
         )
         if not is_valid:
             logging.warning(
@@ -3026,6 +3035,7 @@ class OrchestratorEngineMixin:
                 reason=validation_error or "tool validation failed",
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                native_action=native_context,
                 evidence=allowlist_evidence(self, call_context, tool_name),
             )
             result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
@@ -3085,7 +3095,8 @@ class OrchestratorEngineMixin:
         dispatch_event_id = await self.observability_store.log_tool_call(
             agent_name=self.did,
             tool_name=f"feature_dispatch:{tool_name}",
-            metadata={"arguments": args, "iteration": iteration, "source": source},
+            metadata={**({'arguments': args} if native_context is None else action_audit(native_context, args)),
+                      'iteration': iteration, 'source': source},
             **({"session_id": session_id} if bound_tool is not None else {}),
         )
 
@@ -3329,7 +3340,8 @@ class OrchestratorEngineMixin:
                 ) or "turn_unknown",
                 tool_name=tool_name,
                 adapter=adapter,
-                args_redacted=args,
+                args_redacted=(action_parameter_audit(args)
+                    if execution_witness is not None and execution_witness.native_action is not None else args),
                 result_status=infer_tool_result_status(result, status_hint),
                 error_class=error_class,
                 error_message=error_message,
@@ -3337,6 +3349,8 @@ class OrchestratorEngineMixin:
                 result_size_bytes=tool_result_size_bytes(result),
                 dispatch_id=dispatch_id,
                 parent_dispatch_id=parent_dispatch_id,
+                native_action=(execution_witness.native_action.to_dict()
+                    if execution_witness is not None and execution_witness.native_action is not None else None),
             )
             if execution_witness is None:
                 await log_dispatch(entry, **({"required": True} if required else {}))
@@ -3715,6 +3729,8 @@ class OrchestratorEngineMixin:
         # A caller that did not supply a witness still needs to distinguish
         # pre-execution refusal from a failure after effects became possible.
         execution = bound_execution if bound_execution is not None else _ToolExecution()
+        native = (NativeActionInvocation(execution.action_declaration, execution.native_action)
+                  if execution.native_action is not None else None)
         dispatch_meta = {} if dispatch_meta is None else dispatch_meta
         tool = tool if tool is not None else self._direct_tools[tool_name]
         from kestrel_sovereign.agent.tool_allowlist import registry_generation
@@ -3749,7 +3765,13 @@ class OrchestratorEngineMixin:
 
         # #3396: before PRE_TOOL_USE, so hooks, approvals, and the audit see
         # exactly the arguments the tool will run with.
-        args, argument_error = normalize_direct_tool_arguments(tool_name, tool, args)
+        if native is None:
+            args, argument_error = normalize_direct_tool_arguments(tool_name, tool, args)
+        else:
+            try:
+                args, argument_error = native.validate(args), None
+            except ValueError as error:
+                argument_error = str(error)
         if argument_error is not None:
             logging.warning(
                 "[DIRECT-TOOL] %s refused: %s %s",
@@ -3761,6 +3783,7 @@ class OrchestratorEngineMixin:
                 reason=argument_error,
                 action=ACTION_TOOL_VALIDATION,
                 args=args,
+                native_action=native.context if native is not None else None,
                 evidence=allowlist_evidence(self, call_context, tool_name),
             )
             return await _failed(argument_error, error_class=_TOOL_ARGUMENT_ERROR)
@@ -3772,6 +3795,12 @@ class OrchestratorEngineMixin:
             dispatch_meta["arguments"] = args
 
         def _prepare_bound_arguments(effective_args):
+            if native is not None:
+                snapshot = deepcopy(effective_args)
+                execution.arguments = snapshot
+                dispatch_meta['arguments'] = snapshot
+                bound_tool.require_current()
+                return native.validate(snapshot)
             # A rewrite the hooks authorized must already be the binding that
             # runs; normalizing it would coerce it after authorization (#3921).
             rewrite_error = hook_rewrite_argument_error(tool_name, tool, effective_args)
@@ -3804,13 +3833,18 @@ class OrchestratorEngineMixin:
                     raise ToolArgumentRewriteError(rewrite_error)
             async def execute_registered():
                 execution.started = True
-                result = await t.execute(**effective_args)
+                result = (await native.declaration.handler(snapshot_action_context(native.context),
+                                                          deepcopy(effective_args))
+                          if native is not None else await t.execute(**effective_args))
                 execution.returned = True
                 return result
 
             from kestrel_sovereign.tools.effect_journal import execute_tool_effect
 
-            return await execute_tool_effect(self, registration=[hook_feature_name, tool_name],
+            registration = [hook_feature_name, tool_name]
+            if native is not None:
+                registration.append({'native_action': native.context.to_dict()})
+            return await execute_tool_effect(self, registration=registration,
                 arguments=effective_args, execute=execute_registered,
                 expected_generation=selected_generation,
                 validate_registration=bound_tool.require_current if bound_tool is not None else registration_validator)

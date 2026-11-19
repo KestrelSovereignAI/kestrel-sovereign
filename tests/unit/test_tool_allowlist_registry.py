@@ -41,6 +41,7 @@ def _make_tool(name: str):
     from kestrel_sdk.tools.base import AgentTool
 
     tool = MagicMock(spec=AgentTool)
+    tool.native_actions = {}
     tool.name = name
     tool.schema = ToolSchema(
         name=name,

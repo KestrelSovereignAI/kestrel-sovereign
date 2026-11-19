@@ -19,6 +19,7 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 def _make_mock_tool(name: str, description: str = "test tool"):
     """Create a mock AgentTool with a proper schema."""
     tool = MagicMock()
+    tool.native_actions = {}
     tool.name = name
     tool.schema = ToolSchema(
         name=name,

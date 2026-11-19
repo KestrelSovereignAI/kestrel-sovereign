@@ -720,6 +720,8 @@ class SecurityFeature(Feature):
                     "tool": request.tool_name,
                     "args": request.tool_args,
                     "timestamp": request.created_at.isoformat(),
+                    **({'native_action': request.native_action.to_dict()}
+                       if request.native_action is not None else {}),
                 },
             )
         else:
@@ -949,9 +951,11 @@ class SecurityFeature(Feature):
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
             age = (datetime.now(timezone.utc) - created_at).total_seconds()
+            action_label = (f"{req.native_action.action} · {req.native_action.method} · {req.native_action.task_handle} "
+                            if req.native_action is not None else '')
             lines.append(
                 f"  [{req.id[:8]}] {req.feature_name}.{req.tool_name} "
-                f"({int(age)}s ago)"
+                f"{action_label}({int(age)}s ago)"
             )
             requests_data.append({
                 "id": req.id,
@@ -959,6 +963,7 @@ class SecurityFeature(Feature):
                 "tool_name": req.tool_name,
                 "age_seconds": int(age),
                 "created_at": created_at.isoformat(),
+                **({'native_action': req.native_action.to_dict()} if req.native_action is not None else {}),
             })
 
         lines.append(
@@ -1010,9 +1015,9 @@ class SecurityFeature(Feature):
         decision = await self.approval_queue.submit_decision(full_id, True, scope)
         if not decision.in_memory:
             return ToolResult.failed(
-                f"Request '{request_id}' is no longer pending "
-                "(timeout, cancellation, or already decided)",
-                data={"request_id": full_id, "decision_attempted": "approved"},
+                f"Request '{request_id}' was not approved: {decision.error}",
+                data={"request_id": full_id, "decision_attempted": "approved",
+                      "decision_error": decision.error},
             )
 
         # The original tool-call awaiter had already been cancelled (Cloud Run
@@ -1133,9 +1138,9 @@ class SecurityFeature(Feature):
                 },
             )
         return ToolResult.failed(
-            f"Request '{request_id}' is no longer pending "
-            "(timeout, cancellation, or already decided)",
-            data={"request_id": full_id, "decision_attempted": "denied"},
+            f"Request '{request_id}' was not denied: {decision.error}",
+            data={"request_id": full_id, "decision_attempted": "denied",
+                  "decision_error": decision.error},
         )
 
     @tool(

@@ -13,6 +13,7 @@
  */
 
 import API from './api.js';
+import { nativeActionLabel } from './native-action.js';
 import { Toast } from './ui.js';
 import { extractUpgradeRequired, upgradeToastHtml } from './upgrade-prompt.js';
 
@@ -128,11 +129,12 @@ function renderPending(pending) {
                 <span class="text-muted text-sm">${esc(r.timestamp)}</span>
               </div>
               <div class="mb-2">${summary}</div>
+              ${r.native_action ? `<div class="native-action-target mb-2">${esc(nativeActionLabel(r.native_action))}</div>` : ''}
               <pre style="background:var(--bg-secondary);padding:0.75rem;border-radius:6px;overflow:auto;max-height:240px;white-space:pre-wrap;">${preview}</pre>
               <div class="row-flex" style="gap:0.5rem;margin-top:0.75rem;">
                 <button class="btn btn-primary text-sm" onclick="Approvals.decide('${id}',true,'once',false)">Approve</button>
                 <button class="btn btn-secondary text-sm" onclick="Approvals.decide('${id}',false,'once',false)">Reject</button>
-                <button class="btn btn-secondary text-sm" onclick="Approvals.decide('${id}',true,'once',true)" title="Approve and add a scoped, revocable auto-approve rule">Approve &amp; remember</button>
+                ${r.native_action ? '' : `<button class="btn btn-secondary text-sm" onclick="Approvals.decide('${id}',true,'once',true)" title="Approve and add a scoped, revocable auto-approve rule">Approve &amp; remember</button>`}
               </div>
             </div>`;
         })
