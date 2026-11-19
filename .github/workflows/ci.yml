@@ -649,7 +649,11 @@ jobs:
           cache-dependency-path: package-lock.json
 
       - name: Install dependencies
-        run: uv sync
+        # Provider modules otherwise import-skip before collection (#4172).
+        run: uv sync --frozen --extra cloud
+
+      - name: Validate cloud provider test dependencies
+        run: uv run --frozen --extra cloud python -c "import google.cloud.run_v2; import azure.mgmt.appcontainers"
 
       # jsdom (a devDependency) is required by tests/frontend. The lockfile's
       # `file:../kestrel-flight` entry is a symlink npm tolerates when the
@@ -704,7 +708,7 @@ jobs:
         # the 35-minute limit in PR #3999. Each worker records its original
         # collection and deterministic selection. The coverage job proves
         # both shards contain every collected node exactly once.
-        run: uv run pytest tests/unit/ -p tests.utils.unit_sharding --unit-shard=${{ matrix.shard }} --unit-shard-count=2 --unit-shard-manifests=unit-shard-manifests -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --durations=50
+        run: uv run --frozen --extra cloud pytest tests/unit/ -p tests.utils.unit_sharding --unit-shard=${{ matrix.shard }} --unit-shard-count=2 --unit-shard-manifests=unit-shard-manifests -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --durations=50
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in

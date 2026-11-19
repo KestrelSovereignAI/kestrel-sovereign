@@ -117,7 +117,21 @@ def test_managed_template_omits_previous_revision_without_resetting_custody(
                 "name": "cloudsql",
                 "cloud_sql_instance": {"instances": ["test-project:us-central1:primary"]},
             }],
-            "containers": [{"image": "gcr.io/test-project/kestrel:previous"}],
+            "containers": [{
+                "name": "ingress",
+                "image": "gcr.io/test-project/kestrel:previous",
+                "command": ["/app/start"],
+                "args": ["--serve"],
+                "ports": [{"container_port": 8080, "name": "h2c"}],
+                "volume_mounts": [{"name": "cloudsql", "mount_path": "/cloudsql"}],
+                "startup_probe": {"tcp_socket": {"port": 8080}},
+                "liveness_probe": {"http_get": {"path": "/health", "port": 8080}},
+                "resources": {
+                    "limits": {"cpu": "1", "memory": "1Gi", "nvidia.com/gpu": "1"},
+                    "cpu_idle": False,
+                    "startup_cpu_boost": True,
+                },
+            }],
         },
         traffic=[{
             "type_": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
@@ -127,7 +141,12 @@ def test_managed_template_omits_previous_revision_without_resetting_custody(
         }],
     )
     original = Service(existing)
-    container = Container(image="gcr.io/test-project/kestrel:v0.66.5")
+    container = Container(
+        image="gcr.io/test-project/kestrel:v0.66.5",
+        ports=[{"container_port": deployment_profile.port}],
+        env=[{"name": "KESTREL_ENV", "value": "development"}],
+        resources={"limits": {"cpu": "2", "memory": "2Gi"}},
+    )
 
     _apply_managed_template(existing, container, deployment_profile)
 
@@ -144,11 +163,47 @@ def test_managed_template_omits_previous_revision_without_resetting_custody(
     assert existing.template.service_account == original.template.service_account
     assert existing.template.vpc_access == original.template.vpc_access
     assert existing.template.volumes == original.template.volumes
-    assert existing.template.containers == [container]
+    actual = existing.template.containers[0]
+    previous = original.template.containers[0]
+    assert actual.image == container.image
+    assert actual.env == container.env
+    assert actual.ports[0].container_port == deployment_profile.port
+    assert actual.ports[0].name == previous.ports[0].name
+    assert actual.name == previous.name
+    assert actual.command == previous.command
+    assert actual.args == previous.args
+    assert actual.volume_mounts == previous.volume_mounts
+    assert actual.startup_probe == previous.startup_probe
+    assert actual.liveness_probe == previous.liveness_probe
+    assert actual.resources.cpu_idle is False
+    assert actual.resources.startup_cpu_boost is True
+    assert dict(actual.resources.limits) == {
+        "cpu": "2", "memory": "2Gi", "nvidia.com/gpu": "1"}
     assert existing.template.scaling.min_instance_count == deployment_profile.min_instances
     assert existing.template.scaling.max_instance_count == deployment_profile.max_instances
     assert existing.template.timeout.total_seconds() == deployment_profile.timeout
     assert existing.template.max_instance_request_concurrency == deployment_profile.concurrency
+
+
+@pytest.mark.parametrize('kind', ['startup_probe', 'liveness_probe'])
+def test_managed_port_conflict_with_existing_probe_refuses_without_mutation(
+    deployment_profile, kind
+):
+    from google.cloud.run_v2 import Container, Service
+
+    service = Service(template={
+        'revision': 'kestrel-dev-original',
+        'containers': [{
+            'image': 'example/original',
+            'ports': [{'container_port': 8080}],
+            kind: {'http_get': {'path': '/health', 'port': 8080}},
+        }],
+    })
+    before = Service.serialize(service)
+    incoming = Container(image='example/replacement', ports=[{'container_port': 9090}])
+    with pytest.raises(DeployManagerError, match='probe port conflicts'):
+        _apply_managed_template(service, incoming, replace(deployment_profile, port=9090))
+    assert Service.serialize(service) == before
 
 
 class TestCloudRunProviderDeploy:
@@ -304,6 +359,30 @@ class TestCloudRunProviderDeploy:
         assert not mock_client.create_service.called
 
     @pytest.mark.asyncio
+    async def test_update_refuses_sidecars_before_dispatch(self, deployment_profile):
+        from google.cloud.run_v2 import Service
+
+        client = MagicMock()
+        existing = Service(name="projects/test-project/locations/us-central1/services/kestrel-dev",
+                           template={"revision": "kestrel-dev-original", "containers": [
+            {"name": "ingress", "image": "example/app", "ports": [{"container_port": 8080}]},
+            {"name": "sidecar", "image": "example/sidecar"},
+        ]})
+        before = Service.serialize(existing)
+        client.get_service.return_value = existing
+        provider = CloudRunProvider(project_id="test-project")
+        provider._services_client = client
+
+        with pytest.raises(DeployManagerError, match="single-container"):
+            await provider.deploy(
+                image="gcr.io/test-project/kestrel:v1",
+                service_name="kestrel-dev", profile=deployment_profile)
+
+        client.update_service.assert_not_called()
+        client.create_service.assert_not_called()
+        assert Service.serialize(existing) == before
+
+    @pytest.mark.asyncio
     async def test_deploy_surfaces_iam_grant_failure_as_warning(
         self, mock_services_client, deployment_profile
     ):
@@ -403,6 +482,17 @@ class TestCloudRunProviderDeploy:
 
         existing = Service()
         existing.template.revision = previous_revision
+        existing.template.containers = [{
+            "image": "gcr.io/test-project/kestrel:previous",
+            "ports": [{"container_port": 8080, "name": "h2c"}],
+            "volume_mounts": [{"name": "cloudsql", "mount_path": "/cloudsql"}],
+            "startup_probe": {"tcp_socket": {"port": 8080}},
+            "resources": {"cpu_idle": False, "startup_cpu_boost": True},
+        }]
+        existing.template.volumes = [{
+            "name": "cloudsql",
+            "cloud_sql_instance": {"instances": ["test-project:us-central1:primary"]},
+        }]
         existing.template.service_account = (
             "custom-sa@test-project.iam.gserviceaccount.com"
         )
@@ -439,6 +529,12 @@ class TestCloudRunProviderDeploy:
         assert sent.template.containers[0].image == (
             "gcr.io/test-project/kestrel:latest"
         )
+        assert list(sent.template.containers[0].volume_mounts), "provider update lost the Cloud SQL socket mount"
+        assert sent.template.containers[0].volume_mounts[0].mount_path == "/cloudsql"
+        assert sent.template.containers[0].startup_probe.tcp_socket.port == 8080
+        assert sent.template.containers[0].ports[0].name == "h2c"
+        assert sent.template.containers[0].resources.cpu_idle is False
+        assert sent.template.containers[0].resources.startup_cpu_boost is True
 
     @pytest.mark.asyncio
     async def test_deploy_with_custom_env_vars(self, mock_services_client, deployment_profile):
