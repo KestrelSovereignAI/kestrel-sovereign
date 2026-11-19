@@ -112,6 +112,10 @@ identify an accepted Task. Consumed receipts cannot be reused for a new attempt.
 Failed opening does not turn `observe(defer_cancellation=False)` into an unbounded
 join: the original operation retains its finalizer while the borrowed caller can
 withdraw. The default observation remains an unbounded join.
+After failed opening, neither observation mode forwards a fresh cancellation
+into the original owner's already-running finalizer. Factory-publication errors
+and unstarted-resource debt remain on the same canonical admission receipt, not
+only on the operation's observer.
 
 `reconcile_owned_task_admission` reports UNKNOWN for a fresh unused receipt,
 ambiguous acceptance, lost completion capture, or an original unretired physical
