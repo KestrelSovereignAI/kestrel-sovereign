@@ -89,7 +89,9 @@ async def test_eager_native_completion_keeps_later_privacy_publication_failure(
         assert (await await_owned_task(task)).error is observed
         await asyncio.sleep(0)
         assert owned_task_error(task) is observed
-        assert reads == [task], "Late admission failure re-harvested consumed original native completion"
+        # The canonical receipt bypasses the subclass observer. Reconciliation
+        # above must preserve both original carriers without invoking it.
+        assert not reads, "Original physical completion used a subclass observer"
         assert owners == publications == [task] and receipt.task is task and task.done()
         assert not bodies and not lock._native_work and not lock.locked()
         assert effect.read_text() == "original native outer physically completed once"

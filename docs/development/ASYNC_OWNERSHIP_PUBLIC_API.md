@@ -117,6 +117,10 @@ into the original owner's already-running finalizer. Factory-publication errors
 and unstarted-resource debt remain on the same canonical admission receipt, not
 only on the operation's observer.
 
+Both borrow and must-join observation use the retained original receipt through
+`await_owned_task(..., admission=receipt)`, even when the Task refuses diagnostic
+metadata. The explicit receipt must name an exactly admitted native Task.
+
 `reconcile_owned_task_admission` reports UNKNOWN for a fresh unused receipt,
 ambiguous acceptance, lost completion capture, or an original unretired physical
 resource. `task is None` alone is never proven nonacceptance. That state requires
