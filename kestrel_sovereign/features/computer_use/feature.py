@@ -33,17 +33,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from kestrel_sovereign._async_ownership import run_blocking_operation
-from kestrel_sovereign.constitution.hierarchy import (
-    DANGEROUS_CAPABILITIES,
-    parse_amendment_ix_grants,
-)
+from kestrel_sovereign.constitution.grants import resolve_amendment_ix_grants
+from kestrel_sovereign.constitution.hierarchy import DANGEROUS_CAPABILITIES
 from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -656,54 +653,7 @@ class ComputerUseFeature(Feature):
 
     def _granted_capabilities(self) -> frozenset[str]:
         """Read Amendment IX grants. Empty set means deny-everything default."""
-        for attr in ("granted_capabilities", "capability_grants", "amendment_ix"):
-            grants = getattr(self.agent, attr, None)
-            if grants:
-                return frozenset(grants)
-
-        # The per-agent overlay (self.agent.constitution_text) may grant DANGEROUS
-        # capabilities via Amendment IX — but ONLY honor it when the overlay has
-        # been integrity-verified against its anchor (#1722). An unanchored or
-        # tampered overlay (e.g. one an attacker wrote next to the agent DB to
-        # self-grant shell) is ignored; we fall through to the packaged
-        # constitution. ``constitution_overlay_verified`` defaults False until
-        # verify_constitution_overlay() runs in initialize()/audit.
-        # ``is not None`` (not truthiness): an intentionally EMPTY overlay file
-        # is ``""`` and must still count as "overlay present" so a verified empty
-        # overlay denies all (rather than falling through to package grants) —
-        # #1722 codex r4. ``None`` means genuinely no overlay file.
-        overlay_text = getattr(self.agent, "constitution_text", None)
-        if overlay_text is not None:
-            if getattr(self.agent, "constitution_overlay_verified", False):
-                # A verified per-agent overlay is AUTHORITATIVE: its parsed grants
-                # stand even when EMPTY, so it can NARROW capabilities the
-                # packaged constitution would otherwise grant. We do NOT fall
-                # through to the package for a verified overlay (#1722 codex r2).
-                return parse_amendment_ix_grants(overlay_text)
-            logger.warning(
-                "Ignoring Amendment IX grants from an UNVERIFIED constitution "
-                "overlay (not anchored). Run `kestrel constitution anchor-overlay`."
-            )
-
-        text = self._read_constitution_text()
-        if text:
-            grants = parse_amendment_ix_grants(text)
-            if grants:
-                return grants
-
-        env_grants = os.environ.get("KESTREL_CAPABILITY_GRANTS", "")
-        if env_grants:
-            return frozenset(g.strip() for g in env_grants.split(",") if g.strip())
-        return frozenset()
-
-    def _read_constitution_text(self) -> str | None:
-        try:
-            from kestrel_sovereign.config import CONSTITUTION_PATH
-
-            return Path(CONSTITUTION_PATH).read_text(encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("could not read constitution: %s", exc)
-            return None
+        return resolve_amendment_ix_grants(self.agent).grants
 
     # =========================================================================
     # The five gate steps

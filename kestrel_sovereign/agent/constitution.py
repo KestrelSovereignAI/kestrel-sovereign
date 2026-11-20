@@ -18,6 +18,7 @@ from kestrel_sovereign.command_policy import (
     SAFE_MODE_COMMANDS,
     prefixed_command_token,
 )
+from kestrel_sovereign.constitution.grants import OverlayGrantEvidence
 from kestrel_sovereign.paths import PROJECT_ROOT_ENV, runtime_path_env
 
 # Import the concrete submodule, not the ``storage`` package aggregator.
@@ -1657,12 +1658,17 @@ class ConstitutionMixin:
         # also sees current content.
         overlay_path = getattr(self, "_constitution_overlay_path", None)
         overlay_sha = None
+        self._constitution_overlay_grant_evidence = OverlayGrantEvidence(
+            "verification unavailable"
+        )
+        unavailable = False
         if overlay_path is not None and overlay_path.exists():
             try:
                 overlay_bytes = overlay_path.read_bytes()
             except OSError as e:
                 logging.warning("Could not re-read constitution overlay %s: %s", overlay_path, e)
                 overlay_bytes = None
+                unavailable = True
             if overlay_bytes is not None:
                 # Hash the raw bytes FIRST so the anchor comparison runs even for
                 # a non-UTF-8 overlay; decode defensively (invalid UTF-8 must NOT
@@ -1696,6 +1702,9 @@ class ConstitutionMixin:
             if is_execution_control_error(e):
                 raise
             # Can't read the anchor → can't trust an overlay if one is present.
+            self._constitution_overlay_grant_evidence = OverlayGrantEvidence(
+                "anchor unavailable"
+            )
             if overlay_sha is not None:
                 self.constitution_overlay_verified = False
                 return False, f"OVERLAY INTEGRITY FAILURE: cannot read anchor: {e}"
@@ -1703,6 +1712,8 @@ class ConstitutionMixin:
             return True, "No overlay; anchor unreadable but not required"
 
         if overlay_sha is None:
+            status = "source unavailable" if unavailable else "missing" if anchor else "absent"
+            self._constitution_overlay_grant_evidence = OverlayGrantEvidence(status)
             if anchor:
                 # An overlay was anchored before but is now gone — tampering.
                 self.constitution_overlay_verified = False
@@ -1714,6 +1725,7 @@ class ConstitutionMixin:
             return True, "No per-agent constitution overlay"
 
         if not anchor:
+            self._constitution_overlay_grant_evidence = OverlayGrantEvidence("unanchored")
             # Present but never anchored → must not be trusted (fail closed).
             self.constitution_overlay_verified = False
             return False, (
@@ -1723,6 +1735,7 @@ class ConstitutionMixin:
             )
 
         if anchor != overlay_sha:
+            self._constitution_overlay_grant_evidence = OverlayGrantEvidence("hash mismatch")
             self.constitution_overlay_verified = False
             logging.critical(
                 "CONSTITUTION OVERLAY MISMATCH!\n  Anchored: %s\n  File:     %s",
@@ -1731,6 +1744,11 @@ class ConstitutionMixin:
             return False, "OVERLAY INTEGRITY FAILURE: overlay has been modified since anchoring."
 
         self.constitution_overlay_verified = True
+        self._constitution_overlay_grant_evidence = (
+            OverlayGrantEvidence("hash verified", overlay_sha)
+            if self.constitution_text is not None
+            else OverlayGrantEvidence("unreadable text")
+        )
         return True, f"Constitution overlay verified. Hash: {overlay_sha[:16]}..."
 
     async def anchor_constitution_overlay(self) -> Tuple[bool, str]:
@@ -1753,6 +1771,9 @@ class ConstitutionMixin:
         if not agent_node:
             return False, "Agent identity node not found; cannot anchor overlay."
         self.constitution_overlay_verified = True
+        self._constitution_overlay_grant_evidence = OverlayGrantEvidence(
+            "hash verified", overlay_sha
+        )
         logging.info("Anchored constitution overlay hash %s", overlay_sha[:16])
         return True, f"Anchored constitution overlay. Hash: {overlay_sha[:16]}..."
 
@@ -2813,6 +2834,22 @@ class ConstitutionMixin:
         measure the same governing bytes as production without causing the
         legacy lazy-anchor transaction.
         """
+        return await ConstitutionMixin._read_governing_constitution(
+            self, allow_lazy_anchor=allow_lazy_anchor, include_runtime_contributions=True
+        )
+
+    async def _get_original_governing_constitution(self) -> str:
+        """Read the exact anchored text for diagnostics without creating an anchor."""
+        return await ConstitutionMixin._read_governing_constitution(
+            self, allow_lazy_anchor=False, include_runtime_contributions=False
+        )
+
+    async def _read_governing_constitution(
+        self,
+        *,
+        allow_lazy_anchor: bool,
+        include_runtime_contributions: bool,
+    ) -> str:
         from kestrel_sovereign.agent.turn_lifecycle import _live_turn_binding
 
         binding = _live_turn_binding(self)
@@ -3000,6 +3037,8 @@ class ConstitutionMixin:
             if not isinstance(constitution_bytes, bytes) or hashlib.sha256(constitution_bytes).hexdigest() != constitution_hash:
                 raise RuntimeError("Native governing bytes do not match the anchored hash")
             constitution_text = constitution_bytes.decode('utf-8')
+            if not include_runtime_contributions:
+                return constitution_text
             if self.extension:
                 amendments = self.extension.get_constitution_amendments()
                 if amendments:
