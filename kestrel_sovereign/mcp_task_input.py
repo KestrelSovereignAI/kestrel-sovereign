@@ -70,7 +70,7 @@ class MCPTaskInputCustody:
             record = await self.inputs._apply_create(prepared)
             await self.tasks._lock()
             records = await self.tasks._all()
-            actual, row = self.tasks._select_issuance(records, identity)
+            actual, row = self.tasks._select_issuance(self.tasks._in_inventory(records, identity.handle), identity)
             self._binding(actual, record)
             if record.binding.operation_id != actual.current_operation_id:
                 raise MCPTaskConflict('MCP input requires its actual current Task operation')
@@ -111,10 +111,10 @@ class MCPTaskInputCustody:
             claimed = await self.inputs._apply_response(prepared)
             await self.tasks._lock()
             records = await self.tasks._all()
-            selected = [(record, row) for record, row in records if record.handle == handle]
-            if len(selected) != 1:
+            selected = self.tasks._in_inventory(records, handle)
+            if selected is None:
                 raise MCPTaskConflict('Original waiting MCP Task is absent')
-            actual, row = selected[0]
+            actual, row = selected
             self._waiting_link(actual, claimed.record)
             if self.tasks._operation_owner(records, operation_id) is not None:
                 raise MCPTaskConflict('MCP Task continuation operation already has original custody')
@@ -135,8 +135,7 @@ class MCPTaskInputCustody:
         async with self.inputs.write_transaction():
             closed_input = await self.inputs._apply_settlement(prepared)
             await self.tasks._lock()
-            records = await self.tasks._all()
-            actual, row = self.tasks._select_issuance(records, expected)
+            actual, row = self.tasks._select_issuance(await self.tasks._read_row(expected.handle), expected)
             self._input_link(actual, closed_input)
             closed_task = await self.tasks._persist(actual, row, 'NOT_SENT', envelope)
         return closed_task, closed_input
@@ -157,8 +156,7 @@ class MCPTaskInputCustody:
         async with self.inputs.write_transaction():
             await self.inputs._apply_expiry(prepared)
             await self.tasks._lock()
-            records = await self.tasks._all()
-            actual, row = self.tasks._select(records, expected)
+            actual, row = self.tasks._require_binding(await self.tasks._read_row(expected.handle), expected.binding)
             if actual.revision != expected.revision:
                 raise MCPTaskConflict('MCP Task waiting expiry revision was already consumed')
             self._waiting_link(actual, record)

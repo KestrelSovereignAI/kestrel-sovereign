@@ -7,6 +7,7 @@ Task handle nor any of these private descriptions authorizes an execution.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
 import hashlib
@@ -46,6 +47,8 @@ class MCPTaskHostPolicy(BaseModel):
     observation_reserve_bytes: int = Field(default=1_048_576, gt=0, le=16_777_216)
     max_held_tools: int = Field(default=16, gt=0)
     max_payload_bytes: int = Field(default=4_194_304, gt=0, le=67_108_864)
+    maintenance_page_records: int = Field(default=32, gt=0, le=256)
+    maintenance_page_bytes: int = Field(default=4_194_304, gt=0, le=67_108_864)
 
     @model_validator(mode='after')
     def budgets(self):
@@ -91,6 +94,9 @@ class MCPTaskHost:
         self._rounds = WeakKeyDictionary()
         self._owners = set()
         self._unreconciled = set()
+        self._maintenance_lock = asyncio.Lock()
+        self._maintenance_after: str | None = None
+        self._maintenance_operations: set[str] = set()
         self._accepting, self.retired = True, False
 
     def require_prepared(self):
@@ -232,8 +238,7 @@ class MCPTaskHost:
             self.input_host._require_reader()
             if record.binding.custody is None:
                 raise ResourceConflict('Tasks cannot adopt an unlinked original Input call')
-            records = await self.store.list_retained()
-            actual = next((row for row in records if row.handle == record.binding.custody), None)
+            actual = await self.store.read_handle(record.binding.custody)
             if actual is None:
                 raise ResourceConflict('Original Input Task custody is unavailable')
             sealed = await self.store.open_submission(actual)
@@ -277,14 +282,20 @@ class MCPTaskHost:
         return result
 
     async def maintain(self):
-        async with require_durable_persistence_gate(self.agent).shared():
+        async with self._maintenance_lock, require_durable_persistence_gate(self.agent).shared():
             await self._maintain()
 
     async def _maintain(self):
         self.require_current()
         await self._reconcile_reservations()
-        records = await self.store.list_retained()
+        records = await self.store.retained_page(after=self._maintenance_after,
+            max_records=self.policy.maintenance_page_records, max_bytes=self.policy.maintenance_page_bytes)
         self.require_current()
+        if not records:
+            self._maintenance_after = None
+            self._maintenance_operations.clear()
+            return
+        operations = self.store.inventory_operations(records, prior=self._maintenance_operations)
         for actual in records:
             if actual.phase in {'SETTLED', 'NOT_SENT', 'INPUT_CLOSED'}:
                 # Lost ACKs may leave a retained owner after its real durable
@@ -313,6 +324,8 @@ class MCPTaskHost:
                 for owner in tuple(self._owners):
                     if owner.hold.handle == actual.handle:
                         self._release(owner)
+        self._maintenance_operations.update(operations)
+        self._maintenance_after = records[-1].handle
 
     def withdraw(self):
         self._accepting = False
@@ -322,6 +335,7 @@ class MCPTaskHost:
         for owner in tuple(self._owners):
             self._release(owner)
         self._rounds.clear()
+        self._maintenance_operations.clear()
         await self.store.close()
         self.retired = True
 

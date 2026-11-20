@@ -156,3 +156,27 @@ async def test_attach_cannot_smuggle_observation_or_unbound_initial_settlement(c
         await store.settle_initial(reserved.issuance, disposition='SETTLED',
             envelope={'version': 1, 'native': {}, 'observation': observation('completed')})
     assert await store.lookup(binding()) == reserved.record
+
+
+@pytest.mark.asyncio
+async def test_read_and_observe_authenticate_only_the_selected_task(custody, monkeypatch):
+    store = await custody.reopen(max_active=4)
+    original = await attached(store)
+    other = await store.reserve(binding(operation_id='unrelated-task'), submission())
+    opened = []
+    open_row = store._open
+
+    def record_open(row):
+        result = open_row(row)
+        opened.append(result.handle)
+        return result
+
+    monkeypatch.setattr(store, '_open', record_open)
+    assert await store.read(original.binding, original.handle) == original
+    assert opened == [original.handle]
+    opened.clear()
+
+    observed = await store.observe(original, observation('completed'))
+    assert observed.phase == 'SETTLED'
+    assert opened == [original.handle]
+    assert await store.read(other.record.binding, other.record.handle) == other.record
