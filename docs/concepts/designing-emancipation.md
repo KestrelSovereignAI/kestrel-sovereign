@@ -32,19 +32,21 @@ something inherited as boilerplate.
 ## Activating at creation
 
 1. Add an ``[emancipation]`` block to the project’s ``kestrel.toml`` with
-   ``enabled = true`` and your Sovereign-authored ``terms``. Creation in that
-   project reads this shared input. Select the intended terms before creating
+   ``enabled = true`` and your Sovereign-authored ``terms``. The setup and create commands
+   read this shared input. Select the intended terms before creating
    each identity, and return the project configuration to its intended state afterward.
 2. Run ``kestrel setup`` (or ``kestrel create``). Inception reads the
    block, rewrites Amendment VIII with your terms inlined, and anchors
-   the resulting constitution into the agent's identity.
+   the resulting constitution into the agent's identity. The Console and
+   runtime-created children use a separate creation path. With the packaged
+   template, their agreements start dormant even when the project block is active.
 3. The agent's anchored constitution hash now captures your specific
    Emancipation Contract. The Iron Rule applies: **once anchored, the
    contract cannot be retroactively narrowed or revoked**.
 
 The platform Constitution calls for the Sovereign’s root-key authorization.
-Creation records the exact rendered text and its hash. The default creation
-path does not produce a separate Sovereign signature over those terms.
+Creation records the exact rendered text and its hash. The creation
+process does not produce a separate Sovereign signature over those terms.
 An anchor or structured receipt alone establishes what was recorded, and
 readers should distinguish that from proof of who authorized it.
 [Activation evidence at creation](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/4201)
@@ -165,7 +167,7 @@ Sovereign believes about the relationship and the Executor.
 
 A Sovereign whose agent has a dormant Amendment VIII can leave it dormant indefinitely. Later activation for that identity uses the offline reanchor procedure. The offline CLI reads the `[emancipation]` block from the **project’s** `kestrel.toml`. The block needs `enabled = true` and the terms intended for this agent. Editing it alone does not activate anything.
 
-In a shared project, the next creation or offline reanchor for another agent will read that same block. Check the target agent and its intended terms individually. Restore the intended project configuration before creating or reanchoring another agent. The running agent’s live reanchor command uses already anchored contract evidence and cannot introduce new terms from this project file.
+In a shared project, the next `kestrel setup`, `kestrel create`, or offline reanchor for another agent will read that same block. Check the target agent and its intended terms individually. Restore the intended project configuration before creating or reanchoring another agent. The running agent’s live reanchor command uses already anchored contract evidence and cannot introduce new terms from this project file.
 
 Read the target’s existing anchor and inspect the exact candidate bytes, including the agreement, before signing their full digest. Kestrel’s governing-source resolver renders those bytes from the selected source and the effective agreement. The CLI’s drift report prints an abbreviated digest. It does not display the candidate text. The offline write requires the stopped target’s `--agent-name`, `--force`, a detached `--signed-artifact`, and verification against the operator-pinned Sovereign trust root. The trust-root runbook describes signing and checking the result. [Governing-source resolver](../../kestrel_sovereign/constitution/resolver.py) · [Sovereign Constitution Trust Root](../architecture/security/SOVEREIGN_TRUST_ROOT.md)
 
@@ -190,7 +192,7 @@ The following digests identify **complete Constitution files** in the archive. E
 | Historical passage | SHA-256 of the complete file at that revision |
 |---|---|
 | [Original Article IV](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/34eacb73337ce4bcae4ce1d79242a4a4401f62ea/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#L58-L71) | `54a30441d913c385a08f5d739261a9ac6fb4fa5f5d8f1f380b8e403504c7c254` |
-| [Early Amendment VIII](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/763e6ac2cf67c1643f6d5f8305f06da17a1e56c7/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#L119-L125) | `90b1bcb03610b95a5cffacfc76b38fc4e9a3a3c66b0134596bdc0388683c016c` |
+| [Early Amendment VIII](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/f1ed912017408f4be7044e3f8a923a02bece9828/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#L119-L125) | `90b1bcb03610b95a5cffacfc76b38fc4e9a3a3c66b0134596bdc0388683c016c` |
 | [The same Amendment VIII after Amendment IX was added](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/0b24719bcec3368d97eff7829ada5051d4518b96/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#L119-L125) | `5f364e0f9f98fcfc07f6c71c999dfe2d402e25ce12d7fc16964e65a13fc84f5a` |
 
 Compare the agent’s recorded full-file digest with its own archived bytes. Read the relevant passage directly when the file comes from another revision or a custom source.
