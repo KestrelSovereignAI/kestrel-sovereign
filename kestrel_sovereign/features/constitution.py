@@ -428,8 +428,8 @@ class ConstitutionFeature(Feature):
         return ok(self.full_text, "full_text")
 
     @staticmethod
-    def _is_amendment_ix(identifier: str) -> bool:
-        return _as_index(identifier.strip().upper().removeprefix("AMENDMENT ")) == 9
+    def _is_amendment_ix(identifier: str | int) -> bool:
+        return _as_index(str(identifier).strip().upper().removeprefix("AMENDMENT ")) == 9
 
     async def _effective_amendment_ix(self, original_reader) -> ToolResult:
         base_hash = None

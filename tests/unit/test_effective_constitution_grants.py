@@ -256,3 +256,16 @@ async def test_failed_governing_reads_do_not_show_current_grants():
         assert view["error"] == error
         assert "effective_grants" not in view["data"]
     agent._get_original_governing_constitution.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identifier, heading",
+    [(8, "Amendment VIII: Historical Terms"), (9, "Effective ComputerUse constitutional grants")],
+)
+async def test_public_tool_accepts_integer_amendment_identifier(identifier, heading):
+    text = _BASE.replace(_BASE_IX, f"### Amendment VIII: Historical Terms\n\n{_BASE_IX}")
+    agent = SimpleNamespace(_get_governing_constitution=AsyncMock(return_value=text))
+    view = await _constitution_tool(agent).execute(article="amendment", search=identifier)
+    assert view["status"] == "ok", view
+    assert heading in view["confirmation"]
