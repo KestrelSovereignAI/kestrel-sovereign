@@ -121,8 +121,10 @@ Both borrow and must-join observation use the retained original receipt through
 `await_owned_task(..., admission=receipt)`, even when the Task refuses diagnostic
 metadata. The explicit receipt must name an exactly admitted native Task.
 Actual result publication is still a separate observable step. A subclass's
-refusal is delivered to the observer; a substituted value cannot replace the
-admitted Task's actual result or acknowledge resource delivery.
+refusal is delivered in the explicit admission's observation outcome so the
+existing owner can close any unpublished handle before propagation. A substituted
+value cannot replace the Task's actual result or certify resource delivery. Neither
+publication failure rewrites the producer's original physical receipt.
 
 `reconcile_owned_task_admission` reports UNKNOWN for a fresh unused receipt,
 ambiguous acceptance, lost completion capture, or an original unretired physical
