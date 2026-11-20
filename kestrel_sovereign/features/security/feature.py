@@ -722,6 +722,7 @@ class SecurityFeature(Feature):
                     "tool": request.tool_name,
                     "args": request.tool_args,
                     "timestamp": request.created_at.isoformat(),
+                    **({"invocation_id": request.invocation_id} if request.invocation_id is not None else {}),
                     **({'native_action': request.native_action.to_dict()}
                        if request.native_action is not None else {}),
                 },

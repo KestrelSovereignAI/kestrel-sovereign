@@ -141,6 +141,8 @@ core = true
 
 [inference_lease.skills]
 inference_lease_acquire = { description = "Acquire approved private inference capacity within cost and privacy bounds", category = "model_management", tags = ["inference", "gpu", "lease"] }
+inference_lease_offer = { description = "Prepare one read-only, expiring private inference offer", category = "model_management", tags = ["inference", "gpu", "lease"] }
+inference_lease_acquire_prepared = { description = "Acquire the exact prepared private inference offer with approval", category = "model_management", tags = ["inference", "gpu", "lease"] }
 inference_lease_status = { description = "Inspect this agent's sanitized inference lease state", category = "model_management", tags = ["inference", "status"] }
 inference_lease_release = { description = "Drain routing and release this agent's inference capacity", category = "model_management", tags = ["inference", "release"] }
 

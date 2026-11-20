@@ -51,6 +51,11 @@ class InferenceLeaseFeature(Feature):
             "in ModelAgent."
         )
 
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        """Expose read-only offers directly while keeping each mutation's approval."""
+        return True
+
     async def initialize(self) -> None:
         llm_service = getattr(self.agent, "llm_service", None)
         owner_id = getattr(self.agent, "agent_id", None)
@@ -237,7 +242,8 @@ class InferenceLeaseFeature(Feature):
             self._assert_cloud_allowed()
             if self._db is None:
                 return ToolResult.failed("Durable storage is required before preparing an acquisition")
-            offer = await self._require_coordinator().prepare_offer(self._lease_request(**request))
+            coordinator = self._require_coordinator()
+            offer = await coordinator.prepare_offer(self._lease_request(**request))
         except (InvalidOperation, TypeError, ValueError) as exc:
             if is_execution_control_error(exc):
                 raise
@@ -246,10 +252,13 @@ class InferenceLeaseFeature(Feature):
             if is_execution_control_error(exc):
                 raise
             return ToolResult.failed(str(exc))
-        return ToolResult.ok(confirmation="One read-only inference offer prepared", data={
-            "request": offer.request.to_public_dict(), "quote": offer.quote.to_public_dict(),
-            "offer_digest": offer.digest,
-        })
+        result = ToolResult.ok(
+            confirmation="One read-only inference offer prepared", data=offer.to_public_dict(),
+        )
+        from kestrel_sovereign.features.inference_lease.offer_evidence import observe_prepared_offer
+
+        observe_prepared_offer(self.agent, coordinator, offer, result)
+        return result
 
     @tool(
         name="inference_lease_acquire_prepared",

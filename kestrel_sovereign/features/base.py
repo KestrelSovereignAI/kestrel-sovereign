@@ -3428,6 +3428,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             _attach_envelope_parts(
                                 response, getattr(result, "parts", None), pending_parts,
                             )
+                            from kestrel_sovereign.tools.effect_journal import (
+                                transfer_tool_effect_result_observation,
+                            )
+
+                            transfer_tool_effect_result_observation(self.feature.agent, result, response)
                             return response
 
                         # Pre-migration return shape (Dict[str, Any]

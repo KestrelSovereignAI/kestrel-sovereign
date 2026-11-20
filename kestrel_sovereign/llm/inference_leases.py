@@ -62,6 +62,13 @@ class PreparedInferenceLeaseOffer:
     request: InferenceLeaseRequest
     quote: InferenceLeaseQuote
 
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "request": self.request.to_public_dict(),
+            "quote": self.quote.to_public_dict(),
+            "offer_digest": self.digest,
+        }
+
     @property
     def digest(self) -> str:
         contents = json.dumps(
@@ -597,6 +604,13 @@ class InferenceLeaseCoordinator:
                 lease = await self._acquire_locked(offer.request, offer=offer)
                 self._prepared_offer = None
                 return lease
+
+    async def is_current_prepared_offer(self, offer: PreparedInferenceLeaseOffer) -> bool:
+        """Confirm the original offer still exists without extending its lifetime."""
+        with bind_execution_runtime(self._llm_service):
+            async with self._lock:
+                require_execution_work()
+                return self._prepared_offer is offer and offer.quote.expires_at > datetime.now(UTC)
 
     async def _choose_offer(self, request: InferenceLeaseRequest) -> InferenceLeaseQuote:
         from kestrel_sovereign._async_ownership import gather_owned
