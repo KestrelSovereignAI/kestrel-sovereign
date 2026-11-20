@@ -3618,6 +3618,7 @@ async def _lifespan_startup(app: FastAPI):
                     multi_agent_path if multi_agent_path.exists() else None
                 ),
                 startup_runtime_env=multi_agent_runtime_env,
+                mcp_oauth_host_policy=getattr(app.state, "mcp_oauth_policy", None),
             )
             # Registry persistence is deliberately ordered before roster
             # persistence during spawn. Repair and contextually validate that
@@ -4122,6 +4123,9 @@ async def _lifespan_startup(app: FastAPI):
             app.state.host_context_publication_gate = host_context_publication_gate
             app.state.agent._host_context_publication_gate = (
                 host_context_publication_gate
+            )
+            app.state.agent._mcp_oauth_host_policy = getattr(
+                app.state, "mcp_oauth_policy", None
             )
             app.state.agent.defer_agent_readiness_to_host()
             _attach_stop_runtime(app, app.state.agent)

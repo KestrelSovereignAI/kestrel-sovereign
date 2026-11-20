@@ -261,6 +261,95 @@ async def test_fresh_restore_request_reads_one_immutable_host_identity_and_budge
 
 
 @pytest.mark.asyncio
+async def test_background_policy_is_bound_at_boot_without_an_interactive_request(oauth_boundary):
+    b = oauth_boundary
+    policy = b.app.state.mcp_oauth_policy
+    replacement = policy.model_copy()
+    assert replacement == policy and replacement is not policy
+    b.agent._mcp_oauth_host_policy = policy
+    b.app.state.mcp_oauth_policy = replacement
+    headers = {"X-API-Key": API_KEY}
+
+    assert (await b.client.get("/api/owned-identity", headers=headers)).status_code == 403
+    assert b.host._require_policy() is policy
+    b.app.state.mcp_oauth_policy = policy
+    assert (await b.client.get("/api/owned-identity", headers=headers)).status_code == 200
+
+    b.agent._mcp_oauth_host_policy = replacement
+    with pytest.raises(HostCapabilityAccessDenied, match="host identity changed"):
+        b.host._require_policy()
+    assert (await b.client.get("/api/owned-identity", headers=headers)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_an_interactive_request_cannot_supply_background_policy(oauth_boundary):
+    b = oauth_boundary
+    headers = {"X-API-Key": API_KEY}
+    assert (await b.client.get("/api/owned-identity", headers=headers)).status_code == 200
+    with pytest.raises(HostCapabilityAccessDenied, match="host identity is not configured"):
+        b.host._require_policy()
+
+    b.agent._mcp_oauth_host_policy = None
+    assert (await b.client.get("/api/owned-identity", headers=headers)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_standalone_startup_publishes_original_oauth_policy(tmp_path, monkeypatch):
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.llm import service as service_module
+    from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
+    from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
+
+    root = tmp_path / "agent"
+    root.mkdir()
+    monkeypatch.chdir(tmp_path)
+    for key, value in {
+        "KESTREL_HOME": str(tmp_path),
+        "KESTREL_DB_PATH": str(root),
+        "KESTREL_HOST_DB_PATH": str(tmp_path / "host.db"),
+        "KESTREL_DB_BACKEND": "sqlite",
+        "KESTREL_HOLD_BACKEND": "sqlite",
+        "KESTREL_MULTI_AGENT_CONFIG": str(tmp_path / "absent.toml"),
+        "KESTREL_API_KEY": API_KEY,
+        "KESTREL_PHOENIX_ENABLED": "0",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_CONFIG_FILE": str(tmp_path / "absent-aws-config"),
+        "AWS_SHARED_CREDENTIALS_FILE": str(tmp_path / "absent-aws-credentials"),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
+    monkeypatch.setattr(service_module, "load_section", lambda _name: {})
+    payer_policy = PayerPolicy.host_env_default().model_copy(
+        update={"llm": PayerSpec(vendor="local", kind=PayerKind.NONE)}
+    )
+    monkeypatch.setattr(
+        server, "KestrelAgent",
+        lambda **kwargs: KestrelAgent(**kwargs, allowed_features={"SpawnFeature"}, payer_policy=payer_policy),
+    )
+    await create_kestrel_identity_async(
+        str(root), is_test_instance=True, genesis_auditor=deterministic_safe_genesis_auditor,
+        genesis_audit_provenance="test:standalone-mcp-oauth-policy",
+    )
+    policy = MCPOAuthHostPolicy(console_origin="https://console.example")
+    app = FastAPI()
+    app.state.mcp_oauth_policy = policy
+
+    async with server.lifespan(app):
+        assert app.state.startup_error is None
+        agent = app.state.agent
+        reserve_native_shutdown_budget(agent, monkeypatch, lifecycle_module=server)
+        assert agent in agent._agent_manager.list_agents().values()
+        feature = OwnedOAuthFeature(agent)
+        await agent._register_feature(feature)
+        host = agent.create_mcp_oauth_host(feature, is_current=lambda: True)
+        try:
+            assert host._require_policy() is policy
+        finally:
+            await host.close()
+            await agent._unregister_feature_runtime(feature, unload=True)
+
+
+@pytest.mark.asyncio
 async def test_copied_task_cannot_read_original_host_operation_identity(oauth_boundary):
     b = oauth_boundary
     result = await b.client.get('/api/owned-identity?mode=copied-task', headers={'X-API-Key': API_KEY})

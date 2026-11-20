@@ -697,6 +697,7 @@ class SpawnFeature(Feature):
                 base_data_dir=base_dir,
                 startup_roster_enabled=False,
                 hold_store=vars(self.agent).get("_hold_store"),
+                mcp_oauth_host_policy=vars(self.agent).get("_mcp_oauth_host_policy"),
             )
             standalone_manager_created = True
             self._standalone_manager_owned = True

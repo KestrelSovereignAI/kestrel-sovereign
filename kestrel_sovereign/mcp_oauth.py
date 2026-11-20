@@ -442,8 +442,14 @@ class MCPOAuthHost:
                     and not any(candidate is self.agent for candidate in manager.list_agents().values()))):
             raise HostCapabilityAccessDenied("original MCP OAuth agent was withdrawn")
 
-    def _policy_for(self, request) -> MCPOAuthHostPolicy:
-        policy = getattr(request.app.state, "mcp_oauth_policy", None)
+    def _require_policy(self, *, request: Request | None = None) -> MCPOAuthHostPolicy:
+        """Resolve the original host identity without relying on a past request."""
+        if request is None:
+            policy = getattr(self.agent, "_mcp_oauth_host_policy", None)
+        else:
+            policy = getattr(request.app.state, "mcp_oauth_policy", None)
+            if getattr(self.agent, "_mcp_oauth_host_policy", policy) is not policy:
+                raise HostCapabilityAccessDenied("original MCP OAuth host identity changed")
         if not isinstance(policy, MCPOAuthHostPolicy):
             raise HostCapabilityAccessDenied("MCP OAuth host identity is not configured")
         if self._policy is not None and self._policy is not policy:
@@ -498,7 +504,7 @@ class MCPOAuthHost:
     @asynccontextmanager
     async def _resolve_context(self, request):
         self._require_live(request)
-        policy = self._policy_for(request)
+        self._require_policy(request=request)
         service = getattr(request.app.state, "request_authentication", None)
         if not isinstance(service, RequestAuthenticationService):
             raise HostCapabilityAccessDenied("interactive request authentication is unavailable")
@@ -510,10 +516,10 @@ class MCPOAuthHost:
 
             def check_current(_context, _action, target):
                 self._require_live(request)
+                self._require_policy(request=request)
                 authentication.require_current()
                 if (not reader.active or target is not None or reader.context is not _context
                         or getattr(request.app.state, "agent_manager", None) is not manager
-                        or getattr(request.app.state, "mcp_oauth_policy", None) is not policy
                         or self.agent._get_privacy_policy_epoch() != epoch):
                     raise HostCapabilityAccessDenied("original MCP OAuth request expired")
 
@@ -799,7 +805,7 @@ class MCPOAuthHost:
             if not isinstance(host, MCPOAuthHost) or host._runtime is None:
                 raise TypeError("original attached MCP OAuth host required")
             try:
-                host._policy_for(request)
+                host._require_policy(request=request)
             except HostCapabilityAccessDenied:
                 raise HTTPException(status_code=403, detail="mcp_oauth_host_identity_unavailable") from None
             return host
