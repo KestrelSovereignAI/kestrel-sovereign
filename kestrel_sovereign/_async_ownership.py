@@ -1163,12 +1163,13 @@ class OwnedOperation:
         if self._task is None:
             return OwnedTaskOutcome(None, self._opening, observation.get("pending_cancellation"))
         if self._opening is None:
-            return await await_owned_task(self._task, **observation)
+            return await await_owned_task(self._task, admission=self._admission, **observation)
         # Do not cancel a failed start gate into a substitute CancelledError.
         # A failed opening already owns unwinding. Observer withdrawal must
         # neither cancel that finalizer nor silently change borrowed timing.
         outcome = await await_owned_task(
-            self._task, **{**observation, "cancel_on_caller_cancellation": False},
+            self._task, admission=self._admission,
+            **{**observation, "cancel_on_caller_cancellation": False},
         )
         return OwnedTaskOutcome(
             outcome.result,
@@ -1883,6 +1884,7 @@ async def await_owned_task(
     task: asyncio.Future[_T],
     pending_cancellation: asyncio.CancelledError | None = None,
     *,
+    admission: OwnedTaskAdmission | None = None,
     cancel_on_caller_cancellation: bool | Callable[[asyncio.Future[_T]], None] = False,
     defer_cancellation: bool = True,
     retain_cancellations: bool = False,
@@ -1914,11 +1916,23 @@ async def await_owned_task(
     immediately. Cancellation of the original Task is retrieved from that
     Task, rather than from the observer's completion signal.
 
+    Pass the original admission when the lifecycle already retains it. Its
+    physical completion must not depend on publication of Task metadata.
+
     ``retain_cancellations`` preserves every distinct delivered withdrawal in
     a fresh finite observer carrier, never on the physical owner's cached
     result or by rewriting an original cancellation's cause. Legacy callers
     retain their existing first-withdrawal disposition by default.
     """
+    if admission is not None and (
+        type(admission) is not OwnedTaskAdmission or not admission._creation_started
+        or admission.task is not task or not isinstance(task, _NATIVE_TASK)
+    ):
+        raise TypeError("owned join requires this Task's original admission")
+
+    def original_done():
+        return task.done() if admission is None else _NATIVE_TASK.done(task)
+
     if not defer_cancellation and (cancel_on_caller_cancellation or pending_cancellation is not None):
         raise ValueError("borrowed observation cannot forward or own pending cancellation")
     completion: asyncio.Future[None] | None = None
@@ -1945,13 +1959,13 @@ async def await_owned_task(
         # Observation admission is fallible too. Its allocation refusal must
         # use the SAME positive-interval, original-task must-join path as
         # callback publication refusal, not unwind an accepted native owner.
-        if not task.done():
+        if not original_done():
             completion = asyncio.get_running_loop().create_future()
             task.add_done_callback(mark_complete)
     except BaseException as error:
         retain_publication_failure(error)
     try:
-        while not task.done():
+        while not original_done():
             if publication_errors and not defer_cancellation:
                 # This is explicitly a borrowed observer, not its native
                 # lifecycle owner. Its original owner retains the must-join.
@@ -2007,12 +2021,12 @@ async def await_owned_task(
     if not defer_cancellation and pending_cancellation is not None:
         from kestrel_sovereign.execution_custody import execution_observation_error
         raise execution_observation_error(pending_cancellation, *publication_errors)
-    if not task.done():
+    if not original_done():
         # Only an explicitly borrowed observer may leave before settlement.
         assert not defer_cancellation and publication_errors
         from kestrel_sovereign.execution_custody import execution_observation_error
         raise execution_observation_error(*publication_errors)
-    error = owned_task_error(task)
+    error = owned_task_error(task, admission=admission)
     if publication_errors:
         from kestrel_sovereign.execution_custody import execution_observation_error
         failures = ([error] if error is not None else []) + publication_errors
@@ -2028,7 +2042,8 @@ async def await_owned_task(
             error.add_note(f"cancellation forwarding also failed: {forwarding_error}")
     if error is not None:
         return OwnedTaskOutcome(None, error, pending_cancellation)
-    return OwnedTaskOutcome(task.result(), None, pending_cancellation)
+    result = task.result() if admission is None else _NATIVE_TASK.result(task)
+    return OwnedTaskOutcome(result, None, pending_cancellation)
 
 
 async def wait_owned_or_pending(

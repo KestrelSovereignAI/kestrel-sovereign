@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign._async_ownership import (
     OwnedOperation,
@@ -350,6 +351,53 @@ async def test_reconciliation_keeps_explicit_receipt_when_task_metadata_is_denie
         loop.set_task_factory(previous)
         if operation is not None and operation.task is not None:
             await await_owned_task(operation.task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("borrowed", [False, True])
+@pytest.mark.parametrize("reconcile_first", [False, True])
+async def test_operation_observers_keep_original_receipt_after_metadata_refusal(borrowed, reconcile_first):
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    receipt = OwnedTaskAdmission()
+    unknown = ResourceOutcomeUnknown("original physical finalizer outcome uncertain")
+    physical = asyncio.CancelledError("original physical finalizer")
+    physical.__cause__ = unknown
+
+    class RefuseMetadata(asyncio.Task):
+        def __setattr__(self, name, value):
+            if name in {"_kestrel_owned_admission", "_kestrel_owned_terminal_error"}:
+                raise RuntimeError("original native metadata publication refused")
+            super().__setattr__(name, value)
+
+    def factory(loop, operation, **kwargs):
+        async def original_finalizer():
+            try:
+                return await operation
+            finally:
+                raise physical
+
+        return RefuseMetadata(original_finalizer(), loop=loop, **kwargs)
+
+    async def body():
+        pytest.fail("metadata publication failed before payload admission")
+
+    loop.set_task_factory(factory)
+    try:
+        operation = OwnedOperation(body(), admission=receipt)
+    finally:
+        loop.set_task_factory(previous)
+    assert operation.task is receipt.task and operation.task is not None
+
+    # Native wait gives us terminalization without consuming original C.
+    await asyncio.wait((operation.task,))
+    if reconcile_first:
+        retirement = public.reconcile_owned_task_admission(receipt)
+        assert unknown in execution_evidence_carriers(retirement.error)
+    seen = await operation.observe(defer_cancellation=not borrowed)
+    assert seen.cancellation is None
+    assert unknown in execution_evidence_carriers(seen.error)
+    assert unknown in execution_evidence_carriers(public.reconcile_owned_task_admission(receipt).error)
 
 
 @pytest.mark.asyncio
