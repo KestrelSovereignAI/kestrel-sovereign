@@ -225,6 +225,8 @@ _DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
         # approval rail. Status is read-only; release is owner-scoped and stops
         # spend, so both must remain available for unattended reconciliation.
         "inference_lease_acquire": PermissionLevel.ALWAYS_ASK,
+        "inference_lease_acquire_prepared": PermissionLevel.ALWAYS_ASK,
+        "inference_lease_offer": PermissionLevel.ALLOW,
         "inference_lease_status": PermissionLevel.ALLOW,
         "inference_lease_release": PermissionLevel.ALLOW,
     },

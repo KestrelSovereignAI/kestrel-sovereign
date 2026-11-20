@@ -336,6 +336,36 @@ async def test_prepared_offer_retry_still_requires_original_durable_ack():
 
 
 @pytest.mark.asyncio
+async def test_offer_tools_only_mutate_through_exact_always_ask_acquisition():
+    from kestrel_sovereign.features.inference_lease.feature import InferenceLeaseFeature
+    from kestrel_sovereign.features.security.feature import default_permission_for_tool
+    from kestrel_sovereign.features.security.permissions import PermissionLevel
+
+    assert default_permission_for_tool("InferenceLeaseFeature", "inference_lease_offer") is PermissionLevel.ALLOW
+    assert default_permission_for_tool("InferenceLeaseFeature", "inference_lease_acquire_prepared") is PermissionLevel.ALWAYS_ASK
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    coordinator, persisted = _coordinator({"runpod": provider})
+    feature = InferenceLeaseFeature(SimpleNamespace(
+        privacy_agent=SimpleNamespace(can_use_cloud=lambda: True),
+    ))
+    feature._coordinator = coordinator
+    feature._owner_id = "agent-1"
+    feature._db = object()
+    preview = await feature.offer({
+        "model": "qwen3:8b", "max_hourly_cost_usd": "1", "max_total_cost_usd": "0.40",
+        "allowed_regions": ["us-tx-1"], "request_id": "offer-bound-request",
+    })
+    assert not persisted and provider.acquire_calls == 0
+    assert preview.data["quote"]["request_id"] == "offer-bound-request"
+    wrong = await feature.acquire_prepared("some-other-request", preview.data["offer_digest"])
+    assert "does not match the approval" in wrong.error
+    assert not persisted and provider.acquire_calls == 0
+    accepted = await feature.acquire_prepared("offer-bound-request", preview.data["offer_digest"])
+    assert accepted.data["lease"]["quote_id"] == preview.data["quote"]["quote_id"]
+    assert provider.acquire_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_selects_cheapest_quote_then_fastest_without_mutating_others():
     cheap_slow = _Provider("cheap", total="0.10", ready_seconds=50)
     cheap_fast = _Provider("fast", total="0.10", ready_seconds=20)
