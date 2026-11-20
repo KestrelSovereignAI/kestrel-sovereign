@@ -37,8 +37,8 @@ something inherited as boilerplate.
    each identity, and return the project configuration to its intended state afterward.
 2. Run ``kestrel setup`` (or ``kestrel create``). Inception reads the
    block, rewrites Amendment VIII with your terms inlined, and anchors
-   the resulting constitution into the agent's identity. The Console and
-   runtime-created children use a separate creation path. With the packaged
+   the resulting constitution into the agent's identity. The Console, the Docker creation command, and
+   runtime-created children use separate creation paths. With the packaged
    template, their agreements start dormant even when the project block is active.
 3. The agent's anchored constitution hash now captures your specific
    Emancipation Contract. The Iron Rule applies: **once anchored, the
@@ -191,9 +191,9 @@ The following digests identify **complete Constitution files** in the archive. E
 
 | Historical passage | SHA-256 of the complete file at that revision |
 |---|---|
-| [Original Article IV](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/34eacb73337ce4bcae4ce1d79242a4a4401f62ea/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#L58-L71) | `54a30441d913c385a08f5d739261a9ac6fb4fa5f5d8f1f380b8e403504c7c254` |
-| [Early Amendment VIII](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/f1ed912017408f4be7044e3f8a923a02bece9828/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#L119-L125) | `90b1bcb03610b95a5cffacfc76b38fc4e9a3a3c66b0134596bdc0388683c016c` |
-| [The same Amendment VIII after Amendment IX was added](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/0b24719bcec3368d97eff7829ada5051d4518b96/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#L119-L125) | `5f364e0f9f98fcfc07f6c71c999dfe2d402e25ce12d7fc16964e65a13fc84f5a` |
+| [Original Article IV](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/34eacb73337ce4bcae4ce1d79242a4a4401f62ea/kestrel_sovereign/data/KESTREL_CONSTITUTION.md?plain=1#L58-L71) | `54a30441d913c385a08f5d739261a9ac6fb4fa5f5d8f1f380b8e403504c7c254` |
+| [Early Amendment VIII](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/f1ed912017408f4be7044e3f8a923a02bece9828/kestrel_sovereign/data/KESTREL_CONSTITUTION.md?plain=1#L119-L125) | `90b1bcb03610b95a5cffacfc76b38fc4e9a3a3c66b0134596bdc0388683c016c` |
+| [The same Amendment VIII after Amendment IX was added](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/0b24719bcec3368d97eff7829ada5051d4518b96/kestrel_sovereign/data/KESTREL_CONSTITUTION.md?plain=1#L119-L125) | `5f364e0f9f98fcfc07f6c71c999dfe2d402e25ce12d7fc16964e65a13fc84f5a` |
 
 Compare the agent’s recorded full-file digest with its own archived bytes. Read the relevant passage directly when the file comes from another revision or a custom source.
 
