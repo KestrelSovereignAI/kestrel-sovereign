@@ -7,7 +7,14 @@ import pytest
 
 from kestrel_sovereign import async_ownership as ownership
 from kestrel_sovereign._async_ownership import OwnedCallbackScope, without_owned_coordinators
-from kestrel_sovereign.execution_custody import execution_evidence_carriers
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ProcessRuntimeExecutionFence,
+    bind_execution_cleanup,
+    bind_execution_custody,
+    execution_evidence_carriers,
+    require_execution_work,
+)
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 
 
@@ -250,3 +257,34 @@ async def test_factory_captured_outside_a_root_cannot_enroll_in_active_root():
         with without_owned_coordinators():
             await ownership.create_owned_task(body())
     assert not host.retired
+
+
+@pytest.mark.asyncio
+async def test_exact_cleanup_does_not_request_a_new_work_loan(tmp_path):
+    host = CapacityLoan(capacity=1)
+    closed = asyncio.Event()
+    path = tmp_path / "original-resource"
+    resource = path.open("wb")
+
+    async def body():
+        capture = ownership.capture_owned_task_lender()
+        assert capture is not None and len(host.outstanding) == 1
+
+        async def release():
+            assert ownership.capture_owned_task_lender() is None
+            with pytest.raises(ExecutionAuthorityError, match="cleanup"):
+                require_execution_work()
+            resource.close()
+            closed.set()
+
+        with bind_execution_cleanup(None):
+            await ownership.create_owned_task(release(), lender_capture=capture)
+        assert closed.is_set() and len(host.outstanding) == 1
+
+    try:
+        with bind_execution_custody(ProcessRuntimeExecutionFence("owned-task-lender-test")):
+            with ownership.bind_owned_task_lender(host):
+                await ownership.create_owned_task(body())
+    finally:
+        resource.close()
+    assert len(host.retired) == 1 and not host.outstanding

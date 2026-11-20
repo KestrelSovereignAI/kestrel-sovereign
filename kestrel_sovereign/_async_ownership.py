@@ -44,6 +44,7 @@ _NATIVE_LOOP_CREATE_TASK_CODE = asyncio.BaseEventLoop.create_task.__code__
 # original native admission; inheriting this context grants no membership.
 _OWNED_COORDINATORS = contextvars.ContextVar("kestrel_owned_coordinators", default=())
 _OWNED_TASK_LENDER = contextvars.ContextVar("kestrel_owned_task_lender", default=None)
+_LENDING_DISABLED = object()
 
 
 class _AutomaticTaskLender:
@@ -132,12 +133,26 @@ def without_owned_coordinators():
     is created with no coordinator routed, and copies none into its context.
     """
     reset = _OWNED_COORDINATORS.set(())
-    reset_lender = _OWNED_TASK_LENDER.set(None)
+    reset_lender = _OWNED_TASK_LENDER.set(
+        _LENDING_DISABLED if _OWNED_TASK_LENDER.get() is _LENDING_DISABLED else None,
+    )
     try:
         yield
     finally:
         _OWNED_TASK_LENDER.reset(reset_lender)
         _OWNED_COORDINATORS.reset(reset)
+
+
+@contextmanager
+def _disable_owned_task_lending(disabled: bool):
+    if not disabled:
+        yield
+        return
+    reset = _OWNED_TASK_LENDER.set(_LENDING_DISABLED)
+    try:
+        yield
+    finally:
+        _OWNED_TASK_LENDER.reset(reset)
 
 
 @asynccontextmanager
@@ -394,6 +409,8 @@ class OwnedTaskLenderCapture:
 @contextmanager
 def bind_owned_task_lender(policy: OwnedTaskLender):
     """Bind the host's live root to this exact Task until lexical exit."""
+    if _OWNED_TASK_LENDER.get() is _LENDING_DISABLED:
+        raise RuntimeError("cleanup-only custody cannot bind a work lender")
     parent = asyncio.current_task()
     if parent is None:
         raise RuntimeError("owned task lender needs an original Task")
@@ -409,7 +426,7 @@ def bind_owned_task_lender(policy: OwnedTaskLender):
 def capture_owned_task_lender() -> OwnedTaskLenderCapture | None:
     """Capture the actual admitted parent; a copied ContextVar grants nothing."""
     capture = _OWNED_TASK_LENDER.get()
-    if (capture is not None and capture._binding.active
+    if (type(capture) is OwnedTaskLenderCapture and capture._binding.active
             and asyncio.current_task() is capture._parent):
         return capture
     return None
@@ -601,6 +618,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     gate = None
     admitted_coordinators = ()
     admitted_lender = None
+    lending_disabled = _OWNED_TASK_LENDER.get() is _LENDING_DISABLED
     loan = None
     loan_retirement_ready = False
     loan_retirement_started = False
@@ -618,7 +636,9 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
                 (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
             )))
-            reset_lender = _OWNED_TASK_LENDER.set(admitted_lender)
+            reset_lender = _OWNED_TASK_LENDER.set(
+                _LENDING_DISABLED if lending_disabled else admitted_lender,
+            )
             try:
                 return await operation
             finally:
@@ -752,6 +772,8 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         task_factory = owner_loop.get_task_factory()
         capture = ((capture_owned_task_lender() if context is None else None)
                    if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture)
+        if lending_disabled:
+            capture = None
         if capture is not None:
             if (type(capture) is not OwnedTaskLenderCapture or not capture._binding.active
                     or _NATIVE_TASK.done(capture._parent)

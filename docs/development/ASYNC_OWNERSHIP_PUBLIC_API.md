@@ -151,6 +151,9 @@ or fresh context does not supply a captured parent. Pass the exact capture to
 explicitly delegate across a fresh execution context; pass `None` to suppress
 lending. Native privacy factories and callback scopes retain the capture at
 creation, independently of privacy scope. A detached boundary suppresses it.
+Core's cleanup-only custody suppresses WORK lending even for previously
+captured factories. The original admitted owner still retains its physical
+cleanup and reports its exact outcome; no new work grant is made there.
 
 For complete native retirement or proven nonacceptance, Core publishes one
 canonical observation to the host. UNKNOWN retains the admission and its

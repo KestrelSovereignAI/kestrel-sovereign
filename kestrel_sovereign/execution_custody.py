@@ -1817,12 +1817,18 @@ def bind_execution_cleanup(
     storage, tools and provider calls still pass through ordinary work denial.
     Children inherit this restriction even after their closer leaves the scope.
     """
+    from kestrel_sovereign._async_ownership import _disable_owned_task_lending
+
     existing = current_execution_custody(owner)
     scopes = existing + tuple(scope for scope in captured if scope not in existing)
     custody_token = _CURRENT_CUSTODY.set(scopes)
-    cleanup_token = _CLEANUP_ONLY.set(_CLEANUP_ONLY.get() or bool(scopes))
+    cleanup_only = _CLEANUP_ONLY.get() or bool(scopes)
+    cleanup_token = _CLEANUP_ONLY.set(cleanup_only)
     try:
-        yield
+        # The original physical owner carries this cleanup. It cannot request
+        # a fresh WORK loan, including through a previously captured factory.
+        with _disable_owned_task_lending(cleanup_only):
+            yield
     finally:
         _CLEANUP_ONLY.reset(cleanup_token)
         _CURRENT_CUSTODY.reset(custody_token)
