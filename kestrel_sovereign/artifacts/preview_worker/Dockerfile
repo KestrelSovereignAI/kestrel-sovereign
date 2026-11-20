@@ -10,6 +10,8 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && \
 COPY requirements.txt /renderer/requirements.txt
 RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r /renderer/requirements.txt
 COPY worker.py /renderer/worker.py
+# The decoder runs as a non-root user even when built from a private checkout.
+RUN chmod 0444 /renderer/worker.py
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/nonexistent
 USER 65532:65532
 ENTRYPOINT ["python", "-I", "/renderer/worker.py"]
