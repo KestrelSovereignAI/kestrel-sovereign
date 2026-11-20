@@ -425,8 +425,10 @@ async def test_original_success_refuses_substitute_result_publication(borrowed):
         operation = OwnedOperation(original(), admission=receipt)
     finally:
         loop.set_task_factory(previous)
-    with pytest.raises(RuntimeError, match="replaced the original native result"):
-        await operation.observe(defer_cancellation=not borrowed)
+    outcome = await operation.observe(defer_cancellation=not borrowed)
+    assert isinstance(outcome.error, RuntimeError)
+    assert "replaced the original native result" in str(outcome.error)
+    assert outcome.result is None and outcome.cancellation is None
     physical = public.reconcile_owned_task_admission(receipt)
     assert physical.state == "complete" and physical.error is None
     assert physical.task is operation.task

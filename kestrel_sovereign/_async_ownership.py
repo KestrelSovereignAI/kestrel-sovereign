@@ -2042,13 +2042,22 @@ async def await_owned_task(
             error.add_note(f"cancellation forwarding also failed: {forwarding_error}")
     if error is not None:
         return OwnedTaskOutcome(None, error, pending_cancellation)
+    if admission is None:
+        return OwnedTaskOutcome(task.result(), None, pending_cancellation)
     # A successful physical return is not proof that its observer received
     # it. Preserve the Task's result publication (and its original refusal),
     # but never accept a subclass's substitute as this admission's result.
-    result = task.result()
-    if (admission is not None and type(task) is not _NATIVE_TASK
-            and result is not _NATIVE_TASK.result(task)):
-        raise RuntimeError("owned result publication replaced the original native result")
+    try:
+        result = task.result()
+        if type(task) is not _NATIVE_TASK and result is not _NATIVE_TASK.result(task):
+            raise RuntimeError("owned result publication replaced the original native result")
+    except BaseException as publication:
+        # Acquisition callers must receive an observation so they can retire
+        # the actual opened handle before propagating its publication failure.
+        # Do not change the already-settled producer receipt.
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        retain_publication_failure(publication)
+        return OwnedTaskOutcome(None, execution_observation_error(*publication_errors), pending_cancellation)
     return OwnedTaskOutcome(result, None, pending_cancellation)
 
 

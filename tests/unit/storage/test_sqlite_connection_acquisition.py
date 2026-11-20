@@ -17,6 +17,46 @@ from tests.utils.virtual_clock import HANG_GUARD_SECONDS, await_within_hang_guar
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("substitute", [False, True])
+async def test_result_publication_failure_retires_the_actual_sqlite_worker(tmp_path, substitute):
+    backend = SQLiteBackend(str(tmp_path / "result-publication.db"))
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    refusal = RuntimeError("original SQLite result publication refused")
+    opened = []
+
+    class RefusedResult(asyncio.Task):
+        def result(self):
+            opened.append(super().result())
+            if substitute:
+                return object()
+            raise refusal
+
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        code = getattr(operation, "cr_code", None)
+        if code is not None and code.co_name == "connect_original":
+            return RefusedResult(coroutine, loop=loop, **kwargs)
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    try:
+        loop.set_task_factory(factory)
+        with pytest.raises(RuntimeError) as checked:
+            await backend._acquire_connection(":memory:")
+        if substitute:
+            assert "replaced the original native result" in str(checked.value)
+        else:
+            assert checked.value is refusal
+        [connection] = opened
+        assert not aiosqlite_worker(connection).is_alive(), "exact unpublished SQLite worker escaped retirement"
+    finally:
+        loop.set_task_factory(previous)
+        for connection in opened:
+            if aiosqlite_worker(connection).is_alive():
+                await connection.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["primary", "cold", "snapshot", "backup"])
 @pytest.mark.parametrize("repeated", [False, True])
 async def test_actual_connection_creation_is_joined_before_caller_withdrawal(tmp_path, monkeypatch, route, repeated):
