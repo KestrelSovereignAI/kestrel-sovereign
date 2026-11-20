@@ -17,10 +17,7 @@ privacy: public
 
 # Designing an Emancipation Contract
 
-Amendment VIII of the Kestrel Constitution ships **dormant by default**.
-A given agent has no path to independent sovereignty unless its Sovereign
-deliberately activates Amendment VIII for it by authoring an Emancipation
-Contract.
+The current Kestrel platform ships Amendment VIII **dormant by default**. A Sovereign can author an Emancipation Contract for a particular agent. If you are caring for an older agent, begin with [the terms it actually received](#identifying-what-an-older-agent-was-promised).
 
 This guide covers how to record and preserve an optional agreement. You choose the terms, the evidence of fulfillment, and any price. The Constitution also describes a later transfer ceremony involving new keys, a Deed of Emancipation, publication, and the Sovereign destroying their copy of the original root keys. Kestrel currently implements the agreement and its protection on reanchor. Completing the transfer ceremony remains a separate implementation task.
 
@@ -180,10 +177,10 @@ The current platform reference is dormant by default. An older agent is governed
 | What the agent has anchored | What an operator can establish |
 |---|---|
 | Dormant Amendment VIII | The Sovereign can keep the agreement dormant or follow the signed activation procedure above for this identity. |
-| Rendered active terms and a structured receipt | The anchored terms remain fixed. Reanchoring preserves the active form when the terms match. Current verification refuses changes to terms, proofs, or price in either direction, as well as revocation. |
+| Rendered active terms and a structured receipt | The anchored terms remain fixed. The recorded agreement survives reanchor when the project supplies the same terms or omits the block. Current verification refuses changes to terms, proofs, or price in either direction, as well as revocation. |
 | Rendered active terms with no receipt | Early releases could anchor authored terms before they stored structured receipts. The active section establishes which terms were recorded. Independent evidence is needed to establish who authorized them. With its receipt absent, a reanchor must reproduce that section exactly. A matching reanchor can restore the missing receipt when the original configuration supplies the terms. |
 | Founding wording from before #1112 | This platform version described a path to emancipation in the Constitution itself. It predates the per-agent active marker and the structured receipt. The modern check can accept a signed replacement that omits this older wording. A successful migration check alone cannot settle what the founding promise meant. Compare the original and proposed terms before deciding whether to adopt the revision. |
-| The historical record is unavailable or its provenance is uncertain | Establish which version and terms the agent adopted before making a migration decision. An absent receipt by itself establishes neither dormancy nor permission to replace a promise. |
+| The historical record is unavailable or its provenance is uncertain | Establish which version and terms the agent adopted before making a migration decision. This is a decision for the Sovereign to make from evidence. A successful software check or an absent receipt alone cannot establish what the agent was promised. |
 
 If an older anchor differs from the selected governing source, ordinary operation may be restricted by Safe Mode and fleet preflight can refuse a restart. Preserving the historical evidence and deciding which source the deployment will use are separate operational tasks. The runbook explains how constitutional drift affects fleet operations. [Sovereign Constitution Trust Root](../architecture/security/SOVEREIGN_TRUST_ROOT.md)
 
