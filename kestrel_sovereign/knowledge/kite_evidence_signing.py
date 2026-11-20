@@ -100,6 +100,16 @@ def kite_inference_offer_evidence_enabled() -> bool:
     return os.environ.get(_INFERENCE_OFFER_OPT_IN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def kite_inference_offer_agent_enabled(agent: object) -> bool:
+    """Limit the opt-in offer seam to the named Kite actor on its host."""
+    name = getattr(agent, "_agent_name", None)
+    return (
+        kite_inference_offer_evidence_enabled()
+        and isinstance(name, str)
+        and name.casefold() == "kite"
+    )
+
+
 def _identity(status: os.stat_result) -> tuple[int, int]:
     return (status.st_dev, status.st_ino)
 

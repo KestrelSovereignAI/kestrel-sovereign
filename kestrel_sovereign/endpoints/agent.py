@@ -168,13 +168,11 @@ def _kite_evidence_error(message: str) -> ApiHTTPException:
 
 
 def _require_kite_inference_offer_evidence(request: Request, agent: Any) -> None:
-    from kestrel_sovereign.knowledge.kite_evidence_signing import kite_inference_offer_evidence_enabled
+    from kestrel_sovereign.knowledge.kite_evidence_signing import kite_inference_offer_agent_enabled
     from kestrel_sovereign.security.bootstrap_access import forwarding_header_names
 
     caller = getattr(request.state, "caller", None)
-    name = getattr(agent, "_agent_name", None)
-    if (not kite_inference_offer_evidence_enabled()
-            or not isinstance(name, str) or name.casefold() != "kite"
+    if (not kite_inference_offer_agent_enabled(agent)
             or request.client is None or request.client.host not in {"127.0.0.1", "::1"}
             or forwarding_header_names(request.headers.keys())
             or type(caller) is not CallerContext or not caller.is_sovereign

@@ -21,6 +21,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.knowledge.kite_evidence_signing import kite_inference_offer_agent_enabled
 from kestrel_sovereign.llm.inference_leases import (
     InferenceLeaseCoordinator,
     discover_inference_lease_providers,
@@ -53,8 +54,8 @@ class InferenceLeaseFeature(Feature):
 
     @property
     def promote_tools_on_startup(self) -> bool:
-        """Expose read-only offers directly while keeping each mutation's approval."""
-        return True
+        """Only the opt-in Kite actor pins the exact offer and approval surface."""
+        return kite_inference_offer_agent_enabled(self.agent)
 
     async def initialize(self) -> None:
         llm_service = getattr(self.agent, "llm_service", None)
