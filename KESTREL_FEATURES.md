@@ -425,6 +425,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `inference_lease_acquire` |  | `model_management` | `model`, `max_hourly_cost_usd`, `max_total_cost_usd`, `runtime`, `privacy`, `expected_session_seconds`, `idle_ttl_seconds`, `ready_deadline_seconds`, `expected_concurrency`, `allowed_regions`, `capabilities`, `request_id` | 497 | `enabled` |
+| `inference_lease_acquire_prepared` |  | `model_management` | `request_id`, `offer_digest` | 91 | `enabled` |
+| `inference_lease_offer` |  | `model_management` | `request` | 65 | `enabled` |
 | `inference_lease_release` |  | `model_management` | `lease_id` | 72 | `enabled` |
 | `inference_lease_status` |  | `model_management` | `lease_id` | 75 | `enabled` |
 
@@ -782,6 +784,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/health/trigger`
   - `GET /api/agent/heartbeat/status`
   - `POST /api/agent/heartbeat/trigger`
+  - `GET /api/agent/inference-offer-evidence/key`
   - `GET /api/agent/info`
   - `POST /api/agent/invoke`
   - `GET /api/agent/notifications`

@@ -32,6 +32,24 @@ from kestrel_sovereign.llm.inference_leases import (
 )
 
 
+@pytest.mark.parametrize(
+    ("opt_in", "name", "expected"),
+    [(None, "Kite", False), ("1", "Other agent", False), ("1", "Kite", True)],
+)
+def test_startup_promotion_is_scoped_to_opted_in_kite(monkeypatch, opt_in, name, expected):
+    setting = "KESTREL_KITE_INFERENCE_OFFER_EVIDENCE"
+    if opt_in is None:
+        monkeypatch.delenv(setting, raising=False)
+    else:
+        monkeypatch.setenv(setting, opt_in)
+    feature = InferenceLeaseFeature(SimpleNamespace(_agent_name=name))
+
+    assert feature.promote_tools_on_startup is expected
+    assert {tool.name for tool in feature.get_tools()} >= {
+        "inference_lease_offer", "inference_lease_acquire_prepared",
+    }
+
+
 class _Database:
     def __init__(self):
         self.values: dict[tuple[str, str], str] = {}

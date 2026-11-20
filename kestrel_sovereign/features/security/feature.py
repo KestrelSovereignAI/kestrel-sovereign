@@ -225,6 +225,8 @@ _DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
         # approval rail. Status is read-only; release is owner-scoped and stops
         # spend, so both must remain available for unattended reconciliation.
         "inference_lease_acquire": PermissionLevel.ALWAYS_ASK,
+        "inference_lease_acquire_prepared": PermissionLevel.ALWAYS_ASK,
+        "inference_lease_offer": PermissionLevel.ALLOW,
         "inference_lease_status": PermissionLevel.ALLOW,
         "inference_lease_release": PermissionLevel.ALLOW,
     },
@@ -720,6 +722,7 @@ class SecurityFeature(Feature):
                     "tool": request.tool_name,
                     "args": request.tool_args,
                     "timestamp": request.created_at.isoformat(),
+                    **({"invocation_id": request.invocation_id} if request.invocation_id is not None else {}),
                     **({'native_action': request.native_action.to_dict()}
                        if request.native_action is not None else {}),
                 },

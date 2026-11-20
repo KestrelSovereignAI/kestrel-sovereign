@@ -92,6 +92,7 @@ class ApprovalRequest:
     awaiter_error: BaseException | None = field(default=None, repr=False)
     decision_operation: Optional["OwnedOperation"] = field(default=None, repr=False)
     native_action: NativeActionContext | None = None
+    invocation_id: str | None = None
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -520,6 +521,8 @@ class ApprovalQueue:
             )
             return (False, "no_approver")
 
+        from kestrel_sovereign.agent.invocation import current_invocation_id
+
         request = ApprovalRequest(
             id=str(uuid4()),
             feature_name=feature_name,
@@ -529,6 +532,7 @@ class ApprovalQueue:
             timeout_seconds=timeout,
             audit_action=audit_action,
             native_action=native_action,
+            invocation_id=current_invocation_id(),
         )
 
         self._pending[request.id] = request

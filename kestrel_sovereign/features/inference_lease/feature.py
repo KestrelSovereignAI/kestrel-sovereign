@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from kestrel_sdk.llm import (
+    InferenceLease,
     InferenceLeaseError,
     InferenceLeaseRequest,
     InferencePrivacy,
@@ -20,6 +21,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.knowledge.kite_evidence_signing import kite_inference_offer_agent_enabled
 from kestrel_sovereign.llm.inference_leases import (
     InferenceLeaseCoordinator,
     discover_inference_lease_providers,
@@ -49,6 +51,11 @@ class InferenceLeaseFeature(Feature):
             "and release it when finished. Model discovery and selection remain "
             "in ModelAgent."
         )
+
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        """Only the opt-in Kite actor pins the exact offer and approval surface."""
+        return kite_inference_offer_agent_enabled(self.agent)
 
     async def initialize(self) -> None:
         llm_service = getattr(self.agent, "llm_service", None)
@@ -133,6 +140,24 @@ class InferenceLeaseFeature(Feature):
             (self._owner_id, _STATE_KEY, value, datetime.now(UTC)),
         )
 
+    def _lease_request(
+        self, model: str, max_hourly_cost_usd: str, max_total_cost_usd: str, *,
+        runtime: str = "ollama", privacy: str = "authenticated_endpoint",
+        expected_session_seconds: int = 900, idle_ttl_seconds: int = 300,
+        ready_deadline_seconds: int = 900, expected_concurrency: int = 1,
+        allowed_regions: list[str] | None = None, capabilities: list[str] | None = None,
+        request_id: str | None = None,
+    ) -> InferenceLeaseRequest:
+        return InferenceLeaseRequest(
+            request_id=request_id or f"lease-{uuid4().hex}", owner_id=self._owner_id,
+            model=model, runtime=runtime, max_hourly_cost_usd=Decimal(max_hourly_cost_usd),
+            max_total_cost_usd=Decimal(max_total_cost_usd), privacy=InferencePrivacy(privacy),
+            capabilities=tuple(capabilities or _DEFAULT_CAPABILITIES),
+            allowed_regions=tuple(allowed_regions or ()), expected_concurrency=expected_concurrency,
+            expected_session_seconds=expected_session_seconds, idle_ttl_seconds=idle_ttl_seconds,
+            ready_deadline_seconds=ready_deadline_seconds,
+        )
+
     @tool(
         name="inference_lease_acquire",
         description=(
@@ -184,23 +209,12 @@ class InferenceLeaseFeature(Feature):
                 return ToolResult.failed(
                     "Durable storage is required before acquiring billable capacity"
                 )
-            hourly = Decimal(max_hourly_cost_usd)
-            total = Decimal(max_total_cost_usd)
-            privacy_mode = InferencePrivacy(privacy)
-            request = InferenceLeaseRequest(
-                request_id=request_id or f"lease-{uuid4().hex}",
-                owner_id=self._owner_id,
-                model=model,
-                runtime=runtime,
-                max_hourly_cost_usd=hourly,
-                max_total_cost_usd=total,
-                privacy=privacy_mode,
-                capabilities=tuple(capabilities or _DEFAULT_CAPABILITIES),
-                allowed_regions=tuple(allowed_regions or ()),
-                expected_concurrency=expected_concurrency,
-                expected_session_seconds=expected_session_seconds,
-                idle_ttl_seconds=idle_ttl_seconds,
-                ready_deadline_seconds=ready_deadline_seconds,
+            request = self._lease_request(
+                model, max_hourly_cost_usd, max_total_cost_usd,
+                runtime=runtime, privacy=privacy, capabilities=capabilities,
+                allowed_regions=allowed_regions, expected_concurrency=expected_concurrency,
+                expected_session_seconds=expected_session_seconds, idle_ttl_seconds=idle_ttl_seconds,
+                ready_deadline_seconds=ready_deadline_seconds, request_id=request_id,
             )
             lease = await self._require_coordinator().acquire(request)
         except (InvalidOperation, TypeError, ValueError) as exc:
@@ -211,6 +225,66 @@ class InferenceLeaseFeature(Feature):
             if is_execution_control_error(exc):
                 raise
             return ToolResult.failed(str(exc))
+        return self._acquired_lease_result(lease)
+
+    @tool(
+        name="inference_lease_offer",
+        description="Select a read-only, expiring private inference offer without allocating capacity.",
+        category=ToolCategory.MODEL_MANAGEMENT,
+    )
+    async def offer(self, request: dict[str, Any]) -> ToolResult:
+        """Prepare one exact offer for a later unpromotable acquire approval.
+
+        Args:
+            request: The inference_lease_acquire request fields, including model,
+                max_hourly_cost_usd, max_total_cost_usd and optional allowed_regions.
+        """
+        try:
+            self._assert_cloud_allowed()
+            if self._db is None:
+                return ToolResult.failed("Durable storage is required before preparing an acquisition")
+            coordinator = self._require_coordinator()
+            offer = await coordinator.prepare_offer(self._lease_request(**request))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            if is_execution_control_error(exc):
+                raise
+            return ToolResult.failed(f"Invalid inference offer request: {exc}")
+        except InferenceLeaseError as exc:
+            if is_execution_control_error(exc):
+                raise
+            return ToolResult.failed(str(exc))
+        result = ToolResult.ok(
+            confirmation="One read-only inference offer prepared", data=offer.to_public_dict(),
+        )
+        from kestrel_sovereign.features.inference_lease.offer_evidence import observe_prepared_offer
+
+        observe_prepared_offer(self.agent, coordinator, offer, result)
+        return result
+
+    @tool(
+        name="inference_lease_acquire_prepared",
+        description="Acquire the exact approved inference offer. This can start a billable GPU.",
+        category=ToolCategory.MODEL_MANAGEMENT,
+    )
+    async def acquire_prepared(self, request_id: str, offer_digest: str) -> ToolResult:
+        """Acquire only the exact live request and provider quote from preview.
+
+        Args:
+            request_id: The identifier returned by inference_lease_offer.
+            offer_digest: The exact digest returned by inference_lease_offer.
+        """
+        try:
+            self._assert_cloud_allowed()
+            if self._db is None:
+                return ToolResult.failed("Durable storage is required before acquiring billable capacity")
+            lease = await self._require_coordinator().acquire_prepared(request_id, offer_digest)
+        except InferenceLeaseError as exc:
+            if is_execution_control_error(exc):
+                raise
+            return ToolResult.failed(str(exc))
+        return self._acquired_lease_result(lease)
+
+    def _acquired_lease_result(self, lease: InferenceLease) -> ToolResult:
         self._reconciliation_error = None
         return ToolResult.ok(
             confirmation=(f"Inference lease {lease.lease_id!r} is {lease.state.value}"),

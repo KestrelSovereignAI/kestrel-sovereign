@@ -202,6 +202,7 @@ class ToolEffectTurn:
     privacy_scope: Any = field(init=False, repr=False)
     owns_privacy_scope: bool = field(init=False, repr=False)
     native_root: asyncio.Task = field(init=False, repr=False)
+    _closed_confirmed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         native_root = asyncio.current_task()
@@ -245,6 +246,7 @@ class ToolEffectTurn:
             if self.owns_privacy_scope:
                 self.privacy_scope.closing = True
             terminal = error
+            finished = False
             try:
                 # Publish before the first cleanup await: a nested consumer
                 # cannot catch its own terminal and resume an unfenced parent.
@@ -274,6 +276,7 @@ class ToolEffectTurn:
                         if privacy.allows_persistent_storage():
                             uncertain = bool(self.unconfirmed)
                             await self.store.finish(self.attempt, unconfirmed=uncertain)
+                            finished = not uncertain
                 except BaseException as finish_error:
                     _record_terminal_uncertainty(self, finish_error)
                     terminal = execution_observation_error(terminal, finish_error,
@@ -300,6 +303,7 @@ class ToolEffectTurn:
                             prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
             if terminal is not None:
                 raise terminal
+            self._closed_confirmed = finished
 
 _current_turn: ContextVar[ToolEffectTurn | None] = ContextVar(
     "kestrel_tool_effect_turn", default=None,
@@ -330,6 +334,20 @@ class _ToolEffectExecution:
     arguments_json: bytes
     task: asyncio.Task
     live: bool = True
+    observation: _ToolEffectResultObservation | None = None
+
+
+@dataclass(eq=False, repr=False)
+class _ToolEffectResultObservation:
+    """In-process proof for one original handler result, not a replay permit."""
+
+    turn: ToolEffectTurn
+    result: ToolResult | dict[str, Any]
+    _acknowledged: bool = False
+
+    @property
+    def confirmed(self) -> bool:
+        return self._acknowledged and self.turn._closed_confirmed and not self.turn.unconfirmed
 
 
 # Unlike the turn/claim relation, this proof belongs only to the actual handler
@@ -349,6 +367,28 @@ def current_tool_effect_execution(owner: Any) -> _ToolEffectExecution:
     frame.turn.require_live(owner)
     require_execution_work(owner)
     return frame
+
+
+def observe_tool_effect_result(owner: Any, result: ToolResult) -> _ToolEffectResultObservation:
+    """Retain proof only if this exact value is returned and durably settled."""
+    frame = current_tool_effect_execution(owner)
+    if type(result) is not ToolResult or result.status is not ToolResultStatus.OK:
+        raise TypeError('Tool effect observation requires one successful ToolResult')
+    if frame.observation is not None:
+        raise ToolEffectJournalUnavailable('Tool effect already has an observed result')
+    observed = _ToolEffectResultObservation(frame.turn, result)
+    frame.observation = observed
+    return observed
+
+
+def transfer_tool_effect_result_observation(
+    owner: Any, original: ToolResult, envelope: dict[str, Any],
+) -> None:
+    """Carry exact result identity through the built-in ToolResult wrapper."""
+    frame = _current_execution.get()
+    if frame is not None and frame.observation is not None and frame.observation.result is original:
+        current_tool_effect_execution(owner)
+        frame.observation.result = envelope
 
 
 @contextmanager
@@ -502,6 +542,7 @@ async def execute_tool_effect(
             error = None
             returned = False
             returned_error = False
+            frame = None
             token = _current_claim.set(claim)
             try:
                 # Retain host permission across actual handler execution and
@@ -562,6 +603,9 @@ async def execute_tool_effect(
                     prefer_cancellation=isinstance(error, asyncio.CancelledError))
             if error is not None:
                 raise error
+            if (state == 'RETURNED_OK' and frame is not None and frame.observation is not None
+                    and frame.observation.result is result):
+                frame.observation._acknowledged = True
             return result
     finally:
         turn.pending.pop(completion, None)

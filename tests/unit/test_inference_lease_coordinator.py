@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from pydantic import SecretStr
 from kestrel_sovereign.llm.inference_leases import (
     InferenceLeaseCoordinator,
     InferenceLeaseProviderDiscoveryError,
+    InferenceLeaseRecord,
     discover_inference_lease_providers,
 )
 
@@ -270,6 +272,313 @@ def _coordinator(
         ),
         persisted,
     )
+
+
+@pytest.mark.asyncio
+async def test_read_only_offer_is_promoted_without_requoting_after_approval():
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    coordinator, persisted = _coordinator({"runpod": provider})
+    request = _request()
+    offer = await coordinator.prepare_offer(request)
+    assert offer.request is request and offer.quote.estimated_total_cost_usd == Decimal("0.20")
+    assert provider.acquire_calls == 0 and not persisted
+
+    provider.total = "0.90"
+    with pytest.raises(InferenceLeaseConstraintError, match="prepared.*offer"):
+        await coordinator.acquire_prepared(request.request_id, "sha256:" + "0" * 64)
+    assert provider.acquire_calls == 0 and not persisted
+
+    lease = await coordinator.acquire_prepared(request.request_id, offer.digest)
+    assert lease.quote_id == offer.quote.quote_id
+    assert provider.last_request is request and provider.last_quote is offer.quote
+    assert provider.acquire_calls == 1 and persisted[0]["quote"] == offer.quote.to_public_dict()
+
+
+@pytest.mark.asyncio
+async def test_replacing_offer_refuses_previous_approval_even_with_same_provider_quote_id():
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    coordinator, persisted = _coordinator({"runpod": provider})
+    request = _request()
+    old = await coordinator.prepare_offer(request)
+    provider.total = "0.30"
+    new = await coordinator.prepare_offer(request)
+    assert old.quote.quote_id == new.quote.quote_id and old.digest != new.digest
+    with pytest.raises(InferenceLeaseConstraintError, match="prepared.*offer"):
+        await coordinator.acquire_prepared(request.request_id, old.digest)
+    assert provider.acquire_calls == 0 and not persisted
+
+
+@pytest.mark.asyncio
+async def test_prepared_offer_retry_still_requires_original_durable_ack():
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    attempts = []
+    permit_persistence = False
+
+    async def persist(payload):
+        attempts.append(payload)
+        if not permit_persistence:
+            raise OSError("prepared lease journal is unavailable")
+
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+        persist_state=persist,
+    )
+    request = _request()
+    offer = await coordinator.prepare_offer(request)
+    for _ in range(2):
+        with pytest.raises(InferenceLeaseProvisioningError, match="could not be saved"):
+            await coordinator.acquire_prepared(request.request_id, offer.digest)
+    assert len(attempts) == 2 and provider.acquire_calls == 0
+    assert attempts[0] == attempts[1]
+    assert attempts[0]["prepared_offer_digest"] == offer.digest
+
+    permit_persistence = True
+    # A second approval through the legacy tool is not authority to resume
+    # this plan, even when the caller has repeated every original argument.
+    for legacy in (request, replace(request, model="other-model", max_total_cost_usd=Decimal("0.01"))):
+        with pytest.raises(InferenceLeaseProvisioningError, match="already in progress"):
+            await coordinator.acquire(legacy)
+    assert len(attempts) == 2 and provider.acquire_calls == 0
+    assert InferenceLeaseRecord.from_persisted_dict(attempts[0], owner_id=request.owner_id).prepared_offer_digest == offer.digest
+    with pytest.raises(InferenceLeaseProvisioningError, match="prepared offer does not match"):
+        InferenceLeaseRecord.from_persisted_dict(
+            {**attempts[0], "prepared_offer_digest": "sha256:" + "0" * 64},
+            owner_id=request.owner_id,
+        )
+    await coordinator.acquire_prepared(request.request_id, offer.digest)
+    assert provider.acquire_calls == 1 and provider.last_quote is offer.quote
+    assert attempts[2] == attempts[0]
+
+
+@pytest.mark.asyncio
+async def test_offer_tools_only_mutate_through_exact_always_ask_acquisition():
+    from kestrel_sovereign.features.inference_lease.feature import InferenceLeaseFeature
+    from kestrel_sovereign.features.security.feature import default_permission_for_tool
+    from kestrel_sovereign.features.security.permissions import PermissionLevel
+
+    assert default_permission_for_tool("InferenceLeaseFeature", "inference_lease_offer") is PermissionLevel.ALLOW
+    assert default_permission_for_tool("InferenceLeaseFeature", "inference_lease_acquire_prepared") is PermissionLevel.ALWAYS_ASK
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    coordinator, persisted = _coordinator({"runpod": provider})
+    feature = InferenceLeaseFeature(SimpleNamespace(
+        privacy_agent=SimpleNamespace(can_use_cloud=lambda: True),
+    ))
+    feature._coordinator = coordinator
+    feature._owner_id = "agent-1"
+    feature._db = object()
+    preview = await feature.offer({
+        "model": "qwen3:8b", "max_hourly_cost_usd": "1", "max_total_cost_usd": "0.40",
+        "allowed_regions": ["us-tx-1"], "request_id": "offer-bound-request",
+    })
+    assert not persisted and provider.acquire_calls == 0
+    assert preview.data["quote"]["request_id"] == "offer-bound-request"
+    wrong = await feature.acquire_prepared("some-other-request", preview.data["offer_digest"])
+    assert "does not match the approval" in wrong.error
+    assert not persisted and provider.acquire_calls == 0
+    accepted = await feature.acquire_prepared("offer-bound-request", preview.data["offer_digest"])
+    assert accepted.data["lease"]["quote_id"] == preview.data["quote"]["quote_id"]
+    assert provider.acquire_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_tool_cannot_resume_an_unacknowledged_prepared_acquisition():
+    from kestrel_sovereign.features.inference_lease.feature import InferenceLeaseFeature
+
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    allow_persistence = False
+
+    async def persist(_payload):
+        if not allow_persistence:
+            raise OSError("lease journal not acknowledged")
+
+    feature = InferenceLeaseFeature(SimpleNamespace(
+        privacy_agent=SimpleNamespace(can_use_cloud=lambda: True),
+    ))
+    feature._owner_id = "agent-1"
+    feature._db = object()
+    feature._coordinator = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+        persist_state=persist,
+    )
+    original = {
+        "model": "qwen3:8b", "max_hourly_cost_usd": "1", "max_total_cost_usd": "0.40",
+        "allowed_regions": ["us-tx-1"], "request_id": "offer-legacy-crossing",
+    }
+    preview = await feature.offer(original)
+    digest = preview.data["offer_digest"]
+    failure = await feature.acquire_prepared(original["request_id"], digest)
+    assert "could not be saved" in failure.error
+    assert provider.acquire_calls == 0
+
+    allow_persistence = True
+    for args in (original, {**original, "model": "smaller", "max_total_cost_usd": "0.01"}):
+        denied = await feature.acquire(**args)
+        assert "already in progress" in denied.error
+        assert provider.acquire_calls == 0
+    accepted = await feature.acquire_prepared(original["request_id"], digest)
+    assert accepted.data["lease"]["quote_id"] == preview.data["quote"]["quote_id"]
+    assert provider.acquire_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted", [False, True])
+async def test_expired_prepared_retry_reconciles_only_the_original_submission(submitted):
+    class _OriginalProvider(_Provider):
+        def __init__(self):
+            super().__init__("runpod", total="0.20", ready_seconds=30)
+            self.original = None
+            self.reconciliations = 0
+
+        async def quote(self, request):
+            result = await super().quote(request)
+            return replace(result, expires_at=now + timedelta(minutes=5))
+
+        async def acquire(self, request, quote):
+            self.acquire_calls += 1
+            self.original = (request, quote)
+            raise ConnectionError("lost response after the provider accepted the original lease")
+
+        async def reconcile_expired_acquisition(self, request, quote):
+            assert self.original == (request, quote)
+            self.reconciliations += 1
+            return _lease(request, quote, state=InferenceLeaseState.PENDING)
+
+    provider = _OriginalProvider()
+    now = _now()
+    allow_persistence = submitted
+    durable = []
+
+    async def persist(payload):
+        if not allow_persistence:
+            raise OSError("initial persistence not acknowledged")
+        durable.append(payload)
+
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+        persist_state=persist, clock=lambda: now,
+    )
+    request = _request()
+    offer = await coordinator.prepare_offer(request)
+    with pytest.raises(InferenceLeaseProvisioningError):
+        await coordinator.acquire_prepared(request.request_id, offer.digest)
+    assert not await coordinator.is_current_prepared_offer(offer)
+    now = offer.quote.expires_at
+    allow_persistence = True
+    if submitted:
+        lease = await coordinator.acquire_prepared(request.request_id, offer.digest)
+        assert lease.quote_id == offer.quote.quote_id
+        assert (provider.acquire_calls, provider.reconciliations) == (1, 1)
+    else:
+        with pytest.raises(InferenceLeaseConstraintError, match="quote is expired"):
+            await coordinator.acquire_prepared(request.request_id, offer.digest)
+        assert (provider.acquire_calls, provider.reconciliations) == (0, 0)
+        newer = await coordinator.prepare_offer(_request(request_id="new-explicit-offer"))
+        assert durable == [None]
+        assert newer.request.request_id == "new-explicit-offer"
+
+
+@pytest.mark.asyncio
+async def test_failed_legacy_stage_cannot_attest_the_conflicting_offer():
+    async def persist(_payload):
+        raise OSError("legacy stage not acknowledged")
+
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+        persist_state=persist,
+    )
+    offer = await coordinator.prepare_offer(_request())
+    with pytest.raises(InferenceLeaseProvisioningError, match="could not be saved"):
+        await coordinator.acquire(_request(request_id="legacy-unacknowledged"))
+    assert not await coordinator.is_current_prepared_offer(offer)
+    with pytest.raises(InferenceLeaseConstraintError, match="does not match"):
+        await coordinator.acquire_prepared(offer.request.request_id, offer.digest)
+    assert provider.acquire_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_normal_prepared_tool_recovers_original_offer_after_failed_startup_restore():
+    from kestrel_sovereign.features.inference_lease.feature import InferenceLeaseFeature
+
+    class _LostReplyProvider(_Provider):
+        def __init__(self):
+            super().__init__("runpod", total="0.20", ready_seconds=30)
+            self.original = None
+            self.reconcile_calls = 0
+
+        async def acquire(self, request, quote):
+            self.acquire_calls += 1
+            self.original = (request, quote)
+            raise ConnectionError("lost the original provider receipt")
+
+        async def reconcile_expired_acquisition(self, request, quote):
+            assert (request, quote) == self.original
+            self.reconcile_calls += 1
+            if self.reconcile_calls == 1:
+                raise ConnectionError("provider unavailable at startup")
+            return _lease(request, quote, state=InferenceLeaseState.PENDING)
+
+    provider = _LostReplyProvider()
+    durable = []
+    now = _now()
+
+    async def persist(payload):
+        durable.append(payload)
+
+    def coordinator():
+        return InferenceLeaseCoordinator(
+            llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+            persist_state=persist, clock=lambda: now,
+        )
+
+    original = coordinator()
+    offer = await original.prepare_offer(_request())
+    with pytest.raises(InferenceLeaseProvisioningError, match="could not acquire"):
+        await original.acquire_prepared(offer.request.request_id, offer.digest)
+    now = offer.quote.expires_at
+    restored = coordinator()
+    with pytest.raises(InferenceLeaseProvisioningError, match="could not reconcile persisted state"):
+        await restored.restore(durable[-1])
+    feature = InferenceLeaseFeature(SimpleNamespace(
+        privacy_agent=SimpleNamespace(can_use_cloud=lambda: True),
+    ))
+    feature._db = object()
+    feature._coordinator = restored
+    wrong = await feature.acquire_prepared(offer.request.request_id, "sha256:" + "0" * 64)
+    assert "does not match" in wrong.error
+    accepted = await feature.acquire_prepared(offer.request.request_id, offer.digest)
+    assert accepted.data["lease"]["quote_id"] == offer.quote.quote_id
+    assert provider.acquire_calls == 1 and provider.reconcile_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_durable_pending_offer_survives_missing_original_provider():
+    original = _Provider("original", total="0.20", ready_seconds=30)
+    first, _persisted = _coordinator({"original": original})
+    offer = await first.prepare_offer(_request())
+    durable = InferenceLeaseRecord(
+        provider_name="original", request=offer.request, quote=offer.quote,
+        prepared_offer_digest=offer.digest,
+    ).to_persisted_dict()
+    replacement = _Provider("replacement", total="0.10", ready_seconds=30)
+    writes = []
+
+    async def persist(payload):
+        writes.append(payload)
+
+    restarted = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1",
+        providers={"replacement": replacement}, persist_state=persist,
+        clock=lambda: offer.quote.expires_at,
+    )
+    with pytest.raises(InferenceLeaseProviderUnavailableError, match="original"):
+        await restarted.restore(durable)
+    with pytest.raises(InferenceLeaseProvisioningError, match="active or pending"):
+        await restarted.prepare_offer(_request(request_id="unapproved-replacement"))
+    with pytest.raises(InferenceLeaseProviderUnavailableError, match="original"):
+        await restarted.acquire_prepared(offer.request.request_id, offer.digest)
+    assert restarted.current_record.to_persisted_dict() == durable
+    assert replacement.acquire_calls == 0 and writes == []
 
 
 @pytest.mark.asyncio
@@ -689,8 +998,10 @@ async def test_acquire_failure_retries_only_with_same_request_id():
         await coordinator.acquire(request)
     with pytest.raises(InferenceLeaseProvisioningError, match="already in progress"):
         await coordinator.acquire(_request(request_id="different-request"))
+    with pytest.raises(InferenceLeaseProvisioningError, match="already in progress"):
+        await coordinator.acquire(replace(request, model="other-model"))
 
-    lease = await coordinator.acquire(request)
+    lease = await coordinator.acquire(replace(request, requested_at=request.requested_at + timedelta(seconds=1)))
     assert lease.request_id == "durable-request"
     assert provider.acquire_calls == 2
 

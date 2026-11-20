@@ -24,6 +24,7 @@ from kestrel_sovereign.paths import HOME_ENV, runtime_path_env
 
 
 _OPT_IN_ENV = "KESTREL_KITE_RELEASE_EVIDENCE"
+_INFERENCE_OFFER_OPT_IN_ENV = "KESTREL_KITE_INFERENCE_OFFER_EVIDENCE"
 _TRUSTED_ROOT_ENV = "KESTREL_KITE_RELEASE_EVIDENCE_ROOT"
 _KEY_FILE = ".kite-evidence-ed25519.key"
 _NONCE_LEDGER = ".kite-evidence-nonces.sqlite3"
@@ -88,7 +89,25 @@ class _TrustedHome:
 
 
 def _enabled() -> bool:
-    return os.environ.get(_OPT_IN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    return (
+        os.environ.get(_OPT_IN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+        or kite_inference_offer_evidence_enabled()
+    )
+
+
+def kite_inference_offer_evidence_enabled() -> bool:
+    """Offer evidence is separate from headless semantic release controls."""
+    return os.environ.get(_INFERENCE_OFFER_OPT_IN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def kite_inference_offer_agent_enabled(agent: object) -> bool:
+    """Limit the opt-in offer seam to the named Kite actor on its host."""
+    name = getattr(agent, "_agent_name", None)
+    return (
+        kite_inference_offer_evidence_enabled()
+        and isinstance(name, str)
+        and name.casefold() == "kite"
+    )
 
 
 def _identity(status: os.stat_result) -> tuple[int, int]:

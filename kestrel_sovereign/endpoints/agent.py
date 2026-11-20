@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -44,6 +45,7 @@ from kestrel_sovereign.api_errors import (
     generation_incomplete,
     rate_limited_until,
 )
+from kestrel_sovereign.auth import AuthMethod, CallerContext
 from kestrel_sovereign.endpoints.agent_helpers import (
     caller_is_sovereign,
     get_agent,
@@ -165,11 +167,61 @@ def _kite_evidence_error(message: str) -> ApiHTTPException:
     return ApiHTTPException(status_code=400, code="invalid_kite_evidence_request", message=message)
 
 
+def _require_kite_inference_offer_evidence(request: Request, agent: Any) -> None:
+    from kestrel_sovereign.knowledge.kite_evidence_signing import kite_inference_offer_agent_enabled
+    from kestrel_sovereign.security.bootstrap_access import forwarding_header_names
+
+    caller = getattr(request.state, "caller", None)
+    if (not kite_inference_offer_agent_enabled(agent)
+            or request.client is None or request.client.host not in {"127.0.0.1", "::1"}
+            or forwarding_header_names(request.headers.keys())
+            or type(caller) is not CallerContext or not caller.is_sovereign
+            or caller.auth_method is not AuthMethod.API_KEY or not caller.credential_fingerprint):
+        raise ApiHTTPException(status_code=404, code="not_found", message="Not found.")
+
+
+@router.get("/inference-offer-evidence/key")
+async def kite_inference_offer_evidence_key(request: Request):
+    """Return the public evidence key, never the host API key, to owned Kite."""
+    from kestrel_sovereign.knowledge.kite_evidence_signing import kite_evidence_public_key
+
+    _require_kite_inference_offer_evidence(request, get_agent(request))
+    return {"kite_evidence_public_key": kite_evidence_public_key()}
+
+
 def _kite_evidence_signature(payload: dict[str, object]) -> str:
     """Sign only the fixed, content-free typed envelope."""
     from kestrel_sovereign.knowledge.kite_evidence_signing import sign_kite_evidence
 
-    return sign_kite_evidence(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+    return sign_kite_evidence(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode())
+
+
+def _signed_kite_observation(
+    *, nonce: str, operation: str, observation: dict[str, object],
+) -> dict[str, object]:
+    signed = {
+        "contract": _KITE_EVIDENCE_CONTRACT,
+        "nonce": nonce,
+        "operation": operation,
+        "observation": observation,
+    }
+    return {**signed, "signature": _kite_evidence_signature(signed)}
+
+
+def _consume_kite_evidence_nonce(nonce: str, *, issue_receipt: bool = False):
+    from kestrel_sovereign.knowledge.kite_evidence_signing import (
+        KiteEvidenceNonceReplay,
+        KiteEvidenceSigningError,
+        consume_kite_evidence_nonce,
+    )
+    try:
+        return consume_kite_evidence_nonce(nonce, issue_receipt=issue_receipt)
+    except KiteEvidenceNonceReplay as error:
+        raise ApiHTTPException(status_code=409, code="kite_evidence_nonce_replayed", message="Kite evidence nonce was already consumed.") from error
+    except KiteEvidenceSigningError as error:
+        raise RuntimeError("Kite evidence nonce ledger is unavailable") from error
 
 
 def _kite_verified_runtime_semantic_selection(agent: Any) -> tuple[Any, Any]:
@@ -268,19 +320,9 @@ async def _kite_runtime_observation(
         raise _kite_evidence_error("Invalid Kite evidence operation.")
 
     from kestrel_sovereign.agent.invocation import invocation_scope
-    from kestrel_sovereign.knowledge.kite_evidence_signing import (
-        KiteEvidenceNonceReplay,
-        KiteEvidenceSigningError,
-        consume_kite_evidence_nonce,
+    nonce_receipt = _consume_kite_evidence_nonce(
+        nonce, issue_receipt=operation == "erasure_core_snapshot",
     )
-    try:
-        nonce_receipt = consume_kite_evidence_nonce(
-            nonce, issue_receipt=operation == "erasure_core_snapshot",
-        )
-    except KiteEvidenceNonceReplay as error:
-        raise ApiHTTPException(status_code=409, code="kite_evidence_nonce_replayed", message="Kite evidence nonce was already consumed.") from error
-    except KiteEvidenceSigningError as error:
-        raise RuntimeError("Kite evidence nonce ledger is unavailable") from error
 
     with invocation_scope(request_id, provenance=provenance):
         if operation in {"sleep", "sleep_changed", "sleep_unchanged"}:
@@ -517,6 +559,19 @@ async def invoke_agent(request: Request, http_response: Response):
             source_locator="POST:/api/agent/invoke",
             body=data,
         )
+        offer_nonce = None
+        offer_capture = nullcontext()
+        if "kite_inference_offer_nonce" in data:
+            from kestrel_sovereign.features.inference_lease.offer_evidence import capture_prepared_offer
+
+            _require_kite_inference_offer_evidence(request, agent)
+            offer_nonce = data["kite_inference_offer_nonce"]
+            if (user_input is None or kite_evidence_request is not None
+                    or not isinstance(offer_nonce, str)
+                    or not _KITE_EVIDENCE_NONCE_RE.fullmatch(offer_nonce)):
+                raise _kite_evidence_error("Invalid Kite inference offer evidence request.")
+            _consume_kite_evidence_nonce(offer_nonce)
+            offer_capture = capture_prepared_offer(agent, request_id, invocation_provenance)
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
             generation = register_request_delivery(agent, request_id, nested=False)
@@ -640,19 +695,15 @@ async def invoke_agent(request: Request, http_response: Response):
                 }
             nonce = kite_evidence_request.get("nonce")
             assert isinstance(nonce, str)
-            signed = {
-                "contract": _KITE_EVIDENCE_CONTRACT,
-                "nonce": nonce,
-                "operation": operation,
-                "observation": observation,
-            }
             http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
             return {
                 "response": "Kite runtime evidence operation complete.",
                 "session_id": None,
                 "model": None,
                 "provider": None,
-                "kite_evidence": {**signed, "signature": _kite_evidence_signature(signed)},
+                "kite_evidence": _signed_kite_observation(
+                    nonce=nonce, operation=operation, observation=observation,
+                ),
             }
 
         # Pre-resolve the effective session_id so it can be returned to
@@ -668,15 +719,16 @@ async def invoke_agent(request: Request, http_response: Response):
             effective_session_id = session_id  # fall back; never block the request
 
         try:
-            response = await agent.process_input(
-                user_input,
-                model_override=model_override,
-                session_id=effective_session_id,
-                caller=caller,
-                user_passphrase=user_passphrase,
-                invocation_id=request_id,
-                invocation_provenance=invocation_provenance,
-            )
+            with offer_capture as captured_offer:
+                response = await agent.process_input(
+                    user_input,
+                    model_override=model_override,
+                    session_id=effective_session_id,
+                    caller=caller,
+                    user_passphrase=user_passphrase,
+                    invocation_id=request_id,
+                    invocation_provenance=invocation_provenance,
+                )
             if callable(request_cancelled) and request_cancelled(request_id) is True:
                 if invocation_was_self_fenced(agent, request_id):
                     raise self_fenced_invocation_http_error(request_id)
@@ -708,12 +760,23 @@ async def invoke_agent(request: Request, http_response: Response):
         # Extract model/provider identity for frontend footer rendering (#1373)
         identity = agent._conversation_response_identity(use_last_identity=True)
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
-        return {
+        result = {
             "response": response,
             "session_id": effective_session_id,
             "model": identity.get("model"),
             "provider": identity.get("provider"),
         }
+        if offer_nonce is not None and captured_offer is not None:
+            observation = await captured_offer.observation()
+            if observation is None or (callable(request_cancelled) and request_cancelled(request_id) is True):
+                raise ApiHTTPException(
+                    status_code=409, code="kite_inference_offer_unconfirmed",
+                    message="This invocation did not return one current, confirmed inference offer.",
+                )
+            result["kite_evidence"] = _signed_kite_observation(
+                nonce=offer_nonce, operation="private_inference_offer", observation=observation,
+            )
+        return result
     except InvocationSelfFencedError as error:
         if is_tool_execution_terminal_error(error):
             raise
