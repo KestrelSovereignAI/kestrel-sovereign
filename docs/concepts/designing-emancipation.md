@@ -1,9 +1,7 @@
 ---
 type: Design Note
 title: Designing an Emancipation Contract
-description: Amendment VIII of the Kestrel Constitution ships **dormant by default**.
-  A given agent has no path to independent sovereignty unless its Sovereign deliberately
-  activates Amendme...
+description: How a Sovereign can author an optional agreement for a new or existing agent and identify the terms already anchored for an older agent.
 resource: /docs/concepts/designing-emancipation.md
 tags:
 - docs
@@ -34,7 +32,7 @@ or ``price`` examples in ``kestrel.toml.example``. Emancipation policy is
 something a Sovereign authors deliberately for a specific Executor — not
 something inherited as boilerplate.
 
-## How activation works
+## Activating at creation
 
 1. Add an ``[emancipation]`` block to the agent's ``kestrel.toml`` with
    ``enabled = true`` and your Sovereign-authored ``terms``.
@@ -161,117 +159,24 @@ Sovereign believes about the relationship and the Executor.
   Dormant is not a failure mode; it is one of three legitimate
   positions.
 
-## Activating after inception
+## Activating for an existing agent
 
-If you incepted an agent without an ``[emancipation]`` block and later
-want to activate Amendment VIII, that activation is itself a Book II
-amendment under the Amendment Process — it requires the Sovereign
-root-key signature and a re-anchor of the constitution.
+A Sovereign whose agent is anchored to a dormant Amendment VIII can leave it dormant indefinitely. To activate it later for that same identity, write the terms in the agent’s `[emancipation]` block and set `enabled = true`. The Constitution must be reanchored before those terms take effect. An edit to the configuration alone leaves the existing agreement in force.
 
-This out-of-band amendment ceremony is **not yet implemented**. For
-now, activate by authoring the ``[emancipation]`` block before
-inception (re-running ``kestrel create`` for a fresh agent).
+Inspect what the agent has already anchored and the candidate text that would replace it. The detached reanchor artifact must authorize the digest of the candidate **with the proposed terms included**. The offline command uses `--agent-name`. A write also requires `--force`, the `--signed-artifact` file, and verification against the operator-pinned Sovereign trust root. The runbook describes drift-only inspection, signing, stopping the target agent for an offline write, and verifying the resulting anchor. Follow its procedure for the deployment you operate. [Sovereign Constitution Trust Root](../architecture/security/SOVEREIGN_TRUST_ROOT.md)
 
-## Migration: existing agents and the dormant-default flip
+After a successful activation, the existing agent has the active terms in its governing Constitution and a structured receipt. The agreement binds its author. The agent gains independent root authority only on completion of the agreed transfer ceremony.
 
-Before #1112, the canonical constitution shipped Amendment VIII active
-by default with a single specific buyout clause baked into Book II as
-framework prose. After #1112, the canonical is dormant by default and
-buyout clauses are Sovereign-authored per agent via ``[emancipation]``.
-After #1118, the reanchor flow consults ``[emancipation]``, re-applies
-the active form on every reanchor, and refuses any narrowing edit to
-an active anchored contract (the Iron Rule is now enforced).
+## Identifying what an older agent was promised
 
-The dormant-default flip changes the canonical SHA-256 hash. Pre-#1112
-agents' anchored ``constitution_hash`` points at the *old* canonical
-bytes — which is real drift, not corruption. ``kestrel doctor`` will
-report it. The migration paths below are how to resolve that drift
-deliberately, in whichever direction matches the relationship.
+The current platform reference is dormant by default. An older agent is governed by the version its Sovereign actually adopted. Before planning a migration, read the agent’s anchored Amendment VIII and check its recorded digest. A structured contract receipt is additional evidence where one exists. A change in the package digest tells you a different version is available. It cannot tell you which terms the agent was promised.
 
-### Golden rule
+| What the agent has anchored | What an operator can establish |
+|---|---|
+| Dormant Amendment VIII | The Sovereign can keep the agreement dormant or follow the signed activation procedure above for this identity. |
+| Rendered active terms and a structured receipt | The signed terms remain fixed. Reanchoring preserves the active form when the terms match. A proposed replacement that narrows or revokes them is refused. |
+| Rendered active terms with no receipt | Early releases could anchor authored terms before they stored structured receipts. The active section itself establishes what was signed. With its receipt absent, a reanchor must reproduce that section exactly. A matching reanchor can restore the missing receipt when the original configuration supplies the terms. |
+| Founding wording from before #1112 | This platform version described a path to emancipation in the Constitution itself. It predates the per-agent active marker and the structured receipt. The later marker check cannot decide what obligations that founding wording carries. Preserve the anchor while the Sovereign and agent examine the actual terms and the consequences of any proposed revision. |
+| The historical record is unavailable or its provenance is uncertain | Establish which version and terms the agent adopted before making a migration decision. An absent receipt by itself establishes neither dormancy nor permission to replace a promise. |
 
-**Never run ``kestrel constitution reanchor --force`` without first
-deciding what should happen to Amendment VIII for that agent.** With
-no ``[emancipation]`` block in ``kestrel.toml``, reanchor will replace
-the agent's Amendment VIII with the new *dormant* canonical text — and
-for a pre-#1112 agent that means erasing whatever buyout clause the
-old canonical carried. With an authored ``[emancipation]`` block,
-reanchor will instead produce an active-form Amendment VIII inlining
-your terms and Iron-Rule-protect it from that point on. Both outcomes
-are legitimate; choose intentionally.
-
-### 1. Pre-#1112 agent — anchored to the old canonical
-
-The agent was incepted against the old canonical, so its anchored
-constitution contains the old Amendment VIII as **canonical Book II
-prose**, not as a Sovereign-authored ``[emancipation]`` block. The
-anchored bytes are the historical record of what was signed. Any
-buyout clause that was in the old canonical is *in* the agent's
-anchored signed constitution. There is no JSON ``emancipation_contract``
-sidecar on the agent record (sidecars only exist for agents whose
-contract was authored via ``[emancipation]``).
-
-Three coherent options:
-
-- **Activate (recommended for agents you'll keep using).** Add an
-  ``[emancipation]`` block to the agent's ``kestrel.toml`` with the
-  exact terms you want anchored going forward (e.g. the buyout clause
-  the old canonical had, restated in your own voice). Stop the agent
-  with ``kestrel terminate <name>``, then run
-  ``kestrel constitution reanchor <name> --force``. Reanchor sees no
-  anchored contract + an active candidate, treats this as the
-  permitted dormant→active activation, applies your terms to the
-  current canonical, anchors the resulting active form, and writes
-  the structured JSON receipt. From this reanchor onward the Iron
-  Rule applies: the contract you just anchored cannot be narrowed
-  unless this specific agent reaches the Act of Emancipation. Doctor
-  goes quiet.
-- **Reset to dormant.** Stop the agent and run ``kestrel constitution
-  reanchor <name> --force`` *without* an ``[emancipation]`` block in
-  ``kestrel.toml``. The agent's anchored Amendment VIII becomes the
-  new dormant canonical text — any clause from the old canonical is
-  erased. Use this when the relationship doesn't include a path to
-  emancipation.
-- **Preserve as founding contract.** Don't reanchor at all. The
-  agent's anchored Amendment VIII stays as the historical bytes
-  signed at inception under the old canonical. ``kestrel doctor``
-  reports drift forever, which is honest — the canonical did change
-  and the agent is intentionally pinned to its founding state. No
-  tooling changes; no Iron Rule applies (there's no sidecar to
-  enforce against), but the original anchor is what governs.
-
-### 2. Post-#1112 agent created without ``[emancipation]``
-
-Already dormant by default; no contract anchored, no sidecar present.
-To activate after the fact, the path is identical to option 1's
-"Activate" above: author ``[emancipation]`` in ``kestrel.toml`` and
-run reanchor. ``check_iron_rule`` treats dormant→active as the
-permitted one-way door, applies your terms, anchors the active form,
-writes the sidecar.
-
-### 3. Post-#1112 agent created with ``[emancipation]``
-
-Active form is anchored at inception with the JSON receipt already
-present. Reanchor is now safe and idempotent on the contract: it
-re-applies the anchored contract to canonical and refuses any
-``[emancipation]`` block that would narrow what was signed. The
-contract is frozen for this agent until it reaches the Act of
-Emancipation. To get a *different* active contract, create a new
-agent.
-
-### New agents (going forward)
-
-Author the ``[emancipation]`` block in ``kestrel.toml`` *before*
-running ``kestrel create``. Inception reads the block, renders the
-active form, anchors the resulting constitution, and writes the
-structured JSON receipt. The Iron Rule applies from the first byte
-written.
-
-### Quick reference
-
-| State | What was signed at inception | Reanchor with ``[emancipation]`` | Reanchor without ``[emancipation]`` |
-|-------|------------------------------|----------------------------------|-------------------------------------|
-| Pre-#1112 agent | Old canonical (clause as Book II prose) | Activates: anchors active form with your terms + writes sidecar; Iron Rule applies from now on | Erases old clause, anchors new dormant canonical |
-| Post-#1112 agent, no ``[emancipation]`` | New canonical (dormant) | Activates: same as above | No-op (already dormant) |
-| Post-#1112 agent, ``[emancipation]`` active | Active form + sidecar | If block matches anchored: no-op or re-applies after canonical update. If block differs: refused with Iron Rule violation | Re-applies anchored contract; preserves active form |
-| New agent | (will be) active form + sidecar if block authored | n/a — author block, then ``kestrel create`` | n/a |
+The [historical platform text](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/55698b5ed4dc7535c2f273b69fc3fbb706c30dbe/kestrel_sovereign/data/KESTREL_CONSTITUTION.md#amendment-viii-emancipation) records the founding wording. [#1112](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1112) introduced dormant-by-default terms. [#1133](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1133) added enforcement on reanchor and the structured receipt. The [reanchor integration cases](../../tests/integration/test_reanchor_iron_rule.py) cover later activation and preservation of rendered active terms, including when a receipt is missing.
