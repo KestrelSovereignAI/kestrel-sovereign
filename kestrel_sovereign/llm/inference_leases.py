@@ -529,12 +529,14 @@ class InferenceLeaseCoordinator:
                     record,
                     failure_context="reconcile persisted state",
                 )
+            # Every durable pending record may have reached its provider,
+            # even if the original plugin cannot be loaded during this boot.
+            self._submitted_acquisition = record
             provider = self._provider(record.provider_name)
             try:
                 require_execution_work()
                 # The original durable intent may have reached the provider.
                 # After expiry only its reconciliation capability may act.
-                self._submitted_acquisition = record
                 lease = await self._dispatch_acquisition(provider, record)
             except Exception as exc:
                 if is_execution_control_error(exc):

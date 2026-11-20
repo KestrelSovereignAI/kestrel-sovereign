@@ -106,6 +106,28 @@ _current_invocation_provenance: ContextVar[InvocationProvenance | None] = Contex
     default=None,
 )
 
+
+@contextmanager
+def _bind_invocation_identity(
+    identity: tuple[str | None, InvocationProvenance | None],
+) -> Iterator[None]:
+    invocation_id, provenance = identity
+    id_token = _current_invocation_id.set(invocation_id)
+    provenance_token = _current_invocation_provenance.set(provenance)
+    try:
+        yield
+    finally:
+        _current_invocation_provenance.reset(provenance_token)
+        _current_invocation_id.reset(id_token)
+
+
+turn_scoped(
+    "invocation_identity",
+    variables=(_current_invocation_id, _current_invocation_provenance),
+    capture=lambda owner: (_current_invocation_id.get(), _current_invocation_provenance.get()),
+    bind=_bind_invocation_identity,
+)
+
 _T = TypeVar("_T")
 
 
@@ -432,17 +454,11 @@ def _exact_invocation_scope(
 ) -> Iterator[str]:
     """Bind an already-resolved identity and an exact provenance value."""
 
-    id_token = _current_invocation_id.set(invocation_id)
-    provenance_token = _current_invocation_provenance.set(provenance)
-    effect_token = _current_effect_checkpoint.set(
-        effect_checkpoint or InvocationEffectCheckpoint()
-    )
-    try:
+    with (
+        _bind_invocation_identity((invocation_id, provenance)),
+        _bind_effect_checkpoint(effect_checkpoint or InvocationEffectCheckpoint()),
+    ):
         yield invocation_id
-    finally:
-        _current_effect_checkpoint.reset(effect_token)
-        _current_invocation_provenance.reset(provenance_token)
-        _current_invocation_id.reset(id_token)
 
 
 @contextmanager

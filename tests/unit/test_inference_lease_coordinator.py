@@ -552,6 +552,36 @@ async def test_normal_prepared_tool_recovers_original_offer_after_failed_startup
 
 
 @pytest.mark.asyncio
+async def test_expired_durable_pending_offer_survives_missing_original_provider():
+    original = _Provider("original", total="0.20", ready_seconds=30)
+    first, _persisted = _coordinator({"original": original})
+    offer = await first.prepare_offer(_request())
+    durable = InferenceLeaseRecord(
+        provider_name="original", request=offer.request, quote=offer.quote,
+        prepared_offer_digest=offer.digest,
+    ).to_persisted_dict()
+    replacement = _Provider("replacement", total="0.10", ready_seconds=30)
+    writes = []
+
+    async def persist(payload):
+        writes.append(payload)
+
+    restarted = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1",
+        providers={"replacement": replacement}, persist_state=persist,
+        clock=lambda: offer.quote.expires_at,
+    )
+    with pytest.raises(InferenceLeaseProviderUnavailableError, match="original"):
+        await restarted.restore(durable)
+    with pytest.raises(InferenceLeaseProvisioningError, match="active or pending"):
+        await restarted.prepare_offer(_request(request_id="unapproved-replacement"))
+    with pytest.raises(InferenceLeaseProviderUnavailableError, match="original"):
+        await restarted.acquire_prepared(offer.request.request_id, offer.digest)
+    assert restarted.current_record.to_persisted_dict() == durable
+    assert replacement.acquire_calls == 0 and writes == []
+
+
+@pytest.mark.asyncio
 async def test_selects_cheapest_quote_then_fastest_without_mutating_others():
     cheap_slow = _Provider("cheap", total="0.10", ready_seconds=50)
     cheap_fast = _Provider("fast", total="0.10", ready_seconds=20)

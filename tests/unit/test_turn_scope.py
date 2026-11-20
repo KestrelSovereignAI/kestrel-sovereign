@@ -31,6 +31,10 @@ from kestrel_sdk.signals import CausationFrame
 from kestrel_sdk.tools.result import ToolResultStatus
 
 import kestrel_sovereign
+from kestrel_sovereign.agent.invocation import (
+    current_invocation_id, current_invocation_provenance, invocation_scope,
+    request_provenance,
+)
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.parts import current_part_collector, part_collector
 from kestrel_sovereign.agent.turn_lifecycle import (
@@ -99,6 +103,8 @@ def _observe(host: _Host) -> dict:
     """What an inline tool sees, through the accessors its consumers use."""
     return {
         "turn_id": host.get_current_turn_id(),
+        "invocation_id": current_invocation_id(),
+        "invocation_provenance": current_invocation_provenance(),
         "chain": host._get_current_chain(),
         "signal": get_current_signal(),
         "collector": current_part_collector(),
@@ -280,16 +286,22 @@ async def test_orchestrator_executor_carries_turn_id_and_chain_to_reader_task():
         return {"ok": True}
 
     host.tool_impl = tool
+    provenance = request_provenance(
+        actor="operator", source_kind="http_request", source_locator="POST:/api/agent/invoke",
+    )
     try:
-        turn = await _run_turn(
-            host, harness, lambda: host._make_inline_tool_executor("chat-owner")
-        )
+        with invocation_scope("promoted-offer-origin", provenance=provenance):
+            turn = await _run_turn(
+                host, harness, lambda: host._make_inline_tool_executor("chat-owner")
+            )
     finally:
         await harness.stop()
 
     assert harness.baseline.get(_BOUND_TURN_SESSION) is None
     assert current_turn_id() is None
     _assert_owning_turn_observed(host.seen, turn)
+    assert host.seen["invocation_id"] == "promoted-offer-origin"
+    assert host.seen["invocation_provenance"] is provenance
 
 
 @pytest.mark.asyncio
@@ -505,17 +517,97 @@ async def test_nested_feature_executor_carries_turn_scope_across_second_reader(n
     host.register_dynamic_tools('owned-turn-parent', [Parent()],
         on_registered=lambda tool, binding: mounted.append(binding))
     binding, = mounted
+    provenance = request_provenance(
+        actor="operator", source_kind="http_request", source_locator="POST:/api/agent/invoke",
+    )
     try:
-        turn = await drive_native(host, lambda: _run_turn(host, parent_reader,
-            lambda: host._make_inline_tool_executor('chat-owner'), name=binding.name))
+        with invocation_scope("feature-offer-origin", provenance=provenance):
+            turn = await drive_native(host, lambda: _run_turn(host, parent_reader,
+                lambda: host._make_inline_tool_executor('chat-owner'), name=binding.name),
+                invocation_id="feature-offer-origin")
     finally:
         await parent_reader.stop()
         await nested_reader.stop()
 
     assert host.seen, 'nested tool did not run'
     _assert_owning_turn_observed(host.seen, turn)
+    assert host.seen["invocation_id"] == "feature-offer-origin"
+    assert host.seen["invocation_provenance"] is provenance
     assert await host.tool_effect_store.database.fetchall(
         'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('RETURNED_OK',)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("through_feature_reader", [False, True])
+async def test_exact_inference_offer_is_observed_after_original_reader_handoff(
+    native_tool_effect_agent, through_feature_reader,
+):
+    from kestrel_sdk.tools import ToolCategory, ToolSchema
+
+    from kestrel_sovereign.features.inference_lease.feature import InferenceLeaseFeature
+    from kestrel_sovereign.features.inference_lease.offer_evidence import capture_prepared_offer
+    from kestrel_sovereign.llm.inference_leases import InferenceLeaseCoordinator
+    from tests.unit.test_inference_lease_coordinator import _Provider
+    from tests.utils.native_tool_effects import drive_native
+
+    host = await native_tool_effect_agent(did="did:test:original-offer-reader")
+    feature = InferenceLeaseFeature(host)
+    feature._db = host._raw_storage.db
+    feature._owner_id = host.agent_id
+    provider = _Provider("local-catalog", total="0.20", ready_seconds=30)
+    feature._coordinator = InferenceLeaseCoordinator(
+        llm_service=host.llm_service, owner_id=host.agent_id,
+        providers={provider.provider_name: provider}, persist_state=feature._persist_state,
+    )
+    host.features[feature.name] = feature
+    [offer_tool] = [tool for tool in feature.get_tools() if tool.name == "inference_lease_offer"]
+    parent_reader, feature_reader = _ReaderHarness(), _ReaderHarness()
+    await parent_reader.start()
+    await feature_reader.start()
+    offer_arguments = {"request": {
+        "model": "qwen3:8b", "max_hourly_cost_usd": "1", "max_total_cost_usd": "0.40",
+        "allowed_regions": ["us-tx-1"], "request_id": "reader-catalog-offer",
+    }}
+
+    class Parent:
+        name = "parent_offer_reader"
+        schema = ToolSchema(name, "Dispatch the real offer on a second reader", ToolCategory.UTILITY, parameters=[])
+
+        async def execute(self, **arguments):
+            executor = feature._make_feature_inline_tool_executor(
+                parts_sink=None, runtime_tools=[offer_tool],
+            )
+            return await feature_reader.dispatch(executor, offer_tool.name, offer_arguments)
+
+    if through_feature_reader:
+        host.register_dynamic_tools("offer-reader-parent", [Parent()])
+        call_name, call_args = Parent.name, {}
+    else:
+        host.register_dynamic_tools(feature.tool_name, [offer_tool])
+        call_name, call_args = offer_tool.name, offer_arguments
+    invocation_id = "original-kite-invocation"
+    provenance = request_provenance(
+        actor="api_key", source_kind="http_request", source_locator="POST:/api/agent/invoke",
+    )
+    try:
+        with capture_prepared_offer(host, invocation_id, provenance) as capture:
+            with invocation_scope(invocation_id, provenance=provenance):
+                await drive_native(
+                    host,
+                    lambda: _run_turn(
+                        host, parent_reader, lambda: host._make_inline_tool_executor("chat-owner"),
+                        name=call_name, args=call_args,
+                    ),
+                    invocation_id=invocation_id,
+                )
+    finally:
+        await parent_reader.stop()
+        await feature_reader.stop()
+    evidence = await capture.observation()
+    assert evidence is not None
+    assert evidence["invocation_id"] == invocation_id and evidence["actor"] == "api_key"
+    assert evidence["offer"]["request"]["request_id"] == "reader-catalog-offer"
+    assert provider.acquire_calls == 0
 
 
 @pytest.mark.asyncio
