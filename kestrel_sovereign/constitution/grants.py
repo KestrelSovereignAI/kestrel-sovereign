@@ -37,7 +37,10 @@ def resolve_amendment_ix_grants(agent) -> GrantResolution:
         overlay_status = evidence.status
         verified_hash = evidence.verified_hash
     else:
-        overlay_status = "absent" if overlay_text is None else "unverified"
+        if overlay_text is None:
+            overlay_status = "absent"
+        else:
+            overlay_status = "verification unavailable" if overlay_accepted else "unverified"
         verified_hash = None
 
     # Legacy agents can supply an accepted overlay without hash evidence.

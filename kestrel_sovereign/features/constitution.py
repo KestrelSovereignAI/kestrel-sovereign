@@ -226,8 +226,7 @@ class ConstitutionFeature(Feature):
 
         for entry, body in _unit_bodies(self.full_text):
             kind = entry["kind"]
-            if kind != "Amendment" or _as_index(entry["identifier"]) != 9:
-                body = body.strip()
+            body = body.strip()
 
             if kind == "Frame":
                 self._record_frame(entry["title"], body)
@@ -434,22 +433,20 @@ class ConstitutionFeature(Feature):
 
     async def _effective_amendment_ix(self, original_reader) -> ToolResult:
         base_hash = None
-        base_error = None
         if callable(original_reader):
             original = await original_reader()
-            base_heading = "Anchored Amendment IX text"
             if original.startswith("Error:"):
-                base_text = None
-                base_error = original
-            else:
-                base_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
-                base_text = None
-                for entry, body in _unit_bodies(original):
-                    if entry["kind"] == "Amendment" and _as_index(entry["identifier"]) == 9:
-                        base_text = body
+                return ToolResult.failed(original, data={"kind": "unavailable"})
+            base_heading = "Anchored Amendment IX text"
+            base_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
         else:
             base_heading = "Governing Amendment IX text"
-            base_text = self.amendments.get("9")
+            original = self.full_text
+
+        base_text = None
+        for entry, body in _unit_bodies(original):
+            if entry["kind"] == "Amendment" and _as_index(entry["identifier"]) == 9:
+                base_text = body
         resolution = resolve_amendment_ix_grants(self.agent)
         grants = sorted(resolution.grants & DANGEROUS_CAPABILITIES)
         details = [
@@ -464,7 +461,7 @@ class ConstitutionFeature(Feature):
             "Privacy, runtime configuration, and approval checks still apply.",
             f"## {base_heading}",
             f"Full anchored text SHA-256: {base_hash or 'unavailable'}",
-            base_text if base_text is not None else base_error or "Amendment IX is absent from this text.",
+            base_text if base_text is not None else "Amendment IX is absent from this text.",
         ]
         return ToolResult.ok(
             confirmation="\n\n".join(details),

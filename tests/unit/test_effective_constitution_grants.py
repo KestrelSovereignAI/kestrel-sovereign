@@ -3,6 +3,7 @@
 import hashlib
 import sqlite3
 from contextlib import closing
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -48,6 +49,14 @@ def _constitution_tool(agent):
         (None, "other", "missing", {"filesystem_read"}),
         (None, None, "absent", {"filesystem_read"}),
         (_OVERLAY, "unavailable", "anchor unavailable", {"filesystem_read"}),
+        pytest.param(
+            _OVERLAY, "unreadable", "source unavailable", {"filesystem_read"},
+            id="unreadable-overlay",
+        ),
+        pytest.param(
+            b"\xff", "matching", "unreadable text", {"filesystem_read"},
+            id="invalid-utf8-overlay",
+        ),
     ],
 )
 async def test_anchored_tool_view_matches_gate_and_preserves_original(
@@ -60,8 +69,9 @@ async def test_anchored_tool_view_matches_gate_and_preserves_original(
     monkeypatch.setattr(config, "CONSTITUTION_PATH", package)
     monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_write")
     overlay_path = tmp_path / "CONSTITUTION.md"
-    if overlay is not None:
-        overlay_path.write_bytes(overlay.encode("utf-8"))
+    overlay_bytes = overlay.encode("utf-8") if isinstance(overlay, str) else overlay
+    if isinstance(overlay, str):
+        overlay_path.write_bytes(overlay_bytes)
 
     path = tmp_path / "agent.db"
     agent = KestrelAgent(did="did:test:effective-grants", storage_path=str(path))
@@ -70,8 +80,11 @@ async def test_anchored_tool_view_matches_gate_and_preserves_original(
     await storage.initialize()
     agent.storage = agent._raw_storage = storage
     try:
+        # Invalid bytes written after startup model a live replacement.
+        if isinstance(overlay, bytes):
+            overlay_path.write_bytes(overlay)
         digest = await storage.store_file(_BASE.encode("utf-8"), "governing.md")
-        overlay_hash = hashlib.sha256(overlay.encode("utf-8")).hexdigest() if overlay is not None else None
+        overlay_hash = hashlib.sha256(overlay_bytes).hexdigest() if overlay_bytes is not None else None
         properties = {"constitution_hash": digest}
         if anchor in ("matching", "other"):
             properties["constitution_overlay_hash"] = overlay_hash if anchor == "matching" else "0" * 64
@@ -81,6 +94,17 @@ async def test_anchored_tool_view_matches_gate_and_preserves_original(
         if anchor == "unavailable":
             with monkeypatch.context() as error_scope:
                 error_scope.setattr(storage, "get_node", AsyncMock(side_effect=OSError("read unavailable")))
+                await agent.verify_constitution_overlay()
+        elif anchor == "unreadable":
+            read_bytes = Path.read_bytes
+
+            def read_with_unavailable_overlay(path):
+                if path == overlay_path:
+                    raise OSError("overlay file unavailable")
+                return read_bytes(path)
+
+            with monkeypatch.context() as error_scope:
+                error_scope.setattr(Path, "read_bytes", read_with_unavailable_overlay)
                 await agent.verify_constitution_overlay()
         else:
             await agent.verify_constitution_overlay()
@@ -99,7 +123,7 @@ async def test_anchored_tool_view_matches_gate_and_preserves_original(
         assert data["signer"] is None
         assert "Signer: unavailable" in view["confirmation"]
         assert "Privacy, runtime configuration, and approval checks still apply." in view["confirmation"]
-        if anchor == "matching":
+        if expected_status == "hash verified":
             assert data["source"] == "per-agent overlay"
             assert data["verification"] == "hash verified"
             assert data["sha256"] == overlay_hash
@@ -123,8 +147,33 @@ async def test_anchored_tool_view_matches_gate_and_preserves_original(
         assert original["confirmation"].encode("utf-8") == _BASE.encode("utf-8")
         with_contributions = await tool.execute(article="amendment", search="9")
         assert with_contributions["data"] == data
+        if overlay == _OVERLAY and anchor == "matching":
+            # Runtime may refresh cached text before the asynchronous anchor
+            # read completes. The existing gate still uses its acceptance flag.
+            monkeypatch.setattr(agent, "constitution_text", _OVERLAY.replace("filesystem_write", "filesystem_read"))
+            stale = (await tool.execute(article="amendment", search="IX"))["data"]
+            assert set(stale["effective_grants"]) == {
+                capability for capability in DANGEROUS_CAPABILITIES if gate._constitution_allows(capability)
+            } == {"filesystem_read", "shell_execution_host"}
+            assert stale["verification"] == "unavailable"
+            assert stale["overlay_status"] == "verification unavailable"
+            assert stale["sha256"] is None
+
+            # The anchored bytes become unavailable between the two native
+            # reads. Do not label the surviving grant data a current result.
+            with monkeypatch.context() as error_scope:
+                retrieval = AsyncMock(
+                    side_effect=[_BASE.encode("utf-8"), OSError("governing bytes unavailable")]
+                )
+                error_scope.setattr(storage, "retrieve_file", retrieval)
+                failed_view = await tool.execute(article="amendment", search="IX")
+                assert retrieval.await_count == 2
+            assert failed_view["status"] == "error", failed_view
+            assert "governing bytes unavailable" in failed_view["error"]
+            assert "effective_grants" not in failed_view["data"]
+
         assert _snapshot(path) == before
-        assert (overlay_path.read_text() if overlay_path.exists() else None) == overlay
+        assert (overlay_path.read_bytes() if overlay_path.exists() else None) == overlay_bytes
     finally:
         await storage.close()
 
@@ -179,4 +228,31 @@ async def test_legacy_grant_sources_keep_precedence_without_claiming_verificatio
     assert data["verification"] == "unavailable"
     assert data["signer"] is None
     assert data["sha256"] is None
+    if attributes.get("constitution_overlay_verified"):
+        assert data["overlay_status"] == "verification unavailable"
     agent._get_governing_constitution.assert_awaited_once_with(allow_lazy_anchor=False)
+
+
+@pytest.mark.asyncio
+async def test_search_lists_amendment_ix_once():
+    agent = SimpleNamespace(_get_governing_constitution=AsyncMock(return_value=_BASE))
+    view = await _constitution_tool(agent).execute(article="search", search="shell_execution_host")
+    assert view["status"] == "ok", view
+    assert view["confirmation"].count("### Amendment IX: Capability Boundaries") == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_governing_reads_do_not_show_current_grants():
+    error = "Error: Governing constitution changed after this turn's audited admission."
+    agent = SimpleNamespace(
+        _get_governing_constitution=AsyncMock(return_value=error),
+        _get_original_governing_constitution=AsyncMock(return_value=error),
+        granted_capabilities={"filesystem_write"},
+    )
+    tool = _constitution_tool(agent)
+    for args in ({"article": "amendment", "search": "IX"}, {"article": "original"}):
+        view = await tool.execute(**args)
+        assert view["status"] == "error", view
+        assert view["error"] == error
+        assert "effective_grants" not in view["data"]
+    agent._get_original_governing_constitution.assert_awaited_once()
