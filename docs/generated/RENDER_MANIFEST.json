@@ -4684,6 +4684,30 @@
       "type": "Design Proposal"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/proposals/constitution-and-pledge/CONSTITUTION.md",
+      "privacy": "",
+      "render": "public",
+      "status": "proposed",
+      "title": "Proposed Kestrel Constitution",
+      "type": "Principle Document"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/proposals/constitution-and-pledge/PLEDGE.md",
+      "privacy": "",
+      "render": "public",
+      "status": "proposed",
+      "title": "Proposed Kestrel agent pledge",
+      "type": "Principle Document"
+    },
+    {
       "existing_code_refs": [
         "kestrel_sovereign/static/js/api_client.mjs",
         "kestrel_sovereign/static/js/app.js",
