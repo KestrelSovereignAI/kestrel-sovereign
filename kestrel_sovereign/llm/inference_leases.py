@@ -87,6 +87,7 @@ class InferenceLeaseRecord:
     request: InferenceLeaseRequest
     quote: InferenceLeaseQuote
     lease: InferenceLease | None = None
+    prepared_offer_digest: str | None = None
 
     def to_persisted_dict(self) -> dict[str, Any]:
         """Return a credential-free record safe for agent metadata storage."""
@@ -97,6 +98,7 @@ class InferenceLeaseRecord:
             "request": self.request.to_public_dict(),
             "quote": self.quote.to_public_dict(),
             "lease": self.lease.to_public_dict() if self.lease else None,
+            **({"prepared_offer_digest": self.prepared_offer_digest} if self.prepared_offer_digest else {}),
         }
 
     @classmethod
@@ -116,6 +118,7 @@ class InferenceLeaseRecord:
         request_payload = payload.get("request")
         quote_payload = payload.get("quote")
         lease_payload = payload.get("lease")
+        prepared_offer_digest = payload.get("prepared_offer_digest")
         if (
             not isinstance(provider_name, str)
             or not isinstance(request_payload, Mapping)
@@ -143,6 +146,12 @@ class InferenceLeaseRecord:
             raise InferenceLeaseProvisioningError(
                 "persisted inference provider does not match its quote"
             )
+        if prepared_offer_digest is not None and prepared_offer_digest != PreparedInferenceLeaseOffer(
+            request, quote,
+        ).digest:
+            raise InferenceLeaseProvisioningError(
+                "persisted prepared offer does not match its request and quote"
+            )
         if lease is not None:
             lease.validate_for(request, quote)
         return cls(
@@ -150,6 +159,7 @@ class InferenceLeaseRecord:
             request=request,
             quote=quote,
             lease=lease,
+            prepared_offer_digest=prepared_offer_digest,
         )
 
 
@@ -642,9 +652,11 @@ class InferenceLeaseCoordinator:
         if self._record is not None:
             previous = self._record
             if previous.lease is None:
-                if previous.request.request_id != request.request_id or (
-                    offer is not None and (previous.request != request or previous.quote != offer.quote)
-                ):
+                # requested_at is assigned by the host on every tool call;
+                # every caller-controlled field and the exact consent lane
+                # must still match the original pending operation.
+                if (previous.request != replace(request, requested_at=previous.request.requested_at)
+                        or previous.prepared_offer_digest != (offer.digest if offer is not None else None)):
                     raise InferenceLeaseProvisioningError(
                         "an inference acquisition is already in progress"
                     )
@@ -680,6 +692,7 @@ class InferenceLeaseCoordinator:
             provider_name=quote.provider_name,
             request=request,
             quote=quote,
+            prepared_offer_digest=offer.digest if offer is not None else None,
         )
         # Persist the idempotency request and selected quote before the
         # first billable mutation.  A crash can then resume acquire with

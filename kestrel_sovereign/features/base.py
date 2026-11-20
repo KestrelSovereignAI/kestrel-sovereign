@@ -2534,7 +2534,7 @@ class Feature(_SdkFeature):
                     registration=[type(self).__name__, tool_name], arguments=effective_args,
                     expected_generation=selected_generation,
                     validate_registration=require_original_registration,
-                    execute=execute)
+                    execute=execute, witness=execution)
 
                 from kestrel_sovereign.agent.invocation import (
                     mark_current_invocation_effect_completed,

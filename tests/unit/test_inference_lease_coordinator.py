@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from pydantic import SecretStr
 from kestrel_sovereign.llm.inference_leases import (
     InferenceLeaseCoordinator,
     InferenceLeaseProviderDiscoveryError,
+    InferenceLeaseRecord,
     discover_inference_lease_providers,
 )
 
@@ -328,8 +330,21 @@ async def test_prepared_offer_retry_still_requires_original_durable_ack():
             await coordinator.acquire_prepared(request.request_id, offer.digest)
     assert len(attempts) == 2 and provider.acquire_calls == 0
     assert attempts[0] == attempts[1]
+    assert attempts[0]["prepared_offer_digest"] == offer.digest
 
     permit_persistence = True
+    # A second approval through the legacy tool is not authority to resume
+    # this plan, even when the caller has repeated every original argument.
+    for legacy in (request, replace(request, model="other-model", max_total_cost_usd=Decimal("0.01"))):
+        with pytest.raises(InferenceLeaseProvisioningError, match="already in progress"):
+            await coordinator.acquire(legacy)
+    assert len(attempts) == 2 and provider.acquire_calls == 0
+    assert InferenceLeaseRecord.from_persisted_dict(attempts[0], owner_id=request.owner_id).prepared_offer_digest == offer.digest
+    with pytest.raises(InferenceLeaseProvisioningError, match="prepared offer does not match"):
+        InferenceLeaseRecord.from_persisted_dict(
+            {**attempts[0], "prepared_offer_digest": "sha256:" + "0" * 64},
+            owner_id=request.owner_id,
+        )
     await coordinator.acquire_prepared(request.request_id, offer.digest)
     assert provider.acquire_calls == 1 and provider.last_quote is offer.quote
     assert attempts[2] == attempts[0]
@@ -361,6 +376,46 @@ async def test_offer_tools_only_mutate_through_exact_always_ask_acquisition():
     assert "does not match the approval" in wrong.error
     assert not persisted and provider.acquire_calls == 0
     accepted = await feature.acquire_prepared("offer-bound-request", preview.data["offer_digest"])
+    assert accepted.data["lease"]["quote_id"] == preview.data["quote"]["quote_id"]
+    assert provider.acquire_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_tool_cannot_resume_an_unacknowledged_prepared_acquisition():
+    from kestrel_sovereign.features.inference_lease.feature import InferenceLeaseFeature
+
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    allow_persistence = False
+
+    async def persist(_payload):
+        if not allow_persistence:
+            raise OSError("lease journal not acknowledged")
+
+    feature = InferenceLeaseFeature(SimpleNamespace(
+        privacy_agent=SimpleNamespace(can_use_cloud=lambda: True),
+    ))
+    feature._owner_id = "agent-1"
+    feature._db = object()
+    feature._coordinator = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+        persist_state=persist,
+    )
+    original = {
+        "model": "qwen3:8b", "max_hourly_cost_usd": "1", "max_total_cost_usd": "0.40",
+        "allowed_regions": ["us-tx-1"], "request_id": "offer-legacy-crossing",
+    }
+    preview = await feature.offer(original)
+    digest = preview.data["offer_digest"]
+    failure = await feature.acquire_prepared(original["request_id"], digest)
+    assert "could not be saved" in failure.error
+    assert provider.acquire_calls == 0
+
+    allow_persistence = True
+    for args in (original, {**original, "model": "smaller", "max_total_cost_usd": "0.01"}):
+        denied = await feature.acquire(**args)
+        assert "already in progress" in denied.error
+        assert provider.acquire_calls == 0
+    accepted = await feature.acquire_prepared(original["request_id"], digest)
     assert accepted.data["lease"]["quote_id"] == preview.data["quote"]["quote_id"]
     assert provider.acquire_calls == 1
 
@@ -782,8 +837,10 @@ async def test_acquire_failure_retries_only_with_same_request_id():
         await coordinator.acquire(request)
     with pytest.raises(InferenceLeaseProvisioningError, match="already in progress"):
         await coordinator.acquire(_request(request_id="different-request"))
+    with pytest.raises(InferenceLeaseProvisioningError, match="already in progress"):
+        await coordinator.acquire(replace(request, model="other-model"))
 
-    lease = await coordinator.acquire(request)
+    lease = await coordinator.acquire(replace(request, requested_at=request.requested_at + timedelta(seconds=1)))
     assert lease.request_id == "durable-request"
     assert provider.acquire_calls == 2
 

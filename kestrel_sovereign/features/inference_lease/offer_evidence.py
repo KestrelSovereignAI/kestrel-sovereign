@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 from kestrel_sovereign.agent.invocation import (
     InvocationProvenance,
@@ -17,6 +18,7 @@ from kestrel_sovereign.turn_scope import turn_scoped
 
 if TYPE_CHECKING:
     from kestrel_sdk.tools.result import ToolResult
+
     from kestrel_sovereign.llm.inference_leases import (
         InferenceLeaseCoordinator,
         PreparedInferenceLeaseOffer,
@@ -42,7 +44,12 @@ class _OfferCapture:
 
     async def observation(self) -> dict[str, Any] | None:
         candidate = self.candidate
-        if self.active or self.ambiguous or candidate is None or not candidate.receipt.confirmed:
+        if (
+            self.active
+            or self.ambiguous
+            or candidate is None
+            or not candidate.receipt.confirmed
+        ):
             return None
         if not await candidate.coordinator.is_current_prepared_offer(candidate.offer):
             return None
@@ -57,7 +64,8 @@ class _OfferCapture:
 
 
 _capture: ContextVar[_OfferCapture | None] = ContextVar(
-    "kestrel_current_prepared_offer_capture", default=None,
+    "kestrel_current_prepared_offer_capture",
+    default=None,
 )
 
 
@@ -72,18 +80,26 @@ def _bind(capture: _OfferCapture | None) -> Iterator[None]:
 
 def _capture_for_owner(owner: object) -> _OfferCapture | None:
     capture = _capture.get()
-    return capture if capture is not None and capture.active and capture.owner is owner else None
+    return (
+        capture
+        if capture is not None and capture.active and capture.owner is owner
+        else None
+    )
 
 
 turn_scoped(
-    "private_inference_offer_capture", variables=(_capture,),
-    capture=_capture_for_owner, bind=_bind,
+    "private_inference_offer_capture",
+    variables=(_capture,),
+    capture=_capture_for_owner,
+    bind=_bind,
 )
 
 
 @contextmanager
 def capture_prepared_offer(
-    owner: object, invocation_id: str, provenance: InvocationProvenance,
+    owner: object,
+    invocation_id: str,
+    provenance: InvocationProvenance,
 ) -> Iterator[_OfferCapture]:
     """Ask the original authenticated invoke to observe, never execute, a tool."""
     capture = _OfferCapture(owner, invocation_id, provenance)
@@ -95,12 +111,17 @@ def capture_prepared_offer(
 
 
 def observe_prepared_offer(
-    owner: object, coordinator: InferenceLeaseCoordinator, offer: PreparedInferenceLeaseOffer,
+    owner: object,
+    coordinator: InferenceLeaseCoordinator,
+    offer: PreparedInferenceLeaseOffer,
     result: ToolResult,
 ) -> None:
     capture = _capture_for_owner(owner)
-    if (capture is None or current_invocation_id() != capture.invocation_id
-            or current_invocation_provenance() is not capture.provenance):
+    if (
+        capture is None
+        or current_invocation_id() != capture.invocation_id
+        or current_invocation_provenance() is not capture.provenance
+    ):
         return
     receipt = observe_tool_effect_result(owner, result)
     if receipt.turn.invocation_id != capture.invocation_id:
