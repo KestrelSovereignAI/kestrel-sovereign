@@ -3913,6 +3913,7 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/constitution/resolver.py",
         "tests/integration/test_reanchor_iron_rule.py"
       ],
       "findings": [],
