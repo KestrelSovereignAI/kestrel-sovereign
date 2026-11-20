@@ -1441,11 +1441,16 @@ class OrchestratorEngineMixin:
         invocation_context=None,
         original_delivered: bool = False,
         request: Optional[str] = None,
+        keep_trailing_system: bool = False,
     ) -> Union[str, LLMResponse]:
         """Give the model one more step when it narrates continuing but emits no tool call.
 
         ``request`` is the user text the message answers, for the decision
         check (#3527).
+
+        ``keep_trailing_system`` is the turn's first call's: ``messages``
+        carries that call's operator notice where it sent it, and the repair
+        call delivers it the same way (#4198).
 
         ``original_delivered`` says the repaired message has already been
         yielded to the client (the streaming tool loop streams text as it
@@ -1493,6 +1498,7 @@ class OrchestratorEngineMixin:
                 if request_id else None
             ),
             invocation_context=invocation_context,
+            keep_trailing_system=keep_trailing_system,
         )
         if isinstance(repaired, ToolInputSuspensionResponse):
             return repaired
@@ -4225,11 +4231,12 @@ class OrchestratorEngineMixin:
         conversation_history: Optional[List[Dict[str, Any]]],
         user_message: Optional[str],
         log_prefix: str,
+        operator_notice: Optional[Dict[str, Any]] = None,
     ) -> tuple[List[Dict[str, Any]], frozenset]:
         """Rebuild the turn's message prefix for a tool continuation.
 
         A continuation must reconstruct the SAME prefix the turn's first
-        provider call used — ``[system, *history, user]`` — not just
+        provider call used — ``[system, *history, user, notice?]`` — not just
         ``[system, user]``. Seeding only the current user turn (#2841) left
         every post-tool synthesis call answering from a blank conversation:
         the model that writes the user-visible text had no memory of any
@@ -4244,6 +4251,15 @@ class OrchestratorEngineMixin:
         prefix byte-stable (Anthropic ``messages[-2]``/``[-4]`` cache
         markers, llama.cpp KV, OpenAI prefix caching) instead of presenting
         a different prefix on every continuation.
+
+        ``operator_notice`` is the operator notice that first call carried
+        after the user message (``inject_operator_turn``, #2530), the very
+        message it sent. It is part of that prefix: a provider that keeps a
+        reasoning item only when everything before it is unchanged (the
+        OpenAI Responses API, #4198) drops the reasoning a continuation sends
+        back behind a prefix that lost it. The inline ``system`` form is
+        ephemeral in conversation history (#2009), not in the turn that
+        delivered it.
 
         Returns ``(messages, history_ids)``. ``history_ids`` identifies the
         replayed rows by object identity so the prefix bounds can be
@@ -4277,6 +4293,9 @@ class OrchestratorEngineMixin:
                 f"[{log_prefix}] No user_message provided - LLM won't have context for tool results!"
             )
 
+        if operator_notice is not None:
+            messages.append(operator_notice)
+
         return messages, history_ids
 
     @staticmethod
@@ -4284,6 +4303,7 @@ class OrchestratorEngineMixin:
         messages: List[Dict[str, Any]],
         history_ids: frozenset,
         has_user_message: bool,
+        has_operator_notice: bool = False,
     ) -> tuple[int, int]:
         """Derive ``(protected_prefix, history_len)`` for the CURRENT array.
 
@@ -4299,9 +4319,16 @@ class OrchestratorEngineMixin:
         Identity (``id``) is the stable marker: the seeded rows are the caller's
         own dicts and the prune only ever drops or replaces whole entries, never
         rewrites a replayed row in place.
+
+        ``has_operator_notice``: the seed appended the turn's operator notice
+        after the user message (:meth:`_seed_orchestrator_messages`). It is
+        part of the protected prefix, never sheddable history.
         """
         history_len = sum(1 for m in messages if id(m) in history_ids)
-        return 1 + history_len + (1 if has_user_message else 0), history_len
+        return (
+            1 + history_len + (1 if has_user_message else 0)
+            + (1 if has_operator_notice else 0)
+        ), history_len
 
     async def _handle_orchestrator_response(
         self,
@@ -4317,6 +4344,8 @@ class OrchestratorEngineMixin:
         invocation_context=None,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         continuation_user_content: Optional[str] = None,
+        operator_notice: Optional[Dict[str, Any]] = None,
+        keep_trailing_system: bool = False,
     ) -> str:
         """Run the non-streaming loop behind a completed-effect Stop fence."""
 
@@ -4337,6 +4366,8 @@ class OrchestratorEngineMixin:
                 invocation_context=invocation_context,
                 conversation_history=conversation_history,
                 continuation_user_content=continuation_user_content,
+                operator_notice=operator_notice,
+                keep_trailing_system=keep_trailing_system,
             )
         except asyncio.CancelledError as error:
             state = current_invocation_effect_checkpoint()
@@ -4371,6 +4402,8 @@ class OrchestratorEngineMixin:
         invocation_context=None,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         continuation_user_content: Optional[str] = None,
+        operator_notice: Optional[Dict[str, Any]] = None,
+        keep_trailing_system: bool = False,
     ) -> str:
         """
         Handle the orchestrator's response, executing any tool calls.
@@ -4389,6 +4422,12 @@ class OrchestratorEngineMixin:
                 ``user_message`` so tool continuations keep the session's
                 context instead of answering from a blank conversation
                 (#2841).
+            operator_notice: The operator notice the turn's first provider
+                call sent after the user message, and
+            keep_trailing_system: that call's flag for it (#2530). Every
+                continuation sends the notice where the first call did and
+                delivers it the same way, so its prefix is the first call's
+                (#4198; see ``_seed_orchestrator_messages``).
         """
         _init_constants()
         from kestrel_sovereign.tools.effect_journal import TOOL_INPUT_REQUIRED_MESSAGE, tool_effect_input_waiting
@@ -4408,7 +4447,9 @@ class OrchestratorEngineMixin:
             conversation_history,
             continuation_user_content or user_message,
             "ORCHESTRATOR",
+            operator_notice,
         )
+        has_operator_notice = operator_notice is not None
 
         if not response.has_tool_calls:
             if (not tool_effect_input_waiting(self) and feature_tools
@@ -4421,6 +4462,7 @@ class OrchestratorEngineMixin:
                     self, messages, feature_tools, history_ids,
                     bool(continuation_user_content or user_message),
                     effective_model,
+                    has_operator_notice,
                 )
                 response = await self._repair_premature_turn_yield(
                     response=response,
@@ -4430,6 +4472,7 @@ class OrchestratorEngineMixin:
                     force_local_only=force_local_only,
                     effective_model=effective_model,
                     session_id=session_id,
+                    keep_trailing_system=keep_trailing_system,
                 )
                 if isinstance(response, ToolInputSuspensionResponse):
                     await self._append_executed_tool_breadcrumbs([], response.executed_tool_calls,
@@ -4491,7 +4534,8 @@ class OrchestratorEngineMixin:
             # Re-derive on every pass: a prior iteration's prune may have
             # shed replayed history, shifting all seed-time indexes (#2841).
             protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
-                messages, history_ids, bool(continuation_user_content or user_message)
+                messages, history_ids, bool(continuation_user_content or user_message),
+                has_operator_notice,
             )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
@@ -4511,6 +4555,7 @@ class OrchestratorEngineMixin:
                 model_override=effective_model,
                 session_id=session_id,
                 invocation_context=invocation_context,
+                keep_trailing_system=keep_trailing_system,
             )
 
             if isinstance(response, ToolInputSuspensionResponse):
@@ -4534,6 +4579,7 @@ class OrchestratorEngineMixin:
                         force_local_only=force_local_only,
                         effective_model=effective_model,
                         session_id=session_id,
+                        keep_trailing_system=keep_trailing_system,
                     )
                     if isinstance(response, ToolInputSuspensionResponse):
                         await self._append_executed_tool_breadcrumbs([], response.executed_tool_calls,
@@ -4576,6 +4622,7 @@ class OrchestratorEngineMixin:
     def _prune_repair_messages(
         self, messages: list, tools: list, history_ids: frozenset,
         has_user_message: bool, model: Optional[str],
+        has_operator_notice: bool = False,
     ) -> list:
         """Model-aware prune for a repair turn's message array (#2841).
 
@@ -4586,7 +4633,7 @@ class OrchestratorEngineMixin:
         on the repair call.
         """
         protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
-            messages, history_ids, has_user_message
+            messages, history_ids, has_user_message, has_operator_notice,
         )
         return self._prune_orchestrator_messages(
             messages, tools, protected_prefix=protected_prefix,
@@ -4839,6 +4886,8 @@ class OrchestratorEngineMixin:
         buffer_audit: bool = False,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         continuation_user_content: Optional[str] = None,
+        operator_notice: Optional[Dict[str, Any]] = None,
+        keep_trailing_system: bool = False,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -4882,6 +4931,12 @@ class OrchestratorEngineMixin:
         conflated — without it the synthesis call silently lost the CURRENT
         turn's retrieved context (codex review r3).
 
+        ``operator_notice`` / ``keep_trailing_system`` (#4198): the operator
+        notice the first call sent after the user message, and that call's
+        flag for it. Every follow-up and repair sends the notice where the
+        first call did and delivers it the same way, as the non-streaming
+        handler does.
+
         Yields:
             Text chunks as they arrive from the LLM
         """
@@ -4902,7 +4957,9 @@ class OrchestratorEngineMixin:
             conversation_history,
             continuation_user_content or user_message,
             "ORCHESTRATOR-STREAM",
+            operator_notice,
         )
+        has_operator_notice = operator_notice is not None
 
         if not response.has_tool_calls:
             if (not tool_effect_input_waiting(self) and feature_tools
@@ -4912,6 +4969,7 @@ class OrchestratorEngineMixin:
                     self, messages, feature_tools, history_ids,
                     bool(continuation_user_content or user_message),
                     effective_model,
+                    has_operator_notice,
                 )
                 response = await self._repair_premature_turn_yield(
                     response=response,
@@ -4924,6 +4982,7 @@ class OrchestratorEngineMixin:
                     streaming=True,
                     request_id=request_id,
                     invocation_context=invocation_context,
+                    keep_trailing_system=keep_trailing_system,
                 )
                 if isinstance(response, ToolInputSuspensionResponse):
                     yield response
@@ -5072,7 +5131,8 @@ class OrchestratorEngineMixin:
             # Re-derive on every pass: a prior iteration's prune may have
             # shed replayed history, shifting all seed-time indexes (#2841).
             protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
-                messages, history_ids, bool(continuation_user_content or user_message)
+                messages, history_ids, bool(continuation_user_content or user_message),
+                has_operator_notice,
             )
             messages = self._prune_orchestrator_messages(
                 messages, all_tools, protected_prefix=protected_prefix,
@@ -5146,6 +5206,7 @@ class OrchestratorEngineMixin:
                             (lambda: self.is_request_cancelled(request_id))
                             if request_id else None
                         ),
+                        keep_trailing_system=keep_trailing_system,
                     )
                 ) as followup_stream:
                     async for item in followup_stream:
@@ -5260,6 +5321,7 @@ class OrchestratorEngineMixin:
                             request_id=request_id,
                             invocation_context=invocation_context,
                             original_delivered=bool(streamed_text),
+                            keep_trailing_system=keep_trailing_system,
                         )
                     except Exception as exc:
                         # The repair is part of this follow-up: one that is

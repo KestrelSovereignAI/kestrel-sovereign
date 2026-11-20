@@ -642,7 +642,17 @@ async def test_structured_output_becomes_the_responses_text_format():
                  {"type": "function_call", "call_id": "call_1"}]},
      "text length"),
     ({"output": [{"type": "web_search_call"}]}, "not one Kestrel wrote"),
-], ids=["unencrypted-reasoning", "unknown-key", "bad-length", "unknown-entry"])
+    ({"output": [{"type": "function_call", "call_id": "call_1"}]}, "JSON object text"),
+    ({"output": [{"type": "function_call", "call_id": "call_1", "arguments": "[]"}]},
+     "JSON object text"),
+    ({"output": [{"type": "function_call", "call_id": "call_1", "arguments": "{"}]},
+     "must be JSON text"),
+    ({"output": [{"type": "function_call", "call_id": "call_1",
+                  "arguments": '{"a":' * 200_000 + "1" + "}" * 200_000}]},
+     "must be JSON text"),
+], ids=["unencrypted-reasoning", "unknown-key", "bad-length", "unknown-entry",
+        "no-argument-text", "non-object-arguments", "invalid-argument-text",
+        "too-deeply-nested-argument-text"])
 async def test_malformed_replay_data_is_refused_before_any_request(replay, refusal):
     wire = _OpenAIWire([])
     messages = [*FIRST_TURN, {"role": "assistant", "content": "", "tool_calls": [{
@@ -764,7 +774,10 @@ def _interleaved_history(path: str):
     ("text", "no longer matches the Responses output"),
     ("drop-call", "does not carry"),
     ("add-call", "does not place"),
-], ids=["edited-text", "dropped-call", "added-call"])
+    ("other-arguments", "arguments no longer match"),
+    ("same-truth-as-number", "arguments no longer match"),
+], ids=["edited-text", "dropped-call", "added-call", "edited-arguments",
+        "bool-as-int-arguments"])
 async def test_a_session_message_that_no_longer_fits_its_replay_is_refused(
     path, change, refusal,
 ):
@@ -772,6 +785,11 @@ async def test_a_session_message_that_no_longer_fits_its_replay_is_refused(
     assistant = messages[2]
     if change == "text":
         assistant["content"] += " (edited)"
+    elif change == "other-arguments":
+        assistant["tool_calls"][1]["function"]["arguments"] = {"again": False}
+    elif change == "same-truth-as-number":
+        # ``1 == True`` in Python; as JSON they are different arguments.
+        assistant["tool_calls"][1]["function"]["arguments"] = {"again": 1}
     elif change == "drop-call":
         assistant["tool_calls"].pop()
         messages.pop()
@@ -786,6 +804,183 @@ async def test_a_session_message_that_no_longer_fits_its_replay_is_refused(
     with pytest.raises(ValueError, match=refusal):
         await _call(path, wire, messages)
     assert wire.requests == []
+
+
+#: Argument text a provider may write that ``json.dumps`` of its decoded value
+#: does not reproduce: compact separators, a raw non-ASCII character, a JSON
+#: escape, exponent notation and a negative zero.
+NATIVE_ARGUMENTS = [
+    '{"x":1}',
+    '{"city":"Z\u00fcrich","note":"\\u2603"}',
+    '{"n":1e3,"z":-0.0}',
+]
+NATIVE_ARGUMENTS_OUTPUT = [
+    {"type": "reasoning", "id": "rs_1", "summary": [],
+     "encrypted_content": "enc-before", "status": "completed"},
+    *({"type": "function_call", "id": f"fc_{index}", "call_id": f"call_{index}",
+       "name": "lookup_marker", "arguments": arguments, "status": "completed"}
+      for index, arguments in enumerate(NATIVE_ARGUMENTS)),
+    {"type": "reasoning", "id": "rs_2", "summary": [],
+     "encrypted_content": "enc-after", "status": "completed"},
+    {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+     "content": [{"type": "output_text", "text": "One more.", "annotations": []}]},
+    {"type": "function_call", "id": "fc_last", "call_id": "call_last",
+     "name": "lookup_marker", "arguments": '{ "spaced" : true }', "status": "completed"},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", PATHS)
+async def test_each_call_goes_back_with_the_argument_text_the_provider_wrote(path):
+    """A call's arguments are sent back as the provider wrote them, byte for
+    byte. Re-encoding the decoded arguments (``{"x":1}`` as ``{"x": 1}``)
+    changes the history the later reasoning item was produced after."""
+    response = _response(NATIVE_ARGUMENTS_OUTPUT)
+    reply = response if path == "generate" else _stream_events(response, text=OWN_TEXT)
+    wire = _OpenAIWire([reply, _reply(path, ANSWER_OUTPUT, response_id="resp_2")])
+    first, _ = await _call(path, wire, FIRST_TURN)
+    assert [call.arguments for call in first.tool_calls] == [
+        {"x": 1}, {"city": "Z\u00fcrich", "note": "\u2603"}, {"n": 1000.0, "z": -0.0},
+        {"spaced": True},
+    ]
+    messages = json.loads(json.dumps(_two_call_round(first)))
+
+    await _call(path, wire, messages)
+
+    sent = [item for item in wire.bodies()[1]["input"] if item.get("type") in (
+        "reasoning", "message", "function_call")]
+    assert [item.get("encrypted_content") or item.get("arguments") or item["content"]
+            for item in sent] == [
+        "enc-before", *NATIVE_ARGUMENTS, "enc-after", "One more.", '{ "spaced" : true }',
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", PATHS)
+async def test_a_response_of_calls_alone_keeps_their_argument_text(path):
+    """With no reasoning or message to place, the calls' own argument text is
+    still the provider's, not a re-encoding of it."""
+    output = [{"type": "function_call", "id": "fc_1", "call_id": "call_1",
+               "name": "lookup_marker", "arguments": '{"x":1}', "status": "completed"}]
+    response = _response(output)
+    reply = response if path == "generate" else _stream_events(response)
+    wire = _OpenAIWire([reply, _reply(path, ANSWER_OUTPUT, response_id="resp_2")])
+    first, _ = await _call(path, wire, FIRST_TURN)
+    messages = json.loads(json.dumps(_tool_round(first)))
+
+    await _call(path, wire, messages)
+
+    assert wire.bodies()[1]["input"][2:] == [
+        {"type": "function_call", "call_id": "call_1", "name": "lookup_marker",
+         "arguments": '{"x":1}'},
+        {"type": "function_call_output", "call_id": "call_1", "output": MARKER},
+    ]
+
+
+class _DroppedBody(httpx.AsyncByteStream):
+    """An SSE body that sends ``data`` and then loses its connection."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    async def __aiter__(self):
+        yield self.data
+        raise httpx.ReadError("connection lost mid-response")
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _dropped(events: List[Dict[str, Any]]) -> httpx.Response:
+    return httpx.Response(200, stream=_DroppedBody(_sse(events)),
+                          headers={"content-type": "text/event-stream"})
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_drops_raises_the_sdks_error_with_what_served_it():
+    """A connection lost after ``response.created`` is the SDK's own error,
+    raised as the SDK raised it, and the attempt keeps the model and response
+    id the stream had already named."""
+    events = _stream_events(_response(CALL_OUTPUT), text=["Checking."], terminal=None)
+    wire = _OpenAIWire([_dropped(events)])
+
+    with pytest.raises(openai.APIConnectionError) as raised:
+        await _call("stream", wire, FIRST_TURN)
+
+    assert type(raised.value) is openai.APIConnectionError
+    assert isinstance(raised.value.__cause__, httpx.ReadError)
+    evidence = reported_usage(raised.value)
+    assert response_provider_served(evidence) == {
+        "api": "responses", "model": SERVED, "response_id": "resp_1",
+    }
+    assert evidence.content is None and evidence.tool_calls is None
+    assert (evidence.input_tokens, evidence.output_tokens) == (None, None)
+    assert wire.paths() == ["/v1/responses"]
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_drops_after_its_terminal_event_keeps_its_counts():
+    events = _stream_events(_response(CALL_OUTPUT), text=["Checking."])
+    wire = _OpenAIWire([_dropped(events)])
+
+    with pytest.raises(openai.APIConnectionError) as raised:
+        await _call("stream", wire, FIRST_TURN)
+
+    evidence = reported_usage(raised.value)
+    assert response_provider_served(evidence)["response_id"] == "resp_1"
+    assert (evidence.input_tokens, evidence.cache_read_input_tokens,
+            evidence.output_tokens, evidence.total_tokens) == (100, 20, 30, 130)
+    assert response_stop_reason(evidence) == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_drops_before_it_began_carries_nothing():
+    wire = _OpenAIWire([_dropped([])])
+
+    with pytest.raises(openai.APIConnectionError) as raised:
+        await _call("stream", wire, FIRST_TURN)
+
+    assert reported_usage(raised.value) is None
+
+
+@pytest.mark.asyncio
+async def test_a_non_streamed_transport_failure_names_nothing_it_never_saw(monkeypatch):
+    """A non-streamed response arrives whole, so a transport failure comes
+    before anything served it is known: the SDK's error is raised with no
+    evidence invented for it (the call is retried, as any dropped connection
+    is, first)."""
+    real_sleep = asyncio.sleep
+
+    async def no_backoff(delay, *args, **kwargs):
+        await real_sleep(0)
+
+    monkeypatch.setattr("kestrel_sovereign.llm.retry.asyncio.sleep", no_backoff)
+
+    def drop(request):
+        raise httpx.ReadError("connection lost", request=request)
+
+    with pytest.raises(openai.APIConnectionError) as raised:
+        await _call("generate", drop, FIRST_TURN)
+
+    assert reported_usage(raised.value) is None
+
+
+@pytest.mark.asyncio
+async def test_a_non_streamed_response_that_cannot_be_read_keeps_what_served_it():
+    """A failure after a non-streamed response arrived is raised as it was,
+    and the attempt keeps what the response reported."""
+    malformed = [{"type": "message", "id": "msg_1", "role": "assistant",
+                  "status": "completed", "content": 5}]
+    wire = _OpenAIWire([_response(malformed)])
+
+    with pytest.raises(TypeError) as raised:
+        await _call("generate", wire, FIRST_TURN)
+
+    evidence = reported_usage(raised.value)
+    assert response_provider_served(evidence) == {
+        "api": "responses", "model": SERVED, "response_id": "resp_1",
+    }
+    assert (evidence.input_tokens, evidence.output_tokens) == (100, 30)
 
 
 @pytest.mark.asyncio
@@ -867,4 +1062,11 @@ def test_a_protocol_error_is_never_completion_evidence():
     with pytest.raises(LLMProtocolError):
         _parse_responses_output({"output": [
             {"type": "function_call", "call_id": "", "name": "lookup_marker", "arguments": "{}"},
+        ]})
+    # The Responses API writes arguments as JSON text, and that text is what
+    # the call is sent back as: decoded arguments have no text to send.
+    with pytest.raises(LLMProtocolError, match="JSON text"):
+        _parse_responses_output({"output": [
+            {"type": "function_call", "call_id": "call_1", "name": "lookup_marker",
+             "arguments": {}},
         ]})

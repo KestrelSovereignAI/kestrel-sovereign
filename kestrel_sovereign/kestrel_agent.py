@@ -9233,6 +9233,11 @@ Expected Duration: {expected_duration}
             # sent. Without it the post-tool continuation answered from a blank
             # conversation while the first call had full context.
             conversation_history=context_result.messages,
+            # #4198: ...and the operator notice it sent after the user message,
+            # delivered the same way, so every continuation's prefix is that
+            # call's (a changed prefix loses replayed Responses reasoning).
+            operator_notice=operator_turn.injected_message,
+            keep_trailing_system=operator_turn.keep_trailing_system,
         )
 
         # #2675: assemble the SAME tool/narration evidence the streaming path

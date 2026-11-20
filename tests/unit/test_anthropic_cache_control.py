@@ -192,6 +192,39 @@ def test_convert_messages_preserves_supported_inline_system():
     ]
 
 
+def test_a_tool_continuation_keeps_the_first_calls_inline_system_in_place():
+    """#4198: a tool continuation sends the first call's notice where it did,
+    now followed by the tool exchange, with the first call's flag. It stays
+    inline in the same place, so both requests share the same prefix."""
+    adapter = AnthropicAdapter()
+    model = "claude-opus-4-8-20260501"
+    first = [
+        {"role": "system", "content": "prefix"},
+        {"role": "user", "content": "q1"},
+        {"role": "system", "content": "operator fact"},
+    ]
+    continuation = first + [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+
+    sent_first, system_first = adapter._convert_messages_to_anthropic(
+        first, keep_trailing_system=True, model=model,
+    )
+    sent_next, system_next = adapter._convert_messages_to_anthropic(
+        continuation, keep_trailing_system=True, model=model,
+    )
+
+    assert system_next == system_first == "prefix"
+    assert sent_next[:len(sent_first)] == sent_first
+    assert [message["role"] for message in sent_next] == [
+        "user", "system", "assistant", "user",
+    ]
+
+
 def test_convert_messages_demotes_unsupported_inline_system(caplog):
     adapter = AnthropicAdapter()
     messages = [

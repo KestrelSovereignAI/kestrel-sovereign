@@ -192,6 +192,25 @@ class TestMessageHelpers:
         assert dev == "Operator context: governance changed."
         assert [m["role"] for m in inputs] == ["user"]
 
+    def test_continuation_notice_stays_the_turns_developer_instructions(self):
+        # #4198: a continuation of the turn (a premature-yield repair) sends
+        # the first call's notice where that call did, before the repair's
+        # own exchange. It is still the turn's notice, never the thread's
+        # system prompt.
+        instructions, inputs, dev = _extract_instructions_and_input(
+            [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "Operator context: governance changed."},
+                {"role": "assistant", "content": "I'll check that next."},
+                {"role": "user", "content": "Make the tool call now."},
+            ],
+            keep_trailing_system=True,
+        )
+        assert instructions == "You are helpful"
+        assert dev == "Operator context: governance changed."
+        assert [m["role"] for m in inputs] == ["user", "assistant", "user"]
+
     def test_keep_flag_noop_when_last_message_not_system(self):
         instructions, inputs, dev = _extract_instructions_and_input(
             [

@@ -210,21 +210,60 @@ def reported_usage(error: BaseException) -> Optional[LLMResponse]:
     (:attr:`IncompleteGenerationError.usage`) rather than on a response. The
     LLM service records a failed attempt with it (#3577). A provider's own
     failure of an accepted request carries the same evidence
-    (:attr:`ProviderReportedFailure.usage`, #4198); an incomplete generation
-    ``error`` is or wraps is read first. ``None`` when ``error`` is neither,
-    or carries no usage.
+    (:attr:`ProviderReportedFailure.usage`, #4198), as does any other error
+    an adapter carried it on (:func:`carry_reported_usage`); an incomplete
+    generation ``error`` is or wraps is read first. ``None`` when ``error``
+    is none of these, or carries no usage.
     """
+    return _stated_usage(error)[1]
+
+
+#: The attribute :func:`carry_reported_usage` puts an attempt's evidence on.
+_CARRIED_USAGE_ATTR = "_kestrel_reported_usage"
+
+
+def carry_reported_usage(error: BaseException, usage: Optional[LLMResponse]) -> None:
+    """Carry ``usage`` on ``error``, a failure an adapter did not raise
+    itself, so the failed attempt is recorded with it (#4198).
+
+    A provider's SDK can fail an attempt after the provider already said
+    what served it: a stream that drops after its first event named the
+    model and response id raises the SDK's own connection error. That error
+    is left exactly as raised (its type, message and retry classification
+    are the SDK's), and only the evidence rides on it, for
+    :func:`reported_usage` to read wherever the error is then wrapped.
+    ``usage`` holds what the provider reported and never text. An error that
+    already states its attempt's usage (an incomplete generation, a
+    provider's own failure, evidence carried before) keeps its own.
+    """
+    if usage is None or _stated_usage(error)[0]:
+        return
+    try:
+        setattr(error, _CARRIED_USAGE_ATTR, usage)
+    except (AttributeError, TypeError):
+        # An error type that refuses new attributes stays exactly as raised:
+        # its attempt is recorded without the evidence rather than changed.
+        return
+
+
+def _stated_usage(error: BaseException) -> tuple[bool, Optional[LLMResponse]]:
+    """``(stated, usage)``: whether ``error`` or an error it explicitly wraps
+    states its attempt's usage, and the usage it states (``None`` when it
+    states that there is none to read)."""
     found = incomplete_generation(error)
     if found is not None:
         usage = getattr(found, "usage", None)
-        return usage if isinstance(usage, LLMResponse) else None
+        return True, usage if isinstance(usage, LLMResponse) else None
     for current in _explicitly_wrapped(error):
         if hasattr(current, "declined_wait"):
-            return None
+            return True, None
         if isinstance(current, ProviderReportedFailure):
             usage = current.usage
-            return usage if isinstance(usage, LLMResponse) else None
-    return None
+            return True, usage if isinstance(usage, LLMResponse) else None
+        carried = getattr(current, _CARRIED_USAGE_ATTR, None)
+        if isinstance(carried, LLMResponse):
+            return True, carried
+    return False, None
 
 
 #: Runtime attribute on an aggregate of several routes' errors: its
@@ -436,6 +475,7 @@ __all__ = [
     "OutputCeilings",
     "ProviderReportedFailure",
     "attach_stop_reason",
+    "carry_reported_usage",
     "context_window_notice",
     "incomplete_generation",
     "join_output_ceiling_notice",

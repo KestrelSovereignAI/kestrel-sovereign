@@ -651,3 +651,189 @@ class TestSeedIdentity:
         )
         assert messages[1] is history[0]
         assert history_ids == frozenset({id(history[0])})
+
+    def test_seed_appends_the_operator_notice_after_the_user_turn(self):
+        """#4198: the notice the first call sent after the user message is part
+        of the prefix a continuation must send unchanged."""
+        notice = {"role": "system", "content": "Operator context: auto-mode on."}
+        messages, history_ids = OrchestratorEngineMixin._seed_orchestrator_messages(
+            "sys", HISTORY, "ask", "TEST", notice,
+        )
+        assert messages == [
+            {"role": "system", "content": "sys"}, *HISTORY,
+            {"role": "user", "content": "ask"}, notice,
+        ]
+        assert messages[-1] is notice
+        assert notice not in [m for m in messages if id(m) in history_ids]
+        # The notice is protected prefix, never sheddable history.
+        assert OrchestratorEngineMixin._prefix_bounds(
+            messages, history_ids, True, True,
+        ) == (len(messages), len(HISTORY))
+
+
+NOTICE = {"role": "system", "content": "Operator context: auto-mode is now enabled."}
+
+
+@pytest.mark.asyncio
+class TestContinuationKeepsTheOperatorNotice:
+    """#4198: a turn's first call can send an operator notice after the user
+    message (#2530). Every continuation of the turn sends that same prefix,
+    notice included, and delivers the notice the way the first call did. A
+    provider that keeps reasoning only behind an unchanged prefix (the OpenAI
+    Responses API) otherwise drops the reasoning a continuation replays."""
+
+    async def test_the_follow_up_call_sends_the_notice_where_the_first_call_did(
+        self, native_tool_effect_agent,
+    ):
+        agent = await _base_agent(native_tool_effect_agent)
+        agent.llm_service = MagicMock()
+        agent.llm_service.generate_with_messages = AsyncMock(
+            return_value=LLMResponse(content="done", tool_calls=None)
+        )
+        pruned = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
+        agent._prune_orchestrator_messages = pruned
+
+        handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
+        await drive_native(agent, lambda: handler(
+            response=_tool_call_response(),
+            feature_tools=[],
+            system_prompt="sys",
+            force_local_only=False,
+            effective_model="claude-opus-5",
+            user_message="ask",
+            session_id="s-1",
+            conversation_history=HISTORY,
+            operator_notice=NOTICE,
+            keep_trailing_system=True,
+        ))
+
+        call = agent.llm_service.generate_with_messages.await_args.kwargs
+        assert call["messages"][:5] == [
+            {"role": "system", "content": "sys"}, *HISTORY,
+            {"role": "user", "content": "ask"}, NOTICE,
+        ]
+        assert call["messages"][5]["role"] == "assistant"
+        assert call["keep_trailing_system"] is True
+        assert pruned.call_args.kwargs["protected_prefix"] == 1 + len(HISTORY) + 2
+
+    async def test_the_streamed_follow_up_sends_the_notice_where_the_first_call_did(
+        self, native_tool_effect_agent,
+    ):
+        agent = await _base_agent(native_tool_effect_agent)
+        captured = {}
+
+        async def _fake_stream(*_args, **kwargs):
+            captured.update(kwargs)
+            yield LLMResponse(content="done", tool_calls=None)
+
+        agent.llm_service = MagicMock()
+        agent.llm_service.stream_with_tool_detection = _fake_stream
+        agent.is_request_cancelled = MagicMock(return_value=False)
+        pruned = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
+        agent._prune_orchestrator_messages = pruned
+
+        handler = OrchestratorEngineMixin._handle_orchestrator_response_streaming.__get__(agent)
+
+        async def consume_stream():
+            async for _chunk in handler(
+                response=_tool_call_response(),
+                feature_tools=[],
+                system_prompt="sys",
+                force_local_only=False,
+                effective_model="claude-opus-5",
+                user_message="ask",
+                tool_events=[],
+                tool_results=[],
+                session_id="s-1",
+                conversation_history=HISTORY,
+                operator_notice=NOTICE,
+                keep_trailing_system=True,
+            ):
+                pass
+
+        await drive_native(agent, consume_stream)
+
+        assert captured["messages"][:5] == [
+            {"role": "system", "content": "sys"}, *HISTORY,
+            {"role": "user", "content": "ask"}, NOTICE,
+        ]
+        assert captured["messages"][5]["role"] == "assistant"
+        assert captured["keep_trailing_system"] is True
+        assert pruned.call_args.kwargs["protected_prefix"] == 1 + len(HISTORY) + 2
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_a_repair_sends_the_notice_and_delivers_it_the_same_way(
+        self, native_tool_effect_agent, streaming,
+    ):
+        agent = await _base_agent(native_tool_effect_agent)
+        agent.llm_service = MagicMock()
+        agent.is_request_cancelled = MagicMock(return_value=False)
+        agent._repair_premature_turn_yield = AsyncMock(
+            return_value=LLMResponse(content="repaired", tool_calls=None)
+        )
+        pruned = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
+        agent._prune_orchestrator_messages = pruned
+        kwargs = dict(
+            response=LLMResponse(content="let me check that", tool_calls=None),
+            feature_tools=[{"function": {"name": "t"}}],
+            system_prompt="sys",
+            force_local_only=False,
+            effective_model="claude-opus-5",
+            user_message="ask",
+            session_id="s-1",
+            conversation_history=HISTORY,
+            operator_notice=NOTICE,
+            keep_trailing_system=True,
+        )
+
+        with patch.object(
+            OrchestratorEngineMixin, "_signals_unfinished_tool_work", return_value=True,
+        ):
+            if streaming:
+                handler = OrchestratorEngineMixin._handle_orchestrator_response_streaming.__get__(agent)
+
+                async def consume_stream():
+                    async for _chunk in handler(tool_events=[], tool_results=[], **kwargs):
+                        pass
+
+                await drive_native(agent, consume_stream)
+            else:
+                handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
+                await drive_native(agent, lambda: handler(**kwargs))
+
+        repair = agent._repair_premature_turn_yield.await_args.kwargs
+        assert repair["messages"][-1] is NOTICE
+        assert repair["keep_trailing_system"] is True
+        assert pruned.call_args.kwargs["protected_prefix"] == 1 + len(HISTORY) + 2
+
+    async def test_the_repair_call_delivers_the_notice_the_same_way(
+        self, native_tool_effect_agent,
+    ):
+        agent = await _base_agent(native_tool_effect_agent)
+        agent.llm_service = MagicMock()
+        agent.llm_service.generate_with_messages = AsyncMock(
+            return_value=LLMResponse(content="done", tool_calls=None)
+        )
+        messages = [{"role": "system", "content": "sys"},
+                    {"role": "user", "content": "ask"}, NOTICE]
+
+        repair = OrchestratorEngineMixin._repair_premature_turn_yield.__get__(agent)
+        # Tool-call markup written as text: repaired without a decision check.
+        with patch.object(
+            OrchestratorEngineMixin, "_signals_unfinished_tool_work", return_value=True,
+        ), patch.object(
+            OrchestratorEngineMixin, "_tool_call_emitted_as_text", return_value=True,
+        ):
+            await drive_native(agent, lambda: repair(
+                response=LLMResponse(content="t(...)", tool_calls=None),
+                messages=messages,
+                tools=[{"function": {"name": "t"}}],
+                force_local_only=False,
+                effective_model="claude-opus-5",
+                session_id="s-1",
+                keep_trailing_system=True,
+            ))
+
+        call = agent.llm_service.generate_with_messages.await_args.kwargs
+        assert call["messages"][:3] == messages
+        assert call["keep_trailing_system"] is True

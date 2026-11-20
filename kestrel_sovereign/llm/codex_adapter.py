@@ -154,36 +154,34 @@ def _extract_instructions_and_input(messages, *, keep_trailing_system: bool = Fa
     The leading ``system`` message is the durable thread system prompt →
     ``instructions`` (consumed once at ``thread/start``).
 
-    When ``keep_trailing_system`` is set and the final message is a
-    mid-conversation ``system`` turn — the operator-signal inline delivery
-    (auto-mode / token-budget / governance) appended after the user turn —
-    it is peeled off and returned separately as ``turn_developer_instructions``.
-    The caller routes it to the app-server's per-turn
-    ``collaborationMode.settings.developer_instructions`` channel (the codex
-    equivalent of an OpenAI ``developer`` message) instead of letting it
-    overwrite the thread-level system prompt. Mirrors kestrel-claw's
-    ``buildTurnCollaborationMode`` (run-attempt.ts / thread-lifecycle.ts).
+    When ``keep_trailing_system`` is set, a mid-conversation ``system`` turn
+    is the operator-signal inline delivery (auto-mode / token-budget /
+    governance) appended after the user turn. It is peeled off and returned
+    separately as ``turn_developer_instructions``. The caller routes it to the
+    app-server's per-turn ``collaborationMode.settings.developer_instructions``
+    channel (the codex equivalent of an OpenAI ``developer`` message) instead
+    of letting it overwrite the thread-level system prompt. Mirrors
+    kestrel-claw's ``buildTurnCollaborationMode`` (run-attempt.ts /
+    thread-lifecycle.ts). The turn's first call sends the notice last; a
+    continuation of that turn (a premature-yield repair) sends the same
+    notice where the first call did, before the repair's own exchange
+    (#4198), and it is still that turn's notice, never the thread prompt.
 
     Returns ``(instructions, input_messages, turn_developer_instructions)``.
     """
-    working = list(messages)
-    turn_developer_instructions: Optional[str] = None
-    if (
-        keep_trailing_system
-        and working
-        and working[-1].get("role") == "system"
-    ):
-        turn_developer_instructions = (
-            _system_content_text(working.pop().get("content", "")) or None
-        )
-
+    notices: List[str] = []
     instructions = None
     input_messages = []
-    for msg in working:
-        if msg.get("role") == "system":
-            instructions = _system_content_text(msg.get("content", ""))
-        else:
+    for index, msg in enumerate(messages):
+        if msg.get("role") != "system":
             input_messages.append(msg)
+        elif keep_trailing_system and index > 0:
+            notice = _system_content_text(msg.get("content", ""))
+            if notice:
+                notices.append(notice)
+        else:
+            instructions = _system_content_text(msg.get("content", ""))
+    turn_developer_instructions = "\n\n".join(notices) or None
     return instructions, input_messages, turn_developer_instructions
 
 

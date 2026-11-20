@@ -111,3 +111,62 @@ def test_a_providers_failure_behind_a_route_aggregate_is_not_read():
     aggregate.__cause__ = failure
 
     assert reported_usage(aggregate) is None
+
+
+def test_evidence_carried_on_an_sdk_error_is_read_through_its_wrappers():
+    """An SDK's own error (a dropped stream's connection error) keeps its type
+    and message, and the evidence the adapter carried on it is what the
+    failed attempt is recorded with, however the error is then wrapped."""
+    from kestrel_sovereign.llm.output_ceiling import carry_reported_usage, reported_usage
+
+    dropped = ConnectionError("Connection error.")
+    evidence = _evidence("resp_dropped")
+
+    carry_reported_usage(dropped, evidence)
+    wrapper = RuntimeError("route failed")
+    wrapper.__cause__ = dropped
+
+    assert type(dropped) is ConnectionError and str(dropped) == "Connection error."
+    assert reported_usage(dropped) is evidence
+    assert reported_usage(wrapper) is evidence
+    aggregate = RuntimeError("every route failed")
+    aggregate.declined_wait = None
+    aggregate.__cause__ = dropped
+    assert reported_usage(aggregate) is None
+
+
+def test_carrying_never_replaces_evidence_an_error_states_itself():
+    from kestrel_sovereign.llm.output_ceiling import (
+        IncompleteGenerationError,
+        ProviderReportedFailure,
+        carry_reported_usage,
+        reported_usage,
+    )
+
+    failure = ProviderReportedFailure("the provider failed the response")
+    failure.usage = _evidence("resp_failed")
+    incomplete = IncompleteGenerationError("unfinished")
+    carried = ConnectionError("Connection error.")
+    carry_reported_usage(carried, _evidence("resp_first"))
+
+    for error, stated in ((failure, failure.usage), (incomplete, None),
+                          (carried, reported_usage(carried))):
+        carry_reported_usage(error, _evidence("resp_later"))
+        assert reported_usage(error) is stated
+    plain = ConnectionError("Connection error.")
+    carry_reported_usage(plain, None)
+    assert reported_usage(plain) is None
+
+
+def test_an_error_that_refuses_attributes_is_left_as_raised():
+    from kestrel_sovereign.llm.output_ceiling import carry_reported_usage, reported_usage
+
+    class Sealed(Exception):
+        def __setattr__(self, name, value):
+            raise AttributeError(name)
+
+    sealed = Sealed("sealed")
+
+    carry_reported_usage(sealed, _evidence("resp_sealed"))
+
+    assert reported_usage(sealed) is None and str(sealed) == "sealed"

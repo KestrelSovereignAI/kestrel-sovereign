@@ -2063,6 +2063,12 @@ class StreamingMixin:
                     # separate from ``user_message`` above, which stays raw user
                     # speech for dispatched subagents.
                     continuation_user_content=prompt + lazy_hint,
+                    # #4198: ...and the operator notice it sent after that
+                    # message, delivered the same way, so the continuation's
+                    # prefix is the first call's (a changed prefix loses the
+                    # replayed Responses reasoning).
+                    operator_notice=operator_turn.injected_message,
+                    keep_trailing_system=operator_turn.keep_trailing_system,
                 )) as _owned_forwarder_1870:
                     async for chunk in _owned_forwarder_1870:
                         if isinstance(chunk, ToolInputSuspensionResponse):

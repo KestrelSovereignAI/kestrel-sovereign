@@ -13,8 +13,10 @@ id. The service records it on the call's durable ``llm_calls`` row and on its
 ``llm.usage`` line, under :data:`PROVIDER_SERVED_KEY`. Nothing reads it to
 route; it is evidence only. A failed attempt keeps it too: an adapter puts it
 on the usage evidence its error carries
-(:func:`~kestrel_sovereign.llm.output_ceiling.reported_usage`), and the
-usage-only copy a failed attempt is recorded from keeps it
+(:func:`~kestrel_sovereign.llm.output_ceiling.reported_usage`), including an
+SDK error it did not raise, such as a stream that dropped after naming what
+served it (:func:`~kestrel_sovereign.llm.output_ceiling.carry_reported_usage`),
+and the usage-only copy a failed attempt is recorded from keeps it
 (:func:`carry_provider_served`).
 
 Only short identifiers are kept. A value that is not a non-empty string of at

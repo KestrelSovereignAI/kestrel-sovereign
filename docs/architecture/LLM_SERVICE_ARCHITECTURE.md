@@ -111,14 +111,21 @@ Nothing is stored by the provider (`store=false`), so the Kestrel session is
 the only owner of the conversation. The provider keeps a reasoning item only
 when the history before it is unchanged, so a response's output goes back on
 the turn's next call exactly as it came: every reasoning item, message and
-function call in its original order, each message with its own `phase`. The
-order travels as a replay record on the first tool call's
+function call in its original order, each message with its own `phase`, and
+each call's arguments as the exact text the provider wrote. Decoding and
+re-encoding them would change that history (`{"x":1}` would go back as
+`{"x": 1}`). The order travels as a replay record on the first tool call's
 `extra_content["openai"]` (the carrier Gemini thought signatures use, #3619).
 It holds the encrypted reasoning, each message's phase and text length, and
-each call's id, but no text and no call. Message text and calls are read back
-from the session's own assistant message, so nothing is sent that the session
-does not hold. A session message that no longer fits its record (other text
-length, a missing or extra call) is refused before any request. Reasoning is
+each call's id and argument text, but no message text. Message text and calls
+are read back from the session's own assistant message. A call's recorded
+argument text is sent only when it decodes to the session's own arguments for
+that call, so nothing is sent that the session does not hold. A session
+message that no longer fits its record (other text length, a missing or extra
+call, changed arguments) is refused before any request. What precedes that
+output is the turn's first request, sent back whole: the agent's tool
+continuations rebuild it as that request sent it, including an operator notice
+it carried after the user message (#2530), delivered the same way. Reasoning is
 never replayed across turns or to another provider. A stream whose final
 response holds text other than what it streamed is a protocol failure.
 
@@ -129,7 +136,13 @@ reported for the attempt (for a stream, from `response.created` when the
 failure names none). The service reads that through `reported_usage`, as it
 does an incomplete generation's usage, so the failed attempt's `llm_calls` row
 and `llm.usage` line keep the tokens and what served it beside the provider's
-error. `completed` is the natural stop, and `incomplete` reports its
+error. Any other failure once a stream has begun, such as the SDK's
+`APIConnectionError` for a connection that dropped after `response.created`,
+is raised exactly as the SDK raised it. It carries what the stream had reported
+by then (`carry_reported_usage`), so the failed attempt is still recorded with
+the model and response id that served it. A non-streamed response arrives
+whole, so its transport failure comes before anything served it is known and
+records none. `completed` is the natural stop, and `incomplete` reports its
 `incomplete_details.reason`; `max_output_tokens` is an output-limit cut.
 
 Each OpenAI adapter response also carries the provider's own account of what

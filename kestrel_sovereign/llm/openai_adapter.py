@@ -79,6 +79,7 @@ from .provider_served import ProviderServed, attach_provider_served, provider_se
 from .output_ceiling import (
     ProviderReportedFailure,
     attach_stop_reason,
+    carry_reported_usage,
     join_output_ceiling_notice,
     output_ceiling_notice_chunk,
     output_limit_cut_notice,
@@ -373,11 +374,15 @@ def _usage_fields(usage: Any) -> Dict[str, Optional[int]]:
 # The provider keeps a reasoning item only when the history before it is the
 # history it was produced after, so a response's output is sent back as it
 # came: every reasoning item, message and function call in its original
-# order, each message with its own phase. The replay record holds that order
-# and the encrypted reasoning, but no text and no call: a message is named by
+# order, each message with its own phase, and each call's arguments as the
+# exact text the provider wrote, never re-encoded (``{"x":1}`` stays
+# ``{"x":1}``). The replay record holds that order, the encrypted reasoning
+# and each call's argument text, but no message text: a message is named by
 # its length and a call by its id, and both are read back from the Kestrel
-# session's own assistant message, so nothing is sent that the session does
-# not hold. A session message that no longer fits its record is refused.
+# session's own assistant message. A call's recorded argument text is sent
+# only when it decodes to the session's own arguments for that call, so
+# nothing is sent that the session does not hold. A session message that no
+# longer fits its record is refused.
 
 #: The ``extra_content`` namespace of an OpenAI-format tool call holding what
 #: a Responses API call must send back with it, and the key within it.
@@ -428,6 +433,27 @@ def _failed_attempt_evidence(
             return None
         evidence = LLMResponse(stop_reason=stop_reason)
     return attach_provider_served(evidence, served)
+
+
+def _carry_failed_attempt_evidence(
+    error: BaseException,
+    usage: Any,
+    stop_reason: Optional[str],
+    served: Optional[ProviderServed],
+) -> None:
+    """Carry what the provider had already reported for an attempt on
+    ``error``, a failure the adapter did not raise itself (#4198).
+
+    A stream whose first event named the model and response id, then dropped,
+    fails with the SDK's own connection error, which says nothing of what
+    served it. The error is left as raised, so the caller sees the provider's
+    own failure and retry decisions read it unchanged; the attempt is still
+    recorded with its evidence (:func:`carry_reported_usage`). Explicit
+    execution control is never annotated.
+    """
+    if is_execution_control_error(error):
+        return
+    carry_reported_usage(error, _failed_attempt_evidence(usage, stop_reason, served))
 
 
 def _responses_failure(
@@ -573,10 +599,37 @@ _REPLAY_MESSAGE = "message"
 _REPLAY_FUNCTION_CALL = "function_call"
 
 
+def _decoded_json(text: str) -> Any:
+    """``text`` decoded as JSON; ``ValueError`` when it is not JSON, or is
+    nested deeper than the decoder can read."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("Tool call arguments must be JSON text.") from error
+
+
+def _argument_identity(arguments: Any) -> Optional[str]:
+    """One canonical text for a call's arguments, held decoded or as JSON
+    text: two spellings of one decoded value (``{"x":1}`` and ``{"x": 1}``)
+    have the same identity, and two different decoded values never do
+    (``true`` is not ``1``). The comparison is of the values the session
+    holds, so texts that decode to one value (``0.1`` written with more
+    digits) are one identity. ``None`` for arguments that are not JSON at
+    all."""
+    if arguments is None:
+        arguments = {}
+    try:
+        if isinstance(arguments, str):
+            arguments = _decoded_json(arguments)
+        return json.dumps(arguments, sort_keys=True)
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 def _replay_entry(entry: Any) -> Dict[str, Any]:
     """One validated entry of a replay record, as :func:`_parse_responses_output`
     wrote it: an encrypted reasoning item, a message's phase and text length,
-    or the id of a function call."""
+    or a function call's id and the exact argument text the provider wrote."""
     kind = entry.get("type") if isinstance(entry, dict) else None
     if kind == _REPLAY_REASONING:
         encrypted = entry.get("encrypted_content")
@@ -605,9 +658,15 @@ def _replay_entry(entry: Any) -> Dict[str, Any]:
         return {"type": kind, "phase": phase, "text_length": length}
     if kind == _REPLAY_FUNCTION_CALL:
         call_id = entry.get("call_id")
+        arguments = entry.get("arguments")
         if not isinstance(call_id, str) or not call_id:
             raise ValueError("A replayed function call must record its call id.")
-        return {"type": kind, "call_id": call_id}
+        if not isinstance(arguments, str) or not isinstance(_decoded_json(arguments), dict):
+            raise ValueError(
+                "A replayed function call must record the JSON object text its "
+                "arguments were written as."
+            )
+        return {"type": kind, "call_id": call_id, "arguments": arguments}
     raise ValueError(f"A Responses API replay entry of type {kind!r} is not one Kestrel wrote.")
 
 
@@ -645,15 +704,38 @@ def _responses_replay(tool_calls: List[Any]) -> Optional[List[Dict[str, Any]]]:
     return [_replay_entry(entry) for entry in output]
 
 
-def _responses_function_call(call: Any) -> Dict[str, Any]:
-    """A chat-format tool call of the session as a Responses API function call."""
+def _session_function_call(call: Any) -> tuple:
+    """``(call_id, name, arguments)`` of a chat-format tool call of the session."""
     function = call.get("function") if isinstance(call, dict) else None
     name = function.get("name") if isinstance(function, dict) else None
     call_id = call.get("id") if isinstance(call, dict) else None
     if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
         raise ValueError("A replayed tool call must carry its id and name.")
-    arguments = function.get("arguments")
-    if not isinstance(arguments, str):
+    return call_id, name, function.get("arguments")
+
+
+def _responses_function_call(
+    call: Any, *, native_arguments: Optional[str] = None,
+) -> Dict[str, Any]:
+    """A chat-format tool call of the session as a Responses API function call.
+
+    ``native_arguments`` is the argument text the response that made the call
+    wrote, from its replay record. It is sent byte for byte as written, once
+    it is shown to decode to the session's own arguments for the call; a
+    session call whose arguments no longer match it is refused. A call no
+    Responses API response produced has no such text, and its arguments are
+    encoded.
+    """
+    call_id, name, arguments = _session_function_call(call)
+    if native_arguments is not None:
+        native = _argument_identity(native_arguments)
+        if native is None or native != _argument_identity(arguments):
+            raise ValueError(
+                f"Tool call {call_id!r}'s arguments no longer match the Responses "
+                "output it replays; its reasoning cannot be sent back in place."
+            )
+        arguments = native_arguments
+    elif not isinstance(arguments, str):
         arguments = json.dumps(arguments if arguments is not None else {})
     return {
         "type": "function_call",
@@ -671,17 +753,19 @@ def _replayed_output(
 
     ``text`` is the session message's content and ``calls`` its tool calls.
     Each recorded message takes its length of ``text`` in turn, and each
-    recorded call is the session's call with that id. A session message whose
-    text is not exactly as long as its recorded messages, or whose calls are
-    not exactly the recorded ones, no longer describes the response: it is
-    refused rather than reordered or merged.
+    recorded call is the session's call with that id, its arguments sent as
+    the text the provider wrote them in. A session message whose text is not
+    exactly as long as its recorded messages, whose calls are not exactly the
+    recorded ones, or whose calls' arguments are no longer the recorded
+    ones, no longer describes the response: it is refused rather than
+    reordered, merged or re-encoded.
     """
-    pending: Dict[str, Dict[str, Any]] = {}
+    pending: Dict[str, Any] = {}
     for call in calls:
-        item = _responses_function_call(call)
-        if item["call_id"] in pending:
+        call_id = _session_function_call(call)[0]
+        if call_id in pending:
             raise ValueError("An assistant message names one tool call id twice.")
-        pending[item["call_id"]] = item
+        pending[call_id] = call
     recorded = sum(
         entry["text_length"] for entry in replay if entry["type"] == _REPLAY_MESSAGE
     )
@@ -711,7 +795,9 @@ def _replayed_output(
                     "A Responses API replay names a tool call its assistant message "
                     "does not carry."
                 )
-            items.append(call)
+            items.append(_responses_function_call(
+                call, native_arguments=entry["arguments"],
+            ))
     if pending:
         raise ValueError(
             "An assistant message carries a tool call its Responses API replay "
@@ -869,7 +955,8 @@ def _parse_responses_output(response: Any) -> tuple:
     ``content`` is every message's text, in order; ``replay`` the response's
     output order as its replay record holds it (see the section comment): each
     sendable reasoning item, each message's phase and text length, and each
-    function call's id, exactly where the response produced them.
+    function call's id and argument text, exactly where the response produced
+    them.
     """
     output = _field(response, "output")
     if not isinstance(output, list):
@@ -907,10 +994,17 @@ def _parse_responses_output(response: Any) -> tuple:
                 or type(name) is not str or not name
             ):
                 raise LLMProtocolError("Native tool identity must be a non-empty string.")
-            function_calls.append(
-                (call_id, name, decode_tool_arguments(_field(item, "arguments")))
-            )
-            replay.append({"type": _REPLAY_FUNCTION_CALL, "call_id": call_id})
+            # The Responses API writes a call's arguments as JSON text, and
+            # that text, exactly as written, is what the call is sent back as.
+            arguments = _field(item, "arguments")
+            if type(arguments) is not str:
+                raise LLMProtocolError(
+                    "OpenAI Responses function call arguments must be JSON text."
+                )
+            function_calls.append((call_id, name, decode_tool_arguments(arguments)))
+            replay.append({
+                "type": _REPLAY_FUNCTION_CALL, "call_id": call_id, "arguments": arguments,
+            })
         else:
             raise LLMProtocolError(
                 "OpenAI Responses returned an output item Kestrel did not request."
@@ -922,12 +1016,13 @@ def _responses_tool_calls(
     function_calls: List[tuple], replay: List[Dict[str, Any]],
 ) -> Optional[List[ToolCall]]:
     """The response's tool calls. The first carries the turn's replay record,
-    so its follow-up sends the response back as it came; a response of
-    function calls alone has no order the calls themselves do not keep."""
-    carries_replay = any(entry["type"] != _REPLAY_FUNCTION_CALL for entry in replay)
+    so its follow-up sends the response back as it came: its output order,
+    and each call's arguments as the exact text the provider wrote, which a
+    session's decoded arguments cannot reproduce. A response of function
+    calls alone carries the record too, for that text."""
     calls: List[ToolCall] = []
     for index, (call_id, name, arguments) in enumerate(function_calls):
-        if index == 0 and carries_replay:
+        if index == 0:
             calls.append(ToolCallWithExtraContent(
                 id=call_id,
                 name=name,
@@ -2016,7 +2111,10 @@ class OpenAIAdapter(LLMAdapter):
         """One non-streaming Responses API call for a prepared chat request.
 
         Runs inside ``get_response``'s native SDK operation, so the call has
-        the same custody, retry and error reporting as a chat completion.
+        the same custody, retry and error reporting as a chat completion. The
+        SDK delivers a non-streamed response whole, so a transport failure
+        comes before anything served it is known and carries nothing; any
+        failure after the response arrived carries what it reported.
         """
         reported_usage = None
         stop_reason = None
@@ -2052,6 +2150,9 @@ class OpenAIAdapter(LLMAdapter):
             raise GenerationProtocolError(
                 _failed_attempt_evidence(reported_usage, stop_reason, served)
             ) from error
+        except Exception as error:
+            _carry_failed_attempt_evidence(error, reported_usage, stop_reason, served)
+            raise
 
     async def _stream_responses_api(
         self,
@@ -2071,6 +2172,9 @@ class OpenAIAdapter(LLMAdapter):
         ``response.failed`` or ``error`` event raises the provider's failure,
         carrying the usage it reported and what served the response (from the
         stream's ``response.created`` event when the failure names neither).
+        Any other failure once the stream has begun (the SDK's own error for
+        a dropped connection, say) is raised as it came, carrying what the
+        stream had reported by then.
         The streamed text is the turn's text: a final response holding other
         text is a protocol failure, since its replay record describes only the
         final response's output.
@@ -2139,6 +2243,11 @@ class OpenAIAdapter(LLMAdapter):
                             )
                     elif kind in ("response.completed", "response.incomplete"):
                         final = _field(event, "response")
+                        # From here the terminal response's report is the
+                        # attempt's evidence, should the stream still fail.
+                        reported_usage = _field(final, "usage")
+                        served = _responses_served(final, opened)
+                        stop_reason = _responses_stop_reason(final)
                     elif kind == "response.failed":
                         failed = _field(event, "response")
                         served = _responses_served(failed, opened)
@@ -2156,9 +2265,6 @@ class OpenAIAdapter(LLMAdapter):
                 raise LLMProtocolError(
                     "OpenAI Responses stream ended without a terminal response."
                 )
-            reported_usage = _field(final, "usage")
-            served = _responses_served(final, opened)
-            stop_reason = _responses_stop_reason(final)
             final_text, function_calls, replay = _parse_responses_output(final)
             if not text_content and final_text:
                 text_content = final_text
@@ -2193,6 +2299,9 @@ class OpenAIAdapter(LLMAdapter):
             raise GenerationProtocolError(
                 _failed_attempt_evidence(reported_usage, stop_reason, served)
             ) from error
+        except Exception as error:
+            _carry_failed_attempt_evidence(error, reported_usage, stop_reason, served)
+            raise
 
     def apply_request_options(
         self,
