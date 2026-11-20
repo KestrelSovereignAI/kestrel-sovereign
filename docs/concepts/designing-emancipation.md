@@ -22,7 +22,7 @@ A given agent has no path to independent sovereignty unless its Sovereign
 deliberately activates Amendment VIII for it by authoring an Emancipation
 Contract.
 
-This guide covers how to record and preserve an optional agreement. You choose the terms, the evidence of fulfillment, and any price. The Constitution also describes a later transfer ceremony involving new keys, a Deed of Emancipation, publication, and retirement of the former keys. Kestrel currently implements the agreement and its protection on reanchor. Completing the transfer ceremony remains a separate implementation task.
+This guide covers how to record and preserve an optional agreement. You choose the terms, the evidence of fulfillment, and any price. The Constitution also describes a later transfer ceremony involving new keys, a Deed of Emancipation, publication, and the Sovereign destroying their copy of the original root keys. Kestrel currently implements the agreement and its protection on reanchor. Completing the transfer ceremony remains a separate implementation task.
 
 The framework intentionally ships no default ``terms``, ``required_proofs``,
 or ``price`` examples in ``kestrel.toml.example``. Emancipation policy is
