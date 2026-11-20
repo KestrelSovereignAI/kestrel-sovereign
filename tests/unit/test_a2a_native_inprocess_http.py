@@ -565,7 +565,11 @@ async def test_body_failure_retirement_timeout_retains_both_explicit_originals(r
 
     async def consume():
         nonlocal current
-        async with httpx.AsyncClient(transport=transport, timeout=0.02) as client:
+        # This case controls response read/retirement, not upload. Using the
+        # same tiny write deadline lets EOF scheduling cause an independent
+        # WriteTimeout while this test is collecting the original read failure.
+        timeout = httpx.Timeout(1.0, read=0.02)
+        async with httpx.AsyncClient(transport=transport, timeout=timeout) as client:
             async with client.stream("GET", "https://native.test/native") as response:
                 body = response.aiter_raw()
                 assert await anext(body) == b"initial"
