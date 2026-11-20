@@ -491,7 +491,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
     monkeypatch.setenv("PORT", "9090")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda env: config_path)
     monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *a, **k: fake_config)
-    monkeypatch.setattr(agent_manager, "AgentManager", lambda **k: fake_manager)
+    def create_manager(**kwargs):
+        assert kwargs["mcp_oauth_host_policy"] is oauth_policy
+        return fake_manager
+
+    monkeypatch.setattr(agent_manager, "AgentManager", create_manager)
     monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *a, **k: None)
     monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda agents: True)
     monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda app: None)
@@ -518,7 +522,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
         hf, "unmount_host_features", lambda app: events.append("host-unmount")
     )
 
+    from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
+
+    oauth_policy = MCPOAuthHostPolicy(console_origin="https://console.example")
     test_app = FastAPI()
+    test_app.state.mcp_oauth_policy = oauth_policy
     if reject_context:
         with pytest.raises(
             ContributionContractError,

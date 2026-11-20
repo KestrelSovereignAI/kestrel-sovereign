@@ -7379,7 +7379,10 @@ class TestAgentManagerBasics:
     def test_registration_rebinds_host_context_published_during_initialization(self):
         """A cold agent cannot retain the registry snapshot from construction."""
 
-        manager = AgentManager()
+        from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
+
+        oauth_policy = MCPOAuthHostPolicy(console_origin="https://console.example")
+        manager = AgentManager(mcp_oauth_host_policy=oauth_policy)
         current_registry = object()
         publication_gate = asyncio.Event()
         # Model the window after construction but before registration: neither
@@ -7397,6 +7400,7 @@ class TestAgentManagerBasics:
             current_registry
         )
         assert agent._host_context_publication_gate is publication_gate
+        assert agent._mcp_oauth_host_policy is oauth_policy
         assert (
             agent._host_context_publication_state
             is manager._host_context_publication_state
@@ -11737,8 +11741,10 @@ class TestLoadFromConfig:
         mock_get_did.return_value = "did:future"
         future_agent = _make_mock_agent("did:future")
         mock_agent_cls.return_value = future_agent
-        manager = AgentManager(base_data_dir=tmp_path)
+        from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
         from kestrel_sovereign.operator import OperatorRuntimeRegistry
+        oauth_policy = MCPOAuthHostPolicy(console_origin="https://console.example")
+        manager = AgentManager(base_data_dir=tmp_path, mcp_oauth_host_policy=oauth_policy)
         services = OperatorRuntimeRegistry()
         registry = object()
         publication_gate = asyncio.Event()
@@ -11748,6 +11754,7 @@ class TestLoadFromConfig:
 
         async def initialize_with_gate_bound():
             assert future_agent._host_context_publication_gate is publication_gate
+            assert future_agent._mcp_oauth_host_policy is oauth_policy
             assert (
                 future_agent._host_context_publication_state
                 is manager._host_context_publication_state

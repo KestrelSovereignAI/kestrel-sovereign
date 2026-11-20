@@ -64,6 +64,7 @@ from kestrel_sovereign.llm.lifecycle import (
     retire_unpublished_llm,
 )
 from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
 from kestrel_sovereign.spawn.authority_registry import (
     PendingSpawnAuthority,
     SpawnAuthorityRegistry,
@@ -1483,6 +1484,7 @@ class AgentManager:
         shared_postgres_backend: object | None = None,
         execution_custody_factory: Callable[[str, str, LocalAgentConfig], object | None] | None = None,
         hold_store: object | None = None,
+        mcp_oauth_host_policy: MCPOAuthHostPolicy | None = None,
     ):
         self._validate_shared_postgres_backend(shared_postgres_backend)
         self._agents: dict[str, KestrelAgent] = {}
@@ -1519,6 +1521,7 @@ class AgentManager:
         self._host_context_clause_registry = None
         self._host_service_resolver = None
         self._host_context_publication_gate: asyncio.Event | None = None
+        self._mcp_oauth_host_policy = mcp_oauth_host_policy
         self._host_context_publication_state = _HostContextPublicationState()
         # A multi-agent host owns one mutable isolated-feature root.  The
         # per-agent namespace is derived below from the stable DID rather than
@@ -3192,6 +3195,7 @@ class AgentManager:
             agent._host_context_publication_gate = (
                 self._host_context_publication_gate
             )
+            agent._mcp_oauth_host_policy = self._mcp_oauth_host_policy
             # Keep the live state box attached before initialize: ready hooks
             # can enter cognition while the agent is still absent from
             # ``_agents`` and therefore invisible to manager fan-out.  Leave
@@ -6237,6 +6241,7 @@ class AgentManager:
         # routable.  This also records that the direct rebind above consumed the
         # current generation, avoiding redundant work on its first normal turn.
         agent._host_context_publication_gate = self._host_context_publication_gate
+        agent._mcp_oauth_host_policy = self._mcp_oauth_host_policy
         agent._host_context_publication_state = self._host_context_publication_state
         agent._host_context_publication_generation = (
             self._host_context_publication_state.generation
