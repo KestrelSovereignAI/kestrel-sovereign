@@ -2042,7 +2042,13 @@ async def await_owned_task(
             error.add_note(f"cancellation forwarding also failed: {forwarding_error}")
     if error is not None:
         return OwnedTaskOutcome(None, error, pending_cancellation)
-    result = task.result() if admission is None else _NATIVE_TASK.result(task)
+    # A successful physical return is not proof that its observer received
+    # it. Preserve the Task's result publication (and its original refusal),
+    # but never accept a subclass's substitute as this admission's result.
+    result = task.result()
+    if (admission is not None and type(task) is not _NATIVE_TASK
+            and result is not _NATIVE_TASK.result(task)):
+        raise RuntimeError("owned result publication replaced the original native result")
     return OwnedTaskOutcome(result, None, pending_cancellation)
 
 
