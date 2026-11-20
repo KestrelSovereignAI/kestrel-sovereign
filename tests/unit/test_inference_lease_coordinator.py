@@ -497,6 +497,61 @@ async def test_failed_legacy_stage_cannot_attest_the_conflicting_offer():
 
 
 @pytest.mark.asyncio
+async def test_normal_prepared_tool_recovers_original_offer_after_failed_startup_restore():
+    from kestrel_sovereign.features.inference_lease.feature import InferenceLeaseFeature
+
+    class _LostReplyProvider(_Provider):
+        def __init__(self):
+            super().__init__("runpod", total="0.20", ready_seconds=30)
+            self.original = None
+            self.reconcile_calls = 0
+
+        async def acquire(self, request, quote):
+            self.acquire_calls += 1
+            self.original = (request, quote)
+            raise ConnectionError("lost the original provider receipt")
+
+        async def reconcile_expired_acquisition(self, request, quote):
+            assert (request, quote) == self.original
+            self.reconcile_calls += 1
+            if self.reconcile_calls == 1:
+                raise ConnectionError("provider unavailable at startup")
+            return _lease(request, quote, state=InferenceLeaseState.PENDING)
+
+    provider = _LostReplyProvider()
+    durable = []
+    now = _now()
+
+    async def persist(payload):
+        durable.append(payload)
+
+    def coordinator():
+        return InferenceLeaseCoordinator(
+            llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+            persist_state=persist, clock=lambda: now,
+        )
+
+    original = coordinator()
+    offer = await original.prepare_offer(_request())
+    with pytest.raises(InferenceLeaseProvisioningError, match="could not acquire"):
+        await original.acquire_prepared(offer.request.request_id, offer.digest)
+    now = offer.quote.expires_at
+    restored = coordinator()
+    with pytest.raises(InferenceLeaseProvisioningError, match="could not reconcile persisted state"):
+        await restored.restore(durable[-1])
+    feature = InferenceLeaseFeature(SimpleNamespace(
+        privacy_agent=SimpleNamespace(can_use_cloud=lambda: True),
+    ))
+    feature._db = object()
+    feature._coordinator = restored
+    wrong = await feature.acquire_prepared(offer.request.request_id, "sha256:" + "0" * 64)
+    assert "does not match" in wrong.error
+    accepted = await feature.acquire_prepared(offer.request.request_id, offer.digest)
+    assert accepted.data["lease"]["quote_id"] == offer.quote.quote_id
+    assert provider.acquire_calls == 1 and provider.reconcile_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_selects_cheapest_quote_then_fastest_without_mutating_others():
     cheap_slow = _Provider("cheap", total="0.10", ready_seconds=50)
     cheap_fast = _Provider("fast", total="0.10", ready_seconds=20)

@@ -629,6 +629,13 @@ class InferenceLeaseCoordinator:
             async with self._lock:
                 require_execution_work()
                 offer = self._prepared_offer
+                pending = self._record
+                if (pending is not None and pending.lease is None
+                        and pending.request.request_id == request_id
+                        and pending.prepared_offer_digest == offer_digest):
+                    # Startup may have loaded or failed to reconcile this
+                    # original attempt before any new offer can exist.
+                    offer = PreparedInferenceLeaseOffer(pending.request, pending.quote)
                 if offer is None or offer.request.request_id != request_id or offer.digest != offer_digest:
                     raise InferenceLeaseConstraintError("prepared inference offer does not match the approval")
                 lease = await self._acquire_locked(offer.request, offer=offer)
