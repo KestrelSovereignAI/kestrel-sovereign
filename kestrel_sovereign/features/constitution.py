@@ -1,9 +1,12 @@
+import hashlib
 import logging
 import re
 from typing import Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.constitution.grants import resolve_amendment_ix_grants
+from kestrel_sovereign.constitution.hierarchy import DANGEROUS_CAPABILITIES
 from kestrel_sovereign.features.base import Feature, tool
 
 logger = logging.getLogger(__name__)
@@ -100,6 +103,14 @@ def _extent(text: str, entries: List[dict], position: int) -> int:
         if later["level"] <= level and later["is_unit"]:
             return later["match"].start()
     return len(text)
+
+
+def _unit_bodies(text: str):
+    """Yield each structural entry and its exact slice of the document."""
+    entries = _classify_headings(text)
+    for position, entry in enumerate(entries):
+        if entry["is_unit"]:
+            yield entry, text[entry["match"].start():_extent(text, entries, position)]
 
 
 class ConstitutionFeature(Feature):
@@ -213,15 +224,9 @@ class ConstitutionFeature(Feature):
         self.amendments = {}
         self.frame = {}
 
-        entries = _classify_headings(self.full_text)
-
-        for position, entry in enumerate(entries):
-            if not entry["is_unit"]:
-                continue
-
-            end = _extent(self.full_text, entries, position)
-            body = self.full_text[entry["match"].start():end].strip()
+        for entry, body in _unit_bodies(self.full_text):
             kind = entry["kind"]
+            body = body.strip()
 
             if kind == "Frame":
                 self._record_frame(entry["title"], body)
@@ -287,7 +292,7 @@ class ConstitutionFeature(Feature):
 
     @tool(
         name="constitution",
-        description="Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary.",
+        description="Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary; article='original' for the exact anchored text. Amendment IX also displays the effective ComputerUse constitutional grants and their provenance.",
         category=ToolCategory.SYSTEM,
         command_prefix="!constitution"
     )
@@ -296,7 +301,8 @@ class ConstitutionFeature(Feature):
         Retrieve constitutional content.
 
         Usage:
-            !constitution                  - Full text
+            !constitution                  - Full governing text
+            !constitution original         - Exact anchored text
             !constitution book I           - A Book (I-IV or 1-4)
             !constitution chapter 5        - A Chapter of Book I
             !constitution amendment VIII   - An Amendment of Book II (I-IX or 1-9)
@@ -318,6 +324,15 @@ class ConstitutionFeature(Feature):
             # The honesty contract requires a miss to surface as ERROR rather
             # than OK carrying apologetic text.
             return ToolResult.failed(body, data={"kind": kind})
+
+        original_reader = getattr(self.agent, "_get_original_governing_constitution", None)
+        if article and article.lower() == "original" and not search:
+            if not callable(original_reader):
+                return failed("Error: No anchored constitution source is available.", "unavailable")
+            original = await original_reader()
+            if original.startswith("Error:"):
+                return failed(original, "unavailable")
+            return ok(original, "original_text")
 
         error = await self._refresh_governing_text()
         if error:
@@ -342,6 +357,8 @@ class ConstitutionFeature(Feature):
                     "book",
                 )
             if keyword == "amendment" and search:
+                if self._is_amendment_ix(search):
+                    return await self._effective_amendment_ix(original_reader)
                 body = self._get_amendment(search)
                 return ok(body, "amendment") if body else failed(
                     f"Amendment '{search}' not found. "
@@ -365,6 +382,9 @@ class ConstitutionFeature(Feature):
             body = self._get_book(article)
             if body:
                 return ok(body, "book")
+
+            if self._is_amendment_ix(article):
+                return await self._effective_amendment_ix(original_reader)
 
             body = self._get_amendment(article)
             if body:
@@ -406,6 +426,57 @@ class ConstitutionFeature(Feature):
             )
 
         return ok(self.full_text, "full_text")
+
+    @staticmethod
+    def _is_amendment_ix(identifier: str | int) -> bool:
+        return _as_index(str(identifier).strip().upper().removeprefix("AMENDMENT ")) == 9
+
+    async def _effective_amendment_ix(self, original_reader) -> ToolResult:
+        base_hash = None
+        if callable(original_reader):
+            original = await original_reader()
+            if original.startswith("Error:"):
+                return ToolResult.failed(original, data={"kind": "unavailable"})
+            base_heading = "Anchored Amendment IX text"
+            base_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        else:
+            base_heading = "Governing Amendment IX text"
+            original = self.full_text
+
+        base_text = None
+        for entry, body in _unit_bodies(original):
+            if entry["kind"] == "Amendment" and _as_index(entry["identifier"]) == 9:
+                base_text = body
+        resolution = resolve_amendment_ix_grants(self.agent)
+        grants = sorted(resolution.grants & DANGEROUS_CAPABILITIES)
+        details = [
+            "## Amendment IX — Effective ComputerUse constitutional grants",
+            f"Grants: {', '.join(grants) or '(none)'}",
+            f"Operative source: {resolution.source}",
+            f"Source verification: {resolution.verification}",
+            f"Operative source SHA-256: {resolution.content_hash or 'unavailable'}",
+            "Signer: unavailable",
+            f"Per-agent overlay status: {resolution.overlay_status}",
+            "A grant permits the capability at the constitutional gate. "
+            "Privacy, runtime configuration, and approval checks still apply.",
+            f"## {base_heading}",
+            f"Full anchored text SHA-256: {base_hash or 'unavailable'}",
+            base_text if base_text is not None else "Amendment IX is absent from this text.",
+        ]
+        return ToolResult.ok(
+            confirmation="\n\n".join(details),
+            data={
+                "kind": "amendment",
+                "effective_grants": grants,
+                "source": resolution.source,
+                "verification": resolution.verification,
+                "sha256": resolution.content_hash,
+                "signer": None,
+                "overlay_status": resolution.overlay_status,
+                "base_text": base_text,
+                "base_sha256": base_hash,
+            },
+        )
 
     def _get_book(self, identifier: str) -> Optional[str]:
         """Look up a Book by number or roman numeral."""
