@@ -236,19 +236,7 @@ Your conversations and agent identity remain protected.
 
 Someday, you may want your agent to be fully independent. This is called **emancipation**.
 
-By default, **Amendment VIII is dormant** — your agent has no path to
-independent sovereignty unless you author one. To enable emancipation
-for a specific agent, add an `[emancipation]` block to that agent's
-`kestrel.toml` before inception (or before reanchor for an existing
-agent). See
-[docs/concepts/designing-emancipation.md](../concepts/designing-emancipation.md)
-for example contracts and a migration guide for agents created
-before the dormant-default flip. The golden rule: never run
-`kestrel constitution reanchor --force` without first deciding what
-should happen to Amendment VIII for that agent — with no
-`[emancipation]` block, reanchor will replace the agent's Amendment
-VIII with the new dormant canonical text and any clause from the
-old canonical is erased.
+New agents use a dormant Amendment VIII by default. An optional agreement sets out the conditions for a future transfer of authority. Before acting for an existing agent, read its anchored terms and any recorded agreement. The `kestrel setup`, `kestrel create`, and offline reanchor commands read the project’s configuration. Check which agent and terms it will apply to. The Docker creation procedure in this guide starts with the packaged dormant default. For activation, preservation of earlier promises, and the history of the default, see [Designing an Emancipation Contract](../concepts/designing-emancipation.md).
 
 **Before granting sovereignty, consider:**
 
