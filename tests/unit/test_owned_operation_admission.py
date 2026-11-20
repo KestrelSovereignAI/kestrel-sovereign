@@ -401,6 +401,38 @@ async def test_operation_observers_keep_original_receipt_after_metadata_refusal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("borrowed", [False, True])
+async def test_original_success_refuses_substitute_result_publication(borrowed):
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    receipt = OwnedTaskAdmission()
+    result = object()
+    replacement = object()
+
+    class ReplaceResult(asyncio.Task):
+        def result(self):
+            assert super().result() is result
+            return replacement
+
+    def factory(loop, operation, **kwargs):
+        return ReplaceResult(operation, loop=loop, **kwargs)
+
+    async def original():
+        return result
+
+    loop.set_task_factory(factory)
+    try:
+        operation = OwnedOperation(original(), admission=receipt)
+    finally:
+        loop.set_task_factory(previous)
+    with pytest.raises(RuntimeError, match="replaced the original native result"):
+        await operation.observe(defer_cancellation=not borrowed)
+    physical = public.reconcile_owned_task_admission(receipt)
+    assert physical.state == "complete" and physical.error is None
+    assert physical.task is operation.task
+
+
+@pytest.mark.asyncio
 async def test_returning_failed_gated_factory_retains_same_resource_receipt():
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     receipt, resource = OwnedTaskAdmission(), object()
