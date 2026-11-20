@@ -45,9 +45,12 @@ something inherited as boilerplate.
    Emancipation Contract. The Iron Rule applies: **once anchored, the
    contract cannot be retroactively narrowed or revoked**.
 
-The activation itself is signed by the Sovereign root key generated at
-inception, so the contract and the signature are byte-coupled in the
-agent's first signed artifact.
+The platform Constitution calls for the Sovereign’s root-key authorization.
+Creation records the exact rendered text and its hash. The default creation
+path does not produce a separate Sovereign signature over those terms.
+An anchor or structured receipt alone establishes what was recorded, and
+readers should distinguish that from proof of who authorized it.
+[Activation evidence at creation](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/4201)
 
 ## What you author
 
