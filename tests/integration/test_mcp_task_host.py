@@ -16,9 +16,11 @@ from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.mcp_tasks import MCPTaskHostPolicy
+from kestrel_sovereign.mcp_task_store import MCPTaskIntegrityError
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable, current_tool_effect_execution
 from tests.integration.test_mcp_apps_host import apps_boundary as apps_boundary
+from tests.shared.mcp_task_custody import attach as attach_task, binding as task_binding, submission
 from tests.utils.original_failure import lost_original_database_commit_ack
 from kestrel_sovereign.execution_custody import execution_evidence_carriers
 
@@ -28,10 +30,10 @@ CONTRACT = b'{"connection":"owned-apps","tool":{"name":"initial"}}'
 
 
 @pytest_asyncio.fixture
-async def task_boundary(apps_boundary):
+async def task_boundary(apps_boundary, request):
     b = apps_boundary
     host = b.agent.create_mcp_task_host(b.feature, input_host=b.feature._input_host,
-        configuration={}, is_current=lambda: not b.feature._closing)
+        configuration=getattr(request, 'param', {}), is_current=lambda: not b.feature._closing)
     await host.initialize()
     try:
         yield b, host
@@ -53,6 +55,57 @@ async def invoke(b, marker='approved'):
 async def admit(host, selected):
     return await host.admit(selected.binding, connection_name='owned-apps',
         authorization_id='a' * 64, contract=CONTRACT)
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+@pytest.mark.parametrize('task_boundary', [{'maintenance_page_records': 1}], indirect=True)
+async def test_task_maintenance_visits_one_page_per_tick_and_wraps(task_boundary, monkeypatch):
+    _, host = task_boundary
+    reservations = [await host.store.reserve(
+        task_binding(agent_did=host.agent.did, operation_id=f'maintenance-task-{index}'), submission())
+        for index in range(3)]
+    handles = sorted(item.record.handle for item in reservations)
+    opened = []
+    open_row = host.store._open
+
+    def record_open(row):
+        result = open_row(row)
+        opened.append(result.handle)
+        return result
+
+    monkeypatch.setattr(host.store, '_open', record_open)
+    for expected in ([handles[0]], [handles[1]], [handles[2]], [], [handles[0]]):
+        opened.clear()
+        await host.maintain()
+        assert opened == expected
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+@pytest.mark.parametrize('task_boundary', [{'maintenance_page_records': 1}], indirect=True)
+async def test_task_maintenance_rejects_duplicate_authenticated_operations_across_pages(task_boundary):
+    _, host = task_boundary
+    store = host.store
+    other = await store.reserve(task_binding(agent_did=host.agent.did), submission())
+    reservation = await store.reserve(
+        task_binding(agent_did=host.agent.did, operation_id='different-task'), submission())
+    attached = await attach_task(store, reservation.issuance)
+    mutation = await store.reserve_mutation(attached, operation_id='different-mutation', kind='cancel')
+
+    # Seed a damaged inventory with two authentic rows, each of which is
+    # internally valid. Only a scan across both can detect the reused ID.
+    envelope = mutation.record.envelope
+    receipts = envelope['control']['mutations']
+    receipts[other.record.binding.operation_id] = receipts.pop('different-mutation')
+    async with store.write_transaction():
+        await store._lock()
+        actual, row = await store._read_row(attached.handle)
+        await store._persist(actual, row, actual.phase, envelope)
+
+    assert await store.read_handle(attached.handle) is not None
+    assert await store.read_handle(other.record.handle) == other.record
+    await host.maintain()
+    with pytest.raises(MCPTaskIntegrityError, match='conflicting original custody'):
+        await host.maintain()
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)

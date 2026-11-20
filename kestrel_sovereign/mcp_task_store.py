@@ -502,13 +502,19 @@ class MCPTaskStore(UnifiedStoreBase):
         # Open every retained row before trusting phase/uniqueness projections.
         rows = await self.database.fetchall(f'SELECT {_ROW_COLUMNS} FROM mcp_task_records WHERE scope=? ORDER BY handle', (self.scope,))
         records = [(self._open(row), row) for row in rows]
+        self.inventory_operations(record for record, _ in records)
+        return records
+
+    @staticmethod
+    def inventory_operations(records, *, prior=frozenset()) -> set[str]:
+        """Reject conflicting authenticated operation IDs across inventory pages."""
         operations = set()
-        for record, _ in records:
+        for record in records:
             for operation in (record.binding.operation_id, *record.continuity['operations'], *record.control['mutations']):
-                if operation in operations:
+                if operation in prior or operation in operations:
                     raise MCPTaskIntegrityError('MCP Task operation has conflicting original custody')
                 operations.add(operation)
-        return records
+        return operations
 
     async def _lock(self):
         changed = await self.database.execute('UPDATE mcp_task_keys SET revision=revision+1 WHERE scope=?', (self.scope,))
@@ -525,11 +531,25 @@ class MCPTaskStore(UnifiedStoreBase):
                 return record
         return None
 
+    async def _read_row(self, handle: str):
+        row = await self.database.fetchone(
+            f'SELECT {_ROW_COLUMNS} FROM mcp_task_records WHERE scope=? AND handle=?',
+            (self.scope, handle))
+        return None if row is None else (self._open(row), row)
+
+    async def read_handle(self, handle: str) -> MCPTaskRecord | None:
+        """Authenticate one row. A handle selects evidence and grants no authority."""
+        self._ready()
+        _binding_text(handle)
+        selected = await self._read_row(handle)
+        return None if selected is None else selected[0]
+
     async def read(self, binding: MCPTaskBinding, handle: str) -> MCPTaskRecord:
-        record = await self.lookup(binding)
-        if record is None or record.handle != handle:
-            raise MCPTaskConflict('MCP Task custody is absent or belongs to another operation')
-        return record
+        self._ready()
+        self._binding_digest(binding)
+        _binding_text(handle)
+        actual, _ = self._require_binding(await self._read_row(handle), binding)
+        return actual
 
     async def list_remote_tasks(self) -> tuple[MCPTaskRecord, ...]:
         """Private restart inventory; the owning host must authorize every poll."""
@@ -541,6 +561,33 @@ class MCPTaskStore(UnifiedStoreBase):
         """Private owner reconstruction, including uncertain and input-held work."""
         self._ready()
         return tuple(record for record, _ in await self._all())
+
+    async def retained_page(self, *, after: str | None, max_records: int,
+                            max_bytes: int) -> tuple[MCPTaskRecord, ...]:
+        """Authenticate a handle-ordered page without trusting stored state as a filter.
+
+        The byte target paces transport of existing ciphertext. An original row
+        larger than the page target is read on its own, including after a policy
+        reduction.
+        """
+        self._ready()
+        if after is not None:
+            _binding_text(after)
+        if any(type(limit) is not int or limit <= 0 for limit in (max_records, max_bytes)):
+            raise ValueError('MCP Task inventory requires positive page limits')
+        rows = await self.database.fetchall(
+            'WITH candidates AS ('
+            'SELECT handle,LENGTH(payload) AS payload_bytes FROM mcp_task_records '
+            'WHERE scope=? AND handle>? ORDER BY handle LIMIT ?'
+            '), budget AS ('
+            'SELECT handle,ROW_NUMBER() OVER (ORDER BY handle) AS ordinal,'
+            'SUM(payload_bytes) OVER (ORDER BY handle ROWS UNBOUNDED PRECEDING) AS total '
+            'FROM candidates'
+            ') '
+            f'SELECT {_ROW_COLUMNS} FROM mcp_task_records WHERE scope=? '
+            'AND handle IN (SELECT handle FROM budget WHERE ordinal=1 OR total<=?) ORDER BY handle',
+            (self.scope, after or '', max_records, self.scope, max_bytes))
+        return tuple(self._open(row) for row in rows)
 
     @staticmethod
     def _operation_owner(records, operation_id):
@@ -611,11 +658,14 @@ class MCPTaskStore(UnifiedStoreBase):
             binding, hashlib.sha256(issuance.secret.encode()).hexdigest())
 
     @staticmethod
-    def _select_issuance(records, expected):
-        selected = [(record, row) for record, row in records if record.handle == expected.handle]
-        if len(selected) != 1:
+    def _in_inventory(records, handle):
+        return next((selected for selected in records if selected[0].handle == handle), None)
+
+    @staticmethod
+    def _select_issuance(selected, expected):
+        if selected is None:
             raise MCPTaskConflict('MCP Task original issuance is absent')
-        actual, row = selected[0]
+        actual, row = selected
         if (actual.binding != expected.binding or actual.revision != expected.revision
                 or actual.phase != 'ISSUING' or not hmac.compare_digest(row[7], expected.claim_hash)):
             raise MCPTaskConflict('MCP Task issuance is no longer current')
@@ -628,7 +678,7 @@ class MCPTaskStore(UnifiedStoreBase):
         async with self.write_transaction():
             await self._lock()
             records = await self._all()
-            actual, row = self._select_issuance(records, expected)
+            actual, row = self._select_issuance(self._in_inventory(records, expected.handle), expected)
             remote = self._remote_digest(actual.binding, task_id)
             if remote is not None and any(other[4] == remote for _, other in records):
                 raise MCPTaskConflict('MCP Task remote identity already has original custody')
@@ -684,11 +734,10 @@ class MCPTaskStore(UnifiedStoreBase):
         self._binding_digest(expected.binding)
 
     @staticmethod
-    def _select(records, expected):
-        selected = [(record, row) for record, row in records if record.handle == expected.handle]
-        if len(selected) != 1 or selected[0][0].binding != expected.binding:
+    def _require_binding(selected, binding):
+        if selected is None or selected[0].binding != binding:
             raise MCPTaskConflict('MCP Task original custody is absent or has another binding')
-        return selected[0]
+        return selected
 
     async def reserve_mutation(self, expected: MCPTaskRecord, *, operation_id: str,
                                kind: Literal['update', 'cancel'], input_responses: dict | None = None
@@ -711,7 +760,7 @@ class MCPTaskStore(UnifiedStoreBase):
         async with self.write_transaction():
             await self._lock()
             records = await self._all()
-            actual, row = self._select(records, expected)
+            actual, row = self._require_binding(self._in_inventory(records, expected.handle), expected.binding)
             if actual.remote_task_id is None:
                 raise MCPTaskConflict('MCP Task mutation requires original remote custody')
             params = {'taskId': actual.remote_task_id}
@@ -757,7 +806,8 @@ class MCPTaskStore(UnifiedStoreBase):
         claim_hash = hashlib.sha256(issuance.secret.encode()).hexdigest()
         async with self.write_transaction():
             await self._lock()
-            actual, row = self._select(await self._all(), issuance.record)
+            actual, row = self._require_binding(
+                await self._read_row(issuance.record.handle), issuance.record.binding)
             envelope = actual.envelope
             if actual.remote_task_id is None:
                 raise MCPTaskConflict('MCP Task original mutation custody is absent')
@@ -785,12 +835,8 @@ class MCPTaskStore(UnifiedStoreBase):
         observation = self._snapshot(observation)
         async with self.write_transaction():
             await self._lock()
-            selected = [(record, row) for record, row in await self._all() if record.handle == expected.handle]
-            if len(selected) != 1:
-                raise MCPTaskConflict('MCP Task original observation custody is absent')
-            actual, row = selected[0]
-            if (actual.binding != expected.binding or actual.revision != expected.revision
-                    or actual.phase != 'ATTACHED'):
+            actual, row = self._require_binding(await self._read_row(expected.handle), expected.binding)
+            if actual.revision != expected.revision or actual.phase != 'ATTACHED':
                 raise MCPTaskConflict('MCP Task observation revision is no longer current')
             terminal = self._observation(actual.remote_task_id, observation)
             phase = 'SETTLED' if terminal else 'ATTACHED'

@@ -554,7 +554,7 @@ async def test_an_assigned_task_lineage_cannot_be_replaced_even_by_authenticated
     with pytest.raises(MCPTaskConflict, match='lineage cannot change'):
         async with joint.tasks.write_transaction():
             await joint.tasks._lock()
-            actual, row = joint.tasks._select(await joint.tasks._all(), current)
+            actual, row = joint.tasks._require_binding(await joint.tasks._read_row(current.handle), current.binding)
             await joint.tasks._persist(actual, row, 'INPUT_WAITING', None,
                 continuity=continuity, input_lineage_digest=lineage)
     assert await joint.tasks.database.fetchall('SELECT * FROM mcp_task_records') == before

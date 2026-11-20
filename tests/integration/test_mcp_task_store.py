@@ -19,6 +19,45 @@ from tests.shared.mcp_task_custody import custody as custody, binding, claim, at
 
 
 @pytest.mark.asyncio
+async def test_retained_inventory_pages_authenticate_original_rows_with_bounded_work(custody, monkeypatch):
+    store = await custody.reopen(max_active=3)
+    reservations = [await store.reserve(binding(operation_id=f'page-task-{index}'), submission())
+                    for index in range(3)]
+    records = sorted((item.record for item in reservations), key=lambda record: record.handle)
+    opened = []
+    open_row = store._open
+
+    def record_open(row):
+        result = open_row(row)
+        opened.append(result.handle)
+        return result
+
+    monkeypatch.setattr(store, '_open', record_open)
+    first = await store.retained_page(after=None, max_records=3, max_bytes=1)
+    assert first == (records[0],)
+    assert opened == [records[0].handle]
+    opened.clear()
+
+    second = await store.retained_page(after=first[0].handle, max_records=1, max_bytes=4096)
+    assert second == (records[1],)
+    assert opened == [records[1].handle]
+    sizes = await store.database.fetchall(
+        'SELECT LENGTH(payload) FROM mcp_task_records WHERE scope=? ORDER BY handle', (store.scope,))
+    opened.clear()
+    byte_budget = sizes[0][0] + sizes[1][0]
+    assert await store.retained_page(after=None, max_records=3, max_bytes=byte_budget) == tuple(records[:2])
+    assert opened == [records[0].handle, records[1].handle]
+    assert await store.retained_page(after=records[-1].handle, max_records=3, max_bytes=4096) == ()
+
+    # The page must authenticate the row even if plaintext metadata suggests
+    # a different revision or the next legitimate row would fit its budget.
+    await store.database.execute('UPDATE mcp_task_records SET revision=revision+1 WHERE handle=?',
+        (records[2].handle,))
+    with pytest.raises(MCPTaskIntegrityError):
+        await store.retained_page(after=second[0].handle, max_records=3, max_bytes=1)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('task_id', ['', 'é/任務/🔒', ' opaque\u0000task\r\n'])
 async def test_reservation_and_exact_private_claim_survive_fresh_connections(custody, task_id):
     store = custody.store
