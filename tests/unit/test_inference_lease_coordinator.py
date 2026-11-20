@@ -273,6 +273,69 @@ def _coordinator(
 
 
 @pytest.mark.asyncio
+async def test_read_only_offer_is_promoted_without_requoting_after_approval():
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    coordinator, persisted = _coordinator({"runpod": provider})
+    request = _request()
+    offer = await coordinator.prepare_offer(request)
+    assert offer.request is request and offer.quote.estimated_total_cost_usd == Decimal("0.20")
+    assert provider.acquire_calls == 0 and not persisted
+
+    provider.total = "0.90"
+    with pytest.raises(InferenceLeaseConstraintError, match="prepared.*offer"):
+        await coordinator.acquire_prepared(request.request_id, "sha256:" + "0" * 64)
+    assert provider.acquire_calls == 0 and not persisted
+
+    lease = await coordinator.acquire_prepared(request.request_id, offer.digest)
+    assert lease.quote_id == offer.quote.quote_id
+    assert provider.last_request is request and provider.last_quote is offer.quote
+    assert provider.acquire_calls == 1 and persisted[0]["quote"] == offer.quote.to_public_dict()
+
+
+@pytest.mark.asyncio
+async def test_replacing_offer_refuses_previous_approval_even_with_same_provider_quote_id():
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    coordinator, persisted = _coordinator({"runpod": provider})
+    request = _request()
+    old = await coordinator.prepare_offer(request)
+    provider.total = "0.30"
+    new = await coordinator.prepare_offer(request)
+    assert old.quote.quote_id == new.quote.quote_id and old.digest != new.digest
+    with pytest.raises(InferenceLeaseConstraintError, match="prepared.*offer"):
+        await coordinator.acquire_prepared(request.request_id, old.digest)
+    assert provider.acquire_calls == 0 and not persisted
+
+
+@pytest.mark.asyncio
+async def test_prepared_offer_retry_still_requires_original_durable_ack():
+    provider = _Provider("runpod", total="0.20", ready_seconds=30)
+    attempts = []
+    permit_persistence = False
+
+    async def persist(payload):
+        attempts.append(payload)
+        if not permit_persistence:
+            raise OSError("prepared lease journal is unavailable")
+
+    coordinator = InferenceLeaseCoordinator(
+        llm_service=_LLMService(), owner_id="agent-1", providers={"runpod": provider},
+        persist_state=persist,
+    )
+    request = _request()
+    offer = await coordinator.prepare_offer(request)
+    for _ in range(2):
+        with pytest.raises(InferenceLeaseProvisioningError, match="could not be saved"):
+            await coordinator.acquire_prepared(request.request_id, offer.digest)
+    assert len(attempts) == 2 and provider.acquire_calls == 0
+    assert attempts[0] == attempts[1]
+
+    permit_persistence = True
+    await coordinator.acquire_prepared(request.request_id, offer.digest)
+    assert provider.acquire_calls == 1 and provider.last_quote is offer.quote
+    assert attempts[2] == attempts[0]
+
+
+@pytest.mark.asyncio
 async def test_selects_cheapest_quote_then_fastest_without_mutating_others():
     cheap_slow = _Provider("cheap", total="0.10", ready_seconds=50)
     cheap_fast = _Provider("fast", total="0.10", ready_seconds=20)
