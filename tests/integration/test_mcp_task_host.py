@@ -11,16 +11,21 @@ import json
 
 import pytest
 import pytest_asyncio
+from fastapi import Request
 from mcp import types
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.mcp_tasks import MCPTaskHostPolicy
+from kestrel_sovereign.mcp_oauth import MCPOAuthAction, MCPOAuthHostPolicy
+from kestrel_sovereign.security.request_auth import current_request_authentication
 from kestrel_sovereign.mcp_task_store import MCPTaskIntegrityError
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable, current_tool_effect_execution
 from tests.integration.test_mcp_apps_host import apps_boundary as apps_boundary
-from tests.shared.mcp_task_custody import attach as attach_task, binding as task_binding, submission
+from tests.shared.mcp_task_custody import (
+    attach as attach_task, binding as task_binding, observation, submission,
+)
 from tests.utils.original_failure import lost_original_database_commit_ack
 from kestrel_sovereign.execution_custody import execution_evidence_carriers
 
@@ -32,13 +37,29 @@ CONTRACT = b'{"connection":"owned-apps","tool":{"name":"initial"}}'
 @pytest_asyncio.fixture
 async def task_boundary(apps_boundary, request):
     b = apps_boundary
+    b.app.state.mcp_oauth_policy = MCPOAuthHostPolicy(console_origin='https://host.apps.test')
+    b.agent._mcp_oauth_host_policy = b.app.state.mcp_oauth_policy
+    oauth = b.agent.create_mcp_oauth_host(b.feature, is_current=lambda: not b.feature._closing)
     host = b.agent.create_mcp_task_host(b.feature, input_host=b.feature._input_host,
         configuration=getattr(request, 'param', {}), is_current=lambda: not b.feature._closing)
     await host.initialize()
+
+    @b.app.post('/api/owned-task-oauth-lease')
+    async def issue_lease(request: Request):
+        async with oauth._resolve_context(request) as context:
+            async with oauth._operation(context, MCPOAuthAction.CONNECT):
+                b.task_lease = oauth.issue_lease(context, connection_id='owned-apps', slot_id='e' * 64)
+        return {'issued': True}
+
     try:
+        response = await b.client.post('/api/owned-task-oauth-lease', headers=b.headers('key'))
+        assert response.status_code == 200, response.text
         yield b, host
     finally:
-        await host.close()
+        try:
+            await host.close()
+        finally:
+            await oauth.close()
         # A borrowed host must never close the original effect database.
         assert await b.agent.tool_effect_store.database.fetchone('SELECT 1') == (1,)
 
@@ -47,14 +68,82 @@ def initial(b):
     return next(item for item in b.tools if item.tool.native_tool.name == 'open_marker')
 
 
-async def invoke(b, marker='approved'):
-    return await b.client.post('/api/owned-initial', headers=b.headers('key'),
+async def invoke(b, marker='approved', *, principal='key'):
+    return await b.client.post('/api/owned-initial', headers=b.headers(principal),
         json={'marker': marker, 'session_id': 'original-chat'})
 
 
-async def admit(host, selected):
-    return await host.admit(selected.binding, connection_name='owned-apps',
+async def admit(host, selected, lease):
+    return await host.admit(selected.binding, authorization_lease=lease,
         authorization_id='a' * 64, contract=CONTRACT)
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+async def test_durable_task_borrow_needs_no_interactive_request_and_fences_obsolete_rows(task_boundary):
+    b, host = task_boundary
+    owned = b.agent._mcp_oauth_hosts[0]
+    reserved = await host.store.reserve(task_binding(agent_did=b.agent.did), submission())
+    attached = await attach_task(host.store, reserved.issuance)
+    original = await host.store.open_submission(attached)
+    b.task_lease.revoke()
+    assert current_request_authentication() is None
+
+    async with owned.borrow_task_observation(host, attached.handle) as lease:
+        assert lease.authorization == original.authorization
+        assert lease.authorization_id == attached.binding.authorization_id
+        assert lease.remote_task_id == attached.remote_task_id
+        with pytest.raises(ResourceConflict, match='capacity'):
+            async with owned.borrow_task_observation(host, attached.handle):
+                pytest.fail('second observation acquired the same Task')
+        await host.store.observe(attached, observation(statusMessage='new revision'))
+        with pytest.raises(ResourceConflict, match='changed before observation'):
+            async with lease.operation():
+                pytest.fail('an obsolete record acquired observation authority')
+    with pytest.raises(HostCapabilityAccessDenied):
+        lease.require_current()
+
+    async with owned.borrow_task_observation(host, attached.handle) as resumed:
+        native = observation(statusMessage='original observation')
+        with pytest.raises(HostCapabilityAccessDenied, match='operation'):
+            await resumed.record(native)
+        async with resumed.operation() as check:
+            check()
+            with pytest.raises(HostCapabilityAccessDenied, match='operation'):
+                await asyncio.create_task(resumed.record(native))
+            written = await resumed.record(native)
+            assert written.observation == native
+            with pytest.raises(ResourceConflict, match='revision'):
+                await resumed.record(native)
+        assert await host.store.read_handle(attached.handle) == written
+        with pytest.raises(HostCapabilityAccessDenied, match='single use'):
+            async with resumed.operation():
+                pytest.fail('one borrow acquired a second operation')
+        owned.withdraw()
+        with pytest.raises(HostCapabilityAccessDenied):
+            resumed.require_current()
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+async def test_independent_task_borrow_denies_publication_and_policy_replacement(task_boundary):
+    b, host = task_boundary
+    owned = b.agent._mcp_oauth_hosts[0]
+    reserved = await host.store.reserve(task_binding(agent_did=b.agent.did), submission())
+    attached = await attach_task(host.store, reserved.issuance)
+    from kestrel_sovereign.multi_agent.agent_manager import _HostContextPublicationState
+
+    publication = _HostContextPublicationState(generation=1)
+    b.agent._host_context_publication_state = publication
+    async with owned.borrow_task_observation(host, attached.handle) as lease:
+        async with lease.operation() as check:
+            check()
+            publication.generation += 1
+            with pytest.raises(HostCapabilityAccessDenied):
+                check()
+    original = b.agent._mcp_oauth_host_policy
+    async with owned.borrow_task_observation(host, attached.handle) as lease:
+        b.agent._mcp_oauth_host_policy = original.model_copy()
+        with pytest.raises(HostCapabilityAccessDenied, match='host identity changed'):
+            lease.require_current()
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
@@ -125,13 +214,17 @@ async def test_native_handler_custody_keeps_exact_args_and_retires_only_confirme
     captured = []
 
     async def handler(**arguments):
-        round = await admit(host, selected)
+        round = await admit(host, selected, b.task_lease)
         captured.append(round)
         frame = current_tool_effect_execution(b.agent)
         assert round.issuance.record.binding.operation_id == frame.claim.claim_id
         sealed = await host.store.open_submission(round.issuance.record)
         assert sealed.arguments == {'marker': 'approved'} and sealed.contract == CONTRACT
         assert sealed.delivery.kind == 'chat' and sealed.delivery.session_id == 'original-chat'
+        assert sealed.authorization.principal_digest == b.task_lease.principal_id
+        assert sealed.authorization.slot_id == b.task_lease.slot_id
+        assert sealed.authorization.connection_name == b.task_lease.connection_id
+        assert sealed.authorization.owner == selected.binding.owner
         assert round.issuance.record.binding.origin.kind == 'interactive'
         assert await host.store.database.fetchone('SELECT phase FROM mcp_task_records') == ('ISSUING',)
         if outcome == 'refusal':
@@ -172,7 +265,8 @@ async def test_host_refuses_a_binding_different_from_the_actual_engine_selection
 
     async def handler(**arguments):
         with pytest.raises(ResourceConflict):
-            await host.admit(supplied, connection_name='owned-apps', authorization_id='a' * 64, contract=CONTRACT)
+            await host.admit(supplied, authorization_lease=b.task_lease,
+                authorization_id='a' * 64, contract=CONTRACT)
         refused.append(True)
         return ToolResult.ok('Refused foreign binding').to_dict()
 
@@ -183,13 +277,72 @@ async def test_host_refuses_a_binding_different_from_the_actual_engine_selection
 
 
 @pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+@pytest.mark.parametrize('mismatch', ['locator-only', 'different-principal', 'withdrawn'])
+async def test_original_oauth_lease_is_required_before_governed_task_admission(
+        task_boundary, monkeypatch, mismatch):
+    b, host = task_boundary
+    selected = initial(b)
+    lease = b.task_lease
+    principal = 'bob@apps.test' if mismatch == 'different-principal' else 'key'
+    if mismatch == 'withdrawn':
+        lease.revoke()
+    if mismatch == 'locator-only':
+        lease = lease.slot_id
+    exercised = []
+
+    async def handler(**arguments):
+        with pytest.raises(HostCapabilityAccessDenied, match='OAuth'):
+            await admit(host, selected, lease)
+        exercised.append(True)
+        return ToolResult.ok('Refused unavailable lease').to_dict()
+
+    monkeypatch.setattr(selected.tool, 'execute', handler)
+    response = await invoke(b, principal=principal)
+    assert response.status_code == 200, response.text
+    assert exercised == [True]
+    assert await host.store.list_retained() == () and not selected.binding.registration.task_holds
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
+@pytest.mark.parametrize('when', ['before-reserve', 'after-reserve'])
+async def test_task_admission_rechecks_original_lease_across_native_awaits(task_boundary, monkeypatch, when):
+    b, host = task_boundary
+    selected = initial(b)
+    owner, attribute = ((host, '_reconcile_reservations') if when == 'before-reserve'
+        else (host.store, 'reserve'))
+    original = getattr(owner, attribute)
+    exercised = []
+
+    async def withdraw_after(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        b.task_lease.revoke()
+        return result
+
+    monkeypatch.setattr(owner, attribute, withdraw_after)
+
+    async def handler(**arguments):
+        with pytest.raises(HostCapabilityAccessDenied, match='lease'):
+            await admit(host, selected, b.task_lease)
+        exercised.append(True)
+        return ToolResult.ok('Refused retired lease').to_dict()
+
+    monkeypatch.setattr(selected.tool, 'execute', handler)
+    response = await invoke(b)
+    assert response.status_code == 200, response.text
+    assert exercised == [True]
+    rows = await host.store.list_retained()
+    assert [row.phase for row in rows] == ([] if when == 'before-reserve' else ['NOT_SENT'])
+    assert not selected.binding.registration.task_holds
+
+
+@pytest.mark.parametrize('apps_boundary', [{'operator_input': 'form'}], indirect=True)
 async def test_a_copied_child_cannot_dispatch_its_parents_task_round(task_boundary, monkeypatch):
     b, host = task_boundary
     selected = initial(b)
     admitted = []
 
     async def handler(**arguments):
-        round = await admit(host, selected)
+        round = await admit(host, selected, b.task_lease)
         async def child():
             try:
                 round.require_wire()
@@ -216,7 +369,7 @@ async def test_another_current_tool_cannot_be_substituted_for_the_actual_handler
 
     async def handler(**arguments):
         try:
-            round = await admit(host, other)
+            round = await admit(host, other, b.task_lease)
         except ResourceConflict:
             refused.append(True)
         else:
@@ -258,7 +411,7 @@ async def test_lost_native_commit_ack_keeps_custody_and_the_original_error_until
         return bool(armed)
 
     async def handler(**arguments):
-        round = await admit(host, selected)
+        round = await admit(host, selected, b.task_lease)
         round.start_wire()
         effects.append('one-native-disposition')
         await round.settle_result(types.CallToolResult(result_type='complete', content=[]).model_dump(

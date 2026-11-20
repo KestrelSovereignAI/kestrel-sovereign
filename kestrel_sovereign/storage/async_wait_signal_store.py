@@ -757,12 +757,13 @@ class WaitSignalStore:
         handle: str,
         *,
         origin_session_id: Optional[str] = None,
+        rearm: bool = True,
     ) -> None:
         """Arm an explicit watch on ``(kind, handle)`` (set watching=1).
 
-        Upsert that PRESERVES any existing delivery/signaled/pending fields:
-        a row may already exist from a prior delivery cycle. Try-UPDATE first;
-        if no row, INSERT a fresh one with watching=1 and zeroed counters.
+        Upsert preserves existing delivery, signal and pending fields.
+        Set rearm=False for durable provider discovery, which may run repeatedly
+        or after restart and must leave an existing watch's history intact.
         This is the durable half of ``wait(target, mode="signal")`` — the
         reconciler polls watched rows so even a poll-only provider is wakeable.
 
@@ -794,31 +795,24 @@ class WaitSignalStore:
                     f"got {type(origin_session_id).__name__}"
                 )
             origin_session_id = origin_session_id.strip() or None
-        rowcount = await self._db.execute(
+        await self._db.execute(
             """
-            UPDATE wait_signal_state
-            SET watching = 1,
-                watch_baseline = COALESCE(
-                    pending_signaled_target, last_signaled_outcome
-                ),
-                watch_origin_session_id = COALESCE(
-                    ?, watch_origin_session_id
-                ),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE agent_id = ? AND kind = ? AND handle = ?
+            INSERT INTO wait_signal_state
+                (agent_id, kind, handle, watching, watch_origin_session_id, updated_at)
+            VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (agent_id, kind, handle) DO UPDATE
+                SET watching = 1,
+                    watch_baseline = COALESCE(
+                        wait_signal_state.pending_signaled_target, wait_signal_state.last_signaled_outcome
+                    ),
+                    watch_origin_session_id = COALESCE(
+                        excluded.watch_origin_session_id, wait_signal_state.watch_origin_session_id
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE ?
             """,
-            (origin_session_id, self._agent_id, kind, handle),
+            (self._agent_id, kind, handle, origin_session_id, rearm),
         )
-        if rowcount == 0:
-            await self._db.execute(
-                """
-                INSERT INTO wait_signal_state
-                    (agent_id, kind, handle, watching,
-                     watch_origin_session_id, updated_at)
-                VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
-                """,
-                (self._agent_id, kind, handle, origin_session_id),
-            )
 
     async def stop_watch(self, kind: str, handle: str) -> None:
         """Clear the explicit watch on ``(kind, handle)`` (set watching=0)."""

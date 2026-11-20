@@ -1,6 +1,7 @@
 """Private immutable Task submission evidence; none of these DTOs grant authority."""
 
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 from typing import Literal
 
@@ -15,6 +16,11 @@ def _binding_text(value: str) -> None:
 
 def _is_digest(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+
+
+def task_connection_id(agent_did: str, owner: str, connection_name: str) -> str:
+    return hashlib.sha256(encode_inline_json(
+        ['mcp-task-connection-v1', agent_did, owner, connection_name])).hexdigest()
 
 
 def _conversation(value: str) -> None:
@@ -85,8 +91,33 @@ class MCPTaskDelivery:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class MCPTaskOAuthLocator:
+    """Restored custody can select this exact grant slot without granting access."""
+
+    owner: str
+    connection_name: str
+    principal_digest: str
+    slot_id: str
+    kind: Literal['oauth'] = field(default='oauth', init=False)
+
+    def __post_init__(self):
+        _binding_text(self.owner)
+        _binding_text(self.connection_name)
+        if not _is_digest(self.principal_digest) or not _is_digest(self.slot_id):
+            raise ValueError('MCP Task OAuth attribution requires principal and slot digests')
+
+    @classmethod
+    def from_json(cls, value):
+        if (type(value) is not dict
+                or set(value) != {'kind', 'owner', 'connection_name', 'principal_digest', 'slot_id'}
+                or value['kind'] != 'oauth'):
+            raise ValueError('Invalid MCP Task OAuth locator')
+        return cls(value['owner'], value['connection_name'], value['principal_digest'], value['slot_id'])
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class MCPTaskSubmission:
-    """Detached arguments, original descriptor bytes and delivery, sealed once."""
+    """Original arguments, descriptor, delivery and grant locator, sealed once."""
 
     canonical_json: bytes
 
@@ -95,7 +126,7 @@ class MCPTaskSubmission:
             raise TypeError('MCP Task submission requires immutable bytes')
         try:
             value = json.loads(self.canonical_json)
-            if (type(value) is not dict or set(value) != {'arguments', 'contract', 'delivery'}
+            if (type(value) is not dict or set(value) != {'arguments', 'contract', 'delivery', 'authorization'}
                     or type(value['arguments']) is not dict or type(value['contract']) is not str
                     or not value['contract'] or type(value['delivery']) is not dict
                     or set(value['delivery']) != {'kind', 'session_id', 'view_token'}
@@ -103,16 +134,19 @@ class MCPTaskSubmission:
                 raise ValueError('Invalid submission')
             value['contract'].encode('utf-8')
             MCPTaskDelivery(**value['delivery'])
+            MCPTaskOAuthLocator.from_json(value['authorization'])
         except (TypeError, ValueError, RecursionError):
             raise ValueError('Invalid private MCP Task submission') from None
 
     @classmethod
-    def seal(cls, *, arguments: dict, contract: bytes, delivery: MCPTaskDelivery):
-        if type(contract) is not bytes or type(delivery) is not MCPTaskDelivery:
-            raise TypeError('MCP Task submission requires original bytes and typed delivery')
+    def seal(cls, *, arguments: dict, contract: bytes, delivery: MCPTaskDelivery,
+             authorization: MCPTaskOAuthLocator):
+        if (type(contract) is not bytes or type(delivery) is not MCPTaskDelivery
+                or type(authorization) is not MCPTaskOAuthLocator):
+            raise TypeError('MCP Task submission requires original bytes, typed delivery and OAuth attribution')
         try:
             return cls(encode_inline_json({'arguments': arguments, 'contract': contract.decode('utf-8'),
-                'delivery': asdict(delivery)}, sort_keys=True))
+                'delivery': asdict(delivery), 'authorization': asdict(authorization)}, sort_keys=True))
         except (TypeError, ValueError, RecursionError):
             raise ValueError('Invalid private MCP Task submission') from None
 
@@ -127,3 +161,7 @@ class MCPTaskSubmission:
     @property
     def delivery(self) -> MCPTaskDelivery:
         return MCPTaskDelivery(**json.loads(self.canonical_json)['delivery'])
+
+    @property
+    def authorization(self) -> MCPTaskOAuthLocator:
+        return MCPTaskOAuthLocator.from_json(json.loads(self.canonical_json)['authorization'])

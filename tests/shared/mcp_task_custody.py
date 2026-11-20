@@ -12,7 +12,8 @@ import pytest_asyncio
 
 from kestrel_sovereign.mcp_task_store import MCPTaskBinding, MCPTaskStore
 from kestrel_sovereign.mcp_task_submission import (
-    MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskSubmission,
+    MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskOAuthLocator, MCPTaskSubmission,
+    task_connection_id,
 )
 
 CONTRACT = b'{"connection":"owned","protocol":"2026-07-28","tool":{"inputSchema":{"type":"object"},"name":"private-native-tool"},"url":null}'
@@ -64,17 +65,22 @@ async def custody(tmp_path, monkeypatch, request):
 
 
 def binding(**changes):
-    return replace(MCPTaskBinding('did:test:task-owner',
+    did = changes.get('agent_did', 'did:test:task-owner')
+    return replace(MCPTaskBinding(did,
         MCPTaskInteractiveOrigin('f' * 64, 'private-session'),
-        'original-leaf-claim', 'a' * 64, 'b' * 64, 'private-native-tool', hashlib.sha256(CONTRACT).hexdigest()), **changes)
+        'original-leaf-claim', task_connection_id(did, 'owned-owner', 'owned'),
+        'b' * 64, 'private-native-tool', hashlib.sha256(CONTRACT).hexdigest()), **changes)
 
 
-def submission(*, origin=None, arguments=None, contract=CONTRACT):
+def submission(*, origin=None, arguments=None, contract=CONTRACT, authorization=None):
     origin = binding().origin if origin is None else origin
     delivery = (MCPTaskDelivery('chat', origin.session_id) if origin.session_id is not None
         else MCPTaskDelivery('internal'))
+    if authorization is None:
+        principal = origin.principal_digest if type(origin) is MCPTaskInteractiveOrigin else 'f' * 64
+        authorization = MCPTaskOAuthLocator('owned-owner', 'owned', principal, 'e' * 64)
     return MCPTaskSubmission.seal(arguments={'private-answer': 'original-private-value'}
-        if arguments is None else arguments, contract=contract, delivery=delivery)
+        if arguments is None else arguments, contract=contract, delivery=delivery, authorization=authorization)
 
 
 def claim(task_id='remote-private-task'):

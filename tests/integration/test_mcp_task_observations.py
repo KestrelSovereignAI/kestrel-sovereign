@@ -7,11 +7,55 @@ import json
 import pytest
 
 from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers
-from kestrel_sovereign.mcp_task_store import MCPTaskConflict
+from kestrel_sovereign.mcp_task_store import (
+    MCPTaskConflict, MCPTaskObservationRefused, MCPTaskPayloadLimit,
+)
 from kestrel_sovereign.storage.db.interface import TransactionError
 from kestrel_sovereign.mcp_task_submission import MCPTaskInteractiveOrigin
 from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack, observation, attached, submission
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ['resource_rejected', 'authorization_revoked'])
+async def test_observation_blocks_persist_without_settling_the_original_task(custody, reason):
+    store = custody.store
+    original = await attached(store)
+    blocked = await store.block_observation(original, reason=reason, blocked_at=1234.0,
+        authority_epoch='owned-host', admission_serial=1)
+    assert blocked.phase == original.phase == 'ATTACHED'
+    assert blocked.envelope == original.envelope
+    assert blocked.local == {'observation_block': {'reason': reason, 'blocked_at': 1234.0,
+        'authorization_id': original.binding.authorization_id, 'authority_epoch': 'owned-host',
+        'admission_serial': 1}, 'withheld': None, 'poll_not_before': None}
+    restarted = await custody.reopen(max_active=1)
+    assert await restarted.read_handle(original.handle) == blocked
+    with pytest.raises(MCPTaskConflict, match='blocked'):
+        await restarted.observe(blocked, observation('completed'))
+    if reason == 'authorization_revoked':
+        with pytest.raises(MCPTaskConflict, match='recoverable'):
+            await restarted.clear_observation_block(blocked)
+        assert (await restarted.reserve(binding(operation_id='new-task'), submission())).fresh
+        assert await restarted.read_handle(original.handle) == blocked
+    else:
+        with pytest.raises(MCPTaskConflict, match='active capacity'):
+            await restarted.reserve(binding(operation_id='new-task'), submission())
+        cleared = await restarted.clear_observation_block(blocked)
+        assert cleared.local == original.local and cleared.envelope == original.envelope
+        assert cleared.revision == blocked.revision + 1
+
+
+@pytest.mark.asyncio
+async def test_withheld_completion_keeps_the_exact_native_receipt(custody):
+    store = custody.store
+    original = await attached(store)
+    with pytest.raises(TransactionError, match='withheld'):
+        await store.observe(original, observation('working'), withheld='contract_drift')
+    native = observation('completed')
+    retained = await store.observe(original, native, withheld='contract_drift')
+    assert retained.phase == 'SETTLED' and retained.observation == native
+    assert retained.local == {'observation_block': None, 'withheld': 'contract_drift', 'poll_not_before': None}
+    restarted = await custody.reopen()
+    assert await restarted.read_handle(original.handle) == retained
 
 
 @pytest.mark.asyncio
@@ -66,7 +110,7 @@ async def test_invalid_native_observation_cannot_change_current_custody(custody,
     original = await attached(store)
     with pytest.raises(MCPTaskConflict):
         await store.observe(replace(original, revision=True), observation('completed'))
-    with pytest.raises(TransactionError):
+    with pytest.raises(MCPTaskObservationRefused):
         await store.observe(original, observation(**changes))
     assert await store.read(binding(), original.handle) == original
 
@@ -117,8 +161,9 @@ async def test_oversize_observation_does_not_release_capacity_and_lowered_budget
     store = await custody.reopen(max_active=1)
     original = await attached(store)
     oversized = observation('completed', result={'private': 'x' * 4096})
-    with pytest.raises(TransactionError, match='storage budget'):
+    with pytest.raises(TransactionError, match='storage budget') as failure:
         await store.observe(original, oversized)
+    assert type(failure.value.__cause__) is MCPTaskPayloadLimit
     assert await store.read(binding(), original.handle) == original
     with pytest.raises(MCPTaskConflict, match='active capacity'):
         await store.reserve(binding(operation_id='new'), submission())

@@ -1599,7 +1599,7 @@ async def _registration_lifetime(agent: Any, ref: str):
 
 
 async def register_wait_watch(
-    agent: Any, ref: str, *, origin_session_id: Optional[str] = None
+    agent: Any, ref: str, *, origin_session_id: Optional[str] = None, rearm: bool = True
 ) -> None:
     """Register an explicit watch on ``ref`` so the reconciler wakes the agent
     when that handle reaches a terminal state.
@@ -1620,6 +1620,8 @@ async def register_wait_watch(
     (:data:`~kestrel_sovereign.waits.engine.TERMINAL_EVENT_KEY`) makes "other"
     mean a different event — a CI re-run that fails again — rather than a
     different outcome.
+
+    Provider recovery can set rearm=False to create only a missing watch.
 
     Provider *availability* (a kind is registered) and provider *ownership*
     (the handle actually belongs to that provider) are distinct. A registered
@@ -1644,7 +1646,7 @@ async def register_wait_watch(
             resolved if resolved is not None else await _resolve_owned_provider(agent, ref)
         )
         await reconciler._store.start_watch(
-            kind, handle, origin_session_id=origin_session_id
+            kind, handle, origin_session_id=origin_session_id, rearm=rearm
         )
 
 

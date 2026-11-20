@@ -99,7 +99,9 @@ async def test_repeat_reservation_cannot_replace_original_arguments_contract_or_
     variants = [
         (binding(), submission(arguments={'private-answer': 'substituted'})),
         (binding(), MCPTaskSubmission.seal(arguments=original.arguments, contract=original.contract,
-            delivery=MCPTaskDelivery('app', 'private-session', 'another-view'))),
+            delivery=MCPTaskDelivery('app', 'private-session', 'another-view'),
+            authorization=original.authorization)),
+        (binding(), submission(authorization=replace(original.authorization, slot_id='d' * 64))),
     ]
     other = submission(contract=b'another-original-descriptor')
     variants.append((replace(binding(), contract_digest=hashlib.sha256(other.contract).hexdigest()), other))
@@ -122,24 +124,35 @@ async def test_service_origin_uses_real_ambient_attribution_without_inventing_a_
     actual = await restarted.read(target, reserved.record.handle)
     assert actual.binding.origin == origin and origin.session_id is None
     assert (await restarted.open_submission(actual)).delivery == MCPTaskDelivery('internal')
+    assert (await restarted.open_submission(actual)).authorization == original.authorization
     assert not (await restarted.reserve(target, original)).fresh
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['contract', 'internal-interactive', 'app-service', 'wrong-session'])
+@pytest.mark.parametrize('failure', [
+    'contract', 'internal-interactive', 'app-service', 'wrong-session',
+    'wrong-connection', 'wrong-owner', 'wrong-principal',
+])
 async def test_submission_mismatch_refuses_before_database_admission(custody, failure):
     store = custody.store
     target = binding()
     original = submission()
     if failure == 'contract':
         original = submission(contract=b'private-wrong-descriptor')
+    elif failure == 'wrong-connection':
+        original = submission(authorization=replace(original.authorization, connection_name='another-connection'))
+    elif failure == 'wrong-owner':
+        original = submission(authorization=replace(original.authorization, owner='another-owner'))
+    elif failure == 'wrong-principal':
+        original = submission(authorization=replace(original.authorization, principal_digest='d' * 64))
     else:
         delivery = MCPTaskDelivery('internal') if failure == 'internal-interactive' else (
             MCPTaskDelivery('chat', 'different-session') if failure == 'wrong-session'
             else MCPTaskDelivery('app', 'private-session', 'original-view'))
         if failure == 'app-service':
             target = binding(origin=MCPTaskServiceOrigin('internal', 'd' * 64, 'private-session'))
-        original = MCPTaskSubmission.seal(arguments=original.arguments, contract=original.contract, delivery=delivery)
+        original = MCPTaskSubmission.seal(arguments=original.arguments, contract=original.contract,
+            delivery=delivery, authorization=original.authorization)
     before = await store.database.fetchone('SELECT revision FROM mcp_task_keys')
     with pytest.raises(ValueError, match='original'):
         await store.reserve(target, original)
@@ -200,7 +213,7 @@ async def test_untrusted_record_fields_cannot_replace_the_sql_opened_submission(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('revision', [1, 2, 3])
+@pytest.mark.parametrize('revision', [1, 2, 3, 4, 5])
 async def test_prototype_revision_refuses_without_migrating_original_rows(custody, revision):
     store = custody.store
     await store.reserve(binding(), submission())
@@ -224,7 +237,7 @@ async def test_authenticated_submission_still_requires_original_contract_digest_
     payload = cipher.decrypt(bytes(row[9]), aad=store._aad((*row[:9], *row[10:13])))
     if damage == 'contract':
         altered = submission(contract=b'authenticated-but-wrong-original-descriptor')
-        row[11] = store._digest('mcp-task-submission-v2',
+        row[11] = store._digest('mcp-task-submission-v3',
             [store._binding_digest(binding()), altered.canonical_json.decode('ascii')])
     elif damage == 'digest':
         altered = submission(arguments={'private-answer': 'authenticated-substitution'})
