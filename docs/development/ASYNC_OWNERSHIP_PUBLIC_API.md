@@ -12,10 +12,14 @@ retry policy, or altered default:
 | --- | --- |
 | `OwnedOperation` | Retain one original operation and its admission across repeated or finite borrowed observations; an explicit fresh receipt can be reserved before construction. |
 | `OwnedTaskAdmission` | Fresh caller-local receipt of the exact accepted native Task, written before callback publication; not a second registry or work grant. |
+| `OwnedTaskLender` | Synchronous host-owned resource policy. Reserve against the original admission, lend to the exact gated Task, retire only from canonical completion. |
+| `OwnedTaskLenderCapture` | One live binding occurrence and its actual admitted parent, captured separately from the body's execution context. |
 | `OwnedTaskOutcome` | Original result, failure, and caller-cancellation observation. |
 | `OwnedTaskRetirement` | Read-only snapshot of one exact admission: unknown, proven task nonacceptance, pending, or complete with its original error. |
 | `await_owned_operation` | Admit and physically join one asynchronous operation at an existing unbounded join boundary, including failed task publication. |
 | `await_owned_task` | Observe the same original task despite repeated caller cancellation; existing borrowing and forwarding options retain their semantics. |
+| `bind_owned_task_lender` | Route the embedding host's own policy from its actual resource-owning Task. This binding never creates a resource or grants authority on its own. |
+| `capture_owned_task_lender` | Retain the current exact parent for a later, explicitly delegated native admission. A copied context does not carry the task identity. |
 | `create_owned_task` | Create one gated original Task, retaining the exact accepted Task on an explicit admission receipt if later publication fails; true allocation refusal closes the unstarted original coroutine. |
 | `owned_task_error` | Harvest a terminal original Task's error without replacing its original cancellation or explicit evidence; an unfinished Task is not a terminal outcome. |
 | `pending_owned_retirement_error` | Snapshot unfinished original Tasks as resource-bound retirement debt without cancelling, replacing, or acknowledging them. |
@@ -136,6 +140,26 @@ completion was captured, not that its business operation succeeded. Original
 errors remain attached to the observation. These snapshots do not lend execution
 authority, retire a database lease, decrement accounting, or implement the
 cross-task resource-loan policy; physical custodians still own those obligations.
+
+## Explicit host-resource loans
+
+The embedding resource owner provides the one synchronous `OwnedTaskLender`
+policy and validates the actual creator, original admitted parent, resource
+occurrence and capacity. Core reserves against the exact admission before
+native allocation and calls `lend` before opening the payload gate. A copied
+or fresh context does not supply a captured parent. Pass the exact capture to
+explicitly delegate across a fresh execution context; pass `None` to suppress
+lending. Native privacy factories and callback scopes retain the capture at
+creation, independently of privacy scope. A detached boundary suppresses it.
+
+For complete native retirement or proven nonacceptance, Core publishes one
+canonical observation to the host. UNKNOWN retains the admission and its
+original errors for the host. Callbacks are notification, not the resource's
+owner: a host must still retain and reconcile its own receipts if publication
+fails. No callback runs a replacement task or acknowledges an external
+resource. Opaque factory wrappers never receive a loan. Exhausted or revoked
+policies must refuse synchronously, without allocating another owner or
+reattributing an existing resource. A reservation refusal is atomic.
 
 ## Task completion is not process-tree drain
 

@@ -199,22 +199,24 @@ async def admit_request_operation(
     leave the accepted Task reachable, and failure means ABANDONED bookkeeping
     at that caller, never a successful delivery.
     """
-    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
+    from kestrel_sovereign._async_ownership import (
+        OwnedTaskAdmission, capture_owned_task_lender, create_owned_task,
+    )
 
     from .request_lifecycle import bind_request_operation_if_supported
     admission = OwnedTaskAdmission()
     try:
         if privacy_work_factory is None:
             task = create_owned_task(operation, name=name, context=context,
-                                     retain_originals=True, admission=admission)
+                                     retain_originals=True, admission=admission,
+                                     lender_capture=capture_owned_task_lender())
         else:
             # Transfer only this explicitly admitted child through the held
             # native privacy frame. Copying a token cannot transfer a foreign
             # reentry mutex that the parent must retain until this child ends.
             # The factory accepts a lazy body, so a refused native start has
             # no unstarted request coroutine left outside its own inventory.
-            task = privacy_work_factory(operation, context=context)
-            admission.task = task
+            task = privacy_work_factory(operation, context=context, admission=admission)
             task.set_name(name)
         bind_request_operation_if_supported(agent, request_id, task)
         return task
