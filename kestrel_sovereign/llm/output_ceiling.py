@@ -92,6 +92,23 @@ class IncompleteGenerationError(RuntimeError):
     usage: Optional[LLMResponse] = None
 
 
+class ProviderReportedFailure(Exception):
+    """A provider accepted a request, then reported in its own response that
+    the attempt failed.
+
+    Unlike an :class:`IncompleteGenerationError` this is the provider's own
+    failure, raised as the provider stated it, not a judgment about an
+    answer. The provider may still have consumed tokens, and its response
+    named what served it, so ``usage`` carries that evidence the way
+    :attr:`IncompleteGenerationError.usage` does: a response holding only the
+    reported counts, stop reason and provider-served evidence, never text;
+    ``None`` when the provider reported none. Read with
+    :func:`reported_usage`, so the failed attempt is recorded with it (#4198).
+    """
+
+    usage: Optional[LLMResponse] = None
+
+
 class OutputCapReachedError(IncompleteGenerationError):
     """A response stopped at its output cap, not because it finished.
 
@@ -186,17 +203,28 @@ def _usage_report(
 
 
 def reported_usage(error: BaseException) -> Optional[LLMResponse]:
-    """The usage reported for the unfinished attempt ``error`` is or wraps.
+    """The usage reported for the failed attempt ``error`` is or wraps.
 
     An adapter that refuses an unfinished generation itself raises before it
     returns a response, so the attempt's usage arrives on the error
     (:attr:`IncompleteGenerationError.usage`) rather than on a response. The
-    LLM service records a failed attempt with it (#3577). ``None`` when
-    ``error`` is not an incomplete generation, or carries no usage.
+    LLM service records a failed attempt with it (#3577). A provider's own
+    failure of an accepted request carries the same evidence
+    (:attr:`ProviderReportedFailure.usage`, #4198); an incomplete generation
+    ``error`` is or wraps is read first. ``None`` when ``error`` is neither,
+    or carries no usage.
     """
     found = incomplete_generation(error)
-    usage = getattr(found, "usage", None)
-    return usage if isinstance(usage, LLMResponse) else None
+    if found is not None:
+        usage = getattr(found, "usage", None)
+        return usage if isinstance(usage, LLMResponse) else None
+    for current in _explicitly_wrapped(error):
+        if hasattr(current, "declined_wait"):
+            return None
+        if isinstance(current, ProviderReportedFailure):
+            usage = current.usage
+            return usage if isinstance(usage, LLMResponse) else None
+    return None
 
 
 #: Runtime attribute on an aggregate of several routes' errors: its
@@ -219,6 +247,22 @@ def incomplete_generation(
     lead to the last route's error, which describes neither the routes before
     it nor the call as a whole.
     """
+    for current in _explicitly_wrapped(error):
+        if isinstance(current, IncompleteGenerationError):
+            return current
+        if hasattr(current, "declined_wait"):
+            verdict = getattr(current, INCOMPLETE_ATTEMPT_ATTR, None)
+            return verdict if isinstance(verdict, IncompleteGenerationError) else None
+    return None
+
+
+def _explicitly_wrapped(error: BaseException) -> Iterable[BaseException]:
+    """``error`` and the errors it explicitly wraps, nearest first.
+
+    The links are ``__cause__``, ``original_error`` and ``underlying``, never
+    the implicit ``__context__``; an aggregate of several routes' errors (one
+    carrying ``declined_wait``) is yielded but not read past.
+    """
     seen: set[int] = set()
     pending: list[BaseException] = [error]
     while pending:
@@ -226,11 +270,9 @@ def incomplete_generation(
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, IncompleteGenerationError):
-            return current
+        yield current
         if hasattr(current, "declined_wait"):
-            verdict = getattr(current, INCOMPLETE_ATTEMPT_ATTR, None)
-            return verdict if isinstance(verdict, IncompleteGenerationError) else None
+            continue
         for link in (
             current.__cause__,
             getattr(current, "original_error", None),
@@ -238,7 +280,6 @@ def incomplete_generation(
         ):
             if isinstance(link, BaseException):
                 pending.append(link)
-    return None
 
 
 def reported_token_limit(value: Any) -> Optional[int]:
@@ -393,6 +434,7 @@ __all__ = [
     "OutputCapReachedError",
     "OutputCeilingUnknownError",
     "OutputCeilings",
+    "ProviderReportedFailure",
     "attach_stop_reason",
     "context_window_notice",
     "incomplete_generation",

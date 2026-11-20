@@ -72,7 +72,8 @@ NATURAL_STOP_REASONS = frozenset({
     "function_call",
     # Gemini and Vertex AI ``FinishReason`` names.
     "STOP",
-    # Codex app-server ``TurnStatus``.
+    # Codex app-server ``TurnStatus``; also the OpenAI Responses API's
+    # ``status`` for a finished response (#4198).
     "completed",
 })
 
@@ -83,6 +84,8 @@ OUTPUT_LIMIT_STOP_REASONS = frozenset({
     "model_context_window_exceeded",
     "length",
     "MAX_TOKENS",
+    # OpenAI Responses API ``incomplete_details.reason`` (#4198).
+    "max_output_tokens",
 })
 
 

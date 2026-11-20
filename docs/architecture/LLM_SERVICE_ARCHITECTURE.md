@@ -87,6 +87,58 @@ the Codex protocol exposes stable semantic ranks. Live capability negotiation
 remains authoritative; the disk model cache is only a bounded fallback when
 the live catalog RPC is unavailable.
 
+#### `openai:api` tool turns that chat completions cannot serve
+
+Native OpenAI refuses function tools on `/v1/chat/completions` while some
+models reason. For gpt-5.6 the adapter sends `reasoning_effort="none"` (#2501).
+gpt-6.2-sol does not accept `none`, so `OpenAIAdapter` sends its tool-bearing
+requests to the Responses API instead (#4198). It uses the same
+`get_response` / `get_streaming_response_with_tools` entry points, custody,
+retries and errors. Requests without function tools, other models and
+OpenAI-compatible routes stay on chat completions.
+
+Only gpt-6.2-sol, its dated snapshots and its fine-tunes are matched.
+
+The endpoint is chosen from the payload the request actually sends: the
+prepared chat request, request options included, with `extra_body` merged over
+the typed fields as the SDK merges it. A function tool named only in
+`extra_body` therefore selects the Responses API, and the gpt-5.6 rule reads
+the same merged payload. The Responses request is translated from that same
+payload. A field the Responses API has no equivalent for is refused, never
+dropped, and so are two spellings of one field.
+
+Nothing is stored by the provider (`store=false`), so the Kestrel session is
+the only owner of the conversation. The provider keeps a reasoning item only
+when the history before it is unchanged, so a response's output goes back on
+the turn's next call exactly as it came: every reasoning item, message and
+function call in its original order, each message with its own `phase`. The
+order travels as a replay record on the first tool call's
+`extra_content["openai"]` (the carrier Gemini thought signatures use, #3619).
+It holds the encrypted reasoning, each message's phase and text length, and
+each call's id, but no text and no call. Message text and calls are read back
+from the session's own assistant message, so nothing is sent that the session
+does not hold. A session message that no longer fits its record (other text
+length, a missing or extra call) is refused before any request. Reasoning is
+never replayed across turns or to another provider. A stream whose final
+response holds text other than what it streamed is a protocol failure.
+
+A `failed` response or a stream `error` event raises `ResponsesAPIFailure`
+with the provider's own code and message. It is a `ProviderReportedFailure`:
+it carries the token counts, status and provider-served evidence the provider
+reported for the attempt (for a stream, from `response.created` when the
+failure names none). The service reads that through `reported_usage`, as it
+does an incomplete generation's usage, so the failed attempt's `llm_calls` row
+and `llm.usage` line keep the tokens and what served it beside the provider's
+error. `completed` is the natural stop, and `incomplete` reports its
+`incomplete_details.reason`; `max_output_tokens` is an output-limit cut.
+
+Each OpenAI adapter response also carries the provider's own account of what
+served it: the API called, the model the response names and its response id.
+The service records it on the call's `llm_calls` row and `llm.usage` line under
+`provider_served`, beside the model Kestrel asked for (`provider_served.py`).
+The usage-only copy a failed attempt is recorded from keeps it. In privacy
+modes that gate `llm_calls` metadata, the row does not keep it.
+
 #### Native provider retirement and turn isolation
 
 Withdrawal stops new admission; it does not retire an already acquired native

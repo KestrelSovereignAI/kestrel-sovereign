@@ -61,6 +61,7 @@ from .output_ceiling import (
     response_stop_reason,
 )
 from .rate_limit_headers import RATE_LIMIT_HEADERS_KEY, response_rate_limit_headers
+from .provider_served import PROVIDER_SERVED_KEY, response_provider_served
 from .generation_gate import UnfinishedAfterInlineToolsError
 from .discovery_deadline import discovery_route_deadline_seconds
 from .model_discovery import ModelDiscoveryMixin, discovery_call
@@ -4681,6 +4682,13 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         rate_limit_headers = response_rate_limit_headers(response)
         if rate_limit_headers is not None:
             record_metadata.setdefault(RATE_LIMIT_HEADERS_KEY, rate_limit_headers)
+        # #4198: what the provider's own response says served the call (the
+        # endpoint, the model it names, its response id), as the adapter
+        # copied it. Kestrel's ``model`` is the one it asked for; this is the
+        # provider's word, recorded beside it on the row and the usage line.
+        served = response_provider_served(response)
+        if served is not None:
+            record_metadata.setdefault(PROVIDER_SERVED_KEY, served)
 
         tracked_tokens = total_tokens
         if tracked_tokens is None and (
@@ -5234,6 +5242,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 usage_log["caller"] = caller
             if RATE_LIMIT_HEADERS_KEY in record_metadata:
                 usage_log[RATE_LIMIT_HEADERS_KEY] = record_metadata[RATE_LIMIT_HEADERS_KEY]
+            if PROVIDER_SERVED_KEY in record_metadata:
+                usage_log[PROVIDER_SERVED_KEY] = record_metadata[PROVIDER_SERVED_KEY]
             logger.info("llm.usage: %s", json.dumps(usage_log, default=str))
         except Exception as log_err:
             if is_execution_control_error(log_err):

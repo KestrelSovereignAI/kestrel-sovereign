@@ -6,6 +6,10 @@ Adapter for OpenAI's chat completion API with full support for:
 - Streaming responses
 - Vision (image inputs)
 - API-based model discovery
+
+A native OpenAI model whose chat completions endpoint refuses function tools
+while it reasons has its tool-bearing requests sent to the Responses API
+instead (#4198); see :data:`_RESPONSES_FUNCTION_TOOL_MODEL_PATTERN`.
 """
 
 from contextlib import aclosing
@@ -34,6 +38,7 @@ from .adapter import (
     ThinkingContentSplitter,
     ThinkingDelta,
     ToolCall,
+    ToolCallWithExtraContent,
     provider_usage_cost,
     split_thinking_from_content,
 )
@@ -70,7 +75,9 @@ except ImportError:  # pragma: no cover - compatibility with SDK v4 checkouts.
 from .call_progress import report_call_progress
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
+from .provider_served import ProviderServed, attach_provider_served, provider_served
 from .output_ceiling import (
+    ProviderReportedFailure,
     attach_stop_reason,
     join_output_ceiling_notice,
     output_ceiling_notice_chunk,
@@ -88,6 +95,22 @@ logger = logging.getLogger(__name__)
 #: The chat-completions ``finish_reason`` for a response cut at the output
 #: limit (OpenRouter forwards every upstream's cut as this value too).
 _LENGTH_FINISH_REASON = "length"
+
+#: The provider APIs the adapter calls, as recorded in provider-served
+#: evidence: the OpenAI SDK's names for them, whatever a route's base URL.
+_CHAT_COMPLETIONS_API = "chat.completions"
+_RESPONSES_API = "responses"
+
+#: The Responses API's ``incomplete_details.reason`` for a response cut at
+#: its output limit.
+_RESPONSES_OUTPUT_LIMIT_REASON = "max_output_tokens"
+
+
+def _field(source: Any, name: str) -> Any:
+    """``name`` of an SDK object or of the plain dict a test or batch holds."""
+    if isinstance(source, dict):
+        return source.get(name)
+    return getattr(source, name, None)
 
 
 def _structured_response_format(model: Type[BaseModel]) -> Dict[str, Any]:
@@ -151,6 +174,58 @@ _GPT56_CHAT_FUNCTION_REASONING_MODEL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Native OpenAI refuses function tools through /v1/chat/completions while
+# gpt-6.2-sol reasons, and the model does not accept reasoning_effort 'none'
+# (#4198), so the gpt-5.6 normalization above cannot apply: the endpoint
+# cannot serve its tool-bearing turns at all. Those requests go to the
+# Responses API, which serves function tools with reasoning. Requests without
+# function tools keep chat completions. The boundary accepts qualified ids,
+# dated snapshots and fine-tunes, and no other model: neither gpt-6.2-solar
+# nor a sibling such as gpt-6.2-sol-mini, whose endpoint support is unknown.
+_RESPONSES_FUNCTION_TOOL_MODEL_PATTERN = re.compile(
+    r"(?:^|[/:])gpt-6\.2-sol(?:-\d{4}-\d{2}-\d{2})?(?::|$)",
+    re.IGNORECASE,
+)
+
+#: Chat-completions request fields the Responses API takes under the same
+#: name with the same meaning. Every other field is translated explicitly or
+#: refused, never dropped.
+_RESPONSES_SAME_FIELDS = frozenset({
+    "metadata",
+    "parallel_tool_calls",
+    "safety_identifier",
+    "service_tier",
+    "temperature",
+    "top_p",
+    "user",
+})
+
+
+def _effective_chat_request(request_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """The payload a prepared chat request actually sends.
+
+    The OpenAI SDK merges ``extra_body`` over its typed fields, so a nested
+    value wins over the same top-level field. Every decision about the request
+    (which endpoint serves it, what the Responses API is sent) reads this
+    merged payload, never the top level alone (#4198).
+    """
+    effective = {key: value for key, value in request_kwargs.items() if key != "extra_body"}
+    extra_body = request_kwargs.get("extra_body")
+    if extra_body is not None:
+        if not isinstance(extra_body, dict):
+            raise ValueError("A chat request's extra_body must be an object.")
+        effective.update(extra_body)
+    return effective
+
+
+def _has_function_tools(request_kwargs: Dict[str, Any]) -> bool:
+    """Whether the payload ``request_kwargs`` sends carries a function tool,
+    whether it is named at the top level or in ``extra_body``."""
+    tools = _effective_chat_request(request_kwargs).get("tools")
+    return isinstance(tools, list) and any(
+        isinstance(tool, dict) and tool.get("type") == "function" for tool in tools
+    )
+
 
 def _capability_kwargs(**kwargs: Any) -> Dict[str, Any]:
     fields = getattr(ProviderCapabilities, "__dataclass_fields__", {})
@@ -199,10 +274,7 @@ def _normalized_openai_usage(
     at the top level. Preserve either reported shape, preferring the canonical
     nested value when both exist.
     """
-    def field(source: Any, name: str) -> Any:
-        if isinstance(source, dict):
-            return source.get(name)
-        return getattr(source, name, None)
+    field = _field
 
     def token_count(value: Any) -> Optional[int]:
         return (
@@ -213,10 +285,19 @@ def _normalized_openai_usage(
             else None
         )
 
+    # The Responses API names the same counters ``input_tokens`` /
+    # ``output_tokens`` / ``input_tokens_details`` with the same meaning
+    # (cached tokens included in the input count), #4198.
     input_tokens = field(usage, "prompt_tokens")
+    if input_tokens is None:
+        input_tokens = field(usage, "input_tokens")
     output_tokens = field(usage, "completion_tokens")
+    if output_tokens is None:
+        output_tokens = field(usage, "output_tokens")
     total_tokens = field(usage, "total_tokens")
     details = field(usage, "prompt_tokens_details")
+    if details is None:
+        details = field(usage, "input_tokens_details")
     cache_creation_input_tokens = token_count(
         field(details, "cache_write_tokens")
     )
@@ -261,6 +342,615 @@ def _protocol_failure_usage(usage: Any, stop_reason: Optional[str]) -> Optional[
     return LLMResponse(input_tokens=inputs, output_tokens=outputs, total_tokens=total,
         cache_creation_input_tokens=writes, cache_read_input_tokens=reads,
         stop_reason=stop_reason)
+
+
+def _usage_fields(usage: Any) -> Dict[str, Optional[int]]:
+    """``LLMResponse`` token fields for a reported usage object, if any."""
+    if not usage:
+        return {}
+    inputs, outputs, total, writes, reads = _normalized_openai_usage(usage)
+    return {
+        "input_tokens": inputs,
+        "output_tokens": outputs,
+        "total_tokens": total,
+        "cache_creation_input_tokens": writes,
+        "cache_read_input_tokens": reads,
+    }
+
+
+# ---- Responses API (#4198) ------------------------------------------------
+#
+# The agent hands every adapter OpenAI chat-format messages. A Responses API
+# call takes ``input`` items instead, and a reasoning model's tool calls must
+# be sent back with the reasoning that produced them. Nothing is stored by the
+# provider (``store=False``): the Kestrel session is the only owner of the
+# conversation, and the reasoning travels between the calls of a turn as the
+# encrypted items the provider returns, on the replayed tool call's
+# ``extra_content`` (the carrier Gemini's thought signatures use, #3619).
+# Replayed items omit their provider ids: with nothing stored there is no
+# provider-side item for an id to name.
+#
+# The provider keeps a reasoning item only when the history before it is the
+# history it was produced after, so a response's output is sent back as it
+# came: every reasoning item, message and function call in its original
+# order, each message with its own phase. The replay record holds that order
+# and the encrypted reasoning, but no text and no call: a message is named by
+# its length and a call by its id, and both are read back from the Kestrel
+# session's own assistant message, so nothing is sent that the session does
+# not hold. A session message that no longer fits its record is refused.
+
+#: The ``extra_content`` namespace of an OpenAI-format tool call holding what
+#: a Responses API call must send back with it, and the key within it.
+OPENAI_EXTRA_CONTENT = "openai"
+_RESPONSES_REPLAY = "responses"
+
+
+class ResponsesAPIFailure(openai.OpenAIError, ProviderReportedFailure):
+    """The Responses API reported that a response it accepted failed.
+
+    The request itself was accepted, so there is no HTTP status to report.
+    ``code`` and ``provider_message`` are the provider's own words, kept so
+    the failure reaches the caller as the provider stated it. ``usage`` is
+    what the provider reported for the attempt (its token counts, its status
+    and what served it, never text), so the failed attempt is recorded with
+    the tokens it consumed and the model and response id that answered.
+    """
+
+    def __init__(
+        self,
+        *,
+        event: str,
+        code: Optional[str] = None,
+        message: Optional[str] = None,
+        response_id: Optional[str] = None,
+    ) -> None:
+        self.event = event
+        self.code = code
+        self.provider_message = message
+        self.response_id = response_id
+        detail = f"OpenAI Responses API {event}"
+        if code:
+            detail += f" ({code})"
+        if message:
+            detail += f": {message}"
+        super().__init__(detail)
+
+
+def _failed_attempt_evidence(
+    usage: Any, stop_reason: Optional[str], served: Optional[ProviderServed],
+) -> Optional[LLMResponse]:
+    """What the provider reported for an attempt that failed: its token
+    counts, its stop reason and what served it, never text. ``None`` when it
+    reported neither counts nor a model or response id."""
+    evidence = _protocol_failure_usage(usage, stop_reason)
+    if evidence is None:
+        if served is None:
+            return None
+        evidence = LLMResponse(stop_reason=stop_reason)
+    return attach_provider_served(evidence, served)
+
+
+def _responses_failure(
+    event: str,
+    *,
+    served: Optional[ProviderServed],
+    response: Any = None,
+    error: Any = None,
+) -> ResponsesAPIFailure:
+    """The provider's failure of an accepted response, carrying what it
+    reported for the attempt. ``served`` is what the failed response, or for
+    a stream the response it began, named as serving it."""
+    if error is None:
+        error = _field(response, "error")
+    code = _field(error, "code")
+    message = _field(error, "message")
+    failure = ResponsesAPIFailure(
+        event=event,
+        code=code if isinstance(code, str) else None,
+        message=message if isinstance(message, str) else None,
+        response_id=served.response_id if served is not None else None,
+    )
+    failure.usage = _failed_attempt_evidence(
+        _field(response, "usage") if response is not None else None,
+        _responses_stop_reason(response) if response is not None else None,
+        served,
+    )
+    return failure
+
+
+def _responses_tool(tool: Any) -> Dict[str, Any]:
+    """A chat-format function tool as a Responses API function tool."""
+    if not isinstance(tool, dict) or tool.get("type") != "function":
+        kind = tool.get("type") if isinstance(tool, dict) else type(tool).__name__
+        raise ValueError(
+            f"The OpenAI Responses API path sends function tools only, not {kind!r}."
+        )
+    function = tool.get("function")
+    name = function.get("name") if isinstance(function, dict) else None
+    if not isinstance(name, str) or not name:
+        raise ValueError("A function tool must name its function.")
+    converted: Dict[str, Any] = {
+        "type": "function",
+        "name": name,
+        "parameters": function.get("parameters"),
+        # The Responses API requires ``strict``. Chat completions leaves it
+        # off when unset, so an unset value keeps that meaning.
+        "strict": bool(function.get("strict", False)),
+    }
+    if function.get("description") is not None:
+        converted["description"] = function["description"]
+    return converted
+
+
+def _responses_tool_choice(choice: Any) -> Any:
+    if isinstance(choice, str):
+        return choice
+    function = choice.get("function") if isinstance(choice, dict) else None
+    name = function.get("name") if isinstance(function, dict) else None
+    if (
+        isinstance(choice, dict)
+        and choice.get("type") == "function"
+        and isinstance(name, str)
+        and name
+    ):
+        return {"type": "function", "name": name}
+    raise ValueError("This tool_choice has no Responses API equivalent.")
+
+
+def _responses_text_format(response_format: Any) -> Dict[str, Any]:
+    kind = response_format.get("type") if isinstance(response_format, dict) else None
+    if kind == "json_schema":
+        schema = response_format.get("json_schema")
+        if not isinstance(schema, dict):
+            raise ValueError("A json_schema response_format must carry its schema.")
+        converted = {
+            "type": "json_schema",
+            "name": schema.get("name"),
+            "schema": schema.get("schema"),
+        }
+        for key in ("strict", "description"):
+            if schema.get(key) is not None:
+                converted[key] = schema[key]
+        return converted
+    if kind in ("json_object", "text"):
+        return {"type": kind}
+    raise ValueError(f"A response_format of type {kind!r} has no Responses API equivalent.")
+
+
+def _responses_input_part(part: Any) -> Dict[str, Any]:
+    """A chat content part as a Responses API input content part."""
+    kind = part.get("type") if isinstance(part, dict) else None
+    if kind in ("text", "input_text"):
+        text = part.get("text")
+        if not isinstance(text, str):
+            raise ValueError("A text content part must carry text.")
+        return {"type": "input_text", "text": text}
+    if kind == "image_url":
+        image = part.get("image_url")
+        url = image.get("url") if isinstance(image, dict) else image
+        if not isinstance(url, str) or not url:
+            raise ValueError("An image_url content part must carry a URL.")
+        detail = image.get("detail") if isinstance(image, dict) else None
+        return {"type": "input_image", "image_url": url, "detail": detail or "auto"}
+    if kind == "input_image":
+        return dict(part)
+    raise ValueError(f"A content part of type {kind!r} has no Responses API equivalent.")
+
+
+def _responses_content(content: Any, *, role: str) -> Any:
+    """A chat message's content as Responses API message content."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise ValueError(f"A {role} message's content must be text or content parts.")
+    if role == "assistant":
+        texts = []
+        for part in content:
+            kind = part.get("type") if isinstance(part, dict) else None
+            text = part.get("text") if isinstance(part, dict) else None
+            if kind not in ("text", "output_text") or not isinstance(text, str):
+                raise ValueError("An assistant message's content parts must be text.")
+            texts.append(text)
+        return "".join(texts)
+    return [_responses_input_part(part) for part in content]
+
+
+def _responses_tool_output(content: Any) -> Any:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return [_responses_input_part(part) for part in content]
+    raise ValueError("A tool result's content must be text or content parts.")
+
+
+#: The kinds of entry a replay record holds, in the response's own order.
+_REPLAY_REASONING = "reasoning"
+_REPLAY_MESSAGE = "message"
+_REPLAY_FUNCTION_CALL = "function_call"
+
+
+def _replay_entry(entry: Any) -> Dict[str, Any]:
+    """One validated entry of a replay record, as :func:`_parse_responses_output`
+    wrote it: an encrypted reasoning item, a message's phase and text length,
+    or the id of a function call."""
+    kind = entry.get("type") if isinstance(entry, dict) else None
+    if kind == _REPLAY_REASONING:
+        encrypted = entry.get("encrypted_content")
+        summary = entry.get("summary", [])
+        if not isinstance(encrypted, str) or not encrypted:
+            raise ValueError("Responses API replay reasoning must be encrypted reasoning items.")
+        if not isinstance(summary, list) or not all(
+            isinstance(part, dict)
+            and part.get("type") == "summary_text"
+            and isinstance(part.get("text"), str)
+            for part in summary
+        ):
+            raise ValueError("A replayed reasoning item's summary must be summary text.")
+        return {
+            "type": "reasoning",
+            "summary": [dict(part) for part in summary],
+            "encrypted_content": encrypted,
+        }
+    if kind == _REPLAY_MESSAGE:
+        phase = entry.get("phase")
+        length = entry.get("text_length")
+        if phase is not None and not isinstance(phase, str):
+            raise ValueError("A Responses API replay phase must be a string.")
+        if type(length) is not int or length < 0:
+            raise ValueError("A replayed message must record its text length.")
+        return {"type": kind, "phase": phase, "text_length": length}
+    if kind == _REPLAY_FUNCTION_CALL:
+        call_id = entry.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise ValueError("A replayed function call must record its call id.")
+        return {"type": kind, "call_id": call_id}
+    raise ValueError(f"A Responses API replay entry of type {kind!r} is not one Kestrel wrote.")
+
+
+def _responses_replay(tool_calls: List[Any]) -> Optional[List[Dict[str, Any]]]:
+    """The replay record an assistant turn's tool calls carry for the
+    Responses API, as :func:`_responses_tool_calls` put it, validated; or
+    ``None`` when no call carries one."""
+    found = None
+    for call in tool_calls:
+        extra = call.get("extra_content") if isinstance(call, dict) else None
+        if extra is None:
+            continue
+        if not isinstance(extra, dict):
+            raise ValueError("A tool call's extra_content must be an object.")
+        namespace = extra.get(OPENAI_EXTRA_CONTENT)
+        if namespace is None:
+            continue
+        if not isinstance(namespace, dict):
+            raise ValueError("A tool call's OpenAI extra_content must be an object.")
+        replay = namespace.get(_RESPONSES_REPLAY)
+        if replay is None:
+            continue
+        if not isinstance(replay, dict):
+            raise ValueError("A tool call's Responses API replay data must be an object.")
+        if found is not None:
+            raise ValueError(
+                "Two tool calls of one assistant turn carry Responses API replay data."
+            )
+        found = replay
+    if found is None:
+        return None
+    output = found.get("output")
+    if not isinstance(output, list) or set(found) != {"output"}:
+        raise ValueError("Responses API replay data must hold only the response's output order.")
+    return [_replay_entry(entry) for entry in output]
+
+
+def _responses_function_call(call: Any) -> Dict[str, Any]:
+    """A chat-format tool call of the session as a Responses API function call."""
+    function = call.get("function") if isinstance(call, dict) else None
+    name = function.get("name") if isinstance(function, dict) else None
+    call_id = call.get("id") if isinstance(call, dict) else None
+    if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+        raise ValueError("A replayed tool call must carry its id and name.")
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments if arguments is not None else {})
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def _replayed_output(
+    replay: List[Dict[str, Any]], text: str, calls: List[Any],
+) -> List[Dict[str, Any]]:
+    """The session's assistant tool-call message, sent back in the order the
+    response produced it (see the section comment above).
+
+    ``text`` is the session message's content and ``calls`` its tool calls.
+    Each recorded message takes its length of ``text`` in turn, and each
+    recorded call is the session's call with that id. A session message whose
+    text is not exactly as long as its recorded messages, or whose calls are
+    not exactly the recorded ones, no longer describes the response: it is
+    refused rather than reordered or merged.
+    """
+    pending: Dict[str, Dict[str, Any]] = {}
+    for call in calls:
+        item = _responses_function_call(call)
+        if item["call_id"] in pending:
+            raise ValueError("An assistant message names one tool call id twice.")
+        pending[item["call_id"]] = item
+    recorded = sum(
+        entry["text_length"] for entry in replay if entry["type"] == _REPLAY_MESSAGE
+    )
+    if recorded != len(text):
+        raise ValueError(
+            "An assistant message's text no longer matches the Responses output "
+            "it replays; its reasoning cannot be sent back in place."
+        )
+    items: List[Dict[str, Any]] = []
+    offset = 0
+    for entry in replay:
+        if entry["type"] == _REPLAY_REASONING:
+            items.append(entry)
+        elif entry["type"] == _REPLAY_MESSAGE:
+            end = offset + entry["text_length"]
+            message: Dict[str, Any] = {
+                "type": "message", "role": "assistant", "content": text[offset:end],
+            }
+            offset = end
+            if entry["phase"] is not None:
+                message["phase"] = entry["phase"]
+            items.append(message)
+        else:
+            call = pending.pop(entry["call_id"], None)
+            if call is None:
+                raise ValueError(
+                    "A Responses API replay names a tool call its assistant message "
+                    "does not carry."
+                )
+            items.append(call)
+    if pending:
+        raise ValueError(
+            "An assistant message carries a tool call its Responses API replay "
+            "does not place."
+        )
+    return items
+
+
+def _responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Chat-format ``messages`` as Responses API ``input`` items."""
+    items: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("Each message must be an object.")
+        role = message.get("role")
+        content = message.get("content")
+        if role in ("system", "developer", "user"):
+            items.append({"role": role, "content": _responses_content(content, role=role)})
+        elif role == "assistant":
+            calls = message.get("tool_calls") or []
+            if not isinstance(calls, list):
+                raise ValueError("An assistant message's tool_calls must be a list.")
+            text = _responses_content(content, role="assistant")
+            replay = _responses_replay(calls)
+            if replay is not None:
+                items.extend(_replayed_output(replay, text, calls))
+                continue
+            # A message no Responses API call produced (an earlier route's, or
+            # a chat completion's) has no native order to keep.
+            if text:
+                items.append({"role": "assistant", "content": text})
+            items.extend(_responses_function_call(call) for call in calls)
+        elif role == "tool":
+            call_id = message.get("tool_call_id")
+            if not isinstance(call_id, str) or not call_id:
+                raise ValueError("A tool result must name the call it answers.")
+            items.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": _responses_tool_output(content),
+            })
+        else:
+            raise ValueError(f"A message with role {role!r} has no Responses API equivalent.")
+    return items
+
+
+def _responses_request(
+    *, model: str, messages: List[Dict[str, Any]], chat_request: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The Responses API request equivalent to the prepared chat request.
+
+    ``chat_request`` is what :meth:`OpenAIAdapter._prepare_chat_completion_request`
+    produced, request options and raw fields included, so both endpoints
+    start from the same caller intent. What is translated is the merged
+    payload :func:`_effective_chat_request` gives, the one endpoint selection
+    also reads: a nested value wins over the same top-level field, exactly as
+    on chat completions. Every field is translated through one table; a field
+    the Responses API has no equivalent for is refused rather than dropped,
+    and nothing is forwarded untranslated.
+    """
+    effective = _effective_chat_request(chat_request)
+
+    request: Dict[str, Any] = {
+        "model": model,
+        "input": _responses_input(messages),
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+    }
+    reasoning: Dict[str, Any] = {}
+    text: Dict[str, Any] = {}
+    effort = None
+    text_overrides: Dict[str, Any] = {}
+    output_budgets = set()
+    refused = []
+    for key, value in effective.items():
+        if key == "tools":
+            request["tools"] = [_responses_tool(tool) for tool in value]
+        elif key == "tool_choice":
+            request["tool_choice"] = _responses_tool_choice(value)
+        elif key == "response_format":
+            text_overrides["format"] = _responses_text_format(value)
+        elif key == "verbosity":
+            text_overrides["verbosity"] = value
+        elif key in ("max_completion_tokens", "max_tokens"):
+            if value is not None:
+                output_budgets.add(value)
+                request["max_output_tokens"] = value
+        elif key == "reasoning_effort":
+            effort = value
+        elif key in ("reasoning", "text"):
+            # Responses API objects a raw option may carry; they merge with,
+            # never replace, what the chat fields translate to.
+            if not isinstance(value, dict):
+                raise ValueError(f"A raw {key} field must be an object.")
+            (reasoning if key == "reasoning" else text).update(value)
+        elif key in _RESPONSES_SAME_FIELDS or key == "prompt_cache_key":
+            request[key] = value
+        else:
+            refused.append(key)
+    if refused:
+        raise ValueError(
+            f"OpenAI {model} tool requests use the Responses API, which has no "
+            f"equivalent of {', '.join(sorted(refused))}; refusing to drop them."
+        )
+    # Two spellings of one field (a chat field and a raw Responses object, or
+    # both chat output budgets) are refused rather than one chosen.
+    conflicts = []
+    if len(output_budgets) > 1:
+        conflicts.append("max_output_tokens")
+    if effort is not None and "effort" in reasoning:
+        conflicts.append("reasoning.effort")
+    conflicts.extend(f"text.{name}" for name in sorted(text_overrides) if name in text)
+    if conflicts:
+        raise ValueError(
+            f"OpenAI {model} tool request sets {', '.join(conflicts)} twice; "
+            "refusing to choose one."
+        )
+    if effort is not None:
+        reasoning["effort"] = effort
+    text.update(text_overrides)
+    if reasoning:
+        request["reasoning"] = reasoning
+    if text:
+        request["text"] = text
+    return request
+
+
+def _responses_stop_reason(response: Any) -> Optional[str]:
+    """The Responses API's own verdict: its ``status``, or for an incomplete
+    response the ``incomplete_details.reason`` it gives."""
+    status = _field(response, "status")
+    if status == "incomplete":
+        reason = _field(_field(response, "incomplete_details"), "reason")
+        return reason if isinstance(reason, str) and reason else status
+    return status if isinstance(status, str) and status else None
+
+
+def _responses_reasoning_replay_item(item: Any) -> Optional[Dict[str, Any]]:
+    """A returned reasoning item as it is sent back, or ``None`` when the
+    provider gave no encrypted content, which is all that can be sent back."""
+    encrypted = _field(item, "encrypted_content")
+    if not isinstance(encrypted, str) or not encrypted:
+        return None
+    summary = []
+    for part in _field(item, "summary") or []:
+        text = _field(part, "text")
+        if isinstance(text, str):
+            summary.append({"type": "summary_text", "text": text})
+    return {"type": "reasoning", "summary": summary, "encrypted_content": encrypted}
+
+
+def _parse_responses_output(response: Any) -> tuple:
+    """``(content, function_calls, replay)`` of a final response.
+
+    ``content`` is every message's text, in order; ``replay`` the response's
+    output order as its replay record holds it (see the section comment): each
+    sendable reasoning item, each message's phase and text length, and each
+    function call's id, exactly where the response produced them.
+    """
+    output = _field(response, "output")
+    if not isinstance(output, list):
+        raise LLMProtocolError("OpenAI Responses output must be a list.")
+    texts: List[str] = []
+    function_calls: List[tuple] = []
+    replay: List[Dict[str, Any]] = []
+    for item in output:
+        kind = _field(item, "type")
+        if kind == "reasoning":
+            replay_item = _responses_reasoning_replay_item(item)
+            if replay_item is not None:
+                replay.append(replay_item)
+        elif kind == "message":
+            item_phase = _field(item, "phase")
+            message_texts = []
+            for part in _field(item, "content") or []:
+                part_kind = _field(part, "type")
+                text = _field(part, "text" if part_kind == "output_text" else "refusal")
+                if part_kind not in ("output_text", "refusal") or not isinstance(text, str):
+                    raise LLMProtocolError("OpenAI Responses message content must be text.")
+                message_texts.append(text)
+            message_text = "".join(message_texts)
+            texts.append(message_text)
+            replay.append({
+                "type": _REPLAY_MESSAGE,
+                "phase": item_phase if isinstance(item_phase, str) else None,
+                "text_length": len(message_text),
+            })
+        elif kind == "function_call":
+            call_id = _field(item, "call_id")
+            name = _field(item, "name")
+            if (
+                type(call_id) is not str or not call_id
+                or type(name) is not str or not name
+            ):
+                raise LLMProtocolError("Native tool identity must be a non-empty string.")
+            function_calls.append(
+                (call_id, name, decode_tool_arguments(_field(item, "arguments")))
+            )
+            replay.append({"type": _REPLAY_FUNCTION_CALL, "call_id": call_id})
+        else:
+            raise LLMProtocolError(
+                "OpenAI Responses returned an output item Kestrel did not request."
+            )
+    return ("".join(texts) or None), function_calls, replay
+
+
+def _responses_tool_calls(
+    function_calls: List[tuple], replay: List[Dict[str, Any]],
+) -> Optional[List[ToolCall]]:
+    """The response's tool calls. The first carries the turn's replay record,
+    so its follow-up sends the response back as it came; a response of
+    function calls alone has no order the calls themselves do not keep."""
+    carries_replay = any(entry["type"] != _REPLAY_FUNCTION_CALL for entry in replay)
+    calls: List[ToolCall] = []
+    for index, (call_id, name, arguments) in enumerate(function_calls):
+        if index == 0 and carries_replay:
+            calls.append(ToolCallWithExtraContent(
+                id=call_id,
+                name=name,
+                arguments=arguments,
+                extra_content={OPENAI_EXTRA_CONTENT: {_RESPONSES_REPLAY: {
+                    "output": replay,
+                }}},
+            ))
+        else:
+            calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
+    return calls or None
+
+
+def _responses_served(response: Any, started: Any = None) -> Optional[ProviderServed]:
+    """What ``response`` names as serving it. A stream's ``started`` response
+    (the one its ``response.created`` event carried) supplies what a failed or
+    unfinished stream's own response does not name."""
+    model = _field(response, "model") if response is not None else None
+    response_id = _field(response, "id") if response is not None else None
+    if started is not None:
+        model = model or _field(started, "model")
+        response_id = response_id or _field(started, "id")
+    return provider_served(_RESPONSES_API, model=model, response_id=response_id)
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -514,18 +1204,22 @@ class OpenAIAdapter(LLMAdapter):
         model: str,
         finish_reason: Optional[str],
         caller_budget: bool,
+        *,
+        cut_reason: str = _LENGTH_FINISH_REASON,
     ) -> Optional[str]:
         """The notice for a ``length`` cut at a limit nobody chose, else None.
 
         No output budget is sent unless a caller chose one, so the limit a
         ``length`` stop hit is the provider's own and its size is not reported
         (#3355). A request with a caller's budget keeps its text untouched.
+        ``cut_reason`` is the API's own name for that stop: ``length`` on chat
+        completions, ``max_output_tokens`` on the Responses API.
         """
         return output_limit_cut_notice(
             provider=self.name,
             model=model,
             stop_reason=finish_reason,
-            cut_reason=_LENGTH_FINISH_REASON,
+            cut_reason=cut_reason,
             caller_budget=caller_budget,
         )
 
@@ -600,6 +1294,13 @@ class OpenAIAdapter(LLMAdapter):
                 options=kwargs.get("request_options"),
             )
 
+            if self._uses_responses_api(extra_kwargs, model=model):
+                # The Responses path translates the messages itself, replay
+                # data included; ``normalized_messages`` is chat-only.
+                return await self._get_responses_api_response(
+                    client, model, messages, extra_kwargs,
+                )
+
             response = await with_retry(
                 client.chat.completions.create,
                 model=model,
@@ -655,7 +1356,7 @@ class OpenAIAdapter(LLMAdapter):
             if notice is not None:
                 content = join_output_ceiling_notice(content, notice)
 
-            return attach_stop_reason(LLMResponse(
+            return attach_provider_served(attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
@@ -664,7 +1365,11 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), finish_reason)
+            ), finish_reason), provider_served(
+                _CHAT_COMPLETIONS_API,
+                model=_field(response, "model"),
+                response_id=_field(response, "id"),
+            ))
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
@@ -778,6 +1483,14 @@ class OpenAIAdapter(LLMAdapter):
                 options=kwargs.get("request_options"),
             )
 
+            if self._uses_responses_api(extra_kwargs, model=model):
+                async with aclosing(self._stream_responses_api(
+                    client, model, messages, extra_kwargs,
+                )) as responses_stream:
+                    async for item in responses_stream:
+                        yield item
+                return
+
             # Request streaming with usage stats
             extra_kwargs["stream_options"] = {"include_usage": True}
 
@@ -814,10 +1527,16 @@ class OpenAIAdapter(LLMAdapter):
             cache_read_input_tokens = None
             call_cost = None
             finish_reason = None
+            served_model = None
+            response_id = None
 
             try:
                 async for chunk in stream:
                     report_call_progress()
+                    # #4198: every chunk names the response and the model the
+                    # provider served; keep the first it reports.
+                    served_model = served_model or _field(chunk, "model")
+                    response_id = response_id or _field(chunk, "id")
                     # Extract usage from final chunk (OpenAI sends it with stream_options)
                     if hasattr(chunk, 'usage') and chunk.usage:
                         reported_native_usage = chunk.usage
@@ -971,7 +1690,7 @@ class OpenAIAdapter(LLMAdapter):
                 _raw["reasoning_content"] = reasoning_content
             if call_cost is not None:
                 _raw["cost"] = call_cost
-            yield attach_stop_reason(LLMResponse(
+            yield attach_provider_served(attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=parsed_tool_calls,
                 raw=_raw or None,
@@ -980,7 +1699,9 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), finish_reason)
+            ), finish_reason), provider_served(
+                _CHAT_COMPLETIONS_API, model=served_model, response_id=response_id,
+            ))
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
@@ -1264,10 +1985,214 @@ class OpenAIAdapter(LLMAdapter):
             or not _GPT56_CHAT_FUNCTION_REASONING_MODEL_PATTERN.search(model)
         ):
             return False
-        tools = request_kwargs.get("tools")
-        return isinstance(tools, list) and any(
-            isinstance(tool, dict) and tool.get("type") == "function" for tool in tools
+        return _has_function_tools(request_kwargs)
+
+    def _uses_responses_api(
+        self,
+        request_kwargs: Dict[str, Any],
+        *,
+        model: str,
+    ) -> bool:
+        """Whether this request must go to the Responses API (#4198).
+
+        Read from the payload the request actually sends
+        (:func:`_has_function_tools`), so a function tool named only in
+        ``extra_body`` selects the Responses API exactly as a top-level one
+        does: the payload translated is the payload selected on.
+        """
+        return (
+            self._native_openai
+            and bool(_RESPONSES_FUNCTION_TOOL_MODEL_PATTERN.search(model))
+            and _has_function_tools(request_kwargs)
         )
+
+    async def _get_responses_api_response(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        chat_request: Dict[str, Any],
+    ) -> LLMResponse:
+        """One non-streaming Responses API call for a prepared chat request.
+
+        Runs inside ``get_response``'s native SDK operation, so the call has
+        the same custody, retry and error reporting as a chat completion.
+        """
+        reported_usage = None
+        stop_reason = None
+        served = None
+        try:
+            request = _responses_request(
+                model=model, messages=messages, chat_request=chat_request,
+            )
+            response = await with_retry(client.responses.create, **request)
+            reported_usage = _field(response, "usage")
+            served = _responses_served(response)
+            stop_reason = _responses_stop_reason(response)
+            if _field(response, "status") == "failed":
+                raise _responses_failure(
+                    "response failed", response=response, served=served,
+                )
+            content, function_calls, replay = _parse_responses_output(response)
+            notice = self._output_limit_notice(
+                model, stop_reason, _caller_output_budget(chat_request),
+                cut_reason=_RESPONSES_OUTPUT_LIMIT_REASON,
+            )
+            if notice is not None:
+                content = join_output_ceiling_notice(content, notice)
+            return attach_provider_served(attach_stop_reason(LLMResponse(
+                content=content,
+                tool_calls=_responses_tool_calls(function_calls, replay),
+                raw=response,
+                **_usage_fields(reported_usage),
+            ), stop_reason), served)
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(
+                _failed_attempt_evidence(reported_usage, stop_reason, served)
+            ) from error
+
+    async def _stream_responses_api(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        chat_request: Dict[str, Any],
+    ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
+        """Stream one Responses API call for a prepared chat request.
+
+        Text and reasoning summaries stream as they arrive, and each function
+        call is announced as it starts. The terminal response is built from
+        the provider's final ``response.completed`` (or ``response.incomplete``)
+        event: its tool calls, usage, stop reason and served evidence. The
+        stream is acquired, owned and closed exactly as the chat-completions
+        stream is, so Stop or an early close retires it the same way. A
+        ``response.failed`` or ``error`` event raises the provider's failure,
+        carrying the usage it reported and what served the response (from the
+        stream's ``response.created`` event when the failure names neither).
+        The streamed text is the turn's text: a final response holding other
+        text is a protocol failure, since its replay record describes only the
+        final response's output.
+        """
+        reported_usage = None
+        stop_reason = None
+        served = None
+        try:
+            request = _responses_request(
+                model=model, messages=messages, chat_request=chat_request,
+            )
+            logger.info("Starting OpenAI Responses stream with tools for model: %s", model)
+
+            async def acquire_stream(**acquire_request):
+                async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+                    acquired = await client.responses.create(**acquire_request)
+                    responses.handles.clear()
+                    return acquired
+
+            stream = await with_retry(
+                acquire_stream,
+                stream=True,
+                acquired_result_cleanup=close_native_execution_stream,
+                **request,
+            )
+
+            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
+            retain_native_execution_stream_close(stream, self)
+
+            text_content = ""
+            started: Dict[Any, int] = {}
+            final = None
+            # The response ``response.created`` announced: what serves the
+            # stream before its terminal event names it.
+            opened = None
+            try:
+                async for event in stream:
+                    report_call_progress()
+                    kind = _field(event, "type")
+                    if kind == "response.created" and opened is None:
+                        opened = _field(event, "response")
+                        served = _responses_served(None, opened)
+                    elif kind in ("response.output_text.delta", "response.refusal.delta"):
+                        delta = _field(event, "delta")
+                        if isinstance(delta, str) and delta:
+                            text_content += delta
+                            yield delta
+                    elif kind in (
+                        "response.reasoning_summary_text.delta",
+                        "response.reasoning_text.delta",
+                    ):
+                        delta = _field(event, "delta")
+                        if isinstance(delta, str) and delta:
+                            yield ThinkingDelta(delta, provider=self.name)
+                    elif kind == "response.output_item.added":
+                        item = _field(event, "item")
+                        key = _field(event, "output_index")
+                        if _field(item, "type") == "function_call" and key not in started:
+                            started[key] = len(started)
+                            call_id = _field(item, "call_id")
+                            name = _field(item, "name")
+                            yield ToolCallStarted(
+                                index=started[key],
+                                id=call_id if isinstance(call_id, str) and call_id else None,
+                                name=name if isinstance(name, str) and name else None,
+                            )
+                    elif kind in ("response.completed", "response.incomplete"):
+                        final = _field(event, "response")
+                    elif kind == "response.failed":
+                        failed = _field(event, "response")
+                        served = _responses_served(failed, opened)
+                        raise _responses_failure(
+                            "response failed", response=failed, served=served,
+                        )
+                    elif kind == "error":
+                        raise _responses_failure(
+                            "stream error", error=event, served=served,
+                        )
+            finally:
+                await close_native_execution_stream(stream, self)
+
+            if final is None:
+                raise LLMProtocolError(
+                    "OpenAI Responses stream ended without a terminal response."
+                )
+            reported_usage = _field(final, "usage")
+            served = _responses_served(final, opened)
+            stop_reason = _responses_stop_reason(final)
+            final_text, function_calls, replay = _parse_responses_output(final)
+            if not text_content and final_text:
+                text_content = final_text
+                yield final_text
+            elif text_content != (final_text or ""):
+                raise LLMProtocolError(
+                    "OpenAI Responses streamed text its final response does not hold."
+                )
+            logger.info(
+                "Responses stream completed. Tool calls: %d", len(function_calls),
+            )
+
+            notice = self._output_limit_notice(
+                model, stop_reason, _caller_output_budget(chat_request),
+                cut_reason=_RESPONSES_OUTPUT_LIMIT_REASON,
+            )
+            if notice is not None:
+                notice_chunk = output_ceiling_notice_chunk(
+                    notice, follows_text=bool(text_content),
+                )
+                text_content += notice_chunk
+                yield notice_chunk
+
+            yield attach_provider_served(attach_stop_reason(LLMResponse(
+                content=text_content or None,
+                tool_calls=_responses_tool_calls(function_calls, replay),
+                **_usage_fields(reported_usage),
+            ), stop_reason), served)
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(
+                _failed_attempt_evidence(reported_usage, stop_reason, served)
+            ) from error
 
     def apply_request_options(
         self,
@@ -1691,6 +2616,18 @@ class OpenAIAdapter(LLMAdapter):
                 new_tool_calls = []
                 for tc in msg["tool_calls"]:
                     new_tc = {**tc}
+                    extra_content = tc.get("extra_content")
+                    if isinstance(extra_content, dict) and OPENAI_EXTRA_CONTENT in extra_content:
+                        # Responses API replay data (#4198) has no meaning on
+                        # chat completions; other namespaces stay as they are.
+                        kept = {
+                            name: value for name, value in extra_content.items()
+                            if name != OPENAI_EXTRA_CONTENT
+                        }
+                        if kept:
+                            new_tc["extra_content"] = kept
+                        else:
+                            new_tc.pop("extra_content")
                     if "function" in tc and "arguments" in tc["function"]:
                         args = tc["function"]["arguments"]
                         if isinstance(args, dict):
