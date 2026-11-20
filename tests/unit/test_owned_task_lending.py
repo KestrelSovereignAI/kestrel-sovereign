@@ -13,6 +13,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup,
     bind_execution_custody,
     execution_evidence_carriers,
+    owned_execution_stream,
     require_execution_work,
 )
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
@@ -288,3 +289,35 @@ async def test_exact_cleanup_does_not_request_a_new_work_loan(tmp_path):
     finally:
         resource.close()
     assert len(host.retired) == 1 and not host.outstanding
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_reader", [False, True])
+async def test_execution_stream_carries_original_work_loan_without_charging_its_closers(foreign_reader):
+    host = CapacityLoan(capacity=1)
+    entered = []
+    closed = []
+
+    async def source():
+        producer = asyncio.current_task()
+        entered.append(producer)
+        assert ownership.capture_owned_task_lender() is not None
+        assert [entry[1] for entry in host.outstanding.values()] == [producer]
+        try:
+            yield "original stream output"
+        finally:
+            closed.append(asyncio.current_task())
+
+    async def consume(stream):
+        assert await anext(stream) == "original stream output"
+        assert len(host.outstanding) == 1
+
+    with bind_execution_custody(ProcessRuntimeExecutionFence("owned-stream-lender-test")):
+        with ownership.bind_owned_task_lender(host):
+            async with owned_execution_stream(None, source()) as stream:
+                if foreign_reader:
+                    await asyncio.create_task(consume(stream))
+                else:
+                    await consume(stream)
+    assert entered == closed and len(entered) == 1
+    assert not host.outstanding and host.retired[0].task is entered[0]

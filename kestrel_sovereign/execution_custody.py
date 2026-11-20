@@ -1866,6 +1866,10 @@ class _ExecutionForwarder:
     """
 
     def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = (), *, lifecycle: ExecutionStreamLifecycle | None = None, withdrawal: SourceWithdrawal | None = None):
+        from kestrel_sovereign._async_ownership import (
+            OwnedSourceAdmission, OwnedTaskAdmission, capture_owned_task_lender,
+        )
+
         if withdrawal is not None and type(withdrawal) is not SourceWithdrawal:
             raise TypeError("execution withdrawal must be a SourceWithdrawal")
         self._withdrawal = withdrawal
@@ -1889,6 +1893,8 @@ class _ExecutionForwarder:
         # Capture now, dispatch only on the first admitted consumer pull.
         # A deferred HTTP response may never be consumed at all.
         self._owner_context = context
+        self._source_admission = OwnedSourceAdmission(retirement=OwnedTaskAdmission())
+        self._source_lender = capture_owned_task_lender()
         self._iterator = None
         self._consumer_started = asyncio.Event()
         self._producer_started = False
@@ -1938,16 +1944,21 @@ class _ExecutionForwarder:
                     owner_context=self._owner_context,
                     owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
                     owner_started=started,
+                    source_admission=self._source_admission,
+                    lender_capture=self._source_lender,
                 )
 
     def _reserve_close_owner(self):
         if self._close_operation is None:
-            from kestrel_sovereign._async_ownership import OwnedOperation
+            from kestrel_sovereign._async_ownership import OwnedOperation, _disable_owned_task_lending
             factory = None if self._lifecycle is None else self._lifecycle.cleanup_factory
-            self._close_operation = OwnedOperation(
-                self._close_when_requested() if factory is None else self._close_when_requested,
-                retirement_resource=self, retain_originals=True,
-                context=self._owner_context.copy(), owner_factory=factory)
+            with _disable_owned_task_lending(True):
+                self._close_operation = OwnedOperation(
+                    self._close_when_requested() if factory is None else self._close_when_requested,
+                    retirement_resource=self, retain_originals=True,
+                    context=self._owner_context.copy(), owner_factory=factory,
+                    admission=self._source_admission.retirement,
+                )
 
     async def _close_when_requested(self):
         await self._close_requested.wait()

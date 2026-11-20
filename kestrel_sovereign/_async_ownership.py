@@ -1415,6 +1415,15 @@ class _CoreSourceHandoff(SourceHandoff[_T]):
             )
 
 
+@dataclass(frozen=True, eq=False, slots=True)
+class OwnedSourceAdmission:
+    """Exact structural receipts allocated before the first native source task."""
+
+    producer: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
+    watcher: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
+    retirement: OwnedTaskAdmission | None = None
+
+
 class OwnedAsyncIterator(Generic[_T]):
     """Keep every interaction with an async iterator in one owner task.
 
@@ -1442,6 +1451,8 @@ class OwnedAsyncIterator(Generic[_T]):
         owner_context: contextvars.Context | None = None,
         owner_factory: Callable | None = None,
         owner_started: Callable | None = None,
+        source_admission: OwnedSourceAdmission | None = None,
+        lender_capture: OwnedTaskLenderCapture | None = None,
     ) -> None:
         if (iterator_factory is None) == (source_factory is None):
             raise TypeError("Provide exactly one iterator_factory or source_factory")
@@ -1495,11 +1506,13 @@ class OwnedAsyncIterator(Generic[_T]):
             await dispatch.wait()
             await self._run()
         self._owner = None
-        owner_admission, watcher_admission = OwnedTaskAdmission(), OwnedTaskAdmission()
+        admission = source_admission if source_admission is not None else OwnedSourceAdmission()
+        owner_admission, watcher_admission = admission.producer, admission.watcher
         try:
             self._owner = (
                 create_owned_task(run_owned(), name=f"owned_async_iterator:{operation}",
-                    context=owner_context, admission=owner_admission, retain_originals=True)
+                    context=owner_context, admission=owner_admission, retain_originals=True,
+                    lender_capture=lender_capture)
                 if owner_factory is None else owner_factory(run_owned, owner_context)
             )
             # All accepted owners and every subsequent publication belong to
@@ -1510,6 +1523,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 self._watch_owner_cancellation(),
                 name=f"owned_async_iterator_cancel:{operation}",
                 admission=watcher_admission, retain_originals=True,
+                lender_capture=None,
             )
             self._cancellation_owner.add_done_callback(
                 self._interrupt_if_watch_never_started
