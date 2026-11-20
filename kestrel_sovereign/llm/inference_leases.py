@@ -388,6 +388,7 @@ class InferenceLeaseCoordinator:
         owner_id: str,
         providers: Mapping[str, InferenceLeaseProvider] | None = None,
         persist_state: PersistLeaseState | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._llm_service = llm_service
         self._owner_id = owner_id
@@ -395,8 +396,10 @@ class InferenceLeaseCoordinator:
             providers if providers is not None else discover_inference_lease_providers()
         )
         self._persist_state = persist_state
+        self._clock = clock if clock is not None else lambda: datetime.now(UTC)
         self._record: InferenceLeaseRecord | None = None
         self._prepared_offer: PreparedInferenceLeaseOffer | None = None
+        self._submitted_acquisition: InferenceLeaseRecord | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -529,7 +532,10 @@ class InferenceLeaseCoordinator:
             provider = self._provider(record.provider_name)
             try:
                 require_execution_work()
-                lease = await provider.acquire(record.request, record.quote)
+                # The original durable intent may have reached the provider.
+                # After expiry only its reconciliation capability may act.
+                self._submitted_acquisition = record
+                lease = await self._dispatch_acquisition(provider, record)
             except Exception as exc:
                 if is_execution_control_error(exc):
                     raise
@@ -553,7 +559,7 @@ class InferenceLeaseCoordinator:
                 return None
             require_execution_work(self._llm_service)
             quote = await provider.quote(request)
-            quote.validate_for(request)
+            quote.validate_for(request, now=self._clock())
             if quote.provider_name != provider.provider_name.strip().lower():
                 raise InferenceLeaseConstraintError(
                     "quote provider does not match selected provider"
@@ -593,6 +599,21 @@ class InferenceLeaseCoordinator:
         with bind_execution_runtime(self._llm_service):
             async with self._lock:
                 require_execution_work()
+                record = self._record
+                if (record is not None and record.lease is None
+                        and self._submitted_acquisition is not record
+                        and record.quote.expires_at <= self._clock()):
+                    # No provider call was admitted in this lifetime. Retire
+                    # the original stale plan only after storage acknowledges it.
+                    cleared = False
+                    self._record = None
+                    try:
+                        await self._persist()
+                        cleared = True
+                    finally:
+                        if not cleared:
+                            self._record = record
+                    self._prepared_offer = None
                 if self._record is not None and (
                     self._record.lease is None or not self._record.lease.is_terminal
                 ):
@@ -603,14 +624,13 @@ class InferenceLeaseCoordinator:
                 return offer
 
     async def acquire_prepared(self, request_id: str, offer_digest: str) -> InferenceLease:
-        """Consume the exact still-live offer, never select a replacement."""
+        """Acquire a current offer or reconcile its exact original submission."""
         with bind_execution_runtime(self._llm_service):
             async with self._lock:
                 require_execution_work()
                 offer = self._prepared_offer
                 if offer is None or offer.request.request_id != request_id or offer.digest != offer_digest:
                     raise InferenceLeaseConstraintError("prepared inference offer does not match the approval")
-                offer.quote.validate_for(offer.request)
                 lease = await self._acquire_locked(offer.request, offer=offer)
                 self._prepared_offer = None
                 return lease
@@ -620,7 +640,11 @@ class InferenceLeaseCoordinator:
         with bind_execution_runtime(self._llm_service):
             async with self._lock:
                 require_execution_work()
-                return self._prepared_offer is offer and offer.quote.expires_at > datetime.now(UTC)
+                record = self._record
+                return (
+                    self._prepared_offer is offer and offer.quote.expires_at > self._clock()
+                    and (record is None or (record.lease is not None and record.lease.is_terminal))
+                )
 
     async def _choose_offer(self, request: InferenceLeaseRequest) -> InferenceLeaseQuote:
         from kestrel_sovereign._async_ownership import gather_owned
@@ -645,6 +669,21 @@ class InferenceLeaseCoordinator:
         async with self._lock:
             return await self._acquire_locked(request)
 
+    async def _dispatch_acquisition(
+        self, provider: InferenceLeaseProvider, record: InferenceLeaseRecord,
+    ) -> InferenceLease:
+        now = self._clock()
+        if record.quote.expires_at <= now and self._submitted_acquisition is record:
+            reconcile = getattr(provider, "reconcile_expired_acquisition", None)
+            if not callable(reconcile):
+                raise InferenceLeaseProvisioningError(
+                    "provider does not support reconciliation of this expired acquisition"
+                )
+            return await reconcile(record.request, record.quote)
+        record.quote.validate_for(record.request, now=now)
+        self._submitted_acquisition = record
+        return await provider.acquire(record.request, record.quote)
+
     async def _acquire_locked(
         self, request: InferenceLeaseRequest, *, offer: PreparedInferenceLeaseOffer | None = None,
     ) -> InferenceLease:
@@ -663,10 +702,12 @@ class InferenceLeaseCoordinator:
                 provider = self._provider(previous.provider_name)
                 # A refused prior persistence is not authorization to start
                 # the pending acquisition. Confirm the same record again.
+                if self._submitted_acquisition is not previous:
+                    previous.quote.validate_for(previous.request, now=self._clock())
                 await self._persist()
                 try:
                     require_execution_work()
-                    lease = await provider.acquire(previous.request, previous.quote)
+                    lease = await self._dispatch_acquisition(provider, previous)
                 except Exception as exc:
                     if is_execution_control_error(exc):
                         raise
@@ -687,7 +728,7 @@ class InferenceLeaseCoordinator:
                 )
 
         quote = offer.quote if offer is not None else await self._choose_offer(request)
-        quote.validate_for(request)
+        quote.validate_for(request, now=self._clock())
         record = InferenceLeaseRecord(
             provider_name=quote.provider_name,
             request=request,
@@ -697,16 +738,16 @@ class InferenceLeaseCoordinator:
         # Persist the idempotency request and selected quote before the
         # first billable mutation.  A crash can then resume acquire with
         # the exact same request identifier.
-        self._record = record
-        await self._persist()
         if offer is None:
             # A different acquisition invalidates any outstanding read-only
             # offer rather than reusing a stale preflight after release.
             self._prepared_offer = None
+        self._record = record
+        await self._persist()
         provider = self._provider(quote.provider_name)
         try:
             require_execution_work()
-            lease = await provider.acquire(request, quote)
+            lease = await self._dispatch_acquisition(provider, record)
         except Exception as exc:
             if is_execution_control_error(exc):
                 raise
