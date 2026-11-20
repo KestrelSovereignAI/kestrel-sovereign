@@ -349,6 +349,21 @@ async def test_stop_watch_clears_flag(make_store):
 
 
 @pytest.mark.asyncio
+async def test_recovery_registration_cannot_restart_a_stopped_watch(make_store):
+    store = await make_store()
+    await store.start_watch("mcp", "task-1", origin_session_id="original", rearm=False)
+    [original] = await store.list_watched()
+    assert original.watch_origin_session_id == "original"
+    await store.stop_watch("mcp", "task-1")
+    stopped = await store.get("mcp", "task-1")
+
+    await store.start_watch("mcp", "task-1", origin_session_id="other", rearm=False)
+
+    assert await store.get("mcp", "task-1") == stopped
+    assert await store.list_watched() == []
+
+
+@pytest.mark.asyncio
 async def test_list_watched_only_active_unsignaled(make_store):
     store = await make_store()
     await store.start_watch("task", "active-1")

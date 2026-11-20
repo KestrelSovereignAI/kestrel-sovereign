@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import hmac
 import json
+import math
 import secrets
 from typing import Literal
 from uuid import uuid4
@@ -25,19 +26,26 @@ from kestrel_sovereign.a2a.stores.unified.base import NativeStoreConflict, Unifi
 from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from kestrel_sovereign.mcp_task_submission import (
     MCPTaskInteractiveOrigin, MCPTaskServiceOrigin, MCPTaskSubmission,
-    _binding_text, _is_digest, decode_origin,
+    _binding_text, _is_digest, decode_origin, task_connection_id,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
 
 
-MCP_TASK_SCHEMA_REVISION = 4
+MCP_TASK_SCHEMA_REVISION = 6
+RECOVERABLE_OBSERVATION_BLOCKS = frozenset({'resource_rejected', 'credential_unavailable'})
+_OBSERVATION_BLOCKS = RECOVERABLE_OBSERVATION_BLOCKS | {
+    'authorization_changed', 'authorization_revoked', 'remote_expired', 'remote_unavailable',
+    'remote_result_unusable',
+}
 
 
-def task_routing_payload(binding, task_id, envelope, continuity):
+def task_routing_payload(binding, task_id, envelope, continuity, local=None):
     """Canonical routing bytes, also used to measure host admission headroom."""
     return encode_inline_json({'binding': asdict(binding), 'remote_task_id': task_id,
-        'envelope': envelope, 'continuity': continuity})
+        'envelope': envelope, 'continuity': continuity,
+        'local': {'observation_block': None, 'withheld': None, 'poll_not_before': None}
+            if local is None else local})
 
 _ROW_COLUMNS = ('scope,handle,operation_digest,binding_digest,remote_digest,revision,phase,'
     'claim_hash,payload_limit,payload,submission_limit,submission_digest,input_lineage_digest')
@@ -49,6 +57,14 @@ class MCPTaskConflict(NativeStoreConflict):
 
 class MCPTaskIntegrityError(ResourceError):
     """Original custody cannot safely be opened or replaced."""
+
+
+class MCPTaskObservationRefused(MCPTaskConflict):
+    """The native observation cannot be retained in its original custody."""
+
+
+class MCPTaskPayloadLimit(ValueError):
+    """The serialized record exceeds its original limit."""
 
 
 @dataclass(frozen=True, repr=False)
@@ -126,6 +142,18 @@ class MCPTaskRecord:
     def observation(self) -> dict | None:
         envelope = self.envelope
         return envelope.get('observation') if envelope is not None else None
+
+    @property
+    def local(self) -> dict:
+        """Detached host decisions, authenticated separately from the peer receipt."""
+        return json.loads(self._payload)['local']
+
+    @property
+    def occupies_active_slot(self) -> bool:
+        if self.phase != 'ATTACHED':
+            return self.phase in {'ISSUING', 'INPUT_WAITING'}
+        block = self.local['observation_block']
+        return block is None or block['reason'] in RECOVERABLE_OBSERVATION_BLOCKS
 
 
 @dataclass(frozen=True)
@@ -221,7 +249,7 @@ class MCPTaskStore(UnifiedStoreBase):
             with repository_initialization_errors(integrity_error=MCPTaskIntegrityError,
                     unknown_message='MCP Task initialization requires reconciliation'):
                 # Keep the original shared lock across schema revisions.
-                # Prototypes1-3 cannot prove joint input lineage and issuance.
+                # Earlier private layouts cannot prove the original OAuth slot.
                 async with self.database.migration_lock('kestrel-mcp-task-schema-v1'):
                     await self.database.execute('CREATE TABLE IF NOT EXISTS mcp_task_schema (singleton BIGINT PRIMARY KEY, revision BIGINT NOT NULL)')
                     revision = await self.database.fetchone('SELECT revision FROM mcp_task_schema WHERE singleton=1')
@@ -261,7 +289,7 @@ class MCPTaskStore(UnifiedStoreBase):
         return self._digest('mcp-task-remote-v2', [binding.connection_id, binding.authorization_id, task_id])
 
     def _aad(self, columns):
-        return encode_inline_json(['mcp-task-v3', *columns])
+        return encode_inline_json(['mcp-task-v5', *columns])
 
     @staticmethod
     def _envelope(phase, task_id, envelope):
@@ -397,19 +425,45 @@ class MCPTaskStore(UnifiedStoreBase):
         if link['operation_id'] != previous:
             raise ValueError('MCP Task input has another original operation')
 
-    def _encode(self, binding, columns, task_id, envelope, *, continuity=None):
+    @staticmethod
+    def _local(binding, phase, envelope, value):
+        if type(value) is not dict or set(value) != {'observation_block', 'withheld', 'poll_not_before'}:
+            raise ValueError('Invalid MCP Task local observation state')
+        poll = value['poll_not_before']
+        if poll is not None and (phase != 'ATTACHED' or type(poll) not in (int, float)
+                or not 0 <= poll < math.inf):
+            raise ValueError('Invalid MCP Task observation schedule')
+        block = value['observation_block']
+        if block is not None and (phase != 'ATTACHED' or type(block) is not dict
+                or set(block) != {'reason', 'authorization_id', 'blocked_at', 'authority_epoch', 'admission_serial'}
+                or block['reason'] not in _OBSERVATION_BLOCKS
+                or block['authorization_id'] != binding.authorization_id
+                or type(block['blocked_at']) not in (int, float)
+                or not 0 <= block['blocked_at'] < math.inf
+                or type(block['admission_serial']) is not int or block['admission_serial'] < 0):
+            raise ValueError('Invalid MCP Task observation block')
+        if block is not None:
+            _binding_text(block['authority_epoch'])
+        if value['withheld'] is not None and (value['withheld'] != 'contract_drift'
+                or phase != 'SETTLED' or not envelope
+                or envelope.get('observation', {}).get('status') != 'completed'):
+            raise ValueError('Invalid withheld MCP Task completion')
+
+    def _encode(self, binding, columns, task_id, envelope, *, continuity=None, local=None):
         self._envelope(columns[6], task_id, envelope)
         if ((columns[6] == 'ISSUING') != (columns[7] is not None)
                 or columns[7] is not None and not _is_digest(columns[7])):
             raise ValueError('Invalid MCP Task issuance state')
         continuity = {'operations': [], 'input': None} if continuity is None else continuity
         self._continuity(binding, columns[6], columns[11], continuity)
+        if local is not None:
+            self._local(binding, columns[6], envelope, local)
         if set(continuity['operations']).intersection(
                 envelope.get('control', {}).get('mutations', {}) if envelope else ()):
             raise ValueError('MCP Task continuation operation already owns a mutation')
-        raw = task_routing_payload(binding, task_id, envelope, continuity)
+        raw = task_routing_payload(binding, task_id, envelope, continuity, local)
         if len(raw) > columns[8]:
-            raise ValueError('MCP Task custody exceeded its storage budget')
+            raise MCPTaskPayloadLimit('MCP Task custody exceeded its storage budget')
         return raw, AEADCipher(self._root).encrypt(raw, aad=self._aad(columns))
 
     def _open(self, row) -> MCPTaskRecord:
@@ -436,12 +490,13 @@ class MCPTaskStore(UnifiedStoreBase):
         try:
             value = json.loads(raw)
             if (len(raw) > limit or type(value) is not dict
-                    or set(value) != {'binding','remote_task_id','envelope','continuity'}):
+                    or set(value) != {'binding','remote_task_id','envelope','continuity','local'}):
                 raise ValueError('Invalid private payload')
             binding_value = value['binding']
             binding = MCPTaskBinding(**{**binding_value, 'origin': decode_origin(binding_value['origin'])})
             self._envelope(phase, value['remote_task_id'], value['envelope'])
             self._continuity(binding, phase, lineage_digest, value['continuity'])
+            self._local(binding, phase, value['envelope'], value['local'])
         except (ValueError, TypeError, KeyError, RecursionError):
             raise MCPTaskIntegrityError('Invalid private MCP Task payload') from None
         if (binding.agent_did != self.agent_did or digest != self._binding_digest(binding)
@@ -457,16 +512,21 @@ class MCPTaskStore(UnifiedStoreBase):
         submission = MCPTaskSubmission(submission.canonical_json)
         if hashlib.sha256(submission.contract).hexdigest() != binding.contract_digest:
             raise ValueError('MCP Task submission does not match its original contract digest')
+        locator = submission.authorization
+        if (binding.connection_id != task_connection_id(binding.agent_did, locator.owner, locator.connection_name)
+                or (type(binding.origin) is MCPTaskInteractiveOrigin
+                    and binding.origin.principal_digest != locator.principal_digest)):
+            raise ValueError('MCP Task submission does not match its original OAuth attribution')
         delivery = submission.delivery
         if ((delivery.kind == 'app' and type(binding.origin) is not MCPTaskInteractiveOrigin)
                 or (delivery.kind == 'internal' and type(binding.origin) is MCPTaskInteractiveOrigin)
                 or (delivery.kind != 'internal' and delivery.session_id != binding.origin.session_id)):
             raise ValueError('MCP Task submission does not match its original delivery provenance')
-        return self._digest('mcp-task-submission-v2',
+        return self._digest('mcp-task-submission-v3',
             [self._binding_digest(binding), submission.canonical_json.decode('ascii')])
 
     def _submission_aad(self, handle, binding_digest, limit, digest):
-        return encode_inline_json(['mcp-task-submission-v2', self.scope, handle, binding_digest, limit, digest])
+        return encode_inline_json(['mcp-task-submission-v3', self.scope, handle, binding_digest, limit, digest])
 
     async def open_submission(self, expected: MCPTaskRecord) -> MCPTaskSubmission:
         """Open original immutable evidence only; this never grants execution authority.
@@ -563,12 +623,13 @@ class MCPTaskStore(UnifiedStoreBase):
         return tuple(record for record, _ in await self._all())
 
     async def retained_page(self, *, after: str | None, max_records: int,
-                            max_bytes: int) -> tuple[MCPTaskRecord, ...]:
+                            max_bytes: int, budget_submission: bool = False) -> tuple[MCPTaskRecord, ...]:
         """Authenticate a handle-ordered page without trusting stored state as a filter.
 
         The byte target paces transport of existing ciphertext. An original row
         larger than the page target is read on its own, including after a policy
-        reduction.
+        reduction. Budget the sealed submission when the caller may open it
+        for each selected row.
         """
         self._ready()
         if after is not None:
@@ -577,7 +638,8 @@ class MCPTaskStore(UnifiedStoreBase):
             raise ValueError('MCP Task inventory requires positive page limits')
         rows = await self.database.fetchall(
             'WITH candidates AS ('
-            'SELECT handle,LENGTH(payload) AS payload_bytes FROM mcp_task_records '
+            'SELECT handle,LENGTH(payload) + CASE WHEN ? THEN LENGTH(submission) ELSE 0 END '
+            'AS payload_bytes FROM mcp_task_records '
             'WHERE scope=? AND handle>? ORDER BY handle LIMIT ?'
             '), budget AS ('
             'SELECT handle,ROW_NUMBER() OVER (ORDER BY handle) AS ordinal,'
@@ -586,7 +648,7 @@ class MCPTaskStore(UnifiedStoreBase):
             ') '
             f'SELECT {_ROW_COLUMNS} FROM mcp_task_records WHERE scope=? '
             'AND handle IN (SELECT handle FROM budget WHERE ordinal=1 OR total<=?) ORDER BY handle',
-            (self.scope, after or '', max_records, self.scope, max_bytes))
+            (budget_submission, self.scope, after or '', max_records, self.scope, max_bytes))
         return tuple(self._open(row) for row in rows)
 
     @staticmethod
@@ -625,7 +687,7 @@ class MCPTaskStore(UnifiedStoreBase):
                     raise MCPTaskConflict('MCP Task original operation already owns retained work')
                 if len(records) >= self.max_records:
                     raise MCPTaskConflict('MCP Task retained record capacity is exhausted')
-                if sum(record.phase in {'ISSUING','INPUT_WAITING','ATTACHED'} for record, _ in records) >= self.max_active:
+                if sum(record.occupies_active_slot for record, _ in records) >= self.max_active:
                     raise MCPTaskConflict('MCP Task active capacity is exhausted')
                 if len(submission.canonical_json) > self.max_submission_bytes:
                     raise ValueError('MCP Task submission exceeded its storage budget')
@@ -671,7 +733,7 @@ class MCPTaskStore(UnifiedStoreBase):
             raise MCPTaskConflict('MCP Task issuance is no longer current')
         return actual, row
 
-    async def _finish(self, issuance, phase, task_id, envelope):
+    async def _finish(self, issuance, phase, task_id, envelope, *, local=None):
         self._ready()
         expected = self._issuance_identity(issuance)
         envelope = self._snapshot(envelope)
@@ -684,7 +746,7 @@ class MCPTaskStore(UnifiedStoreBase):
                 raise MCPTaskConflict('MCP Task remote identity already has original custody')
             columns = (*row[:4], remote, actual.revision + 1, phase, None, actual.payload_limit, *row[10:13])
             raw, ciphertext = self._encode(actual.binding, columns, task_id, envelope,
-                continuity=actual.continuity)
+                continuity=actual.continuity, local=local)
             changed = await self.database.execute('UPDATE mcp_task_records SET remote_digest=?,revision=?,phase=?,claim_hash=NULL,payload=? WHERE scope=? AND handle=? AND revision=? AND phase=\'ISSUING\' AND claim_hash=?',
                 (remote, actual.revision + 1, phase, ciphertext, self.scope, actual.handle, actual.revision, expected.claim_hash))
             if changed != 1:
@@ -693,15 +755,17 @@ class MCPTaskStore(UnifiedStoreBase):
                 actual.submission_limit, actual.submission_digest, actual.input_lineage_digest)
         return result
 
-    async def attach_task(self, issuance: MCPTaskIssuance, *, remote_task_id: str, envelope: dict) -> MCPTaskRecord:
+    async def attach_task(self, issuance: MCPTaskIssuance, *, remote_task_id: str, envelope: dict,
+                          poll_not_before: float | None = None) -> MCPTaskRecord:
         """Bind a feature-validated native claim without exposing its raw payload."""
         if type(envelope) is not dict or set(envelope) != {'version','native'}:
             raise ValueError('Initial MCP Task attachment requires only its native creation claim')
         self._envelope('ATTACHED', remote_task_id, envelope)
-        return await self._finish(issuance, 'ATTACHED', remote_task_id, envelope)
+        return await self._finish(issuance, 'ATTACHED', remote_task_id, envelope,
+            local={'observation_block': None, 'withheld': None, 'poll_not_before': poll_not_before})
 
     async def _persist(self, actual, row, phase, envelope, *, continuity=None,
-                       claim_hash=None, input_lineage_digest=None):
+                       claim_hash=None, input_lineage_digest=None, local=None):
         lineage = actual.input_lineage_digest
         assigning_lineage = lineage is None and input_lineage_digest is not None
         if input_lineage_digest is not None:
@@ -712,7 +776,7 @@ class MCPTaskStore(UnifiedStoreBase):
         columns = (*row[:5], actual.revision + 1, phase, claim_hash, actual.payload_limit,
             *row[10:12], lineage)
         raw, ciphertext = self._encode(actual.binding, columns, actual.remote_task_id, envelope,
-            continuity=continuity)
+            continuity=continuity, local=actual.local if local is None else local)
         assignments = 'revision=?,phase=?,claim_hash=?,payload=?'
         parameters = (actual.revision + 1, phase, claim_hash, ciphertext)
         predicate = "scope=? AND handle=? AND revision=? AND phase=? AND COALESCE(claim_hash,'')=?"
@@ -821,7 +885,56 @@ class MCPTaskStore(UnifiedStoreBase):
             result = await self._persist(actual, row, actual.phase, envelope)
         return result
 
-    async def observe(self, expected: MCPTaskRecord, observation: dict) -> MCPTaskRecord:
+    async def _select_observation(self, expected):
+        actual, row = self._require_binding(await self._read_row(expected.handle), expected.binding)
+        if actual.revision != expected.revision or actual.phase != 'ATTACHED':
+            raise MCPTaskConflict('MCP Task observation revision is no longer current')
+        return actual, row
+
+    async def defer_observation(self, expected: MCPTaskRecord, *, not_before: float) -> MCPTaskRecord:
+        """Persist pacing before a read can head to the wire."""
+        self._ready()
+        self._expected(expected)
+        async with self.write_transaction():
+            await self._lock()
+            actual, row = await self._select_observation(expected)
+            local = actual.local
+            if local['observation_block'] is not None:
+                raise MCPTaskConflict('MCP Task observation is blocked')
+            local['poll_not_before'] = not_before
+            return await self._persist(actual, row, actual.phase, actual.envelope, local=local)
+
+    async def block_observation(self, expected: MCPTaskRecord, *, reason: str, blocked_at: float,
+                                authority_epoch: str, admission_serial: int) -> MCPTaskRecord:
+        """Retain a local observation block without inventing a remote outcome."""
+        self._ready()
+        self._expected(expected)
+        async with self.write_transaction():
+            await self._lock()
+            actual, row = await self._select_observation(expected)
+            local = actual.local
+            if local['observation_block'] is not None:
+                raise MCPTaskConflict('MCP Task observation already has a block')
+            local['observation_block'] = {'reason': reason, 'blocked_at': blocked_at,
+                'authorization_id': actual.binding.authorization_id, 'authority_epoch': authority_epoch,
+                'admission_serial': admission_serial}
+            return await self._persist(actual, row, actual.phase, actual.envelope, local=local)
+
+    async def clear_observation_block(self, expected: MCPTaskRecord) -> MCPTaskRecord:
+        self._ready()
+        self._expected(expected)
+        async with self.write_transaction():
+            await self._lock()
+            actual, row = await self._select_observation(expected)
+            local = actual.local
+            block = local['observation_block']
+            if block is None or block['reason'] not in RECOVERABLE_OBSERVATION_BLOCKS:
+                raise MCPTaskConflict('MCP Task has no recoverable observation block')
+            local['observation_block'] = None
+            return await self._persist(actual, row, actual.phase, actual.envelope, local=local)
+
+    async def observe(self, expected: MCPTaskRecord, observation: dict, *, withheld=None,
+                      poll_not_before: float | None = None) -> MCPTaskRecord:
         """Retain a feature-validated native get result, never an inferred finish.
 
         The host authorizes the observer independently. This is strict CAS,
@@ -832,18 +945,27 @@ class MCPTaskStore(UnifiedStoreBase):
                 or type(expected.revision) is not int or expected.revision < 0):
             raise MCPTaskConflict('MCP Task observation requires original attached custody')
         self._binding_digest(expected.binding)
-        observation = self._snapshot(observation)
+        try:
+            observation = self._snapshot(observation)
+        except (ValueError, RecursionError) as error:
+            raise MCPTaskObservationRefused('MCP Task observation must be bounded JSON') from error
         async with self.write_transaction():
             await self._lock()
-            actual, row = self._require_binding(await self._read_row(expected.handle), expected.binding)
-            if actual.revision != expected.revision or actual.phase != 'ATTACHED':
-                raise MCPTaskConflict('MCP Task observation revision is no longer current')
-            terminal = self._observation(actual.remote_task_id, observation)
-            phase = 'SETTLED' if terminal else 'ATTACHED'
+            actual, row = await self._select_observation(expected)
+            local = actual.local
+            if local['observation_block'] is not None:
+                raise MCPTaskConflict('MCP Task observation is blocked')
             envelope = actual.envelope
-            envelope['observation'] = observation
-            self._retain_inputs(envelope, observation)
-            result = await self._persist(actual, row, phase, envelope)
+            try:
+                terminal = self._observation(actual.remote_task_id, observation)
+                envelope['observation'] = observation
+                self._retain_inputs(envelope, observation)
+            except ValueError as error:
+                raise MCPTaskObservationRefused(str(error)) from error
+            phase = 'SETTLED' if terminal else 'ATTACHED'
+            local['withheld'] = withheld
+            local['poll_not_before'] = None if terminal else poll_not_before
+            result = await self._persist(actual, row, phase, envelope, local=local)
         return result
 
     async def settle_initial(self, issuance: MCPTaskIssuance, *,

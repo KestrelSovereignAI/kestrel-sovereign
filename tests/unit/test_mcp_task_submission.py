@@ -10,22 +10,27 @@ from kestrel_sovereign.a2a.media import encode_inline_json
 from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
 from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.mcp_task_submission import (
-    MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskServiceOrigin,
+    MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskOAuthLocator, MCPTaskServiceOrigin,
     MCPTaskSubmission, decode_origin,
 )
 from kestrel_sovereign.tools.effect_invocation import current_service_operation_attribution
 from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
 
 
+LOCATOR = MCPTaskOAuthLocator('original-owner', 'original-connection', 'a' * 64, 'b' * 64)
+
+
 def test_original_arguments_contract_and_delivery_are_sealed_without_retained_aliases():
     arguments = {'private-answer': {'city': 'original-private-city'}}
     contract = b'{"tool":{"name":"original-private-tool"}}'
     delivery = MCPTaskDelivery('app', 'original-session', 'original-view')
-    submission = MCPTaskSubmission.seal(arguments=arguments, contract=contract, delivery=delivery)
+    submission = MCPTaskSubmission.seal(arguments=arguments, contract=contract, delivery=delivery,
+        authorization=LOCATOR)
     arguments['private-answer']['city'] = 'producer-replacement'
     submission.arguments['private-answer']['city'] = 'reader-replacement'
     assert submission.arguments == {'private-answer': {'city': 'original-private-city'}}
     assert submission.contract == contract and submission.delivery == delivery
+    assert submission.authorization == LOCATOR
     assert MCPTaskSubmission(submission.canonical_json) == submission
     assert 'private' not in repr(submission) and 'original-view' not in repr(delivery)
     with pytest.raises(FrozenInstanceError):
@@ -75,14 +80,14 @@ def test_delivery_requires_a_real_conversation_and_only_apps_identify_views(kind
 def test_invalid_submission_does_not_echo_private_arguments(arguments, contract):
     with pytest.raises(ValueError) as caught:
         MCPTaskSubmission.seal(arguments=arguments, contract=contract,
-            delivery=MCPTaskDelivery('internal'))
+            delivery=MCPTaskDelivery('internal'), authorization=LOCATOR)
     assert 'private-key' not in str(caught.value)
 
 
 @pytest.mark.parametrize('kind', ['mutable', 'text', 'none'])
 def test_submission_requires_immutable_bytes(kind):
     raw = MCPTaskSubmission.seal(arguments={}, contract=b'original',
-        delivery=MCPTaskDelivery('internal')).canonical_json
+        delivery=MCPTaskDelivery('internal'), authorization=LOCATOR).canonical_json
     value = {'mutable': bytearray(raw), 'text': raw.decode(), 'none': None}[kind]
     with pytest.raises(TypeError, match='immutable'):
         MCPTaskSubmission(value)
@@ -90,10 +95,12 @@ def test_submission_requires_immutable_bytes(kind):
 
 def test_direct_submission_bytes_require_the_exact_finite_canonical_shape():
     submission = MCPTaskSubmission.seal(arguments={}, contract=b'original',
-        delivery=MCPTaskDelivery('internal'))
+        delivery=MCPTaskDelivery('internal'), authorization=LOCATOR)
     value = json.loads(submission.canonical_json)
     malformed = [b'bad-private-json', b'\xff', submission.canonical_json + b' ',
         encode_inline_json({**value, 'extra': 'private-extra'}, sort_keys=True),
+        encode_inline_json({**value, 'authorization': {**value['authorization'], 'slot_id': 'raw-id'}}, sort_keys=True),
+        encode_inline_json({**value, 'authorization': {**value['authorization'], 'kind': 'other'}}, sort_keys=True),
         json.dumps({**value, 'arguments': {'private': float('nan')}}, sort_keys=True).encode()]
     for raw in malformed:
         with pytest.raises(ValueError, match='Invalid private MCP Task submission') as caught:

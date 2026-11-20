@@ -380,8 +380,14 @@ async def test_native_case_cleanup_joins_late_invocations_before_clearing_approv
             yield case
 
     owner = asyncio.create_task(driver(gated_factory, entrypoint))
+    started = asyncio.create_task(entered.wait())
     try:
-        await asyncio.wait_for(entered.wait(), 10)
+        # Boot and script signing share this test's overall timeout. If the
+        # owner exits first, surface its failure before waiting for cleanup.
+        done, _ = await asyncio.wait((started, owner), return_when=asyncio.FIRST_COMPLETED)
+        if started not in done:
+            await owner
+            pytest.fail("Native permission case exited before entering its invocation")
         await asyncio.wait_for(cleanup_started.wait(), 10)
         release.set()
         async with asyncio.timeout(30):
@@ -395,6 +401,9 @@ async def test_native_case_cleanup_joins_late_invocations_before_clearing_approv
         owned["case"].assert_effect_count(0)
     finally:
         release.set()
+        if not started.done():
+            started.cancel()
+        await asyncio.gather(started, return_exceptions=True)
         invocation = owned.get("invocation")
         if invocation is not None:
             if not invocation.done():

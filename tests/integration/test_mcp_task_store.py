@@ -14,7 +14,7 @@ from kestrel_sovereign.mcp_task_store import (
 )
 from kestrel_sovereign.security.key_rotation import RotationStatus
 from kestrel_sovereign.storage.db.interface import TransactionError
-from kestrel_sovereign.mcp_task_submission import MCPTaskInteractiveOrigin
+from kestrel_sovereign.mcp_task_submission import MCPTaskInteractiveOrigin, task_connection_id
 from tests.shared.mcp_task_custody import custody as custody, binding, claim, attach, lost_commit_ack, rotate_task_root, submission
 
 
@@ -47,6 +47,10 @@ async def test_retained_inventory_pages_authenticate_original_rows_with_bounded_
     byte_budget = sizes[0][0] + sizes[1][0]
     assert await store.retained_page(after=None, max_records=3, max_bytes=byte_budget) == tuple(records[:2])
     assert opened == [records[0].handle, records[1].handle]
+    opened.clear()
+    assert await store.retained_page(after=None, max_records=3, max_bytes=byte_budget,
+        budget_submission=True) == (records[0],)
+    assert opened == [records[0].handle]
     assert await store.retained_page(after=records[-1].handle, max_records=3, max_bytes=4096) == ()
 
     # The page must authenticate the row even if plaintext metadata suggests
@@ -87,14 +91,19 @@ async def test_reservation_and_exact_private_claim_survive_fresh_connections(cus
     ('agent_did', 'did:test:foreign'),
     ('origin', MCPTaskInteractiveOrigin('d' * 64, 'private-session')),
     ('origin', MCPTaskInteractiveOrigin('f' * 64, 'foreign')), ('operation_id', 'foreign'),
-    ('connection_id', 'd' * 64), ('authorization_id', 'd' * 64),
+    ('connection_id', 'foreign-connection'), ('authorization_id', 'd' * 64),
     ('tool_name', 'foreign'), ('contract_digest', 'd' * 64),
 ])
 async def test_identifiers_never_replace_original_binding_or_issuance(custody, field, value):
     store = custody.store
     reserved = await store.reserve(binding(), submission())
-    foreign = binding(**{field: value})
-    foreign_submission = submission(origin=foreign.origin)
+    if field == 'connection_id':
+        locator = replace(submission().authorization, connection_name=value)
+        foreign = binding(connection_id=task_connection_id(binding().agent_did, locator.owner, value))
+        foreign_submission = submission(authorization=locator)
+    else:
+        foreign = binding(**{field: value})
+        foreign_submission = submission(origin=foreign.origin)
     if field == 'contract_digest':
         foreign_submission = submission(origin=foreign.origin, contract=b'other-original-contract')
         foreign = replace(foreign, contract_digest=hashlib.sha256(foreign_submission.contract).hexdigest())

@@ -24,10 +24,14 @@ from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.security.hooks import reserved_session_id
 from kestrel_sovereign.mcp_input import MCPInputHost
 from kestrel_sovereign.mcp_input_store import MCPInputConflict
+from kestrel_sovereign.mcp_oauth import MCPOAuthHost
 from kestrel_sovereign.mcp_task_input import MCPTaskInputCustody
-from kestrel_sovereign.mcp_task_store import MCPTaskBinding, MCPTaskConflict, MCPTaskStore, task_routing_payload
+from kestrel_sovereign.mcp_task_store import (
+    MCPTaskBinding, MCPTaskConflict, MCPTaskStore, RECOVERABLE_OBSERVATION_BLOCKS, task_routing_payload,
+)
 from kestrel_sovereign.mcp_task_submission import (
-    MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskServiceOrigin, MCPTaskSubmission,
+    MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskOAuthLocator, MCPTaskServiceOrigin,
+    MCPTaskSubmission, task_connection_id,
 )
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied, require_raw_capability_disclosure
 from kestrel_sovereign.tools.effect_invocation import current_service_operation_attribution
@@ -40,6 +44,8 @@ class MCPTaskHostPolicy(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, frozen=True,
         allow_inf_nan=False, hide_input_in_errors=True)
     max_active: int = Field(default=64, gt=0, le=4096)
+    observations_per_tick: int = Field(default=2, gt=0, le=16)
+    min_observation_seconds: float = Field(default=1.0, gt=0, le=60.0)
     max_records: int = Field(default=4096, gt=0, le=65536)
     max_submission_bytes: int = Field(default=1_048_576, gt=0, le=16_777_216)
     max_native_claim_bytes: int = Field(default=1_048_576, gt=0, le=16_777_216)
@@ -206,31 +212,39 @@ class MCPTaskHost:
             else:
                 owner.hold.handle = actual.handle
                 self._unreconciled.discard(owner)
-                if actual.phase in {'SETTLED', 'NOT_SENT', 'INPUT_CLOSED'}:
+                if not actual.occupies_active_slot:
                     self._release(owner)
 
-    async def admit(self, binding, *, connection_name, authorization_id, contract, view_label=None):
+    async def admit(self, binding, *, authorization_lease, authorization_id, contract, view_label=None):
         frame = self._execution(binding)
         if frame in self._rounds:
             raise ResourceConflict('This original handler already owns its Task admission')
-        if (not isinstance(connection_name, str) or not connection_name or len(connection_name) > 1024
-                or type(contract) is not bytes):
+        if type(contract) is not bytes:
             raise ResourceConflict('Task admission requires its original connection and contract bytes')
+        oauth = next(iter(getattr(self.agent, '_mcp_oauth_hosts', ())), None)
+        if type(oauth) is not MCPOAuthHost or oauth.agent is not self.agent or oauth.feature is not self.feature:
+            raise ResourceConflict('Task admission requires its original OAuth host')
+        lease = oauth.attest_task_lease(authorization_lease)
+        connection_name = lease.connection_id
+        try:
+            locator = MCPTaskOAuthLocator(binding.owner, connection_name, lease.principal_id, lease.slot_id)
+        except ValueError as error:
+            raise ResourceConflict('Task admission requires its original OAuth attribution') from error
         origin = self.input_host.origin()
         attribution = self._attribution(origin)
-        connection_id = hashlib.sha256(encode_inline_json(
-            ['mcp-task-connection-v1', self._agent_id, binding.owner, connection_name])).hexdigest()
+        connection_id = task_connection_id(self._agent_id, locator.owner, connection_name)
         contract_digest = hashlib.sha256(contract).hexdigest()
         expected = MCPTaskBinding(self._agent_id, attribution, frame.claim.claim_id,
             connection_id, authorization_id, binding.name, contract_digest)
         self._headroom(expected)
         submission = MCPTaskSubmission.seal(arguments=json.loads(frame.arguments_json),
-            contract=contract, delivery=self._delivery(attribution, view_label))
+            contract=contract, delivery=self._delivery(attribution, view_label), authorization=locator)
         if len(submission.canonical_json) > self.policy.max_submission_bytes:
             raise ResourceConflict('Original Task submission exceeded its admission budget')
         await self._reconcile_reservations()
         self._execution(binding)
         origin.require_current()
+        lease.require_principal()
         reader = self.input_host._reader.get()
         record = reader.record if reader is not None else None
         issuance, original = None, expected
@@ -248,10 +262,12 @@ class MCPTaskHost:
                     or record.binding.connection_id != connection_name
                     or encode_inline_json(sealed.arguments, sort_keys=True) != frame.arguments_json
                     or sealed.contract != contract
+                    or sealed.authorization != locator
                     or len(actual.continuity['operations']) >= self.policy.max_continuations):
                 raise ResourceConflict('Original Task submission or continuation lifetime changed')
             self._execution(binding)
             origin.require_current()
+            lease.require_principal()
             owner = self._hold(binding, original)
             owner.hold.handle = actual.handle
         else:
@@ -276,28 +292,69 @@ class MCPTaskHost:
         try:
             self._execution(binding)
             origin.require_current()
-        except ResourceConflict:
+            lease.require_principal()
+        except (ResourceConflict, HostCapabilityAccessDenied):
             await result.refuse()
             raise
         return result
 
-    async def maintain(self):
-        async with self._maintenance_lock, require_durable_persistence_gate(self.agent).shared():
-            await self._maintain()
+    def next_observation_at(self, native):
+        hinted = native.get('pollIntervalMs')
+        seconds = hinted / 1000 if type(hinted) is int and hinted > 0 else 0
+        return self.input_host.authority.clock().timestamp() + max(self.policy.min_observation_seconds, seconds)
 
-    async def _maintain(self):
+    async def maintain(self, *, observe=False):
+        async with self._maintenance_lock, require_durable_persistence_gate(self.agent).shared():
+            due, watches = await self._maintain(observe=observe)
+        if watches:
+            from kestrel_sovereign.waits.reconciler import register_wait_watch
+
+            # The reconciler takes its own lifetime lock and may poll the
+            # provider under a persistence lease. Keep this acquisition
+            # outside the inventory lease to preserve lock ordering.
+            for handle, session_id in watches:
+                await register_wait_watch(self.agent, f'mcp:{handle}',
+                    origin_session_id=session_id, rearm=False)
+        return due
+
+    async def _maintain(self, *, observe=False):
         self.require_current()
         await self._reconcile_reservations()
         records = await self.store.retained_page(after=self._maintenance_after,
-            max_records=self.policy.maintenance_page_records, max_bytes=self.policy.maintenance_page_bytes)
+            max_records=self.policy.maintenance_page_records, max_bytes=self.policy.maintenance_page_bytes,
+            budget_submission=observe)
         self.require_current()
         if not records:
             self._maintenance_after = None
             self._maintenance_operations.clear()
-            return
+            return (), ()
+        due = []
+        if observe:
+            now = self.input_host.authority.clock().timestamp()
+            for index, actual in enumerate(records):
+                if actual.phase != 'ATTACHED':
+                    continue
+                local = actual.local
+                blocked = local['observation_block']
+                not_before = local['poll_not_before']
+                if ((blocked is None or blocked['reason'] in RECOVERABLE_OBSERVATION_BLOCKS)
+                        and (not_before is None or not_before <= now)):
+                    due.append(actual.handle)
+                    if len(due) == self.policy.observations_per_tick:
+                        # The next sweep starts after this prefix. A whole-page
+                        # advance would skip unserved Tasks on every cycle.
+                        records = records[:index + 1]
+                        break
         operations = self.store.inventory_operations(records, prior=self._maintenance_operations)
+        watches = []
         for actual in records:
-            if actual.phase in {'SETTLED', 'NOT_SENT', 'INPUT_CLOSED'}:
+            if (observe and actual.remote_task_id is not None
+                    and actual.binding.origin.session_id is not None):
+                delivery = (await self.store.open_submission(actual)).delivery
+                self.require_current()
+                if delivery.kind == 'chat':
+                    watches.append((actual.handle, delivery.session_id))
+            if not actual.occupies_active_slot:
                 # Lost ACKs may leave a retained owner after its real durable
                 # settlement. The normal publication lease is separate and is
                 # no longer in _owners, so maintenance cannot retire it early.
@@ -326,6 +383,7 @@ class MCPTaskHost:
                         self._release(owner)
         self._maintenance_operations.update(operations)
         self._maintenance_after = records[-1].handle
+        return tuple(due), tuple(watches)
 
     def withdraw(self):
         self._accepting = False
@@ -433,8 +491,9 @@ class MCPTaskRound:
 
     async def attach(self, native):
         native = self._native(native)
+        poll = self.host.next_observation_at(native)
         actual = await self._finish(lambda: self.host.store.attach_task(self.issuance,
-            remote_task_id=native.get('taskId'), envelope={'version': 1, 'native': native}),
+            remote_task_id=native.get('taskId'), envelope={'version': 1, 'native': native}, poll_not_before=poll),
             phase='ATTACHED', native=native)
         return actual.handle
 
@@ -567,6 +626,11 @@ class MCPTaskRound:
 
 class MCPTaskHostMixin:
     # Public capability advertisement is a later acceptance-gated change.
+    def create_mcp_task_wait_provider(self, feature):
+        from kestrel_sovereign.mcp_task_wait import MCPTaskWaitable
+
+        return MCPTaskWaitable(self, feature)
+
     def create_mcp_task_host(self, feature, *, input_host, configuration, is_current):
         if any(not host.retired for host in getattr(self, '_mcp_task_hosts', ())):
             raise ResourceConflict('Close the original MCP Task host before replacement')
