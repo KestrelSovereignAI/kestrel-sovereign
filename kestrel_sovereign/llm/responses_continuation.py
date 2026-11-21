@@ -91,11 +91,17 @@ class ResponsesAnchor:
 
     The tool loop replays a reply as an assistant message carrying its text
     and its tool calls. A reply with tool calls is found by its call ids,
-    which the provider minted; a reply without any by its text.
+    which the provider minted; a reply without any by its text. The message
+    found must still carry the reply as the caller received it: its
+    ``content``, and its tool calls, whose ids, names and arguments
+    (compared by value) ``calls_digest`` digests. A caller that kept the
+    calls but excluded or rewrote the text beside them, or rewrote a call,
+    removed something the reply's replay would restore.
     """
 
     content: str
     call_ids: Tuple[str, ...]
+    calls_digest: str
 
 
 @dataclass(frozen=True)
@@ -158,8 +164,9 @@ class RetiredSnapshot:
     """What the registry remembers of a snapshot it retired, and why.
 
     Enough to recognise a request that still continues the chain (its route,
-    model and anchors), and nothing of its items: no encrypted reasoning and
-    no message text beyond the anchors'.
+    model and anchors), and nothing of its items: no encrypted reasoning, no
+    message text beyond the anchors' and no tool-call arguments beyond their
+    digest.
     """
 
     route: str

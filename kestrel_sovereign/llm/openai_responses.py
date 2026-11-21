@@ -57,15 +57,25 @@ the chain's declarations to them). A continuation whose digest differs ends
 the chain.
 
 Pruning wins. A continuation must still carry, unchanged, every item its
-chain's requests built from the caller's messages. The one exception is the
-turn notices that close the chain's first request, system or developer
-messages directly after its last user message (an operator notice): the
-tool loop never carries those back, so the snapshot replays them in place. When the caller dropped or rewrote
-one, the tool loop pruned or excluded it and replaying the snapshot would
-restore it, so the chain ends at boundary ``prefix_pruned``; one that only
-inserted items ends at ``prefix_changed``. A continuation whose replay would
-exceed the context budget the tool loop pruned its own messages to ends at
-``budget_exceeded``.
+chain's requests built from the caller's messages, and every reply the chain
+absorbed as the caller received it: a reply's tool call ids find the
+assistant message replaying it, and that message must still hold the
+reply's text and each call's name and arguments, compared by value. When the
+caller dropped or rewrote any of it, text it excluded from a reply whose
+calls it kept included, the tool loop pruned or excluded it and replaying
+the snapshot would restore it, so the chain ends at boundary
+``prefix_pruned``; one that only inserted items ends at ``prefix_changed``.
+A continuation whose replay would exceed the context budget the tool loop
+pruned its own messages to ends at ``budget_exceeded``.
+
+The one exception is the turn notices that close the chain's first request,
+system or developer messages directly after its last user message (an
+operator notice): the tool loop never carries those back, so the snapshot
+replays them in place. The exception rests on role and position alone, so a
+caller cannot mark such a message removed: one it leaves out is replayed,
+and one it still carries but changed ends the chain. The core turn never
+removes one; its inline notice is never stored as a conversation row, so no
+exclusion can name it.
 
 A request that carries tool history no snapshot of the turn accounts for (no
 turn, another route or model, a provider that served a different model) is
@@ -634,12 +644,62 @@ def _call_ids(message: Mapping[str, Any]) -> Tuple[str, ...]:
     )
 
 
+def _calls_digest(calls: Sequence[Tuple[Any, Any, Any]]) -> Optional[str]:
+    """The digest of ``(id, name, arguments)`` tool calls, compared by value.
+
+    Arguments are compared as the JSON object they encode, so the tool loop's
+    re-encoding of the provider's argument text (a dict, keys in any order)
+    is the same call and a changed value is not. ``None`` when an argument
+    encodes no JSON object: such a call carries nothing a reply holds. That
+    includes missing and falsy arguments (``None``, ``""``, ``[]``, ``0``,
+    ``False``), which are not read as ``{}``: a reply whose call took no
+    arguments was replayed with ``{}``, and anything else in its place is a
+    rewrite.
+    """
+    canonical: List[Dict[str, Any]] = []
+    for call_id, name, arguments in calls:
+        try:
+            decoded = decode_tool_arguments(arguments)
+        except LLMProtocolError:
+            return None
+        canonical.append({"id": call_id, "name": name, "arguments": decoded})
+    text = json.dumps(canonical, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def _message_calls(message: Mapping[str, Any]) -> List[Tuple[Any, Any, Any]]:
+    calls: List[Tuple[Any, Any, Any]] = []
+    for call in message.get("tool_calls") or ():
+        if not isinstance(call, Mapping):
+            calls.append((None, None, None))
+            continue
+        function = call.get("function")
+        function = function if isinstance(function, Mapping) else {}
+        calls.append((call.get("id"), function.get("name"), function.get("arguments")))
+    return calls
+
+
 def _matches(message: Mapping[str, Any], anchor: ResponsesAnchor) -> bool:
     if message.get("role") != "assistant":
         return False
     if anchor.call_ids:
         return _call_ids(message) == anchor.call_ids
     return not message.get("tool_calls") and _text_of(message.get("content")) == anchor.content
+
+
+def _carries_reply(message: Mapping[str, Any], anchor: ResponsesAnchor) -> bool:
+    """Whether ``message``, found by ``anchor``, still holds the reply as the
+    caller received it: its text and every tool call, compared by value.
+
+    A tool call id only finds the message. A caller that kept a reply's calls
+    may still have excluded or rewritten the text beside them, or a call's
+    arguments, and replaying the reply would restore what it removed.
+    """
+    digest = _calls_digest(_message_calls(message))
+    return (
+        digest is not None and digest == anchor.calls_digest
+        and _text_of(message.get("content")) == anchor.content
+    )
 
 
 def _locate(
@@ -973,6 +1033,13 @@ def prepare_responses_request(
     if found is not None:
         parent, positions = found
         try:
+            if not all(
+                _carries_reply(messages[index], anchor)
+                for anchor, index in zip(parent.anchors, positions)
+            ):
+                # The caller kept a reply's tool calls but not all of the
+                # reply: replaying the snapshot would restore what it left out.
+                raise _Boundary(PREFIX_PRUNED)
             change = _prefix_change(parent, _carried_now(parent, messages, positions))
             if change is not None:
                 raise _Boundary(change)
@@ -1420,6 +1487,11 @@ class ResponsesEventState:
                 anchors=request.anchors + (ResponsesAnchor(
                     content=result.content or "",
                     call_ids=tuple(call.id for call in result.tool_calls or ()),
+                    # Calls that cannot be digested match no message, so a
+                    # reply holding them is never continued.
+                    calls_digest=_calls_digest([
+                        (call.id, call.name, call.arguments) for call in result.tool_calls or ()
+                    ]) or "",
                 ),),
                 carried=request.carried,
                 notices_from=request.notices_from,
