@@ -418,6 +418,45 @@ class MCPAppsHost:
                 return JSONResponse({"tools": [_native(tool) for tool in physical.view.list_tools()]})
             return respond(host, request, _Action.READ, build)
 
+        @router.get("/views/{view_id}/tasks/{handle}")
+        async def task_result(view_id: str, handle: str, request: Request):
+            host = original_host()
+            async def build(_context):
+                results = task_results(host)
+                reference = results.request_reference(request)
+                value = await results.app_result(host, handle, view_id, reference)
+                response = JSONResponse(value)
+                if len(response.body) > host._policy.max_message_bytes:
+                    raise ResourceConflict('MCP Task result exceeds the original App message budget')
+                return response
+            return respond(host, request, _Action.READ, build)
+
+        def task_results(host):
+            task_host = next(iter(getattr(host.agent, '_mcp_task_hosts', ())), None)
+            if task_host is None:
+                raise ResourceConflict('Original MCP Task host is unavailable')
+            return task_host.results
+
+        def task_mutation(view_id, handle, request, kind, model):
+            host = original_host()
+            async def build(_context, value):
+                results = task_results(host)
+                reference = results.request_reference(request)
+                return JSONResponse(await results.app_mutation(host, handle, view_id, reference, kind, value))
+            return respond(host, request, _Action.CALL, build, model)
+
+        @router.post("/views/{view_id}/tasks/{handle}/responses")
+        async def respond_to_task(view_id: str, handle: str, request: Request):
+            from kestrel_sovereign.mcp_task_results import _TaskInput
+
+            return task_mutation(view_id, handle, request, 'update', _TaskInput)
+
+        @router.post("/views/{view_id}/tasks/{handle}/cancel")
+        async def cancel_task(view_id: str, handle: str, request: Request):
+            from kestrel_sovereign.mcp_task_results import _TaskOperation
+
+            return task_mutation(view_id, handle, request, 'cancel', _TaskOperation)
+
         @router.post("/views/{view_id}/tools/call")
         async def call_tool(view_id: str, request: Request):
             host = original_host()
@@ -428,6 +467,10 @@ class MCPAppsHost:
                     result = await executor.invoke(physical.view, value.name,
                         value.arguments, operation_id=value.operation_id)
                 except ResourceConflict as error:
+                    task_pending = getattr(executor, 'task_pending', None)
+                    task = task_pending(error, physical.view) if callable(task_pending) else None
+                    if task is not None:
+                        return JSONResponse({'task': task}, status_code=202)
                     pending = executor.input_required(error, physical.view)
                     if pending is None:
                         raise

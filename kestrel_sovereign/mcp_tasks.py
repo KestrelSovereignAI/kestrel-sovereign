@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
+from datetime import datetime
 import hashlib
 import json
 from uuid import UUID
@@ -19,21 +20,27 @@ from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kestrel_sovereign.a2a.media import encode_inline_json
+from kestrel_sovereign.agent.parts import current_tool_publication_context
 from kestrel_sovereign.agent.tool_registry import _GovernedToolBinding, _ToolExecution
+from kestrel_sovereign.auth import caller_identity_digest, current_caller_context
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.security.hooks import reserved_session_id
 from kestrel_sovereign.mcp_input import MCPInputHost
 from kestrel_sovereign.mcp_input_store import MCPInputConflict
 from kestrel_sovereign.mcp_oauth import MCPOAuthHost
 from kestrel_sovereign.mcp_task_input import MCPTaskInputCustody
+from kestrel_sovereign.mcp_task_actions import MCPTaskActions
+from kestrel_sovereign.mcp_task_results import MCPTaskResults
 from kestrel_sovereign.mcp_task_store import (
-    MCPTaskBinding, MCPTaskConflict, MCPTaskStore, RECOVERABLE_OBSERVATION_BLOCKS, task_routing_payload,
+    MCPTaskBinding, MCPTaskConflict, MCPTaskRecord, MCPTaskStore, RECOVERABLE_OBSERVATION_BLOCKS,
+    task_routing_payload,
 )
 from kestrel_sovereign.mcp_task_submission import (
     MCPTaskDelivery, MCPTaskInteractiveOrigin, MCPTaskOAuthLocator, MCPTaskServiceOrigin,
     MCPTaskSubmission, task_connection_id,
 )
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied, require_raw_capability_disclosure
+from kestrel_sovereign.security.request_auth import current_request_authentication
 from kestrel_sovereign.tools.effect_invocation import current_service_operation_attribution
 from kestrel_sovereign.tools.effect_journal import current_tool_effect_execution, require_persistent_tool_effects
 from kestrel_sovereign.storage.db.interface import DatabaseError
@@ -97,6 +104,8 @@ class MCPTaskHost:
             max_records=self.policy.max_records, max_payload_bytes=self.policy.max_payload_bytes,
             max_submission_bytes=self.policy.max_submission_bytes)
         self.joint = None
+        self.actions = MCPTaskActions(self)
+        self.results = MCPTaskResults(self)
         self._rounds = WeakKeyDictionary()
         self._owners = set()
         self._unreconciled = set()
@@ -239,6 +248,7 @@ class MCPTaskHost:
         self._headroom(expected)
         submission = MCPTaskSubmission.seal(arguments=json.loads(frame.arguments_json),
             contract=contract, delivery=self._delivery(attribution, view_label), authorization=locator)
+        delivery = submission.delivery
         if len(submission.canonical_json) > self.policy.max_submission_bytes:
             raise ResourceConflict('Original Task submission exceeded its admission budget')
         await self._reconcile_reservations()
@@ -256,6 +266,7 @@ class MCPTaskHost:
             if actual is None:
                 raise ResourceConflict('Original Input Task custody is unavailable')
             sealed = await self.store.open_submission(actual)
+            delivery = sealed.delivery
             original = actual.binding
             self.joint._waiting_link(actual, record)
             if (replace(expected, operation_id=original.operation_id) != original
@@ -287,7 +298,7 @@ class MCPTaskHost:
                 raise ResourceConflict('Original Task issuance cannot be recovered or replayed')
             issuance = reservation.issuance
         result = MCPTaskRound(self, binding, origin, connection_name, original,
-            owner, issuance, record)
+            owner, issuance, record, delivery)
         self._rounds[frame] = result
         try:
             self._execution(binding)
@@ -302,6 +313,27 @@ class MCPTaskHost:
         hinted = native.get('pollIntervalMs')
         seconds = hinted / 1000 if type(hinted) is int and hinted > 0 else 0
         return self.input_host.authority.clock().timestamp() + max(self.policy.min_observation_seconds, seconds)
+
+    @staticmethod
+    def observation_expired(record: MCPTaskRecord, now: float) -> bool:
+        envelope = record.envelope
+        native = envelope.get('observation') or envelope['native']
+        ttl = native.get('ttlMs')
+        if type(ttl) is not int or ttl < 0:
+            return False
+        try:
+            created = datetime.fromisoformat(native['createdAt'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if created.utcoffset() is None:
+            return False
+        return now >= created.timestamp() + ttl / 1000
+
+    def observation_due(self, record: MCPTaskRecord, now: float) -> bool:
+        not_before = record.local['poll_not_before']
+        # A retention deadline can wake local reconciliation before the next
+        # poll. The scheduled lease handles expiry before any network I/O.
+        return not_before is None or not_before <= now or self.observation_expired(record, now)
 
     async def maintain(self, *, observe=False):
         async with self._maintenance_lock, require_durable_persistence_gate(self.agent).shared():
@@ -334,11 +366,9 @@ class MCPTaskHost:
             for index, actual in enumerate(records):
                 if actual.phase != 'ATTACHED':
                     continue
-                local = actual.local
-                blocked = local['observation_block']
-                not_before = local['poll_not_before']
+                blocked = actual.local['observation_block']
                 if ((blocked is None or blocked['reason'] in RECOVERABLE_OBSERVATION_BLOCKS)
-                        and (not_before is None or not_before <= now)):
+                        and self.observation_due(actual, now)):
                     due.append(actual.handle)
                     if len(due) == self.policy.observations_per_tick:
                         # The next sweep starts after this prefix. A whole-page
@@ -399,10 +429,12 @@ class MCPTaskHost:
 
 
 class MCPTaskRound:
-    def __init__(self, host, binding, origin, connection_name, original, owner, issuance, predecessor):
+    def __init__(self, host, binding, origin, connection_name, original, owner, issuance, predecessor, delivery):
         self.host, self.binding, self.origin = host, binding, origin
         self.connection_name, self.original, self.owner = connection_name, original, owner
         self.issuance, self.predecessor = issuance, predecessor
+        self._delivery = delivery
+        self._attachment = None
         self._wire, self._closed = False, False
         self._suspended = None
         self.response_claim = None
@@ -490,12 +522,41 @@ class MCPTaskRound:
             envelope={'version': 1, 'native': native}), phase='SETTLED', native=native)
 
     async def attach(self, native):
+        witness = self._require().witness
         native = self._native(native)
         poll = self.host.next_observation_at(native)
         actual = await self._finish(lambda: self.host.store.attach_task(self.issuance,
             remote_task_id=native.get('taskId'), envelope={'version': 1, 'native': native}, poll_not_before=poll),
             phase='ATTACHED', native=native)
+        self._attachment = actual, witness
         return actual.handle
+
+    def publish_result(self, context):
+        """Issue a private reference only during approved native delivery."""
+        attachment, self._attachment = self._attachment, None
+        if attachment is None:
+            return None
+        record, witness = attachment
+        delivery = self._delivery
+        origin = record.binding.origin
+        if type(origin) is not MCPTaskInteractiveOrigin or not witness.audit_recorded:
+            return None
+        self.host.require_current()
+        self.binding.require_current()
+        authentication = current_request_authentication()
+        caller = current_caller_context()
+        if (authentication is None or caller is not authentication.caller
+                or caller_identity_digest(caller) != origin.principal_digest):
+            return None
+        authentication.require_current()
+        if delivery.kind == 'chat':
+            if context is None or context is not current_tool_publication_context(self.host.agent, delivery.session_id):
+                return None
+        elif delivery.kind == 'app':
+            self.host.results.require_app_delivery(delivery)
+        else:
+            return None
+        return {'handle': record.handle, 'reference': self.host.results.reference(record, delivery)}
 
     async def _finish(self, write, *, phase, native):
         with self.owner.writing():
@@ -630,6 +691,16 @@ class MCPTaskHostMixin:
         from kestrel_sovereign.mcp_task_wait import MCPTaskWaitable
 
         return MCPTaskWaitable(self, feature)
+
+    def create_mcp_task_result_router(self, feature, *, resolve_host):
+        def original():
+            host = resolve_host()
+            if (type(host) is MCPTaskHost and host.agent is self and host.feature is feature
+                    and any(candidate is host for candidate in getattr(self, '_mcp_task_hosts', ()))):
+                return host
+            return None
+
+        return MCPTaskResults.router_for(original)
 
     def create_mcp_task_host(self, feature, *, input_host, configuration, is_current):
         if any(not host.retired for host in getattr(self, '_mcp_task_hosts', ())):
