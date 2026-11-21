@@ -367,6 +367,13 @@ jobs:
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
       - name: Install the locked minimum-version host
         run: uv sync --python 3.11 --locked
+      - name: Verify a genuine historical SPHINCS+ signature
+        shell: bash
+        run: |
+          uv venv --python 3.11 "$RUNNER_TEMP/legacy-sphincs"
+          export KESTREL_HISTORICAL_SPHINCS_PYTHON="$RUNNER_TEMP/legacy-sphincs/bin/python"
+          uv pip install --python "$KESTREL_HISTORICAL_SPHINCS_PYTHON" --only-binary :all: --require-hashes -r scripts/verification/legacy-sphincs/requirements.txt
+          uv run --python 3.11 --no-sync python -m pytest tests/unit/test_historical_archival.py -q
       - name: Check native minimum-version custody
         run: >-
           uv run --python 3.11 --no-sync python -m pytest
