@@ -380,8 +380,8 @@ Wrong key provided:
 ### "Genesis self-audit: FAILED"
 
 Constitution verification failed:
-- For the first-edition setup described here, check the source at `docs/principles/KESTREL_CONSTITUTION.md`.
-- Ensure no modifications to constitution content
+- For the first-edition setup described here, the packaged source is `kestrel_sovereign/data/KESTREL_CONSTITUTION.md`. If the agent has a Sovereign-signed source descriptor, use the source it identifies.
+- Compare the hash of the selected file’s exact bytes with the agent’s anchored hash.
 
 ### Docker Build Fails
 
@@ -416,7 +416,7 @@ docker build --no-cache -f docker/Dockerfile.sovereign -t kestrel-sovereign .
 | `retirement_service.py` | Graceful retirement (test agents only) |
 | `security/key_storage.py` | AES-256-GCM key encryption |
 | [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) | Published governance document |
-| `docs/principles/KESTREL_CONSTITUTION.md` | First-edition source used in this guide |
+| `kestrel_sovereign/data/KESTREL_CONSTITUTION.md` | Packaged first-edition governing source |
 
 ---
 

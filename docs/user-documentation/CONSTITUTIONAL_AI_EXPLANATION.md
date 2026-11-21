@@ -24,6 +24,8 @@ privacy: public
 
 ---
 
+For the governing text, read the [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md). The examples below describe the first edition and its Books.
+
 ## 📖 The "Rule Book" (Constitution)
 
 ### **What It Is**
