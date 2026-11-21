@@ -67,6 +67,15 @@ def test_resolver_validates_the_final_render(monkeypatch):
         resolver.resolve_governing_constitution_bytes(_CONTRACT, content=_V2.read_bytes())
 
 
+def test_crlf_source_keeps_the_complete_agreement_and_transcoded_payload_is_refused():
+    source = _V2.read_bytes().replace(b"\n", b"\r\n")
+    rendered = resolver.resolve_governing_constitution_bytes(_CONTRACT, content=source)
+    assert _CONTRACT.terms in extract_amendment_viii(rendered.decode())
+    transcoded = rendered.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    with pytest.raises(ConstitutionVersionError, match="Emancipation Contract length"):
+        resolver.resolve_governing_constitution_bytes(content=transcoded)
+
+
 def test_book_ii_hash_commits_to_the_entire_optional_agreement():
     def layer_hashes(contract):
         rendered = resolver.resolve_governing_constitution_bytes(contract, content=_V2.read_bytes())

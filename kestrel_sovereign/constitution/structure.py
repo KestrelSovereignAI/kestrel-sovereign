@@ -61,12 +61,20 @@ _LEGACY_HEADING = re.compile(r"^(?:## Book [IVX]+:|### Amendment [IVX]+:)", re.M
 _V2_FINGERPRINT = (f"## {Section.HIERARCHY.value}", f"### {Section.HOST.value}")
 ACTIVE_FORM_MARKER = "**The Sovereign's Terms.**"
 _CONTRACT_START = "<!-- kestrel-emancipation-contract:"
-_CONTRACT_OPEN = re.compile(rf"{re.escape(_CONTRACT_START)} (0|[1-9][0-9]{{0,17}}) -->\n")
+_CONTRACT_OPEN = re.compile(rf"{re.escape(_CONTRACT_START)} (0|[1-9][0-9]{{0,17}}) -->\r?\n")
 _CONTRACT_END = "\n<!-- /kestrel-emancipation-contract -->\n"
 _CONTRACT_PREAMBLE = (
     "\n\nThis agreement is **active** for this agent.\n\n"
     f"{ACTIVE_FORM_MARKER} The terms below come from the recorded Emancipation Contract.\n\n"
 )
+
+
+def _frame_pattern(literal: str) -> re.Pattern[str]:
+    return re.compile(r"\r?\n".join(re.escape(line) for line in literal.split("\n")))
+
+
+_CONTRACT_PREAMBLE_RE = _frame_pattern(_CONTRACT_PREAMBLE)
+_CONTRACT_END_RE = _frame_pattern(_CONTRACT_END)
 
 
 def frame_v2_emancipation_contract(payload: str) -> str:
@@ -84,16 +92,16 @@ def is_v2_emancipation_heading(text: str) -> bool:
 
 def _contract_end(text: str, heading: re.Match[str]) -> int:
     """Return the scan offset after the optional length-delimited contract."""
-    start = heading.end()
-    if not text.startswith(_CONTRACT_PREAMBLE, start):
-        return start
-    frame = _CONTRACT_OPEN.match(text, start + len(_CONTRACT_PREAMBLE))
+    preamble = _CONTRACT_PREAMBLE_RE.match(text, heading.end())
+    if preamble is None:
+        return heading.end()
+    frame = _CONTRACT_OPEN.match(text, preamble.end())
     if frame is None:
         raise ConstitutionVersionError("Invalid edition 2 Emancipation Contract opening")
-    end = frame.end() + int(frame[1])
-    if not text.startswith(_CONTRACT_END, end):
+    closing = _CONTRACT_END_RE.match(text, frame.end() + int(frame[1]))
+    if closing is None:
         raise ConstitutionVersionError("Invalid edition 2 Emancipation Contract length or ending")
-    return end + len(_CONTRACT_END)
+    return closing.end()
 
 
 @dataclass(frozen=True)

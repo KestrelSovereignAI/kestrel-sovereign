@@ -551,7 +551,7 @@ def _amendment_viii_bounds(constitution_text: str) -> Optional[tuple[int, int]]:
 
 
 def extract_amendment_viii(constitution_text: str) -> Optional[str]:
-    """Return the Amendment VIII section of ``constitution_text``, stripped.
+    """Extract the emancipation section, preserving whitespace in edition 2.
 
     None when the text carries no Amendment VIII heading. Shared by
     :func:`apply_emancipation` and by the reanchor guard so "which bytes are

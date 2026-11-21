@@ -309,7 +309,7 @@ class ConstitutionFeature(Feature):
         for section, body in bodies.items():
             self._named_clauses[section.value.lower()] = body
 
-        introduction = text[:spans[Section.HIERARCHY].start]
+        introduction = text[:min(span.start for span in spans.values())]
         heading = re.search(r"(?m)^# ", introduction)
         preamble = introduction[heading.start():] if heading else introduction
         self._record_frame("Preamble", preamble)
