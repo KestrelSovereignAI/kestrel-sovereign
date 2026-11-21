@@ -8,10 +8,10 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.constitution.grants import resolve_amendment_ix_grants
 from kestrel_sovereign.constitution.hierarchy import DANGEROUS_CAPABILITIES, LAYER_MARKERS
 from kestrel_sovereign.constitution.structure import (
-    LAYER_SECTIONS,
     ConstitutionVersionError,
     Section,
     constitution_version,
+    v2_layer_text,
     v2_sections,
 )
 from kestrel_sovereign.features.base import Feature, tool
@@ -36,12 +36,12 @@ _INT_TO_ROMAN = {value: key for key, value in _ROMAN_TO_INT.items()}
 # A single named clause can consolidate several old addresses. Lookups
 # return the actual section from the selected text, with its own heading.
 _V2_AMENDMENT_ALIASES = {
-    1: (Section.HIERARCHY, "Sovereignty"),
+    1: (None, "Sovereignty"),
     2: (Section.PRIVACY, "Data Sanctity"),
     3: (Section.HISTORY, "Verifiable History"),
     4: (Section.EXIT, "Freedom of Mind"),
     5: (Section.EXIT, "Right of Exit"),
-    6: (Section.PRIVACY, "The Third Law"),
+    6: (Section.BUILDERS, "The Third Law"),
     7: (Section.BUILDERS, "The Principle of Compounding"),
     8: (Section.EMANCIPATION, "Emancipation"),
     9: (Section.HOST, "Capability Boundaries"),
@@ -305,22 +305,28 @@ class ConstitutionFeature(Feature):
 
     def _parse_v2_structure(self, text: str) -> None:
         spans = v2_sections(text)
-        bodies = {section: span.extract(text).strip() for section, span in spans.items()}
+        bodies = {section: span.extract(text) for section, span in spans.items()}
         for section, body in bodies.items():
             self._named_clauses[section.value.lower()] = body
 
+        introduction = text[:spans[Section.HIERARCHY].start]
+        heading = re.search(r"(?m)^# ", introduction)
+        preamble = introduction[heading.start():] if heading else introduction
+        self._record_frame("Preamble", preamble)
+
         for layer, marker in LAYER_MARKERS.items():
-            section = LAYER_SECTIONS[layer.value]
+            body = v2_layer_text(layer.value, text, spans)
             roman = _INT_TO_ROMAN[layer.value]
-            self._record(self.books, "Book", roman, bodies[section])
+            self._record(self.books, "Book", roman, body)
             legacy_title = marker.partition(":")[2].strip()
-            self._named_clauses[f"book {roman}".lower()] = bodies[section]
-            self._named_clauses[legacy_title.lower()] = bodies[section]
+            self._named_clauses[f"book {roman}".lower()] = body
+            self._named_clauses[legacy_title.lower()] = body
         for number, (section, legacy_title) in _V2_AMENDMENT_ALIASES.items():
+            body = preamble if section is None else bodies[section]
             roman = _INT_TO_ROMAN[number]
-            self._record(self.amendments, "Amendment", roman, bodies[section])
-            self._named_clauses[f"amendment {roman}".lower()] = bodies[section]
-            self._named_clauses[legacy_title.lower()] = bodies[section]
+            self._record(self.amendments, "Amendment", roman, body)
+            self._named_clauses[f"amendment {roman}".lower()] = body
+            self._named_clauses[legacy_title.lower()] = body
         for number, (section, legacy_title) in _V2_CHAPTER_ALIASES.items():
             self.chapters[f"I.{number}"] = bodies[section]
             self._named_clauses[legacy_title.lower()] = bodies[section]
@@ -329,9 +335,6 @@ class ConstitutionFeature(Feature):
             self._named_clauses[legacy_title.lower()] = bodies[section]
         self._record_frame("Amendment Process", bodies[Section.CHANGE])
         self._named_clauses["amendment process"] = bodies[Section.CHANGE]
-        introduction = text[:spans[Section.HIERARCHY].start]
-        if heading := re.search(r"(?m)^# ", introduction):
-            self._record_frame("Preamble", introduction[heading.start():].strip())
 
     def _record_frame(self, title: str, body: str) -> None:
         """Key an unnumbered top-level section by the names people type.

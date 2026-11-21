@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from .emancipation import EmancipationContract, apply_emancipation
-from .structure import constitution_version, v2_sections
+from .structure import ConstitutionVersionError, constitution_version, v2_sections
 from .source_descriptor import (
     SOURCE_KIND_PACKAGE,
     ConstitutionSourceError,
@@ -250,11 +250,14 @@ def resolve_governing_constitution_bytes(
                 f"{source.content_sha256[:16]}…: the {source.kind} source "
                 f"changed after the descriptor was signed."
             )
-    if contract is not None and contract.enabled:
-        return apply_emancipation(content.decode("utf-8"), contract).encode("utf-8")
-    # Validate versioned source structure even for dormant agents, before
-    # the bytes can be signed or audited as interpretable v2 text.
     text = content.decode("utf-8", errors="surrogateescape")
-    if constitution_version(text) == 2:
+    edition = constitution_version(text)
+    if contract is not None and contract.enabled:
+        text = apply_emancipation(content.decode("utf-8"), contract)
+        content = text.encode("utf-8")
+    # Validate the exact v2 document whose bytes can be signed or audited.
+    if edition == 2:
+        if constitution_version(text) != edition:
+            raise ConstitutionVersionError("Rendering changed the Constitution edition")
         v2_sections(content.decode("utf-8"))
     return content

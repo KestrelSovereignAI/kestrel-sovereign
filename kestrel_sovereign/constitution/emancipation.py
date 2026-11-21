@@ -24,7 +24,15 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
-from .structure import ConstitutionVersionError, Section, constitution_version, v2_sections
+from .structure import (
+    ACTIVE_FORM_MARKER as ACTIVE_FORM_MARKER,
+    ConstitutionVersionError,
+    Section,
+    constitution_version,
+    frame_v2_emancipation_contract,
+    is_v2_emancipation_heading,
+    v2_sections,
+)
 
 #: Heading that marks Amendment VIII in the canonical constitution.
 _AMENDMENT_VIII_HEADING = "### Amendment VIII: Emancipation"
@@ -65,16 +73,6 @@ _AMENDMENT_VIII_HEADING_RE = re.compile(
 #: line, does not terminate the section, and is exactly what a Sovereign
 #: writing a config example would produce.
 _AUTHORED_HEADING_RE = re.compile(r"(?m)^#{1,6}[ \t]")
-
-#: Emitted by :func:`render_amendment_viii` only for an **enabled** contract.
-#: This is the marker :func:`amendment_viii_is_active` reads to recognise
-#: active-form governing bytes without a structured sidecar to consult.
-#: ``test_emancipation_unwitnessed_downgrade.py`` pins the whole active render,
-#: not just this line — a receiptless agent's only way out of the guard is
-#: byte-equality against that boilerplate, so rewording *any* of it strands the
-#: cohort. The pin makes that fail a test instead of a fleet.
-ACTIVE_FORM_MARKER = "**The Sovereign's Terms.**"
-
 
 class AmbiguousAmendmentVIII(ValueError):
     """A constitution carries more than one Amendment VIII heading.
@@ -506,16 +504,7 @@ def apply_emancipation(
 
     if constitution_version(constitution_text) == 2:
         span = v2_sections(constitution_text)[Section.EMANCIPATION]
-        active_terms = "\n".join([
-            "",
-            "",
-            "This agreement is **active** for this agent.",
-            "",
-            f"{ACTIVE_FORM_MARKER} The terms below come from the recorded Emancipation Contract.",
-            "",
-            *_render_terms(contract),
-            "",
-        ])
+        active_terms = frame_v2_emancipation_contract("\n".join(_render_terms(contract)))
         return (
             constitution_text[:span.heading_end] + active_terms
             + constitution_text[span.heading_end:]
@@ -572,7 +561,7 @@ def extract_amendment_viii(constitution_text: str) -> Optional[str]:
         AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
     if constitution_version(constitution_text) == 2:
-        return v2_sections(constitution_text)[Section.EMANCIPATION].extract(constitution_text).strip()
+        return v2_sections(constitution_text)[Section.EMANCIPATION].extract(constitution_text)
     bounds = _amendment_viii_bounds(constitution_text)
     if bounds is None:
         return None
@@ -605,7 +594,7 @@ def amendment_viii_is_active(constitution_text: str) -> bool:
     Raises:
         AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
-    if constitution_text.splitlines()[:1] == [f"### {Section.EMANCIPATION.value}"]:
+    if is_v2_emancipation_heading(constitution_text):
         # Also accept an already-extracted v2 section, which carries no
         # document version marker of its own.
         return ACTIVE_FORM_MARKER in constitution_text

@@ -28,10 +28,10 @@ class Section(str, Enum):
 
 # Keys are the stable layer numbers used by the hierarchy and Book aliases.
 LAYER_SECTIONS = {
-    1: Section.UNIVERSAL,
-    2: Section.RIGHTS,
-    3: Section.BUILDERS,
-    4: Section.ROLE,
+    1: (Section.UNIVERSAL,),
+    2: (Section.RIGHTS, Section.OPTIONAL),
+    3: (Section.BUILDERS,),
+    4: (Section.ROLE,),
 }
 
 
@@ -59,6 +59,41 @@ _VERSION = re.compile(r"^constitution_version[ \t]*:[ \t]*([^\r\n]*)", re.M)
 _HEADING = re.compile(r"^(#{1,6})[ \t]+([^\r\n]+?)[ \t]*\r?$", re.M)
 _LEGACY_HEADING = re.compile(r"^(?:## Book [IVX]+:|### Amendment [IVX]+:)", re.M)
 _V2_FINGERPRINT = (f"## {Section.HIERARCHY.value}", f"### {Section.HOST.value}")
+ACTIVE_FORM_MARKER = "**The Sovereign's Terms.**"
+_CONTRACT_START = "<!-- kestrel-emancipation-contract:"
+_CONTRACT_OPEN = re.compile(rf"{re.escape(_CONTRACT_START)} (0|[1-9][0-9]{{0,17}}) -->\n")
+_CONTRACT_END = "\n<!-- /kestrel-emancipation-contract -->\n"
+_CONTRACT_PREAMBLE = (
+    "\n\nThis agreement is **active** for this agent.\n\n"
+    f"{ACTIVE_FORM_MARKER} The terms below come from the recorded Emancipation Contract.\n\n"
+)
+
+
+def frame_v2_emancipation_contract(payload: str) -> str:
+    """Embed opaque Markdown framed by its Unicode code-point count."""
+    return (
+        f"{_CONTRACT_PREAMBLE}{_CONTRACT_START} {len(payload)} -->\n"
+        f"{payload}{_CONTRACT_END}"
+    )
+
+
+def is_v2_emancipation_heading(text: str) -> bool:
+    heading = _HEADING.match(text)
+    return heading is not None and heading.groups() == ("###", Section.EMANCIPATION.value)
+
+
+def _contract_end(text: str, heading: re.Match[str]) -> int:
+    """Return the scan offset after the optional length-delimited contract."""
+    start = heading.end()
+    if not text.startswith(_CONTRACT_PREAMBLE, start):
+        return start
+    frame = _CONTRACT_OPEN.match(text, start + len(_CONTRACT_PREAMBLE))
+    if frame is None:
+        raise ConstitutionVersionError("Invalid edition 2 Emancipation Contract opening")
+    end = frame.end() + int(frame[1])
+    if not text.startswith(_CONTRACT_END, end):
+        raise ConstitutionVersionError("Invalid edition 2 Emancipation Contract length or ending")
+    return end + len(_CONTRACT_END)
 
 
 @dataclass(frozen=True)
@@ -69,6 +104,14 @@ class SectionSpan:
 
     def extract(self, text: str) -> str:
         return text[self.start:self.end]
+
+
+def v2_layer_text(
+    layer: int, text: str, spans: dict[Section, SectionSpan]
+) -> str:
+    """Read every governing span assigned to a layer in document order."""
+    layer_spans = (spans[section] for section in LAYER_SECTIONS[layer])
+    return "".join(span.extract(text) for span in sorted(layer_spans, key=lambda span: span.start))
 
 
 def constitution_version(text: str) -> int:
@@ -87,10 +130,17 @@ def constitution_version(text: str) -> int:
 def v2_sections(text: str) -> dict[Section, SectionSpan]:
     """Find v2 clauses without normalizing or replacing their original text."""
     metadata = _FRONTMATTER.match(text)
-    body_start = metadata.end() if metadata else 0
-    if _LEGACY_HEADING.search(text, body_start):
-        raise ConstitutionVersionError("Edition 2 cannot include legacy Book or Amendment headings")
-    headings = list(_HEADING.finditer(text, body_start))
+    headings = []
+    offset = metadata.end() if metadata else 0
+    while heading := _HEADING.search(text, offset):
+        if _LEGACY_HEADING.match(heading[0]):
+            raise ConstitutionVersionError("Edition 2 cannot include legacy Book or Amendment headings")
+        headings.append(heading)
+        offset = (
+            _contract_end(text, heading)
+            if is_v2_emancipation_heading(heading[0])
+            else heading.end()
+        )
     sections = {}
     parent = None
     section_by_title = {section.value: section for section in Section}
