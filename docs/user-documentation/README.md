@@ -23,7 +23,8 @@ End-user guides and non-technical explanations for Kestrel concepts.
 
 | Document | Description |
 |----------|-------------|
-| [CONSTITUTIONAL_AI_EXPLANATION.md](CONSTITUTIONAL_AI_EXPLANATION.md) | Non-technical explanation of Kestrel's AI governance system |
+| [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) | Published governing text for readers and agents |
+| [Constitutional AI explained](CONSTITUTIONAL_AI_EXPLANATION.md) | Historical introduction to governance under the first edition |
 | [EDUCATION_IMPLEMENTATION_ROADMAP.md](EDUCATION_IMPLEMENTATION_ROADMAP.md) | 6-month implementation roadmap for user education |
 | [EMMA_INCEPTION_GUIDE.md](EMMA_INCEPTION_GUIDE.md) | Guide for creating Emma, the first permanent Kestrel agent |
 | [EXCEL_IMPORT_GUIDE.md](EXCEL_IMPORT_GUIDE.md) | How to import GTM spreadsheet data into Excel |

@@ -5143,7 +5143,8 @@
     },
     {
       "existing_code_refs": [
-        "kestrel_sovereign/cli_agent_docker.py"
+        "kestrel_sovereign/cli_agent_docker.py",
+        "kestrel_sovereign/data/KESTREL_CONSTITUTION.md"
       ],
       "findings": [],
       "missing_code_refs": [],
