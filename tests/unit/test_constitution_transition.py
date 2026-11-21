@@ -76,11 +76,25 @@ def test_unsigned_extension_leaves_legacy_canonical_bytes_identical():
     assert canonical_amendment_bytes(artifact) != canonical
 
 
+def _seed_legacy_custody(directory, keypair):
+    from kestrel_sovereign.identity.signing import get_key_id
+
+    did = _did(keypair)
+    document = did_document_from_legacy_public_key(did, keypair.public_key)
+    key_id = get_key_id(did)
+    (directory / f"{key_id}.json").write_text(json.dumps(document))
+    SecureKeyStorage(directory, master_key="synthetic-genesis-custody").save_private_key(
+        keypair.private_key, key_id,
+    )
+    return document
+
+
 @pytest.fixture
 def declaration(tmp_path):
     genesis_key = _SUITE.generate_keypair()
     sovereign = _SUITE.generate_keypair()
     genesis_did = _did(genesis_key)
+    _seed_legacy_custody(tmp_path, genesis_key)
     sovereign_did = _did(sovereign)
     root = did_document_from_legacy_public_key(sovereign_did, sovereign.public_key)
     intent = {
@@ -153,8 +167,12 @@ def test_same_hash_repair_and_v2_reanchor_keep_existing_authority(declaration):
         artifact={"publisher_release": _publisher()}, **(inputs | {"prior_hash": inputs["new_hash"], "prior_text": None}),
     )
     prior = _V2 + "\nPrior edition 2 release notes.\n"
+    prior_inputs = inputs | {"prior_hash": _hash(prior), "prior_text": prior}
+    with pytest.raises(AmendmentArtifactError, match="publisher-backed governing anchor"):
+        verify_transition_adoption(artifact={"publisher_release": _publisher()}, **prior_inputs)
     verify_transition_adoption(
-        artifact={"publisher_release": _publisher()}, **(inputs | {"prior_hash": _hash(prior), "prior_text": prior}),
+        artifact={"publisher_release": _publisher()}, **prior_inputs,
+        verified_prior_anchor=(inputs["target_did"], _hash(prior)),
     )
 
 
@@ -165,6 +183,7 @@ def proof_declaration(tmp_path):
     sovereign = _SUITE.generate_keypair()
     root = did_document_from_legacy_public_key(_did(sovereign), sovereign.public_key)
     target = _did(genesis)
+    _seed_legacy_custody(tmp_path, genesis)
     return genesis, sovereign, {
         "target_did": target,
         "admission_at": "2026-11-20T00:00:00+00:00",
@@ -534,3 +553,55 @@ def test_signed_adoption_requires_the_actual_order_of_events(declaration, misord
     )
     with pytest.raises(AmendmentArtifactError, match="predates|postdates"):
         verify_transition_adoption(artifact=artifact, **inputs)
+
+
+@pytest.mark.parametrize("indicator", [None, "archival-sidecar", "active-successor", "missing-legacy"])
+def test_direct_genesis_refuses_incomplete_or_conflicting_native_custody(proof_declaration, indicator):
+    genesis, _sovereign, intent, inputs = proof_declaration
+    directory = inputs["identity_directory"]
+    target = inputs["target_did"]
+    kwargs = {}
+    if indicator == "archival-sidecar":
+        (directory / "rotation_archival_slhdsa_pub.bytes.enc").touch()
+    elif indicator == "active-successor":
+        kwargs["active_signing_did"] = "did:web:agents.test.example:successor"
+    elif indicator == "missing-legacy":
+        next(directory.glob("kestrel_*.key.enc")).unlink()
+    proof = build_transition(intent, genesis_private_key=genesis.private_key)["genesis_proof"]
+    args = (target, intent, proof, inputs["trusted_did_document"], directory)
+    if indicator is None:
+        assert verify_live_genesis_proof(*args) == {}
+    else:
+        with pytest.raises(AmendmentArtifactError, match="custody|public succession"):
+            verify_live_genesis_proof(*args, **kwargs)
+
+
+def test_directoryless_hosted_adoption_uses_only_independent_public_custody(declaration):
+    genesis, sovereign, intent, inputs = declaration
+    directory = inputs.pop("identity_directory")
+    target = inputs["target_did"]
+    path = directory / "operator-public-custody.json"
+    custody = {
+        "version": 1, "target_did": target, "state": "legacy-only",
+        "genesis_document": did_document_from_legacy_public_key(target, genesis.public_key),
+    }
+    path.write_text(json.dumps(custody))
+    for private in directory.glob("*.key.enc"):
+        private.unlink()
+    artifact = build_legacy_signed_reanchor_artifact(
+        signer_did=_did(sovereign), constitution_sha256=inputs["new_hash"],
+        private_key=sovereign.private_key,
+        transition=build_transition(intent, genesis_private_key=genesis.private_key),
+        publisher_release=_publisher(),
+    )
+    kwargs = dict(artifact=artifact, identity_directory=None, **inputs)
+    with pytest.raises(AmendmentArtifactError, match="exactly one"):
+        verify_transition_adoption(**kwargs)
+    assert verify_transition_adoption(**kwargs, hosted_identity_evidence_path=path) == {}
+    path.chmod(0o666)
+    with pytest.raises(AmendmentArtifactError, match="operator-owned regular file"):
+        verify_transition_adoption(**kwargs, hosted_identity_evidence_path=path)
+    path.chmod(0o600)
+    path.write_text(json.dumps(custody | {"genesis_document": artifact}))
+    with pytest.raises(AmendmentArtifactError, match="independently retained"):
+        verify_transition_adoption(**kwargs, hosted_identity_evidence_path=path)

@@ -115,6 +115,7 @@ async def test_anchored_tool_view_matches_gate_and_preserves_original(
         view = await tool.execute(article="amendment", search="IX")
         assert view["status"] == "ok", view
         data = view["data"]
+        assert data["workspace_policy_observation"] == {"enabled": False}
         assert set(data["effective_grants"]) == expected_grants
         assert set(data["effective_grants"]) == {
             capability for capability in DANGEROUS_CAPABILITIES if gate._constitution_allows(capability)
@@ -357,6 +358,7 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
         did_document_from_legacy_public_key,
     )
     from kestrel_sovereign.constitution.grants import build_grant_baseline, resolve_legacy_grants
+    from kestrel_sovereign.constitution.publisher import verify_packaged_publisher
     from kestrel_sovereign.constitution.reanchor_receipt import CONSTITUTION_REANCHOR_KEY
 
     v2_path = (
@@ -374,11 +376,12 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
     async with AsyncStorage(agent.storage_path, agent_id=agent.agent_id) as storage:
         agent.storage = agent._raw_storage = storage
         digest = await storage.store_file(v2_bytes, "governing.md")
+        publisher = verify_packaged_publisher(digest)
         record = build_grant_baseline(agent.agent_id, resolve_legacy_grants(agent))
         assert record["grants"] == ["filesystem_read"]
         artifact = build_legacy_signed_reanchor_artifact(
             signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
-            grant_baseline=record,
+            grant_baseline=record, publisher_release=publisher,
         )
 
         async def store_artifact(artifact):
@@ -389,7 +392,10 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
                 label="Baseline",
                 properties={
                     "constitution_hash": digest,
-                    CONSTITUTION_REANCHOR_KEY: {"new_hash": digest, "signed_artifact_hash": artifact_hash},
+                    CONSTITUTION_REANCHOR_KEY: {
+                        "new_hash": digest, "source_content_sha256": digest,
+                        "signed_artifact_hash": artifact_hash,
+                    },
                 },
             )
             await storage.add_node(node)
@@ -419,7 +425,7 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
         conflicting_record["grants"].append("filesystem_write")
         conflicting_artifact = build_legacy_signed_reanchor_artifact(
             signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
-            grant_baseline=conflicting_record,
+            grant_baseline=conflicting_record, publisher_release=publisher,
         )
         conflict_node, conflict_hash = await store_artifact(conflicting_artifact)
         conflict_node.properties["constitution_reanchor_history"] = [{
@@ -509,8 +515,13 @@ async def test_only_independently_pinned_admitted_grant_artifacts_survive_root_r
     old = did_document_from_legacy_public_key("did:test:old-root", old_key.public_key())
     new = did_document_from_legacy_public_key("did:test:new-root", new_key.public_key())
     unrelated = did_document_from_legacy_public_key("did:test:new-root", unrelated_key.public_key())
+    from importlib.resources import files
+    from kestrel_sovereign.constitution.publisher import verify_packaged_publisher
+
     target = "did:test:host-grant-history"
-    digest = "1" * 64
+    source = files("kestrel_sovereign").joinpath("data", "constitutions", "v2", "KESTREL_CONSTITUTION.md")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    publisher = verify_packaged_publisher(digest)
     baseline = build_grant_baseline(target, resolve_legacy_grants(SimpleNamespace(
         granted_capabilities={"filesystem_read"},
     )))
@@ -518,7 +529,7 @@ async def test_only_independently_pinned_admitted_grant_artifacts_survive_root_r
     def artifact(signer, key, *, reason="preserve decision"):
         return build_legacy_signed_reanchor_artifact(
             signer_did=signer["id"], constitution_sha256=digest, private_key=key,
-            grant_baseline=baseline, reason=reason,
+            grant_baseline=baseline, reason=reason, publisher_release=publisher,
         )
 
     historic = artifact(old, old_key)
@@ -532,7 +543,7 @@ async def test_only_independently_pinned_admitted_grant_artifacts_survive_root_r
     async with AsyncStorage(str(tmp_path / "history.db"), agent_id=target) as storage:
         async def receipt(value):
             artifact_hash = await storage.store_file(json.dumps(value).encode(), "artifact.json")
-            return {"new_hash": digest, "signed_artifact_hash": artifact_hash}
+            return {"source_content_sha256": digest, "new_hash": digest, "signed_artifact_hash": artifact_hash}
 
         prior = await receipt(historic)
         current = await receipt(latest)

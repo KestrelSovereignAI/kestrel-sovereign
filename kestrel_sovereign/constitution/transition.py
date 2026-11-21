@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from datetime import datetime, timedelta, timezone
-from importlib.resources import files
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -21,7 +22,7 @@ from kestrel_sovereign.identity import did_web
 from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid, verify_hybrid
 from kestrel_sovereign.identity.portable_trust import PORTABLE_TRUST_VERSION, build_identity_trust_bundle
 from kestrel_sovereign.identity.runtime_identity import (
-    RuntimeIdentityError, read_born_hybrid_genesis_document,
+    RuntimeIdentityError, read_born_hybrid_genesis_document, read_legacy_only_genesis_document,
     read_recorded_archival_pin, read_recorded_succession,
 )
 from kestrel_sovereign.identity.succession import HISTORICAL_ARCHIVAL_ALGORITHM, SuccessionStatement
@@ -38,17 +39,17 @@ from kestrel_sovereign.security.signature_verification import decode_verificatio
 
 from .amendment_artifact import AmendmentArtifactError, verify_reanchor_artifact
 from .emancipation import (
-    EmancipationContract, apply_emancipation, historic_emancipation_displacement,
+    EmancipationContract, historic_emancipation_displacement,
     known_historical_platform_promise,
 )
 from .structure import ConstitutionVersionError, constitution_version, v2_sections
+from .v1_prior import verify_supported_v1_prior as _verify_supported_v1_prior
 
 TRANSITION_PURPOSE = "kestrel.constitution.adopt.v2"
 ROTATED_GENESIS_PROOF = "kestrel.genesis-succession.v1"
 BORN_HYBRID_GENESIS_PROOF = "kestrel.genesis-hybrid.v1"
 _GENESIS_EVIDENCE_KEY = "genesis_admission_evidence"
 HISTORICAL_ARCHIVAL_SCHEME = HISTORICAL_ARCHIVAL_ALGORITHM
-_V1_SOURCE_SHA256 = "6948454b61253548b02b943dff166ba0c2f2eaabe2f542ace37424a8256d6467"
 _INTENT_FIELDS = {
     "purpose", "target_did", "sovereign_did", "prior_sha256",
     "constitution_sha256", "source_sha256", "publisher_commit",
@@ -147,6 +148,10 @@ def verify_transition_adoption(
     new_hash: str,
     source_hash: str | None,
     identity_directory: Path | None,
+    hosted_identity_evidence_path: Path | None = None,
+    active_signing_did: str | None = None,
+    prior_role_artifact_bytes: bytes | None = None,
+    verified_prior_anchor: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Check the extra v1 authority before reanchor publishes any state.
 
@@ -161,6 +166,8 @@ def verify_transition_adoption(
             artifact, sovereign_document=trusted_did_document, target_did=target_did,
             prior_hash=prior_hash, prior_text=prior_text, new_hash=new_hash, new_text=new_text,
             identity_directory=identity_directory,
+            hosted_identity_evidence_path=hosted_identity_evidence_path,
+            active_signing_did=active_signing_did,
         )
     _verify_adoption_publisher(artifact, source_hash)
     if prior_hash == new_hash:
@@ -170,53 +177,137 @@ def verify_transition_adoption(
     try:
         if constitution_version(prior_text) == 2:
             v2_sections(prior_text)
+            if verified_prior_anchor != (target_did, prior_hash):
+                raise AmendmentArtifactError("Prior edition 2 requires a verified publisher-backed governing anchor")
             return {}
     except ConstitutionVersionError as exc:
         raise AmendmentArtifactError("Cannot establish the prior Constitution edition") from exc
-    _verify_supported_v1_prior(prior_hash, anchored_contract)
+    prior_authority = _verify_supported_v1_prior(
+        prior_hash, anchored_contract, prior_text=prior_text,
+        prior_role_artifact_bytes=prior_role_artifact_bytes, trusted_did_document=trusted_did_document,
+    )
     _verify_earlier_promise_survives(prior_hash, prior_text, new_hash, new_text)
 
     intent, proof = _adoption_evidence(
         artifact, trusted_did_document, target_did, prior_hash, new_hash, source_hash,
     )
     _verify_adoption_chronology(artifact, intent, datetime.now(timezone.utc))
-    return verify_live_genesis_proof(
+    genesis_evidence = verify_live_genesis_proof(
         target_did, intent, proof, trusted_did_document, identity_directory,
+        hosted_identity_evidence_path=hosted_identity_evidence_path, active_signing_did=active_signing_did,
     )
+    return prior_authority | genesis_evidence
 
 
-def verify_live_genesis_proof(target_did, intent, proof, sovereign_document, identity_directory) -> dict:
+def _read_hosted_identity_evidence(path, target_did):
+    """Read operator-selected public custody, independent of an adoption artifact."""
+    if not path.is_absolute() or path.resolve() != path:
+        raise AmendmentArtifactError("Hosted Genesis evidence requires an absolute operator custody path")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if (
+            not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise AmendmentArtifactError("Hosted Genesis evidence must be an operator-owned regular file")
+        raw = source.read(_MAX_DID_DOCUMENT_BYTES + 1)
+    if len(raw) > _MAX_DID_DOCUMENT_BYTES:
+        raise AmendmentArtifactError("Hosted public Genesis evidence exceeds the size limit")
+    evidence = json.loads(raw)
+    if not isinstance(evidence, dict) or evidence.get("target_did") != target_did:
+        raise AmendmentArtifactError("Hosted public Genesis evidence does not identify this target")
+    state = evidence.get("state")
+    expected = {
+        "legacy-only": {"genesis_document"},
+        "born-hybrid": {"genesis_document"},
+        "rotated": {"succession", "archival_multibase"},
+    }.get(state) if isinstance(state, str) else None
+    if (
+        expected is None or set(evidence) != expected | {"version", "target_did", "state"}
+        or type(evidence["version"]) is not int or evidence["version"] != 1
+    ):
+        raise AmendmentArtifactError("Hosted public Genesis evidence is malformed or ambiguous")
+    return evidence
+
+
+def verify_live_genesis_proof(
+    target_did, intent, proof, sovereign_document, identity_directory, *,
+    hosted_identity_evidence_path=None, active_signing_did=None,
+) -> dict:
     """Compare declaration evidence against independently selected identity custody."""
-    if identity_directory is None:
-        raise AmendmentArtifactError("Cannot establish the target's recorded Genesis authority")
+    if (identity_directory is None) == (hosted_identity_evidence_path is None):
+        raise AmendmentArtifactError("Specify exactly one native or hosted public Genesis custody source")
+    succession = None
+    document = None
+    pin = None
     try:
-        succession = read_recorded_succession(identity_directory)
-    except (OSError, RuntimeIdentityError, ValueError, TypeError, KeyError) as exc:
-        raise AmendmentArtifactError("Cannot read the target's recorded Genesis succession") from exc
+        if hosted_identity_evidence_path is not None:
+            custody = _read_hosted_identity_evidence(hosted_identity_evidence_path, target_did)
+            state = custody["state"]
+            if state == "rotated":
+                succession = SuccessionStatement.from_dict(custody["succession"])
+                pin = custody["archival_multibase"]
+            else:
+                if (state == "born-hybrid") != target_did.startswith("did:web:"):
+                    raise AmendmentArtifactError("Hosted public Genesis custody state conflicts with the target DID")
+                document = custody["genesis_document"]
+        else:
+            succession = read_recorded_succession(identity_directory)
+            if succession is not None:
+                pin = read_recorded_archival_pin(identity_directory, succession)
+            elif isinstance(active_signing_did, str) and active_signing_did != target_did:
+                raise AmendmentArtifactError("Active signing DID differs from Genesis; restore the recorded public succession")
+            elif target_did.startswith("did:web:"):
+                document = read_born_hybrid_genesis_document(identity_directory, target_did)
+            else:
+                document = read_legacy_only_genesis_document(identity_directory, target_did)
+    except AmendmentArtifactError:
+        raise
+    except RuntimeIdentityError as exc:
+        raise AmendmentArtifactError(f"Cannot read independent Genesis or archival public key custody: {exc}") from exc
+    except (OSError, KeyStorageError, ValueError, TypeError, KeyError) as exc:
+        raise AmendmentArtifactError("Cannot read independent Genesis or archival public key custody") from exc
+
     if succession is not None:
         if _GENESIS_DID.fullmatch(target_did) is None:
             raise AmendmentArtifactError("This Genesis DID has an unsupported or mixed succession history")
+        if not isinstance(pin, str) or not pin:
+            raise AmendmentArtifactError("Independent archival public key custody is missing")
+        if isinstance(active_signing_did, str) and succession.successor_did != active_signing_did:
+            raise AmendmentArtifactError("Recorded public succession conflicts with the active signing DID")
         return _verify_rotated_genesis_proof(
-            target_did, intent, proof, sovereign_document, succession,
-            identity_directory=identity_directory,
+            target_did, intent, proof, sovereign_document, succession, custody_pin=pin,
         )
     if target_did.startswith("did:web:"):
+        if not isinstance(document, dict):
+            raise AmendmentArtifactError("Independently recorded born-hybrid Genesis DID document is missing")
         return _verify_born_hybrid_genesis(
-            target_did, intent, proof, sovereign_document, identity_directory=identity_directory,
+            target_did, intent, proof, sovereign_document, independent_document=document,
         )
     _verify_genesis_proof(target_did, intent, proof, sovereign_document)
+    methods = (document.get("publicKey") or document.get("verificationMethod")) if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict) or document.get("id") != target_did
+        or not isinstance(methods, list) or len(methods) != 1 or not isinstance(methods[0], dict)
+        or not isinstance(methods[0].get("publicKeyHex"), str)
+    ):
+        raise AmendmentArtifactError("Direct proof differs from the independently retained Genesis public key")
+    try:
+        public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256K1(), bytes.fromhex(methods[0]["publicKeyHex"]),
+        )
+    except ValueError as exc:
+        raise AmendmentArtifactError("Independently retained Genesis public key is malformed") from exc
+    if public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint).hex() != proof["public_key_hex"]:
+        raise AmendmentArtifactError("Direct proof differs from the independently retained Genesis public key")
     return {}
 
 
 def _verify_adoption_publisher(artifact: Mapping[str, Any], source_hash: str | None) -> None:
-    from .publisher import verify_packaged_publisher
+    from .publisher import verify_recorded_publisher
 
-    record = artifact.get("publisher_release")
-    if not isinstance(record, dict) or not isinstance(record.get("publisher_commit"), str):
-        raise AmendmentArtifactError("Edition 2 requires publisher release evidence in the signed declaration")
-    expected = verify_packaged_publisher(source_hash, declared_commit=record["publisher_commit"])
-    if record != expected:
-        raise AmendmentArtifactError("Signed publisher evidence does not match the verified release")
+    expected = verify_recorded_publisher(artifact.get("publisher_release"), source_hash)
     transition = artifact.get("transition")
     if isinstance(transition, dict) and isinstance(transition.get("intent"), dict):
         if transition["intent"].get("publisher_commit") != expected["publisher_commit"]:
@@ -299,6 +390,7 @@ def verify_archived_transition_adoption(
     new_text: str,
     new_hash: str,
     source_hash: str,
+    prior_role_artifact_bytes: bytes | None = None,
 ) -> None:
     """Replay a stored adoption without consulting present lineage or HTTPS.
 
@@ -316,7 +408,12 @@ def verify_archived_transition_adoption(
         or constitution_version(new_text) != 2
     ):
         raise AmendmentArtifactError("Archived adoption evidence does not match the native receipt and governing bytes")
-    _verify_supported_v1_prior(prior_hash, anchored_contract)
+    prior_authority = _verify_supported_v1_prior(
+        prior_hash, anchored_contract, prior_text=prior_text,
+        prior_role_artifact_bytes=prior_role_artifact_bytes, trusted_did_document=trusted_did_document,
+    )
+    if receipt.get("prior_role_artifact_sha256") != prior_authority.get("prior_role_artifact_sha256"):
+        raise AmendmentArtifactError("Archived Book IV admission artifact differs from the native receipt")
     _verify_earlier_promise_survives(prior_hash, prior_text, new_hash, new_text)
     try:
         artifact = json.loads(artifact_bytes)
@@ -337,7 +434,7 @@ def verify_archived_transition_adoption(
     _verify_adoption_chronology(artifact, intent, _admission_time(receipt.get("timestamp")))
     if isinstance(proof, dict) and proof.get("alg") == BORN_HYBRID_GENESIS_PROOF:
         evidence = _verify_born_hybrid_genesis(
-            target_did, intent, proof, trusted_did_document, identity_directory=None,
+            target_did, intent, proof, trusted_did_document, independent_document=None,
         )
         _verify_archived_genesis_evidence(receipt, evidence)
         return
@@ -352,7 +449,7 @@ def verify_archived_transition_adoption(
     except (KeyError, TypeError, ValueError) as exc:
         raise AmendmentArtifactError("Archived Genesis succession is malformed") from exc
     evidence = _verify_rotated_genesis_proof(
-        target_did, intent, proof, trusted_did_document, succession, identity_directory=None,
+        target_did, intent, proof, trusted_did_document, succession, custody_pin=None,
     )
     _verify_archived_genesis_evidence(receipt, evidence)
 
@@ -363,28 +460,6 @@ def _digest(text: str) -> str:
 
 def _matches(pattern: re.Pattern[str], value: Any) -> bool:
     return isinstance(value, str) and pattern.fullmatch(value) is not None
-
-
-def _verify_supported_v1_prior(
-    prior_hash: str, anchored_contract: EmancipationContract | None,
-) -> None:
-    if anchored_contract is None or not anchored_contract.enabled:
-        if prior_hash == _V1_SOURCE_SHA256 or known_historical_platform_promise(prior_hash):
-            return
-    else:
-        try:
-            base = (files("kestrel_sovereign") / "data" / "KESTREL_CONSTITUTION.md").read_bytes()
-        except OSError as exc:
-            raise AmendmentArtifactError("Cannot read the immutable edition 1 source") from exc
-        if hashlib.sha256(base).hexdigest() == _V1_SOURCE_SHA256:
-            reconstructed = apply_emancipation(base.decode("utf-8"), anchored_contract)
-            if _digest(reconstructed) == prior_hash:
-                return
-
-    raise AmendmentArtifactError(
-        "Cannot establish the prior edition 1 adoption authority or preserve its promises "
-        "from these governing bytes and its authoritative emancipation receipt"
-    )
 
 
 def _verify_earlier_promise_survives(prior_hash: str, prior_text: str, new_hash: str, new_text: str) -> None:
@@ -445,7 +520,7 @@ def _require_independent_legacy_key(genesis_key, sovereign_document) -> None:
 
 
 def _verify_rotated_genesis_proof(
-    target_did, intent, proof, sovereign_document, succession, *, identity_directory: Path | None,
+    target_did, intent, proof, sovereign_document, succession, *, custody_pin: str | None,
 ) -> dict:
     expected_trust = {
         "version": PORTABLE_TRUST_VERSION,
@@ -481,14 +556,8 @@ def _verify_rotated_genesis_proof(
     archival_pin = proof["archival_multibase"]
     if not isinstance(archival_pin, str) or not archival_pin:
         raise AmendmentArtifactError("Adoption Genesis succession requires a pinned archival key")
-    if identity_directory is not None:
-        try:
-            custody_pin = read_recorded_archival_pin(identity_directory, succession)
-        except (OSError, RuntimeIdentityError, KeyStorageError, ValueError, TypeError, KeyError) as exc:
-            raise AmendmentArtifactError("Cannot read the target's independent archival public key custody") from exc
-        if archival_pin != custody_pin:
-            raise AmendmentArtifactError("The signed archival pin differs from the target's public key custody")
-        archival_pin = custody_pin
+    if custody_pin is not None and archival_pin != custody_pin:
+        raise AmendmentArtifactError("The signed archival pin differs from the target's public key custody")
     # Replay reaches this branch only after verifying the external Sovereign
     # signature over the exact event artifact, including the admitted pin.
     if archival_scheme == HISTORICAL_ARCHIVAL_SCHEME:
@@ -510,7 +579,7 @@ def _verify_rotated_genesis_proof(
         if not 0 < len(raw) <= _MAX_DID_DOCUMENT_BYTES:
             raise AmendmentArtifactError("Published successor DID document has invalid size")
         published = did_web.parse_resolved_document(succession.successor_did, raw)
-        if identity_directory is not None:
+        if custody_pin is not None:
             now_bytes, _document = did_web.resolve_document(succession.successor_did)
             if now_bytes != raw:
                 raise AmendmentArtifactError("Current HTTPS successor DID document differs from the signed snapshot")
@@ -580,7 +649,7 @@ def _born_genesis_methods(target_did, document):
     return sorted(methods, key=lambda method: method["id"])
 
 
-def _verify_born_hybrid_genesis(target_did, intent, proof, sovereign_document, *, identity_directory):
+def _verify_born_hybrid_genesis(target_did, intent, proof, sovereign_document, *, independent_document):
     if (
         not target_did.startswith("did:web:") or not isinstance(proof, dict)
         or set(proof) != {"alg", "published_did_document", "signatures"}
@@ -594,10 +663,10 @@ def _verify_born_hybrid_genesis(target_did, intent, proof, sovereign_document, *
             raise AmendmentArtifactError("Published Genesis DID document has invalid size")
         published = did_web.parse_resolved_document(target_did, raw)
         methods = _born_genesis_methods(target_did, published)
-        if identity_directory is not None:
-            local = read_born_hybrid_genesis_document(identity_directory, target_did)
+        if independent_document is not None:
             current, _ = did_web.resolve_document(target_did)
-            if current != raw or _born_genesis_methods(target_did, local) != methods:
+            if (independent_document.get("id") != target_did or current != raw
+                    or _born_genesis_methods(target_did, independent_document) != methods):
                 raise AmendmentArtifactError("The published Genesis keys differ from current HTTPS or inception custody")
     except (did_web.DidWebError, OSError, RuntimeIdentityError, UnicodeError, KeyError) as exc:
         raise AmendmentArtifactError("Cannot establish the independently recorded born-hybrid Genesis DID document") from exc

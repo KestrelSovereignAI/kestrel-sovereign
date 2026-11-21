@@ -38,6 +38,8 @@ def verify_legacy_fixed_guarantee_change(
     artifact: Mapping, *, sovereign_document: Mapping, target_did: str,
     prior_hash: str | None, prior_text: str | None, new_hash: str, new_text: str,
     identity_directory: Path | None,
+    hosted_identity_evidence_path: Path | None = None,
+    active_signing_did: str | None = None,
 ) -> dict:
     """Preserve legacy repair while requiring Genesis for material edition-one amendments."""
     if prior_hash == new_hash or prior_text is None or constitution_version(new_text) != 1:
@@ -66,7 +68,7 @@ def verify_legacy_fixed_guarantee_change(
         "admission_at": admission_at,
     }
     if (
-        identity_directory is None or hashlib.sha256(prior_text.encode()).hexdigest() != prior_hash
+        hashlib.sha256(prior_text.encode()).hexdigest() != prior_hash
         or not isinstance(admission_at, str)
         or not isinstance(proof, dict) or set(proof) != {"intent", "genesis_proof"}
         or proof["intent"] != expected
@@ -83,14 +85,15 @@ def verify_legacy_fixed_guarantee_change(
         raise AmendmentArtifactError("Edition 1 amendment admission time must be UTC and not in the future")
     genesis = verify_live_genesis_proof(
         target_did, expected, proof["genesis_proof"], sovereign_document, identity_directory,
+        hosted_identity_evidence_path=hosted_identity_evidence_path, active_signing_did=active_signing_did,
     )
     # This distribution authenticates its original edition-one platform text.
     # A Sovereign credential can ratify that text, but cannot author a new
     # set of fixed guarantees merely by retaining edition-one headings.
-    from .transition import _V1_SOURCE_SHA256
+    from .v1_prior import CURRENT_V1_DIGEST
 
     base = (files("kestrel_sovereign") / "data" / "KESTREL_CONSTITUTION.md").read_bytes()
-    if (hashlib.sha256(base).hexdigest() != _V1_SOURCE_SHA256
+    if (hashlib.sha256(base).hexdigest() != CURRENT_V1_DIGEST
             or _fixed_provisions(new_text) != _fixed_provisions(base.decode("utf-8"))):
         raise AmendmentArtifactError("A change to edition 1 fixed guarantees requires a verified platform-authored release")
     return genesis

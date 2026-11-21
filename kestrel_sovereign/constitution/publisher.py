@@ -71,6 +71,16 @@ def verify_packaged_publisher(source_sha256: str, *, declared_commit: str | None
     }
 
 
+def verify_recorded_publisher(record, source_sha256: str) -> dict[str, str]:
+    """Independently authenticate the exact publisher event recorded at birth or adoption."""
+    if not isinstance(record, dict) or not isinstance(record.get("publisher_commit"), str):
+        raise AmendmentArtifactError("Edition 2 requires verifiable publisher release evidence")
+    expected = verify_packaged_publisher(source_sha256, declared_commit=record["publisher_commit"])
+    if record != expected:
+        raise AmendmentArtifactError("Recorded publisher evidence does not match the verified release")
+    return expected
+
+
 def _verify_members(archive: Path, expected: dict[str, str], commit: str) -> None:
     with tarfile.open(archive, "r:gz") as tar:
         if tar.pax_headers.get("comment") != commit:

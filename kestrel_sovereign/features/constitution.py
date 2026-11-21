@@ -580,6 +580,16 @@ class ConstitutionFeature(Feature):
             return ToolResult.failed(f"Error: {exc}", data={"kind": "unavailable"})
         base_heading = base_heading.replace("Amendment IX", provision_title)
         resolution = resolve_amendment_ix_grants(self.agent, edition=edition)
+        workspace_observation = None
+        if edition == 1:
+            from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+            from kestrel_sovereign.constitution.workspace_disposition import running_workspace_policy
+
+            try:
+                workspace_observation = running_workspace_policy(self.agent)
+            except AmendmentArtifactError:
+                # A missing policy witness cannot become a signed disabled observation.
+                pass
         grants = sorted(resolution.grants & DANGEROUS_CAPABILITIES)
         operative_source = "signed edition 2 grant baseline" if resolution.baseline_sha256 else resolution.source
         details = [
@@ -632,6 +642,7 @@ class ConstitutionFeature(Feature):
                 "workspace_disposition_sha256": scope.sha256 if scope else None,
                 "workspace_disposition_signer": scope.signer if scope else None,
                 "workspace_conflict": resolution.workspace_conflict,
+                "workspace_policy_observation": workspace_observation,
                 "conflicts": sorted(resolution.conflicts),
                 "overlay_status": resolution.overlay_status,
                 "base_text": base_text,

@@ -667,6 +667,16 @@ class ComputerUseFeature(Feature):
             return "workspace disposition matching the active path policy"
         return None
 
+    def _sandbox_mount_refusal(self, capability: str, cwd: Path | None) -> str | None:
+        """A file-only disposition never authorizes a sandbox host mount."""
+        if cwd is None or capability != "shell_execution_sandboxed" or not self._uses_structured_host_grants():
+            return None
+        if resolve_realpath(cwd) != cwd or not cwd.is_dir():
+            return "path_safety:resolved sandbox cwd changed during authorization"
+        if self._outside_workspace(cwd) and not self._constitution_allows("filesystem_outside_workspace"):
+            return "constitution:missing grant 'filesystem_outside_workspace' for sandbox cwd"
+        return None
+
     def _uses_structured_host_grants(self) -> bool:
         return isinstance(getattr(self.agent, "_constitution_host_grant_baseline", None), GrantResolution)
 
@@ -864,6 +874,7 @@ class ComputerUseFeature(Feature):
 
         # 3. Path safety + 4. Policy (filesystem ops)
         resolved = None
+        resolved_cwd = None
         workspace_scope = None
         if path_arg is not None:
             try:
@@ -974,6 +985,10 @@ class ComputerUseFeature(Feature):
                         f"path_safety:cwd is not an existing directory: "
                         f"{resolved_cwd}",
                     )
+                mount_refusal = self._sandbox_mount_refusal(capability, resolved_cwd)
+                if mount_refusal:
+                    await self._audit_denied(tool_name, payload, allowed_by + ["denied:constitution:sandbox_cwd"])
+                    return _GateOutcome(False, allowed_by, mount_refusal)
                 cwd_decision = self._path_policy.evaluate(resolved_cwd, write=False)
                 if cwd_decision.decision is Decision.DENY:
                     payload["rule"] = cwd_decision.rule
@@ -1070,6 +1085,11 @@ class ComputerUseFeature(Feature):
         if resolved is not None and self._uses_structured_host_grants() and resolve_realpath(resolved) != resolved:
             await self._audit_denied(tool_name, payload, allowed_by + ["denied:path_safety"])
             return _GateOutcome(False, allowed_by, "path_safety:resolved path changed during authorization")
+
+        mount_refusal = self._sandbox_mount_refusal(capability, resolved_cwd)
+        if mount_refusal:
+            await self._audit_denied(tool_name, payload, allowed_by + ["denied:constitution:sandbox_cwd"])
+            return _GateOutcome(False, allowed_by, mount_refusal)
 
         # An approval or input preparation can await while an environment-backed
         # grant narrows or governance is replaced. Recheck before the operation.
@@ -1652,6 +1672,7 @@ class ComputerUseFeature(Feature):
 
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved_cwd = Path(payload["cwd"]) if payload.get("cwd") else None
+        gated_backend = self._backend
         started_at = capture.utcnow()
         started = time.monotonic()
         bundle: Optional[capture.CaptureBundle] = None
@@ -1673,7 +1694,11 @@ class ComputerUseFeature(Feature):
             if head_dir is None and self._backend.name == "local":
                 head_dir = Path.cwd()
             head_before = await capture.git_head(head_dir) if bundle else None
-            result = await self._backend.exec(
+            mount_refusal = self._sandbox_mount_refusal(capability, resolved_cwd)
+            if self._backend is not gated_backend or not self._constitution_allows(capability) or mount_refusal:
+                await self._audit_denied("shell", payload, outcome.allowed_by + ["denied:dispatch:authority_changed"])
+                return ToolResult.failed(error=mount_refusal or "Shell authorization changed before dispatch")
+            result = await gated_backend.exec(
                 argv,
                 cwd=resolved_cwd,
                 env=None,

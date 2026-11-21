@@ -1586,6 +1586,9 @@ async def test_v2_workspace_disposition_rechecks_deny_after_queue_wait(workspace
 @pytest.mark.asyncio
 @pytest.mark.parametrize("writer", ["offline", "runtime"])
 async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_path, monkeypatch, writer):
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+
     from kestrel_sovereign.config import CONSTITUTION_PATH
     from kestrel_sovereign.constitution.amendment_artifact import build_legacy_signed_reanchor_artifact
     from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
@@ -1594,12 +1597,15 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
         load_anchored_grant_baseline, preview_offline_legacy_grants,
     )
     from kestrel_sovereign.constitution.source_descriptor import CONSTITUTION_SOURCE_DESCRIPTOR_ENV
+    from kestrel_sovereign.constitution.publisher import verify_packaged_publisher
     from kestrel_sovereign.constitution.transition import TRANSITION_PURPOSE, build_transition, publisher_source_url
     from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
     from kestrel_sovereign.constitution.workspace_disposition import (
         build_legacy_signed_workspace_disposition, workspace_path_policy_evidence,
     )
-    from kestrel_sovereign.features.computer_use.policy import load_computer_use_config
+    from kestrel_sovereign.constitution.source_descriptor import CONSTITUTION_SOURCE_DESCRIPTOR_ENV
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+    from kestrel_sovereign.features.computer_use.policy import load_computer_use_config, path_policy_from_config
     from kestrel_sovereign.identity.signing import get_key_id
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
     from kestrel_sovereign.security.key_storage import SecureKeyStorage
@@ -1613,10 +1619,21 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
     from tests.shared.environment_guard import unset_environment
 
     unset_environment(monkeypatch, SOVEREIGN_TRUST_ROOT_ENV, CONSTITUTION_SOURCE_DESCRIPTOR_ENV)
+    monkeypatch.delenv(SOVEREIGN_TRUST_ROOT_ENV, raising=False)
+    monkeypatch.delenv(CONSTITUTION_SOURCE_DESCRIPTOR_ENV, raising=False)
     monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read")
+    monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
+    no_network = AsyncMock(side_effect=AssertionError("Native workspace fixture must not invoke any provider"))
+    monkeypatch.setattr("httpx.AsyncClient.send", no_network)
+
+    @asynccontextmanager
+    async def no_embedding(*args, **kwargs):
+        yield None
+
+    monkeypatch.setattr("kestrel_sovereign.setup.constitution_reanchor._agent_embedding", no_embedding)
     agent_dir = tmp_path / "agent"
     credentials = await create_kestrel_identity_async(
-        output_dir=str(agent_dir), agent_name="Workspace", identity_method="did:pkh",
+        output_dir=str(agent_dir), agent_name="Workspace", identity_method="did:pkh", is_test_instance=True,
     )
     did = credentials.agent_did
     db_path = Path(credentials.db_path)
@@ -1628,12 +1645,7 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
     source = Path(__file__).resolve().parents[2] / "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md"
     content = source.read_bytes()
     digest = _sha(content)
-    publisher = {
-        "publisher_commit": "4" * 40, "source_sha256": digest,
-        "archive_sha256": "5" * 64, "attestation_sha256": "6" * 64,
-        "issued_at": "2000-01-01T00:00:00+00:00",
-    }
-    monkeypatch.setattr("kestrel_sovereign.constitution.publisher.verify_packaged_publisher", lambda *_, **__: publisher)
+    publisher = verify_packaged_publisher(digest)
     operator = tmp_path / "operator"
     operator.mkdir()
     descriptor = _descriptor_file(operator, source, content)
@@ -1654,6 +1666,8 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
         "admission_at": utc_timestamp(),
     }, genesis_private_key=SecureKeyStorage(storage_dir=agent_dir).load_private_key(get_key_id(did)))
 
+    live_config = load_computer_use_config(db_path)
+
     async def attempt(scope):
         artifact_path.write_text(json.dumps(build_legacy_signed_reanchor_artifact(
             signer_did=_ROOT_DID, constitution_sha256=digest, private_key=_ROOT_KEYPAIR.private_key,
@@ -1665,6 +1679,10 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
                 agent = _RuntimeAgentHarness(PrivacyEnforcingStorage(raw), did, trust_root, raw)
                 agent.storage_path = str(db_path)
                 agent._constitution_source_descriptor_path = descriptor
+                feature = ComputerUseFeature(agent)
+                feature._cfg = live_config
+                feature._path_policy = path_policy_from_config(live_config)
+                agent.features = {"ComputerUseFeature": feature}
                 answer = await agent.reanchor_constitution(amendment_artifact_path=str(artifact_path))
                 return "re-anchored successfully" in answer.lower(), answer
         result = await reanchor_constitution(
@@ -1682,6 +1700,19 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
         prior_sha256=prior_hash, constitution_sha256=digest, grant_baseline=baseline,
         path_policy=workspace_path_policy_evidence(load_computer_use_config(db_path)),
     )
+    config_file = agent_dir / "kestrel.toml"
+    installed_config = config_file.read_text()
+    config_file.write_text(installed_config.replace("enabled = true", "enabled = false"))
+    accepted, message = await attempt(scope)
+    assert not accepted
+    assert ("disk-selected policy" if writer == "runtime" else "differs from the active legacy path policy") in message
+    assert await _snapshot(db_path, did) == before
+    config_file.write_text(installed_config.replace("ordinary-folder", "different-folder"))
+    accepted, message = await attempt(scope)
+    assert not accepted
+    assert ("disk-selected policy" if writer == "runtime" else "differs from the active legacy path policy") in message
+    assert await _snapshot(db_path, did) == before
+    config_file.write_text(installed_config)
     accepted, message = await attempt(scope)
     assert accepted, message
     async with AsyncStorage(str(db_path), agent_id=did) as storage:
@@ -1693,3 +1724,4 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
     assert loaded.grants == frozenset({"filesystem_read"})
     assert loaded.workspace_disposition.signer == _ROOT_DID
     assert loaded.workspace_disposition.path_policy.evidence() == scope["path_policy"]
+    no_network.assert_not_awaited()

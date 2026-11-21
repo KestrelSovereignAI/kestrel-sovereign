@@ -10,7 +10,7 @@ from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.stop import StopReceiptStore, StopDoor
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
-from tests.integration.test_constitution_turn_admission import _ready_turn
+from tests.integration.test_constitution_turn_admission import _ready_turn, _role_only_revision
 from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
 from tests.unit.test_stop_receipts import _request, _outcomes
 from tests.unit.test_execution_custody_review43_native import carries
@@ -36,7 +36,7 @@ async def test_actual_control_publication_does_not_become_success_or_error_text(
             return {"risk_level": 1, "reasoning": "Deterministic offline audit receipt"}
         agent.get_audit_response = offline_auditor
     elif route == "reanchor":
-        replacement = content + b"\nSigned offline review55 replacement.\n"
+        replacement = _role_only_revision(content)
         path = tmp_path / "KESTREL_CONSTITUTION.md"
         path.write_bytes(replacement)
         import kestrel_sovereign.config as config

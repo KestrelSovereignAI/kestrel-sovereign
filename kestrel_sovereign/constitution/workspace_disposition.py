@@ -104,6 +104,29 @@ def workspace_path_policy_evidence(computer_use_config: dict) -> dict[str, Any]:
     return WorkspacePathPolicy.from_policy(path_policy_from_config(computer_use_config)).evidence()
 
 
+def configured_workspace_policy(storage_path) -> dict[str, Any]:
+    """Report the disk-selected ComputerUse policy without loading the feature."""
+    from kestrel_sovereign.features.computer_use.policy import load_computer_use_config
+
+    config = load_computer_use_config(storage_path) if storage_path is not None else {}
+    if not config.get("enabled"):
+        return {"enabled": False}
+    return {"enabled": True, "path_policy": workspace_path_policy_evidence(config)}
+
+
+def running_workspace_policy(agent) -> dict[str, Any]:
+    """Read the policy the loaded feature is actually using, not staged TOML."""
+    from kestrel_sovereign.features.computer_use.feature import ComputerUseFeature
+
+    features = getattr(agent, "features", None)
+    feature = features.get("ComputerUseFeature") if isinstance(features, Mapping) else None
+    if not isinstance(feature, ComputerUseFeature) or not feature._cfg.get("enabled"):
+        return {"enabled": False}
+    if feature._path_policy is None:
+        raise AmendmentArtifactError("Cannot establish the running ComputerUse path policy")
+    return {"enabled": True, "path_policy": WorkspacePathPolicy.from_policy(feature._path_policy).evidence()}
+
+
 def build_legacy_signed_workspace_disposition(
     *, signer_did: str, private_key: ec.EllipticCurvePrivateKey, target_did: str,
     prior_sha256: str, constitution_sha256: str, grant_baseline: Mapping[str, Any],

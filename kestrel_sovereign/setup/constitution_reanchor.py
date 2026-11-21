@@ -435,6 +435,7 @@ async def reanchor_constitution(
     runtime_backend: str | None = None,
     runtime_dsn: str | None = None,
     hosted_agent_did: str | None = None,
+    hosted_identity_evidence_path: Path | None = None,
     backup_root: Path | None = None,
 ) -> ReanchorResult:
     """Reanchor one agent to the current canonical constitution.
@@ -497,6 +498,10 @@ async def reanchor_constitution(
             tenant registry. It must be paired with an explicit PostgreSQL
             DSN and no local agent directory. The host must independently
             verify the DID-to-tenant binding before calling this API.
+        hosted_identity_evidence_path: An operator-pinned, separate public
+            custody JSON file for that hosted DID. Existing edition-one agents
+            require it for a Genesis declaration. The host must obtain and
+            protect the file independently of the adoption request and database.
         backup_root: Where a forced write to a local SQLite file copies the
             database first (#3785). None resolves the project's configured
             backup root (:func:`kestrel_sovereign.paths.backup_dir`) from
@@ -509,12 +514,12 @@ async def reanchor_constitution(
     requested_path = canonical_path
     if canonical_path is None:
         canonical_path = Path(governing_constitution_path())
-    if hosted_agent_did is not None:
+    if hosted_agent_did is not None or hosted_identity_evidence_path is not None:
         if (
             agent_dir is not None
             or runtime_backend != "postgres"
             or not runtime_dsn
-            or not hosted_agent_did.startswith("did:")
+            or not isinstance(hosted_agent_did, str) or not hosted_agent_did.startswith("did:")
         ):
             return ReanchorResult(
                 agent_name=agent_name,
@@ -973,19 +978,15 @@ async def reanchor_constitution(
             previous_hash=historical_hash, new_text=new_text, new_hash=new_hash,
             contract=effective_contract,
         )
-        transition_evidence = await asyncio.to_thread(
-            verify_transition_adoption,
-            artifact=amendment_artifact,
-            trusted_did_document=trusted_did_document,
-            target_did=agent_did,
-            prior_hash=historical_hash,
-            prior_text=anchored_text,
-            anchored_contract=anchored_contract,
-            new_text=new_text,
-            new_hash=new_hash,
-            source_hash=governing_source.content_sha256,
-            identity_directory=agent_dir,
-        )
+        from kestrel_sovereign.constitution.v1_prior import read_prior_role_artifact
+
+        prior_role_artifact = None
+        if historical_hash != new_hash and constitution_version(new_text) == 2:
+            async with target.open_storage(cold_read=True) as storage:
+                prior_role_artifact = await read_prior_role_artifact(
+                    storage.db, governance_preflight["properties"], prior_hash=historical_hash,
+                    prior_text=anchored_text, anchored_contract=anchored_contract,
+                )
         from kestrel_sovereign.constitution.grants import (
             load_anchored_grant_baseline,
             preview_offline_legacy_grants,
@@ -1016,6 +1017,22 @@ async def reanchor_constitution(
                     recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
                 )
 
+        transition_evidence = await asyncio.to_thread(
+            verify_transition_adoption,
+            artifact=amendment_artifact,
+            trusted_did_document=trusted_did_document,
+            target_did=agent_did,
+            prior_hash=historical_hash,
+            prior_text=anchored_text,
+            anchored_contract=anchored_contract,
+            new_text=new_text,
+            new_hash=new_hash,
+            source_hash=governing_source.content_sha256,
+            identity_directory=agent_dir,
+            prior_role_artifact_bytes=prior_role_artifact,
+            verified_prior_anchor=prior_baseline.verified_governing_anchor if prior_baseline else None,
+            hosted_identity_evidence_path=hosted_identity_evidence_path,
+        )
         def legacy_grant_resolution():
             return preview_offline_legacy_grants(
                 agent_dir,
@@ -1024,6 +1041,8 @@ async def reanchor_constitution(
             )
 
         def recheck_grant_cutover():
+            if constitution_version(new_text) == 2 and prior_baseline is None:
+                require_offline_grant_observation(amendment_artifact, prior_sha256=historical_hash)
             return validate_grant_cutover(
                 target_did=agent_did,
                 artifact=amendment_artifact,
@@ -1033,11 +1052,10 @@ async def reanchor_constitution(
                 prior_baseline=prior_baseline,
                 trusted_did_document=trusted_did_document,
                 storage_path=target.anchor_path,
+                stopped=True,
             )
 
         proposed_baseline = recheck_grant_cutover()
-        if proposed_baseline is not None and prior_baseline is None:
-            require_offline_grant_observation(amendment_artifact, prior_sha256=historical_hash)
     except (SovereignTrustRootError, AmendmentArtifactError, ConstitutionVersionError) as exc:
         return _result(
             old_hash=old_hash,
@@ -1509,6 +1527,7 @@ async def _write_reanchor(
             # not reinterpret that display string as corrupt stored governance.
             prior_pointer_fields = reanchor_prior_pointer_fields(
                 agent.properties.get("constitution_hash"), historical_hash,
+                pointer_present="constitution_hash" in agent.properties,
             )
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
             from kestrel_sovereign.constitution.anchored_bytes import store_verified_governing_file

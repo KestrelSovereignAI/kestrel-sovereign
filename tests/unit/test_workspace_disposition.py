@@ -72,3 +72,20 @@ def test_native_cutover_requires_independent_matching_workspace_signature(tmp_pa
     accepted = authorize(sign())
     assert accepted.workspace_disposition is not None
     assert accepted.grants == existing.grants
+
+
+def test_stopped_adoption_requires_signed_observation_when_disabled_on_disk(tmp_path):
+    target = "did:test:workspace-adopter"
+    resolution = GrantResolution(frozenset({"filesystem_read"}), "legacy", "unavailable", "absent")
+    baseline = build_grant_baseline(target, resolution)
+    artifact = {"grant_baseline": baseline}
+    inputs = dict(
+        target_did=target, artifact=artifact, prior_text=V1, new_text=V2,
+        legacy_resolution=lambda: resolution, storage_path=tmp_path / "kestrel_prime.db",
+    )
+    with pytest.raises(AmendmentArtifactError, match="signed pre-stop ComputerUse policy observation"):
+        validate_grant_cutover(**inputs, stopped=True)
+    artifact["offline_grant_observation"] = {"workspace_policy": {"enabled": False}}
+    assert validate_grant_cutover(**inputs, stopped=True).grants == resolution.grants
+    with pytest.raises(AmendmentArtifactError, match="Running ComputerUse policy differs"):
+        validate_grant_cutover(**inputs, live_workspace_policy=lambda: {"enabled": True})

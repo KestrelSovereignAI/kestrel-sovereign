@@ -431,6 +431,7 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     observation = build_offline_grant_observation(
         target_did=credentials.agent_did, prior_sha256=_sha(legacy_bytes),
         observed_at=utc_timestamp(), resolution=observed,
+        workspace_policy={"enabled": False},
     )
 
     def make_artifact(transition=None, *, offline_observation=True):
@@ -625,7 +626,8 @@ async def test_new_v2_genesis_refuses_active_contract_without_target_declaration
 
 
 @pytest.mark.asyncio
-async def test_v2_native_lazy_bootstrap_commits_pending_genesis_with_first_anchor(tmp_path, operator_dir, monkeypatch):
+@pytest.mark.parametrize("privacy", ["normal", "ephemeral", "isolated", "deidentified"])
+async def test_v2_native_lazy_bootstrap_commits_pending_genesis_with_first_anchor(tmp_path, operator_dir, monkeypatch, privacy):
     from datetime import datetime, timezone
 
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
@@ -646,6 +648,10 @@ async def test_v2_native_lazy_bootstrap_commits_pending_genesis_with_first_ancho
     did = "did:test:v2-native-lazy-bootstrap"
     async with AsyncStorage(str(tmp_path / "lazy-v2.db"), agent_id=did) as storage:
         agent = _DurableConstitutionHarness(storage, datetime.now(timezone.utc))
+        from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+        from kestrel_sovereign.privacy import PrivacyMode
+
+        agent.storage = PrivacyEnforcingStorage(storage, PrivacyMode(privacy))
         agent.agent_id = did
         agent.extension = None
         agent._anchor_constitution_governance = KestrelAgent._anchor_constitution_governance.__get__(agent)
@@ -661,9 +667,60 @@ async def test_v2_native_lazy_bootstrap_commits_pending_genesis_with_first_ancho
         )
         assert not resolution.grants
         assert not (await agent._constitution_state_store.load(did)).bootstrap_pending
+        properties["genesis_audit"].pop("publisher")
+        with pytest.raises(AmendmentArtifactError, match="publisher release evidence"):
+            await load_anchored_grant_baseline(
+                storage.db, target_did=did, properties=properties,
+                trusted_did_document=_ROOT_DID_DOCUMENT,
+            )
         properties.pop("genesis_audit")
         with pytest.raises(AmendmentArtifactError, match="no matching reanchor receipt"):
             await load_anchored_grant_baseline(
                 storage.db, target_did=did, properties=properties,
                 trusted_did_document=_ROOT_DID_DOCUMENT,
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["running", "stopped"])
+async def test_native_reanchor_refuses_unpublished_prior_v2_genesis(tmp_path, operator_dir, writer):
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    from tests.integration.test_constitution_reanchor_e2e import _RuntimeAgentHarness, _snapshot
+
+    source = Path(__file__).resolve().parents[2] / "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md"
+    digest = _sha(source.read_bytes())
+    descriptor = _descriptor_file(operator_dir, source, source.read_bytes())
+    root = operator_dir / "sovereign-root.did.json"
+    agent_dir = tmp_path / "unpublished-birth"
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(agent_dir), constitution_source_descriptor_path=str(descriptor),
+        sovereign_trust_root_path=str(root),
+    )
+    did = credentials.agent_did
+    db_path = Path(credentials.db_path)
+    async with AsyncStorage(str(db_path), agent_id=did) as raw:
+        node = await raw.get_node(did)
+        del node.properties["genesis_audit"]["publisher"]
+        await raw.add_node(node)
+    before = await _snapshot(db_path, did)
+    artifact = build_legacy_signed_reanchor_artifact(
+        signer_did=_ROOT_DID, constitution_sha256=digest, private_key=_ROOT_KEYPAIR.private_key,
+        publisher_release=verify_packaged_publisher(digest),
+    )
+    signed = operator_dir / "reanchor.json"
+    signed.write_text(json.dumps(artifact), encoding="utf-8")
+    if writer == "running":
+        async with AsyncStorage(str(db_path), agent_id=did) as raw:
+            agent = _RuntimeAgentHarness(PrivacyEnforcingStorage(raw), did, root, raw)
+            agent.storage_path = db_path
+            agent._constitution_source_descriptor_path = descriptor
+            error = await agent.reanchor_constitution(amendment_artifact_path=str(signed))
+    else:
+        result = await reanchor_constitution(
+            agent_name="Unpublished", agent_dir=agent_dir, source_descriptor_path=descriptor,
+            sovereign_trust_root_path=root, force=True, amendment_artifact_path=signed,
+        )
+        assert not result.reanchored and result.backup_path is None
+        error = result.error
+    assert "publisher release evidence" in error
+    assert await _snapshot(db_path, did) == before

@@ -349,6 +349,27 @@ registry, `runtime_backend="postgres"`, and an explicit `runtime_dsn=`. The host
 must independently verify the selected DID belongs to the intended tenant;
 the API cannot infer that relationship from a caller-supplied display name.
 
+
+When the prior edition requires a Genesis declaration, also pass
+`hosted_identity_evidence_path=` as an absolute path to an independently
+retained operator custody file. Select it from the host's trusted tenant
+registry. The adoption request, signed artifact and tenant database do not
+select this path. The file is read-only during reanchor and must be a regular
+file without group or other write permission. It contains only public evidence.
+Use an object with `version: 1`, `target_did`, and one of these states.
+
+| `state` | Additional fields |
+| --- | --- |
+| `legacy-only` | `genesis_document` with the confirmed, still-active legacy public Genesis key |
+| `born-hybrid` | `genesis_document` with the original born-hybrid public Genesis DID document |
+| `rotated` | `succession` with the recorded public statement and `archival_multibase` with the independently retained archival public key |
+
+Use `legacy-only` only when the host has established that the Genesis key
+still governs signing. For a rotated managed agent with incomplete custody,
+restore the authentic public succession and archival public sidecar through
+the existing identity recovery workflow. A still-present predecessor key
+cannot stand in for a retired credential.
+
 Stop hosted agent writers first, take a PostgreSQL snapshot, and run a
 `force=False` preview for each DID. A forced call still requires the same
 signed artifact and operator-owned trust root as the CLI. The write is
@@ -540,6 +561,27 @@ Trust-root rotation is an operator ceremony, not a database migration:
    the pin before performing a real amendment.
 6. Retain prior signed artifacts and reanchor audit nodes; rotation does not
    rewrite historical signer identity.
+
+### Proving the prior constitution before edition two adoption
+
+Keep the exact bytes at the agent's prior digest. The verifier recognizes the
+published edition-one files at `84f4591ab`, `f0672b394`, and `a292b641`,
+along with the registered pre-dormancy publications. Verify the current
+declaration under the applicable Genesis and Sovereign authority. An earlier
+emancipation promise continues on its original terms.
+
+A role revision can qualify when the exact published provisions outside the
+body of Book IV still match and the native reanchor receipt identifies the
+original signed role admission. Preserve that artifact and supply it when
+replaying the later adoption. If the prior role signature or its public
+verification authority cannot be established, resolve that custody before
+adopting the new edition.
+
+Recover the exact historical bytes for any other retained digest that could
+contain a personalized agreement. The verifier can reproduce an earlier
+agreement from a witnessed sidecar only when it reproduces the recorded
+digest and the proposed edition preserves the same terms, proofs, and price.
+Same-digest repair can proceed under the existing signed repair procedure.
 
 ### Retaining edition-two host grant evidence
 

@@ -2573,6 +2573,7 @@ class ConstitutionMixin:
             )
             prior_pointer_fields = reanchor_prior_pointer_fields(
                 validated_properties.get("constitution_hash"), historical_hash,
+                pointer_present="constitution_hash" in validated_properties,
             )
         except Exception as exc:  # noqa: BLE001 - incomplete history cannot waive rights
             from kestrel_sovereign.execution_custody import is_execution_control_error
@@ -2703,19 +2704,14 @@ class ConstitutionMixin:
                 contract=reanchor_contract,
             )
             storage_path = getattr(self, "storage_path", None)
-            transition_evidence = await asyncio.to_thread(
-                verify_transition_adoption,
-                artifact=amendment_artifact,
-                trusted_did_document=trusted_did_document,
-                target_did=self.agent_id,
-                prior_hash=historical_hash,
-                prior_text=anchored_text,
-                anchored_contract=reanchor_contract,
-                new_text=constitution_content.decode("utf-8"),
-                new_hash=new_hash,
-                source_hash=governing_source.content_sha256,
-                identity_directory=Path(storage_path).parent if storage_path else None,
-            )
+            from kestrel_sovereign.constitution.v1_prior import read_prior_role_artifact
+
+            prior_role_artifact = None
+            if historical_hash != new_hash and constitution_version(new_text) == 2:
+                prior_role_artifact = await read_prior_role_artifact(
+                    self._raw_storage.db, validated_properties, prior_hash=historical_hash,
+                    prior_text=anchored_text, anchored_contract=reanchor_contract,
+                )
             from kestrel_sovereign.constitution.grants import (
                 load_anchored_grant_baseline,
                 prior_text_for_grant_repair,
@@ -2743,10 +2739,28 @@ class ConstitutionMixin:
                     unknown_prior_edition=unknown_prior,
                     recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
                 )
+            transition_evidence = await asyncio.to_thread(
+                verify_transition_adoption,
+                artifact=amendment_artifact,
+                trusted_did_document=trusted_did_document,
+                target_did=self.agent_id,
+                prior_hash=historical_hash,
+                prior_text=anchored_text,
+                anchored_contract=reanchor_contract,
+                new_text=constitution_content.decode("utf-8"),
+                new_hash=new_hash,
+                source_hash=governing_source.content_sha256,
+                identity_directory=Path(storage_path).parent if storage_path else None,
+                prior_role_artifact_bytes=prior_role_artifact,
+                verified_prior_anchor=prior_baseline.verified_governing_anchor if prior_baseline else None,
+                active_signing_did=getattr(getattr(self, "identity", None), "signing_did", None),
+            )
             if constitution_version(new_text) == 2 and prior_baseline is None:
                 overlay_ok, overlay_error = await self.verify_constitution_overlay()
                 if not overlay_ok:
                     raise AmendmentArtifactError(overlay_error)
+            from kestrel_sovereign.constitution.workspace_disposition import running_workspace_policy
+
             proposed_baseline = validate_grant_cutover(
                 target_did=self.agent_id,
                 artifact=amendment_artifact,
@@ -2755,6 +2769,7 @@ class ConstitutionMixin:
                 legacy_resolution=lambda: resolve_legacy_grants(self),
                 trusted_did_document=trusted_did_document,
                 storage_path=storage_path,
+                live_workspace_policy=lambda: running_workspace_policy(self),
                 prior_baseline=prior_baseline,
             )
         except (AmendmentArtifactError, ConstitutionVersionError) as exc:
@@ -2815,6 +2830,7 @@ class ConstitutionMixin:
                         legacy_resolution=lambda: resolve_legacy_grants(self),
                         trusted_did_document=trusted_did_document,
                         storage_path=storage_path,
+                        live_workspace_policy=lambda: running_workspace_policy(self),
                     )
                 stored_hash = await store_verified_governing_file(
                     self._raw_storage, constitution_content, verification=verification,
@@ -3127,14 +3143,14 @@ class ConstitutionMixin:
                 # One transaction: blob + governance edges + agent pointer
                 # land together or not at all — a partial lazy anchor would
                 # be the same property/edge drift #2617 repairs.
-                async with ConstitutionMixin._constitution_state_guard(self), self.storage.transaction():
+                async with ConstitutionMixin._constitution_state_guard(self), self._raw_storage.transaction():
                     # Match signed repair and exit verification: reserve the
                     # graph write set before file ownership/blob writes.
                     initial_hash = hashlib.sha256(constitution_content).hexdigest()
-                    await self.storage.lock_nodes_for_update(
+                    await self._raw_storage.lock_nodes_for_update(
                         sorted([self.agent_id, initial_hash])
                     )
-                    agent_node = await self.storage.get_node(self.agent_id)
+                    agent_node = await self._raw_storage.get_node(self.agent_id)
                     if agent_node is None:
                         raise ValueError("identity disappeared during bootstrap")
                     if agent_node.properties.get("constitution_hash"):
@@ -3189,7 +3205,7 @@ class ConstitutionMixin:
                             constitution_hash, provenance="native_bootstrap",
                         )
                         agent_node.properties["genesis_audit"]["publisher"] = publisher_evidence
-                    await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
+                    await self._raw_storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 # store.write joined the outer graph transaction. Its revision
                 # becomes usable custody only after that transaction commits;
                 # publishing it before commit lets rollback accidentally match

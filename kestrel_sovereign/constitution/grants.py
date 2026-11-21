@@ -29,8 +29,8 @@ from .trust_root import MAX_TRUST_ROOT_BYTES
 from .workspace_disposition import (
     WORKSPACE_DISPOSITION_FIELD,
     WorkspaceDisposition,
+    configured_workspace_policy,
     verify_workspace_disposition,
-    workspace_path_policy_evidence,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,7 @@ class GrantResolution:
     conflicts: frozenset[str] = frozenset()
     workspace_disposition: WorkspaceDisposition | None = None
     workspace_conflict: bool = False
+    verified_governing_anchor: tuple[str, str] | None = None
 
 
 def resolve_amendment_ix_grants(agent, *, edition: int | None = None) -> GrantResolution:
@@ -221,14 +222,23 @@ def build_grant_baseline(target_did: str, resolution: GrantResolution) -> dict[s
 
 def build_offline_grant_observation(
     *, target_did: str, prior_sha256: str, observed_at: str, resolution: GrantResolution,
+    workspace_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Describe the running pre-stop grant decision for Sovereign attestation."""
-    return {
+    """Describe the running pre-stop grant decision for Sovereign attestation.
+
+    Use the v1 effective-grant viewer's workspace policy observation when
+    the legacy file scope requires it and has no separate signed disposition.
+    """
+    record = {
         "version": 1,
         "prior_sha256": prior_sha256,
         "observed_at": observed_at,
         "baseline": build_grant_baseline(target_did, resolution),
     }
+
+    if workspace_policy is not None:
+        record["workspace_policy"] = dict(workspace_policy)
+    return record
 
 
 def require_offline_grant_observation(
@@ -239,7 +249,7 @@ def require_offline_grant_observation(
     if (
         not is_constitution_hash(prior_sha256)
         or not isinstance(observation, dict)
-        or set(observation) != {"version", "prior_sha256", "observed_at", "baseline"}
+        or set(observation) - {"workspace_policy"} != {"version", "prior_sha256", "observed_at", "baseline"}
         or type(observation["version"]) is not int or observation["version"] != 1
         or observation["prior_sha256"] != prior_sha256
         or observation["baseline"] != artifact.get(BASELINE_FIELD)
@@ -294,6 +304,8 @@ def validate_grant_cutover(
     prior_baseline: GrantResolution | None = None,
     trusted_did_document: Mapping[str, Any] | None = None,
     storage_path: str | os.PathLike | None = None,
+    live_workspace_policy: Callable[[], dict] | None = None,
+    stopped: bool = False,
 ) -> GrantResolution | None:
     """Compare the complete observed and proposed decisions before a write.
 
@@ -318,17 +330,27 @@ def validate_grant_cutover(
     if prior_v2 and (previous_scope is not None) != proof_present:
         raise AmendmentArtifactError("Reanchor cannot add or discard the existing signed workspace disposition")
 
-    config = None
-    if not prior_v2 and {"filesystem_read", "filesystem_write"} & proposed.grants and (
-        proof_present or "filesystem_outside_workspace" not in proposed.grants
-    ):
-        from kestrel_sovereign.features.computer_use.policy import load_computer_use_config
-
-        config = load_computer_use_config(storage_path) if storage_path is not None else {}
-        if config.get("enabled") and not proof_present:
+    disk_policy = None
+    preserving_files = not prior_v2 and bool({"filesystem_read", "filesystem_write"} & proposed.grants)
+    needs_scope = preserving_files and "filesystem_outside_workspace" not in proposed.grants
+    if preserving_files and (live_workspace_policy is not None or needs_scope or proof_present):
+        disk_policy = configured_workspace_policy(storage_path)
+        if live_workspace_policy is not None and live_workspace_policy() != disk_policy:
+            raise AmendmentArtifactError("Running ComputerUse policy differs from the disk-selected policy")
+    if needs_scope:
+        if disk_policy["enabled"] and not proof_present:
             raise AmendmentArtifactError(
                 "Preserving legacy approval-mediated workspace access requires a separate signed workspace disposition"
             )
+        if stopped and not proof_present:
+            observation = artifact.get("offline_grant_observation")
+            observed_policy = observation.get("workspace_policy") if isinstance(observation, dict) else None
+            if (
+                not isinstance(observed_policy, dict)
+                or observed_policy.get("enabled") is not False
+                or observed_policy != disk_policy
+            ):
+                raise AmendmentArtifactError("Offline adoption requires the signed pre-stop ComputerUse policy observation")
     if not proof_present:
         return proposed
     if trusted_did_document is None or prior_text is None:
@@ -344,9 +366,9 @@ def validate_grant_cutover(
     )
     if previous_scope and not previous_scope.same_scope(disposition):
         raise AmendmentArtifactError("Reanchor cannot change the existing signed workspace disposition")
-    if not prior_v2 and (
-        not config or not config.get("enabled") or workspace_path_policy_evidence(config) != disposition.path_policy.evidence()
-    ):
+    if not prior_v2 and disk_policy != {
+        "enabled": True, "path_policy": disposition.path_policy.evidence(),
+    }:
         raise AmendmentArtifactError("Signed workspace disposition differs from the active legacy path policy")
     return replace(proposed, workspace_disposition=disposition)
 
@@ -456,9 +478,15 @@ async def load_anchored_grant_baseline(
         except GenesisAuditError as exc:
             raise AmendmentArtifactError("Genesis host grant ancestry could not be established") from exc
         if genesis is not None:
+            from .publisher import verify_recorded_publisher
+
+            # V2 inception is necessarily dormant and its stored governing
+            # digest is the exact digest of the unrendered publisher source.
+            verify_recorded_publisher(genesis.get("publisher"), current_hash)
             return GrantResolution(
                 frozenset(), "edition 2 default deny at genesis",
                 "genesis receipt bound to governing bytes", "not operative", current_hash,
+                verified_governing_anchor=(target_did, current_hash),
             )
     receipt = properties.get(CONSTITUTION_REANCHOR_KEY)
     if not isinstance(receipt, Mapping) or receipt.get("new_hash") != current_hash:
@@ -543,6 +571,9 @@ async def _read_signed_baseline(
         raise AmendmentArtifactError(f"Host grant baseline failed signature verification: {verification.reason}")
     if allow_legacy and BASELINE_FIELD not in artifact:
         return None
+    from .publisher import verify_recorded_publisher
+
+    verify_recorded_publisher(artifact.get("publisher_release"), receipt.get("source_content_sha256"))
     baseline = _parse_baseline(target_did, artifact)
     disposition = None
     if WORKSPACE_DISPOSITION_FIELD in artifact:
@@ -556,5 +587,6 @@ async def _read_signed_baseline(
         )
     return replace(
         baseline, baseline_sha256=artifact_hash, baseline_signer=verification.signer,
+        verified_governing_anchor=(target_did, constitution_hash),
         workspace_disposition=disposition,
     )

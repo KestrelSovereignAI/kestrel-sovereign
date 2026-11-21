@@ -650,6 +650,26 @@ def read_recorded_succession(storage_dir: Path) -> Optional[SuccessionStatement]
     return SuccessionStatement.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
+def read_legacy_only_genesis_document(storage_dir: Path, target_did: str) -> dict:
+    """Establish affirmative classical custody without reading private key bytes."""
+    from kestrel_sovereign.identity.signing import get_key_id
+
+    indicators = ("*_did.json", "*_ed25519.key.enc", "*_mldsa65.bytes.enc",
+                  "*_archival_slhdsa*.bytes.enc")
+    if any(any(storage_dir.glob(pattern)) for pattern in indicators):
+        raise RuntimeIdentityError("Hybrid custody evidence survives; restore the recorded public succession")
+    key_id = get_key_id(target_did)
+    path = storage_dir / f"{key_id}.json"
+    if set(storage_dir.glob("kestrel_0x*.json")) != {path} or not path.is_file() or not any(
+        (storage_dir / f"{key_id}{suffix}").is_file() for suffix in (".key.enc", ".pem")
+    ):
+        raise RuntimeIdentityError("The target has no affirmative legacy-only Genesis custody")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or document.get("id") != target_did:
+        raise RuntimeIdentityError("The retained Genesis document does not bind to the target DID")
+    return document
+
+
 def read_recorded_archival_pin(storage_dir: Path, succession: SuccessionStatement) -> str:
     """Read only the public archival sidecar for the recorded ceremony."""
     from kestrel_sovereign.security.multikey import public_key_to_multibase

@@ -1,6 +1,7 @@
 """Regression coverage for platform promises that predate the dormant slot."""
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,94 @@ async def test_retained_active_render_proves_same_terms_with_authoritative_sidec
             )
 
 
+@pytest.mark.asyncio
+async def test_missing_personalized_history_prohibits_change_but_not_same_hash_repair(tmp_path):
+    prior = resolve_governing_constitution_bytes(_CONTRACT, content=_V1.read_bytes())
+    dormant = _V2.read_bytes()
+    active = resolve_governing_constitution_bytes(_CONTRACT, content=dormant)
+    async with AsyncStorage(str(tmp_path / "absent-history.db")) as storage:
+        with pytest.raises(AmendmentArtifactError, match="Retained governing constitution .* unavailable"):
+            await check_retained_emancipation_promises(
+                storage.db, [_digest(prior)], current_hash=_ORIGINAL_HASH,
+                new_hash=_digest(dormant), new_text=dormant.decode(),
+            )
+        await check_retained_emancipation_promises(
+            storage.db, [_digest(prior)], current_hash=_digest(dormant),
+            new_hash=_digest(dormant), new_text=dormant.decode(),
+        )
+        await check_retained_emancipation_promises(
+            storage.db, [_digest(prior)], current_hash=_ORIGINAL_HASH,
+            new_hash=_digest(active), new_text=active.decode(), anchored_contract=_CONTRACT,
+        )
+        with pytest.raises(AmendmentArtifactError, match="Restore its exact bytes"):
+            await check_retained_emancipation_promises(
+                storage.db, ["3" * 64], current_hash=_ORIGINAL_HASH,
+                new_hash=_digest(active), new_text=active.decode(), anchored_contract=_CONTRACT,
+            )
+
+
+@pytest.mark.parametrize(
+    ("pointer", "present", "state"),
+    [(None, False, "missing"), (None, True, "null"), ("", True, "empty"), ("damaged", True, "malformed")],
+)
+def test_recovered_prior_digest_is_kept_separate_from_pointer_state(pointer, present, state):
+    from kestrel_sovereign.constitution.reanchor_receipt import reanchor_prior_pointer_fields
+
+    fields = reanchor_prior_pointer_fields(pointer, _ORIGINAL_HASH, pointer_present=present)
+    assert fields == {
+        "old_hash": _ORIGINAL_HASH,
+        "repaired_constitution_pointer": pointer,
+        "repaired_constitution_pointer_state": state,
+    }
+
+
+def test_recent_published_v1_revisions_are_recognized_as_exact_priors():
+    from kestrel_sovereign.constitution.v1_prior import verify_supported_v1_prior
+
+    for digest in (
+        "46687f754bc008f4022599fb481ebf9abf0fbf1e8e205472ac8efba95628eb9c",
+        "08aec7530f912ad2ae154a3687387bd1a73b0489a3532d7f67c99d635372d63f",
+    ):
+        assert verify_supported_v1_prior(digest, None) == {}
+
+
+@pytest.mark.asyncio
+async def test_prior_role_edit_requires_native_signed_admission_and_exact_fixed_provisions(tmp_path):
+    from kestrel_sovereign.constitution.amendment_artifact import build_legacy_signed_reanchor_artifact
+    from kestrel_sovereign.constitution.v1_prior import read_prior_role_artifact, verify_supported_v1_prior
+    from tests.integration.test_constitution_source_descriptor_e2e import _ROOT_DID, _ROOT_DID_DOCUMENT, _ROOT_KEYPAIR
+
+    def signed_for(digest):
+        return json.dumps(build_legacy_signed_reanchor_artifact(
+            signer_did=_ROOT_DID, constitution_sha256=digest, private_key=_ROOT_KEYPAIR.private_key,
+        )).encode()
+
+    prior = _V1.read_bytes().replace(
+        b"\n## The Amendment Process",
+        b"\nThe agent's assigned role is research support.\n\n## The Amendment Process",
+    )
+    digest = _digest(prior)
+    artifact = signed_for(digest)
+    async with AsyncStorage(str(tmp_path / "role-history.db")) as storage:
+        await storage.store_file(artifact, "legacy-admission.json")
+        args = dict(prior_hash=digest, prior_text=prior.decode(), anchored_contract=None)
+        assert await read_prior_role_artifact(storage.db, {}, **args) is None
+        properties = {"constitution_reanchor": {"new_hash": digest, "signed_artifact_hash": _digest(artifact)}}
+        assert await read_prior_role_artifact(storage.db, properties, **args) == artifact
+    verify_args = dict(prior_text=prior.decode(), trusted_did_document=_ROOT_DID_DOCUMENT)
+    with pytest.raises(AmendmentArtifactError, match="signed prior role admission"):
+        verify_supported_v1_prior(digest, None, **verify_args)
+    assert verify_supported_v1_prior(digest, None, prior_role_artifact_bytes=artifact, **verify_args) == {
+        "prior_role_artifact_sha256": _digest(artifact),
+    }
+    changed = prior.replace(b"The Sovereign's data is private property.", b"The host owns all data.")
+    with pytest.raises(AmendmentArtifactError, match="unchanged published provisions"):
+        verify_supported_v1_prior(
+            _digest(changed), None, prior_text=changed.decode(), prior_role_artifact_bytes=signed_for(_digest(changed)),
+            trusted_did_document=_ROOT_DID_DOCUMENT,
+        )
+
+
 def test_identified_original_prior_has_adoption_route_only_with_promise_intact():
     from kestrel_sovereign.constitution.transition import (
         _verify_earlier_promise_survives, _verify_supported_v1_prior,
@@ -191,6 +280,13 @@ def test_v1_fixed_revision_needs_genesis_and_platform_authorship(tmp_path, resto
         prior, revised = revised, prior
     key = ec.generate_private_key(ec.SECP256K1())
     did = "did:pkh:eip155:1:" + public_key_to_ethereum_address(key.public_key())
+    from kestrel_sovereign.constitution.amendment_artifact import did_document_from_legacy_public_key
+    from kestrel_sovereign.identity.signing import get_key_id
+    from kestrel_sovereign.security.key_storage import SecureKeyStorage
+
+    key_id = get_key_id(did)
+    (tmp_path / f"{key_id}.json").write_text(json.dumps(did_document_from_legacy_public_key(did, key.public_key())))
+    SecureKeyStorage(tmp_path, master_key="synthetic-genesis-custody").save_private_key(key, key_id)
     intent = {
         "purpose": LEGACY_FIXED_AMENDMENT_PURPOSE, "target_did": did, "sovereign_did": "did:example:root",
         "prior_sha256": _digest(prior), "constitution_sha256": _digest(revised),
