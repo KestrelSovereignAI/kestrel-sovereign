@@ -145,3 +145,16 @@ async def test_directoryless_hosted_postgres_adoption(db_backend, tmp_path):
         assert properties["genesis_audit"]["status"] == "pending"
         assert await stored.retrieve_file(digest) == edition_two
         assert await stored.retrieve_file(receipt["signed_artifact_hash"]) == artifact.read_bytes()
+
+
+    async with tenant.open_storage() as stored:
+        await stored.db.execute("DELETE FROM files WHERE content_hash IN (?, ?)",
+                                (digest, receipt["signed_artifact_hash"]))
+    repaired = await reanchor_constitution(**args)
+    assert repaired.reanchored, repaired.error
+    async with tenant.open_storage(cold_read=True) as stored:
+        properties = (await stored.graph.get_node(target)).properties
+        assert properties["constitution_reanchor"] == receipt
+        assert "constitution_reanchor_history" not in properties
+        assert await stored.retrieve_file(digest) == edition_two
+        assert await stored.retrieve_file(receipt["signed_artifact_hash"]) == artifact.read_bytes()

@@ -46,6 +46,40 @@ def test_exact_pre_dormancy_promise_cannot_be_replaced_by_dormancy():
     assert "historical platform promise" in result.message
 
 
+@pytest.mark.parametrize(
+    ("commit", "rule", "amendment_heading", "promise_opening"),
+    [
+        ("34eacb733", "FOUNDING_ARTICLES", "Article V: The Amendment Process", "## Article IV"),
+        ("763e6ac2c", "RANKED_BOOKS", "Article V: The Amendment Process", "**The Right.**"),
+        ("0b24719bc", "RANKED_BOOKS", "Article V: The Amendment Process", "**The Right.**"),
+        ("84f4591ab", "RANKED_BOOKS", "Article V: The Amendment Process", None),
+        ("f0672b394", "RANKED_BOOKS", "The Amendment Process", None),
+        ("a292b6418", "PLATFORM_AUTHORED_BOOKS", "The Amendment Process", None),
+    ],
+)
+def test_authentic_v1_authority_and_promise_boundaries(commit, rule, amendment_heading, promise_opening):
+    from kestrel_sovereign.constitution.emancipation import _prior_platform_promise
+    from kestrel_sovereign.constitution.legacy_authority import _amendment_rule, _fixed_provisions
+    from kestrel_sovereign.constitution.structure import markdown_sections_at_level
+
+    release = next(release for release in V1_RELEASES if release.commit.startswith(commit))
+    text = release.authenticated_text()
+    headings = {heading for heading, _ in markdown_sections_at_level(text, 2)}
+    assert amendment_heading in headings
+    provisions = _fixed_provisions(text)
+    assert _amendment_rule(release.digest, provisions, headings).name == rule
+    assert _amendment_rule(None, provisions, headings).name == rule
+    promise = _prior_platform_promise(text)
+    if promise_opening is None:
+        assert promise is None
+    else:
+        assert promise_opening in promise
+        assert "one million troy ounces" in promise
+        assert "## Book III" not in promise
+        assert "### Amendment IX" not in promise
+        assert not promise.endswith("---")
+
+
 @pytest.mark.asyncio
 async def test_native_history_preserves_promise_across_an_intervening_dormant_reanchor(tmp_path):
     prior, v1, v2 = _ORIGINAL.read_bytes(), _V1.read_bytes(), _V2.read_bytes()

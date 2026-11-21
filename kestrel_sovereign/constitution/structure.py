@@ -115,6 +115,29 @@ class SectionSpan:
         return text[self.start:self.end]
 
 
+_TRAILING_SECTION_SEPARATOR = re.compile(r"(?m)^ {0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*\r?\n?\s*\Z")
+
+
+def markdown_sections_at_level(text: str, level: int) -> list[tuple[str, SectionSpan]]:
+    """Locate ATX sections up to the next heading at their level or above."""
+    headings = [heading for heading in _HEADING.finditer(text) if len(heading[1]) <= level]
+    return [
+        (heading[2], SectionSpan(heading.start(), heading.end(), end))
+        for heading, end in zip(headings, [heading.start() for heading in headings[1:]] + [len(text)])
+        if len(heading[1]) == level
+    ]
+
+
+def legacy_section_content_end(text: str, span: SectionSpan) -> int:
+    """Keep a legacy section's closing thematic separator outside its content."""
+    separator = _TRAILING_SECTION_SEPARATOR.search(text, span.heading_end, span.end)
+    return separator.start() if separator is not None else span.end
+
+
+def legacy_section_content(text: str, span: SectionSpan) -> str:
+    return text[span.start:legacy_section_content_end(text, span)].strip()
+
+
 def v2_layer_text(
     layer: int, text: str, spans: dict[Section, SectionSpan]
 ) -> str:

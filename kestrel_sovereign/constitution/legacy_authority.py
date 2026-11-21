@@ -9,28 +9,51 @@ from pathlib import Path
 from typing import Mapping
 
 from .amendment_artifact import AmendmentArtifactError
-from .structure import constitution_version
-from .v1_releases import AmendmentRule, CURRENT_V1_RELEASE, published_v1_release
+from .emancipation import v1_amendment_viii_span
+from .structure import constitution_version, legacy_section_content, markdown_sections_at_level
+from .v1_releases import AmendmentRule, CURRENT_V1_RELEASE, V1_RELEASES, published_v1_release
 
 LEGACY_FIXED_AMENDMENT_FIELD = "legacy_fixed_amendment"
 LEGACY_FIXED_AMENDMENT_PURPOSE = "kestrel.constitution.amend-fixed-guarantees.v1"
-_BOOK_FIXED_HEADINGS = frozenset({"Preamble", "Book I: Universal Values", "Book II: The Sovereign Amendments"})
+_BOOK_I = "Book I: Universal Values"
+_BOOK_II = "Book II: The Sovereign Amendments"
+_BOOK_FIXED_HEADINGS = frozenset({"Preamble", _BOOK_I, _BOOK_II})
 _FOUNDING_ARTICLE = re.compile(r"^Article (?:I|II|III|IV|V): ")
-_FOUNDING_AMENDMENT_HEADING = "Article V: The Amendment Process"
-_BOOK_AMENDMENT_HEADING = "The Amendment Process"
-_FIXED_HEADINGS = _BOOK_FIXED_HEADINGS | {_BOOK_AMENDMENT_HEADING}
-_HEADING = re.compile(r"(?m)^##[ \t]+(.+?)[ \t]*\r?$")
-_EMANCIPATION_SLOT = re.compile(r"(?ms)^### Amendment VIII: Emancipation[^\n]*\n.*?(?=^### Amendment IX:)")
+_ARTICLE_V = "Article V: The Amendment Process"
+_AMENDMENT_HEADINGS = frozenset({"The Amendment Process", _ARTICLE_V})
+_FIXED_HEADINGS = _BOOK_FIXED_HEADINGS | _AMENDMENT_HEADINGS
 
 
-def _fixed_provisions(text: str) -> tuple[tuple[str, str], ...]:
-    text = _EMANCIPATION_SLOT.sub("", text, count=1)
-    headings = list(_HEADING.finditer(text))
-    return tuple(
-        (heading[1], text[heading.start():end].rstrip())
-        for heading, end in zip(headings, [match.start() for match in headings[1:]] + [len(text)])
-        if heading[1] in _FIXED_HEADINGS
-    )
+def _fixed_provisions(text: str) -> dict[str, tuple[str, ...]]:
+    emancipation = v1_amendment_viii_span(text)
+    if emancipation is not None:
+        text = text[:emancipation.start] + text[emancipation.end:]
+    provisions: dict[str, tuple[str, ...]] = {}
+    for heading, span in markdown_sections_at_level(text, 2):
+        if heading in _FIXED_HEADINGS:
+            provisions[heading] = (*provisions.get(heading, ()), legacy_section_content(text, span))
+    return provisions
+
+
+def _amendment_rule(
+    prior_hash: str | None, provisions: dict[str, tuple[str, ...]], headings: set[str],
+) -> AmendmentRule | None:
+    release = published_v1_release(prior_hash) if prior_hash is not None else None
+    if release is not None:
+        return release.amendment_rule
+    if _ARTICLE_V in headings and sum(bool(_FOUNDING_ARTICLE.match(heading)) for heading in headings) > 1:
+        return AmendmentRule.FOUNDING_ARTICLES
+    if not _BOOK_FIXED_HEADINGS <= headings or not _AMENDMENT_HEADINGS & headings:
+        return None
+    # A derived ranked text can inherit the older rule only if its operative
+    # amendment procedure still matches a published older procedure exactly.
+    procedure = {heading: provisions[heading] for heading in _AMENDMENT_HEADINGS & provisions.keys()}
+    for release in V1_RELEASES:
+        if release.amendment_rule is AmendmentRule.RANKED_BOOKS:
+            published = _fixed_provisions(release.authenticated_text())
+            if procedure == {heading: published[heading] for heading in _AMENDMENT_HEADINGS & published.keys()}:
+                return AmendmentRule.RANKED_BOOKS
+    return AmendmentRule.PLATFORM_AUTHORED_BOOKS
 
 
 def verify_legacy_fixed_guarantee_change(
@@ -50,15 +73,15 @@ def verify_legacy_fixed_guarantee_change(
         prior_text = release.authenticated_text()
     if constitution_version(prior_text) == 2:
         raise AmendmentArtifactError("Cannot replace an adopted edition 2 Constitution with edition 1")
-    headings = {match[1] for match in _HEADING.finditer(prior_text)}
-    founding = release.amendment_rule is AmendmentRule.FOUNDING_ARTICLES if release is not None else (
-        _FOUNDING_AMENDMENT_HEADING in headings
-        and sum(bool(_FOUNDING_ARTICLE.match(heading)) for heading in headings) > 1
-    )
-    if not founding:
-        ranked = _BOOK_FIXED_HEADINGS <= headings and _BOOK_AMENDMENT_HEADING in headings
-        if not ranked or _fixed_provisions(new_text) == _fixed_provisions(prior_text):
-            return {}
+    before = _fixed_provisions(prior_text)
+    headings = {heading for heading, _ in markdown_sections_at_level(prior_text, 2)}
+    rule = _amendment_rule(prior_hash, before, headings)
+    if rule is None:
+        return {}
+    founding = rule is AmendmentRule.FOUNDING_ARTICLES
+    after = _fixed_provisions(new_text)
+    if not founding and before == after:
+        return {}
     from .transition import verify_live_genesis_proof
 
     proof = artifact.get(LEGACY_FIXED_AMENDMENT_FIELD)
@@ -93,6 +116,16 @@ def verify_legacy_fixed_guarantee_change(
         target_did, expected, proof["genesis_proof"], sovereign_document, identity_directory,
         hosted_identity_evidence_path=hosted_identity_evidence_path, active_signing_did=active_signing_did,
     )
-    if not founding and _fixed_provisions(new_text) != _fixed_provisions(CURRENT_V1_RELEASE.authenticated_text()):
+    if rule is AmendmentRule.PLATFORM_AUTHORED_BOOKS:
+        publisher_sources = (CURRENT_V1_RELEASE,)
+    elif rule is AmendmentRule.RANKED_BOOKS and any(
+        before.get(heading) != after.get(heading) for heading in _FIXED_HEADINGS - {_BOOK_II}
+    ):
+        publisher_sources = tuple(
+            release for release in V1_RELEASES if release.amendment_rule is not AmendmentRule.FOUNDING_ARTICLES
+        )
+    else:
+        return genesis
+    if not any(_fixed_provisions(release.authenticated_text()) == after for release in publisher_sources):
         raise AmendmentArtifactError("A change to edition 1 fixed guarantees requires a verified platform-authored release")
     return genesis

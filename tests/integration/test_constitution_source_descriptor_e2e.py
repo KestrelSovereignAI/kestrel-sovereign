@@ -372,6 +372,92 @@ def _legacy_role_revision(source: Path) -> bytes:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["offline", "live"])
+@pytest.mark.parametrize("revision", ["current-book-ii", "book-iv", "historical-book-ii"])
+async def test_native_ranked_v1_amendment_uses_published_authority(
+    tmp_path, operator_dir, writer, revision,
+):
+    from kestrel_sovereign.config import CONSTITUTION_PATH
+    from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
+    from kestrel_sovereign.constitution.legacy_authority import LEGACY_FIXED_AMENDMENT_PURPOSE
+    from kestrel_sovereign.constitution.transition import build_transition
+    from kestrel_sovereign.constitution.v1_releases import CURRENT_V1_RELEASE, V1_RELEASES
+    from kestrel_sovereign.identity.signing import get_key_id
+    from kestrel_sovereign.security.key_storage import SecureKeyStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    from tests.integration.test_constitution_reanchor_e2e import _RuntimeAgentHarness, _snapshot
+
+    prior_prefix = "763e6ac2c" if revision == "historical-book-ii" else "84f4591ab"
+    prior = next(release for release in V1_RELEASES if release.commit.startswith(prior_prefix))
+    prior_bytes = prior.authenticated_text().encode()
+    Path(CONSTITUTION_PATH).write_bytes(prior_bytes)
+    if revision == "historical-book-ii":
+        later = next(release for release in V1_RELEASES if release.commit.startswith("0b24719bc"))
+        candidate = later.authenticated_text().encode()
+    elif revision == "book-iv":
+        candidate = prior_bytes.replace(
+            b"\n## Article V: The Amendment Process",
+            b"\nThe agent may organize its research notes.\n\n## Article V: The Amendment Process",
+        )
+    else:
+        candidate = CURRENT_V1_RELEASE.authenticated_text().encode()
+    assert candidate != prior_bytes
+
+    agent_dir = tmp_path / "agent_data" / "Ranked"
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(agent_dir), agent_name="Ranked", identity_method="did:pkh",
+    )
+    source = operator_dir / "ranked-constitution.md"
+    source.write_bytes(candidate)
+    descriptor = _descriptor_file(operator_dir, source, candidate)
+    trust_root = operator_dir / "sovereign-root.did.json"
+    artifact = operator_dir / "v1-amendment.signed.json"
+
+    def sign(declaration=None):
+        artifact.write_text(json.dumps(build_legacy_signed_reanchor_artifact(
+            signer_did=_ROOT_DID, constitution_sha256=_sha(candidate),
+            private_key=_ROOT_KEYPAIR.private_key, legacy_fixed_amendment=declaration,
+        )), encoding="utf-8")
+
+    async def attempt():
+        if writer == "offline":
+            result = await reanchor_constitution(
+                agent_name="Ranked", agent_dir=agent_dir, source_descriptor_path=descriptor,
+                sovereign_trust_root_path=trust_root, force=True, amendment_artifact_path=artifact,
+            )
+            return result.reanchored, result.error
+        async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as raw:
+            agent = _RuntimeAgentHarness(
+                PrivacyEnforcingStorage(raw), credentials.agent_did, trust_root, raw,
+            )
+            agent.storage_path = credentials.db_path
+            agent._constitution_source_descriptor_path = descriptor
+            result = await agent.reanchor_constitution(amendment_artifact_path=str(artifact))
+        return "re-anchored successfully" in result.lower(), result
+
+    sign()
+    if revision != "book-iv":
+        before = await _snapshot(Path(credentials.db_path), credentials.agent_did)
+        accepted, message = await attempt()
+        assert not accepted and "Genesis-verifiable declaration" in message
+        assert await _snapshot(Path(credentials.db_path), credentials.agent_did) == before
+        genesis = SecureKeyStorage(storage_dir=agent_dir).load_private_key(get_key_id(credentials.agent_did))
+        sign(build_transition({
+            "purpose": LEGACY_FIXED_AMENDMENT_PURPOSE,
+            "target_did": credentials.agent_did,
+            "sovereign_did": _ROOT_DID,
+            "prior_sha256": prior.digest,
+            "constitution_sha256": _sha(candidate),
+            "admission_at": utc_timestamp(),
+        }, genesis_private_key=genesis))
+
+    accepted, message = await attempt()
+    assert accepted, message
+    properties = await _agent_properties(credentials.db_path, credentials.agent_did)
+    assert properties["constitution_hash"] == _sha(candidate)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path, active, rotated, legacy_release",
     [("offline", True, False, None), ("live", False, False, None),
@@ -622,6 +708,33 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
         sovereign_trust_root_path=str(trust_root),
     )
     assert ok, message
+
+    if active or rotated:
+        governing_hash = _sha(v2_rendered)
+        receipt_history = after.get("constitution_reanchor_history")
+        for missing in (
+            (governing_hash,), (receipt["signed_artifact_hash"],),
+            (governing_hash, receipt["signed_artifact_hash"]),
+        ):
+            async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as storage:
+                for digest in missing:
+                    await storage.db.execute("DELETE FROM files WHERE content_hash = ?", (digest,))
+            if receipt["signed_artifact_hash"] in missing:
+                before_refusal = await _snapshot(Path(credentials.db_path), credentials.agent_did)
+                write_artifact(make_artifact(offline_observation=False))
+                accepted, message = await attempt()
+                assert not accepted and "baseline artifact is unavailable" in message
+                assert await _snapshot(Path(credentials.db_path), credentials.agent_did) == before_refusal
+
+            artifact_path.write_bytes(retained_artifact)
+            accepted, message = await attempt()
+            assert accepted, message
+            repaired = await _agent_properties(credentials.db_path, credentials.agent_did)
+            assert repaired["constitution_reanchor"] == receipt
+            assert repaired.get("constitution_reanchor_history") == receipt_history
+            async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as storage:
+                assert await storage.retrieve_file(governing_hash) == v2_rendered
+                assert await storage.retrieve_file(receipt["signed_artifact_hash"]) == retained_artifact
 
     if rotated:
         # The original classical key is gone. A repair may use the retained

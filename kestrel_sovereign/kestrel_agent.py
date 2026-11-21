@@ -4093,7 +4093,7 @@ class KestrelAgent(
 
         grants_verified, grants_error = await self._refresh_constitution_host_grants(_agent_node)
         if not grants_verified:
-            logging.warning("Constitution host grants denied: %s", grants_error)
+            logging.critical("Constitution governing integrity verification failed: %s", grants_error)
 
         # Auto-discover and register features from features/ directory
         # Features can be disabled via KESTREL_DISABLED_FEATURES env var

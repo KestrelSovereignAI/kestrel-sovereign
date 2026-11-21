@@ -979,50 +979,30 @@ async def reanchor_constitution(
                     storage.db, historical_digests, current_hash=historical_hash,
                     new_hash=new_hash, new_text=new_text, anchored_contract=anchored_contract,
                 )
-        validate_v2_emancipation_activation(
-            amendment_artifact, target_did=agent_did, previous_text=anchored_text,
-            previous_hash=historical_hash, new_text=new_text, new_hash=new_hash,
-            contract=effective_contract,
+        from kestrel_sovereign.constitution.grants import (
+            load_reanchor_prior_state, preview_offline_legacy_grants,
+            require_offline_grant_observation, validate_grant_cutover,
         )
         from kestrel_sovereign.constitution.v1_prior import read_prior_role_artifact
 
-        prior_role_artifact = None
-        if historical_hash != new_hash and constitution_version(new_text) == 2:
-            async with target.open_storage(cold_read=True) as storage:
+        async with target.open_storage(cold_read=True) as storage:
+            grant_prior_text, prior_baseline = await load_reanchor_prior_state(
+                storage.db, target_did=agent_did, governance=governance_preflight,
+                anchored_text=anchored_text, historical_hash=historical_hash,
+                new_text=new_text, new_hash=new_hash, artifact_bytes=amendment_artifact_bytes,
+                trusted_did_document=trusted_did_document, environ=environ,
+            )
+            prior_role_artifact = None
+            if historical_hash != new_hash and constitution_version(new_text) == 2:
                 prior_role_artifact = await read_prior_role_artifact(
                     storage.db, governance_preflight["properties"], prior_hash=historical_hash,
-                    prior_text=anchored_text, anchored_contract=anchored_contract,
+                    prior_text=grant_prior_text, anchored_contract=anchored_contract,
                 )
-        from kestrel_sovereign.constitution.grants import (
-            load_anchored_grant_baseline,
-            preview_offline_legacy_grants,
-            prior_text_for_grant_repair,
-            require_offline_grant_observation,
-            unknown_signed_prior_edition,
-            validate_grant_cutover,
+        validate_v2_emancipation_activation(
+            amendment_artifact, target_did=agent_did, previous_text=grant_prior_text,
+            previous_hash=historical_hash, new_text=new_text, new_hash=new_hash,
+            contract=effective_contract,
         )
-
-        grant_prior_text = prior_text_for_grant_repair(
-            anchored_text=anchored_text,
-            historical_hash=historical_hash,
-            new_text=new_text,
-            new_hash=new_hash,
-            governance=governance_preflight,
-        )
-        unknown_prior = unknown_signed_prior_edition(grant_prior_text, governance_preflight["properties"])
-        prior_baseline = None
-        if unknown_prior or (grant_prior_text is not None and constitution_version(grant_prior_text) == 2):
-            async with target.open_storage(cold_read=True) as storage:
-                prior_baseline = await load_anchored_grant_baseline(
-                    storage.db,
-                    target_did=agent_did,
-                    properties=governance_preflight["properties"],
-                    trusted_did_document=trusted_did_document,
-                    unknown_prior_edition=unknown_prior,
-                    environ=environ,
-                    recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
-                    recovered_governing_text=grant_prior_text,
-                )
 
         transition_evidence = await asyncio.to_thread(
             verify_transition_adoption,
@@ -1030,7 +1010,7 @@ async def reanchor_constitution(
             trusted_did_document=trusted_did_document,
             target_did=agent_did,
             prior_hash=historical_hash,
-            prior_text=anchored_text,
+            prior_text=grant_prior_text,
             anchored_contract=anchored_contract,
             new_text=new_text,
             new_hash=new_hash,
@@ -1525,9 +1505,14 @@ async def _write_reanchor(
                 storage.db, agent_did, governance_preflight["governed_by_targets"], new_hash=new_hash,
             ) != retained_edges:
                 raise AmendmentArtifactError("Retained governing edge ownership changed during reanchor")
-            from kestrel_sovereign.constitution.reanchor_receipt import validate_constitution_reanchor_evidence
+            from kestrel_sovereign.constitution.reanchor_receipt import (
+                reuses_current_reanchor_receipt, validate_constitution_reanchor_evidence,
+            )
 
-            validate_constitution_reanchor_evidence(agent.properties, superseding=True)
+            validate_constitution_reanchor_evidence(
+                agent.properties,
+                superseding=not reuses_current_reanchor_receipt(agent.properties, new_hash, artifact_hash),
+            )
             if recheck_grant_cutover is not None:
                 recheck_grant_cutover()
             # old_hash is a CLI display sentinel ("none" for no anchor).

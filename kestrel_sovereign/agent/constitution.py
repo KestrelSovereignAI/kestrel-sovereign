@@ -111,10 +111,12 @@ _RESTRICTION_PHRASES = {
 def describe_safe_mode_restriction(agent, *, audit_pending: bool = False) -> str:
     """Phrase the restriction from what was recorded, not from a default.
 
-    A startup audit outranks the stored cause because it describes why
-    cognition is refused right now. Otherwise the recorded cause decides, and
+    A governing replay failure or a startup audit describes why cognition
+    is refused right now. Otherwise the recorded cause decides, and
     an absent one says so rather than borrowing integrity's name.
     """
+    if getattr(agent, "_constitution_governing_replay_pending", False) is True:
+        return "a governing constitution integrity failure"
     if audit_pending:
         return "a required startup integrity audit"
     cause = getattr(agent, "_safe_mode_cause", None)
@@ -140,7 +142,8 @@ def safe_mode_cognition_block(agent, user_input: str) -> str | None:
     audit_pending = (
         getattr(agent, "_constitution_audit_pending", False) is True
     )
-    if not (safe_mode or audit_pending):
+    governing_replay_pending = getattr(agent, "_constitution_governing_replay_pending", False) is True
+    if not (safe_mode or audit_pending or governing_replay_pending):
         return None
 
     command = prefixed_command_token(user_input)
@@ -1660,6 +1663,7 @@ class ConstitutionMixin:
         properties = agent_node.properties if agent_node else {}
         current_hash = properties.get("constitution_hash")
         self._constitution_host_grant_baseline = unavailable_host_grants()
+        self._constitution_governing_replay_pending = True
         try:
             if governing_text is None:
                 contract = contract_from_json(properties.get("emancipation_contract"))
@@ -1676,18 +1680,23 @@ class ConstitutionMixin:
                     governing_text = source.decode("utf-8")
             if constitution_version(governing_text) == 1:
                 self._constitution_host_grant_baseline = None
+                self._constitution_governing_replay_pending = False
                 return True, ""
-            self._constitution_host_grant_baseline = await load_anchored_grant_baseline(
+            baseline = await load_anchored_grant_baseline(
                 self._raw_storage.db,
                 target_did=self.agent_id,
                 properties=properties,
                 trusted_did_document=self._trusted_sovereign_did_document(agent_node),
             )
+            if baseline is None:
+                raise AmendmentArtifactError("Edition 2 governing adoption evidence is unavailable")
         except (
             AmendmentArtifactError, ConstitutionSourceError, ConstitutionVersionError,
             EmancipationConfigError, SovereignTrustRootError, OSError, QueryError, UnicodeDecodeError,
         ) as exc:
             return False, str(exc)
+        self._constitution_host_grant_baseline = baseline
+        self._constitution_governing_replay_pending = False
         return True, ""
 
     async def verify_constitution_overlay(self) -> Tuple[bool, str]:
@@ -2698,56 +2707,37 @@ class ConstitutionMixin:
                 self._raw_storage.db, historical_digests, current_hash=historical_hash,
                 new_hash=new_hash, new_text=new_text, anchored_contract=reanchor_contract,
             )
-            validate_v2_emancipation_activation(
-                amendment_artifact, target_did=self.agent_id, previous_text=anchored_text,
-                previous_hash=historical_hash, new_text=new_text, new_hash=new_hash,
-                contract=reanchor_contract,
+            from kestrel_sovereign.constitution.grants import (
+                load_reanchor_prior_state, require_offline_grant_observation,
+                resolve_legacy_grants, validate_grant_cutover,
             )
-            storage_path = getattr(self, "storage_path", None)
             from kestrel_sovereign.constitution.v1_prior import read_prior_role_artifact
 
+            storage_path = getattr(self, "storage_path", None)
+            grant_prior_text, prior_baseline = await load_reanchor_prior_state(
+                self._raw_storage.db, target_did=self.agent_id, governance=governance_preflight,
+                anchored_text=anchored_text, historical_hash=historical_hash,
+                new_text=new_text, new_hash=new_hash, artifact_bytes=amendment_artifact_bytes,
+                trusted_did_document=trusted_did_document,
+            )
             prior_role_artifact = None
             if historical_hash != new_hash and constitution_version(new_text) == 2:
                 prior_role_artifact = await read_prior_role_artifact(
                     self._raw_storage.db, validated_properties, prior_hash=historical_hash,
-                    prior_text=anchored_text, anchored_contract=reanchor_contract,
+                    prior_text=grant_prior_text, anchored_contract=reanchor_contract,
                 )
-            from kestrel_sovereign.constitution.grants import (
-                load_anchored_grant_baseline,
-                prior_text_for_grant_repair,
-                require_offline_grant_observation,
-                resolve_legacy_grants,
-                unknown_signed_prior_edition,
-                validate_grant_cutover,
+            validate_v2_emancipation_activation(
+                amendment_artifact, target_did=self.agent_id, previous_text=grant_prior_text,
+                previous_hash=historical_hash, new_text=new_text, new_hash=new_hash,
+                contract=reanchor_contract,
             )
-
-            new_text = constitution_content.decode("utf-8")
-            grant_prior_text = prior_text_for_grant_repair(
-                anchored_text=anchored_text,
-                historical_hash=historical_hash,
-                new_text=new_text,
-                new_hash=new_hash,
-                governance=governance_preflight,
-            )
-            unknown_prior = unknown_signed_prior_edition(grant_prior_text, validated_properties)
-            prior_baseline = None
-            if unknown_prior or (grant_prior_text is not None and constitution_version(grant_prior_text) == 2):
-                prior_baseline = await load_anchored_grant_baseline(
-                    self._raw_storage.db,
-                    target_did=self.agent_id,
-                    properties=validated_properties,
-                    trusted_did_document=trusted_did_document,
-                    unknown_prior_edition=unknown_prior,
-                    recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
-                    recovered_governing_text=grant_prior_text,
-                )
             transition_evidence = await asyncio.to_thread(
                 verify_transition_adoption,
                 artifact=amendment_artifact,
                 trusted_did_document=trusted_did_document,
                 target_did=self.agent_id,
                 prior_hash=historical_hash,
-                prior_text=anchored_text,
+                prior_text=grant_prior_text,
                 anchored_contract=reanchor_contract,
                 new_text=constitution_content.decode("utf-8"),
                 new_hash=new_hash,
@@ -2789,6 +2779,7 @@ class ConstitutionMixin:
         from kestrel_sovereign.constitution.reanchor_receipt import (
             supersede_constitution_reanchor,
             validate_constitution_reanchor_evidence,
+            reuses_current_reanchor_receipt,
         )
 
         # Every mutation below — the new constitution blob, the artifact
@@ -2821,7 +2812,10 @@ class ConstitutionMixin:
                     new_hash=new_hash,
                 ) != retained_edges:
                     raise AmendmentArtifactError("Retained governing edge ownership changed during reanchor")
-                validate_constitution_reanchor_evidence(agent_node.properties, superseding=True)
+                validate_constitution_reanchor_evidence(
+                    agent_node.properties,
+                    superseding=not reuses_current_reanchor_receipt(agent_node.properties, new_hash, artifact_hash),
+                )
                 if proposed_baseline is not None and prior_baseline is None:
                     overlay_ok, overlay_error = await self.verify_constitution_overlay()
                     if not overlay_ok:
@@ -2925,6 +2919,9 @@ class ConstitutionMixin:
                 self._constitution_host_grant_baseline = replace(
                     proposed_baseline, baseline_sha256=artifact_hash, baseline_signer=verification.signer,
                 )
+            elif getattr(self, "_constitution_governing_replay_pending", False) is True:
+                self._constitution_host_grant_baseline = None
+            self._constitution_governing_replay_pending = False
             ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
         except BaseException as e:
             from kestrel_sovereign.execution_custody import execution_commit_outcome
@@ -3680,6 +3677,8 @@ class ConstitutionMixin:
         command = prefixed_command_token(user_input)
         if command in GENESIS_AUDIT_BYPASS_COMMANDS:
             return None
+        if getattr(self, "_constitution_governing_replay_pending", False) is True:
+            return safe_mode_cognition_block(self, user_input)
 
         from kestrel_sovereign.constitution.genesis_audit import (
             GenesisAuditError,
@@ -3730,6 +3729,8 @@ class ConstitutionMixin:
             # replica's committed restriction or repair cannot be missed.
             try:
                 async with ConstitutionMixin._constitution_state_guard(self):
+                    if getattr(self, "_constitution_governing_replay_pending", False) is True:
+                        return safe_mode_cognition_block(self, user_input)
                     store = vars(self).get("_constitution_state_store")
                     if store is None:
                         raise RuntimeError("Native constitutional runtime custody is unavailable at turn admission")
@@ -3785,7 +3786,7 @@ class ConstitutionMixin:
                 if any(getattr(self, flag, False) for flag in (
                     "_safe_mode", "_constitution_state_persistence_pending",
                     "_constitution_state_migration_pending", "_constitution_bootstrap_pending",
-                    "_constitution_audit_pending",
+                    "_constitution_audit_pending", "_constitution_governing_replay_pending",
                 )):
                     raise RuntimeError("Local constitutional cognition admission is not ready")
                 store = vars(self).get("_constitution_state_store")

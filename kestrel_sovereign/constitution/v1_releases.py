@@ -13,6 +13,7 @@ from .amendment_artifact import AmendmentArtifactError
 class AmendmentRule(Enum):
     FOUNDING_ARTICLES = "genesis-required-for-every-amendment"
     RANKED_BOOKS = "ranked-books"
+    PLATFORM_AUTHORED_BOOKS = "platform-authored-ranked-books"
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,7 @@ V1_RELEASES = (
     V1Release(
         "a292b641893f102c6863f86a6ef0440ca8ae6cf0",
         "6948454b61253548b02b943dff166ba0c2f2eaabe2f542ace37424a8256d6467",
-        AmendmentRule.RANKED_BOOKS,
+        AmendmentRule.PLATFORM_AUTHORED_BOOKS,
         supports_activation=True,
         packaged_default=True,
     ),

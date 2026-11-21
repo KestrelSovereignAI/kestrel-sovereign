@@ -412,6 +412,34 @@ def prior_text_for_grant_repair(
     return None
 
 
+async def load_reanchor_prior_state(
+    db, *, target_did: str, governance: Mapping[str, Any], anchored_text: str | None,
+    historical_hash: str | None, new_text: str, new_hash: str,
+    artifact_bytes: bytes, trusted_did_document: Mapping[str, Any],
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str | None, GrantResolution | None]:
+    """Establish prior governing text and grant authority before applying amendment rules."""
+    properties = governance["properties"]
+    candidate = prior_text_for_grant_repair(
+        anchored_text=anchored_text, historical_hash=historical_hash,
+        new_text=new_text, new_hash=new_hash, governance=governance,
+    )
+    unknown = unknown_signed_prior_edition(candidate, properties)
+    if not unknown and (candidate is None or constitution_version(candidate) != 2):
+        return anchored_text, None
+
+    recovered_hash = new_hash if anchored_text is None and candidate is not None else historical_hash
+    baseline = await load_anchored_grant_baseline(
+        db, target_did=target_did, properties=properties,
+        trusted_did_document=trusted_did_document, unknown_prior_edition=unknown,
+        recovered_hash=recovered_hash, recovered_governing_text=candidate, environ=environ,
+        recovered_artifact_bytes=artifact_bytes if recovered_hash == new_hash else None,
+    )
+    if baseline is not None and baseline.verified_governing_anchor == (target_did, recovered_hash):
+        return candidate, baseline
+    return anchored_text, None
+
+
 def unknown_signed_prior_edition(prior_text: str | None, properties: Mapping[str, Any]) -> bool:
     receipt = properties.get(CONSTITUTION_REANCHOR_KEY)
     return (
@@ -467,6 +495,7 @@ async def load_anchored_grant_baseline(
     unknown_prior_edition: bool = False,
     recovered_hash: str | None = None,
     recovered_governing_text: str | None = None,
+    recovered_artifact_bytes: bytes | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> GrantResolution | None:
     """Verify the baseline, or identify an older signed artifact by its contents."""
@@ -528,6 +557,7 @@ async def load_anchored_grant_baseline(
             receipt=receipt, trusted_did_document=trusted_did_document,
             allow_legacy=True, environ=environ, governing_text=None,
             contract=contract, verified_anchors=verified_anchors,
+            recovered_artifact_bytes=recovered_artifact_bytes,
         )
 
     prior_baselines = []
@@ -546,6 +576,7 @@ async def load_anchored_grant_baseline(
             receipt=previous_receipt, trusted_did_document=trusted_did_document,
             allow_legacy=False, environ=environ, governing_text=previous_text,
             contract=contract, verified_anchors=verified_anchors,
+            recovered_artifact_bytes=recovered_artifact_bytes,
         )
         prior_baselines.append(previous)
         verified_anchors.add(previous_hash)
@@ -555,6 +586,7 @@ async def load_anchored_grant_baseline(
         receipt=receipt, trusted_did_document=trusted_did_document,
         allow_legacy=unknown_prior_edition, environ=environ, governing_text=current_text,
         contract=contract, verified_anchors=verified_anchors,
+        recovered_artifact_bytes=recovered_artifact_bytes,
     )
     if current is None:
         return None
@@ -584,13 +616,22 @@ async def _read_signed_baseline(
     receipt: Mapping[str, Any], trusted_did_document: Mapping[str, Any],
     allow_legacy: bool, environ: Mapping[str, str] | None,
     governing_text: str | None, contract, verified_anchors: set[str],
+    recovered_artifact_bytes: bytes | None,
 ) -> GrantResolution | None:
     from .anchored_bytes import read_anchored_constitution
 
     artifact_hash = receipt.get("signed_artifact_hash")
     if not is_constitution_hash(artifact_hash):
         raise AmendmentArtifactError("Current constitution has no signed reanchor artifact")
-    text, _ = await read_anchored_constitution(db, artifact_hash)
+    text, present = await read_anchored_constitution(db, artifact_hash)
+    if (
+        not present and recovered_artifact_bytes is not None
+        and hashlib.sha256(recovered_artifact_bytes).hexdigest() == artifact_hash
+    ):
+        try:
+            text = recovered_artifact_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AmendmentArtifactError("Retained host grant baseline artifact is not UTF-8") from exc
     if text is None:
         raise AmendmentArtifactError("Signed host grant baseline artifact is unavailable")
     try:

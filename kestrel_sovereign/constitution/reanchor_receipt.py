@@ -153,6 +153,18 @@ def retained_constitution_hashes(properties: Mapping[str, Any]) -> set[str]:
     return hashes
 
 
+def reuses_current_reanchor_receipt(
+    properties: Mapping[str, Any], new_hash: str, artifact_hash: str | None,
+) -> bool:
+    """An exact signed retry keeps the original admission receipt intact."""
+    current = properties.get(CONSTITUTION_REANCHOR_KEY)
+    return (
+        isinstance(current, Mapping) and is_constitution_hash(artifact_hash)
+        and current.get("new_hash") == new_hash
+        and current.get("signed_artifact_hash") == artifact_hash
+    )
+
+
 def supersede_constitution_reanchor(
     properties: MutableMapping[str, Any],
     *,
@@ -176,8 +188,14 @@ def supersede_constitution_reanchor(
     """
     # Complete admission precedes every in-place mutation, even a same-hash
     # repair whose genesis receipt does not need another history entry.
-    history = deepcopy(validate_constitution_reanchor_evidence(properties, superseding=True))
     validate_constitution_reanchor_receipt(receipt)
+    reuse = reuses_current_reanchor_receipt(
+        properties, receipt["new_hash"], receipt.get("signed_artifact_hash"),
+    )
+    history = validate_constitution_reanchor_evidence(properties, superseding=not reuse)
+    if reuse:
+        return dict(properties[CONSTITUTION_REANCHOR_KEY])
+    history = deepcopy(history)
     changed_at = recorded_at or utc_timestamp()
     existing = properties.get(CONSTITUTION_REANCHOR_KEY)
     if existing is not None:
