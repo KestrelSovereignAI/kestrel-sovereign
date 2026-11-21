@@ -2270,3 +2270,406 @@ async def test_a_chat_failure_keeps_an_observed_zero(stream):
     assert usage is not None
     assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (0, 0, 0)
     assert usage.cache_read_input_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# #4207: one receipt per provider attempt, kept on whatever error ends it
+# ---------------------------------------------------------------------------
+
+#: The three entry points whose provider facts arrive as stream events or
+#: chunks: Responses invoke reduces an internal stream (#4207).
+_STREAMED_ENTRIES = ["responses-invoke", "responses-stream", "chat-stream"]
+#: The chat usage the wire reports in this section, and the counts the
+#: service records from it: the cached prompt tokens are counted apart.
+_REPORTED_CHAT_USAGE = {
+    "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150,
+    "prompt_tokens_details": {"cached_tokens": 20},
+}
+
+
+def _entry(entry: str):
+    """``(stream, chat, model, served model, response id, tools)`` of an entry point."""
+    from tests.shared.openai_responses_wire import CHAT_MODEL, CHAT_SERVED
+
+    chat = entry.startswith("chat")
+    return (
+        entry.endswith("stream"), chat,
+        CHAT_MODEL if chat else MODEL, CHAT_SERVED if chat else SERVED,
+        "chatcmpl-test-end" if chat else "resp_test_end",
+        None if chat else TOOLS,
+    )
+
+
+def _evidence(error: BaseException):
+    served = provider_served(error)
+    usage = reported_usage(error)
+    counts = None if usage is None else (
+        usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens,
+    )
+    return (served.model if served else None, served.response_id if served else None, counts)
+
+
+@pytest.mark.parametrize("entry", _STREAMED_ENTRIES)
+@pytest.mark.parametrize("close_fails", [False, True], ids=["closing-succeeds", "closing-fails"])
+async def test_provider_evidence_survives_transport_and_native_cleanup(entry, close_fails, monkeypatch):
+    """The transport breaks after the provider's terminal event or usage
+    chunk, and then, with ``closing-fails``, closing the stream fails too.
+
+    The provider's model, id and usage were already reported, so whatever
+    error escapes carries them: the ordinary transport failure, or the
+    execution-control exception group closing raised. That group is raised
+    as itself, the very object the close raised, with its members, its
+    native cleanup debt and the stream it still owes (#4207); it is never
+    wrapped or replaced. No snapshot is kept for a reply never returned.
+    """
+    from kestrel_sovereign.execution_custody import (
+        execution_cleanup_debts,
+        is_execution_control_error,
+    )
+    from kestrel_sovereign.llm import openai_adapter
+    from tests.shared import openai_responses_wire as wiretypes
+
+    closes: List[Any] = []
+    if close_fails:
+        async def fail_close(body):
+            raise OSError("synthetic close failure after provider terminal event")
+
+        monkeypatch.setattr(wiretypes._DisconnectingBody, "aclose", fail_close)
+        real_close = openai_adapter.close_native_execution_stream
+
+        async def observed_close(stream, owner=None, **kwargs):
+            try:
+                await real_close(stream, owner, **kwargs)
+            except BaseException as raised:
+                closes.append((stream, raised, tuple(getattr(raised, "exceptions", ()))))
+                raise
+
+        monkeypatch.setattr(openai_adapter, "close_native_execution_stream", observed_close)
+    stream, chat, model, serving, response_id, tools = _entry(entry)
+    wire = ResponsesWire(
+        lambda body, index: Reply([message("msg_end", "Example")], response_id,
+                                  disconnect_after_terminal=True),
+        chat_script=lambda body, index: wiretypes.ChatReply(
+            "Example", response_id, usage=_REPORTED_CHAT_USAGE, disconnect_after_usage=True,
+        ),
+    )
+    async with wire.client() as client:
+        with responses_continuation_scope() as registry:
+            with pytest.raises(BaseException) as caught:
+                await _call(_adapter(), client, [USER], stream=stream, tools=tools, model=model)
+            assert not registry.snapshots(), "a reply never returned kept a snapshot"
+
+    error = caught.value
+    assert is_execution_control_error(error) == close_fails
+    assert _evidence(error) == (serving, response_id, (100, 30, 20))
+    if close_fails:
+        [(closed, raised, members)] = closes
+        assert error is raised, "the close's exception group was wrapped or replaced"
+        assert isinstance(error, BaseExceptionGroup)
+        assert len(error.exceptions) == len(members)
+        assert all(now is then for now, then in zip(error.exceptions, members))
+        debts = execution_cleanup_debts(error)
+        assert any(resource is closed for resource, _owner in debts), (
+            "the stream still owed its native retirement is no longer on the error"
+        )
+        assert reported_usage(error) is not None and provider_served(error) is not None
+    else:
+        assert not closes
+
+
+async def _receipts_opened(monkeypatch) -> List[Any]:
+    """Every :class:`ProviderAttemptReceipt` opened from now on, in order."""
+    from kestrel_sovereign.llm.provider_served import ProviderAttemptReceipt
+
+    opened: List[Any] = []
+    original = ProviderAttemptReceipt.__init__
+
+    def record(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        opened.append(self)
+
+    monkeypatch.setattr(ProviderAttemptReceipt, "__init__", record)
+    return opened
+
+
+def _receipt_evidence(receipt):
+    served, usage = receipt.served, receipt.usage
+    counts = None if usage is None else (
+        usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens,
+    )
+    return (served.model if served else None, served.response_id if served else None, counts)
+
+
+@pytest.mark.parametrize("entry", _STREAMED_ENTRIES)
+async def test_the_receipt_holds_each_fact_before_the_attempt_ends(entry, monkeypatch):
+    """The provider's stream reports its identity, its usage and, on the
+    Responses API, a ``prefix_mismatch``, then goes silent before it ends.
+
+    While the iterator is still open, before any exit runs, the attempt's
+    receipt already holds the model, the id and the usage, and the reported
+    mismatch has already retired the parent snapshot: each fact is recorded
+    as it arrives, not when the attempt ends (#4207). The caller then
+    cancels, and the cancellation carries the same receipt.
+    """
+    from tests.shared.openai_responses_wire import ChatReply
+
+    stream, chat, model, serving, response_id, tools = _entry(entry)
+    script = (
+        (lambda body, index: Reply([message("msg_end", "Example")], response_id, stall_after_terminal=True))
+        if chat else
+        (lambda body, index: _first_then_answer(body, index) if index == 0 else Reply(
+            [message("msg_2", "It is 42.")], response_id, extra=dict(_MISMATCH), stall_after_terminal=True,
+        ))
+    )
+    wire = ResponsesWire(script, chat_script=lambda body, index: ChatReply(
+        "Example", response_id, usage=_REPORTED_CHAT_USAGE, stall_after_usage=True,
+    ))
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope() as registry:
+            parent = None
+            if not chat:
+                await _call(adapter, client, [SYSTEM, USER], stream=stream)
+                [parent] = registry.snapshots()
+            opened = await _receipts_opened(monkeypatch)
+            messages = [USER] if chat else _history()
+            attempt = asyncio.create_task(
+                _call(adapter, client, messages, stream=stream, tools=tools, model=model)
+            )
+            await _until_silent(wire)
+
+            # Paused: the iterator has not exited.
+            assert not attempt.done()
+            [receipt] = opened
+            assert _receipt_evidence(receipt) == (serving, response_id, (100, 30, 20))
+            if not chat:
+                assert receipt.served.prefix_mismatch == ("rs_1",)
+                assert registry.retirement_of(parent) == "prefix_mismatch"
+                assert not registry.snapshots()
+
+            attempt.cancel()
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await attempt
+    assert wire.silent[-1].closed
+    assert _evidence(cancelled.value) == (serving, response_id, (100, 30, 20))
+
+
+async def test_a_chat_reply_is_recorded_before_its_tool_arguments_are_parsed(monkeypatch):
+    """An ordinary chat completion arrives whole: its model, id and usage are
+    on the attempt's receipt before the adapter parses any of it (#4207)."""
+    from kestrel_sovereign.llm import openai_adapter
+    from tests.shared.openai_responses_wire import CHAT_MODEL, CHAT_SERVED, ChatReply
+
+    seen: List[Any] = []
+    real_decode = openai_adapter.decode_tool_arguments
+
+    def decode(arguments):
+        seen.append(_receipt_evidence(opened[-1]))
+        return real_decode(arguments)
+
+    monkeypatch.setattr(openai_adapter, "decode_tool_arguments", decode)
+    wire = ResponsesWire(lambda body, index: Reply([], "unused"), chat_script=lambda body, index: ChatReply(
+        "Example", "chatcmpl-parsed", usage=_REPORTED_CHAT_USAGE, tool_arguments='{"key": "x"}',
+    ))
+    async with wire.client() as client:
+        opened = await _receipts_opened(monkeypatch)
+        result = await _adapter().get_response(client=client, model=CHAT_MODEL, messages=[USER], tools=TOOLS)
+    assert result.tool_calls and len(opened) == 1
+    assert seen == [(CHAT_SERVED, "chatcmpl-parsed", (100, 30, 20))]
+
+
+#: Two calls that overlap: each its own identity and usage.
+_OVERLAP = {
+    "A": {"response": "resp_overlap_a", "chat": "chatcmpl-overlap-a",
+          "usage": (100, 30, 20)},
+    "B": {"response": "resp_overlap_b", "chat": "chatcmpl-overlap-b",
+          "usage": (7, 3, 1)},
+}
+
+
+def _overlap_key(body: Dict[str, Any]) -> str:
+    return "A" if "call-A" in json.dumps(body) else "B"
+
+
+def _overlap_usage(key: str, chat: bool) -> Dict[str, Any]:
+    inputs, outputs, cached = _OVERLAP[key]["usage"]
+    if chat:
+        return {"prompt_tokens": inputs + cached, "completion_tokens": outputs,
+                "total_tokens": inputs + cached + outputs,
+                "prompt_tokens_details": {"cached_tokens": cached}}
+    return {"input_tokens": inputs + cached, "output_tokens": outputs,
+            "input_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": inputs + cached + outputs}
+
+
+@pytest.mark.parametrize("entry", [*_STREAMED_ENTRIES, "chat-invoke"])
+@pytest.mark.parametrize("close_fails", [False, True], ids=["closing-succeeds", "closing-fails"])
+async def test_overlapping_attempts_never_share_a_receipt(entry, close_fails, monkeypatch):
+    """Two public adapter calls run at once on one client, each served its
+    own identity and usage, and both fail while both are open: after the
+    terminal event or usage chunk (closing the stream failing too, with
+    ``closing-fails``), or, as an ordinary chat completion, with tool
+    arguments that are not JSON. Each error carries its own attempt's
+    receipt and never the other's (#4207).
+
+    An ordinary chat completion has no stream to close: ``closing-fails``
+    makes its body's close fail as the SDK reads it, before it decodes, and
+    then neither call supplied anything.
+    """
+    from tests.shared import openai_responses_wire as wiretypes
+
+    if close_fails:
+        async def fail_close(body):
+            raise OSError("synthetic close failure")
+
+        target = wiretypes._HeldBody if entry == "chat-invoke" else wiretypes._DisconnectingBody
+        monkeypatch.setattr(target, "aclose", fail_close, raising=False)
+    stream, chat, model, serving, _rid, tools = _entry(entry)
+    release = asyncio.Event()
+    wire = ResponsesWire(
+        lambda body, index: Reply(
+            [message("msg", "Example")], _OVERLAP[_overlap_key(body)]["response"],
+            usage=_overlap_usage(_overlap_key(body), chat=False), disconnect_after_terminal=True,
+        ),
+        chat_script=lambda body, index: wiretypes.ChatReply(
+            "Example", _OVERLAP[_overlap_key(body)]["chat"],
+            usage=_overlap_usage(_overlap_key(body), chat=True),
+            **({"tool_arguments": '{"key": '} if entry == "chat-invoke" else {"disconnect_after_usage": True}),
+        ),
+        release=release,
+    )
+    adapter = _adapter()
+
+    async def attempt(key: str) -> BaseException:
+        messages = [{"role": "user", "content": f"Look it up for call-{key}."}]
+        try:
+            await _call(adapter, client, messages, stream=stream, tools=TOOLS if entry == "chat-invoke" else tools,
+                        model=model)
+        except BaseException as error:  # noqa: BLE001 - the error is the subject
+            return error
+        raise AssertionError(f"call {key} did not fail")
+
+    async with wire.client() as client:
+        with responses_continuation_scope():
+            calls = {key: asyncio.create_task(attempt(key)) for key in _OVERLAP}
+
+            async def both_open():
+                while len(wire.held) < 2 or not all(body.waiting.is_set() for body in wire.held):
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(both_open(), timeout=10)
+            assert not any(task.done() for task in calls.values())
+            release.set()
+            errors = {key: await task for key, task in calls.items()}
+
+    undecoded = entry == "chat-invoke" and close_fails
+    for key, error in errors.items():
+        identity = _OVERLAP[key]["chat" if chat else "response"]
+        expected = (None, None, None) if undecoded else (serving, identity, _OVERLAP[key]["usage"])
+        assert _evidence(error) == expected, (key, error)
+    assert errors["A"] is not errors["B"]
+
+
+@pytest.mark.parametrize("entry", _STREAMED_ENTRIES)
+@pytest.mark.parametrize("control", [False, True], ids=["ordinary", "control-member"])
+async def test_an_explicit_nested_group_keeps_its_members_and_classification(entry, control, monkeypatch):
+    """Handling the reply raises an explicit, nested exception group after
+    the provider reported everything. The same group object escapes with its
+    members, carrying the attempt's receipt; a group with an execution-control
+    member stays control, and one without stays an ordinary failure (#4207)."""
+    from kestrel_sovereign.execution_custody import (
+        ExecutionAuthorityError,
+        is_execution_control_error,
+    )
+    from kestrel_sovereign.llm import openai_adapter
+    from kestrel_sovereign.llm.openai_responses import ResponsesEventState
+    from tests.shared.openai_responses_wire import ChatReply
+
+    inner = ExceptionGroup("inner", [ValueError("b")])
+    member = ExecutionAuthorityError("synthetic denial") if control else KeyError("a")
+    raised = BaseExceptionGroup("outer", [member, inner])
+    stream, chat, model, serving, response_id, tools = _entry(entry)
+    if chat:
+        class FailingSplitter(openai_adapter._ThinkingContentSplitter):
+            def flush(self):
+                raise raised
+
+        monkeypatch.setattr(openai_adapter, "_ThinkingContentSplitter", FailingSplitter)
+    else:
+        original = ResponsesEventState.observe
+
+        def observe(self, event):
+            if getattr(event, "type", None) == "response.trailing":
+                raise raised
+            return original(self, event)
+
+        monkeypatch.setattr(ResponsesEventState, "observe", observe)
+    wire = ResponsesWire(
+        lambda body, index: Reply([message("msg_end", "Example")], response_id,
+                                  after_terminal=[{"type": "response.trailing"}]),
+        chat_script=lambda body, index: ChatReply("Example", response_id, usage=_REPORTED_CHAT_USAGE),
+    )
+    async with wire.client() as client:
+        with pytest.raises(BaseException) as caught:
+            await _call(_adapter(), client, [USER], stream=stream, tools=tools, model=model)
+    error = caught.value
+    assert error is raised
+    assert error.exceptions[0] is member and error.exceptions[1] is inner
+    assert inner.exceptions[0].__class__ is ValueError
+    assert is_execution_control_error(error) is control
+    assert _evidence(error) == (serving, response_id, (100, 30, 20))
+
+
+@pytest.mark.parametrize("ending", ["truncated", "close-fails"])
+async def test_a_chat_body_that_never_decoded_supplied_nothing(ending, monkeypatch):
+    """An ordinary chat completion's body arrives but never decodes: cut off
+    mid-JSON, or its close failing as the SDK reads it. The bytes held the
+    reply's model, id and usage, but the adapter never had a reply, so the
+    error carries none of them: unknown, never inferred (#4207)."""
+    import httpx
+    import openai
+
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    from tests.shared.openai_responses_wire import CHAT_MODEL, ChatReply
+
+    reply = json.dumps(ChatReply("Example", "chatcmpl-undecoded", usage=_REPORTED_CHAT_USAGE).completion())
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield (reply[: len(reply) // 2] if ending == "truncated" else reply).encode()
+
+        async def aclose(self):
+            if ending == "close-fails":
+                raise OSError("synthetic close failure")
+
+    def handle(request):
+        return httpx.Response(200, headers={"content-type": "application/json"}, stream=Body())
+
+    client = openai.AsyncOpenAI(
+        api_key="test-key", base_url="https://api.openai.com/v1", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+    )
+    if ending == "truncated":
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda _delay, *args, **kwargs: real_sleep(0))
+    async with client:
+        opened = await _receipts_opened(monkeypatch)
+        with pytest.raises(BaseException) as caught:
+            await _adapter().get_response(client=client, model=CHAT_MODEL, messages=[USER], tools=TOOLS)
+    assert is_execution_control_error(caught.value) is (ending == "close-fails")
+    assert _evidence(caught.value) == (None, None, None)
+    assert [_receipt_evidence(receipt) for receipt in opened] == [(None, None, None)]
+
+
+@STREAM
+async def test_a_chat_failure_with_no_usage_report_keeps_it_unknown(stream):
+    """The reply named itself but reported no usage before the attempt
+    failed: the identity is kept and the usage stays unknown, never zero."""
+    from tests.shared.openai_responses_wire import CHAT_MODEL, CHAT_SERVED
+
+    wire = _chat_wire(usage=None, tool_arguments='{"key": ')
+    async with wire.client() as client:
+        with pytest.raises(GenerationProtocolError) as raised:
+            await _call(_adapter(), client, [USER], stream=stream, tools=TOOLS, model=CHAT_MODEL)
+    assert _evidence(raised.value) == (CHAT_SERVED, _CHAT_ID, None)

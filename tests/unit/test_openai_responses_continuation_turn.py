@@ -855,3 +855,262 @@ async def test_a_cancelled_chat_default_attempt_is_not_recorded_as_failed(
     assert bool(request.get("stream")) is (path == "stream")
     assert wire.silent[0].closed
     assert [row for row in llm_rows if row["model"] == CHAT_MODEL] == []
+
+
+# ---------------------------------------------------------------------------
+# #4207: one receipt per provider attempt, in the shipped turn loop
+# ---------------------------------------------------------------------------
+
+
+def _receipts_opened(monkeypatch) -> List[Any]:
+    """Every :class:`ProviderAttemptReceipt` opened from now on, in order."""
+    from kestrel_sovereign.llm.provider_served import ProviderAttemptReceipt
+
+    opened: List[Any] = []
+    original = ProviderAttemptReceipt.__init__
+
+    def record(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        opened.append(self)
+
+    monkeypatch.setattr(ProviderAttemptReceipt, "__init__", record)
+    return opened
+
+
+@PATHS
+async def test_serial_host_and_feature_attempts_each_have_their_own_receipt(
+    tmp_path, monkeypatch, fresh_token, llm_rows, path,
+):
+    """The measured turn: the host dispatches the feature, whose subagent
+    calls the model twice on its own chain, then the host calls it twice
+    more (#4198 issuecomment-7059761462). At most one native request is open
+    at any moment, each request is its own attempt with its own receipt,
+    and each receipt and each attempt's row names the reply that request was
+    served, never another's (#4207). Re-entrant, in-flight parent/child
+    requests do not occur on this path and are not assumed."""
+    from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+
+    events: List[Any] = []
+    active: set = set()
+    counter = 0
+    real = OpenAIAdapter._responses_events
+
+    @functools.wraps(real)
+    async def observed(self, *args, **kwargs):
+        nonlocal counter
+        counter += 1
+        index = counter
+        events.append(("start", index, sorted(active)))
+        active.add(index)
+        try:
+            async with contextlib.aclosing(real(self, *args, **kwargs)) as iterator:
+                async for item in iterator:
+                    yield item
+        finally:
+            active.remove(index)
+            events.append(("end", index, sorted(active)))
+
+    monkeypatch.setattr(OpenAIAdapter, "_responses_events", observed)
+    opened = _receipts_opened(monkeypatch)
+    wire = ResponsesWire(_discovery_script)
+    async with _agent(tmp_path, monkeypatch, wire, name="Attempts") as agent:
+        result = await _turn(agent, path, "How are you?", f"attempts-{path}", OVERRIDE)
+
+    assert fresh_token in result
+    roles = ["host" if _main(json.loads(body)) else "feature" for body in wire.raw()]
+    assert roles == ["host", "feature", "feature", "host", "host"]
+    assert counter == len(roles) and active == set()
+    assert max(len(open_others) + 1 for kind, _, open_others in events if kind == "start") == 1
+    # One receipt per request, each holding the reply its request was served.
+    assert len(opened) == len(wire.issued) == len(roles)
+    assert len({id(receipt) for receipt in opened}) == len(opened)
+    assert [(receipt.served.model, receipt.served.response_id) for receipt in opened] == wire.issued
+    assert len({response_id for _model, response_id in wire.issued}) == len(roles)
+    assert [(served.get("model"), served.get("response_id")) for served in _served(llm_rows)] == wire.issued
+
+
+#: How an attempt ends after its provider reported its identity and usage,
+#: and whether the service then records the attempt and bills its usage
+#: (#4207). Genuine failures are recorded and billed once, as before; an
+#: intentional cancellation and execution control are neither recorded as a
+#: failed attempt nor billed.
+_ACCOUNTED_EXITS = {
+    "provider_failure": True,
+    "nested_group": True,
+    "caller_cancel": False,
+    "close_fails": False,
+    "nested_control": False,
+}
+_ACCOUNTING_CASES = [
+    pytest.param(route, path, exit_, id=f"{route}-{path}-{exit_}")
+    for route in ("responses", "chat")
+    for path in ("invoke", "stream")
+    for exit_ in _ACCOUNTED_EXITS
+]
+_METERED = dict(companion_id="companion-4207", user_id="user-4207")
+_CHAT_USAGE = {
+    "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150,
+    "prompt_tokens_details": {"cached_tokens": 20},
+}
+
+
+def _accounting_wire(route: str, path: str, exit_: str) -> ResponsesWire:
+    if route == "responses":
+        ending = {
+            "provider_failure": {"disconnect_after_terminal": True},
+            "close_fails": {"disconnect_after_terminal": True},
+            "caller_cancel": {"stall_after_terminal": True},
+        }.get(exit_, {"after_terminal": [{"type": "response.trailing"}]})
+        return ResponsesWire(lambda body, index: Reply([message("msg", "Done.")], f"resp_acct_{index}", **ending))
+    chat_ending = {
+        # An ordinary completion has no stream: its genuine failure is a
+        # decoded reply whose tool arguments are not JSON.
+        "provider_failure": (
+            {"disconnect_after_usage": True} if path == "stream" else {"tool_arguments": '{"key": '}
+        ),
+        # An ordinary completion's body is read whole by the SDK, and its
+        # close fails as it is read, before the reply decodes.
+        "close_fails": {"disconnect_after_usage": True} if path == "stream" else {"close_fails": True},
+        "caller_cancel": {"stall_after_usage": True},
+    }.get(exit_, {})
+    return ResponsesWire(
+        lambda body, index: Reply([], "unused"),
+        chat_script=lambda body, index: ChatReply(
+            "Done.", f"chatcmpl-acct-{index}", usage=_CHAT_USAGE, **chat_ending,
+        ),
+    )
+
+
+def _fail_handling(monkeypatch, route: str, path: str, exit_: str) -> None:
+    """Make the adapter's own handling raise an explicit nested group once
+    the provider has reported everything."""
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from kestrel_sovereign.llm import openai_adapter
+    from kestrel_sovereign.llm.openai_responses import ResponsesEventState
+
+    def group() -> BaseExceptionGroup:
+        member = ExecutionAuthorityError("synthetic denial") if exit_ == "nested_control" else KeyError("a")
+        return BaseExceptionGroup("outer", [member, ExceptionGroup("inner", [ValueError("b")])])
+
+    if route == "responses":
+        original = ResponsesEventState.observe
+
+        def observe(self, event):
+            if getattr(event, "type", None) == "response.trailing":
+                raise group()
+            return original(self, event)
+
+        monkeypatch.setattr(ResponsesEventState, "observe", observe)
+    elif path == "stream":
+        class FailingSplitter(openai_adapter._ThinkingContentSplitter):
+            def flush(self):
+                raise group()
+
+        monkeypatch.setattr(openai_adapter, "_ThinkingContentSplitter", FailingSplitter)
+    else:
+        def split(*_args, **_kwargs):
+            raise group()
+
+        monkeypatch.setattr(openai_adapter, "_split_thinking_from_content", split)
+
+
+@pytest.mark.parametrize("route, path, exit_", _ACCOUNTING_CASES)
+async def test_only_genuine_failures_are_recorded_and_billed(
+    tmp_path, monkeypatch, llm_rows, route, path, exit_,
+):
+    """The provider reported its identity and usage, then the attempt ended:
+    a genuine provider or parsing failure, an explicit ordinary exception
+    group, the caller's cancellation, a transport failure whose stream then
+    failed to close (execution control), or a group with an
+    execution-control member.
+
+    Whatever error escapes the adapter carries the attempt's receipt, of the
+    kind it was raised as (#4207), but that decides nothing about
+    accounting. Checked at both the ``llm_calls``
+    writer and the metering callback: a genuine failure is recorded as one
+    failed attempt with the reported counts and billed once; a cancellation
+    or execution control writes no failed or billable row and bills nothing.
+    """
+    import asyncio
+
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    from kestrel_sovereign.llm.output_ceiling import reported_usage
+    from kestrel_sovereign.llm.provider_served import ProviderAttemptReceipt, provider_served
+    from tests.shared import openai_responses_wire as wiretypes
+
+    retained: List[BaseException] = []
+    original_retain = ProviderAttemptReceipt.retain
+
+    def retain(self, error):
+        retained.append(error)
+        return original_retain(self, error)
+
+    monkeypatch.setattr(ProviderAttemptReceipt, "retain", retain)
+    if exit_ == "close_fails":
+        async def fail_close(body):
+            raise OSError("synthetic close failure after the provider's usage")
+
+        monkeypatch.setattr(wiretypes._DisconnectingBody, "aclose", fail_close)
+    if exit_.startswith("nested"):
+        _fail_handling(monkeypatch, route, path, exit_)
+    bills: List[Dict[str, Any]] = []
+
+    async def meter(*, companion_id, user_id, provider, model, prompt_tokens, completion_tokens):
+        bills.append(dict(model=model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens))
+
+    wire = _accounting_wire(route, path, exit_)
+    session = f"acct-{route}-{path}-{exit_}"
+    model = MODEL if route == "responses" else CHAT_MODEL
+    configured = CONFIGURED if route == "responses" else CHAT_MODEL
+    override = OVERRIDE if route == "responses" else None
+    async with _agent(tmp_path, monkeypatch, wire, name="Accounting", configured=configured) as agent:
+        agent.llm_service.set_metering_callback(meter)
+        agent.llm_service.set_observability_context(session_id=session, **_METERED)
+        if exit_ == "caller_cancel":
+            turn = asyncio.create_task(_turn(agent, path, "How are you?", session, override))
+
+            async def silent():
+                while not wire.silent:
+                    await asyncio.sleep(0.01)
+                await wire.silent[0].stalled.wait()
+
+            try:
+                await asyncio.wait_for(silent(), timeout=10)
+            finally:
+                turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await turn
+        else:
+            with pytest.raises(Exception):
+                await _turn(agent, path, "How are you?", session, override)
+
+    assert not wire.unexpected
+    escaped = retained[-1]
+    assert is_execution_control_error(escaped) is (exit_ in ("close_fails", "nested_control"))
+    # An ordinary completion's body that never decoded, or never arrived,
+    # supplied nothing.
+    undecoded = route == "chat" and path == "invoke" and exit_ in ("close_fails", "caller_cancel")
+    served, usage = provider_served(escaped), reported_usage(escaped)
+    if undecoded:
+        assert served is None and usage is None
+    else:
+        assert served.response_id == wire.issued[-1][1]
+        assert (usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens) == (100, 30, 20)
+    rows = [row for row in llm_rows if row["model"] == model]
+    model_bills = [bill for bill in bills if bill["model"] == model]
+    if _ACCOUNTED_EXITS[exit_]:
+        assert rows, llm_rows
+        for row in rows:
+            assert row["success"] is False
+            counts = (row["input_tokens"], row["output_tokens"], row["cache_read_input_tokens"])
+            assert counts == (100, 30, 20), counts
+            assert row["usage_available"] is True
+        # Billed once per recorded attempt, at the original signature, which
+        # folds the cached tokens back into the prompt.
+        assert model_bills == [dict(model=model, prompt_tokens=120, completion_tokens=30)] * len(rows)
+    else:
+        # Neither the writer recorded a failed or billable row, nor did the
+        # metering callback bill anything.
+        assert (rows, model_bills) == ([], []), (
+            "a cancelled or execution-control attempt was recorded or billed"
+        )
