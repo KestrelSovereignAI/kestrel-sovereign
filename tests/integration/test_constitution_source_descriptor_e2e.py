@@ -359,13 +359,27 @@ async def test_offline_reanchor_resolves_the_source_from_the_agents_environment(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("active", [False, True], ids=["dormant", "active"])
+@pytest.mark.parametrize(
+    "path, active, rotated",
+    [("offline", True, False), ("live", False, False),
+     ("offline", False, True), ("live", False, True)],
+)
 async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition(
-    tmp_path, operator_dir, active
+    tmp_path, operator_dir, path, active, rotated, monkeypatch,
 ):
     from kestrel_sovereign.config import CONSTITUTION_PATH
     from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
     from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.constitution.transition import (
+        TRANSITION_PURPOSE, build_rotated_transition, build_transition,
+    )
+    from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+    from kestrel_sovereign.identity.signing import get_key_id
+    from kestrel_sovereign.security.crypto_suite import ALG_SLH_DSA_SHA2_128S, Keypair
+    from kestrel_sovereign.security.key_storage import SecureKeyStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    from tests.integration.test_constitution_reanchor_e2e import _RuntimeAgentHarness, _snapshot
+    from tests.shared.rotation_ceremony import build_post_ceremony_template
 
     contract = EmancipationContract(
         enabled=True,
@@ -375,7 +389,8 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     ) if active else None
     agent_dir = tmp_path / "agent_data" / "Adopter"
     credentials = await create_kestrel_identity_async(
-        output_dir=str(agent_dir), agent_name="Adopter", emancipation_contract=contract
+        output_dir=str(agent_dir), agent_name="Adopter", emancipation_contract=contract,
+        identity_method="did:pkh",
     )
     legacy_source = Path(CONSTITUTION_PATH).read_bytes()
     legacy_bytes = resolve_governing_constitution_bytes(contract, content=legacy_source)
@@ -391,12 +406,19 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     descriptor = _descriptor_file(operator_dir, source, v2_base)
     trust_root = operator_dir / "sovereign-root.did.json"
     artifact_path = operator_dir / "v2-adoption.signed.json"
-    artifact_path.write_text(json.dumps(build_legacy_signed_reanchor_artifact(
-        signer_did=_ROOT_DID,
-        constitution_sha256=_sha(v2_rendered),
-        private_key=_ROOT_KEYPAIR.private_key,
-        reason="integration test adoption of edition 2",
-    )), encoding="utf-8")
+    def make_artifact(transition=None):
+        return build_legacy_signed_reanchor_artifact(
+            signer_did=_ROOT_DID,
+            constitution_sha256=_sha(v2_rendered),
+            private_key=_ROOT_KEYPAIR.private_key,
+            reason="integration test adoption of edition 2",
+            transition=transition,
+        )
+
+    def write_artifact(artifact):
+        artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    write_artifact(make_artifact())
 
     # Staging signed files leaves the default audit on immutable legacy bytes.
     ok, message = await _verify(credentials, command_hash=_sha(legacy_bytes))
@@ -422,12 +444,64 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
         "constitution_hash"
     ] == _sha(legacy_bytes)
 
-    adopted = await reanchor_constitution(
-        agent_name="Adopter", agent_dir=agent_dir, source_descriptor_path=descriptor,
-        sovereign_trust_root_path=trust_root, force=True, amendment_artifact_path=artifact_path,
-    )
-    assert adopted.reanchored, adopted.error
-    assert adopted.new_hash == _sha(v2_rendered)
+    async def attempt():
+        if path == "live":
+            async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as raw:
+                agent = _RuntimeAgentHarness(
+                    PrivacyEnforcingStorage(raw), credentials.agent_did, trust_root, raw
+                )
+                agent.storage_path = credentials.db_path
+                agent._constitution_source_descriptor_path = descriptor
+                answer = await agent.reanchor_constitution(amendment_artifact_path=str(artifact_path))
+                return "re-anchored successfully" in answer.lower(), answer
+
+        result = await reanchor_constitution(
+            agent_name="Adopter", agent_dir=agent_dir, source_descriptor_path=descriptor,
+            sovereign_trust_root_path=trust_root, force=True, amendment_artifact_path=artifact_path,
+        )
+        if not result.reanchored:
+            assert result.backup_path is None
+        return result.reanchored, result.error
+
+    before_denial = await _snapshot(Path(credentials.db_path), credentials.agent_did)
+    accepted, message = await attempt()
+    assert not accepted and "Genesis-verifiable" in message
+    assert await _snapshot(Path(credentials.db_path), credentials.agent_did) == before_denial
+
+    key_id = get_key_id(credentials.agent_did)
+    key_storage = SecureKeyStorage(storage_dir=agent_dir)
+    genesis_key = key_storage.load_private_key(key_id)
+    intent = {
+        "purpose": TRANSITION_PURPOSE,
+        "target_did": credentials.agent_did,
+        "sovereign_did": _ROOT_DID,
+        "prior_sha256": _sha(legacy_bytes),
+        "constitution_sha256": _sha(v2_rendered),
+        "source_sha256": _sha(v2_base),
+        "publisher_commit": "1" * 40,
+    }
+    if rotated:
+        build_post_ceremony_template(
+            agent_dir,
+            legacy_keypair=Keypair(
+                suite_id=_SUITE.alg_id, private_key=genesis_key, public_key=genesis_key.public_key(),
+            ),
+        )
+        # The fixture models the runtime after Genesis key retirement, using
+        # public lineage plus active hybrid private keys only.
+        key_storage._get_key_path(key_id).unlink()
+        identity = load_agent_identity(key_id, storage_dir=agent_dir)
+        doc = {"id": identity.signing_did, "verificationMethod": identity.new_verification_methods}
+        monkeypatch.setattr("kestrel_sovereign.identity.did_web.resolve", lambda did: doc)
+        transition = build_rotated_transition(
+            intent, identity=identity, archival_scheme=ALG_SLH_DSA_SHA2_128S,
+            archival_multibase=identity.succession_statement.archival_verification_method["publicKeyMultibase"],
+        )
+    else:
+        transition = build_transition(intent, genesis_private_key=genesis_key)
+    write_artifact(make_artifact(transition))
+    accepted, message = await attempt()
+    assert accepted, message
 
     after = await _agent_properties(credentials.db_path, credentials.agent_did)
     assert after["constitution_reanchor"]["old_hash"] == _sha(legacy_bytes)

@@ -2525,6 +2525,7 @@ class ConstitutionMixin:
             if is_execution_control_error(exc):
                 raise
             return f"Error: Cannot inspect historical governance: {exc}; nothing was written."
+        anchored_text = None
         if historical_hash and historical_hash != "none":
             from kestrel_sovereign.constitution.anchored_bytes import (
                 read_anchored_constitution,
@@ -2605,6 +2606,8 @@ class ConstitutionMixin:
             load_verified_reanchor_artifact,
         )
 
+        from kestrel_sovereign.constitution.transition import verify_transition_adoption
+
         artifact_path_used = str(amendment_artifact_path)
         try:
             (
@@ -2615,6 +2618,20 @@ class ConstitutionMixin:
                 amendment_artifact_path,
                 trusted_did_document=trusted_did_document,
                 expected_constitution_sha256=new_hash,
+            )
+            storage_path = getattr(self, "storage_path", None)
+            await asyncio.to_thread(
+                verify_transition_adoption,
+                artifact=amendment_artifact,
+                trusted_did_document=trusted_did_document,
+                target_did=self.agent_id,
+                prior_hash=historical_hash,
+                prior_text=anchored_text,
+                anchored_contract=reanchor_contract,
+                new_text=constitution_content.decode("utf-8"),
+                new_hash=new_hash,
+                source_hash=governing_source.content_sha256,
+                identity_directory=Path(storage_path).parent if storage_path else None,
             )
         except AmendmentArtifactError as exc:
             logging.critical(

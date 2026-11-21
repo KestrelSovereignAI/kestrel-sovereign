@@ -64,6 +64,9 @@ def test_v2_default_is_dormant_and_active_render_preserves_every_source_byte():
     "rewrite",
     [
         lambda text: text.replace("constitution_version: 2", "constitution_version: 3"),
+        lambda text: text.replace("constitution_version: 2\n", ""),
+        lambda text: text.replace("constitution_version: 2", "constitution_version: 1"),
+        lambda text: text + "\n### Amendment VIII: Emancipation\n",
         lambda text: text.replace("### Emancipation", "#### Emancipation"),
         lambda text: text + "\n### Emancipation\n",
         lambda text: text.replace("### Authority on the host", "### A heading with no mapped grant clause"),

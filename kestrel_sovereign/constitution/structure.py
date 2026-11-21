@@ -57,6 +57,8 @@ _PARENTS = {
 _FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(?P<body>.*?)^---[ \t]*\r?$", re.M | re.S)
 _VERSION = re.compile(r"^constitution_version[ \t]*:[ \t]*([^\r\n]*)", re.M)
 _HEADING = re.compile(r"^(#{1,6})[ \t]+([^\r\n]+?)[ \t]*\r?$", re.M)
+_LEGACY_HEADING = re.compile(r"^(?:## Book [IVX]+:|### Amendment [IVX]+:)", re.M)
+_V2_FINGERPRINT = (f"## {Section.HIERARCHY.value}", f"### {Section.HOST.value}")
 
 
 @dataclass(frozen=True)
@@ -72,20 +74,23 @@ class SectionSpan:
 def constitution_version(text: str) -> int:
     """Return the schema named in the signed bytes; unmarked text is legacy."""
     metadata = _FRONTMATTER.match(text)
-    if metadata is None:
-        return 1
-    versions = _VERSION.findall(metadata["body"])
-    if not versions:
-        return 1
-    if len(versions) != 1 or versions[0].strip() not in {"1", "2"}:
+    versions = _VERSION.findall(metadata["body"]) if metadata is not None else []
+    if len(versions) > 1 or (versions and versions[0].strip() not in {"1", "2"}):
         raise ConstitutionVersionError("Expected one supported constitution_version (1 or 2)")
-    return int(versions[0].strip())
+    version = int(versions[0].strip()) if versions else 1
+    if version == 1 and all(marker in text for marker in _V2_FINGERPRINT):
+        if all(re.search(rf"(?m)^{re.escape(marker)}[ \t]*\r?$", text) for marker in _V2_FINGERPRINT):
+            raise ConstitutionVersionError("Edition 2 headings require constitution_version: 2")
+    return version
 
 
 def v2_sections(text: str) -> dict[Section, SectionSpan]:
     """Find v2 clauses without normalizing or replacing their original text."""
     metadata = _FRONTMATTER.match(text)
-    headings = list(_HEADING.finditer(text, metadata.end() if metadata else 0))
+    body_start = metadata.end() if metadata else 0
+    if _LEGACY_HEADING.search(text, body_start):
+        raise ConstitutionVersionError("Edition 2 cannot include legacy Book or Amendment headings")
+    headings = list(_HEADING.finditer(text, body_start))
     sections = {}
     parent = None
     section_by_title = {section.value: section for section in Section}

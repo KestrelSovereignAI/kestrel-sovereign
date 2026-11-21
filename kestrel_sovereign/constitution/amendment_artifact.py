@@ -50,6 +50,8 @@ def canonical_amendment_bytes(artifact: Mapping[str, Any]) -> bytes:
         "created_at": artifact.get("created_at"),
         "reason": artifact.get("reason", ""),
     }
+    if "transition" in artifact:
+        signed_fields["transition"] = artifact["transition"]
     return json.dumps(
         signed_fields,
         sort_keys=True,
@@ -66,6 +68,7 @@ def build_legacy_signed_reanchor_artifact(
     created_at: Optional[str] = None,
     reason: str = "",
     kid: str = "keys-1",
+    transition: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a detached ECDSA-signed reanchor artifact for operator tooling."""
     artifact: dict[str, Any] = {
@@ -77,6 +80,8 @@ def build_legacy_signed_reanchor_artifact(
         "created_at": created_at or datetime.now(timezone.utc).isoformat(),
         "reason": reason,
     }
+    if transition is not None:
+        artifact["transition"] = dict(transition)
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
     sig = suite.sign(canonical_amendment_bytes(artifact), private_key)
     artifact["signature"] = {
@@ -96,6 +101,7 @@ def build_hybrid_signed_reanchor_artifact(
     reason: str = "",
     classical_kid: str = "key-1",
     pq_kid: str = "key-2",
+    transition: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a detached hybrid-signed reanchor artifact for operator tooling."""
     artifact: dict[str, Any] = {
@@ -107,6 +113,8 @@ def build_hybrid_signed_reanchor_artifact(
         "created_at": created_at or datetime.now(timezone.utc).isoformat(),
         "reason": reason,
     }
+    if transition is not None:
+        artifact["transition"] = dict(transition)
     artifact["signatures"] = sign_hybrid(
         canonical_amendment_bytes(artifact),
         keypair,

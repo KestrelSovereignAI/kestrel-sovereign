@@ -254,8 +254,7 @@ def resolve_governing_constitution_bytes(
         return apply_emancipation(content.decode("utf-8"), contract).encode("utf-8")
     # Validate versioned source structure even for dormant agents, before
     # the bytes can be signed or audited as interpretable v2 text.
-    if content.startswith(b"---"):
-        text = content.decode("utf-8")
-        if constitution_version(text) == 2:
-            v2_sections(text)
+    text = content.decode("utf-8", errors="surrogateescape")
+    if constitution_version(text) == 2:
+        v2_sections(content.decode("utf-8"))
     return content

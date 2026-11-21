@@ -639,6 +639,23 @@ def _find_succession_statement(storage_dir: Path) -> Optional[Path]:
     return candidates[0]
 
 
+def read_recorded_succession(storage_dir: Path) -> Optional[SuccessionStatement]:
+    """Read the local public rotation evidence without loading private keys."""
+    # Unlike the historical finder, explicitly distinguish an unreadable
+    # directory from an absent record before allowing a raw Genesis proof.
+    directory = storage_dir / "successions"
+    try:
+        directory.stat()
+    except FileNotFoundError:
+        return None
+    if not directory.is_dir():
+        raise RuntimeIdentityError(f"{directory} is not a succession directory")
+    path = _find_succession_statement(storage_dir)
+    if path is None:
+        return None
+    return SuccessionStatement.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
 def _load_hybrid_part(
     storage: SecureKeyStorage,
     storage_dir: Path,
@@ -1024,4 +1041,5 @@ __all__ = [
     "IdentityReadinessError",
     "RuntimeIdentityError",
     "load_agent_identity",
+    "read_recorded_succession",
 ]

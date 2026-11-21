@@ -394,6 +394,7 @@ def verify_chain_signatures(
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
     trusted_archival_multibase: Optional[str] = None,
+    historical_archival_verifier: Optional[Callable[..., bool]] = None,
     did_web_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
 ) -> ChainSignaturesResult:
     """Verify every statement in the chain individually.
@@ -431,6 +432,7 @@ def verify_chain_signatures(
             successor_policy=successor_policy,
             require_archival=require_archival,
             trusted_archival_multibase=trusted_archival_multibase,
+            historical_archival_verifier=historical_archival_verifier,
             did_web_resolver=chain_resolver,
         )
         per_results.append(r)
@@ -502,6 +504,7 @@ def verify_artifact_against_chain(
     verify_chain: bool = True,
     require_archival: bool = False,
     trusted_archival_multibase: Optional[str] = None,
+    historical_archival_verifier: Optional[Callable[..., bool]] = None,
     did_web_resolver: Optional[Callable[[str], Mapping]] = None,
 ) -> ArtifactChainVerifyResult:
     """Verify an artifact's signatures against the active identity at
@@ -588,6 +591,7 @@ def verify_artifact_against_chain(
             chain,
             require_archival=require_archival,
             trusted_archival_multibase=trusted_archival_multibase,
+            historical_archival_verifier=historical_archival_verifier,
             did_web_resolver=did_web_resolver,
         )
     else:

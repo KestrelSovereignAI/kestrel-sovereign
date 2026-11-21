@@ -751,6 +751,7 @@ def verify_succession(
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
     trusted_archival_multibase: Optional[str] = None,
+    historical_archival_verifier: Optional[Callable[..., bool]] = None,
     did_web_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
 ) -> SuccessionVerifyResult:
     """Verify a succession statement end-to-end.
@@ -872,11 +873,21 @@ def verify_succession(
                 alg_ids_seen=frozenset(),
             )
         else:
-            archival_result = verify_signature_entries(
-                payload,
-                [statement.archival_signature],
-                [statement.archival_verification_method],
-            ).evaluate(VerifyPolicy.PQ_REQUIRED)
+            if historical_archival_verifier is None:
+                archival_result = verify_signature_entries(
+                    payload,
+                    [statement.archival_signature],
+                    [statement.archival_verification_method],
+                ).evaluate(VerifyPolicy.PQ_REQUIRED)
+            else:
+                ok = bool(trusted_archival_multibase) and historical_archival_verifier(
+                    statement, trusted_archival_multibase=trusted_archival_multibase,
+                )
+                archival_result = PolicyResult(
+                    ok=ok,
+                    reason="Historical archival signature valid" if ok else "Historical archival signature failed",
+                    alg_ids_seen=frozenset({ALG_SLH_DSA_SHA2_128S}) if ok else frozenset(),
+                )
             # Guard: archival sig must specifically be SLH-DSA-128s, not
             # any post-quantum suite. Otherwise a future caller could
             # countersign with ML-DSA-65 and still pass PQ_REQUIRED.

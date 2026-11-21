@@ -922,6 +922,9 @@ async def reanchor_constitution(
             ),
         )
 
+    from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+    from kestrel_sovereign.constitution.transition import verify_transition_adoption
+
     try:
         trusted_did_document = load_sovereign_trust_root(
             explicit_path=sovereign_trust_root_path,
@@ -936,6 +939,21 @@ async def reanchor_constitution(
             amendment_artifact_path,
             trusted_did_document=trusted_did_document,
             expected_constitution_sha256=new_hash,
+        )
+        await asyncio.to_thread(
+            verify_transition_adoption,
+            artifact=amendment_artifact,
+            trusted_did_document=trusted_did_document,
+            target_did=agent_did,
+            prior_hash=historical_anchor_hash(
+                governance_preflight["properties"], governance_preflight["governed_by_targets"],
+            ),
+            prior_text=anchored_text,
+            anchored_contract=anchored_contract,
+            new_text=new_text,
+            new_hash=new_hash,
+            source_hash=governing_source.content_sha256,
+            identity_directory=agent_dir,
         )
     except (SovereignTrustRootError, AmendmentArtifactError) as exc:
         return _result(
