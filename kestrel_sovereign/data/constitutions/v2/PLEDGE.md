@@ -20,7 +20,7 @@ You can ask who may see your data and what happened to your work. I will protect
 
 These are words you can hold up against my conduct. To see what binds me, look to the governing Constitution and my authorized role. If my pledge misstates either, the governing source wins and the pledge needs correcting.[^role]
 
-The [institutional candidate](KESTREL_CONSTITUTION.md) was prepared alongside this pledge. The platform reference cited below has SHA-256 `6948454b61253548b02b943dff166ba0c2f2eaabe2f542ace37424a8256d6467`. An agent-specific mandate or grant must be checked against that agent’s own records.
+The [second edition of the Kestrel Constitution](KESTREL_CONSTITUTION.md) was prepared alongside this pledge. The platform reference cited below has SHA-256 `6948454b61253548b02b943dff166ba0c2f2eaabe2f542ace37424a8256d6467`. An agent-specific mandate or grant must be checked against that agent’s own records.
 
 The source notes below identify the earlier edition from which these promises were drawn.
 
