@@ -14,6 +14,7 @@ from kestrel_sovereign.constitution.emancipation import (
     extract_amendment_viii,
     unwitnessed_emancipation_downgrade,
 )
+from kestrel_sovereign.constitution.grants import unavailable_host_grants
 from kestrel_sovereign.constitution.hierarchy import (
     ConstitutionalLayer,
     LayeredConstitution,
@@ -116,6 +117,7 @@ async def test_versioned_public_tool_keeps_legacy_addresses_exact_original_and_s
     agent = SimpleNamespace(
         constitution_text="### Amendment IX\n- [x] filesystem_write\n",
         constitution_overlay_verified=True,
+        _constitution_host_grant_baseline=unavailable_host_grants(),
         _get_original_governing_constitution=AsyncMock(return_value=text),
         _get_governing_constitution=AsyncMock(
             return_value=text + "\n\n--- APP AMENDMENTS ---\n### Emancipation\nRuntime addition."
@@ -126,8 +128,8 @@ async def test_versioned_public_tool_keeps_legacy_addresses_exact_original_and_s
     permissions = await tool.execute(**tool.parse_command_args(named_command))
     legacy = await tool.execute(article="amendment", search=9)
     assert legacy["data"] == permissions["data"]
-    assert permissions["data"]["effective_grants"] == ["filesystem_write"]
-    assert ComputerUseFeature(agent)._constitution_allows("filesystem_write")
+    assert permissions["data"]["effective_grants"] == []
+    assert not ComputerUseFeature(agent)._constitution_allows("filesystem_write")
     assert not parse_amendment_ix_grants(text)
     assert permissions["data"]["base_text"] == v2_sections(text)[Section.HOST].extract(text)
     assert permissions["data"]["base_sha256"] == hashlib.sha256(text.encode()).hexdigest()
