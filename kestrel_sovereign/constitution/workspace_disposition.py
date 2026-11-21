@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from .amendment_artifact import AmendmentArtifactError, verify_detached_signature
@@ -41,16 +40,13 @@ class WorkspacePathPolicy:
     def from_policy(cls, policy: PathPolicy) -> WorkspacePathPolicy:
         from kestrel_sovereign.features.computer_use.path_safety import path_pattern_identity
 
-        def fingerprints(patterns, *, require_absolute=False):
-            if require_absolute and any(not Path(pattern).expanduser().is_absolute() for pattern in patterns):
-                raise AmendmentArtifactError("Signed workspace policy requires absolute native allow selectors")
+        def fingerprints(patterns):
+            # Use the native identity even for relative selectors. An existing
+            # prefix resolves to its absolute path. A missing prefix retains
+            # the relative literal until it starts matching an absolute path.
             return frozenset(_fingerprint(path_pattern_identity(pattern)) for pattern in patterns)
 
-        return cls(
-            fingerprints(policy.allow, require_absolute=True),
-            fingerprints(policy.deny),
-            policy.auto_approve_read,
-        )
+        return cls(fingerprints(policy.allow), fingerprints(policy.deny), policy.auto_approve_read)
 
     @classmethod
     def parse(cls, evidence: Any) -> WorkspacePathPolicy:

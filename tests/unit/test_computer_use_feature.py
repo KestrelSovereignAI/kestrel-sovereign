@@ -1506,3 +1506,57 @@ async def test_sandbox_cwd_requires_current_named_outside_grant(workspace, monke
         assert outcome.status is not ToolResultStatus.OK
         assert "filesystem_outside_workspace" in outcome.error
         execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_tool", ["read", "shell"])
+async def test_backend_blocked_at_boot_recovers_on_first_admitted_tool(tmp_path, first_tool):
+    from kestrel_sovereign.constitution.grants import GrantResolution, unavailable_host_grants
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    note = workspace / "note.txt"
+    note.write_text("constitutionally admitted")
+    queue = FakeApprovalQueue()
+    agent = FakeAgent(privacy=PrivacyConfig(computer_access=True), grants=set(), queue=queue)
+    agent.storage_path = str(tmp_path / "agent.db")
+    agent._safe_mode = True
+    agent._constitution_host_grant_baseline = unavailable_host_grants()
+    feature = ComputerUseFeature(agent)
+    feature._cfg = _config(workspace, backend="local")
+    await feature.initialize()
+    assert feature._backend is None
+    old_audit, old_policy = feature._audit, feature._path_policy
+
+    agent._constitution_host_grant_baseline = GrantResolution(
+        frozenset({"filesystem_read", "shell_execution_host", "shell_execution_sandboxed"}),
+        "anchored test grant baseline", "verified", "absent",
+    )
+    assert (await feature.fs_read(path=str(note))).error.startswith("readiness:")
+    assert feature._backend is None
+
+    agent._safe_mode = False
+    if first_tool == "shell":
+        result = await feature.shell(command=["echo", "admitted"], cwd=str(workspace), timeout=5)
+        assert result.status is ToolResultStatus.OK
+        assert result.data["stdout"].strip() == "admitted"
+    else:
+        result = await feature.fs_read(path=str(note))
+        assert result.status is ToolResultStatus.OK
+        assert result.data["content"] == "constitutionally admitted"
+    backend = feature._backend
+    assert backend is not None and backend.name == "local"
+    assert feature._audit is old_audit and feature._path_policy is old_policy
+    assert (await feature.fs_read(path=str(note))).status is ToolResultStatus.OK
+    assert feature._backend is backend and not queue.calls
+
+    exterior = tmp_path / "out-of-scope.txt"
+    exterior.write_text("out of scope")
+    refused = await feature.fs_read(path=str(exterior))
+    assert refused.status is not ToolResultStatus.OK
+    assert "filesystem_outside_workspace" in refused.error
+    assert not queue.calls
+
+    await feature.shutdown()
+    assert (await feature.fs_read(path=str(note))).error.startswith("readiness:")
+    assert feature._backend is None

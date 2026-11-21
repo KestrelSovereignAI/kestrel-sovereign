@@ -419,6 +419,17 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
         assert baseline_view["baseline_signer"] == sovereign["id"]
         assert baseline_view["baseline_sha256"] == artifact_hash
 
+        # Unknown absent history is not evidence that the receipt predates v2.
+        node.properties["constitution_reanchor_history"] = [{
+            "receipt": {"new_hash": "a" * 64},
+            "superseded_by_constitution_hash": digest,
+        }]
+        await storage.add_node(node)
+        ok, message = await agent._refresh_constitution_host_grants(node)
+        assert not ok and "no signed reanchor artifact" in message
+        assert not gate._constitution_allows("filesystem_read")
+        node.properties.pop("constitution_reanchor_history")
+
         from copy import deepcopy
 
         conflicting_record = deepcopy(record)

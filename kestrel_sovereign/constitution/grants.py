@@ -333,24 +333,29 @@ def validate_grant_cutover(
     disk_policy = None
     preserving_files = not prior_v2 and bool({"filesystem_read", "filesystem_write"} & proposed.grants)
     needs_scope = preserving_files and "filesystem_outside_workspace" not in proposed.grants
-    if preserving_files and (live_workspace_policy is not None or needs_scope or proof_present):
+    observation = artifact.get("offline_grant_observation")
+    policy_supplied = not prior_v2 and stopped and isinstance(observation, dict) and "workspace_policy" in observation
+    if policy_supplied or (preserving_files and (live_workspace_policy is not None or needs_scope or proof_present)):
         disk_policy = configured_workspace_policy(storage_path)
         if live_workspace_policy is not None and live_workspace_policy() != disk_policy:
             raise AmendmentArtifactError("Running ComputerUse policy differs from the disk-selected policy")
+        if policy_supplied:
+            from .workspace_disposition import WorkspacePathPolicy
+
+            observed_policy = observation["workspace_policy"]
+            if not isinstance(observed_policy, dict) or type(observed_policy.get("enabled")) is not bool:
+                raise AmendmentArtifactError("Malformed signed pre-stop ComputerUse policy observation")
+            if observed_policy["enabled"]:
+                WorkspacePathPolicy.parse(observed_policy.get("path_policy"))
+            if observed_policy != disk_policy:
+                raise AmendmentArtifactError("Signed pre-stop ComputerUse policy differs from the disk-selected policy")
     if needs_scope:
         if disk_policy["enabled"] and not proof_present:
             raise AmendmentArtifactError(
                 "Preserving legacy approval-mediated workspace access requires a separate signed workspace disposition"
             )
-        if stopped and not proof_present:
-            observation = artifact.get("offline_grant_observation")
-            observed_policy = observation.get("workspace_policy") if isinstance(observation, dict) else None
-            if (
-                not isinstance(observed_policy, dict)
-                or observed_policy.get("enabled") is not False
-                or observed_policy != disk_policy
-            ):
-                raise AmendmentArtifactError("Offline adoption requires the signed pre-stop ComputerUse policy observation")
+        if stopped and not proof_present and not policy_supplied:
+            raise AmendmentArtifactError("Offline adoption requires the signed pre-stop ComputerUse policy observation")
     if not proof_present:
         return proposed
     if trusted_did_document is None or prior_text is None:
@@ -463,6 +468,7 @@ async def load_anchored_grant_baseline(
 ) -> GrantResolution | None:
     """Verify the baseline, or identify an older signed artifact by its contents."""
     from .anchored_bytes import read_anchored_constitution
+    from .v1_prior import known_published_v1
 
     current_hash = recovered_hash if recovered_hash is not None else properties.get("constitution_hash")
     if not is_constitution_hash(current_hash):
@@ -510,7 +516,12 @@ async def load_anchored_grant_baseline(
         previous_receipt = entry["receipt"]
         previous_hash = previous_receipt["new_hash"]
         if previous_hash != current_hash:
-            previous_text, _ = await read_anchored_constitution(db, previous_hash)
+            previous_text, previous_present = await read_anchored_constitution(db, previous_hash)
+            # Admission recognizes an exact public v1 digest when the archive
+            # blob is absent. Its native receipt predates signed v2 grant
+            # baselines. A present but unreadable blob is still ambiguous.
+            if not previous_present and known_published_v1(previous_hash):
+                continue
             if previous_text is not None and constitution_version(previous_text) == 1:
                 continue
         previous = await _read_signed_baseline(

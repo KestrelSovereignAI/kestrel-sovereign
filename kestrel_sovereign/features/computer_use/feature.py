@@ -310,6 +310,7 @@ class ComputerUseFeature(Feature):
         self._last_capture_prune: Optional[float] = None
         # Why the last initialize built no backend, for the readiness refusal.
         self._init_refusal: Optional[str] = None
+        self._grant_blocked_backend: tuple[str, frozenset[str]] | None = None
 
     @property
     def tool_description(self) -> str:
@@ -425,7 +426,6 @@ class ComputerUseFeature(Feature):
             subcommands=subcommands,
         )
 
-        granted = self._granted_capabilities()
         backend_name = self._cfg.get("backend", "docker")
         if not isinstance(backend_name, str) or backend_name not in _BACKEND_NAMES:
             # Never read an unrecognised value as the default: a mistyped
@@ -436,6 +436,10 @@ class ComputerUseFeature(Feature):
             )
             logger.error("ComputerUseFeature: %s", self._init_refusal)
             return
+        self._build_backend(backend_name, self._granted_capabilities())
+
+    def _build_backend(self, backend_name: str, granted: frozenset[str]) -> None:
+        self._grant_blocked_backend = None
         try:
             if backend_name == "local":
                 self._backend = LocalSandboxBackend(granted)
@@ -472,8 +476,11 @@ class ComputerUseFeature(Feature):
             logger.warning("ComputerUseFeature: %s", refusal)
             self._backend = None
             self._init_refusal = refusal
+            if exc.gate == "constitution":
+                self._grant_blocked_backend = (backend_name, granted)
             return
 
+        self._init_refusal = None
         logger.info(
             "ComputerUseFeature initialized: backend=%s, allowed=%d, "
             "auto_approved_bins=%d, denied_bins=%d",
@@ -483,10 +490,21 @@ class ComputerUseFeature(Feature):
             len(self._binary_policy.deny),
         )
 
+    def _reconcile_backend_grants(self) -> None:
+        """Retry only a backend blocked by an older constitutional grant set."""
+        blocked = self._grant_blocked_backend
+        if blocked is None or getattr(self.agent, "_safe_mode", False) is True:
+            return
+        backend_name, previous = blocked
+        granted = self._granted_capabilities()
+        if granted != previous:
+            self._build_backend(backend_name, granted)
+
     async def shutdown(self) -> None:
         # Cleared first: a shut-down backend must not run another call, and a
         # later initialize must not shut it down a second time.
         backend, self._backend = self._backend, None
+        self._grant_blocked_backend = None
         if backend is not None:
             await backend.shutdown()
 
@@ -830,6 +848,8 @@ class ComputerUseFeature(Feature):
             await self._audit_denied(tool_name, payload, ["denied:readiness:disabled"])
             return _GateOutcome(False, allowed_by, "readiness:feature not enabled")
         if self._backend is None:
+            self._reconcile_backend_grants()
+        if self._backend is None:
             await self._audit_denied(
                 tool_name,
                 payload,
@@ -841,6 +861,8 @@ class ComputerUseFeature(Feature):
                 reason = f"{reason}: {self._init_refusal}"
             return _GateOutcome(False, allowed_by, reason)
         gated_backend = self._backend
+        if exec_required:
+            payload["backend"] = gated_backend.name
 
         # 1. Privacy
         if not self._privacy_allows():
@@ -1643,10 +1665,9 @@ class ComputerUseFeature(Feature):
 
         # Capability depends on which backend is wired up; gate semantics
         # treat the two as distinct constitutional grants.
+        backend_name = self._backend.name if self._backend is not None else self._cfg.get("backend")
         capability = (
-            "shell_execution_host"
-            if self._backend is not None and self._backend.name == "local"
-            else "shell_execution_sandboxed"
+            "shell_execution_host" if backend_name == "local" else "shell_execution_sandboxed"
         )
 
         outcome = await self._run_gates(

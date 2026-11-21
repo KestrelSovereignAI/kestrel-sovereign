@@ -413,6 +413,12 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     )
     legacy_source = Path(CONSTITUTION_PATH).read_bytes()
     legacy_bytes = resolve_governing_constitution_bytes(contract, content=legacy_source)
+    public_v1_digest = "46687f754bc008f4022599fb481ebf9abf0fbf1e8e205472ac8efba95628eb9c"
+    async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as storage:
+        assert await storage.retrieve_file(public_v1_digest) is None
+        node = await storage.get_node(credentials.agent_did)
+        node.properties["constitution_reanchor"] = {"new_hash": public_v1_digest}
+        await storage.add_node(node)
     before = await _agent_properties(credentials.db_path, credentials.agent_did)
     assert before["constitution_hash"] == _sha(legacy_bytes)
 
@@ -550,6 +556,7 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     after = await _agent_properties(credentials.db_path, credentials.agent_did)
     assert after["constitution_reanchor"]["old_hash"] == _sha(legacy_bytes)
     assert after["constitution_reanchor"]["source_content_sha256"] == _sha(v2_base)
+    assert after["constitution_reanchor_history"][-1]["receipt"]["new_hash"] == public_v1_digest
     if contract is not None:
         assert after["emancipation_contract"] == before["emancipation_contract"] == contract_to_json(contract)
 
