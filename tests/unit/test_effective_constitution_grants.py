@@ -269,3 +269,152 @@ async def test_public_tool_accepts_integer_amendment_identifier(identifier, head
     view = await _constitution_tool(agent).execute(article="amendment", search=identifier)
     assert view["status"] == "ok", view
     assert heading in view["confirmation"]
+
+
+@pytest.mark.parametrize("overlay_present", [False, True], ids=["empty-package-falls-through", "verified-empty-overlay"])
+def test_edition_2_freezes_legacy_precedence_and_retains_evidence(
+    tmp_path, monkeypatch, overlay_present,
+):
+    from kestrel_sovereign.constitution.grants import (
+        build_grant_baseline,
+        preview_offline_legacy_grants,
+        resolve_amendment_ix_grants,
+        validate_grant_cutover,
+    )
+
+    package = tmp_path / "package.md"
+    package.write_text(_BASE)
+    monkeypatch.setattr(config, "CONSTITUTION_PATH", package)
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read,filesystem_write")
+    agent = SimpleNamespace()
+    target = "did:test:grant-baseline"
+    v2 = "---\nconstitution_version: 2\n---\n"
+    overlay_hash = None
+    if overlay_present:
+        raw = b""
+        (tmp_path / "CONSTITUTION.md").write_bytes(raw)
+        overlay_hash = hashlib.sha256(raw).hexdigest()
+
+    original = preview_offline_legacy_grants(tmp_path, overlay_hash=overlay_hash)
+    record = build_grant_baseline(target, original)
+    assert record["legacy_evidence"]["signer"] is None
+    assert record["legacy_evidence"]["sha256"] == overlay_hash
+    assert record["grants"] == ([] if overlay_present else ["filesystem_read", "filesystem_write"])
+    agent._constitution_host_grant_baseline = validate_grant_cutover(
+        target_did=target, artifact={"grant_baseline": record}, prior_text=_BASE,
+        new_text=v2, legacy_resolution=lambda: original,
+    )
+    assert resolve_amendment_ix_grants(agent).grants == set(record["grants"])
+
+    agent.granted_capabilities = {"shell_execution_host"}
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read,filesystem_outside_workspace")
+    package.write_text("### Amendment IX\n- [x] shell_execution_host\n")
+    effective = resolve_amendment_ix_grants(agent)
+    assert effective.grants == (set() if overlay_present else {"filesystem_read"})
+    assert effective.environment_narrowed is not overlay_present
+    assert effective.content_hash == overlay_hash
+    monkeypatch.delenv("KESTREL_CAPABILITY_GRANTS")
+    assert resolve_amendment_ix_grants(agent).grants == set()
+
+
+def test_edition_2_cutover_cannot_expand_remove_or_reattribute_legacy_grants(monkeypatch):
+    from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+    from kestrel_sovereign.constitution.grants import (
+        build_grant_baseline,
+        resolve_legacy_grants,
+        validate_grant_cutover,
+    )
+
+    agent = SimpleNamespace(granted_capabilities={"filesystem_read"})
+    target = "did:test:grant-baseline"
+    v2 = "---\nconstitution_version: 2\n---\n"
+    for grants in ([], ["filesystem_read", "filesystem_write"]):
+        record = build_grant_baseline(target, resolve_legacy_grants(agent))
+        record["grants"] = grants
+        with pytest.raises(AmendmentArtifactError, match="differs from the existing decision"):
+            validate_grant_cutover(
+                target_did=target, artifact={"grant_baseline": record},
+                prior_text=_BASE, new_text=v2,
+                legacy_resolution=lambda: resolve_legacy_grants(agent),
+            )
+    with pytest.raises(AmendmentArtifactError, match="Cannot restore legacy"):
+        validate_grant_cutover(
+            target_did=target, artifact={}, prior_text=v2, new_text=_BASE,
+            legacy_resolution=lambda: resolve_legacy_grants(agent),
+        )
+
+
+@pytest.mark.asyncio
+async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
+    tmp_path, monkeypatch,
+):
+    import json
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from kestrel_sovereign.constitution.amendment_artifact import (
+        build_legacy_signed_reanchor_artifact,
+        did_document_from_legacy_public_key,
+    )
+    from kestrel_sovereign.constitution.grants import build_grant_baseline, resolve_legacy_grants
+    from kestrel_sovereign.constitution.reanchor_receipt import CONSTITUTION_REANCHOR_KEY
+
+    v2_path = (
+        Path(__file__).resolve().parents[2] / "kestrel_sovereign" / "data"
+        / "constitutions" / "v2" / "KESTREL_CONSTITUTION.md"
+    )
+    v2_bytes = v2_path.read_bytes()
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read")
+    agent = KestrelAgent(did="did:test:baseline", storage_path=str(tmp_path / "baseline.db"))
+    agent.extension = None
+    sovereign_key = ec.generate_private_key(ec.SECP256K1())
+    sovereign = did_document_from_legacy_public_key("did:test:external-root", sovereign_key.public_key())
+    monkeypatch.setattr(agent, "_trusted_sovereign_did_document", lambda *_: sovereign)
+
+    async with AsyncStorage(agent.storage_path, agent_id=agent.agent_id) as storage:
+        agent.storage = agent._raw_storage = storage
+        digest = await storage.store_file(v2_bytes, "governing.md")
+        record = build_grant_baseline(agent.agent_id, resolve_legacy_grants(agent))
+        assert record["grants"] == ["filesystem_read"]
+        artifact = build_legacy_signed_reanchor_artifact(
+            signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
+            grant_baseline=record,
+        )
+
+        async def store_artifact(artifact):
+            artifact_hash = await storage.store_file(json.dumps(artifact).encode(), "signed-artifact.json")
+            node = GraphNode(
+                node_id=agent.agent_id,
+                node_type="agent",
+                label="Baseline",
+                properties={
+                    "constitution_hash": digest,
+                    CONSTITUTION_REANCHOR_KEY: {"new_hash": digest, "signed_artifact_hash": artifact_hash},
+                },
+            )
+            await storage.add_node(node)
+            return node, artifact_hash
+
+        tool = _constitution_tool(agent)
+        gate = ComputerUseFeature(agent)
+        node, artifact_hash = await store_artifact(artifact)
+        ok, message = await agent._refresh_constitution_host_grants(node)
+        assert ok, message
+        monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read,filesystem_write")
+        assert gate._constitution_allows("filesystem_read")
+        assert not gate._constitution_allows("filesystem_write")
+        baseline_view = (await tool.execute(article="amendment", search="IX"))["data"]
+        assert baseline_view["effective_grants"] == ["filesystem_read"]
+        assert baseline_view["signer"] is None
+        assert baseline_view["baseline_signer"] == sovereign["id"]
+        assert baseline_view["baseline_sha256"] == artifact_hash
+
+        record["grants"].append("filesystem_write")
+        tampered_node, _ = await store_artifact(artifact)
+        ok, message = await agent._refresh_constitution_host_grants(tampered_node)
+        assert not ok and "signature" in message
+        assert not gate._constitution_allows("filesystem_read")
+        assert not gate._constitution_allows("filesystem_write")
+        denied_view = (await tool.execute(article="amendment", search="IX"))["data"]
+        assert denied_view["effective_grants"] == []
+        assert denied_view["baseline_signer"] is None

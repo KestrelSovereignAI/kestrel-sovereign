@@ -563,7 +563,8 @@ class ConstitutionFeature(Feature):
         base_text = None
         provision_title = "Amendment IX"
         try:
-            if constitution_version(original) == 2:
+            edition = constitution_version(original)
+            if edition == 2:
                 base_text = v2_sections(original)[Section.HOST].extract(original)
                 provision_title = Section.HOST.value
             else:
@@ -573,31 +574,46 @@ class ConstitutionFeature(Feature):
         except ConstitutionVersionError as exc:
             return ToolResult.failed(f"Error: {exc}", data={"kind": "unavailable"})
         base_heading = base_heading.replace("Amendment IX", provision_title)
-        resolution = resolve_amendment_ix_grants(self.agent)
+        resolution = resolve_amendment_ix_grants(self.agent, edition=edition)
         grants = sorted(resolution.grants & DANGEROUS_CAPABILITIES)
+        operative_source = "signed edition 2 grant baseline" if resolution.baseline_sha256 else resolution.source
         details = [
             f"## {provision_title} — Effective ComputerUse constitutional grants",
             f"Grants: {', '.join(grants) or '(none)'}",
-            f"Operative source: {resolution.source}",
-            f"Source verification: {resolution.verification}",
-            f"Operative source SHA-256: {resolution.content_hash or 'unavailable'}",
+            f"Operative source: {operative_source}",
+            f"Original source verification: {resolution.verification}",
+            f"Original source SHA-256: {resolution.content_hash or 'unavailable'}",
             "Signer: unavailable",
             f"Per-agent overlay status: {resolution.overlay_status}",
             "A grant permits the capability at the constitutional gate. "
             "Privacy, runtime configuration, and approval checks still apply.",
+        ]
+        if resolution.baseline_sha256:
+            details.extend([
+                f"Original source: {resolution.source}",
+                f"Signed preservation artifact SHA-256: {resolution.baseline_sha256}",
+                f"Preservation artifact signer: {resolution.baseline_signer}",
+            ])
+        if resolution.environment_narrowed:
+            details.append("The current environment restricts the preserved grant set.")
+        details.extend([
             f"## {base_heading}",
             f"Full anchored text SHA-256: {base_hash or 'unavailable'}",
             base_text if base_text is not None else "Amendment IX is absent from this text.",
-        ]
+        ])
         return ToolResult.ok(
             confirmation="\n\n".join(details),
             data={
                 "kind": "amendment",
                 "effective_grants": grants,
                 "source": resolution.source,
+                "operative_source": operative_source,
                 "verification": resolution.verification,
                 "sha256": resolution.content_hash,
                 "signer": None,
+                "baseline_sha256": resolution.baseline_sha256,
+                "baseline_signer": resolution.baseline_signer,
+                "environment_narrowed": resolution.environment_narrowed,
                 "overlay_status": resolution.overlay_status,
                 "base_text": base_text,
                 "base_sha256": base_hash,

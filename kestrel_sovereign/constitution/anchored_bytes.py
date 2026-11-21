@@ -249,7 +249,7 @@ def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str])
         # receipt/history fields: shared evidence admission correctly rejects
         # those, whereas an identity with no prior receipt can first-anchor.
         "properties": deepcopy({key: properties[key] for key in (
-            "constitution_hash", "emancipation_contract", "genesis_audit",
+            "constitution_hash", "constitution_overlay_hash", "emancipation_contract", "genesis_audit",
             "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history",
         ) if key in properties}),
         "governed_by_targets": sorted(set(governed_by_targets)),
