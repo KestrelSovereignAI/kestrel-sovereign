@@ -6,7 +6,8 @@ response (#4198). An adapter that observes them attaches a
 :class:`ProviderServed` to the response it returns, or to the error it raises
 when the attempt fails after the provider had already identified the
 response, and the service copies it into the attempt's metadata under
-:data:`PROVIDER_SERVED_KEY`.
+:data:`PROVIDER_SERVED_KEY`. While an attempt runs, what its provider has
+reported so far is kept on one :class:`ProviderAttemptReceipt` (#4207).
 
 The evidence is content-free: an API name, a model id, a response id, how the
 request continued its chain or which boundary it crossed, whether the reply's
@@ -19,6 +20,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Mapping, Optional, Tuple
+
+from kestrel_sdk.llm import LLMResponse
+
+from .output_ceiling import attach_reported_usage
 
 #: The ``llm_calls.metadata`` key the evidence is recorded under.
 PROVIDER_SERVED_KEY = "provider_served"
@@ -117,8 +122,74 @@ def provider_served(source: Any) -> Optional[ProviderServed]:
     return None
 
 
+class ProviderAttemptReceipt:
+    """What one provider attempt has reported, recorded as it arrives (#4207).
+
+    An adapter opens one receipt for each provider attempt and keeps it for
+    the attempt's whole lifetime: provider execution, stream iteration and
+    the physical close of its stream or response. The receipt records the
+    provider's identification of its reply (:attr:`served`) the moment the
+    provider gives it, and the usage the provider reported (:attr:`usage`)
+    the moment that arrives, never only once the attempt ends. An attempt
+    that then fails, while closing its stream included, has lost nothing the
+    provider had reported.
+
+    :attr:`served` is ``None`` while the provider has identified nothing,
+    and :attr:`usage` while it has reported no usage: unknown, never zero.
+    A receipt belongs to the one attempt that opened it, so concurrent or
+    successive attempts never share one.
+
+    :meth:`retain` records the receipt on the error that ends the attempt,
+    whatever it is: an ordinary failure, a cancellation, a closed stream, an
+    execution-control error or exception group. It sets attributes on that
+    same object and returns it; it never wraps, replaces or swallows the
+    error, and leaves a group's members, its cause and its native custody as
+    they are. A caller that catches the error reads the receipt from it with
+    :func:`provider_served` and
+    :func:`~kestrel_sovereign.llm.output_ceiling.reported_usage`. Recording
+    evidence decides nothing about whether the attempt is recorded or
+    billed: the service decides that from the error's own classification.
+    """
+
+    __slots__ = ("served", "usage")
+
+    def __init__(self) -> None:
+        self.served: Optional[ProviderServed] = None
+        self.usage: Optional[LLMResponse] = None
+
+    def identify(self, served: ProviderServed) -> None:
+        """Record the provider's identification of its reply, as it is now."""
+        self.served = served
+
+    def report_usage(self, usage: Optional[LLMResponse]) -> None:
+        """Record the usage the provider reported; ``None`` records nothing,
+        so a report never seen stays unknown."""
+        if usage is not None:
+            self.usage = usage
+
+    def reported(self) -> Optional[LLMResponse]:
+        """The reported usage with the provider's identification attached,
+        or ``None`` when none was reported."""
+        return attach_provider_served(self.usage, self.served)
+
+    def retain(self, error: BaseException) -> BaseException:
+        """Record this receipt on ``error`` and return the same ``error``.
+
+        Only what this attempt observed is recorded, on ``error`` itself, so
+        a reader finds it before anything ``error`` wraps: the caller that
+        catches ``error`` reads the attempt it just ran. A field the provider
+        never reported is left as ``error`` has it. Synchronous, so a caller
+        that re-raises ``error``, cancellation included, does so with no
+        await in between.
+        """
+        attach_provider_served(error, self.served)
+        attach_reported_usage(error, self.reported())
+        return error
+
+
 __all__ = [
     "PROVIDER_SERVED_KEY",
+    "ProviderAttemptReceipt",
     "ProviderServed",
     "attach_provider_served",
     "provider_served",

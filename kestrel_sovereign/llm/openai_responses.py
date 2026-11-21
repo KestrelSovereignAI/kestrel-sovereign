@@ -115,7 +115,7 @@ from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
 from .adapter import LLMResponse, ThinkingDelta, ToolCall
 from .completion_protocol import decode_tool_arguments
 from .output_ceiling import IncompleteGenerationError, attach_stop_reason
-from .provider_served import ProviderServed, attach_provider_served
+from .provider_served import ProviderAttemptReceipt, ProviderServed, attach_provider_served
 from .responses_continuation import (
     BUDGET_EXCEEDED,
     DUPLICATE_TOOL_OUTPUT,
@@ -1311,11 +1311,21 @@ class ResponsesEventState:
     :class:`LLMResponse`; :meth:`settle` extends or retires the turn's
     snapshot. :attr:`served` is the provider's identification so far, kept
     for an error raised at any point after ``response.created``.
+
+    ``receipt`` is the attempt's :class:`~.provider_served.ProviderAttemptReceipt`.
+    :meth:`observe` records on it what each event reports as the event
+    arrives (#4207): the identification once the provider has named its
+    response, a ``prefix_mismatch`` the terminal response reports, and the
+    usage the terminal response reported. Whatever ends the attempt after
+    that, the receipt already holds it.
     """
 
-    def __init__(self, request: ResponsesRequest, *, provider: str) -> None:
+    def __init__(
+        self, request: ResponsesRequest, *, provider: str, receipt: ProviderAttemptReceipt,
+    ) -> None:
         self.request = request
         self.provider = provider
+        self.receipt = receipt
         self.served = ProviderServed(api=RESPONSES_API, continuation=request.continuation)
         self._text = ""
         self._text_item: Optional[str] = None
@@ -1340,6 +1350,13 @@ class ResponsesEventState:
         self.served = self.served.with_response(
             model=_field(response, "model"), response_id=_field(response, "id"),
         )
+        self._receive()
+
+    def _receive(self) -> None:
+        """Record on the receipt the identification as it is now, once the
+        provider has named its response."""
+        if self.observed:
+            self.receipt.identify(self.served)
 
     def _visible(self, delta: Any, item_id: Any) -> List[str]:
         if not isinstance(delta, str) or not delta:
@@ -1378,6 +1395,7 @@ class ResponsesEventState:
             self._final = _field(event, "response")
             self._identify(self._final)
             self._end_degraded_chain(self._final)
+            self.receipt.report_usage(self.reported_usage())
         elif kind == "error":
             raise ResponsesAPIFailure(
                 model=self.request.model, status="error", code=_field(event, "code"),
@@ -1453,6 +1471,7 @@ class ResponsesEventState:
             prefix_mismatch=removed,
             continuation={**self.served.continuation, "chain_ended": PREFIX_MISMATCH},
         )
+        self._receive()
         self._retire_parent(PREFIX_MISMATCH)
 
     def _retire_parent(self, reason: str) -> None:

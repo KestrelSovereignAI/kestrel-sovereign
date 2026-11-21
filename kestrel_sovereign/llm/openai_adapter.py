@@ -77,15 +77,13 @@ from .openai_responses import (
     prepare_responses_request,
     requires_responses_api,
 )
-from .provider_served import ProviderServed, attach_provider_served, provider_served
+from .provider_served import ProviderAttemptReceipt, ProviderServed, attach_provider_served
 from .model_metadata import ModelInfo, ModelCategory
 from .output_ceiling import (
-    attach_reported_usage,
     attach_stop_reason,
     join_output_ceiling_notice,
     output_ceiling_notice_chunk,
     output_limit_cut_notice,
-    reported_usage,
 )
 from .retry import with_retry
 from kestrel_sovereign.execution_custody import (
@@ -273,54 +271,18 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _chat_completion_identified(
-    served: Optional[ProviderServed], source: Any,
-) -> Optional[ProviderServed]:
-    """``served`` with the model and response id a chat-completions reply, or
-    one chunk of its stream, names (#4198); ``None`` stays ``None``."""
-    if served is None:
-        return None
-    return served.with_response(
-        model=getattr(source, "model", None), response_id=getattr(source, "id", None),
-    )
-
-
-def _reported_chat_usage(
-    usage: Any, stop_reason: Optional[str], served: Optional[ProviderServed],
-) -> Optional[LLMResponse]:
+def _reported_chat_usage(usage: Any, stop_reason: Optional[str]) -> Optional[LLMResponse]:
     """The token counts a chat-completions reply reported, never its text,
-    for an attempt that failed after they arrived, with the provider's
-    identification of the reply (#4198). ``None`` when it reported none:
-    unknown, never zero."""
+    as an attempt's receipt records them (#4198, #4207). ``None`` when it
+    reported none: unknown, never zero."""
     if usage is None:
         return None
     inputs, outputs, total, writes, reads = _normalized_openai_usage(usage)
-    return attach_provider_served(LLMResponse(
+    return LLMResponse(
         input_tokens=inputs, output_tokens=outputs, total_tokens=total,
         cache_creation_input_tokens=writes, cache_read_input_tokens=reads,
         stop_reason=stop_reason,
-    ), served)
-
-
-def _retain_reported(
-    error: BaseException,
-    *,
-    served: Optional[ProviderServed],
-    usage: Optional[LLMResponse],
-) -> None:
-    """Record on ``error`` what its provider had reported by the time it was
-    raised, keeping whatever an error it wraps already carries (#4198).
-
-    ``served`` is the provider's identification of its reply, ``None`` while
-    it had given none; ``usage`` the counts it reported, ``None`` while it had
-    reported none, which stays unknown, never zero. Synchronous, so a caller
-    that re-raises ``error`` itself, cancellation included, does so with no
-    await in between.
-    """
-    if served is not None and provider_served(error) is None:
-        attach_provider_served(error, served)
-    if reported_usage(error) is None:
-        attach_reported_usage(error, usage)
+    )
 
 
 def _log_chat_failure(error: Exception, *, streaming: bool) -> None:
@@ -620,7 +582,6 @@ class OpenAIAdapter(LLMAdapter):
             caller_budget=caller_budget,
         )
 
-    @native_sdk_operation
     async def get_response(
         self,
         client: openai.AsyncOpenAI,
@@ -645,13 +606,43 @@ class OpenAIAdapter(LLMAdapter):
 
         Returns:
             LLMResponse with content and/or tool calls
+
+        The call is one provider attempt with one
+        :class:`~.provider_served.ProviderAttemptReceipt`, opened here so its
+        lifetime spans the native SDK operation and that operation's cleanup
+        (#4207). Whatever error ends the call carries what the provider had
+        reported, and is raised as itself.
         """
+        receipt = ProviderAttemptReceipt()
+        try:
+            return await self._native_response(
+                client, model, messages, format=format, tools=tools,
+                response_format=response_format, receipt=receipt, **kwargs,
+            )
+        except BaseException as error:
+            # BaseException: a caller cancels a call too. Synchronous, and the
+            # original error is always re-raised.
+            receipt.retain(error)
+            raise
+
+    @native_sdk_operation
+    async def _native_response(
+        self,
+        client: openai.AsyncOpenAI,
+        model: str,
+        messages: List[Dict[str, Any]],
+        format: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        *,
+        receipt: ProviderAttemptReceipt,
+        **kwargs
+    ) -> LLMResponse:
+        """:meth:`get_response`'s native SDK operation, recording on
+        ``receipt`` what the provider reports as it arrives."""
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         reported_native_usage = None
         finish_reason = None
-        # The provider's identification of its chat-completions reply, from
-        # the moment the reply arrives (#4198).
-        served: Optional[ProviderServed] = None
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -697,7 +688,9 @@ class OpenAIAdapter(LLMAdapter):
                 native_openai=self._native_openai, model=model, request=extra_kwargs,
                 messages=messages, route=self._responses_route(client),
             ):
-                return await self._responses_response(client, model, messages, extra_kwargs)
+                return await self._responses_response(
+                    client, model, messages, extra_kwargs, receipt,
+                )
             extra_kwargs = self._chat_completion_compatible(extra_kwargs, model=model)
 
             response = await with_retry(
@@ -707,13 +700,17 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
-            served = _chat_completion_identified(self._chat_completion_served(), response)
+            # The reply arrived whole and decoded: what it names and reports
+            # is recorded before any of it is parsed (#4207).
+            self._identify_chat_reply(receipt, response)
             reported_native_usage = getattr(response, "usage", None)
+            receipt.report_usage(_reported_chat_usage(reported_native_usage, finish_reason))
             choice = _single_choice(response.choices)
             message = choice.message
             # #3355: the provider's own verdict on whether the response is
             # finished; ``length`` means it was cut at an output limit.
             finish_reason = _finish_reason(choice)
+            receipt.report_usage(_reported_chat_usage(reported_native_usage, finish_reason))
 
             # Parse tool calls if present
             # Use getattr to safely access tool_calls (may not exist on mock objects)
@@ -765,27 +762,16 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), finish_reason), served)
+            ), finish_reason), receipt.served)
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
                 raise
-            failure = GenerationProtocolError(
-                _reported_chat_usage(reported_native_usage, finish_reason, served)
-            )
-            attach_provider_served(failure, served)
-            raise failure from error
-        except BaseException as error:
-            # Every other exit keeps what the reply had reported (#4198).
-            # BaseException: a caller cancels a call too. Everything here is
-            # synchronous, and the original error is always re-raised.
+            # The receipt reaches it in :meth:`get_response` (#4198, #4207).
+            raise GenerationProtocolError(receipt.reported()) from error
+        except Exception as error:
             if not is_execution_control_error(error):
-                _retain_reported(
-                    error, served=served,
-                    usage=_reported_chat_usage(reported_native_usage, finish_reason, served),
-                )
-                if isinstance(error, Exception):
-                    _log_chat_failure(error, streaming=False)
+                _log_chat_failure(error, streaming=False)
             raise
 
     async def get_streaming_response(
@@ -842,13 +828,18 @@ class OpenAIAdapter(LLMAdapter):
                         for tc in item.tool_calls:
                             result = execute_tool(tc)
                             # Continue conversation with tool results
+
+        The stream is one provider attempt with one
+        :class:`~.provider_served.ProviderAttemptReceipt`, whose lifetime
+        spans the request, the stream's iteration and its physical close
+        (#4207). What each chunk or event names and reports is recorded on it
+        as it arrives, and whatever error ends the stream carries it and is
+        raised as itself.
         """
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         reported_native_usage = None
         finish_reason = None
-        # The provider's identification of its chat-completions reply, from
-        # the stream's first chunk on; ``None`` until one arrives (#4198).
-        served: Optional[ProviderServed] = None
+        receipt = ProviderAttemptReceipt()
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -886,7 +877,7 @@ class OpenAIAdapter(LLMAdapter):
                 messages=messages, route=self._responses_route(client),
             ):
                 async with aclosing(
-                    self._responses_events(client, model, messages, extra_kwargs)
+                    self._responses_events(client, model, messages, extra_kwargs, receipt)
                 ) as events:
                     async for item in events:
                         yield item
@@ -932,9 +923,9 @@ class OpenAIAdapter(LLMAdapter):
             try:
                 async for chunk in stream:
                     report_call_progress()
-                    served = _chat_completion_identified(
-                        served or self._chat_completion_served(), chunk,
-                    )
+                    # What this chunk names and reports is recorded before
+                    # the rest of it is handled (#4207).
+                    self._identify_chat_reply(receipt, chunk)
                     # Extract usage from final chunk (OpenAI sends it with stream_options)
                     if hasattr(chunk, 'usage') and chunk.usage:
                         reported_native_usage = chunk.usage
@@ -958,6 +949,7 @@ class OpenAIAdapter(LLMAdapter):
                                 call_cost = float(_cost)
                             except (TypeError, ValueError):
                                 call_cost = None
+                    receipt.report_usage(_reported_chat_usage(reported_native_usage, finish_reason))
 
                     # Skip chunks with no choices (like the final usage-only chunk)
                     choice = _single_choice(chunk.choices, allow_empty=True)
@@ -966,6 +958,7 @@ class OpenAIAdapter(LLMAdapter):
 
                     # #3355: the finish reason rides on the last choice chunk.
                     finish_reason = _finish_reason(choice) or finish_reason
+                    receipt.report_usage(_reported_chat_usage(reported_native_usage, finish_reason))
                     delta = choice.delta
 
                     # Handle text content - yield immediately for real-time streaming
@@ -1097,47 +1090,43 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), finish_reason), served or self._chat_completion_served())
+            ), finish_reason), receipt.served or self._chat_completion_served())
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                receipt.retain(error)
                 raise
-            failure = GenerationProtocolError(
-                _reported_chat_usage(reported_native_usage, finish_reason, served)
-            )
-            attach_provider_served(failure, served)
-            raise failure from error
+            raise receipt.retain(GenerationProtocolError(receipt.reported())) from error
         except BaseException as error:
-            # Every other exit keeps what the stream had reported (#4198):
-            # a transport failure, the inactivity watchdog's or a caller's
-            # cancellation, a consumer closing the stream, any other error.
-            # Everything here is synchronous, and the original error is
-            # always re-raised.
-            if not is_execution_control_error(error):
-                _retain_reported(
-                    error, served=served,
-                    usage=_reported_chat_usage(reported_native_usage, finish_reason, served),
-                )
-                if isinstance(error, Exception):
-                    _log_chat_failure(error, streaming=True)
+            # Every exit keeps what the stream had reported (#4198, #4207): a
+            # transport failure, the inactivity watchdog's or a caller's
+            # cancellation, a consumer closing the stream, a failure closing
+            # it (an execution-control error or exception group, kept whole
+            # with its members and custody), any other error. Everything here
+            # is synchronous, and the original error is always re-raised.
+            receipt.retain(error)
+            if isinstance(error, Exception) and not is_execution_control_error(error):
+                _log_chat_failure(error, streaming=True)
             raise
 
     def _chat_completion_served(self) -> Optional[ProviderServed]:
         """The evidence a native chat-completions call starts from (#4198).
 
         The reply says which model served it and the id it gave the response
-        (:func:`_chat_completion_identified`); the model may be a dated
-        snapshot of the alias requested, and a value the reply does not name
-        stays unknown, never the requested model. A chat-completions request
+        (:meth:`_identify_chat_reply`); the model may be a dated snapshot of
+        the alias requested, and a value the reply does not name stays
+        unknown, never the requested model. A chat-completions request
         replays no captured snapshot, so its continuation is always
         ``fresh`` and nothing is stored for its reply.
 
-        The identification is taken the moment the reply, or a stream's first
-        chunk, arrives. Every exit after that keeps it, and the usage once the
-        reply reported it: the response, a broken protocol's
+        The identification is recorded on the attempt's receipt the moment
+        the reply, or a stream's first chunk, arrives, and the usage the
+        moment the reply reports it. Every exit after that keeps them: the
+        response, a broken protocol's
         :class:`~.completion_protocol.GenerationProtocolError`, and any other
-        error, cancellation and a closed stream included
-        (:func:`_retain_reported`). An exit before then carries neither.
+        error, cancellation, a closed stream and a failure closing it
+        included (:meth:`~.provider_served.ProviderAttemptReceipt.retain`).
+        An exit before then carries neither.
 
         ``None`` off the native OpenAI route: a compatible server's reply
         fields are not the provider's own identification of what it served.
@@ -1145,6 +1134,18 @@ class OpenAIAdapter(LLMAdapter):
         if not self._native_openai:
             return None
         return ProviderServed(api=CHAT_COMPLETIONS_API, continuation={"status": FRESH})
+
+    def _identify_chat_reply(self, receipt: ProviderAttemptReceipt, source: Any) -> None:
+        """Record on ``receipt`` the model and response id a native
+        chat-completions reply, or one chunk of its stream, names, as it
+        arrives (#4198, #4207). A value it does not name keeps what an
+        earlier chunk named, or stays unknown; off the native route nothing
+        is recorded (:meth:`_chat_completion_served`)."""
+        served = receipt.served or self._chat_completion_served()
+        if served is not None:
+            receipt.identify(served.with_response(
+                model=getattr(source, "model", None), response_id=getattr(source, "id", None),
+            ))
 
     def _responses_route(self, client: Any) -> ResponsesRoute:
         """The route a Responses continuation snapshot is bound to: this
@@ -1166,13 +1167,14 @@ class OpenAIAdapter(LLMAdapter):
         model: str,
         messages: List[Dict[str, Any]],
         request_kwargs: Dict[str, Any],
+        receipt: ProviderAttemptReceipt,
     ) -> LLMResponse:
         """The non-streaming entry point's Responses call: the same event
         stream the streaming entry point consumes, reduced to its terminal
         response (#4198)."""
         result: Optional[LLMResponse] = None
         async with aclosing(
-            self._responses_events(client, model, messages, request_kwargs)
+            self._responses_events(client, model, messages, request_kwargs, receipt)
         ) as events:
             async for item in events:
                 if isinstance(item, LLMResponse):
@@ -1187,12 +1189,17 @@ class OpenAIAdapter(LLMAdapter):
         model: str,
         messages: List[Dict[str, Any]],
         request_kwargs: Dict[str, Any],
+        receipt: ProviderAttemptReceipt,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """Run one Responses API call; yield what a stream shows, then one
         terminal :class:`LLMResponse` (see :mod:`.openai_responses`).
 
-        Every exit keeps what the provider had reported by then. An error
-        raised after the provider identified the response carries that
+        ``receipt`` is the attempt's, opened by the entry point that calls
+        this and retained on whatever error ends the call (#4207). Each event
+        is recorded on it as it arrives
+        (:meth:`~.openai_responses.ResponsesEventState.observe`), so every
+        exit keeps what the provider had reported by then. An error raised
+        after the provider identified the response carries that
         identification (:func:`~.provider_served.provider_served`), and one
         raised after the terminal response arrived carries the usage it
         reported (:func:`~.output_ceiling.reported_usage`): a failed or
@@ -1200,14 +1207,14 @@ class OpenAIAdapter(LLMAdapter):
         end (:class:`~.openai_responses.ResponsesStreamInterrupted`), a
         cancellation (the caller's, or the inactivity watchdog's, whose
         timeout wraps the cancelled error so both reach the failed attempt's
-        row, #4198) and any other error. With no terminal response the usage
-        is unknown, never zero. The evidence is attached before the error is
-        re-raised, with no await in between, and the error is always
+        row, #4198), a failure physically closing the stream (the
+        execution-control error or exception group, raised as itself with
+        its members and custody) and any other error. With no terminal
+        response the usage is unknown, never zero. The error is always
         re-raised, cancellation included. A consumer that closes the stream
         receives nothing more; a ``prefix_mismatch`` the terminal response
-        reported has already ended its chain
-        (:meth:`~.openai_responses.ResponsesEventState.observe`), and no
-        snapshot is kept for a reply that was never returned.
+        reported has already ended its chain, and no snapshot is kept for a
+        reply that was never returned.
 
         Tools reach this route through the typed ``tools`` parameter only:
         ``extra_body["tools"]`` on a native ``gpt-6.2-sol`` request is refused
@@ -1219,7 +1226,7 @@ class OpenAIAdapter(LLMAdapter):
             messages=messages,
             request=request_kwargs,
         )
-        state = ResponsesEventState(request, provider=self.name)
+        state = ResponsesEventState(request, provider=self.name, receipt=receipt)
 
         async def acquire_stream(**body):
             async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
@@ -1255,32 +1262,20 @@ class OpenAIAdapter(LLMAdapter):
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
                 raise
-            failure = GenerationProtocolError(
-                attach_provider_served(state.reported_usage(), state.served)
-            )
-            if state.observed:
-                attach_provider_served(failure, state.served)
-            raise failure from error
+            raise GenerationProtocolError(receipt.reported()) from error
         except BaseException as error:
             # BaseException: the inactivity watchdog stops a silent stream by
-            # cancelling it, and a caller may cancel or close it too.
-            # Everything here is synchronous, and the original error
-            # (cancellation included) is always re-raised.
-            if is_execution_control_error(error):
-                raise
+            # cancelling it, and a caller may cancel or close it too. Any
+            # other error, execution control included, is raised as itself.
             if (
-                isinstance(error, _STREAM_TRANSPORT_ERRORS)
+                not is_execution_control_error(error)
+                and isinstance(error, _STREAM_TRANSPORT_ERRORS)
                 and not stream_ended
                 and state.terminal_arrived
             ):
                 raise ResponsesStreamInterrupted(
-                    model=model, usage=state.reported_usage(), served=state.served,
+                    model=model, usage=receipt.usage, served=state.served,
                 ) from error
-            _retain_reported(
-                error,
-                served=state.served if state.observed else None,
-                usage=attach_provider_served(state.reported_usage(), state.served),
-            )
             raise
         for chunk in chunks:
             yield chunk

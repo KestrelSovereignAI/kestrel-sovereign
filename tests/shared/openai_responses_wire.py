@@ -133,15 +133,53 @@ class Reply:
 
 
 class _DisconnectingBody(httpx.AsyncByteStream):
+    """Sends ``data``, then drops the connection. Given ``release``, it waits
+    for that event first, holding the stream open; ``waiting`` is set once
+    it does (#4207)."""
+
+    def __init__(self, data: bytes, release: Optional[asyncio.Event] = None) -> None:
+        self._data = data
+        self._release = release
+        self.waiting = asyncio.Event()
+
+    async def __aiter__(self):
+        yield self._data
+        if self._release is not None:
+            self.waiting.set()
+            await self._release.wait()
+        raise httpx.ReadError("the connection dropped mid-stream")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _FailingCloseBody(httpx.AsyncByteStream):
+    """Sends ``data`` whole, then fails to close: the SDK reads an ordinary
+    completion's body to its end and closes it before decoding it (#4207)."""
+
     def __init__(self, data: bytes) -> None:
         self._data = data
 
     async def __aiter__(self):
         yield self._data
-        raise httpx.ReadError("the connection dropped mid-stream")
 
     async def aclose(self) -> None:
-        return None
+        raise OSError("synthetic close failure after the body was read")
+
+
+class _HeldBody(httpx.AsyncByteStream):
+    """Sends ``data`` whole once ``release`` is set; ``waiting`` is set while
+    it waits (#4207)."""
+
+    def __init__(self, data: bytes, release: asyncio.Event) -> None:
+        self._data = data
+        self._release = release
+        self.waiting = asyncio.Event()
+
+    async def __aiter__(self):
+        self.waiting.set()
+        await self._release.wait()
+        yield self._data
 
 
 class SilentBody(httpx.AsyncByteStream):
@@ -169,18 +207,19 @@ class ChatReply:
     provider says served it. ``None`` leaves that field out of the reply.
 
     ``tool_arguments`` adds a call to ``lookup`` with that argument text.
-    On a stream, ``disconnect_before_usage`` ends the body with a transport
+    A ``usage`` of ``None`` reports no usage at all. On a stream, ``disconnect_before_usage`` ends the body with a transport
     error right after the first chunk, and ``disconnect_after_usage`` right
     after the usage chunk, before ``[DONE]``; ``stall_before_usage`` and
     ``stall_after_usage`` leave it open and silent at the same two points
     instead. An ordinary completion is one body, so either disconnect, or
-    either stall, ends it before any of it arrived.
+    either stall, ends it before any of it arrived; ``close_fails`` sends it
+    whole and then fails to close it, before it can decode.
     """
 
     text: str
     response_id: Optional[str]
     model: Optional[str] = CHAT_SERVED
-    usage: Dict[str, Any] = field(default_factory=lambda: {
+    usage: Optional[Dict[str, Any]] = field(default_factory=lambda: {
         "prompt_tokens": 40, "completion_tokens": 6, "total_tokens": 46,
     })
     tool_arguments: Optional[str] = None
@@ -188,6 +227,7 @@ class ChatReply:
     disconnect_after_usage: bool = False
     stall_before_usage: bool = False
     stall_after_usage: bool = False
+    close_fails: bool = False
 
     @property
     def disconnects(self) -> bool:
@@ -275,19 +315,34 @@ class ResponsesWire:
     ``issued`` is the ``(model, response id)`` of every reply it sent, in
     order, on either endpoint: what each call was actually served.
     ``silent`` holds the body of each reply that went silent, in order.
+
+    Given ``release``, a reply that disconnects holds its stream open after
+    its last event, and an ordinary chat completion holds its whole body,
+    until that event is set; ``held`` holds each such body, in order, so
+    calls can be made to overlap (#4207).
     """
 
     def __init__(
         self,
         script: Callable[[Dict[str, Any], int], Reply],
         chat_script: Optional[Callable[[Dict[str, Any], int], ChatReply]] = None,
+        *,
+        release: Optional[asyncio.Event] = None,
     ) -> None:
         self.script = script
         self.chat_script = chat_script
+        self.release = release
         self.requests: List[httpx.Request] = []
         self.unexpected: List[str] = []
         self.issued: List[Any] = []
         self.silent: List[SilentBody] = []
+        self.held: List[Any] = []
+
+    def _disconnecting(self, data: bytes) -> _DisconnectingBody:
+        body = _DisconnectingBody(data, self.release)
+        if self.release is not None:
+            self.held.append(body)
+        return body
 
     def bodies(self, path: str = "/v1/responses") -> List[Dict[str, Any]]:
         return [json.loads(r.content) for r in self.requests if r.url.path == path]
@@ -315,11 +370,17 @@ class ResponsesWire:
                 if not (chat.disconnects or chat.stalls):
                     data = json.dumps(chat.completion()).encode()
             if chat.disconnects:
-                return httpx.Response(200, headers=headers, stream=_DisconnectingBody(data))
+                return httpx.Response(200, headers=headers, stream=self._disconnecting(data))
             if chat.stalls:
                 silent = SilentBody(data)
                 self.silent.append(silent)
                 return httpx.Response(200, headers=headers, stream=silent)
+            if chat.close_fails and not body.get("stream"):
+                return httpx.Response(200, headers=headers, stream=_FailingCloseBody(data))
+            if self.release is not None and not body.get("stream"):
+                held = _HeldBody(data, self.release)
+                self.held.append(held)
+                return httpx.Response(200, headers=headers, stream=held)
             return httpx.Response(200, headers=headers, content=data)
         if request.url.path != "/v1/responses":
             self.unexpected.append(f"{request.method} {request.url.path}")
@@ -330,7 +391,7 @@ class ResponsesWire:
         data = sse(reply.events())
         headers = {"content-type": "text/event-stream"}
         if reply.disconnect_after_created or reply.disconnect_after_terminal:
-            return httpx.Response(200, headers=headers, stream=_DisconnectingBody(data))
+            return httpx.Response(200, headers=headers, stream=self._disconnecting(data))
         if reply.stall_after_created or reply.stall_after_terminal:
             silent = SilentBody(data)
             self.silent.append(silent)
