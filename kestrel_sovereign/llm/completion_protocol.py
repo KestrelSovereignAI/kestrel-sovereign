@@ -10,6 +10,7 @@ from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
 )
 from .output_ceiling import IncompleteGenerationError
+from .provider_served import attach_provider_served, provider_served
 
 _T = TypeVar("_T")
 
@@ -27,15 +28,20 @@ def decode_tool_arguments(arguments: Any) -> dict[str, Any]:
 
 
 def response_usage_only(response: LLMResponse) -> LLMResponse:
-    """Retain native counts and completion metadata without text or tool effects."""
-    return LLMResponse(
+    """Retain native counts and completion metadata without text or tool effects.
+
+    The provider's identification of the response it served
+    (:mod:`~kestrel_sovereign.llm.provider_served`) is completion metadata
+    and is kept too (#4198).
+    """
+    return attach_provider_served(LLMResponse(
         input_tokens=response.input_tokens,
         output_tokens=response.output_tokens,
         total_tokens=response.total_tokens,
         cache_creation_input_tokens=response.cache_creation_input_tokens,
         cache_read_input_tokens=response.cache_read_input_tokens,
         stop_reason=response.stop_reason,
-    )
+    ), provider_served(response))
 
 
 class GenerationProtocolError(IncompleteGenerationError, LLMProtocolError):

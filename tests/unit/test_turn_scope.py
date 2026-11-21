@@ -205,7 +205,7 @@ def test_every_turn_scoped_value_is_declared_at_its_definition_site():
     from kestrel_sovereign import auth, telemetry
     from kestrel_sovereign.agent import parts, tool_allowlist, turn_lifecycle
     from kestrel_sovereign.features import base as feature_base
-    from kestrel_sovereign.llm import invocation_context
+    from kestrel_sovereign.llm import invocation_context, responses_continuation
     from kestrel_sovereign.signals import context
     from kestrel_sovereign.storage import privacy_wrapper
 
@@ -224,6 +224,7 @@ def test_every_turn_scoped_value_is_declared_at_its_definition_site():
         "turn_id": {telemetry._CURRENT_TURN_ID.name},
         "causation_chain": {turn_lifecycle._CURRENT_CHAIN.name},
         "llm_turn_invocation": {invocation_context._TURN_INVOCATION.name},
+        "responses_continuations": {responses_continuation._CONTINUATIONS.name},
         "tool_call_in_flight": {tool_allowlist._TOOL_CALL_IN_FLIGHT.name},
         "flattened_outcome_unknown": {
             feature_base._flattened_outcome_unknown.name
@@ -832,6 +833,7 @@ def test_no_closure_re_presents_turn_scoped_state_by_hand():
             "turn_id",
             "causation_chain",
             "llm_turn_invocation",
+            "responses_continuations",
             "tool_call_in_flight",
             "flattened_outcome_unknown",
         }

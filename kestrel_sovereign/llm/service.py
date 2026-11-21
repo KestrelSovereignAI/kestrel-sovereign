@@ -61,6 +61,7 @@ from .output_ceiling import (
     response_stop_reason,
 )
 from .rate_limit_headers import RATE_LIMIT_HEADERS_KEY, response_rate_limit_headers
+from .provider_served import PROVIDER_SERVED_KEY, provider_served
 from .generation_gate import UnfinishedAfterInlineToolsError
 from .discovery_deadline import discovery_route_deadline_seconds
 from .model_discovery import ModelDiscoveryMixin, discovery_call
@@ -4586,6 +4587,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         usage_available: Optional[bool] = None,
         track_model_usage: Optional[bool] = None,
         meter_usage: Optional[bool] = None,
+        served_source: Optional[BaseException] = None,
     ) -> None:
         """Record one provider attempt while isolating every telemetry sink.
 
@@ -4593,6 +4595,11 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         suppress the billing callback, and an observability-store outage cannot
         suppress Prometheus or the structured usage line.  Cancellation is
         deliberately never swallowed.
+
+        ``served_source`` is the error a failed attempt raised. What the
+        provider said it served (:mod:`.provider_served`) is read from the
+        response, else from that error, and recorded under
+        ``provider_served`` (#4198).
         """
 
         if publish_identity and success:
@@ -4681,6 +4688,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         rate_limit_headers = response_rate_limit_headers(response)
         if rate_limit_headers is not None:
             record_metadata.setdefault(RATE_LIMIT_HEADERS_KEY, rate_limit_headers)
+        served = provider_served(response) or provider_served(served_source)
+        if served is not None:
+            record_metadata.setdefault(PROVIDER_SERVED_KEY, served.as_metadata())
 
         tracked_tokens = total_tokens
         if tracked_tokens is None and (
@@ -4781,6 +4791,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         usage_available: bool = False,
         track_model_usage: bool = False,
         meter_usage: bool = False,
+        served_source: Optional[BaseException] = None,
     ) -> None:
         """Record one failed provider attempt without publishing its identity."""
 
@@ -4804,6 +4815,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             usage_available=usage_available,
             track_model_usage=track_model_usage,
             meter_usage=meter_usage,
+            served_source=error if served_source is None else served_source,
         )
 
     async def _run_provider_attempt(
@@ -4911,6 +4923,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                     # Preserve main's capped-attempt usage without granting
                     # accounting authority after native custody loss.
                     meter_usage=usage_available,
+                    served_source=exc,
                 )
                 raise
 

@@ -80,6 +80,7 @@ from kestrel_sovereign.llm.call_progress import (
 )
 from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
 from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
+from kestrel_sovereign.llm.responses_continuation import note_turn_context_budget
 from kestrel_sovereign.turn_completion import (
     confirm_unfinished,
     confirms_complete,
@@ -4734,6 +4735,11 @@ class OrchestratorEngineMixin:
 
         chars_per_token = 3.5
         max_chars = int(context_limit * chars_per_token * (1 - CONTEXT_RESERVE_FRACTION))
+        # A provider path that replays a captured prefix instead of sending
+        # this list (the OpenAI Responses continuation) measures what it will
+        # actually send against the same budget, so it cannot restore what
+        # this prune removes (#4198).
+        note_turn_context_budget(max_chars)
 
         tool_chars = sum(len(json.dumps(t)) for t in tools) if tools else 0
         max_message_chars = max_chars - tool_chars

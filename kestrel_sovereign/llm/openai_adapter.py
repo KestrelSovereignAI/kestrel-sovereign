@@ -69,6 +69,13 @@ except ImportError:  # pragma: no cover - compatibility with SDK v4 checkouts.
     TokenCount = TokenCountMode = WebSearchOptions = None
 from .call_progress import report_call_progress
 from .gpt5_overlay import prepend_gpt5_overlay
+from .openai_responses import (
+    ResponsesEventState,
+    ResponsesRoute,
+    prepare_responses_request,
+    requires_responses_api,
+)
+from .provider_served import attach_provider_served, provider_served
 from .model_metadata import ModelInfo, ModelCategory
 from .output_ceiling import (
     attach_stop_reason,
@@ -81,6 +88,7 @@ from kestrel_sovereign.execution_custody import (
     owned_native_http_client,
     native_execution_response_owner, native_sdk_operation,
     close_native_execution_stream, retain_native_execution_http_client_close, is_execution_control_error,
+    retain_native_execution_stream_close,
 )
 
 logger = logging.getLogger(__name__)
@@ -594,11 +602,17 @@ class OpenAIAdapter(LLMAdapter):
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
 
-            extra_kwargs = self._prepare_chat_completion_request(
+            extra_kwargs = self._merge_request_options(
                 extra_kwargs,
                 model=model,
                 options=kwargs.get("request_options"),
             )
+            if requires_responses_api(
+                native_openai=self._native_openai, model=model, request=extra_kwargs,
+                messages=messages, route=self._responses_route(client),
+            ):
+                return await self._responses_response(client, model, messages, extra_kwargs)
+            extra_kwargs = self._chat_completion_compatible(extra_kwargs, model=model)
 
             response = await with_retry(
                 client.chat.completions.create,
@@ -772,11 +786,22 @@ class OpenAIAdapter(LLMAdapter):
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
 
-            extra_kwargs = self._prepare_chat_completion_request(
+            extra_kwargs = self._merge_request_options(
                 extra_kwargs,
                 model=model,
                 options=kwargs.get("request_options"),
             )
+            if requires_responses_api(
+                native_openai=self._native_openai, model=model, request=extra_kwargs,
+                messages=messages, route=self._responses_route(client),
+            ):
+                async with aclosing(
+                    self._responses_events(client, model, messages, extra_kwargs)
+                ) as events:
+                    async for item in events:
+                        yield item
+                return
+            extra_kwargs = self._chat_completion_compatible(extra_kwargs, model=model)
 
             # Request streaming with usage stats
             extra_kwargs["stream_options"] = {"include_usage": True}
@@ -797,7 +822,6 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
-            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
             retain_native_execution_stream_close(stream, self)
 
             # Accumulator for tool calls - keyed by index
@@ -1001,6 +1025,106 @@ class OpenAIAdapter(LLMAdapter):
             logger.error("OpenAI streaming with tools failed: %s", type(e).__name__)
             raise
 
+    def _responses_route(self, client: Any) -> ResponsesRoute:
+        """The route a Responses continuation snapshot is bound to: this
+        route's own client, labelled by vendor and base URL (#4198)."""
+        return ResponsesRoute(
+            label=f"{self.name}|{getattr(client, 'base_url', '')}", client=client,
+        )
+
+    async def _responses_response(
+        self,
+        client: openai.AsyncOpenAI,
+        model: str,
+        messages: List[Dict[str, Any]],
+        request_kwargs: Dict[str, Any],
+    ) -> LLMResponse:
+        """The non-streaming entry point's Responses call: the same event
+        stream the streaming entry point consumes, reduced to its terminal
+        response (#4198)."""
+        result: Optional[LLMResponse] = None
+        async with aclosing(
+            self._responses_events(client, model, messages, request_kwargs)
+        ) as events:
+            async for item in events:
+                if isinstance(item, LLMResponse):
+                    result = item
+        if result is None:
+            raise GenerationProtocolError(None)
+        return result
+
+    async def _responses_events(
+        self,
+        client: openai.AsyncOpenAI,
+        model: str,
+        messages: List[Dict[str, Any]],
+        request_kwargs: Dict[str, Any],
+    ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
+        """Run one Responses API call; yield what a stream shows, then one
+        terminal :class:`LLMResponse` (see :mod:`.openai_responses`).
+
+        Every error raised after the provider identified the response carries
+        that identification (:func:`~.provider_served.provider_served`); a
+        failed or unfinished response's error also carries its usage.
+        """
+        request = prepare_responses_request(
+            route=self._responses_route(client),
+            model=model,
+            messages=messages,
+            request=request_kwargs,
+        )
+        state = ResponsesEventState(request, provider=self.name)
+
+        async def acquire_stream(**body):
+            async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
+                acquired = await client.responses.create(**body)
+                responses.handles.clear()
+                return acquired
+
+        def limit_notice(stop_reason: str, caller_budget: bool) -> Optional[str]:
+            notice = self._output_limit_notice(model, stop_reason, caller_budget)
+            if notice is None:
+                return None
+            return output_ceiling_notice_chunk(notice, follows_text=bool(state.text))
+
+        logger.info("Starting OpenAI Responses stream for model: %s", model)
+        try:
+            stream = await with_retry(
+                acquire_stream,
+                stream=True,
+                acquired_result_cleanup=close_native_execution_stream,
+                **request.body,
+            )
+            retain_native_execution_stream_close(stream, self)
+            try:
+                async for event in stream:
+                    report_call_progress()
+                    for item in state.observe(event):
+                        yield item
+            finally:
+                await close_native_execution_stream(stream, self)
+            chunks, result = state.finish(notice=limit_notice)
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            failure = GenerationProtocolError(
+                attach_provider_served(state.reported_usage(), state.served)
+            )
+            if state.observed:
+                attach_provider_served(failure, state.served)
+            raise failure from error
+        except Exception as error:
+            if (
+                not is_execution_control_error(error)
+                and state.observed
+                and provider_served(error) is None
+            ):
+                attach_provider_served(error, state.served)
+            raise
+        for chunk in chunks:
+            yield chunk
+        yield attach_provider_served(result, state.settle(result))
+
     async def continue_with_tool_results(
         self,
         client: openai.AsyncOpenAI,
@@ -1202,6 +1326,22 @@ class OpenAIAdapter(LLMAdapter):
             raise ValueError("file_ref.id is required")
         return {"file_id": file_id}
 
+    def _merge_request_options(
+        self,
+        request_kwargs: Dict[str, Any],
+        *,
+        model: str,
+        options: Any = None,
+    ) -> Dict[str, Any]:
+        """The request as it will be sent, with ``options`` applied.
+
+        Which endpoint serves a request is decided from this merged form, so
+        tools supplied through raw options or ``extra_body`` count (#4198).
+        """
+        if options is None:
+            return request_kwargs
+        return self.apply_request_options(request_kwargs, options, model=model)
+
     def _prepare_chat_completion_request(
         self,
         request_kwargs: Dict[str, Any],
@@ -1211,15 +1351,22 @@ class OpenAIAdapter(LLMAdapter):
     ) -> Dict[str, Any]:
         """Apply options and enforce chat-completions compatibility once.
 
-        All non-streaming, text-streaming, tool-streaming, and batch request
-        builders finish here. Keeping the endpoint policy after raw option
-        merging means neither a caller-supplied top-level value nor
-        ``extra_body`` can restore a combination the native endpoint rejects.
+        The batch builder finishes here; the non-streaming and tool-streaming
+        builders run the same two steps around their endpoint choice. Keeping
+        the endpoint policy after raw option merging means neither a
+        caller-supplied top-level value nor ``extra_body`` can restore a
+        combination the native endpoint rejects.
         """
-        out = request_kwargs
-        if options is not None:
-            out = self.apply_request_options(out, options, model=model)
+        out = self._merge_request_options(request_kwargs, model=model, options=options)
+        return self._chat_completion_compatible(out, model=model)
 
+    def _chat_completion_compatible(
+        self,
+        out: Dict[str, Any],
+        *,
+        model: str,
+    ) -> Dict[str, Any]:
+        """``out`` with any combination chat completions rejects normalized."""
         if not self._requires_none_reasoning_for_function_tools(out, model=model):
             return out
 

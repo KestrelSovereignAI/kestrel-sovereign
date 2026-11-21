@@ -36,6 +36,7 @@ from kestrel_sovereign.agent.invocation import (
     validate_invocation_id,
 )
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.llm.responses_continuation import responses_continuation_scope
 from kestrel_sovereign.telemetry import (
     KESTREL_TURN_ID,
     current_turn_id as telemetry_current_turn_id,
@@ -954,6 +955,10 @@ class TurnLifecycleMixin:
         logger.info("turn_lifecycle: %s begin", label)
         turn_scope = turn_span_scope(turn_id)
         turn_scope.__enter__()
+        # The turn's Responses continuation snapshots live exactly as long as
+        # the turn: a later turn never replays this one's reasoning (#4198).
+        continuations = responses_continuation_scope()
+        continuations.__enter__()
         # Agent-scoped mirror of "which turn is LIVE" — i.e. which one holds
         # the CONVERSATION lock and therefore owns `_active_session_id`.
         self._live_turn_id = turn_id
@@ -1009,6 +1014,7 @@ class TurnLifecycleMixin:
             finally:
                 ownership.__exit__(None, None, None)
                 self._turn_trace_index().pop(turn_id, None)
+                continuations.__exit__(None, None, None)
                 turn_scope.__exit__(None, None, None)
                 self._live_turn_id = None
                 self._live_turn_task = None

@@ -1006,6 +1006,7 @@ class StreamingMixin:
         publish_identity: bool = True,
         invocation_context: Optional["LLMInvocationContext"] = None,
         meter_usage: Optional[bool] = None,
+        served_source: Optional[BaseException] = None,
     ) -> None:
         """Finalize one streamed provider attempt from honest usage evidence.
 
@@ -1021,6 +1022,8 @@ class StreamingMixin:
         usage is recorded; the metadata flag lets telemetry tell it apart.
         ``meter_usage`` overrides whether the usage is billed (``success`` by
         default), for a failed attempt the provider still billed.
+        ``served_source`` is the error a failed stream raised, which may carry
+        what the provider said it served (#4198).
         """
         require_execution_work(self)
         if not isinstance(response, LLMResponse):
@@ -1054,6 +1057,7 @@ class StreamingMixin:
                     usage_available=usage_available,
                     track_model_usage=bool(usage_available),
                     meter_usage=meter_usage,
+                    served_source=served_source,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1395,6 +1399,7 @@ class StreamingMixin:
                             publish_identity=False,
                             invocation_context=invocation_context,
                             meter_usage=True,
+                            served_source=failure,
                         )
                     elif usage_sink:
                         # Preserve the existing partial-usage billing behavior.  The
@@ -1430,6 +1435,7 @@ class StreamingMixin:
                             publish_identity=False,
                             invocation_context=invocation_context,
                             meter_usage=True,
+                            served_source=failure,
                         )
                     elif completed:
                         await self._record_streamed_usage(
@@ -1460,6 +1466,7 @@ class StreamingMixin:
                             usage_available=False,
                             publish_identity=False,
                             invocation_context=invocation_context,
+                            served_source=failure,
                         )
             except BaseException as accounting_error:
                 # Cancellation/close does not prove that accounting control
