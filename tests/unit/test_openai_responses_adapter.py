@@ -853,6 +853,286 @@ async def test_excluded_history_within_budget_is_not_replayed(stream, excluded):
     assert registry.expired
 
 
+# ---------------------------------------------------------------------------
+# A reply found by its call ids must still be carried whole (#4204)
+# ---------------------------------------------------------------------------
+
+ANCHORED_TEXT = "EXCLUDED-ASSISTANT-CONTENT"
+
+
+def _commentary_then(*later_calls: str):
+    """A reply with reasoning, commentary text and ``call_1``; then one reply
+    per ``later_calls`` id carrying only that call; then a text answer."""
+    def script(body, index):
+        if index == 0:
+            return Reply([
+                reasoning("rs_0", "ENC-0"), message("msg_0", ANCHORED_TEXT, phase="commentary"),
+                call("fc_0", "call_1", "lookup", '{"key":"ARG-ORIGINAL"}'),
+            ], "resp_0")
+        if index <= len(later_calls):
+            call_id = later_calls[index - 1]
+            return Reply([reasoning(f"rs_{index}", f"ENC-{index}"),
+                          call(f"fc_{index}", call_id, "lookup", "{}")], f"resp_{index}")
+        return Reply([message(f"msg_{index}", "Done.")], f"resp_{index}")
+    return script
+
+
+def _tool_history_msg(response: LLMResponse) -> Dict[str, Any]:
+    """The assistant message the real tool loop replays ``response`` as."""
+    from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+
+    return OrchestratorEngineMixin()._build_assistant_tool_history_msg(response)
+
+
+def _output(call_id: str) -> Dict[str, Any]:
+    return {"role": "tool", "tool_call_id": call_id, "content": "{}"}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_excluded_anchored_assistant_text_is_not_replayed(stream):
+    """The caller kept a reply's tool call but excluded the text the reply
+    carried beside it. The call id still finds the message; replaying the
+    snapshot would restore the text. So the chain ends at ``prefix_pruned``
+    and the request is the ordinary boundary: no opaque replay."""
+    wire = ResponsesWire(_commentary_then())
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope() as registry:
+            first, _ = await _call(adapter, client, [SYSTEM, USER], stream=stream)
+            [parent] = registry.snapshots()
+            assistant = _tool_history_msg(first)
+            assert assistant["content"] == ANCHORED_TEXT
+            assistant["content"] = ""
+            response, _ = await _call(
+                adapter, client, [SYSTEM, USER, assistant, _output("call_1")], stream=stream,
+            )
+            retired = registry.retirement_of(parent)
+            live = [snapshot.response_id for snapshot in registry.snapshots()]
+    sent = wire.raw()[1]
+    assert ANCHORED_TEXT.encode() not in sent
+    assert b"ENC-0" not in sent and b"function_call" not in sent
+    assert json.loads(sent)["input"] == [
+        {"type": "message", "role": "system", "content": SYSTEM["content"]},
+        {"type": "message", "role": "user", "content": USER["content"]},
+    ]
+    served = provider_served(response)
+    assert served.continuation == {
+        "status": "boundary", "reason": "prefix_pruned", "omitted_tool_items": 2,
+    }
+    assert served.snapshot == {"stored": True}
+    assert retired == "prefix_pruned"
+    assert live == ["resp_1"]
+
+
+@STREAM
+async def test_an_anchored_reply_the_caller_keeps_whole_continues_its_chain(stream):
+    """The control: the same reply, replayed by the real history builder
+    unchanged, continues its chain, and the replay carries the reply's text
+    and call exactly as the provider emitted them."""
+    wire = ResponsesWire(_commentary_then())
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope():
+            first, _ = await _call(adapter, client, [SYSTEM, USER], stream=stream)
+            response, _ = await _call(
+                adapter, client, [SYSTEM, USER, _tool_history_msg(first), _output("call_1")],
+                stream=stream,
+            )
+    sent, continued = wire.raw()
+    assert wire_items(continued)[: len(wire_items(sent))] == wire_items(sent)
+    gained = json.loads(continued)["input"][len(wire_items(sent)):]
+    assert [item["type"] for item in gained] == [
+        "reasoning", "message", "function_call", "function_call_output",
+    ]
+    assert gained[1]["content"][0]["text"] == ANCHORED_TEXT
+    assert gained[2]["arguments"] == '{"key":"ARG-ORIGINAL"}'
+    assert provider_served(response).continuation == {
+        "status": "continued", "previous_response_id": "resp_0", "appended_items": 1,
+    }
+
+
+@STREAM
+async def test_excluded_text_of_an_earlier_anchored_reply_is_not_replayed(stream):
+    """Every reply the chain absorbed is checked, not only its latest: the
+    caller kept round one's call but excluded its text, then continued round
+    two whole."""
+    wire = ResponsesWire(_commentary_then("call_2"))
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope():
+            first, _ = await _call(adapter, client, [SYSTEM, USER], stream=stream)
+            round_one = [SYSTEM, USER, _tool_history_msg(first), _output("call_1")]
+            second, _ = await _call(adapter, client, round_one, stream=stream)
+            assert provider_served(second).continuation["status"] == "continued"
+            round_one[2] = {**round_one[2], "content": ""}
+            response, _ = await _call(
+                adapter, client, [*round_one, _tool_history_msg(second), _output("call_2")],
+                stream=stream,
+            )
+    assert ANCHORED_TEXT.encode() in wire.raw()[1]
+    sent = wire.raw()[2]
+    assert ANCHORED_TEXT.encode() not in sent
+    assert b"ENC-" not in sent and b"function_call" not in sent
+    boundary = provider_served(response).continuation
+    assert (boundary["status"], boundary["reason"]) == ("boundary", "prefix_pruned")
+
+
+@STREAM
+@pytest.mark.parametrize("also", ["inserted_into_prefix", "over_budget"])
+async def test_excluded_anchored_text_is_reported_as_pruned_first(stream, also):
+    """Pruning wins, as it does for any excluded item: a continuation that
+    excluded an anchored reply's text cannot replay at any budget, so its
+    reason is ``prefix_pruned`` even when it also inserted into the prefix
+    or would exceed the turn's context budget."""
+    wire = ResponsesWire(_commentary_then())
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope() as registry:
+            first, _ = await _call(adapter, client, [SYSTEM, USER], stream=stream)
+            assistant = {**_tool_history_msg(first), "content": ""}
+            kept = [SYSTEM, USER, assistant, _output("call_1")]
+            if also == "inserted_into_prefix":
+                kept.insert(2, {"role": "user", "content": "An inserted aside."})
+            else:
+                registry.limit_context(10)
+            response, _ = await _call(adapter, client, kept, stream=stream)
+    sent = wire.raw()[1]
+    assert ANCHORED_TEXT.encode() not in sent and b"ENC-0" not in sent
+    boundary = provider_served(response).continuation
+    assert (boundary["status"], boundary["reason"]) == ("boundary", "prefix_pruned")
+
+
+@STREAM
+@pytest.mark.parametrize("arguments, continues", [
+    ({"key": "[redacted]"}, False),
+    ('["ARG-REPLACED"]', False),
+    ('{\n "key": "\\u0041RG-ORIGINAL"\n}', True),
+], ids=["rewritten", "not_an_object", "re_encoded"])
+async def test_a_kept_call_is_compared_by_its_argument_values(stream, arguments, continues):
+    """A call the caller kept with a rewritten argument is not the call the
+    reply holds: replaying it would restore the original argument text. One
+    whose arguments encode no JSON object is not either, and ends the chain
+    rather than failing the request. The same arguments in another encoding
+    are the same call."""
+    wire = ResponsesWire(_commentary_then())
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope():
+            first, _ = await _call(adapter, client, [SYSTEM, USER], stream=stream)
+            assistant = _tool_history_msg(first)
+            assistant["tool_calls"][0]["function"]["arguments"] = arguments
+            response, _ = await _call(
+                adapter, client, [SYSTEM, USER, assistant, _output("call_1")], stream=stream,
+            )
+    sent = wire.raw()[1]
+    served = provider_served(response).continuation
+    if continues:
+        assert served["status"] == "continued"
+        assert b"ARG-ORIGINAL" in sent
+        return
+    assert b"ARG-ORIGINAL" not in sent
+    assert b"ENC-0" not in sent and b"function_call" not in sent
+    assert (served["status"], served["reason"]) == ("boundary", "prefix_pruned")
+
+
+_DELETED = object()
+
+
+def _empty_arguments_call(body, index):
+    """A reply with reasoning and one call that takes no arguments; then an answer."""
+    if index == 0:
+        return Reply([reasoning("rs_0", "ENC-0"), call("fc_0", "call_1", "lookup", "{}")], "resp_0")
+    return Reply([message(f"msg_{index}", "Done.")], f"resp_{index}")
+
+
+@STREAM
+@pytest.mark.parametrize("arguments, continues", [
+    ({}, True),
+    ("{}", True),
+    (_DELETED, False),
+    (None, False),
+    ("", False),
+    (False, False),
+    ([], False),
+    (0, False),
+], ids=["dict", "json_text", "missing", "none", "empty_text", "false", "empty_list", "zero"])
+async def test_a_kept_call_without_arguments_is_not_read_as_empty(stream, arguments, continues):
+    """A reply whose call took ``{}`` is replayed by the real history builder
+    with ``{}``; that, or the same object as JSON text, continues the chain.
+    A call whose arguments the caller removed or replaced with a falsy
+    non-object is not that call: it is not read as ``{}``, so the snapshot is
+    retired at ``prefix_pruned`` and the request is the ordinary boundary."""
+    wire = ResponsesWire(_empty_arguments_call)
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope() as registry:
+            first, _ = await _call(adapter, client, [SYSTEM, USER], stream=stream)
+            [parent] = registry.snapshots()
+            assistant = _tool_history_msg(first)
+            function = assistant["tool_calls"][0]["function"]
+            assert function["arguments"] == {}
+            if arguments is _DELETED:
+                del function["arguments"]
+            else:
+                function["arguments"] = arguments
+            response, _ = await _call(
+                adapter, client, [SYSTEM, USER, assistant, _output("call_1")], stream=stream,
+            )
+            retired = registry.retirement_of(parent)
+    sent = wire.raw()[1]
+    served = provider_served(response).continuation
+    if continues:
+        assert served == {
+            "status": "continued", "previous_response_id": "resp_0", "appended_items": 1,
+        }
+        assert b"ENC-0" in sent
+        assert retired == "superseded"
+        return
+    assert b"ENC-0" not in sent and b"function_call" not in sent
+    assert json.loads(sent)["input"] == [
+        {"type": "message", "role": "system", "content": SYSTEM["content"]},
+        {"type": "message", "role": "user", "content": USER["content"]},
+    ]
+    assert served == {"status": "boundary", "reason": "prefix_pruned", "omitted_tool_items": 2}
+    assert retired == "prefix_pruned"
+
+
+@STREAM
+@pytest.mark.parametrize("carried", ["replaced", "one_of_two_dropped"])
+async def test_a_turn_notice_the_caller_rewrote_is_not_replayed(stream, carried):
+    """Turn notices may be omitted from a continuation, because the tool loop
+    never carries them back, and they are then replayed in place. A notice
+    the caller still carries, but changed (retracted and replaced, or one of
+    two dropped), is not the one sent: the chain ends and the notice it
+    withdrew is not transmitted.
+
+    A notice omitted altogether cannot be told apart from the tool loop's
+    rebuild, so it is replayed (``test_a_continuation_appends_to_the_captured_prefix``):
+    the exemption rests on role and position only. The core turn's inline
+    notice is never stored as a conversation row, so no exclusion can name it."""
+    withdrawn = {"role": "system", "content": "NOTICE-WITHDRAWN: auto-mode is on."}
+    if carried == "replaced":
+        sent_first = [SYSTEM, USER, withdrawn]
+        now = [{"role": "system", "content": "NOTICE-CURRENT: auto-mode is off."}]
+    else:
+        kept_notice = {"role": "developer", "content": "NOTICE-KEPT: answer briefly."}
+        sent_first = [SYSTEM, USER, kept_notice, withdrawn]
+        now = [kept_notice]
+    wire = ResponsesWire(_first_then_answer)
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope():
+            await _call(adapter, client, sent_first, stream=stream)
+            assert b"NOTICE-WITHDRAWN" in wire.raw()[0]
+            history = _history()
+            response, _ = await _call(adapter, client, [*history[:2], *now, *history[2:]], stream=stream)
+    sent = wire.raw()[1]
+    assert b"NOTICE-WITHDRAWN" not in sent
+    assert b"ENC-" not in sent and b"function_call" not in sent
+    boundary = provider_served(response).continuation
+    assert (boundary["status"], boundary["reason"]) == ("boundary", "prefix_changed")
+
+
 async def test_a_context_budget_is_a_positive_number_of_characters():
     registry = ResponsesContinuations()
     for bad in (0, -1, 1.5, True, None):
@@ -1153,7 +1433,8 @@ async def test_the_registry_records_why_each_snapshot_was_retired():
         return ResponsesSnapshot(
             route="r", client=None, requested_model=MODEL, served_model=SERVED,
             response_id=f"resp_{n}", settings="{}", items=(), declared_tools=(),
-            anchors=(ResponsesAnchor(content="", call_ids=(f"call_{n}",)),), turn_request=None,
+            anchors=(ResponsesAnchor(content="", call_ids=(f"call_{n}",), calls_digest=""),),
+            turn_request=None,
         )
 
     with responses_continuation_scope() as registry:
@@ -1200,7 +1481,8 @@ async def test_a_snapshot_turn_stays_on_the_responses_api_after_its_records_are_
             route=route.label, client=route.client, adapter=route.adapter,
             requested_model=MODEL, served_model=SERVED, response_id=f"resp_{route.label}_{n}",
             settings="{}", items=(), declared_tools=(),
-            anchors=(ResponsesAnchor(content="", call_ids=(f"call_{n}",)),), turn_request=None,
+            anchors=(ResponsesAnchor(content="", call_ids=(f"call_{n}",), calls_digest=""),),
+            turn_request=None,
         )
 
     def stays(route):
@@ -1470,7 +1752,8 @@ def _route_snapshot(route_label, n, *, client=None, adapter=None):
     return ResponsesSnapshot(
         route=route_label, client=client, adapter=adapter, requested_model=MODEL,
         served_model=SERVED, response_id=f"resp_{route_label}_{n}", settings="{}", items=(),
-        declared_tools=(), anchors=(ResponsesAnchor(content="", call_ids=(f"call_{route_label}_{n}",)),),
+        declared_tools=(),
+        anchors=(ResponsesAnchor(content="", call_ids=(f"call_{route_label}_{n}",), calls_digest=""),),
         turn_request=None,
     )
 
