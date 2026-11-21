@@ -72,6 +72,7 @@ from .gpt5_overlay import prepend_gpt5_overlay
 from .openai_responses import (
     ResponsesEventState,
     ResponsesRoute,
+    ResponsesStreamInterrupted,
     prepare_responses_request,
     requires_responses_api,
 )
@@ -92,6 +93,11 @@ from kestrel_sovereign.execution_custody import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Transport failures that end a Responses stream before its clean close.
+#: Only these, after the terminal response arrived, lose a finished stream
+#: (#4198); anything else, a parsing bug included, is raised as itself.
+_STREAM_TRANSPORT_ERRORS = (openai.APIConnectionError, httpx.TransportError, httpx.StreamError)
 
 #: The chat-completions ``finish_reason`` for a response cut at the output
 #: limit (OpenRouter forwards every upstream's cut as this value too).
@@ -279,6 +285,16 @@ class OpenAIAdapter(LLMAdapter):
     - Chat completions with tool calling
     - Streaming responses
     - JSON mode
+
+    On the native OpenAI route, ``gpt-6.2-sol`` requests that carry function
+    tools or tool history, or that belong to a turn which already holds a
+    Responses continuation on this route, go to the Responses API instead
+    (see :mod:`.openai_responses`, #4198). On that route tools are declared
+    through the typed ``tools`` parameter only: a request whose merged body
+    carries ``extra_body["tools"]`` (through ``extra_body`` or
+    ``RequestOptions.raw``) is refused with a :class:`ValueError` before
+    anything is sent, even when it repeats the typed declaration. Every other
+    route passes raw options through unchanged.
     """
 
     DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -292,8 +308,13 @@ class OpenAIAdapter(LLMAdapter):
         embedding_model: Optional[str] = None,
         embedding_dim: Optional[int] = None,
         native_openai: bool = False,
+        route: Optional[str] = None,
     ):
         self.name = name
+        # The configured route this adapter serves (``openai:primary``), when
+        # the provider registry built it: a Responses continuation snapshot is
+        # bound to it (#4198).
+        self.route = route
         if supports_embeddings is None:
             supports_embeddings = name == "openai"
         if supports_embeddings and embedding_model is None:
@@ -1027,9 +1048,16 @@ class OpenAIAdapter(LLMAdapter):
 
     def _responses_route(self, client: Any) -> ResponsesRoute:
         """The route a Responses continuation snapshot is bound to: this
-        route's own client, labelled by vendor and base URL (#4198)."""
+        configured route's name, this adapter and its own client (#4198).
+
+        An adapter built outside the provider registry has no route name and
+        is labelled by its vendor and base URL; its adapter and client
+        identities still keep it apart from every other route.
+        """
         return ResponsesRoute(
-            label=f"{self.name}|{getattr(client, 'base_url', '')}", client=client,
+            label=self.route or f"{self.name}|{getattr(client, 'base_url', '')}",
+            client=client,
+            adapter=self,
         )
 
     async def _responses_response(
@@ -1064,8 +1092,19 @@ class OpenAIAdapter(LLMAdapter):
         terminal :class:`LLMResponse` (see :mod:`.openai_responses`).
 
         Every error raised after the provider identified the response carries
-        that identification (:func:`~.provider_served.provider_served`); a
-        failed or unfinished response's error also carries its usage.
+        that identification (:func:`~.provider_served.provider_served`),
+        cancellation included: the inactivity watchdog's timeout wraps the
+        cancelled error, so the identification reaches the failed attempt's
+        row. The evidence is attached before the error is re-raised, with no
+        await in between, and the error is always re-raised. A failed or
+        unfinished response's error also carries its usage, and so does a
+        transport failure after the terminal response arrived
+        (:class:`~.openai_responses.ResponsesStreamInterrupted`); with no
+        terminal response the usage is unknown, never zero.
+
+        Tools reach this route through the typed ``tools`` parameter only:
+        ``extra_body["tools"]`` on a native ``gpt-6.2-sol`` request is refused
+        before anything is sent (see :mod:`.openai_responses`).
         """
         request = prepare_responses_request(
             route=self._responses_route(client),
@@ -1088,6 +1127,7 @@ class OpenAIAdapter(LLMAdapter):
             return output_ceiling_notice_chunk(notice, follows_text=bool(state.text))
 
         logger.info("Starting OpenAI Responses stream for model: %s", model)
+        stream_ended = False
         try:
             stream = await with_retry(
                 acquire_stream,
@@ -1101,6 +1141,7 @@ class OpenAIAdapter(LLMAdapter):
                     report_call_progress()
                     for item in state.observe(event):
                         yield item
+                stream_ended = True
             finally:
                 await close_native_execution_stream(stream, self)
             chunks, result = state.finish(notice=limit_notice)
@@ -1113,12 +1154,21 @@ class OpenAIAdapter(LLMAdapter):
             if state.observed:
                 attach_provider_served(failure, state.served)
             raise failure from error
-        except Exception as error:
+        except BaseException as error:
+            # BaseException: the inactivity watchdog stops a silent stream by
+            # cancelling it. Everything here is synchronous, and the original
+            # error (cancellation included) is always re-raised.
+            if is_execution_control_error(error):
+                raise
             if (
-                not is_execution_control_error(error)
-                and state.observed
-                and provider_served(error) is None
+                isinstance(error, _STREAM_TRANSPORT_ERRORS)
+                and not stream_ended
+                and state.terminal_arrived
             ):
+                raise ResponsesStreamInterrupted(
+                    model=model, usage=state.reported_usage(), served=state.served,
+                ) from error
+            if state.observed and provider_served(error) is None:
                 attach_provider_served(error, state.served)
             raise
         for chunk in chunks:

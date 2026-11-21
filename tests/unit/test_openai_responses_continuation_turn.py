@@ -37,6 +37,7 @@ from tests.shared.openai_responses_wire import (
     SERVED,
     Reply,
     ResponsesWire,
+    StallingWire,
     call,
     input_types,
     message,
@@ -279,7 +280,9 @@ async def test_discovery_and_operator_notice_keep_the_serialized_prefix(
 async def test_a_reply_served_by_another_model_ends_the_chain(
     tmp_path, monkeypatch, fresh_token, llm_rows, path,
 ):
-    """The next request after a served-model mismatch replays nothing."""
+    """The policy on a reply from a mismatched model: it is the provider's
+    answer and the turn acts on it (its tool call runs), but its chain ends,
+    the substitution is recorded, and the next request replays nothing."""
     replies = iter([
         Reply([reasoning("rs_a", "ENC-A"), call("fc_a", "call_a", DIRECT, "{}")], "resp_a"),
         Reply([reasoning("rs_b", "ENC-B"), call("fc_b", "call_b", DIRECT, "{}")], "resp_b",
@@ -287,10 +290,21 @@ async def test_a_reply_served_by_another_model_ends_the_chain(
         Reply([message("msg_c", "Done.")], "resp_c"),
     ])
     wire = ResponsesWire(lambda body, index: next(replies))
+    ran: List[str] = []
+    reporting = StateOfMindFeature.get_state_of_mind
+
+    @functools.wraps(reporting)
+    async def counted(self):
+        ran.append("state_of_mind")
+        return await reporting(self)
+
+    monkeypatch.setattr(StateOfMindFeature, "get_state_of_mind", counted)
     async with _agent(tmp_path, monkeypatch, wire, name="Mismatch") as agent:
         feature = next(f for f in agent.features.values() if isinstance(f, StateOfMindFeature))
         agent._register_explored_feature_tools(feature)
         await _turn(agent, path, "Report twice.", f"mismatch-{path}", OVERRIDE)
+    # Both replies' tool calls ran, the mismatched one's included.
+    assert ran == ["state_of_mind", "state_of_mind"]
 
     first, second, third = wire.raw()
     _assert_prefix(first, second)
@@ -299,9 +313,16 @@ async def test_a_reply_served_by_another_model_ends_the_chain(
     served = _served(llm_rows)
     assert served[1]["continuation"]["chain_ended"] == "served_model_mismatch"
     assert served[1]["model"] == "gpt-6.2-sol-2026-12-01"
+    # The next request is told the chain was retired and why, never that
+    # there was no snapshot. The mismatched reply's tool call ran: its result
+    # is one of the four tool items (two calls, two results) it left out.
     assert served[2]["continuation"] == {
-        "status": "boundary", "reason": "no_snapshot", "omitted_tool_items": 4,
+        "status": "boundary", "reason": "retired",
+        "retired_reason": "served_model_mismatch", "retired_response_id": "resp_b",
+        "omitted_tool_items": 4,
     }
+    assert served[1]["continuation"]["expected_model"] == SERVED
+    assert served[1]["snapshot"] == {"stored": False, "reason": "served_model_mismatch"}
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +366,23 @@ async def test_the_next_turn_replays_nothing_from_the_last(
     assert body["model"] == (MODEL if second_override else CONFIGURED)
     assert json.loads(wire.raw()[0])["model"] == MODEL
     assert _served(llm_rows[rows_one:])[0]["continuation"] == {"status": "fresh"}
+
+    # What each turn's rows record is what each call actually used: the
+    # model it asked for (the override, then the configured default unless
+    # overridden again) and the model and response id the provider served.
+    chat_rows = [row for row in llm_rows if "provider_served" in (row.get("metadata") or {})]
+    assert [
+        (row["metadata"]["provider_served"]["model"], row["metadata"]["provider_served"]["response_id"])
+        for row in chat_rows
+    ] == wire.issued
+    requested = [row["model"] for row in chat_rows]
+    # Each row's requested model is the model its request actually carried.
+    assert requested == [json.loads(body)["model"] for body in wire.raw()]
+    first_turn_rows = sum(1 for row in llm_rows[:rows_one] if row in chat_rows)
+    assert requested[:first_turn_rows] == [MODEL] * first_turn_rows
+    assert requested[first_turn_rows:] == [MODEL if second_override else CONFIGURED] * (
+        len(requested) - first_turn_rows
+    )
     if first_turn == "tool":
         # The value reached the next turn only as the earlier reply's text.
         assert fresh_token in next_turn.decode()
@@ -523,10 +561,69 @@ async def test_a_continuation_never_restores_history_the_tool_loop_pruned(
     assert b"ENC-" not in after_tool and b"function_call" not in after_tool
     served = _served(llm_rows[rows_one:])
     boundary = served[1]["continuation"]
-    assert boundary["status"] == "boundary" and boundary["reason"] == "context_budget"
-    assert boundary["request_chars"] > boundary["budget_chars"]
+    assert (boundary["status"], boundary["reason"]) == ("boundary", "prefix_pruned")
 
     # The boundary reply starts a chain that fits, and the turn completes.
     assert rest and all(story not in body for body in rest)
     assert served[-1]["continuation"]["status"] == "continued"
     assert fresh_token in reply
+
+
+# ---------------------------------------------------------------------------
+# A watchdog timeout and a disconnect after the terminal event (m, n)
+# ---------------------------------------------------------------------------
+
+
+@PATHS
+async def test_timeout_keeps_created_identity(tmp_path, monkeypatch, llm_rows, path):
+    """The inactivity watchdog cancels a stream that went silent after
+    ``response.created``: the failed attempt's row still names the model and
+    response id the provider had already given."""
+    from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
+
+    # Long enough that the in-process wire has always delivered
+    # ``response.created`` first, however loaded the host; the stream then
+    # stays silent, so only the watchdog ends it.
+    monkeypatch.setattr(LLMCallWatchdog, "for_call", classmethod(
+        lambda cls, *args, **kwargs: cls(1.0, attempt_timeout=lambda route: 1.0)))
+    wire = StallingWire("resp_stall")
+    async with _agent(tmp_path, monkeypatch, wire, name="Timeout") as agent:
+        await _failed_turn(agent, path, f"timeout-{path}")
+
+    rows = [row for row in llm_rows if row["provider"] == "openai:api" and row["model"] == MODEL]
+    assert rows, llm_rows
+    for row in rows:
+        assert row["success"] is False
+        served = row["metadata"].get("provider_served", {})
+        assert (served.get("model"), served.get("response_id")) == (SERVED, "resp_stall"), row
+        # No terminal response arrived: the usage is unknown, never zero.
+        assert (row["input_tokens"], row["output_tokens"]) == (None, None)
+
+
+@PATHS
+@pytest.mark.parametrize("usage", ["reported", "none_reported"])
+async def test_a_disconnect_after_the_terminal_event_records_its_usage(
+    tmp_path, monkeypatch, llm_rows, path, usage,
+):
+    """The stream broke after the terminal event: the failed attempt's row
+    keeps the usage that event reported, or records none (unknown, never
+    zero or an estimate) when it reported none."""
+    wire = ResponsesWire(lambda body, index: Reply(
+        [message("msg", "Done.")], "resp_terminal", disconnect_after_terminal=True,
+        **({} if usage == "reported" else {"usage": None}),
+    ))
+    async with _agent(tmp_path, monkeypatch, wire, name="Terminal") as agent:
+        await _failed_turn(agent, path, f"terminal-{path}-{usage}")
+
+    rows = [row for row in llm_rows if (row.get("metadata") or {}).get("provider_served")]
+    assert rows, [row.get("metadata") for row in llm_rows]
+    for row in rows:
+        assert row["success"] is False
+        assert row["metadata"]["provider_served"]["response_id"] == "resp_terminal"
+        counts = (row["input_tokens"], row["output_tokens"], row["cache_read_input_tokens"])
+        if usage == "reported":
+            assert counts == (100, 30, 20)
+            assert row["usage_available"] is True
+        else:
+            assert counts == (None, None, None)
+            assert row["usage_available"] is False

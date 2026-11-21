@@ -726,6 +726,10 @@ class ProviderRegistry:
                 # (custom base_url) do not. Pass through as a typed signal so the
                 # adapter advertises those capabilities only when truly native.
                 native_openai=(vendor == "openai" and official_openai_base),
+                # The configured route's name: a Responses continuation
+                # snapshot is bound to it, so two routes never share one
+                # (#4198).
+                route=f"{vendor}:{route}",
             )
 
         # --- Fallback: try plain instantiation; let adapter fail at call time ---

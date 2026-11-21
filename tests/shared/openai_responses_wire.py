@@ -9,6 +9,7 @@ entry points stream, so one wire serves both.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -44,10 +45,13 @@ class Reply:
     """One scripted response.
 
     ``status`` is the terminal status (``completed``, ``incomplete`` or
-    ``failed``); ``error`` the failed response's error object.
+    ``failed``); ``error`` the failed response's error object. ``usage`` is
+    the terminal response's usage, omitted when ``None``.
     ``disconnect_after_created`` ends the body with a transport error right
-    after ``response.created``. ``error_event`` sends a stream ``error``
-    event instead of a terminal response.
+    after ``response.created``; ``disconnect_after_terminal`` ends it with one
+    after the terminal event, before the stream's clean end. ``error_event``
+    sends a stream ``error`` event instead of a terminal response.
+    ``after_terminal`` events follow the terminal one.
     """
 
     output: List[Dict[str, Any]]
@@ -55,7 +59,7 @@ class Reply:
     model: str = SERVED
     status: str = "completed"
     error: Optional[Dict[str, Any]] = None
-    usage: Dict[str, Any] = field(default_factory=lambda: {
+    usage: Optional[Dict[str, Any]] = field(default_factory=lambda: {
         "input_tokens": 120,
         "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 0},
         "output_tokens": 30,
@@ -63,7 +67,9 @@ class Reply:
         "total_tokens": 150,
     })
     disconnect_after_created: bool = False
+    disconnect_after_terminal: bool = False
     error_event: Optional[Dict[str, Any]] = None
+    after_terminal: List[Dict[str, Any]] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def response(self, status: str, output: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -72,7 +78,7 @@ class Reply:
             "model": self.model, "status": status, "output": output,
             "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
         }
-        if status != "in_progress":
+        if status != "in_progress" and self.usage is not None:
             body["usage"] = self.usage
         if self.error is not None and status == "failed":
             body["error"] = self.error
@@ -114,6 +120,7 @@ class Reply:
             "failed": "response.failed",
         }[self.status]
         yield {"type": terminal, "response": self.response(self.status, self.output)}
+        yield from self.after_terminal
 
 
 class _DisconnectingBody(httpx.AsyncByteStream):
@@ -136,13 +143,35 @@ def sse(events: Iterator[Dict[str, Any]]) -> bytes:
     return "".join(chunks).encode()
 
 
+class _StallingBody(httpx.AsyncByteStream):
+    """Sends ``response.created`` for ``response_id``, then never another byte."""
+
+    def __init__(self, response_id: str, model: str) -> None:
+        self._created = sse(iter([{
+            "type": "response.created",
+            "response": Reply([], response_id, model=model).response("in_progress", []),
+        }]))
+
+    async def __aiter__(self):
+        yield self._created
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        return None
+
+
 class ResponsesWire:
-    """The fake server. ``script(body, index)`` picks each request's reply."""
+    """The fake server. ``script(body, index)`` picks each request's reply.
+
+    ``issued`` is the ``(model, response id)`` of every reply it sent, in
+    order: what each call was actually served.
+    """
 
     def __init__(self, script: Callable[[Dict[str, Any], int], Reply]) -> None:
         self.script = script
         self.requests: List[httpx.Request] = []
         self.unexpected: List[str] = []
+        self.issued: List[Any] = []
 
     def bodies(self, path: str = "/v1/responses") -> List[Dict[str, Any]]:
         return [json.loads(r.content) for r in self.requests if r.url.path == path]
@@ -164,18 +193,40 @@ class ResponsesWire:
             return httpx.Response(404, json={"error": {"message": "not found"}})
         body = json.loads(request.content)
         reply = self.script(body, len(self.bodies()) - 1)
+        self.issued.append((reply.model, reply.response_id))
         data = sse(reply.events())
         headers = {"content-type": "text/event-stream"}
-        if reply.disconnect_after_created:
+        if reply.disconnect_after_created or reply.disconnect_after_terminal:
             return httpx.Response(200, headers=headers, stream=_DisconnectingBody(data))
         return httpx.Response(200, headers=headers, content=data)
 
     def client(self) -> openai.AsyncOpenAI:
+        """A real SDK client over this wire."""
         return openai.AsyncOpenAI(
             api_key="test-key",
             base_url="https://api.openai.com/v1",
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(self)),
             max_retries=0,
+        )
+
+
+class StallingWire(ResponsesWire):
+    """A Responses endpoint that goes silent right after ``response.created``:
+    the stream a provider that stops answering leaves open."""
+
+    def __init__(self, response_id: str = "resp_stall", model: str = SERVED) -> None:
+        super().__init__(lambda body, index: Reply([], response_id, model=model))
+        self.response_id = response_id
+        self.model = model
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/v1/responses":
+            return super().__call__(request)
+        self.requests.append(request)
+        self.issued.append((self.model, self.response_id))
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            stream=_StallingBody(self.response_id, self.model),
         )
 
 
@@ -188,8 +239,14 @@ def input_types(body: Dict[str, Any]) -> List[str]:
 
 
 def wire_items(raw_body: bytes, key: str = "input") -> List[str]:
-    """Each element of one request's ``key`` array as the text it was sent
-    as: key order and string escapes included."""
+    """Each element of one request's ``key`` array in canonical JSON form.
+
+    Parsed from the bytes the SDK sent and re-encoded compactly, so key order
+    and every string value (a tool call's argument text included) are kept,
+    but the encoding's whitespace and escapes are normalized. Two lists of
+    these are equal when the items are canonically equal, not when their
+    bytes are; compare :meth:`ResponsesWire.raw` for bytes.
+    """
     return [
         json.dumps(item, ensure_ascii=False, separators=(",", ":"))
         for item in json.loads(raw_body)[key]

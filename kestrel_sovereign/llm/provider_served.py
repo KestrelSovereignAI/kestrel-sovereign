@@ -8,10 +8,11 @@ when the attempt fails after the provider had already identified the
 response, and the service copies it into the attempt's metadata under
 :data:`PROVIDER_SERVED_KEY`.
 
-The evidence is content-free: an API name, a model id, a response id, the
-continuation boundary the request crossed, and the ids of any replayed
-reasoning items the provider reported removing. Never text, tool arguments
-or encrypted reasoning.
+The evidence is content-free: an API name, a model id, a response id, how the
+request continued its chain or which boundary it crossed, whether the reply's
+continuation snapshot was kept, and the ids of any replayed items the
+provider reported removing. Never text, tool arguments or encrypted
+reasoning.
 """
 
 from __future__ import annotations
@@ -29,11 +30,14 @@ _ATTR = "_kestrel_provider_served"
 class ProviderServed:
     """The provider's own account of the call it answered.
 
-    ``continuation`` names the request's continuation boundary (see
-    :mod:`kestrel_sovereign.llm.responses_continuation`). ``prefix_mismatch``
-    is ``None`` when the provider reported nothing about removed input, and
-    otherwise the ids of the reasoning items it removed for a changed prefix
-    (empty when it removed none).
+    ``continuation`` describes the request as it was sent: a fresh chain, a
+    continuation, or the boundary it crossed (see
+    :mod:`kestrel_sovereign.llm.responses_continuation`). ``snapshot`` says
+    what was stored for the reply: ``{"stored": True}``, or ``stored`` false
+    with the reason it was not kept; empty when the reply was never settled
+    (a failed attempt). ``prefix_mismatch`` is ``None`` when the provider
+    reported no prefix mismatch, and otherwise the ids of the replayed items
+    it removed for one (empty when it named none).
     """
 
     api: str
@@ -41,6 +45,7 @@ class ProviderServed:
     response_id: Optional[str] = None
     continuation: Mapping[str, Any] = field(default_factory=dict)
     prefix_mismatch: Optional[Tuple[str, ...]] = None
+    snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     def with_response(
         self, *, model: Optional[str], response_id: Optional[str],
@@ -68,6 +73,8 @@ class ProviderServed:
             record["response_id"] = self.response_id
         if self.continuation:
             record["continuation"] = dict(self.continuation)
+        if self.snapshot:
+            record["snapshot"] = dict(self.snapshot)
         if self.prefix_mismatch is not None:
             record["prefix_mismatch"] = list(self.prefix_mismatch)
         return record

@@ -20,11 +20,18 @@ output items exactly as the provider emitted them. That is a
 snapshot unchanged and may only append: tool outputs, new operator or user
 turns, and newly exposed tools as a developer ``additional_tools`` item.
 
-A snapshot is bound to the route that produced it (its configured client,
-not just its vendor and base URL), the model requested and to the response id
-and served model the provider returned. It lives only in memory, in a registry
-the turn lifecycle opens when a turn starts and expires when the turn ends
-(:func:`responses_continuation_scope`). Nothing here is persisted.
+A snapshot is bound to the configured route that produced it (its route
+name, its own adapter and SDK client, so two routes never share one), the
+model requested, the response id and served model the provider returned, and
+a digest of every provider-visible request setting outside the input items.
+It lives only in memory, in a registry the turn lifecycle opens when a turn
+starts and expires when the turn ends (:func:`responses_continuation_scope`).
+Nothing here is persisted.
+
+A snapshot that can no longer be continued is retired, and the registry keeps
+a bounded record of why (:class:`RetiredSnapshot`, one of
+:data:`RETIREMENT_REASONS`). A request that still continues a retired chain is
+told it was retired and why, never that there was no snapshot.
 
 The registry also carries the turn's context budget: the most text the turn's
 tool loop pruned its own messages to (:func:`note_turn_context_budget`). A
@@ -45,6 +52,37 @@ from kestrel_sovereign.turn_scope import turn_scoped
 #: The most snapshots one turn keeps. A turn's main loop and each feature
 #: subagent it runs keep one chain each; a turn with more retires its oldest.
 MAX_SNAPSHOTS_PER_TURN = 16
+
+#: The most retirement records one turn keeps. Routine ones (superseded or
+#: evicted) are forgotten first, so a chain that ended for a reason keeps its
+#: record however long another chain runs.
+MAX_RETIRED_PER_TURN = 32
+
+#: The most routes one turn remembers holding a snapshot on.
+MAX_ROUTES_PER_TURN = 64
+
+#: Why a snapshot was retired or a reply's snapshot never kept. A bounded
+#: vocabulary: evidence names one of these and nothing else.
+SUPERSEDED = "superseded"  # a continuation of the chain replaced it
+EVICTED = "evicted"  # the turn held MAX_SNAPSHOTS_PER_TURN newer ones
+PREFIX_PRUNED = "prefix_pruned"  # the caller no longer carries part of its prefix
+PREFIX_CHANGED = "prefix_changed"  # the caller inserted into its prefix
+BUDGET_EXCEEDED = "budget_exceeded"  # its replay exceeds the turn's context budget
+REQUEST_SETTINGS_CHANGED = "request_settings_changed"  # a bound setting changed
+SERVED_MODEL_MISMATCH = "served_model_mismatch"  # another model answered it
+PREFIX_MISMATCH = "prefix_mismatch"  # the provider reported dropping replayed input
+UNANCHORED_ASSISTANT_MESSAGE = "unanchored_assistant_message"
+UNKNOWN_TOOL_OUTPUT = "unknown_tool_output"
+DUPLICATE_TOOL_OUTPUT = "duplicate_tool_output"
+UNSUPPORTED_MESSAGE_ROLE = "unsupported_message_role"
+PARENT_RETIRED = "parent_retired"  # the chain it extended was retired first
+UNIDENTIFIED_RESPONSE = "unidentified_response"  # its reply named no model or id
+RETIREMENT_REASONS = frozenset({
+    SUPERSEDED, EVICTED, PREFIX_PRUNED, PREFIX_CHANGED, BUDGET_EXCEEDED,
+    REQUEST_SETTINGS_CHANGED, SERVED_MODEL_MISMATCH, PREFIX_MISMATCH,
+    UNANCHORED_ASSISTANT_MESSAGE, UNKNOWN_TOOL_OUTPUT, DUPLICATE_TOOL_OUTPUT,
+    UNSUPPORTED_MESSAGE_ROLE, PARENT_RETIRED, UNIDENTIFIED_RESPONSE,
+})
 
 
 @dataclass(frozen=True)
@@ -68,12 +106,25 @@ class ResponsesSnapshot:
     reply's output items, each as the JSON text it was captured as.
     ``settings`` is the JSON text of the request settings that are part of
     the prefix (tools, reasoning, text format, include, store).
+    ``request_digest`` is the digest the chain's requests are bound to: every
+    provider-visible request field, ``extra_body`` included, other than the
+    input items and the per-request tool offer (see
+    :func:`~kestrel_sovereign.llm.openai_responses.request_digest`).
     ``anchors`` refers to every reply the chain absorbed, oldest first.
+    ``carried`` holds, for each of those replies, the items the request that
+    produced it built from the caller's messages, before the reply; the
+    first entry's items from ``notices_from`` on are the turn notices that
+    followed its user message (an operator notice), which the tool loop does
+    not carry back. A continuation must still carry every other one of them,
+    unchanged, or its chain ends.
     ``turn_request`` is the JSON text of the chain's first user message, used
-    to confirm a chain whose replies carried no tool calls. ``route`` labels
-    the route; ``client`` is the route's own SDK client, held so its identity
-    is never reused while the snapshot lives. ``declared_tools`` names every
-    tool the chain declared, in the order it declared them.
+    to confirm a chain whose replies carried no tool calls. ``route`` names
+    the configured route; ``adapter`` and ``client`` are the route's own
+    adapter and SDK client, held so their identities are never reused while
+    the snapshot lives. ``declared_tools`` names every tool the chain
+    declared, in the order it declared them, and ``tool_definitions`` holds
+    each one's declaration as sent, so a tool redefined under a declared name
+    is noticed.
     """
 
     route: str
@@ -86,6 +137,49 @@ class ResponsesSnapshot:
     declared_tools: Tuple[str, ...]
     anchors: Tuple[ResponsesAnchor, ...]
     turn_request: Optional[str]
+    adapter: object = None
+    request_digest: str = ""
+    carried: Tuple[Tuple[str, ...], ...] = ()
+    notices_from: int = 0
+    tool_definitions: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RouteKey:
+    """A route the turn held a snapshot on, as :meth:`ResponsesRoute.serves` reads it."""
+
+    route: str
+    client: object
+    adapter: object
+
+
+@dataclass(frozen=True)
+class RetiredSnapshot:
+    """What the registry remembers of a snapshot it retired, and why.
+
+    Enough to recognise a request that still continues the chain (its route,
+    model and anchors), and nothing of its items: no encrypted reasoning and
+    no message text beyond the anchors'.
+    """
+
+    route: str
+    adapter: object
+    client: object
+    requested_model: str
+    response_id: str
+    anchors: Tuple[ResponsesAnchor, ...]
+    turn_request: Optional[str]
+    reason: str
+
+    @classmethod
+    def of(cls, snapshot: ResponsesSnapshot, reason: str) -> "RetiredSnapshot":
+        if reason not in RETIREMENT_REASONS:
+            raise ValueError(f"Unknown snapshot retirement reason {reason!r}.")
+        return cls(
+            route=snapshot.route, adapter=snapshot.adapter, client=snapshot.client,
+            requested_model=snapshot.requested_model, response_id=snapshot.response_id,
+            anchors=snapshot.anchors, turn_request=snapshot.turn_request, reason=reason,
+        )
 
 
 class ResponsesContinuations:
@@ -99,6 +193,8 @@ class ResponsesContinuations:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._snapshots: list[ResponsesSnapshot] = []
+        self._retired: list[RetiredSnapshot] = []
+        self._routes: list[RouteKey] = []
         self._expired = False
         self._context_budget: Optional[int] = None
 
@@ -126,17 +222,73 @@ class ResponsesContinuations:
                 return ()
             return tuple(reversed(self._snapshots))
 
+    def retired(self) -> Tuple[RetiredSnapshot, ...]:
+        """Every retirement the registry still remembers, newest first."""
+        with self._lock:
+            if self._expired:
+                return ()
+            return tuple(reversed(self._retired))
+
+    def routes(self) -> Tuple[RouteKey, ...]:
+        """Every route the turn kept or retired a snapshot on.
+
+        Unlike :meth:`snapshots` and :meth:`retired`, eviction does not forget
+        a route: a turn that held a snapshot on one stays a snapshot turn
+        there. Past :data:`MAX_ROUTES_PER_TURN` routes the least recently used
+        one without a live snapshot is forgotten, never one with.
+        """
+        with self._lock:
+            if self._expired:
+                return ()
+            return tuple(self._routes)
+
+    def _touch(self, snapshot: ResponsesSnapshot) -> None:
+        """Remember ``snapshot``'s route, most recently used last.
+
+        Past :data:`MAX_ROUTES_PER_TURN`, the least recently used route that
+        holds no live snapshot is forgotten; a route with one never is.
+        """
+        self._routes = [
+            key for key in self._routes
+            if not (
+                key.route == snapshot.route and key.client is snapshot.client
+                and key.adapter is snapshot.adapter
+            )
+        ]
+        self._routes.append(RouteKey(snapshot.route, snapshot.client, snapshot.adapter))
+        while len(self._routes) > MAX_ROUTES_PER_TURN:
+            idle = next((
+                key for key in self._routes
+                if not any(
+                    kept.route == key.route and kept.client is key.client
+                    and kept.adapter is key.adapter
+                    for kept in self._snapshots
+                )
+            ), None)
+            if idle is None:
+                break
+            self._routes.remove(idle)
+
+    def retirement_of(self, snapshot: ResponsesSnapshot) -> Optional[str]:
+        """Why ``snapshot`` was retired, if the registry remembers it."""
+        with self._lock:
+            for record in reversed(self._retired):
+                if record.response_id == snapshot.response_id and record.route == snapshot.route:
+                    return record.reason
+            return None
+
     def record(
         self,
         snapshot: ResponsesSnapshot,
         *,
         replaces: Optional[ResponsesSnapshot] = None,
     ) -> bool:
-        """Keep ``snapshot``, retiring the one it extends.
+        """Keep ``snapshot``, retiring the one it extends as superseded.
 
         Returns ``False`` when the registry has expired or ``replaces`` is no
         longer live (another request of the same chain extended or retired it
-        first), in which case nothing is kept.
+        first), in which case nothing is kept: the caller records why. Keeping
+        more than :data:`MAX_SNAPSHOTS_PER_TURN` retires the oldest as evicted.
         """
         with self._lock:
             if self._expired:
@@ -144,26 +296,52 @@ class ResponsesContinuations:
             if replaces is not None:
                 if not any(kept is replaces for kept in self._snapshots):
                     return False
-                self._snapshots = [
-                    kept for kept in self._snapshots if kept is not replaces
-                ]
+                self._remove(replaces, SUPERSEDED)
             self._snapshots.append(snapshot)
-            if len(self._snapshots) > MAX_SNAPSHOTS_PER_TURN:
-                del self._snapshots[: len(self._snapshots) - MAX_SNAPSHOTS_PER_TURN]
+            self._touch(snapshot)
+            while len(self._snapshots) > MAX_SNAPSHOTS_PER_TURN:
+                self._remove(self._snapshots[0], EVICTED)
             return True
 
-    def discard(self, snapshot: ResponsesSnapshot) -> None:
-        """Retire ``snapshot``: its chain can no longer be continued."""
+    def discard(self, snapshot: ResponsesSnapshot, reason: str) -> None:
+        """Retire ``snapshot`` for ``reason``: its chain can no longer be continued."""
         with self._lock:
-            self._snapshots = [
-                kept for kept in self._snapshots if kept is not snapshot
-            ]
+            self._remove(snapshot, reason)
+
+    def retire(self, snapshot: ResponsesSnapshot, reason: str) -> None:
+        """Remember that ``snapshot``, never kept, may not be continued."""
+        with self._lock:
+            if not self._expired:
+                self._remember(RetiredSnapshot.of(snapshot, reason))
+                self._touch(snapshot)
+
+    def _remove(self, snapshot: ResponsesSnapshot, reason: str) -> None:
+        record = RetiredSnapshot.of(snapshot, reason)
+        kept = [entry for entry in self._snapshots if entry is not snapshot]
+        if len(kept) != len(self._snapshots):
+            self._snapshots = kept
+            self._remember(record)
+
+    def _remember(self, record: RetiredSnapshot) -> None:
+        self._retired.append(record)
+        while len(self._retired) > MAX_RETIRED_PER_TURN:
+            routine = next(
+                (index for index, kept in enumerate(self._retired) if kept.reason in _ROUTINE),
+                0,
+            )
+            del self._retired[routine]
 
     def expire(self) -> None:
-        """End the registry with its turn; every snapshot is dropped."""
+        """End the registry with its turn; every snapshot and record is dropped."""
         with self._lock:
             self._expired = True
             self._snapshots = []
+            self._retired = []
+            self._routes = []
+
+
+#: Retirements that record no reason a chain ended, only that it moved on.
+_ROUTINE = frozenset({SUPERSEDED, EVICTED})
 
 
 _CONTINUATIONS: contextvars.ContextVar[Optional[ResponsesContinuations]] = (
@@ -231,10 +409,29 @@ turn_scoped(
 
 
 __all__ = [
+    "BUDGET_EXCEEDED",
+    "DUPLICATE_TOOL_OUTPUT",
+    "EVICTED",
+    "MAX_RETIRED_PER_TURN",
+    "MAX_ROUTES_PER_TURN",
     "MAX_SNAPSHOTS_PER_TURN",
+    "PARENT_RETIRED",
+    "PREFIX_CHANGED",
+    "PREFIX_MISMATCH",
+    "PREFIX_PRUNED",
+    "REQUEST_SETTINGS_CHANGED",
+    "RETIREMENT_REASONS",
     "ResponsesAnchor",
     "ResponsesContinuations",
     "ResponsesSnapshot",
+    "RetiredSnapshot",
+    "RouteKey",
+    "SERVED_MODEL_MISMATCH",
+    "SUPERSEDED",
+    "UNANCHORED_ASSISTANT_MESSAGE",
+    "UNIDENTIFIED_RESPONSE",
+    "UNKNOWN_TOOL_OUTPUT",
+    "UNSUPPORTED_MESSAGE_ROLE",
     "bind_responses_continuations",
     "current_responses_continuations",
     "note_turn_context_budget",

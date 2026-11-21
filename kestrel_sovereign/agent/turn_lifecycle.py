@@ -1012,9 +1012,13 @@ class TurnLifecycleMixin:
                         request_generation,
                     )
             finally:
-                ownership.__exit__(None, None, None)
-                self._turn_trace_index().pop(turn_id, None)
-                continuations.__exit__(None, None, None)
+                try:
+                    ownership.__exit__(None, None, None)
+                    self._turn_trace_index().pop(turn_id, None)
+                finally:
+                    # The turn's snapshots expire even if retiring its
+                    # ownership fails: nothing may replay them afterwards.
+                    continuations.__exit__(None, None, None)
                 turn_scope.__exit__(None, None, None)
                 self._live_turn_id = None
                 self._live_turn_task = None
