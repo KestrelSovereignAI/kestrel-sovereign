@@ -380,7 +380,7 @@ Wrong key provided:
 ### "Genesis self-audit: FAILED"
 
 Constitution verification failed:
-- Check constitution file exists at `docs/principles/KESTREL_CONSTITUTION.md`
+- For the first-edition setup described here, check the source at `docs/principles/KESTREL_CONSTITUTION.md`.
 - Ensure no modifications to constitution content
 
 ### Docker Build Fails
@@ -415,7 +415,8 @@ docker build --no-cache -f docker/Dockerfile.sovereign -t kestrel-sovereign .
 | `inception_service.py` | Agent creation logic |
 | `retirement_service.py` | Graceful retirement (test agents only) |
 | `security/key_storage.py` | AES-256-GCM key encryption |
-| `docs/principles/KESTREL_CONSTITUTION.md` | Constitutional governance |
+| [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) | Published governance document |
+| `docs/principles/KESTREL_CONSTITUTION.md` | First-edition source used in this guide |
 
 ---
 

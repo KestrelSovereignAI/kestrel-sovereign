@@ -67,7 +67,8 @@ environment,” not a claim that an external distribution is publicly reachable.
 ### Constitutional and sovereign foundation
 
 - Constitution and governance:
-  - [`kestrel_sovereign/data/KESTREL_CONSTITUTION.md`](kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
+  - [Published second-edition Constitution](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md)
+  - [Packaged first-edition default](kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
   - [`kestrel_sovereign/agent/constitution.py`](kestrel_sovereign/agent/constitution.py)
   - [`kestrel_sovereign/features/constitution.py`](kestrel_sovereign/features/constitution.py)
 - DID identity and continuity:

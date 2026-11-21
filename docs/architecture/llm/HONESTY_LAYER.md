@@ -24,7 +24,7 @@ privacy: public
 >
 > **Substrate:** `kestrel-sovereign-sdk >= 0.9.0` for the `ToolCallStarted` marker and the extended `HookInput` fields.
 
-The honesty layer is the concrete enforcement mechanism for [Constitution Book I, Chapter 1, property 5 ("Non-deceptive")](../../principles/KESTREL_CONSTITUTION.md) in the specific case of tool-use narration. This document describes how it works end-to-end: the failure mode, the signal protocol, the pipeline, and the guarantees each piece provides.
+The honesty layer is the concrete enforcement mechanism for [first-edition Constitution, Book I, Chapter 1, property 5 ("Non-deceptive")](../../principles/KESTREL_CONSTITUTION.md) in the specific case of tool-use narration. This document describes how it works end-to-end: the failure mode, the signal protocol, the pipeline, and the guarantees each piece provides.
 
 ---
 
@@ -463,7 +463,8 @@ Tracked but intentionally out of scope for the initial epic:
 
 * [PROVIDER_PLUGINS.md](PROVIDER_PLUGINS.md) — adapter author's view: the SDK contract, marker emission rules, conformance suite.
 * [LLM_SERVICE_ARCHITECTURE.md](../LLM_SERVICE_ARCHITECTURE.md) — vendor / route / model architecture; this doc is the streaming-honesty leaf of that tree.
-* [Constitution Book I, Chapter 1](../../principles/KESTREL_CONSTITUTION.md) — the seven properties of honesty this layer enforces in code.
+* [Honesty and human judgment](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md#honesty-and-human-judgment) in the second edition.
+* [First-edition Constitution, Book I, Chapter 1](../../principles/KESTREL_CONSTITUTION.md) — the seven properties of honesty this layer enforces in code.
 * [Issue #1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042) — the original failure mode + the four layers of fix.
 * [Epic #1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) — the implementation epic. Final tally in the closing comment.
 

@@ -70,7 +70,8 @@
     {
       "existing_code_refs": [
         "CONTRIBUTING.md",
-        "QUICKSTART.md"
+        "QUICKSTART.md",
+        "kestrel_sovereign/data/KESTREL_CONSTITUTION.md"
       ],
       "findings": [],
       "missing_code_refs": [],

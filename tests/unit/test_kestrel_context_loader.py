@@ -30,11 +30,17 @@ def test_load_context_uses_current_standard_doc_paths(tmp_path):
         "# Anchoring",
     )
 
+    constitution = "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md"
+    write_project_file(tmp_path, constitution, "# Published second edition")
+    write_project_file(tmp_path, "docs/principles/KESTREL_CONSTITUTION.md", "# First-edition mirror")
+
     loader = KestrelContextLoader(str(tmp_path))
 
     context = loader.load_context()
     prompt = loader.create_prompt("Summarize the project")
 
+    assert context[constitution] == "# Published second edition"
+    assert "docs/principles/KESTREL_CONSTITUTION.md" not in context
     assert context["AGENTS.md"] == "# Agent instructions"
     assert "docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md" in context
     assert "docs/architecture/security/PRIVACY_MODES.md" in context

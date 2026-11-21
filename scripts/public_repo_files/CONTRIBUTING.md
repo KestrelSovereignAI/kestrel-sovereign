@@ -188,7 +188,7 @@ Kestrel exists to give people sovereignty over their AI agents. All contribution
 4. **Cryptographic integrity** — don't bypass or weaken the identity or constitution systems to make something easier.
 5. **No platform lock-in** — don't introduce dependencies that tie the agent to a single cloud provider.
 
-See [docs/principles/KESTREL_CONSTITUTION.md](docs/principles/KESTREL_CONSTITUTION.md) for the full governance document.
+Read the [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) for the duties of agents, builders, and hosts.
 
 ---
 

@@ -265,7 +265,7 @@ operations:
 | [Cryptographic anchoring](docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md) | Integrity anchors and verification boundaries |
 | [Update guide](README.md#pulling-in-upstream-changes-kestrel-update) | Pull, install, feature reconciliation, and restart |
 | [Deployment runbook](docs/deployment/README.md) | Cloud Run build and deployment |
-| [Kestrel Constitution](docs/principles/KESTREL_CONSTITUTION.md) | Constitutional framework |
+| [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) | Constitutional framework |
 
 ## Troubleshooting
 
