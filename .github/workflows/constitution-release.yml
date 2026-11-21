@@ -36,7 +36,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/constitution"
           git archive --format=tar.gz --output="$RUNNER_TEMP/constitution/constitution-$EDITION.tar.gz" \
             "$GITHUB_SHA" "$dir/KESTREL_CONSTITUTION.md" "$dir/PLEDGE.md"
-          tar -tzf "$RUNNER_TEMP/constitution/constitution-$EDITION.tar.gz"
+          archive="$RUNNER_TEMP/constitution/constitution-$EDITION.tar.gz"
+          for member in "$dir/KESTREL_CONSTITUTION.md" "$dir/PLEDGE.md"; do
+            git cat-file blob "$GITHUB_SHA:$member" > "$RUNNER_TEMP/constitution/blob"
+            tar -xOzf "$archive" "$member" | cmp - "$RUNNER_TEMP/constitution/blob"
+          done
 
       - name: Attest the release archive from this revision of main
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3

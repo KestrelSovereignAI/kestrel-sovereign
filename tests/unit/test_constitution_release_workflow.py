@@ -5,13 +5,15 @@ import subprocess
 import tarfile
 
 import yaml
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/constitution-release.yml"
 
 
-def test_publisher_attests_only_the_named_edition_from_main(tmp_path):
+@pytest.mark.parametrize("autocrlf", ["false", "true"])
+def test_publisher_attests_only_the_named_edition_from_main(tmp_path, autocrlf):
     job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["attest"]
     assert job["if"] == "github.ref == 'refs/heads/main'"
     assert job["permissions"] == {"contents": "read", "id-token": "write", "attestations": "write"}
@@ -22,6 +24,8 @@ def test_publisher_attests_only_the_named_edition_from_main(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
     subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+    subprocess.run(["git", "config", "core.autocrlf", autocrlf], cwd=root, check=True)
+    (root / ".gitattributes").write_bytes((ROOT / ".gitattributes").read_bytes())
     relative = Path("kestrel_sovereign/data/constitutions/v2")
     folder = root / relative
     folder.mkdir(parents=True)
