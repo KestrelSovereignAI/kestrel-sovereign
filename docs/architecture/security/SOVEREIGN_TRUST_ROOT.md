@@ -541,6 +541,29 @@ Trust-root rotation is an operator ceremony, not a database migration:
 6. Retain prior signed artifacts and reanchor audit nodes; rotation does not
    rewrite historical signer identity.
 
+### Retaining edition-two host grant evidence
+
+Before replacing a pin, independently record the SHA-256 of each admitted
+edition-two grant artifact and retain the public DID document that verified
+it. After authenticating the replacement as in the ceremony above, set
+`KESTREL_SOVEREIGN_GRANT_HISTORY_PATH` to an absolute path to an operator-owned,
+agent-read-only JSON file. Its two fields are:
+
+- `active_document_sha256`, the value of
+  `sovereign_document_fingerprint(new_document)` from
+  `kestrel_sovereign.constitution.grants`.
+- `admitted_artifacts`, an object mapping each exact admitted artifact SHA-256
+  to its independently retained historical public DID document.
+
+Keep this archive outside the graph database and out of the agent's write
+access. The loader checks the active pin fingerprint and uses an archived
+credential only for its explicitly listed artifact. Fresh reanchors and
+source descriptors continue to require the active credential. A source
+descriptor signed by the retired credential needs replacement with a
+current-credential descriptor selecting the same governing bytes before
+boot. If trustworthy historical admission evidence is unavailable, restore
+the earlier pin through the recovery ceremony before attempting rotation.
+
 ## Recovery
 
 If the pin is lost or corrupted, leave the agent in Safe Mode. Restore the

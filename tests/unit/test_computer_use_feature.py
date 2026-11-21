@@ -1408,3 +1408,38 @@ async def test_a_gate_exception_on_the_direct_tool_door_does_not_fence_the_turn(
     else:
         [row] = _audit_rows(tmp_path)
         assert row["allowed_by"][-1] == "denied:gate_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edition, outside_grant, expected",
+    [(1, False, True), (2, False, False), (2, True, True)],
+)
+async def test_file_workspace_scope_keeps_independent_legacy_and_v2_decisions(
+    workspace, edition, outside_grant, expected,
+):
+    from kestrel_sovereign.constitution.grants import GrantResolution
+
+    grants = {"filesystem_read"}
+    if outside_grant:
+        grants.add("filesystem_outside_workspace")
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(privacy=PrivacyConfig(computer_access=True), grants=grants, queue=queue)
+    agent.storage_path = str(workspace / "state.db")
+    if edition == 2:
+        agent._constitution_host_grant_baseline = GrantResolution(
+            frozenset(grants), "test authority", "test", "absent",
+        )
+    inside = workspace / "workspace"
+    inside.mkdir()
+    (inside / "note.txt").write_text("ordinary fixture content")
+    feature = await _make_feature(workspace, agent=agent, backend="none")
+    await feature.initialize()
+
+    in_workspace = await feature.fs_read(path=str(inside / "note.txt"))
+    assert in_workspace.status is ToolResultStatus.OK
+    out_of_workspace = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert (out_of_workspace.status is ToolResultStatus.OK) is expected
+    assert not queue.calls
+    if not expected:
+        assert "filesystem_outside_workspace" in out_of_workspace.error

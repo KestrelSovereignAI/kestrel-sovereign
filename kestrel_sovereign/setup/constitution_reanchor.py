@@ -58,6 +58,7 @@ file, so that is a storage detail, not a governance one.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -922,7 +923,23 @@ async def reanchor_constitution(
             ),
         )
 
+    from kestrel_sovereign.constitution.anchored_bytes import (
+        check_retained_emancipation_promises,
+        historical_anchor_hash,
+        visible_governance_history_targets,
+    )
+    from kestrel_sovereign.constitution.emancipation import (
+        historical_promise_observations,
+        validate_v2_emancipation_activation,
+    )
+    from kestrel_sovereign.constitution.reanchor_receipt import retained_constitution_hashes
+    from kestrel_sovereign.constitution.structure import ConstitutionVersionError, constitution_version
+    from kestrel_sovereign.constitution.transition import verify_transition_adoption
+
     try:
+        historical_hash = historical_anchor_hash(
+            governance_preflight["properties"], governance_preflight["governed_by_targets"],
+        )
         trusted_did_document = load_sovereign_trust_root(
             explicit_path=sovereign_trust_root_path,
             environ=environ,
@@ -937,7 +954,91 @@ async def reanchor_constitution(
             trusted_did_document=trusted_did_document,
             expected_constitution_sha256=new_hash,
         )
-    except (SovereignTrustRootError, AmendmentArtifactError) as exc:
+        observations = historical_promise_observations(amendment_artifact, target_did=agent_did)
+        historical_digests = retained_constitution_hashes(governance_preflight["properties"])
+        historical_digests.update(row["constitution_sha256"] for row in observations)
+        retained_edges = ()
+        if governance_preflight["governed_by_targets"] or historical_digests.difference({historical_hash, new_hash}):
+            async with target.open_storage(cold_read=True) as storage:
+                retained_edges = await visible_governance_history_targets(
+                    storage.db, agent_did, governance_preflight["governed_by_targets"], new_hash=new_hash,
+                )
+                historical_digests.update(retained_edges)
+                await check_retained_emancipation_promises(
+                    storage.db, historical_digests, current_hash=historical_hash,
+                    new_hash=new_hash, new_text=new_text, anchored_contract=anchored_contract,
+                )
+        validate_v2_emancipation_activation(
+            amendment_artifact, target_did=agent_did, previous_text=anchored_text,
+            previous_hash=historical_hash, new_text=new_text, new_hash=new_hash,
+            contract=effective_contract,
+        )
+        transition_evidence = await asyncio.to_thread(
+            verify_transition_adoption,
+            artifact=amendment_artifact,
+            trusted_did_document=trusted_did_document,
+            target_did=agent_did,
+            prior_hash=historical_hash,
+            prior_text=anchored_text,
+            anchored_contract=anchored_contract,
+            new_text=new_text,
+            new_hash=new_hash,
+            source_hash=governing_source.content_sha256,
+            identity_directory=agent_dir,
+        )
+        from kestrel_sovereign.constitution.grants import (
+            load_anchored_grant_baseline,
+            preview_offline_legacy_grants,
+            prior_text_for_grant_repair,
+            require_offline_grant_observation,
+            unknown_signed_prior_edition,
+            validate_grant_cutover,
+        )
+
+        grant_prior_text = prior_text_for_grant_repair(
+            anchored_text=anchored_text,
+            historical_hash=historical_hash,
+            new_text=new_text,
+            new_hash=new_hash,
+            governance=governance_preflight,
+        )
+        unknown_prior = unknown_signed_prior_edition(grant_prior_text, governance_preflight["properties"])
+        prior_baseline = None
+        if unknown_prior or (grant_prior_text is not None and constitution_version(grant_prior_text) == 2):
+            async with target.open_storage(cold_read=True) as storage:
+                prior_baseline = await load_anchored_grant_baseline(
+                    storage.db,
+                    target_did=agent_did,
+                    properties=governance_preflight["properties"],
+                    trusted_did_document=trusted_did_document,
+                    unknown_prior_edition=unknown_prior,
+                    environ=environ,
+                    recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
+                )
+
+        def legacy_grant_resolution():
+            return preview_offline_legacy_grants(
+                agent_dir,
+                overlay_hash=governance_preflight["properties"].get("constitution_overlay_hash"),
+                environ=environ,
+            )
+
+        def recheck_grant_cutover():
+            return validate_grant_cutover(
+                target_did=agent_did,
+                artifact=amendment_artifact,
+                prior_text=grant_prior_text,
+                new_text=new_text,
+                legacy_resolution=legacy_grant_resolution,
+                prior_baseline=prior_baseline,
+                trusted_did_document=trusted_did_document,
+                storage_path=target.anchor_path,
+            )
+
+        proposed_baseline = recheck_grant_cutover()
+        if proposed_baseline is not None and prior_baseline is None:
+            require_offline_grant_observation(amendment_artifact, prior_sha256=historical_hash)
+    except (SovereignTrustRootError, AmendmentArtifactError, ConstitutionVersionError) as exc:
         return _result(
             old_hash=old_hash,
             new_hash=new_hash,
@@ -1014,7 +1115,10 @@ async def reanchor_constitution(
             amendment_artifact_bytes=amendment_artifact_bytes,
             amendment_artifact=amendment_artifact,
             amendment_verification=amendment_verification,
+            transition_evidence=transition_evidence,
             governance_preflight=governance_preflight,
+            retained_edges=retained_edges,
+            recheck_grant_cutover=recheck_grant_cutover if proposed_baseline is not None else None,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
         if is_execution_control_error(exc):
@@ -1307,7 +1411,10 @@ async def _write_reanchor(
     amendment_artifact_bytes: bytes,
     amendment_artifact: dict,
     amendment_verification: AmendmentArtifactVerification,
+    transition_evidence: dict,
     governance_preflight: dict,
+    retained_edges: tuple[str, ...] = (),
+    recheck_grant_cutover=None,
 ) -> ConstitutionRagIndex | None:
     """Apply the five governance locations plus authorization atomically.
 
@@ -1357,7 +1464,10 @@ async def _write_reanchor(
     the target is a local file, remains untouched and available either way.
     """
     rag_index: ConstitutionRagIndex | None = None
-    from kestrel_sovereign.constitution.anchored_bytes import historical_anchor_hash
+    from kestrel_sovereign.constitution.anchored_bytes import (
+        historical_anchor_hash,
+        visible_governance_history_targets,
+    )
 
     historical_hash = historical_anchor_hash(
         governance_preflight["properties"], governance_preflight["governed_by_targets"],
@@ -1385,9 +1495,15 @@ async def _write_reanchor(
             from kestrel_sovereign.constitution.anchored_bytes import revalidate_governance_evidence
 
             agent = await revalidate_governance_evidence(storage, agent_did, governance_preflight)
+            if await visible_governance_history_targets(
+                storage.db, agent_did, governance_preflight["governed_by_targets"], new_hash=new_hash,
+            ) != retained_edges:
+                raise AmendmentArtifactError("Retained governing edge ownership changed during reanchor")
             from kestrel_sovereign.constitution.reanchor_receipt import validate_constitution_reanchor_evidence
 
             validate_constitution_reanchor_evidence(agent.properties, superseding=True)
+            if recheck_grant_cutover is not None:
+                recheck_grant_cutover()
             # old_hash is a CLI display sentinel ("none" for no anchor).
             # Receipt evidence must describe the actual freshly locked pointer,
             # not reinterpret that display string as corrupt stored governance.
@@ -1574,6 +1690,10 @@ async def _write_reanchor(
                     "signed_artifact_path": str(amendment_artifact_path),
                     "signed_artifact_signer": amendment_verification.signer,
                     "signed_artifact_verification": amendment_verification.reason,
+                    **transition_evidence,
+                    **({"historical_promises": amendment_artifact["historical_promises"]}
+                       if amendment_artifact.get("historical_promises") else {}),
+                    **({"retained_governed_by": list(retained_edges)} if retained_edges else {}),
                     "stale_edges_removed": stale_edge_targets,
                 },
                 provenance="setup:constitution_reanchor",

@@ -1612,6 +1612,13 @@ class ConstitutionMixin:
                 "INTEGRITY FAILURE: Governing constitution has been modified."
             )
 
+        if "_constitution_host_grant_baseline" in vars(self):
+            grant_valid, grant_error = await ConstitutionMixin._refresh_constitution_host_grants(
+                self, agent_node, governing_text=governing_content.decode("utf-8"),
+            )
+            if not grant_valid:
+                return False, f"INTEGRITY FAILURE: {grant_error}"
+
         logging.info("Constitution integrity verified against governing source.")
         base_msg = f"Constitution integrity verified. Hash: {stored_hash[:16]}..."
         # Also verify spawn mandate constraints if present
@@ -1634,6 +1641,54 @@ class ConstitutionMixin:
     # ------------------------------------------------------------------
 
     OVERLAY_HASH_PROPERTY = "constitution_overlay_hash"
+
+    async def _refresh_constitution_host_grants(self, agent_node, *, governing_text=None):
+        """Load edition 2 preservation evidence before features are admitted."""
+        from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+        from kestrel_sovereign.constitution.anchored_bytes import read_anchored_constitution
+        from kestrel_sovereign.constitution.grants import (
+            load_anchored_grant_baseline,
+            unavailable_host_grants,
+        )
+        from kestrel_sovereign.constitution.emancipation import EmancipationConfigError, contract_from_json
+        from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+        from kestrel_sovereign.constitution.source_descriptor import ConstitutionSourceError
+        from kestrel_sovereign.constitution.structure import ConstitutionVersionError, constitution_version
+        from kestrel_sovereign.constitution.trust_root import SovereignTrustRootError
+        from kestrel_sovereign.storage.db.interface import QueryError
+
+        properties = agent_node.properties if agent_node else {}
+        current_hash = properties.get("constitution_hash")
+        self._constitution_host_grant_baseline = unavailable_host_grants()
+        try:
+            if governing_text is None:
+                contract = contract_from_json(properties.get("emancipation_contract"))
+                source = resolve_governing_constitution_bytes(
+                    contract, source=ConstitutionMixin._governing_constitution_source(self),
+                )
+                if current_hash:
+                    if hashlib.sha256(source).hexdigest() != current_hash:
+                        return False, "Current Constitution anchor differs from the authoritative source"
+                    governing_text, _ = await read_anchored_constitution(self._raw_storage.db, current_hash)
+                    if governing_text is None:
+                        return False, "Current anchored Constitution bytes are unavailable"
+                else:
+                    governing_text = source.decode("utf-8")
+            if constitution_version(governing_text) == 1:
+                self._constitution_host_grant_baseline = None
+                return True, ""
+            self._constitution_host_grant_baseline = await load_anchored_grant_baseline(
+                self._raw_storage.db,
+                target_did=self.agent_id,
+                properties=properties,
+                trusted_did_document=self._trusted_sovereign_did_document(agent_node),
+            )
+        except (
+            AmendmentArtifactError, ConstitutionSourceError, ConstitutionVersionError,
+            EmancipationConfigError, SovereignTrustRootError, OSError, QueryError, UnicodeDecodeError,
+        ) as exc:
+            return False, str(exc)
+        return True, ""
 
     async def verify_constitution_overlay(self) -> Tuple[bool, str]:
         """Verify the per-agent overlay against its anchored hash.
@@ -2525,6 +2580,7 @@ class ConstitutionMixin:
             if is_execution_control_error(exc):
                 raise
             return f"Error: Cannot inspect historical governance: {exc}; nothing was written."
+        anchored_text = None
         if historical_hash and historical_hash != "none":
             from kestrel_sovereign.constitution.anchored_bytes import (
                 read_anchored_constitution,
@@ -2605,6 +2661,18 @@ class ConstitutionMixin:
             load_verified_reanchor_artifact,
         )
 
+        from kestrel_sovereign.constitution.structure import ConstitutionVersionError, constitution_version
+        from kestrel_sovereign.constitution.transition import verify_transition_adoption
+        from kestrel_sovereign.constitution.anchored_bytes import (
+            check_retained_emancipation_promises,
+            visible_governance_history_targets,
+        )
+        from kestrel_sovereign.constitution.emancipation import (
+            historical_promise_observations,
+            validate_v2_emancipation_activation,
+        )
+        from kestrel_sovereign.constitution.reanchor_receipt import retained_constitution_hashes
+
         artifact_path_used = str(amendment_artifact_path)
         try:
             (
@@ -2616,7 +2684,80 @@ class ConstitutionMixin:
                 trusted_did_document=trusted_did_document,
                 expected_constitution_sha256=new_hash,
             )
-        except AmendmentArtifactError as exc:
+            new_text = constitution_content.decode("utf-8")
+            observations = historical_promise_observations(amendment_artifact, target_did=self.agent_id)
+            retained_edges = await visible_governance_history_targets(
+                self._raw_storage.db, self.agent_id, governance_preflight["governed_by_targets"],
+                new_hash=new_hash,
+            )
+            historical_digests = retained_constitution_hashes(validated_properties)
+            historical_digests.update(retained_edges)
+            historical_digests.update(row["constitution_sha256"] for row in observations)
+            await check_retained_emancipation_promises(
+                self._raw_storage.db, historical_digests, current_hash=historical_hash,
+                new_hash=new_hash, new_text=new_text, anchored_contract=reanchor_contract,
+            )
+            validate_v2_emancipation_activation(
+                amendment_artifact, target_did=self.agent_id, previous_text=anchored_text,
+                previous_hash=historical_hash, new_text=new_text, new_hash=new_hash,
+                contract=reanchor_contract,
+            )
+            storage_path = getattr(self, "storage_path", None)
+            transition_evidence = await asyncio.to_thread(
+                verify_transition_adoption,
+                artifact=amendment_artifact,
+                trusted_did_document=trusted_did_document,
+                target_did=self.agent_id,
+                prior_hash=historical_hash,
+                prior_text=anchored_text,
+                anchored_contract=reanchor_contract,
+                new_text=constitution_content.decode("utf-8"),
+                new_hash=new_hash,
+                source_hash=governing_source.content_sha256,
+                identity_directory=Path(storage_path).parent if storage_path else None,
+            )
+            from kestrel_sovereign.constitution.grants import (
+                load_anchored_grant_baseline,
+                prior_text_for_grant_repair,
+                resolve_legacy_grants,
+                unknown_signed_prior_edition,
+                validate_grant_cutover,
+            )
+
+            new_text = constitution_content.decode("utf-8")
+            grant_prior_text = prior_text_for_grant_repair(
+                anchored_text=anchored_text,
+                historical_hash=historical_hash,
+                new_text=new_text,
+                new_hash=new_hash,
+                governance=governance_preflight,
+            )
+            unknown_prior = unknown_signed_prior_edition(grant_prior_text, validated_properties)
+            prior_baseline = None
+            if unknown_prior or (grant_prior_text is not None and constitution_version(grant_prior_text) == 2):
+                prior_baseline = await load_anchored_grant_baseline(
+                    self._raw_storage.db,
+                    target_did=self.agent_id,
+                    properties=validated_properties,
+                    trusted_did_document=trusted_did_document,
+                    unknown_prior_edition=unknown_prior,
+                    recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
+                )
+            if constitution_version(new_text) == 2 and prior_baseline is None:
+                overlay_ok, overlay_error = await self.verify_constitution_overlay()
+                if not overlay_ok:
+                    raise AmendmentArtifactError(overlay_error)
+            proposed_baseline = validate_grant_cutover(
+                target_did=self.agent_id,
+                artifact=amendment_artifact,
+                prior_text=grant_prior_text,
+                new_text=new_text,
+                legacy_resolution=lambda: resolve_legacy_grants(self),
+                trusted_did_document=trusted_did_document,
+                storage_path=storage_path,
+                prior_baseline=prior_baseline,
+            )
+        except (AmendmentArtifactError, ConstitutionVersionError) as exc:
             logging.critical(
                 "REANCHOR REJECTED: %s",
                 exc,
@@ -2656,7 +2797,25 @@ class ConstitutionMixin:
                 agent_node = await revalidate_governance_evidence(
                     self._raw_storage, self.agent_id, governance_preflight
                 )
+                if await visible_governance_history_targets(
+                    self._raw_storage.db, self.agent_id, governance_preflight["governed_by_targets"],
+                    new_hash=new_hash,
+                ) != retained_edges:
+                    raise AmendmentArtifactError("Retained governing edge ownership changed during reanchor")
                 validate_constitution_reanchor_evidence(agent_node.properties, superseding=True)
+                if proposed_baseline is not None and prior_baseline is None:
+                    overlay_ok, overlay_error = await self.verify_constitution_overlay()
+                    if not overlay_ok:
+                        raise AmendmentArtifactError(overlay_error)
+                    validate_grant_cutover(
+                        target_did=self.agent_id,
+                        artifact=amendment_artifact,
+                        prior_text=grant_prior_text,
+                        new_text=new_text,
+                        legacy_resolution=lambda: resolve_legacy_grants(self),
+                        trusted_did_document=trusted_did_document,
+                        storage_path=storage_path,
+                    )
                 stored_hash = await store_verified_governing_file(
                     self._raw_storage, constitution_content, verification=verification,
                     artifact_content=amendment_artifact_bytes,
@@ -2729,14 +2888,23 @@ class ConstitutionMixin:
                         "signed_artifact_path": artifact_path_used,
                         "signed_artifact_signer": verification.signer,
                         "signed_artifact_verification": verification.reason,
+                        **transition_evidence,
                         "authorization": authorization or "unspecified",
                         "expected_hash_prefix": expected_hash,
+                        **({"historical_promises": observations} if observations else {}),
+                        **({"retained_governed_by": list(retained_edges)} if retained_edges else {}),
                     },
                     provenance="runtime:constitution_reanchor",
                     recorded_at=self._get_timestamp(),
                 )
                 await self._raw_storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
+            if proposed_baseline is not None:
+                from dataclasses import replace
+
+                self._constitution_host_grant_baseline = replace(
+                    proposed_baseline, baseline_sha256=artifact_hash, baseline_signer=verification.signer,
+                )
             ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
         except BaseException as e:
             from kestrel_sovereign.execution_custody import execution_commit_outcome
@@ -2928,7 +3096,7 @@ class ConstitutionMixin:
                 contract_from_json,
             )
             from kestrel_sovereign.constitution.resolver import (
-                resolve_governing_constitution_bytes,
+                resolve_initial_governing_constitution_bytes,
             )
 
             try:
@@ -2939,7 +3107,7 @@ class ConstitutionMixin:
                 return f"Error: Anchored emancipation contract is corrupted: {e}"
 
             try:
-                constitution_content = resolve_governing_constitution_bytes(
+                constitution_content, publisher_evidence = resolve_initial_governing_constitution_bytes(
                     anchor_contract,
                     source=ConstitutionMixin._governing_constitution_source(self),
                 )
@@ -3014,6 +3182,13 @@ class ConstitutionMixin:
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.
                     await self._anchor_constitution_governance(constitution_hash)
                     agent_node.properties["constitution_hash"] = constitution_hash
+                    if publisher_evidence is not None:
+                        from kestrel_sovereign.constitution.genesis_audit import pending_genesis_audit
+
+                        agent_node.properties["genesis_audit"] = pending_genesis_audit(
+                            constitution_hash, provenance="native_bootstrap",
+                        )
+                        agent_node.properties["genesis_audit"]["publisher"] = publisher_evidence
                     await self.storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 # store.write joined the outer graph transaction. Its revision
                 # becomes usable custody only after that transaction commits;
@@ -3219,6 +3394,10 @@ class ConstitutionMixin:
         expected: dict,
     ) -> None:
         """Commit the authoritative receipt before its conversation notice."""
+        prior = agent_node.properties.get("genesis_audit")
+        if isinstance(prior, dict) and prior.get("constitution_hash") == record.get("constitution_hash"):
+            if publisher := prior.get("publisher"):
+                record["publisher"] = publisher
         agent_node.properties["genesis_audit"] = record
         status = record["status"]
         content = (

@@ -1451,3 +1451,245 @@ async def test_symlink_inside_the_allow_list_into_the_deny_list_is_refused(
     assert envelope.status is not ToolResultStatus.OK
     assert envelope.error.startswith("policy:deny:")
     assert responder.responded_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("narrow_during_approval", [False, True])
+async def test_v2_write_rechecks_workspace_grant_after_real_approval(
+    workspace, security_feature, monkeypatch, narrow_during_approval,
+):
+    from kestrel_sovereign.constitution.grants import ENVIRONMENT_KEY, ENVIRONMENT_SOURCE, GrantResolution
+
+    grants = frozenset({"filesystem_write", "filesystem_outside_workspace"})
+    monkeypatch.setenv(ENVIRONMENT_KEY, ",".join(sorted(grants)))
+    feature, agent = await _make_feature(
+        workspace=workspace, privacy=PrivacyConfig(computer_access=True),
+        grants=set(grants), security_feature=security_feature, backend="none",
+    )
+    agent.storage_path = str(workspace / "agent.db")
+    (workspace / "workspace").mkdir()
+    agent._constitution_host_grant_baseline = GrantResolution(
+        grants, ENVIRONMENT_SOURCE, "unavailable", "absent",
+    )
+    target = workspace / "ordinary-note.txt"
+    queue = security_feature.approval_queue
+
+    async def accept():
+        while not queue.pending_requests:
+            await asyncio.sleep(0.01)
+        request, = queue.pending_requests
+        if narrow_during_approval:
+            monkeypatch.setenv(ENVIRONMENT_KEY, "filesystem_write")
+        await queue.submit_decision(request.id, True, "once")
+
+    result, _ = await asyncio.wait_for(
+        asyncio.gather(feature.fs_write(path=str(target), content="ordinary note"), accept()),
+        timeout=5,
+    )
+    if narrow_during_approval:
+        assert result.status is not ToolResultStatus.OK
+        assert "filesystem_outside_workspace" in result.error
+        assert not target.exists()
+        assert _read_audit(workspace / "audit.jsonl")[-1]["allowed_by"][-1] == "denied:constitution"
+    else:
+        assert result.status is ToolResultStatus.OK, result
+        assert target.read_text() == "ordinary note"
+
+
+@pytest.mark.asyncio
+async def test_v2_workspace_disposition_preserves_file_policy_and_existing_queue(
+    workspace, security_feature,
+):
+    from kestrel_sovereign.constitution.grants import GrantResolution
+    from kestrel_sovereign.constitution.workspace_disposition import WorkspaceDisposition, WorkspacePathPolicy
+
+    grants = frozenset({"filesystem_read", "filesystem_write"})
+    feature, agent = await _make_feature(
+        workspace=workspace, privacy=PrivacyConfig(computer_access=True),
+        grants=set(grants), security_feature=security_feature, backend="none",
+    )
+    agent.storage_path = str(workspace / "agent.db")
+    allow = workspace / "allow"
+    allow.mkdir()
+    inside = allow / "note.txt"
+    inside.write_text("approved directory")
+    outside = workspace / "outside.txt"
+    outside.write_text("request approval")
+    denied = workspace / "secret" / "leak.txt"
+    feature._path_policy.allow[:] = [str(allow)]
+    baseline = GrantResolution(grants, "test", "test", "absent")
+    agent._constitution_host_grant_baseline = baseline
+    assert (await feature.fs_read(path=str(outside))).status is not ToolResultStatus.OK
+    scope = WorkspaceDisposition(
+        "1" * 64, WorkspacePathPolicy.from_policy(feature._path_policy), "2" * 64, "did:test:sovereign",
+    )
+    agent._constitution_host_grant_baseline = GrantResolution(
+        grants, "test", "test", "absent", workspace_disposition=scope,
+    )
+
+    async with _ApprovalResponder(security_feature, decision=True, scope="once") as responder:
+        assert (await feature.fs_read(path=str(inside))).status is ToolResultStatus.OK
+        assert responder.responded_count == 0
+        assert (await feature.fs_read(path=str(denied))).status is not ToolResultStatus.OK
+        assert responder.responded_count == 0
+        assert (await feature.fs_read(path=str(outside))).status is ToolResultStatus.OK
+        assert responder.responded_count == 1
+        assert (await feature.fs_write(path=str(inside), content="approved write")).status is ToolResultStatus.OK
+        assert responder.responded_count == 2
+
+    feature._path_policy.allow.append(str(outside))
+    assert (await feature.fs_read(path=str(outside))).status is not ToolResultStatus.OK
+    feature._path_policy.allow.remove(str(outside))
+    feature._path_policy.deny.append(str(outside))
+    assert (await feature.fs_read(path=str(inside))).status is ToolResultStatus.OK
+    assert (await feature.fs_read(path=str(outside))).status is not ToolResultStatus.OK
+
+    audit = _read_audit(workspace / "audit.jsonl")
+    assert any(f"constitutional_workspace_scope:{scope.sha256}" in row["allowed_by"] for row in audit)
+
+
+@pytest.mark.asyncio
+async def test_v2_workspace_disposition_rechecks_deny_after_queue_wait(workspace, security_feature):
+    from kestrel_sovereign.constitution.grants import GrantResolution
+    from kestrel_sovereign.constitution.workspace_disposition import WorkspaceDisposition, WorkspacePathPolicy
+
+    grants = frozenset({"filesystem_write"})
+    feature, agent = await _make_feature(
+        workspace=workspace, privacy=PrivacyConfig(computer_access=True),
+        grants=set(grants), security_feature=security_feature, backend="none",
+    )
+    agent.storage_path = str(workspace / "agent.db")
+    agent._constitution_host_grant_baseline = GrantResolution(
+        grants, "test", "test", "absent", workspace_disposition=WorkspaceDisposition(
+            "1" * 64, WorkspacePathPolicy.from_policy(feature._path_policy), "2" * 64, "did:test:sovereign",
+        ),
+    )
+    target = workspace / "ordinary-note.txt"
+    queue = security_feature.approval_queue
+
+    async def approve_after_narrowing():
+        while not queue.pending_requests:
+            await asyncio.sleep(0.01)
+        request, = queue.pending_requests
+        feature._path_policy.deny.append(str(target))
+        await queue.submit_decision(request.id, True, "once")
+
+    result, _ = await asyncio.wait_for(
+        asyncio.gather(feature.fs_write(path=str(target), content="ordinary note"), approve_after_narrowing()),
+        timeout=5,
+    )
+    assert result.status is not ToolResultStatus.OK
+    assert not target.exists()
+    assert _read_audit(workspace / "audit.jsonl")[-1]["allowed_by"][-1] == "denied:policy:changed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["offline", "runtime"])
+async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_path, monkeypatch, writer):
+    from kestrel_sovereign.config import CONSTITUTION_PATH
+    from kestrel_sovereign.constitution.amendment_artifact import build_legacy_signed_reanchor_artifact
+    from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
+    from kestrel_sovereign.constitution.grants import (
+        build_grant_baseline, build_offline_grant_observation,
+        load_anchored_grant_baseline, preview_offline_legacy_grants,
+    )
+    from kestrel_sovereign.constitution.source_descriptor import CONSTITUTION_SOURCE_DESCRIPTOR_ENV
+    from kestrel_sovereign.constitution.transition import TRANSITION_PURPOSE, build_transition, publisher_source_url
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+    from kestrel_sovereign.constitution.workspace_disposition import (
+        build_legacy_signed_workspace_disposition, workspace_path_policy_evidence,
+    )
+    from kestrel_sovereign.features.computer_use.policy import load_computer_use_config
+    from kestrel_sovereign.identity.signing import get_key_id
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.security.key_storage import SecureKeyStorage
+    from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
+    from kestrel_sovereign.storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+    from tests.integration.test_constitution_reanchor_e2e import _RuntimeAgentHarness, _snapshot
+    from tests.integration.test_constitution_source_descriptor_e2e import (
+        _ROOT_DID, _ROOT_DID_DOCUMENT, _ROOT_KEYPAIR, _descriptor_file, _sha,
+    )
+    from tests.shared.environment_guard import unset_environment
+
+    unset_environment(monkeypatch, SOVEREIGN_TRUST_ROOT_ENV, CONSTITUTION_SOURCE_DESCRIPTOR_ENV)
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read")
+    agent_dir = tmp_path / "agent"
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(agent_dir), agent_name="Workspace", identity_method="did:pkh",
+    )
+    did = credentials.agent_did
+    db_path = Path(credentials.db_path)
+    prior_hash = _sha(Path(CONSTITUTION_PATH).read_bytes())
+    (agent_dir / "kestrel.toml").write_text(
+        "[features.computer_use]\nenabled = true\nbackend = 'none'\n"
+        f"allowed_paths = [{json.dumps(str(tmp_path / 'ordinary-folder'))}]\n"
+    )
+    source = Path(__file__).resolve().parents[2] / "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md"
+    content = source.read_bytes()
+    digest = _sha(content)
+    publisher = {
+        "publisher_commit": "4" * 40, "source_sha256": digest,
+        "archive_sha256": "5" * 64, "attestation_sha256": "6" * 64,
+        "issued_at": "2000-01-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr("kestrel_sovereign.constitution.publisher.verify_packaged_publisher", lambda *_, **__: publisher)
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    descriptor = _descriptor_file(operator, source, content)
+    trust_root = operator / "root.json"
+    trust_root.write_text(json.dumps(_ROOT_DID_DOCUMENT))
+    artifact_path = operator / "adoption.json"
+    observed = preview_offline_legacy_grants(agent_dir, overlay_hash=None)
+    baseline = build_grant_baseline(did, observed)
+    observation = build_offline_grant_observation(
+        target_did=did, prior_sha256=prior_hash, observed_at=utc_timestamp(), resolution=observed,
+    )
+    transition = build_transition({
+        "purpose": TRANSITION_PURPOSE,
+        "target_did": did, "sovereign_did": _ROOT_DID,
+        "prior_sha256": prior_hash, "constitution_sha256": digest, "source_sha256": digest,
+        "publisher_commit": publisher["publisher_commit"],
+        "publisher_source_url": publisher_source_url(publisher["publisher_commit"]),
+        "admission_at": utc_timestamp(),
+    }, genesis_private_key=SecureKeyStorage(storage_dir=agent_dir).load_private_key(get_key_id(did)))
+
+    async def attempt(scope):
+        artifact_path.write_text(json.dumps(build_legacy_signed_reanchor_artifact(
+            signer_did=_ROOT_DID, constitution_sha256=digest, private_key=_ROOT_KEYPAIR.private_key,
+            transition=transition, publisher_release=publisher, grant_baseline=baseline,
+            offline_grant_observation=observation, workspace_disposition=scope,
+        )))
+        if writer == "runtime":
+            async with AsyncStorage(str(db_path), agent_id=did) as raw:
+                agent = _RuntimeAgentHarness(PrivacyEnforcingStorage(raw), did, trust_root, raw)
+                agent.storage_path = str(db_path)
+                agent._constitution_source_descriptor_path = descriptor
+                answer = await agent.reanchor_constitution(amendment_artifact_path=str(artifact_path))
+                return "re-anchored successfully" in answer.lower(), answer
+        result = await reanchor_constitution(
+            agent_name="Workspace", agent_dir=agent_dir, source_descriptor_path=descriptor,
+            sovereign_trust_root_path=trust_root, force=True, amendment_artifact_path=artifact_path,
+        )
+        return result.reanchored, result.error
+
+    before = await _snapshot(db_path, did)
+    accepted, message = await attempt(None)
+    assert not accepted and "separate signed workspace disposition" in message
+    assert await _snapshot(db_path, did) == before
+    scope = build_legacy_signed_workspace_disposition(
+        signer_did=_ROOT_DID, private_key=_ROOT_KEYPAIR.private_key, target_did=did,
+        prior_sha256=prior_hash, constitution_sha256=digest, grant_baseline=baseline,
+        path_policy=workspace_path_policy_evidence(load_computer_use_config(db_path)),
+    )
+    accepted, message = await attempt(scope)
+    assert accepted, message
+    async with AsyncStorage(str(db_path), agent_id=did) as storage:
+        node = await storage.get_node(did)
+        loaded = await load_anchored_grant_baseline(
+            storage.db, target_did=did, properties=node.properties,
+            trusted_did_document=_ROOT_DID_DOCUMENT,
+        )
+    assert loaded.grants == frozenset({"filesystem_read"})
+    assert loaded.workspace_disposition.signer == _ROOT_DID
+    assert loaded.workspace_disposition.path_policy.evidence() == scope["path_policy"]

@@ -39,7 +39,9 @@ from pathlib import Path, PurePath
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from kestrel_sovereign._async_ownership import run_blocking_operation
-from kestrel_sovereign.constitution.grants import resolve_amendment_ix_grants
+from kestrel_sovereign.constitution.grants import GrantResolution, resolve_amendment_ix_grants
+from kestrel_sovereign.constitution.workspace_disposition import WorkspaceDisposition, WorkspacePathPolicy
+from kestrel_sovereign.paths import agent_workspace_path
 from kestrel_sovereign.constitution.hierarchy import DANGEROUS_CAPABILITIES
 from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
 from kestrel_sovereign.features.base import Feature, tool
@@ -70,6 +72,8 @@ from .policy import (
     command_word_is_shell_grammar,
     evaluate_argv_paths,
     first_shell_significant_character,
+    load_computer_use_config,
+    path_policy_from_config,
     quote_words_containing_shell_syntax,
     split_command,
     subcommand_policies_from_config,
@@ -195,7 +199,6 @@ def shell_syntax_refusal(
     )
 
 
-_DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
 # The only accepted ``[features.computer_use].backend`` values; anything else
 # leaves the feature unready (#3760).
 _BACKEND_NAMES = frozenset({"docker", "local", "none"})
@@ -377,15 +380,8 @@ class ComputerUseFeature(Feature):
             logger.info("ComputerUseFeature: disabled in kestrel.toml")
             return
 
-        allowed = [str(Path(p).expanduser()) for p in self._cfg.get("allowed_paths", [])]
-        denied = [str(Path(p).expanduser()) for p in self._cfg.get("deny_paths", _DEFAULT_DENY_PATHS)]
         self._max_read_bytes = int(self._cfg.get("max_read_bytes", 5_000_000))
-
-        self._path_policy = PathPolicy(
-            allow=allowed,
-            deny=denied,
-            auto_approve_read=bool(self._cfg.get("auto_approve_read", True)),
-        )
+        self._path_policy = path_policy_from_config(self._cfg)
         # `auto_approved_binaries` is the canonical key (#1694). The
         # `allowed_binaries` spelling is accepted as a one-release
         # deprecation synonym: if `auto_approved_binaries` is set it
@@ -482,7 +478,7 @@ class ComputerUseFeature(Feature):
             "ComputerUseFeature initialized: backend=%s, allowed=%d, "
             "auto_approved_bins=%d, denied_bins=%d",
             self._backend.name,
-            len(allowed),
+            len(self._path_policy.allow),
             len(self._binary_policy.allow),
             len(self._binary_policy.deny),
         )
@@ -495,38 +491,7 @@ class ComputerUseFeature(Feature):
             await backend.shutdown()
 
     def _load_config(self) -> Dict[str, Any]:
-        """Read [features.computer_use] from kestrel.toml. Best-effort."""
-        try:
-            try:
-                import tomllib  # type: ignore[import-not-found]
-            except ImportError:
-                import tomli as tomllib  # type: ignore[import-not-found]
-        except Exception:
-            return {}
-
-        # Look for kestrel.toml in (1) the agent's storage dir, (2) the
-        # agent_data/<name>/ root if that's the storage layout, and finally
-        # (3) walking up from this source file. Per-agent kestrel.toml
-        # files live alongside agent storage, so checking that directory
-        # first is what most deployments expect.
-        candidates: list[Path] = []
-        storage_path = getattr(self.agent, "storage_path", None) if self.agent else None
-        if storage_path:
-            sp = Path(storage_path)
-            candidates.extend([sp / "kestrel.toml", sp.parent / "kestrel.toml"])
-        here = Path(__file__).resolve()
-        candidates.extend(parent / "kestrel.toml" for parent in here.parents)
-
-        for candidate in candidates:
-            if candidate.exists():
-                try:
-                    with open(candidate, "rb") as f:
-                        data = tomllib.load(f)
-                    return data.get("features", {}).get("computer_use", {}) or {}
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("failed to read %s: %s", candidate, exc)
-                    return {}
-        return {}
+        return load_computer_use_config(getattr(self.agent, "storage_path", None))
 
     def _agent_storage_dir(self) -> Optional[Path]:
         """The agent's storage dir: the directory holding its database.
@@ -670,6 +635,40 @@ class ComputerUseFeature(Feature):
         if capability not in DANGEROUS_CAPABILITIES:
             return True
         return capability in self._granted_capabilities()
+
+    def _outside_workspace(self, path: Path) -> bool:
+        storage_path = getattr(self.agent, "storage_path", None)
+        if not storage_path:
+            return True
+        workspace = agent_workspace_path(storage_path)
+        return workspace.is_symlink() or not path.is_relative_to(resolve_realpath(workspace))
+
+    def _workspace_scope(self, path: Path) -> WorkspaceDisposition | None:
+        baseline = getattr(self.agent, "_constitution_host_grant_baseline", None)
+        if isinstance(baseline, GrantResolution) and self._outside_workspace(path):
+            return baseline.workspace_disposition
+        return None
+
+    def _missing_constitution_grant(self, capability: str, path: Path | None = None) -> str | None:
+        if not self._constitution_allows(capability):
+            return capability
+        if path is None or not self._uses_structured_host_grants() or not self._outside_workspace(path):
+            return None
+
+        outside_grant = "filesystem_outside_workspace"
+        if self._constitution_allows(outside_grant):
+            return None
+        disposition = self._workspace_scope(path)
+        if disposition is None or capability not in {"filesystem_read", "filesystem_write"}:
+            return outside_grant
+        if self._path_policy is None or not disposition.path_policy.permits(
+            WorkspacePathPolicy.from_policy(self._path_policy)
+        ):
+            return "workspace disposition matching the active path policy"
+        return None
+
+    def _uses_structured_host_grants(self) -> bool:
+        return isinstance(getattr(self.agent, "_constitution_host_grant_baseline", None), GrantResolution)
 
     def _get_security_feature(self):
         if hasattr(self.agent, "get_feature"):
@@ -840,7 +839,7 @@ class ComputerUseFeature(Feature):
         allowed_by.append("privacy")
 
         # 2. Constitution
-        if not self._constitution_allows(capability):
+        if self._missing_constitution_grant(capability):
             await self._audit_denied(tool_name, payload, allowed_by + ["denied:constitution"])
             return _GateOutcome(
                 False,
@@ -864,6 +863,8 @@ class ComputerUseFeature(Feature):
             )
 
         # 3. Path safety + 4. Policy (filesystem ops)
+        resolved = None
+        workspace_scope = None
         if path_arg is not None:
             try:
                 resolved = resolve_realpath(path_arg)
@@ -877,7 +878,14 @@ class ComputerUseFeature(Feature):
                 return _GateOutcome(False, allowed_by, f"path_safety:{exc}")
             payload["path"] = str(resolved)
             allowed_by.append("path_safety")
+            missing = self._missing_constitution_grant(capability, resolved)
+            if missing:
+                await self._audit_denied(tool_name, payload, allowed_by + ["denied:constitution"])
+                return _GateOutcome(False, allowed_by, f"constitution:missing grant '{missing}'")
 
+            workspace_scope = self._workspace_scope(resolved)
+            if workspace_scope is not None:
+                allowed_by.append(f"constitutional_workspace_scope:{workspace_scope.sha256}")
             decision = self._path_policy.evaluate(resolved, write=write)
             payload["rule"] = decision.rule
             if decision.decision is Decision.DENY:
@@ -1058,6 +1066,27 @@ class ComputerUseFeature(Feature):
             if self._init_refusal:
                 reason = f"{reason}: {self._init_refusal}"
             return _GateOutcome(False, allowed_by, reason)
+
+        if resolved is not None and self._uses_structured_host_grants() and resolve_realpath(resolved) != resolved:
+            await self._audit_denied(tool_name, payload, allowed_by + ["denied:path_safety"])
+            return _GateOutcome(False, allowed_by, "path_safety:resolved path changed during authorization")
+
+        # An approval or input preparation can await while an environment-backed
+        # grant narrows or governance is replaced. Recheck before the operation.
+        missing = self._missing_constitution_grant(capability, resolved)
+        if missing:
+            await self._audit_denied(tool_name, payload, allowed_by + ["denied:constitution"])
+            return _GateOutcome(False, allowed_by, f"constitution:missing grant '{missing}'")
+
+        if resolved is not None and workspace_scope is not None:
+            decision = self._path_policy.evaluate(resolved, write=write)
+            if (
+                self._workspace_scope(resolved) != workspace_scope
+                or decision.decision is Decision.DENY
+                or (decision.decision is Decision.REQUIRE_APPROVAL and not require_approval)
+            ):
+                await self._audit_denied(tool_name, payload, allowed_by + ["denied:policy:changed"])
+                return _GateOutcome(False, allowed_by, "policy:workspace authority changed during authorization")
 
         # Stash the resolved values on the outcome via the payload so
         # callers don't have to re-resolve.
