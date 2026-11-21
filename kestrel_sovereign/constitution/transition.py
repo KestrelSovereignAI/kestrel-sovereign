@@ -22,6 +22,7 @@ from kestrel_sovereign.identity import did_web
 from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
 from kestrel_sovereign.identity.portable_trust import PORTABLE_TRUST_VERSION, build_identity_trust_bundle
 from kestrel_sovereign.identity.runtime_identity import RuntimeIdentityError, read_recorded_succession
+from kestrel_sovereign.identity.succession import HISTORICAL_ARCHIVAL_ALGORITHM
 from kestrel_sovereign.identity.succession_chain import (
     SuccessionChainError,
     build_chain,
@@ -38,7 +39,7 @@ from .structure import ConstitutionVersionError, constitution_version, v2_sectio
 
 TRANSITION_PURPOSE = "kestrel.constitution.adopt.v2"
 ROTATED_GENESIS_PROOF = "kestrel.genesis-succession.v1"
-HISTORICAL_ARCHIVAL_SCHEME = "sphincs-sha2-128s-simple"
+HISTORICAL_ARCHIVAL_SCHEME = HISTORICAL_ARCHIVAL_ALGORITHM
 _V1_SOURCE_SHA256 = "6948454b61253548b02b943dff166ba0c2f2eaabe2f542ace37424a8256d6467"
 _INTENT_FIELDS = {
     "purpose", "target_did", "sovereign_did", "prior_sha256",
@@ -330,7 +331,7 @@ def _verify_rotated_genesis_proof(target_did, intent, proof, sovereign_document,
             historical_archival_verifier=historical_verifier,
         )
     except (SuccessionChainError, ValueError, TypeError, KeyError) as exc:
-        raise AmendmentArtifactError("Cannot verify the target's recorded Genesis succession") from exc
+        raise AmendmentArtifactError(f"Cannot verify the target's recorded Genesis succession: {exc}") from exc
     if not result.ok or result.active_identity.did != proof["signer_did"]:
         raise AmendmentArtifactError(f"Adoption Genesis succession verification failed: {result.reason}")
     lineage = (

@@ -214,3 +214,72 @@ def test_rotated_genesis_requires_exact_chain_and_both_active_keys(declaration, 
     else:
         with pytest.raises(AmendmentArtifactError, match=failure):
             verify_transition_adoption(artifact={"transition": transition}, **inputs)
+
+
+def test_historical_rotated_proof_uses_spx_without_relabeling_as_fips(declaration, monkeypatch):
+    import os
+    import subprocess
+
+    from kestrel_sovereign.constitution.historical_archival import (
+        ENV_PYTHON,
+        verify_historical_archival_signature,
+    )
+    from kestrel_sovereign.constitution.transition import HISTORICAL_ARCHIVAL_SCHEME
+    from kestrel_sovereign.identity.succession import SuccessionStatement, signable_payload, verify_succession
+
+    interpreter = os.environ.get(ENV_PYTHON)
+    if not interpreter:
+        pytest.skip("Isolated pqcrypto 0.4 historical verifier is not configured")
+    genesis, _sovereign, intent, inputs = declaration
+    transition = _rotate(genesis, intent, inputs["identity_directory"], monkeypatch)
+    proof = transition["genesis_proof"]
+    raw = proof["trust"]["successions"][0]
+    statement = SuccessionStatement.from_dict(raw)
+    signer = """\
+import json
+import sys
+from pqcrypto.sign import sphincs_sha2_128s_simple as spx
+
+public, private = spx.generate_keypair()
+signature = spx.sign(private, sys.stdin.buffer.read())
+print(json.dumps({"public": public.hex(), "signature": signature.hex()}))
+"""
+    result = subprocess.run(
+        [interpreter, "-I", "-c", signer],
+        input=signable_payload(statement), capture_output=True, check=True, timeout=10, env={},
+    )
+    archival = json.loads(result.stdout)
+    method = build_verification_methods(
+        statement.successor_did,
+        [(SLHDSASHA2128sSuite(), bytes.fromhex(archival["public"]))],
+        kid_prefix="archival",
+    )[0]
+    raw["archival_verification_method"] = method
+    raw["archival_signature"] = {
+        "alg": ALG_SLH_DSA_SHA2_128S,
+        "kid": method["id"].rsplit("#", 1)[-1],
+        "sig": archival["signature"],
+    }
+    local_record = inputs["identity_directory"] / "successions" / "adopter.json"
+    local_record.write_text(json.dumps(raw))
+    proof["archival_multibase"] = method["publicKeyMultibase"]
+
+    with pytest.raises(AmendmentArtifactError, match="archival"):
+        verify_transition_adoption(artifact={"transition": transition}, **inputs)
+    proof["archival_scheme"] = HISTORICAL_ARCHIVAL_SCHEME
+    verify_transition_adoption(artifact={"transition": transition}, **inputs)
+
+    from kestrel_sovereign.identity import did_web
+    observation = verify_succession(
+        SuccessionStatement.from_dict(raw),
+        require_archival=True,
+        trusted_archival_multibase=proof["archival_multibase"],
+        historical_archival_verifier=verify_historical_archival_signature,
+        did_web_resolver=did_web.resolve,
+    )
+    assert observation.ok, observation.reason
+    assert observation.archival.alg_ids_seen == {HISTORICAL_ARCHIVAL_SCHEME}
+
+    monkeypatch.delenv(ENV_PYTHON)
+    with pytest.raises(AmendmentArtifactError, match=ENV_PYTHON):
+        verify_transition_adoption(artifact={"transition": transition}, **inputs)

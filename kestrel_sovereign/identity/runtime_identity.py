@@ -624,9 +624,10 @@ def _find_succession_statement(storage_dir: Path) -> Optional[Path]:
     explicitly when that ships).
     """
     successions_dir = storage_dir / "successions"
-    if not successions_dir.is_dir():
+    try:
+        candidates = sorted(path for path in successions_dir.iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
         return None
-    candidates = sorted(successions_dir.glob("*.json"))
     if not candidates:
         return None
     if len(candidates) > 1:
@@ -641,15 +642,8 @@ def _find_succession_statement(storage_dir: Path) -> Optional[Path]:
 
 def read_recorded_succession(storage_dir: Path) -> Optional[SuccessionStatement]:
     """Read the local public rotation evidence without loading private keys."""
-    # Unlike the historical finder, explicitly distinguish an unreadable
-    # directory from an absent record before allowing a raw Genesis proof.
-    directory = storage_dir / "successions"
-    try:
-        directory.stat()
-    except FileNotFoundError:
-        return None
-    if not directory.is_dir():
-        raise RuntimeIdentityError(f"{directory} is not a succession directory")
+    if not storage_dir.is_dir():
+        raise RuntimeIdentityError("No local identity directory is available for the target")
     path = _find_succession_statement(storage_dir)
     if path is None:
         return None

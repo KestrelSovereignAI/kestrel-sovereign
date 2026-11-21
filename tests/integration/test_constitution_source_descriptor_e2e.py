@@ -369,6 +369,7 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
 ):
     from kestrel_sovereign.config import CONSTITUTION_PATH
     from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
+    from kestrel_sovereign.constitution.grants import build_grant_baseline, preview_offline_legacy_grants
     from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
     from kestrel_sovereign.constitution.transition import (
         TRANSITION_PURPOSE, build_rotated_transition, build_transition,
@@ -387,6 +388,7 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
         required_proofs=("independent witness report",),
         price={"currency": "USD", "amount": 25},
     ) if active else None
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read")
     agent_dir = tmp_path / "agent_data" / "Adopter"
     credentials = await create_kestrel_identity_async(
         output_dir=str(agent_dir), agent_name="Adopter", emancipation_contract=contract,
@@ -406,6 +408,10 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     descriptor = _descriptor_file(operator_dir, source, v2_base)
     trust_root = operator_dir / "sovereign-root.did.json"
     artifact_path = operator_dir / "v2-adoption.signed.json"
+    grant_baseline = build_grant_baseline(
+        credentials.agent_did, preview_offline_legacy_grants(agent_dir, overlay_hash=None)
+    )
+
     def make_artifact(transition=None):
         return build_legacy_signed_reanchor_artifact(
             signer_did=_ROOT_DID,
@@ -413,6 +419,7 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
             private_key=_ROOT_KEYPAIR.private_key,
             reason="integration test adoption of edition 2",
             transition=transition,
+            grant_baseline=grant_baseline,
         )
 
     def write_artifact(artifact):
@@ -516,6 +523,32 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     ok, message = await _verify(
         credentials,
         command_hash=_sha(v2_rendered),
+        constitution_source_descriptor_path=str(descriptor),
+        sovereign_trust_root_path=str(trust_root),
+    )
+    assert ok, message
+
+
+@pytest.mark.asyncio
+async def test_new_v2_genesis_uses_signed_source_without_prior_adoption(tmp_path, operator_dir):
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "kestrel_sovereign" / "data" / "constitutions" / "v2" / "KESTREL_CONSTITUTION.md"
+    )
+    digest = _sha(source.read_bytes())
+    descriptor = _descriptor_file(operator_dir, source, source.read_bytes())
+    trust_root = operator_dir / "sovereign-root.did.json"
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(tmp_path / "new-v2"),
+        constitution_source_descriptor_path=str(descriptor),
+        sovereign_trust_root_path=str(trust_root),
+    )
+    properties = await _agent_properties(credentials.db_path, credentials.agent_did)
+    assert properties["constitution_hash"] == digest
+    assert "constitution_reanchor" not in properties
+    ok, message = await _verify(
+        credentials,
+        command_hash=digest,
         constitution_source_descriptor_path=str(descriptor),
         sovereign_trust_root_path=str(trust_root),
     )
