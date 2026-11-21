@@ -691,6 +691,8 @@ class ComputerUseFeature(Feature):
             return None
         if resolve_realpath(cwd) != cwd or not cwd.is_dir():
             return "path_safety:resolved sandbox cwd changed during authorization"
+        if not self._constitution_allows("filesystem_read"):
+            return "constitution:missing grant 'filesystem_read' for sandbox cwd"
         if self._outside_workspace(cwd) and not self._constitution_allows("filesystem_outside_workspace"):
             return "constitution:missing grant 'filesystem_outside_workspace' for sandbox cwd"
         return None

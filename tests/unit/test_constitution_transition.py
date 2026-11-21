@@ -163,18 +163,18 @@ def test_refuses_wrong_bindings_and_unwitnessed_prior_promises(declaration, chan
 
 def test_same_hash_repair_and_v2_reanchor_keep_existing_authority(declaration):
     _genesis, _sovereign, _intent, inputs = declaration
-    verify_transition_adoption(
-        artifact={"publisher_release": _publisher()}, **(inputs | {"prior_hash": inputs["new_hash"], "prior_text": None}),
-    )
     prior = _V2 + "\nPrior edition 2 release notes.\n"
-    prior_inputs = inputs | {"prior_hash": _hash(prior), "prior_text": prior}
-    with pytest.raises(AmendmentArtifactError, match="publisher-backed governing anchor"):
-        verify_transition_adoption(artifact={"publisher_release": _publisher()}, **prior_inputs)
-    verify_transition_adoption(
-        artifact={"publisher_release": _publisher()}, **prior_inputs,
-        verified_prior_anchor=(inputs["target_did"], _hash(prior)),
-    )
-
+    signed = {"publisher_release": _publisher(), "created_at": datetime.now(timezone.utc).isoformat()}
+    for prior_digest, prior_text in ((inputs["new_hash"], None), (_hash(prior), prior)):
+        revision = inputs | {"prior_hash": prior_digest, "prior_text": prior_text}
+        with pytest.raises(AmendmentArtifactError, match="publisher-backed governing anchor"):
+            verify_transition_adoption(artifact=signed, **revision)
+        revision["verified_prior_anchor"] = (inputs["target_did"], prior_digest)
+        verify_transition_adoption(artifact=signed, **revision)
+        with pytest.raises(AmendmentArtifactError, match="predates"):
+            verify_transition_adoption(
+                artifact=signed | {"created_at": "2000-01-01T00:00:00+00:00"}, **revision,
+            )
 
 
 @pytest.fixture

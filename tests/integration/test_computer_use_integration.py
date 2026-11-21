@@ -1712,12 +1712,11 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
     assert ("disk-selected policy" if writer == "runtime" else "differs from the active legacy path policy") in message
     assert await _snapshot(db_path, did) == before
     config_file.write_text(installed_config)
-    if writer == "offline":
-        accepted, message = await attempt(scope, observed_policy={
-            "enabled": True, "path_policy": {**scope["path_policy"], "auto_approve_read": False},
-        })
-        assert not accepted and "Signed pre-stop ComputerUse policy differs" in message
-        assert await _snapshot(db_path, did) == before
+    accepted, message = await attempt(scope, observed_policy={
+        "enabled": True, "path_policy": {**scope["path_policy"], "auto_approve_read": False},
+    })
+    assert not accepted and "Signed pre-stop ComputerUse policy differs" in message
+    assert await _snapshot(db_path, did) == before
     accepted, message = await attempt(scope)
     assert accepted, message
     async with AsyncStorage(str(db_path), agent_id=did) as storage:

@@ -5,21 +5,20 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timezone
-from importlib.resources import files
 from pathlib import Path
 from typing import Mapping
 
 from .amendment_artifact import AmendmentArtifactError
 from .structure import constitution_version
+from .v1_releases import AmendmentRule, CURRENT_V1_RELEASE, published_v1_release
 
 LEGACY_FIXED_AMENDMENT_FIELD = "legacy_fixed_amendment"
 LEGACY_FIXED_AMENDMENT_PURPOSE = "kestrel.constitution.amend-fixed-guarantees.v1"
 _BOOK_FIXED_HEADINGS = frozenset({"Preamble", "Book I: Universal Values", "Book II: The Sovereign Amendments"})
-_ARTICLE_FIXED_HEADINGS = frozenset({
-    "Preamble", "Article I: The Principle of Sovereignty", "Article II: The Digital Bill of Rights",
-})
-_AMENDMENT_HEADINGS = frozenset({"The Amendment Process", "Article V: The Amendment Process"})
-_FIXED_HEADINGS = _BOOK_FIXED_HEADINGS | _ARTICLE_FIXED_HEADINGS | _AMENDMENT_HEADINGS
+_FOUNDING_ARTICLE = re.compile(r"^Article (?:I|II|III|IV|V): ")
+_FOUNDING_AMENDMENT_HEADING = "Article V: The Amendment Process"
+_BOOK_AMENDMENT_HEADING = "The Amendment Process"
+_FIXED_HEADINGS = _BOOK_FIXED_HEADINGS | {_BOOK_AMENDMENT_HEADING}
 _HEADING = re.compile(r"(?m)^##[ \t]+(.+?)[ \t]*\r?$")
 _EMANCIPATION_SLOT = re.compile(r"(?ms)^### Amendment VIII: Emancipation[^\n]*\n.*?(?=^### Amendment IX:)")
 
@@ -42,18 +41,24 @@ def verify_legacy_fixed_guarantee_change(
     active_signing_did: str | None = None,
 ) -> dict:
     """Preserve legacy repair while requiring Genesis for material edition-one amendments."""
-    if prior_hash == new_hash or prior_text is None or constitution_version(new_text) != 1:
+    if prior_hash == new_hash or constitution_version(new_text) != 1:
         return {}
+    release = published_v1_release(prior_hash) if prior_hash is not None else None
+    if prior_text is None:
+        if release is None:
+            return {}
+        prior_text = release.authenticated_text()
     if constitution_version(prior_text) == 2:
         raise AmendmentArtifactError("Cannot replace an adopted edition 2 Constitution with edition 1")
-    before = _fixed_provisions(prior_text)
-    before_headings = {heading for heading, _ in before}
-    published_format = (
-        bool(before_headings & _AMENDMENT_HEADINGS)
-        and (_BOOK_FIXED_HEADINGS <= before_headings or _ARTICLE_FIXED_HEADINGS <= before_headings)
+    headings = {match[1] for match in _HEADING.finditer(prior_text)}
+    founding = release.amendment_rule is AmendmentRule.FOUNDING_ARTICLES if release is not None else (
+        _FOUNDING_AMENDMENT_HEADING in headings
+        and sum(bool(_FOUNDING_ARTICLE.match(heading)) for heading in headings) > 1
     )
-    if not published_format or _fixed_provisions(new_text) == before:
-        return {}
+    if not founding:
+        ranked = _BOOK_FIXED_HEADINGS <= headings and _BOOK_AMENDMENT_HEADING in headings
+        if not ranked or _fixed_provisions(new_text) == _fixed_provisions(prior_text):
+            return {}
     from .transition import verify_live_genesis_proof
 
     proof = artifact.get(LEGACY_FIXED_AMENDMENT_FIELD)
@@ -67,6 +72,7 @@ def verify_legacy_fixed_guarantee_change(
         "constitution_sha256": new_hash,
         "admission_at": admission_at,
     }
+    declaration_scope = "this founding Constitution" if founding else "edition 1 fixed guarantees"
     if (
         hashlib.sha256(prior_text.encode()).hexdigest() != prior_hash
         or not isinstance(admission_at, str)
@@ -74,7 +80,7 @@ def verify_legacy_fixed_guarantee_change(
         or proof["intent"] != expected
     ):
         raise AmendmentArtifactError(
-            "Changes to edition 1 fixed guarantees require a Genesis-verifiable declaration "
+            f"Changes to {declaration_scope} require a Genesis-verifiable declaration "
             "for this agent and its exact prior and proposed governing digests"
         )
     try:
@@ -87,13 +93,6 @@ def verify_legacy_fixed_guarantee_change(
         target_did, expected, proof["genesis_proof"], sovereign_document, identity_directory,
         hosted_identity_evidence_path=hosted_identity_evidence_path, active_signing_did=active_signing_did,
     )
-    # This distribution authenticates its original edition-one platform text.
-    # A Sovereign credential can ratify that text, but cannot author a new
-    # set of fixed guarantees merely by retaining edition-one headings.
-    from .v1_prior import CURRENT_V1_DIGEST
-
-    base = (files("kestrel_sovereign") / "data" / "KESTREL_CONSTITUTION.md").read_bytes()
-    if (hashlib.sha256(base).hexdigest() != CURRENT_V1_DIGEST
-            or _fixed_provisions(new_text) != _fixed_provisions(base.decode("utf-8"))):
+    if not founding and _fixed_provisions(new_text) != _fixed_provisions(CURRENT_V1_RELEASE.authenticated_text()):
         raise AmendmentArtifactError("A change to edition 1 fixed guarantees requires a verified platform-authored release")
     return genesis

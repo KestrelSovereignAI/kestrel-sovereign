@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
+from pathlib import Path
+import stat
+import tomllib
 from typing import TYPE_CHECKING, Any, Mapping
 
 from .amendment_artifact import AmendmentArtifactError, verify_detached_signature
@@ -100,14 +104,52 @@ def workspace_path_policy_evidence(computer_use_config: dict) -> dict[str, Any]:
     return WorkspacePathPolicy.from_policy(path_policy_from_config(computer_use_config)).evidence()
 
 
-def configured_workspace_policy(storage_path) -> dict[str, Any]:
+def configured_workspace_policy(storage_path, *, hosted_config_path: Path | None = None) -> dict[str, Any]:
     """Report the disk-selected ComputerUse policy without loading the feature."""
     from kestrel_sovereign.features.computer_use.policy import load_computer_use_config
 
-    config = load_computer_use_config(storage_path) if storage_path is not None else {}
+    if storage_path is None:
+        if hosted_config_path is None:
+            raise AmendmentArtifactError("Hosted grant cutover requires an operator-selected ComputerUse configuration")
+        config = _read_hosted_computer_use_config(hosted_config_path)
+    else:
+        config = load_computer_use_config(storage_path)
     if not config.get("enabled"):
         return {"enabled": False}
     return {"enabled": True, "path_policy": workspace_path_policy_evidence(config)}
+
+
+def _read_hosted_computer_use_config(path: Path) -> dict[str, Any]:
+    """Read the host's independently selected native TOML policy without fallback."""
+    try:
+        if not path.is_absolute() or path.resolve() != path:
+            raise ValueError("expected an absolute canonical path")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid not in (0, os.geteuid())
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise ValueError("expected an operator-owned regular file")
+            limit = 1024 * 1024
+            raw = source.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError("configuration exceeds size limit")
+        config = tomllib.loads(raw.decode())["features"]["computer_use"]
+        if not isinstance(config, dict) or type(config.get("enabled")) is not bool:
+            raise ValueError("expected an explicit ComputerUse enabled setting")
+        for key in ("allowed_paths", "deny_paths"):
+            if key in config and (
+                not isinstance(config[key], list) or any(not isinstance(path, str) for path in config[key])
+            ):
+                raise ValueError("expected a list of ComputerUse path selectors")
+        if "auto_approve_read" in config and type(config["auto_approve_read"]) is not bool:
+            raise ValueError("expected a boolean ComputerUse auto-approval setting")
+        return config
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise AmendmentArtifactError("Invalid operator-selected hosted ComputerUse configuration") from exc
 
 
 def running_workspace_policy(agent) -> dict[str, Any]:

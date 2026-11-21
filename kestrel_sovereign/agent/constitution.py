@@ -2715,6 +2715,7 @@ class ConstitutionMixin:
             from kestrel_sovereign.constitution.grants import (
                 load_anchored_grant_baseline,
                 prior_text_for_grant_repair,
+                require_offline_grant_observation,
                 resolve_legacy_grants,
                 unknown_signed_prior_edition,
                 validate_grant_cutover,
@@ -2738,6 +2739,7 @@ class ConstitutionMixin:
                     trusted_did_document=trusted_did_document,
                     unknown_prior_edition=unknown_prior,
                     recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
+                    recovered_governing_text=grant_prior_text,
                 )
             transition_evidence = await asyncio.to_thread(
                 verify_transition_adoption,
@@ -2756,6 +2758,8 @@ class ConstitutionMixin:
                 active_signing_did=getattr(getattr(self, "identity", None), "signing_did", None),
             )
             if constitution_version(new_text) == 2 and prior_baseline is None:
+                if "offline_grant_observation" in amendment_artifact:
+                    require_offline_grant_observation(amendment_artifact, prior_sha256=historical_hash)
                 overlay_ok, overlay_error = await self.verify_constitution_overlay()
                 if not overlay_ok:
                     raise AmendmentArtifactError(overlay_error)

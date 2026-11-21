@@ -436,6 +436,7 @@ async def reanchor_constitution(
     runtime_dsn: str | None = None,
     hosted_agent_did: str | None = None,
     hosted_identity_evidence_path: Path | None = None,
+    hosted_computer_use_config_path: Path | None = None,
     backup_root: Path | None = None,
 ) -> ReanchorResult:
     """Reanchor one agent to the current canonical constitution.
@@ -502,6 +503,9 @@ async def reanchor_constitution(
             custody JSON file for that hosted DID. Existing edition-one agents
             require it for a Genesis declaration. The host must obtain and
             protect the file independently of the adoption request and database.
+        hosted_computer_use_config_path: Operator-owned native kestrel.toml
+            selected independently for the directoryless tenant. Required when
+            its ComputerUse policy must be verified before first adoption.
         backup_root: Where a forced write to a local SQLite file copies the
             database first (#3785). None resolves the project's configured
             backup root (:func:`kestrel_sovereign.paths.backup_dir`) from
@@ -514,7 +518,9 @@ async def reanchor_constitution(
     requested_path = canonical_path
     if canonical_path is None:
         canonical_path = Path(governing_constitution_path())
-    if hosted_agent_did is not None or hosted_identity_evidence_path is not None:
+    if any(value is not None for value in (
+        hosted_agent_did, hosted_identity_evidence_path, hosted_computer_use_config_path,
+    )):
         if (
             agent_dir is not None
             or runtime_backend != "postgres"
@@ -1015,6 +1021,7 @@ async def reanchor_constitution(
                     unknown_prior_edition=unknown_prior,
                     environ=environ,
                     recovered_hash=new_hash if anchored_text is None and grant_prior_text is not None else historical_hash,
+                    recovered_governing_text=grant_prior_text,
                 )
 
         transition_evidence = await asyncio.to_thread(
@@ -1053,6 +1060,7 @@ async def reanchor_constitution(
                 trusted_did_document=trusted_did_document,
                 storage_path=target.anchor_path,
                 stopped=True,
+                hosted_computer_use_config_path=hosted_computer_use_config_path,
             )
 
         proposed_baseline = recheck_grant_cutover()

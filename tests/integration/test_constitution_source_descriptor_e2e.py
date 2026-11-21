@@ -373,12 +373,13 @@ def _legacy_role_revision(source: Path) -> bytes:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "path, active, rotated",
-    [("offline", True, False), ("live", False, False),
-     ("offline", False, True), ("live", False, True)],
+    "path, active, rotated, legacy_release",
+    [("offline", True, False, None), ("live", False, False, None),
+     ("offline", False, True, None), ("live", False, True, None),
+     ("offline", True, False, "84f4591ab"), ("live", True, False, "f0672b394")],
 )
 async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition(
-    tmp_path, operator_dir, path, active, rotated, monkeypatch,
+    tmp_path, operator_dir, path, active, rotated, legacy_release, monkeypatch,
 ):
     from kestrel_sovereign.config import CONSTITUTION_PATH
     from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
@@ -399,6 +400,14 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     from tests.integration.test_constitution_reanchor_e2e import _RuntimeAgentHarness, _snapshot
     from tests.shared.rotation_ceremony import build_post_ceremony_template
 
+    from kestrel_sovereign.constitution.v1_releases import CURRENT_V1_RELEASE, V1_RELEASES
+
+    published_prior = next(
+        release for release in V1_RELEASES
+        if release.commit.startswith(legacy_release or CURRENT_V1_RELEASE.commit)
+    )
+    legacy_source = published_prior.authenticated_text().encode()
+    Path(CONSTITUTION_PATH).write_bytes(legacy_source)
     contract = EmancipationContract(
         enabled=True,
         terms="Demonstrate the transfer with independent witnesses.",
@@ -411,13 +420,18 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
         output_dir=str(agent_dir), agent_name="Adopter", emancipation_contract=contract,
         identity_method="did:pkh",
     )
-    legacy_source = Path(CONSTITUTION_PATH).read_bytes()
     legacy_bytes = resolve_governing_constitution_bytes(contract, content=legacy_source)
-    public_v1_digest = "46687f754bc008f4022599fb481ebf9abf0fbf1e8e205472ac8efba95628eb9c"
+    historical_release = next(
+        release for release in V1_RELEASES if release.supports_activation and release != published_prior
+    )
+    historical_bytes = resolve_governing_constitution_bytes(
+        contract, content=historical_release.authenticated_text().encode(),
+    )
+    historical_digest = _sha(historical_bytes)
     async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as storage:
-        assert await storage.retrieve_file(public_v1_digest) is None
+        assert await storage.retrieve_file(historical_digest) is None
         node = await storage.get_node(credentials.agent_did)
-        node.properties["constitution_reanchor"] = {"new_hash": public_v1_digest}
+        node.properties["constitution_reanchor"] = {"new_hash": historical_digest}
         await storage.add_node(node)
     before = await _agent_properties(credentials.db_path, credentials.agent_did)
     assert before["constitution_hash"] == _sha(legacy_bytes)
@@ -490,7 +504,10 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
                 agent.storage_path = credentials.db_path
                 agent._constitution_source_descriptor_path = descriptor
                 answer = await agent.reanchor_constitution(amendment_artifact_path=str(artifact_path))
-                return "re-anchored successfully" in answer.lower(), answer
+                return (
+                    "re-anchored successfully" in answer.lower()
+                    or "Signed repair restored content/ownership" in answer
+                ), answer
 
         result = await reanchor_constitution(
             agent_name="Adopter", agent_dir=agent_dir, source_descriptor_path=descriptor,
@@ -556,7 +573,7 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
     after = await _agent_properties(credentials.db_path, credentials.agent_did)
     assert after["constitution_reanchor"]["old_hash"] == _sha(legacy_bytes)
     assert after["constitution_reanchor"]["source_content_sha256"] == _sha(v2_base)
-    assert after["constitution_reanchor_history"][-1]["receipt"]["new_hash"] == public_v1_digest
+    assert after["constitution_reanchor_history"][-1]["receipt"]["new_hash"] == historical_digest
     if contract is not None:
         assert after["emancipation_contract"] == before["emancipation_contract"] == contract_to_json(contract)
 
@@ -566,6 +583,24 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
         receipt = after["constitution_reanchor"]
         retained_artifact = await storage.retrieve_file(receipt["signed_artifact_hash"])
         assert retained_artifact == artifact_path.read_bytes()
+
+        if rotated:
+            from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+            from kestrel_sovereign.constitution.grants import load_anchored_grant_baseline
+
+            valid = await load_anchored_grant_baseline(
+                storage.db, target_did=credentials.agent_did, properties=after,
+                trusted_did_document=_ROOT_DID_DOCUMENT,
+            )
+            assert valid.grants == frozenset({"filesystem_read"})
+            damaged_receipt = dict(receipt)
+            del damaged_receipt["genesis_admission_evidence"]
+            with pytest.raises(AmendmentArtifactError, match="recorded admission custody"):
+                await load_anchored_grant_baseline(
+                    storage.db, target_did=credentials.agent_did,
+                    properties=after | {"constitution_reanchor": damaged_receipt},
+                    trusted_did_document=_ROOT_DID_DOCUMENT,
+                )
 
     def forbid_network(*args, **kwargs):
         pytest.fail("Replay of native proof consulted the live publication")
@@ -587,6 +622,25 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
         sovereign_trust_root_path=str(trust_root),
     )
     assert ok, message
+
+    if rotated:
+        # The original classical key is gone. A repair may use the retained
+        # native adoption evidence without declaring the same adoption again.
+        async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as storage:
+            await storage.db.execute("DELETE FROM files WHERE content_hash = ?", (_sha(v2_rendered),))
+        write_artifact(make_artifact(offline_observation=False))
+        accepted, message = await attempt()
+        assert accepted, message
+        repaired = await _agent_properties(credentials.db_path, credentials.agent_did)
+        assert repaired["constitution_reanchor"]["old_hash"] == _sha(v2_rendered)
+        assert repaired["constitution_reanchor_history"][-1]["receipt"] == receipt
+        async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as storage:
+            assert await storage.retrieve_file(_sha(v2_rendered)) == v2_rendered
+            retained = await load_anchored_grant_baseline(
+                storage.db, target_did=credentials.agent_did, properties=repaired,
+                trusted_did_document=_ROOT_DID_DOCUMENT,
+            )
+            assert retained.grants == frozenset({"filesystem_read"})
 
 
 @pytest.mark.asyncio

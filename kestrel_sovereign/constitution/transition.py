@@ -40,7 +40,7 @@ from kestrel_sovereign.security.signature_verification import decode_verificatio
 from .amendment_artifact import AmendmentArtifactError, verify_reanchor_artifact
 from .emancipation import (
     EmancipationContract, historic_emancipation_displacement,
-    known_historical_platform_promise,
+    known_historical_platform_promise, matches_recorded_emancipation_contract,
 )
 from .structure import ConstitutionVersionError, constitution_version, v2_sections
 from .v1_prior import verify_supported_v1_prior as _verify_supported_v1_prior
@@ -171,6 +171,9 @@ def verify_transition_adoption(
         )
     _verify_adoption_publisher(artifact, source_hash)
     if prior_hash == new_hash:
+        if verified_prior_anchor != (target_did, prior_hash):
+            raise AmendmentArtifactError("Prior edition 2 requires a verified publisher-backed governing anchor")
+        verify_publication_chronology(artifact, datetime.now(timezone.utc))
         return {}
     if prior_text is None or not prior_hash or _digest(prior_text) != prior_hash:
         raise AmendmentArtifactError("Cannot adopt edition 2 without the exact prior governing bytes")
@@ -179,6 +182,7 @@ def verify_transition_adoption(
             v2_sections(prior_text)
             if verified_prior_anchor != (target_did, prior_hash):
                 raise AmendmentArtifactError("Prior edition 2 requires a verified publisher-backed governing anchor")
+            verify_publication_chronology(artifact, datetime.now(timezone.utc))
             return {}
     except ConstitutionVersionError as exc:
         raise AmendmentArtifactError("Cannot establish the prior Constitution edition") from exc
@@ -191,7 +195,7 @@ def verify_transition_adoption(
     intent, proof = _adoption_evidence(
         artifact, trusted_did_document, target_did, prior_hash, new_hash, source_hash,
     )
-    _verify_adoption_chronology(artifact, intent, datetime.now(timezone.utc))
+    verify_publication_chronology(artifact, datetime.now(timezone.utc), intent=intent)
     genesis_evidence = verify_live_genesis_proof(
         target_did, intent, proof, trusted_did_document, identity_directory,
         hosted_identity_evidence_path=hosted_identity_evidence_path, active_signing_did=active_signing_did,
@@ -334,14 +338,19 @@ def _admission_time(value: Any) -> datetime:
     return stamp
 
 
-def _verify_adoption_chronology(artifact, intent, recorded_at: datetime) -> None:
+def verify_publication_chronology(artifact, recorded_at: datetime, *, intent=None) -> None:
+    """Require publisher release, authorization, and native record in that order."""
     issued = _admission_time(artifact["publisher_release"].get("issued_at"))
-    admission = _admission_time(intent["admission_at"])
     signed = _admission_time(artifact.get("created_at"))
+    admission = _admission_time(intent["admission_at"]) if intent is not None else signed
     if issued > admission:
         raise AmendmentArtifactError("Adoption declaration predates the independently witnessed publisher release")
     if admission > signed or signed > recorded_at or recorded_at > datetime.now(timezone.utc):
         raise AmendmentArtifactError("Adoption declaration or its outer signature postdates its recorded authorization")
+
+
+def verify_reanchor_receipt_chronology(artifact, receipt) -> None:
+    verify_publication_chronology(artifact, _admission_time(receipt.get("timestamp")))
 
 
 def _adoption_evidence(artifact, root, target_did, prior_hash, new_hash, source_hash):
@@ -415,6 +424,11 @@ def verify_archived_transition_adoption(
     if receipt.get("prior_role_artifact_sha256") != prior_authority.get("prior_role_artifact_sha256"):
         raise AmendmentArtifactError("Archived Book IV admission artifact differs from the native receipt")
     _verify_earlier_promise_survives(prior_hash, prior_text, new_hash, new_text)
+    if (
+        anchored_contract is not None and anchored_contract.enabled
+        and not matches_recorded_emancipation_contract(new_text, anchored_contract)
+    ):
+        raise AmendmentArtifactError("Archived adoption does not preserve the proven prior emancipation terms")
     try:
         artifact = json.loads(artifact_bytes)
         if not isinstance(artifact, dict):
@@ -431,7 +445,7 @@ def verify_archived_transition_adoption(
     intent, proof = _adoption_evidence(
         artifact, trusted_did_document, target_did, prior_hash, new_hash, source_hash,
     )
-    _verify_adoption_chronology(artifact, intent, _admission_time(receipt.get("timestamp")))
+    verify_publication_chronology(artifact, _admission_time(receipt.get("timestamp")), intent=intent)
     if isinstance(proof, dict) and proof.get("alg") == BORN_HYBRID_GENESIS_PROOF:
         evidence = _verify_born_hybrid_genesis(
             target_did, intent, proof, trusted_did_document, independent_document=None,

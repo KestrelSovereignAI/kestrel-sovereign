@@ -153,6 +153,18 @@ def test_isolated_preview_build_context_survives_both_distribution_formats(built
             assert wheel.read(name) == sdist.extractfile(members[name]).read() == expected
 
 
+def test_authenticated_v1_publications_ship_with_exact_bytes(built_distributions):
+    from kestrel_sovereign.constitution.v1_releases import V1_RELEASES
+
+    with zipfile.ZipFile(built_distributions["wheel"]) as wheel, tarfile.open(built_distributions["sdist"]) as sdist:
+        members = {member.name.split("/", 1)[1]: member for member in sdist.getmembers() if member.isfile()}
+        for release in V1_RELEASES:
+            name = f"kestrel_sovereign/{release.resource_path}"
+            content = wheel.read(name)
+            assert hashlib.sha256(content).hexdigest() == release.digest
+            assert sdist.extractfile(members[name]).read() == content
+
+
 def test_source_tree_carries_full_package_marker():
     marker = Path(kestrel_sovereign.__file__).resolve().parent / "py.typed"
     assert marker.is_file(), f"{marker} is missing; the Typed classifier is unbacked"

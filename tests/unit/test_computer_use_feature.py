@@ -1446,8 +1446,11 @@ async def test_file_workspace_scope_keeps_independent_legacy_and_v2_decisions(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["file-scope-only", "named-grant", "approval-narrowed", "dispatch-narrowed"])
-async def test_sandbox_cwd_requires_current_named_outside_grant(workspace, monkeypatch, case):
+@pytest.mark.parametrize("case", [
+    "file-scope-only", "named-grant", "approval-narrowed", "dispatch-narrowed",
+    "no-read-inside", "no-cwd", "approval-read-narrowed", "dispatch-read-narrowed",
+])
+async def test_sandbox_cwd_requires_current_named_filesystem_grants(workspace, monkeypatch, case):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -1469,7 +1472,8 @@ async def test_sandbox_cwd_requires_current_named_outside_grant(workspace, monke
 
     def narrow():
         agent._constitution_host_grant_baseline = GrantResolution(
-            base_grants, "test", "test", "absent", workspace_disposition=scope,
+            base_grants - {"filesystem_read"} if case.endswith("read-narrowed") else base_grants,
+            "test", "test", "absent", workspace_disposition=scope,
         )
 
     narrow()
@@ -1477,9 +1481,13 @@ async def test_sandbox_cwd_requires_current_named_outside_grant(workspace, monke
         agent._constitution_host_grant_baseline = GrantResolution(
             base_grants | {"filesystem_outside_workspace"}, "test", "test", "absent",
         )
+    if case in {"no-read-inside", "no-cwd"}:
+        agent._constitution_host_grant_baseline = GrantResolution(
+            frozenset({"shell_execution_sandboxed"}), "test", "test", "absent",
+        )
     execute = AsyncMock(return_value=CompletedRun(["echo"], 0, "fixture", "", 1))
     feature._backend = SimpleNamespace(supports_exec=True, name="docker", exec=execute)
-    if case == "approval-narrowed":
+    if case.startswith("approval-"):
         approve = queue.request_approval
 
         async def approve_then_narrow(*args, **kwargs):
@@ -1488,23 +1496,26 @@ async def test_sandbox_cwd_requires_current_named_outside_grant(workspace, monke
             return result
 
         monkeypatch.setattr(queue, "request_approval", approve_then_narrow)
-    if case == "dispatch-narrowed":
+    if case.startswith("dispatch-"):
         async def observe_capture(_):
             narrow()
             return None
 
         monkeypatch.setattr(capture, "git_head", observe_capture)
 
+    if case == "no-read-inside":
+        chosen = workspace / "workspace"
     outcome = await feature.shell(
-        command="printf ordinary", cwd=str(chosen), capture_output=case == "dispatch-narrowed",
+        command="printf ordinary", cwd=None if case == "no-cwd" else str(chosen), capture_output=case.startswith("dispatch-"),
     )
-    assert len(queue.calls) == (0 if case == "file-scope-only" else 1)
-    if case == "named-grant":
+    assert len(queue.calls) == (0 if case in {"file-scope-only", "no-read-inside"} else 1)
+    if case in {"named-grant", "no-cwd"}:
         assert outcome.status is ToolResultStatus.OK, outcome.error
         execute.assert_awaited_once()
     else:
         assert outcome.status is not ToolResultStatus.OK
-        assert "filesystem_outside_workspace" in outcome.error
+        missing_read = case == "no-read-inside" or case.endswith("read-narrowed")
+        assert ("filesystem_read" if missing_read else "filesystem_outside_workspace") in outcome.error
         execute.assert_not_awaited()
 
 

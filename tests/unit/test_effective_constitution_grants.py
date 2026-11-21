@@ -301,9 +301,10 @@ def test_edition_2_freezes_legacy_precedence_and_retains_evidence(
     assert record["legacy_evidence"]["signer"] is None
     assert record["legacy_evidence"]["sha256"] == overlay_hash
     assert record["grants"] == ([] if overlay_present else ["filesystem_read", "filesystem_write"])
+    (tmp_path / "kestrel.toml").write_text("[features.computer_use]\nenabled = false\n")
     agent._constitution_host_grant_baseline = validate_grant_cutover(
         target_did=target, artifact={"grant_baseline": record}, prior_text=_BASE,
-        new_text=v2, legacy_resolution=lambda: original,
+        new_text=v2, legacy_resolution=lambda: original, storage_path=tmp_path,
     )
     assert resolve_amendment_ix_grants(agent).grants == set(record["grants"])
 
@@ -366,8 +367,18 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
         / "constitutions" / "v2" / "KESTREL_CONSTITUTION.md"
     )
     v2_bytes = v2_path.read_bytes()
+    from datetime import datetime, timezone
+
+    from kestrel_sovereign.constitution.transition import (
+        TRANSITION_PURPOSE, build_transition, publisher_source_url,
+    )
+    from kestrel_sovereign.inception_service import public_key_to_ethereum_address
+
+    v1_bytes = Path(config.CONSTITUTION_PATH).read_bytes()
+    genesis_key = ec.generate_private_key(ec.SECP256K1())
+    target = "did:pkh:eip155:1:" + public_key_to_ethereum_address(genesis_key.public_key())
     monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read")
-    agent = KestrelAgent(did="did:test:baseline", storage_path=str(tmp_path / "baseline.db"))
+    agent = KestrelAgent(did=target, storage_path=str(tmp_path / "baseline.db"))
     agent.extension = None
     sovereign_key = ec.generate_private_key(ec.SECP256K1())
     sovereign = did_document_from_legacy_public_key("did:test:external-root", sovereign_key.public_key())
@@ -375,16 +386,25 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
 
     async with AsyncStorage(agent.storage_path, agent_id=agent.agent_id) as storage:
         agent.storage = agent._raw_storage = storage
+        prior = await storage.store_file(v1_bytes, "prior-governing.md")
         digest = await storage.store_file(v2_bytes, "governing.md")
         publisher = verify_packaged_publisher(digest)
         record = build_grant_baseline(agent.agent_id, resolve_legacy_grants(agent))
         assert record["grants"] == ["filesystem_read"]
+        intent = {
+            "purpose": TRANSITION_PURPOSE, "target_did": target, "sovereign_did": sovereign["id"],
+            "prior_sha256": prior, "constitution_sha256": digest, "source_sha256": digest,
+            "publisher_commit": publisher["publisher_commit"],
+            "publisher_source_url": publisher_source_url(publisher["publisher_commit"]),
+            "admission_at": datetime.now(timezone.utc).isoformat(),
+        }
         artifact = build_legacy_signed_reanchor_artifact(
             signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
             grant_baseline=record, publisher_release=publisher,
+            transition=build_transition(intent, genesis_private_key=genesis_key),
         )
 
-        async def store_artifact(artifact):
+        async def store_artifact(artifact, *, old_hash=prior):
             artifact_hash = await storage.store_file(json.dumps(artifact).encode(), "signed-artifact.json")
             node = GraphNode(
                 node_id=agent.agent_id,
@@ -394,7 +414,8 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
                     "constitution_hash": digest,
                     CONSTITUTION_REANCHOR_KEY: {
                         "new_hash": digest, "source_content_sha256": digest,
-                        "signed_artifact_hash": artifact_hash,
+                        "signed_artifact_hash": artifact_hash, "old_hash": old_hash,
+                        "signed_artifact_signer": sovereign["id"], "timestamp": artifact["created_at"],
                     },
                 },
             )
@@ -413,6 +434,21 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
         monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read,filesystem_write")
         assert gate._constitution_allows("filesystem_read")
         assert not gate._constitution_allows("filesystem_write")
+        no_transition = build_legacy_signed_reanchor_artifact(
+            signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
+            grant_baseline=record, publisher_release=publisher,
+        )
+        forged_node, _ = await store_artifact(no_transition)
+        ok, message = await agent._refresh_constitution_host_grants(forged_node)
+        assert not ok and "Genesis-verifiable" in message
+        assert not gate._constitution_allows("filesystem_read")
+        repair_node, _ = await store_artifact(no_transition, old_hash=digest)
+        ok, message = await agent._refresh_constitution_host_grants(repair_node)
+        assert not ok and "no verified Genesis adoption ancestry" in message
+        assert not gate._constitution_allows("filesystem_read")
+        await storage.add_node(node)
+        ok, message = await agent._refresh_constitution_host_grants(node)
+        assert ok, message
         baseline_view = (await tool.execute(article="amendment", search="IX"))["data"]
         assert baseline_view["effective_grants"] == ["filesystem_read"]
         assert baseline_view["signer"] is None
@@ -438,7 +474,7 @@ async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
             signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
             grant_baseline=conflicting_record, publisher_release=publisher,
         )
-        conflict_node, conflict_hash = await store_artifact(conflicting_artifact)
+        conflict_node, conflict_hash = await store_artifact(conflicting_artifact, old_hash=digest)
         conflict_node.properties["constitution_reanchor_history"] = [{
             "receipt": node.properties[CONSTITUTION_REANCHOR_KEY],
             "superseded_by_constitution_hash": digest,
@@ -526,24 +562,42 @@ async def test_only_independently_pinned_admitted_grant_artifacts_survive_root_r
     old = did_document_from_legacy_public_key("did:test:old-root", old_key.public_key())
     new = did_document_from_legacy_public_key("did:test:new-root", new_key.public_key())
     unrelated = did_document_from_legacy_public_key("did:test:new-root", unrelated_key.public_key())
+    from datetime import datetime, timezone
     from importlib.resources import files
     from kestrel_sovereign.constitution.publisher import verify_packaged_publisher
 
-    target = "did:test:host-grant-history"
-    source = files("kestrel_sovereign").joinpath("data", "constitutions", "v2", "KESTREL_CONSTITUTION.md")
-    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    from kestrel_sovereign.constitution.transition import (
+        TRANSITION_PURPOSE, build_transition, publisher_source_url,
+    )
+    from kestrel_sovereign.inception_service import public_key_to_ethereum_address
+
+    genesis_key = ec.generate_private_key(ec.SECP256K1())
+    target = "did:pkh:eip155:1:" + public_key_to_ethereum_address(genesis_key.public_key())
+    data = files("kestrel_sovereign").joinpath("data")
+    prior_bytes = data.joinpath("KESTREL_CONSTITUTION.md").read_bytes()
+    prior_digest = hashlib.sha256(prior_bytes).hexdigest()
+    source = data.joinpath("constitutions", "v2", "KESTREL_CONSTITUTION.md").read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
     publisher = verify_packaged_publisher(digest)
     baseline = build_grant_baseline(target, resolve_legacy_grants(SimpleNamespace(
         granted_capabilities={"filesystem_read"},
     )))
 
-    def artifact(signer, key, *, reason="preserve decision"):
+    first_adoption = build_transition({
+        "purpose": TRANSITION_PURPOSE, "target_did": target, "sovereign_did": old["id"],
+        "prior_sha256": prior_digest, "constitution_sha256": digest, "source_sha256": digest,
+        "publisher_commit": publisher["publisher_commit"],
+        "publisher_source_url": publisher_source_url(publisher["publisher_commit"]),
+        "admission_at": datetime.now(timezone.utc).isoformat(),
+    }, genesis_private_key=genesis_key)
+
+    def artifact(signer, key, *, reason="preserve decision", transition=None):
         return build_legacy_signed_reanchor_artifact(
             signer_did=signer["id"], constitution_sha256=digest, private_key=key,
-            grant_baseline=baseline, reason=reason, publisher_release=publisher,
+            grant_baseline=baseline, reason=reason, publisher_release=publisher, transition=transition,
         )
 
-    historic = artifact(old, old_key)
+    historic = artifact(old, old_key, transition=first_adoption)
     latest = artifact(new, new_key)
     assert not verify_reanchor_artifact(
         historic, trusted_did_document=new, expected_constitution_sha256=digest,
@@ -552,11 +606,18 @@ async def test_only_independently_pinned_admitted_grant_artifacts_survive_root_r
     env = {HISTORY_PIN_ENV: str(pin_path)}
 
     async with AsyncStorage(str(tmp_path / "history.db"), agent_id=target) as storage:
-        async def receipt(value):
-            artifact_hash = await storage.store_file(json.dumps(value).encode(), "artifact.json")
-            return {"source_content_sha256": digest, "new_hash": digest, "signed_artifact_hash": artifact_hash}
+        await storage.store_file(prior_bytes, "prior-governing.md")
+        await storage.store_file(source, "governing.md")
 
-        prior = await receipt(historic)
+        async def receipt(value, *, previous=digest):
+            artifact_hash = await storage.store_file(json.dumps(value).encode(), "artifact.json")
+            return {
+                "source_content_sha256": digest, "old_hash": previous, "new_hash": digest,
+                "signed_artifact_hash": artifact_hash, "signed_artifact_signer": value["signer"],
+                "timestamp": value["created_at"],
+            }
+
+        prior = await receipt(historic, previous=prior_digest)
         current = await receipt(latest)
         properties = {
             "constitution_hash": digest,

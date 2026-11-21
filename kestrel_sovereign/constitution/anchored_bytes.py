@@ -247,7 +247,7 @@ async def check_retained_emancipation_promises(
         AmbiguousAmendmentVIII, matches_recorded_emancipation_contract, unwitnessed_emancipation_downgrade,
     )
     from kestrel_sovereign.constitution.structure import ConstitutionVersionError, constitution_version
-    from kestrel_sovereign.constitution.v1_prior import known_published_v1, witnessed_v1_render
+    from kestrel_sovereign.constitution.v1_prior import recover_missing_v1_history
 
     if current_hash == new_hash:
         return
@@ -259,9 +259,9 @@ async def check_retained_emancipation_promises(
     )
     for digest in sorted(set(hashes).difference({current_hash, new_hash})):
         text, present = await read_anchored_constitution(db, digest)
-        if requires_exact_history and text is None and not present and not known_published_v1(digest):
-            recovered = witnessed_v1_render(preserved_contract) if preserved_contract is not None else None
-            if recovered is None or hashlib.sha256(recovered.encode("utf-8")).hexdigest() != digest:
+        if requires_exact_history and text is None and not present:
+            recovered = recover_missing_v1_history(digest, new_text, preserved_contract)
+            if recovered is None:
                 raise AmendmentArtifactError(
                     f"Retained governing constitution {digest} is unavailable. Restore its exact "
                     "bytes or independently authenticated emancipation terms before changing the governing digest."

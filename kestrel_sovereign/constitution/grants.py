@@ -1,5 +1,6 @@
 """Resolve the Amendment IX inputs shared by ComputerUse and Constitution lookup."""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ from kestrel_sovereign.constitution.hierarchy import (
 )
 
 from .amendment_artifact import AmendmentArtifactError, verify_reanchor_artifact
-from .genesis_audit import GenesisAuditError, reconcile_genesis_receipt
+from .genesis_audit import GenesisAuditError, _validated_genesis_history, reconcile_genesis_receipt
 from .reanchor_receipt import (
     CONSTITUTION_REANCHOR_HISTORY_KEY,
     CONSTITUTION_REANCHOR_KEY,
@@ -306,6 +307,7 @@ def validate_grant_cutover(
     storage_path: str | os.PathLike | None = None,
     live_workspace_policy: Callable[[], dict] | None = None,
     stopped: bool = False,
+    hosted_computer_use_config_path: Path | None = None,
 ) -> GrantResolution | None:
     """Compare the complete observed and proposed decisions before a write.
 
@@ -334,9 +336,9 @@ def validate_grant_cutover(
     preserving_files = not prior_v2 and bool({"filesystem_read", "filesystem_write"} & proposed.grants)
     needs_scope = preserving_files and "filesystem_outside_workspace" not in proposed.grants
     observation = artifact.get("offline_grant_observation")
-    policy_supplied = not prior_v2 and stopped and isinstance(observation, dict) and "workspace_policy" in observation
+    policy_supplied = not prior_v2 and isinstance(observation, dict) and "workspace_policy" in observation
     if policy_supplied or (preserving_files and (live_workspace_policy is not None or needs_scope or proof_present)):
-        disk_policy = configured_workspace_policy(storage_path)
+        disk_policy = configured_workspace_policy(storage_path, hosted_config_path=hosted_computer_use_config_path)
         if live_workspace_policy is not None and live_workspace_policy() != disk_policy:
             raise AmendmentArtifactError("Running ComputerUse policy differs from the disk-selected policy")
         if policy_supplied:
@@ -464,71 +466,102 @@ async def load_anchored_grant_baseline(
     trusted_did_document: Mapping[str, Any],
     unknown_prior_edition: bool = False,
     recovered_hash: str | None = None,
+    recovered_governing_text: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> GrantResolution | None:
     """Verify the baseline, or identify an older signed artifact by its contents."""
     from .anchored_bytes import read_anchored_constitution
-    from .v1_prior import known_published_v1
+    from .emancipation import EmancipationConfigError, contract_from_json
+    from .publisher import verify_recorded_publisher
+    from .v1_prior import recover_missing_v1_history
 
     current_hash = recovered_hash if recovered_hash is not None else properties.get("constitution_hash")
     if not is_constitution_hash(current_hash):
         raise AmendmentArtifactError("Current constitution has no valid anchor digest")
-    if (
-        not unknown_prior_edition
-        and CONSTITUTION_REANCHOR_KEY not in properties
-        and CONSTITUTION_REANCHOR_HISTORY_KEY not in properties
-        and "genesis_audit_history" not in properties
-    ):
+    try:
+        history = validate_constitution_reanchor_evidence(properties)
+        genesis_history = _validated_genesis_history(properties)
+        contract = contract_from_json(properties.get("emancipation_contract"))
+    except (ValueError, GenesisAuditError, EmancipationConfigError) as exc:
+        raise AmendmentArtifactError("Cannot establish host grant baseline history") from exc
+
+    verified_anchors = set()
+    receipt = properties.get(CONSTITUTION_REANCHOR_KEY)
+    current_genesis = properties.get("genesis_audit")
+    original_genesis = genesis_history[0]["receipt"] if genesis_history else current_genesis
+    # Only the original native inception receipt can establish v2 birth.
+    # A later audit of adopted bytes cannot stand in for the declaration.
+    standalone_genesis = receipt is None and not history and not genesis_history and not unknown_prior_edition
+    if isinstance(original_genesis, Mapping) and ("publisher" in original_genesis or standalone_genesis):
+        digest = original_genesis.get("constitution_hash")
+        if not is_constitution_hash(digest):
+            raise AmendmentArtifactError("Malformed publisher-backed Genesis receipt")
         try:
-            genesis = reconcile_genesis_receipt(properties, current_hash)
+            genesis = reconcile_genesis_receipt({"genesis_audit": original_genesis}, digest)
         except GenesisAuditError as exc:
             raise AmendmentArtifactError("Genesis host grant ancestry could not be established") from exc
-        if genesis is not None:
-            from .publisher import verify_recorded_publisher
+        if genesis is None:
+            raise AmendmentArtifactError("Publisher-backed Genesis receipt is unavailable")
+        verify_recorded_publisher(genesis.get("publisher"), digest)
+        verified_anchors.add(digest)
 
-            # V2 inception is necessarily dormant and its stored governing
-            # digest is the exact digest of the unrendered publisher source.
-            verify_recorded_publisher(genesis.get("publisher"), current_hash)
-            return GrantResolution(
-                frozenset(), "edition 2 default deny at genesis",
-                "genesis receipt bound to governing bytes", "not operative", current_hash,
-                verified_governing_anchor=(target_did, current_hash),
-            )
-    receipt = properties.get(CONSTITUTION_REANCHOR_KEY)
+    if standalone_genesis and current_hash in verified_anchors:
+        return GrantResolution(
+            frozenset(), "edition 2 default deny at genesis",
+            "genesis receipt bound to governing bytes", "not operative", current_hash,
+            verified_governing_anchor=(target_did, current_hash),
+        )
     if not isinstance(receipt, Mapping) or receipt.get("new_hash") != current_hash:
         raise AmendmentArtifactError("Current constitution has no matching reanchor receipt")
+
+    current_text, current_present = await read_anchored_constitution(db, current_hash)
+    if (
+        not current_present and recovered_governing_text is not None
+        and hashlib.sha256(recovered_governing_text.encode("utf-8")).hexdigest() == current_hash
+    ):
+        current_text = recovered_governing_text
+    if unknown_prior_edition and current_text is None:
+        # An unmarked, genuinely legacy artifact can still identify the old
+        # repair lane. It never supplies an edition-two grant baseline.
+        return await _read_signed_baseline(
+            db, target_did=target_did, constitution_hash=current_hash,
+            receipt=receipt, trusted_did_document=trusted_did_document,
+            allow_legacy=True, environ=environ, governing_text=None,
+            contract=contract, verified_anchors=verified_anchors,
+        )
+
+    prior_baselines = []
+    for entry in history:
+        previous_receipt = entry["receipt"]
+        previous_hash = previous_receipt["new_hash"]
+        previous_text = current_text if previous_hash == current_hash else None
+        if previous_hash != current_hash:
+            previous_text, previous_present = await read_anchored_constitution(db, previous_hash)
+            if not previous_present:
+                previous_text = recover_missing_v1_history(previous_hash, current_text, contract)
+        if previous_text is not None and constitution_version(previous_text) == 1:
+            continue
+        previous = await _read_signed_baseline(
+            db, target_did=target_did, constitution_hash=previous_hash,
+            receipt=previous_receipt, trusted_did_document=trusted_did_document,
+            allow_legacy=False, environ=environ, governing_text=previous_text,
+            contract=contract, verified_anchors=verified_anchors,
+        )
+        prior_baselines.append(previous)
+        verified_anchors.add(previous_hash)
+
     current = await _read_signed_baseline(
         db, target_did=target_did, constitution_hash=current_hash,
         receipt=receipt, trusted_did_document=trusted_did_document,
-        allow_legacy=unknown_prior_edition, environ=environ,
+        allow_legacy=unknown_prior_edition, environ=environ, governing_text=current_text,
+        contract=contract, verified_anchors=verified_anchors,
     )
     if current is None:
         return None
 
-    try:
-        history = validate_constitution_reanchor_evidence(properties)
-    except ValueError as exc:
-        raise AmendmentArtifactError("Cannot establish host grant baseline history") from exc
-
     conflicts = set()
     workspace_conflict = False
-    for entry in history:
-        previous_receipt = entry["receipt"]
-        previous_hash = previous_receipt["new_hash"]
-        if previous_hash != current_hash:
-            previous_text, previous_present = await read_anchored_constitution(db, previous_hash)
-            # Admission recognizes an exact public v1 digest when the archive
-            # blob is absent. Its native receipt predates signed v2 grant
-            # baselines. A present but unreadable blob is still ambiguous.
-            if not previous_present and known_published_v1(previous_hash):
-                continue
-            if previous_text is not None and constitution_version(previous_text) == 1:
-                continue
-        previous = await _read_signed_baseline(
-            db, target_did=target_did, constitution_hash=previous_hash,
-            receipt=previous_receipt, trusted_did_document=trusted_did_document,
-            allow_legacy=False, environ=environ,
-        )
+    for previous in prior_baselines:
         scope, previous_scope = current.workspace_disposition, previous.workspace_disposition
         if (scope is None) != (previous_scope is None) or (
             scope is not None and previous_scope is not None and not scope.same_scope(previous_scope)
@@ -550,6 +583,7 @@ async def _read_signed_baseline(
     db, *, target_did: str, constitution_hash: str,
     receipt: Mapping[str, Any], trusted_did_document: Mapping[str, Any],
     allow_legacy: bool, environ: Mapping[str, str] | None,
+    governing_text: str | None, contract, verified_anchors: set[str],
 ) -> GrantResolution | None:
     from .anchored_bytes import read_anchored_constitution
 
@@ -582,9 +616,12 @@ async def _read_signed_baseline(
         raise AmendmentArtifactError(f"Host grant baseline failed signature verification: {verification.reason}")
     if allow_legacy and BASELINE_FIELD not in artifact:
         return None
-    from .publisher import verify_recorded_publisher
-
-    verify_recorded_publisher(artifact.get("publisher_release"), receipt.get("source_content_sha256"))
+    source_hash = receipt.get("source_content_sha256")
+    await _verify_baseline_ancestry(
+        db, artifact_text=text, artifact=artifact, receipt=receipt, target_did=target_did,
+        constitution_hash=constitution_hash, governing_text=governing_text, contract=contract,
+        source_hash=source_hash, credential=credential, verified_anchors=verified_anchors,
+    )
     baseline = _parse_baseline(target_did, artifact)
     disposition = None
     if WORKSPACE_DISPOSITION_FIELD in artifact:
@@ -600,4 +637,59 @@ async def _read_signed_baseline(
         baseline, baseline_sha256=artifact_hash, baseline_signer=verification.signer,
         verified_governing_anchor=(target_did, constitution_hash),
         workspace_disposition=disposition,
+    )
+
+
+async def _verify_baseline_ancestry(
+    db, *, artifact_text, artifact, receipt, target_did, constitution_hash,
+    governing_text, contract, source_hash, credential, verified_anchors,
+):
+    from .anchored_bytes import read_anchored_constitution
+    from .publisher import verify_recorded_publisher
+    from .transition import verify_archived_transition_adoption, verify_reanchor_receipt_chronology
+    from .v1_prior import known_published_v1, recover_published_v1, verify_supported_v1_prior
+
+    old_hash = receipt.get("old_hash")
+    if not is_constitution_hash(old_hash):
+        raise AmendmentArtifactError("Signed edition 2 receipt lacks a prior governing digest")
+    if governing_text is None or constitution_version(governing_text) != 2:
+        raise AmendmentArtifactError("Canonical edition 2 governing bytes are unavailable")
+    if receipt.get("signed_artifact_signer") != credential.get("id"):
+        raise AmendmentArtifactError("Native reanchor receipt does not identify the verified signer")
+    if old_hash in verified_anchors:
+        verify_recorded_publisher(artifact.get("publisher_release"), source_hash)
+        verify_reanchor_receipt_chronology(artifact, receipt)
+        return
+
+    prior, prior_present = await read_anchored_constitution(db, old_hash)
+    if not prior_present:
+        prior = recover_published_v1(old_hash) or recover_published_v1(old_hash, contract)
+    if prior is None or constitution_version(prior) != 1:
+        raise AmendmentArtifactError("Signed edition 2 receipt has no verified Genesis adoption ancestry")
+    role_bytes = None
+    role_hash = receipt.get("prior_role_artifact_sha256")
+    if role_hash is not None:
+        role, _ = await read_anchored_constitution(db, role_hash)
+        if role is not None:
+            role_bytes = role.encode("utf-8")
+
+    # A dormant v1 predecessor may have activated after adoption. Prefer
+    # independent dormant authority before using the still-anchored active terms.
+    prior_contract = None
+    if not known_published_v1(old_hash):
+        try:
+            verify_supported_v1_prior(
+                old_hash, None, prior_text=prior, prior_role_artifact_bytes=role_bytes,
+                trusted_did_document=credential,
+            )
+        except AmendmentArtifactError:
+            prior_contract = contract
+
+    await asyncio.to_thread(
+        verify_archived_transition_adoption,
+        artifact_bytes=artifact_text.encode("utf-8"), receipt=receipt,
+        trusted_did_document=credential, target_did=target_did,
+        prior_hash=old_hash, prior_text=prior, anchored_contract=prior_contract,
+        new_text=governing_text, new_hash=constitution_hash, source_hash=source_hash,
+        prior_role_artifact_bytes=role_bytes,
     )

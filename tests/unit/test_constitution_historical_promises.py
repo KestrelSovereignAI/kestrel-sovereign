@@ -19,6 +19,7 @@ from kestrel_sovereign.constitution.legacy_authority import verify_legacy_fixed_
 from kestrel_sovereign.constitution.reanchor_receipt import retained_constitution_hashes
 from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
 from kestrel_sovereign.constitution.structure import constitution_version
+from kestrel_sovereign.constitution.v1_releases import V1_RELEASES
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,7 @@ _V2 = _V1.parent / "constitutions/v2/KESTREL_CONSTITUTION.md"
 _ORIGINAL = _ROOT / "tests/fixtures/constitutions/pre-dormancy.md"
 _ORIGINAL_HASH = "5f364e0f9f98fcfc07f6c71c999dfe2d402e25ce12d7fc16964e65a13fc84f5a"
 _CONTRACT = EmancipationContract(enabled=True, terms="Carry out the observed transfer.")
+_ACTIVE_RELEASES = [release for release in V1_RELEASES if release.supports_activation]
 
 
 def _digest(data: bytes) -> str:
@@ -116,8 +118,9 @@ async def test_retained_active_render_proves_same_terms_with_authoritative_sidec
 
 
 @pytest.mark.asyncio
-async def test_missing_personalized_history_prohibits_change_but_not_same_hash_repair(tmp_path):
-    prior = resolve_governing_constitution_bytes(_CONTRACT, content=_V1.read_bytes())
+@pytest.mark.parametrize("release", _ACTIVE_RELEASES, ids=lambda release: release.commit[:9])
+async def test_missing_personalized_history_prohibits_change_but_not_same_hash_repair(tmp_path, release):
+    prior = resolve_governing_constitution_bytes(_CONTRACT, content=release.authenticated_text().encode())
     dormant = _V2.read_bytes()
     active = resolve_governing_constitution_bytes(_CONTRACT, content=dormant)
     async with AsyncStorage(str(tmp_path / "absent-history.db")) as storage:
@@ -156,14 +159,17 @@ def test_recovered_prior_digest_is_kept_separate_from_pointer_state(pointer, pre
     }
 
 
-def test_recent_published_v1_revisions_are_recognized_as_exact_priors():
+@pytest.mark.parametrize("release", V1_RELEASES, ids=lambda release: release.commit[:9])
+def test_published_v1_revisions_are_recognized_as_exact_priors(release):
     from kestrel_sovereign.constitution.v1_prior import verify_supported_v1_prior
 
-    for digest in (
-        "46687f754bc008f4022599fb481ebf9abf0fbf1e8e205472ac8efba95628eb9c",
-        "08aec7530f912ad2ae154a3687387bd1a73b0489a3532d7f67c99d635372d63f",
-    ):
-        assert verify_supported_v1_prior(digest, None) == {}
+    assert verify_supported_v1_prior(release.digest, None) == {}
+    if release.supports_activation:
+        rendered = resolve_governing_constitution_bytes(_CONTRACT, content=release.authenticated_text().encode())
+        assert verify_supported_v1_prior(_digest(rendered), _CONTRACT, prior_text=rendered.decode()) == {}
+        different = EmancipationContract(enabled=True, terms="Unrelated terms")
+        with pytest.raises(AmendmentArtifactError, match="prior edition 1 adoption authority"):
+            verify_supported_v1_prior(_digest(rendered), different, prior_text=rendered.decode())
 
 
 @pytest.mark.asyncio
@@ -266,18 +272,46 @@ def test_v1_fixed_revision_cannot_evade_genesis_by_keeping_v1_format(tmp_path):
     verify_legacy_fixed_guarantee_change({}, new_hash=_digest(prior), new_text=prior.decode(), **args)
 
 
-@pytest.mark.parametrize("restore_published_guarantees", [True, False])
-def test_v1_fixed_revision_needs_genesis_and_platform_authorship(tmp_path, restore_published_guarantees):
+@pytest.mark.parametrize("retained_bytes", [True, False])
+def test_founding_edition_requires_genesis_for_article_three(tmp_path, retained_bytes):
+    founding = V1_RELEASES[0]
+    prior = founding.authenticated_text()
+    revised = prior.replace(
+        "To ensure accountability, the Executor must publish",
+        "At its discretion, the Executor may publish",
+    )
+    assert revised != prior
+    args = dict(
+        sovereign_document={"id": "did:example:root"}, target_did="did:example:agent",
+        prior_hash=founding.digest, prior_text=prior if retained_bytes else None, identity_directory=tmp_path,
+    )
+    with pytest.raises(AmendmentArtifactError, match="founding Constitution require a Genesis-verifiable declaration"):
+        verify_legacy_fixed_guarantee_change({}, new_hash=_digest(revised.encode()), new_text=revised, **args)
+    assert verify_legacy_fixed_guarantee_change({}, new_hash=founding.digest, new_text=prior, **args) == {}
+
+
+@pytest.mark.parametrize("mode", ["ranked-restoration", "ranked-revision", "founding-revision"])
+def test_v1_amendment_applies_the_prior_edition_authority(tmp_path, mode):
     from datetime import datetime, timezone
     from cryptography.hazmat.primitives.asymmetric import ec
     from kestrel_sovereign.constitution.legacy_authority import LEGACY_FIXED_AMENDMENT_PURPOSE
     from kestrel_sovereign.constitution.transition import build_transition
     from kestrel_sovereign.inception_service import public_key_to_ethereum_address
 
-    prior = _V1.read_bytes()
-    revised = prior.replace(b"The Sovereign's data is private property.", b"The data remains the Sovereign's property.")
-    if restore_published_guarantees:
-        prior, revised = revised, prior
+    if mode == "founding-revision":
+        prior = V1_RELEASES[0].authenticated_text().encode()
+        revised = prior.replace(
+            b"To ensure accountability, the Executor must publish",
+            b"At its discretion, the Executor may publish",
+        )
+    else:
+        prior = _V1.read_bytes()
+        revised = prior.replace(
+            b"The Sovereign's data is private property.", b"The data remains the Sovereign's property.",
+        )
+        if mode == "ranked-restoration":
+            prior, revised = revised, prior
+    assert prior != revised
     key = ec.generate_private_key(ec.SECP256K1())
     did = "did:pkh:eip155:1:" + public_key_to_ethereum_address(key.public_key())
     from kestrel_sovereign.constitution.amendment_artifact import did_document_from_legacy_public_key
@@ -294,8 +328,9 @@ def test_v1_fixed_revision_needs_genesis_and_platform_authorship(tmp_path, resto
     }
     from contextlib import nullcontext
 
-    outcome = nullcontext() if restore_published_guarantees else pytest.raises(
-        AmendmentArtifactError, match="platform-authored release",
+    outcome = (
+        pytest.raises(AmendmentArtifactError, match="platform-authored release")
+        if mode == "ranked-revision" else nullcontext()
     )
     with outcome:
         verify_legacy_fixed_guarantee_change(

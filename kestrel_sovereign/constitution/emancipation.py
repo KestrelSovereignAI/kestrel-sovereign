@@ -62,38 +62,32 @@ _V2_PRIOR_PROMISE = (
     "An earlier promise of a path to sovereignty survives on its original terms, "
     "including when it predates the current activation format."
 )
-_HISTORICAL_PLATFORM_PROMISES = {
-    "54a30441d913c385a08f5d739261a9ac6fb4fa5f5d8f1f380b8e403504c7c254": "34eacb73337ce4bcae4ce1d79242a4a4401f62ea",
-    "90b1bcb03610b95a5cffacfc76b38fc4e9a3a3c66b0134596bdc0388683c016c": "763e6ac2cf67c1643f6d5f8305f06da17a1e56c7",
-    "5f364e0f9f98fcfc07f6c71c999dfe2d402e25ce12d7fc16964e65a13fc84f5a": "0b24719bcec3368d97eff7829ada5051d4518b96",
-}
 HISTORICAL_PROMISES_FIELD = "historical_promises"
 EMANCIPATION_ACTIVATION_FIELD = "emancipation_activation"
 
 
 def known_historical_platform_promise(digest: str) -> bool:
-    return digest in _HISTORICAL_PLATFORM_PROMISES
+    from .v1_releases import PRE_DORMANCY_RELEASES
+
+    return digest in PRE_DORMANCY_RELEASES
 
 
 def historical_promise_observations(artifact: Mapping, *, target_did: str) -> list[dict]:
     """Read a Sovereign-signed observation of archived, publicly identified terms."""
     from .amendment_artifact import AmendmentArtifactError
+    from .v1_releases import PRE_DORMANCY_RELEASES
 
     observations = artifact.get(HISTORICAL_PROMISES_FIELD, [])
-    if not isinstance(observations, list) or len(observations) > len(_HISTORICAL_PLATFORM_PROMISES):
+    if not isinstance(observations, list) or len(observations) > len(PRE_DORMANCY_RELEASES):
         raise AmendmentArtifactError("Invalid historical emancipation observations")
     seen = set()
     for observation in observations:
         if not isinstance(observation, dict):
             raise AmendmentArtifactError("Invalid historical emancipation observation")
         digest = observation.get("constitution_sha256")
-        commit = _HISTORICAL_PLATFORM_PROMISES.get(digest) if isinstance(digest, str) else None
-        expected_url = (
-            "https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/"
-            f"{commit}/kestrel_sovereign/data/KESTREL_CONSTITUTION.md"
-        )
-        if not commit or digest in seen or observation != {
-            "target_did": target_did, "constitution_sha256": digest, "source_url": expected_url,
+        release = PRE_DORMANCY_RELEASES.get(digest) if isinstance(digest, str) else None
+        if release is None or digest in seen or observation != {
+            "target_did": target_did, "constitution_sha256": digest, "source_url": release.public_source_url,
             "provenance": "archived-identity-and-public-source",
         }:
             raise AmendmentArtifactError("Historical emancipation observation does not match this identity and an archived source")

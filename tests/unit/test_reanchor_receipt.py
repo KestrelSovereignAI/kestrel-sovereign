@@ -17,7 +17,11 @@ def test_new_receipt_keeps_valid_pointer_or_genuine_absence(pointer):
 
 def test_new_receipt_keeps_corruption_as_diagnostic_not_a_digest():
     prior = reanchor_prior_pointer_fields("db-writer-replaced-hash", "a" * 64)
-    assert prior == {"old_hash": "a" * 64, "repaired_constitution_pointer": "db-writer-replaced-hash"}
+    assert prior == {
+        "old_hash": "a" * 64,
+        "repaired_constitution_pointer": "db-writer-replaced-hash",
+        "repaired_constitution_pointer_state": "malformed",
+    }
     # A diagnostic annotation is never permission to accept a malformed
     # previously committed receipt as historical governing evidence.
     properties = {"constitution_reanchor": {"old_hash": "bad", "new_hash": "a" * 64, "repaired_constitution_pointer": "bad"}}

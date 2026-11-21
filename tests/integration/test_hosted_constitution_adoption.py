@@ -23,6 +23,10 @@ from kestrel_sovereign.constitution.transition import (
     build_transition,
     publisher_source_url,
 )
+from kestrel_sovereign.constitution.workspace_disposition import (
+    build_legacy_signed_workspace_disposition,
+    configured_workspace_policy,
+)
 from kestrel_sovereign.identity.signing import get_key_id
 from kestrel_sovereign.inception_service import create_kestrel_identity_async, public_key_to_ethereum_address
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
@@ -82,14 +86,26 @@ async def test_directoryless_hosted_postgres_adoption(db_backend, tmp_path):
         "publisher_source_url": publisher_source_url(publisher["publisher_commit"]),
         "admission_at": timestamp,
     }
+    hosted_config = tmp_path / "tenant-kestrel.toml"
+    hosted_config.write_text(
+        "[features.computer_use]\nenabled = true\nbackend = 'none'\n"
+        "allowed_paths = ['*.md']\nauto_approve_read = false\n"
+    )
+    policy = configured_workspace_policy(None, hosted_config_path=hosted_config)
+    baseline = build_grant_baseline(target, resolution)
+    scope = build_legacy_signed_workspace_disposition(
+        signer_did=signer, private_key=sovereign.private_key, target_did=target,
+        prior_sha256=prior, constitution_sha256=digest, grant_baseline=baseline,
+        path_policy=policy["path_policy"],
+    )
     artifact = tmp_path / "adoption.json"
     artifact.write_text(json.dumps(build_legacy_signed_reanchor_artifact(
         signer_did=signer, constitution_sha256=digest, private_key=sovereign.private_key,
         transition=build_transition(intent, genesis_private_key=private_key),
-        grant_baseline=build_grant_baseline(target, resolution), publisher_release=publisher,
+        grant_baseline=baseline, publisher_release=publisher, workspace_disposition=scope,
         offline_grant_observation=build_offline_grant_observation(
             target_did=target, prior_sha256=prior, observed_at=timestamp,
-            resolution=resolution, workspace_policy={"enabled": False},
+            resolution=resolution, workspace_policy=policy,
         ),
     )))
     # This synthetic inception staging is no longer available to the writer.
@@ -108,7 +124,17 @@ async def test_directoryless_hosted_postgres_adoption(db_backend, tmp_path):
         assert before["constitution_hash"] == prior
         assert "constitution_reanchor" not in before
 
-    accepted = await reanchor_constitution(**args, hosted_identity_evidence_path=custody)
+    hosted_args = {**args, "hosted_identity_evidence_path": custody}
+    refused = await reanchor_constitution(**hosted_args)
+    assert not refused.reanchored and "operator-selected ComputerUse configuration" in refused.error
+    refused = await reanchor_constitution(**hosted_args, hosted_computer_use_config_path=artifact)
+    assert not refused.reanchored and "Invalid operator-selected hosted ComputerUse configuration" in refused.error
+    original_config = hosted_config.read_text()
+    hosted_config.write_text(original_config.replace("enabled = true", "enabled = false"))
+    refused = await reanchor_constitution(**hosted_args, hosted_computer_use_config_path=hosted_config)
+    assert not refused.reanchored and "differs from the disk-selected policy" in refused.error
+    hosted_config.write_text(original_config)
+    accepted = await reanchor_constitution(**hosted_args, hosted_computer_use_config_path=hosted_config)
     assert accepted.reanchored, accepted.error
     assert accepted.new_hash == digest
     assert accepted.backup_path is None
