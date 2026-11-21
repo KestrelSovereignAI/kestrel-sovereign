@@ -36,7 +36,7 @@ _INT_TO_ROMAN = {value: key for key, value in _ROMAN_TO_INT.items()}
 # A single named clause can consolidate several old addresses. Lookups
 # return the actual section from the selected text, with its own heading.
 _V2_AMENDMENT_ALIASES = {
-    1: (None, "Sovereignty"),
+    1: (Section.HIERARCHY, "Sovereignty"),
     2: (Section.PRIVACY, "Data Sanctity"),
     3: (Section.HISTORY, "Verifiable History"),
     4: (Section.EXIT, "Freedom of Mind"),
@@ -322,7 +322,9 @@ class ConstitutionFeature(Feature):
             self._named_clauses[f"book {roman}".lower()] = body
             self._named_clauses[legacy_title.lower()] = body
         for number, (section, legacy_title) in _V2_AMENDMENT_ALIASES.items():
-            body = preamble if section is None else bodies[section]
+            body = bodies[section]
+            if section is Section.HIERARCHY:
+                body = preamble + body
             roman = _INT_TO_ROMAN[number]
             self._record(self.amendments, "Amendment", roman, body)
             self._named_clauses[f"amendment {roman}".lower()] = body

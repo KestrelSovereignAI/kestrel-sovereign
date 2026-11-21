@@ -95,5 +95,9 @@ async def test_legacy_aliases_reach_the_operative_terms(path):
     sovereignty = await tool.execute(article="amendment", search="I")
     third_law = await tool.execute(article="amendment", search="VI")
     assert "root private keys" in sovereignty["confirmation"]
+    if path == _V2:
+        assert "A parent can delegate only powers it holds." in sovereignty["confirmation"]
+        search = await tool.execute(article="search", search="A parent can delegate only powers it holds")
+        assert search["success"]
     for duty in ("Constitutional audits", "red-team reviews", "adversarial test"):
         assert duty in third_law["confirmation"]

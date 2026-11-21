@@ -250,14 +250,16 @@ def resolve_governing_constitution_bytes(
                 f"{source.content_sha256[:16]}…: the {source.kind} source "
                 f"changed after the descriptor was signed."
             )
-    text = content.decode("utf-8", errors="surrogateescape")
+    active = contract is not None and contract.enabled
+    errors = "strict" if active or content.startswith(b"---") else "surrogateescape"
+    text = content.decode("utf-8", errors=errors)
     edition = constitution_version(text)
-    if contract is not None and contract.enabled:
-        text = apply_emancipation(content.decode("utf-8"), contract)
+    if active:
+        text = apply_emancipation(text, contract)
         content = text.encode("utf-8")
     # Validate the exact v2 document whose bytes can be signed or audited.
     if edition == 2:
         if constitution_version(text) != edition:
             raise ConstitutionVersionError("Rendering changed the Constitution edition")
-        v2_sections(content.decode("utf-8"))
+        v2_sections(text)
     return content
