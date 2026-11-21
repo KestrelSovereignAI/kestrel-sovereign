@@ -1,0 +1,50 @@
+name: Attest a constitutional release
+
+on:
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: Packaged constitutional edition (for example v2)
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  attest:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Package the exact edition selected by the publisher
+        env:
+          EDITION: ${{ inputs.edition }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EDITION" =~ ^v[1-9][0-9]*$ ]]
+          dir="kestrel_sovereign/data/constitutions/$EDITION"
+          test -f "$dir/KESTREL_CONSTITUTION.md"
+          test -f "$dir/PLEDGE.md"
+          mkdir -p "$RUNNER_TEMP/constitution"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/constitution/constitution-$EDITION.tar.gz" \
+            "$GITHUB_SHA" "$dir/KESTREL_CONSTITUTION.md" "$dir/PLEDGE.md"
+          tar -tzf "$RUNNER_TEMP/constitution/constitution-$EDITION.tar.gz"
+
+      - name: Attest the release archive from this revision of main
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ runner.temp }}/constitution/*.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: attested-constitution
+          path: ${{ runner.temp }}/constitution/*.tar.gz
+          if-no-files-found: error
