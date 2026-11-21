@@ -100,7 +100,7 @@ Copy that directory to any machine running Kestrel with the same `KESTREL_DATA_K
 
 The Kestrel Constitution is a text document that defines what the agent can and cannot do — its values, constraints, and operating principles. It is loaded at inception, anchored in memory with a cryptographic hash, and verified automatically at runtime.
 
-The default constitution lives at `docs/principles/KESTREL_CONSTITUTION.md`. You can replace it with your own at inception time.
+Read the [published second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md). An existing agent’s governing hash identifies the edition it adopted. The packaged default in this release is the [first edition](../kestrel_sovereign/data/KESTREL_CONSTITUTION.md).
 
 ### Genesis anchoring
 
@@ -136,14 +136,14 @@ Safe mode is intentionally conservative: a tampered constitution cannot silently
 
 ### Writing a custom constitution
 
-A constitution is a plain text file. To use a custom one, pass its path at `kestrel create` time (see the CLI reference). Guidelines:
+A constitution is a plain text file. To select a custom governing source at inception, use a [Sovereign-signed source descriptor](architecture/security/SOVEREIGN_TRUST_ROOT.md).
 
 - Define explicit **values** the agent should embody
 - Define explicit **prohibitions** — things the agent must never do regardless of instruction
 - Define **escalation rules** — what to do when a user request conflicts with a prohibition
 - Keep it concise enough to include in every LLM context window
 
-The default constitution is a good starting point. Read it at `docs/principles/KESTREL_CONSTITUTION.md`.
+The published Constitution separates the duties of agents, Sovereigns, builders, and hosts.
 
 ### What this protects against
 
@@ -252,7 +252,7 @@ This is not a complete security audit. See [docs/architecture/security/CRYPTOGRA
 | Document | What it covers |
 |----------|---------------|
 | [QUICKSTART.md](../QUICKSTART.md) | Get a sovereign agent running in 30 minutes |
-| [docs/principles/KESTREL_CONSTITUTION.md](principles/KESTREL_CONSTITUTION.md) | The default constitutional framework |
+| [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) | Published constitutional framework |
 | [docs/architecture/security/PRIVACY_MODES.md](architecture/security/PRIVACY_MODES.md) | Privacy mode internals and policy enforcement |
 | [docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md](architecture/security/CRYPTOGRAPHIC_ANCHORING.md) | DID generation, key management, genesis audit |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | How to contribute |

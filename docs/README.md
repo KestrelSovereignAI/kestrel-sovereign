@@ -39,7 +39,9 @@ This directory holds detailed documentation for kestrel-sovereign. The top-level
 
 ## Principles & governance
 
-- **[`principles/KESTREL_CONSTITUTION.md`](principles/KESTREL_CONSTITUTION.md)** — the canonical constitutional document
+- [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md)
+- [Optional Agent Pledge](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/PLEDGE.md)
+- [First-edition Constitution](principles/KESTREL_CONSTITUTION.md)
 - **[`principles/CONTEXT.md`](principles/CONTEXT.md)** — context for the constitutional design
 - **[`principles/US_CONSTITUTION.md`](principles/US_CONSTITUTION.md)** — vendored reference document
 

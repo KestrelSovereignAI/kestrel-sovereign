@@ -182,6 +182,6 @@ not current implementation contracts.
   and [`feature_registry.toml`](../../kestrel_sovereign/data/feature_registry.toml)
 - **Full repository and package map:** [`/docs/audit/REPO_MAP.md`](../audit/REPO_MAP.md)
   and [`/docs/ECOSYSTEM.md`](../ECOSYSTEM.md)
-- **Constitution:** [`/docs/principles/KESTREL_CONSTITUTION.md`](../principles/KESTREL_CONSTITUTION.md)
+- [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md)
 - **Cloud Run operations:** [`/docs/deployment/README.md`](../deployment/README.md)
 - **Generated OKF inventory:** [`index.md`](index.md) and [`log.md`](log.md)
