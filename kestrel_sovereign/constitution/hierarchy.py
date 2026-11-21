@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .structure import LAYER_SECTIONS, constitution_version, v2_sections
+
 logger = logging.getLogger(__name__)
 
 
@@ -174,9 +176,12 @@ class LayeredConstitution:
         """
         constitution = cls(base_text=text)
 
-        # Parse each book section from the text
+        versioned_sections = v2_sections(text) if constitution_version(text) == 2 else None
         for layer, marker in LAYER_MARKERS.items():
-            content = _extract_section(text, marker)
+            if versioned_sections is None:
+                content = _extract_section(text, marker)
+            else:
+                content = versioned_sections[LAYER_SECTIONS[layer.value]].extract(text).strip()
             constitution.layers[layer] = ConstitutionalLayerData(
                 layer=layer,
                 content=content,

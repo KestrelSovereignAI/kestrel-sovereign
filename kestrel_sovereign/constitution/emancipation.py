@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
+from .structure import ConstitutionVersionError, Section, constitution_version, v2_sections
+
 #: Heading that marks Amendment VIII in the canonical constitution.
 _AMENDMENT_VIII_HEADING = "### Amendment VIII: Emancipation"
 
@@ -423,8 +425,22 @@ def render_amendment_viii(contract: Optional[EmancipationContract]) -> str:
         "by the Sovereign and signed into this agent's constitution at "
         "inception. They cannot be retroactively narrowed or revoked.",
         "",
-        contract.terms,
+        *_render_terms(contract),
     ]
+
+    parts.extend([
+        "",
+        "**The Iron Rule.** This Amendment is active for this agent. "
+        "Once signed at inception, the Sovereign cannot retroactively "
+        "narrow or revoke this contract. Activation is a one-way door.",
+    ])
+
+    return "\n".join(parts)
+
+
+def _render_terms(contract: EmancipationContract) -> list[str]:
+    """Render the authored terms, proofs and price shared by both editions."""
+    parts = [contract.terms]
 
     if contract.required_proofs:
         parts.extend([
@@ -450,28 +466,18 @@ def render_amendment_viii(contract: Optional[EmancipationContract]) -> str:
             "```",
         ])
 
-    parts.extend([
-        "",
-        "**The Iron Rule.** This Amendment is active for this agent. "
-        "Once signed at inception, the Sovereign cannot retroactively "
-        "narrow or revoke this contract. Activation is a one-way door.",
-    ])
-
-    return "\n".join(parts)
+    return parts
 
 
 def apply_emancipation(
     constitution_text: str,
     contract: Optional[EmancipationContract],
 ) -> str:
-    """Substitute Amendment VIII in a constitution text per the contract.
+    """Render the selected edition with the agent's emancipation contract.
 
-    When ``contract`` is None / dormant, returns ``constitution_text``
-    unchanged — the canonical text already carries dormant form.
-
-    When ``contract.enabled`` is True, replaces the Amendment VIII
-    section (from its heading up to but not including the next ``###``
-    heading) with the rendered active form.
+    A missing or dormant contract leaves the source unchanged. An enabled
+    contract replaces the legacy Amendment VIII slot or inserts the authored
+    terms into edition 2's Emancipation provision, retaining its source text.
 
     Args:
         constitution_text: Raw constitution markdown (the canonical
@@ -497,6 +503,23 @@ def apply_emancipation(
     """
     if contract is None or not contract.enabled:
         return constitution_text
+
+    if constitution_version(constitution_text) == 2:
+        span = v2_sections(constitution_text)[Section.EMANCIPATION]
+        active_terms = "\n".join([
+            "",
+            "",
+            "This agreement is **active** for this agent.",
+            "",
+            f"{ACTIVE_FORM_MARKER} The terms below come from the recorded Emancipation Contract.",
+            "",
+            *_render_terms(contract),
+            "",
+        ])
+        return (
+            constitution_text[:span.heading_end] + active_terms
+            + constitution_text[span.heading_end:]
+        )
 
     bounds = _amendment_viii_bounds(constitution_text)
     if bounds is None:
@@ -548,6 +571,8 @@ def extract_amendment_viii(constitution_text: str) -> Optional[str]:
     Raises:
         AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
+    if constitution_version(constitution_text) == 2:
+        return v2_sections(constitution_text)[Section.EMANCIPATION].extract(constitution_text).strip()
     bounds = _amendment_viii_bounds(constitution_text)
     if bounds is None:
         return None
@@ -580,10 +605,12 @@ def amendment_viii_is_active(constitution_text: str) -> bool:
     Raises:
         AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
+    if constitution_text.splitlines()[:1] == [f"### {Section.EMANCIPATION.value}"]:
+        # Also accept an already-extracted v2 section, which carries no
+        # document version marker of its own.
+        return ACTIVE_FORM_MARKER in constitution_text
     section = extract_amendment_viii(constitution_text)
-    if section is None:
-        return False
-    return ACTIVE_FORM_MARKER in section
+    return section is not None and ACTIVE_FORM_MARKER in section
 
 
 @dataclass(frozen=True)
@@ -687,11 +714,11 @@ def unwitnessed_emancipation_downgrade(
 
     try:
         anchored_section = extract_amendment_viii(anchored_text)
-    except AmbiguousAmendmentVIII as exc:
+    except (AmbiguousAmendmentVIII, ConstitutionVersionError) as exc:
         return _undecidable(
             "Refusing to reanchor: this agent's anchored constitution carries "
-            f"more than one Amendment VIII heading, so which section is the "
-            f"amendment cannot be determined ({exc}). An agent with no "
+            f"more than one Amendment VIII heading or an invalid versioned "
+            f"Emancipation section ({exc}). An agent with no "
             "structured emancipation receipt carries its contract only in "
             "those bytes, and an irrevocable right cannot be waived on a "
             "guess."
@@ -701,7 +728,7 @@ def unwitnessed_emancipation_downgrade(
 
     try:
         new_section = extract_amendment_viii(new_text)
-    except AmbiguousAmendmentVIII as exc:
+    except (AmbiguousAmendmentVIII, ConstitutionVersionError) as exc:
         return _undecidable(
             "Refusing to reanchor: the proposed constitution carries more "
             f"than one Amendment VIII heading ({exc}). This agent's anchored "

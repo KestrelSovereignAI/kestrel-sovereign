@@ -228,3 +228,16 @@ def test_clean_wheel_install_exposes_marker(built_wheel, tmp_path):
     installed_marker = Path(probe.stdout.strip())
     assert installed_marker.is_file()
     assert REPOSITORY not in installed_marker.resolve().parents
+
+
+def test_wheel_and_sdist_ship_each_constitution_edition(built_distributions):
+    paths = (
+        "kestrel_sovereign/data/KESTREL_CONSTITUTION.md",
+        "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md",
+        "kestrel_sovereign/data/constitutions/v2/PLEDGE.md",
+    )
+    with zipfile.ZipFile(built_distributions["wheel"]) as wheel, tarfile.open(built_distributions["sdist"]) as sdist:
+        members = {member.name.split("/", 1)[1]: member for member in sdist.getmembers() if member.isfile()}
+        for path in paths:
+            expected = (built_distributions["source"] / path).read_bytes()
+            assert wheel.read(path) == sdist.extractfile(members[path]).read() == expected

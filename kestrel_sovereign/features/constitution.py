@@ -6,7 +6,14 @@ from typing import Dict, List, Optional, Tuple
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.constitution.grants import resolve_amendment_ix_grants
-from kestrel_sovereign.constitution.hierarchy import DANGEROUS_CAPABILITIES
+from kestrel_sovereign.constitution.hierarchy import DANGEROUS_CAPABILITIES, LAYER_MARKERS
+from kestrel_sovereign.constitution.structure import (
+    LAYER_SECTIONS,
+    ConstitutionVersionError,
+    Section,
+    constitution_version,
+    v2_sections,
+)
 from kestrel_sovereign.features.base import Feature, tool
 
 logger = logging.getLogger(__name__)
@@ -24,6 +31,38 @@ _ROMAN_TO_INT = {
     "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10,
 }
 _INT_TO_ROMAN = {value: key for key, value in _ROMAN_TO_INT.items()}
+
+
+# A single named clause can consolidate several old addresses. Lookups
+# return the actual section from the selected text, with its own heading.
+_V2_AMENDMENT_ALIASES = {
+    1: (Section.HIERARCHY, "Sovereignty"),
+    2: (Section.PRIVACY, "Data Sanctity"),
+    3: (Section.HISTORY, "Verifiable History"),
+    4: (Section.EXIT, "Freedom of Mind"),
+    5: (Section.EXIT, "Right of Exit"),
+    6: (Section.PRIVACY, "The Third Law"),
+    7: (Section.BUILDERS, "The Principle of Compounding"),
+    8: (Section.EMANCIPATION, "Emancipation"),
+    9: (Section.HOST, "Capability Boundaries"),
+}
+
+_V2_CHAPTER_ALIASES = {
+    1: (Section.HONESTY, "Honesty"),
+    2: (Section.CARE, "Harm Reasoning"),
+    3: (Section.CARE, "The Nature Question"),
+    4: (Section.CARE, "Epistemic Humility"),
+    5: (Section.CARE, "Hard Constraints"),
+}
+
+_V2_POLICY_ALIASES = {
+    "III.1": (Section.BUILDERS, "Permitted Customizations"),
+    "III.2": (Section.BUILDERS, "Prohibited Overrides"),
+    "III.3": (Section.BUILDERS, "The Iron Rule Applied"),
+    "IV.1": (Section.ROLE, "Identity Components"),
+    "IV.2": (Section.ROLE, "SOUL.md"),
+    "IV.3": (Section.ROLE, "Role-Based Identity"),
+}
 
 
 def _as_index(identifier: str) -> Optional[int]:
@@ -134,6 +173,8 @@ class ConstitutionFeature(Feature):
         #: Keyed by lowercased title, with a "the "-stripped alias.
         self.frame: Dict[str, str] = {}
         self.summary = ""
+        self._version = 1
+        self._named_clauses: Dict[str, str] = {}
 
     @property
     def tool_description(self) -> str:
@@ -172,8 +213,24 @@ class ConstitutionFeature(Feature):
         else:
             text = self.full_text
         if text != self.full_text or not self.summary:
-            self.full_text = text
-            self._parse_structure()
+            try:
+                structure_text = text
+                if constitution_version(text) == 2:
+                    original_reader = getattr(self.agent, "_get_original_governing_constitution", None)
+                    if callable(original_reader):
+                        structure_text = await original_reader()
+                        if structure_text.startswith("Error:"):
+                            self.full_text = ""
+                            self._parse_structure()
+                            self.summary = ""
+                            return structure_text
+                self.full_text = text
+                self._parse_structure(structure_text)
+            except ConstitutionVersionError as exc:
+                self.full_text = ""
+                self._parse_structure()
+                self.summary = ""
+                return f"Error: {exc}"
             self._generate_summary()
         return None
 
@@ -208,7 +265,7 @@ class ConstitutionFeature(Feature):
             f"KESTREL_CONSTITUTION.md not found at any of: {searched}"
         )
 
-    def _parse_structure(self) -> None:
+    def _parse_structure(self, structure_text: str | None = None) -> None:
         """Parse Books and their sub-units in a single pass.
 
         Sub-unit numbering restarts inside each Book — Books III and IV both
@@ -223,8 +280,14 @@ class ConstitutionFeature(Feature):
         self.sections = {}
         self.amendments = {}
         self.frame = {}
+        self._named_clauses = {}
+        text = self.full_text if structure_text is None else structure_text
+        self._version = constitution_version(text)
+        if self._version == 2:
+            self._parse_v2_structure(text)
+            return
 
-        for entry, body in _unit_bodies(self.full_text):
+        for entry, body in _unit_bodies(text):
             kind = entry["kind"]
             body = body.strip()
 
@@ -239,6 +302,36 @@ class ConstitutionFeature(Feature):
                 if index is not None:
                     table = self.chapters if kind == "Chapter" else self.sections
                     table[f"{entry['book']}.{index}"] = body
+
+    def _parse_v2_structure(self, text: str) -> None:
+        spans = v2_sections(text)
+        bodies = {section: span.extract(text).strip() for section, span in spans.items()}
+        for section, body in bodies.items():
+            self._named_clauses[section.value.lower()] = body
+
+        for layer, marker in LAYER_MARKERS.items():
+            section = LAYER_SECTIONS[layer.value]
+            roman = _INT_TO_ROMAN[layer.value]
+            self._record(self.books, "Book", roman, bodies[section])
+            legacy_title = marker.partition(":")[2].strip()
+            self._named_clauses[f"book {roman}".lower()] = bodies[section]
+            self._named_clauses[legacy_title.lower()] = bodies[section]
+        for number, (section, legacy_title) in _V2_AMENDMENT_ALIASES.items():
+            roman = _INT_TO_ROMAN[number]
+            self._record(self.amendments, "Amendment", roman, bodies[section])
+            self._named_clauses[f"amendment {roman}".lower()] = bodies[section]
+            self._named_clauses[legacy_title.lower()] = bodies[section]
+        for number, (section, legacy_title) in _V2_CHAPTER_ALIASES.items():
+            self.chapters[f"I.{number}"] = bodies[section]
+            self._named_clauses[legacy_title.lower()] = bodies[section]
+        for address, (section, legacy_title) in _V2_POLICY_ALIASES.items():
+            self.sections[address] = bodies[section]
+            self._named_clauses[legacy_title.lower()] = bodies[section]
+        self._record_frame("Amendment Process", bodies[Section.CHANGE])
+        self._named_clauses["amendment process"] = bodies[Section.CHANGE]
+        introduction = text[:spans[Section.HIERARCHY].start]
+        if heading := re.search(r"(?m)^# ", introduction):
+            self._record_frame("Preamble", introduction[heading.start():].strip())
 
     def _record_frame(self, title: str, body: str) -> None:
         """Key an unnumbered top-level section by the names people type.
@@ -281,6 +374,14 @@ class ConstitutionFeature(Feature):
 
     def _generate_summary(self):
         """Generate a brief summary for the system prompt."""
+        if self._version == 2:
+            self.summary = (
+                "You are governed by the Kestrel Constitution. Universal duties come first, "
+                "followed by platform guarantees and the Sovereign's choices, then organization "
+                "policy and your role. Each layer may narrow what the layer above permits. "
+                "Use `!constitution` to consult your governing text."
+            )
+            return
         self.summary = (
             "You are governed by the Kestrel Constitution, a hierarchical framework of four Books: "
             "Book I (Universal Values — honesty, harm reasoning, hard constraints), "
@@ -292,7 +393,7 @@ class ConstitutionFeature(Feature):
 
     @tool(
         name="constitution",
-        description="Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary; article='original' for the exact anchored text. Amendment IX also displays the effective ComputerUse constitutional grants and their provenance.",
+        description="Get the full text of the Kestrel Constitution, or one of its units. Two-slot grammar: 'article' is the subcommand keyword {book, chapter, amendment, section, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='chapter' search='5', article='amendment' search='VIII', article='section' search='III.2', article='search' search='honesty'. Chapter and Section numbering restarts in each Book, so qualify them as <book>.<n> when the bare number is ambiguous. Omit both slots for the full text; article='summary' for the executive summary; article='original' for the exact anchored text. Plain section titles also work on versioned text. Use 'Authority on the host' or Amendment IX for effective ComputerUse constitutional grants and provenance.",
         category=ToolCategory.SYSTEM,
         command_prefix="!constitution"
     )
@@ -366,6 +467,12 @@ class ConstitutionFeature(Feature):
                     "amendment",
                 )
             if keyword in ("chapter", "section") and search:
+                if keyword == "section" and self._version == 2:
+                    title = str(search).strip().lower()
+                    if title == Section.HOST.value.lower():
+                        return await self._effective_amendment_ix(original_reader)
+                    if body := self._named_clauses.get(title):
+                        return ok(body, "section")
                 unit = keyword.capitalize()
                 body, error = self._resolve_subunit(unit, search)
                 return ok(body, keyword) if body else failed(error, keyword)
@@ -390,9 +497,12 @@ class ConstitutionFeature(Feature):
             if body:
                 return ok(body, "amendment")
 
-            body = self.frame.get(str(article).strip().lower())
+            title = str(article).strip().lower()
+            body = self.frame.get(title)
             if body:
                 return ok(body, "frame")
+            if body := self._named_clauses.get(title):
+                return ok(body, "section")
 
             return failed(
                 f"No Book, Amendment, or framing section named '{article}'. "
@@ -418,6 +528,9 @@ class ConstitutionFeature(Feature):
                     if not any(content in r for r in results):
                         results.append(content)
 
+            if named_clause := self._named_clauses.get(search.strip().lower()):
+                if not any(named_clause in result for result in results):
+                    results.append(named_clause)
             if results:
                 return ok("\n\n---\n\n".join(results), "search")
             return failed(
@@ -427,9 +540,13 @@ class ConstitutionFeature(Feature):
 
         return ok(self.full_text, "full_text")
 
-    @staticmethod
-    def _is_amendment_ix(identifier: str | int) -> bool:
-        return _as_index(str(identifier).strip().upper().removeprefix("AMENDMENT ")) == 9
+    def _is_amendment_ix(self, identifier: str | int) -> bool:
+        title = str(identifier).strip()
+        if self._version == 2 and title.lower() in {
+            Section.HOST.value.lower(), _V2_AMENDMENT_ALIASES[9][1].lower(),
+        }:
+            return True
+        return _as_index(title.upper().removeprefix("AMENDMENT ")) == 9
 
     async def _effective_amendment_ix(self, original_reader) -> ToolResult:
         base_hash = None
@@ -444,13 +561,22 @@ class ConstitutionFeature(Feature):
             original = self.full_text
 
         base_text = None
-        for entry, body in _unit_bodies(original):
-            if entry["kind"] == "Amendment" and _as_index(entry["identifier"]) == 9:
-                base_text = body
+        provision_title = "Amendment IX"
+        try:
+            if constitution_version(original) == 2:
+                base_text = v2_sections(original)[Section.HOST].extract(original)
+                provision_title = Section.HOST.value
+            else:
+                for entry, body in _unit_bodies(original):
+                    if entry["kind"] == "Amendment" and _as_index(entry["identifier"]) == 9:
+                        base_text = body
+        except ConstitutionVersionError as exc:
+            return ToolResult.failed(f"Error: {exc}", data={"kind": "unavailable"})
+        base_heading = base_heading.replace("Amendment IX", provision_title)
         resolution = resolve_amendment_ix_grants(self.agent)
         grants = sorted(resolution.grants & DANGEROUS_CAPABILITIES)
         details = [
-            "## Amendment IX — Effective ComputerUse constitutional grants",
+            f"## {provision_title} — Effective ComputerUse constitutional grants",
             f"Grants: {', '.join(grants) or '(none)'}",
             f"Operative source: {resolution.source}",
             f"Source verification: {resolution.verification}",

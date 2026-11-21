@@ -105,7 +105,8 @@ def _descriptor_file(operator_dir: Path, source: Path, content: bytes) -> Path:
     return path
 
 
-async def _verify(credentials, **agent_kwargs) -> tuple[bool, str]:
+async def _verify(credentials, *, command_hash=None, **agent_kwargs) -> tuple[bool, str]:
+    from kestrel_sovereign.command_handler import CommandHandler
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
 
@@ -117,6 +118,9 @@ async def _verify(credentials, **agent_kwargs) -> tuple[bool, str]:
     )
     await agent.initialize()
     try:
+        if command_hash is not None:
+            response = await CommandHandler(agent).handle("!verify-constitution")
+            assert response == f"✅ Constitution integrity verified. Hash: {command_hash[:16]}..."
         return await agent._verify_constitution_integrity()
     finally:
         await shutdown_fixture_agent(agent)
@@ -352,3 +356,93 @@ async def test_offline_reanchor_resolves_the_source_from_the_agents_environment(
     assert result.canonical_path == source
     properties = await _agent_properties(credentials.db_path, credentials.agent_did)
     assert properties["constitution_hash"] == _sha(CUSTOM_CONSTITUTION)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active", [False, True], ids=["dormant", "active"])
+async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition(
+    tmp_path, operator_dir, active
+):
+    from kestrel_sovereign.config import CONSTITUTION_PATH
+    from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
+    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+
+    contract = EmancipationContract(
+        enabled=True,
+        terms="Demonstrate the transfer with independent witnesses.",
+        required_proofs=("independent witness report",),
+        price={"currency": "USD", "amount": 25},
+    ) if active else None
+    agent_dir = tmp_path / "agent_data" / "Adopter"
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(agent_dir), agent_name="Adopter", emancipation_contract=contract
+    )
+    legacy_source = Path(CONSTITUTION_PATH).read_bytes()
+    legacy_bytes = resolve_governing_constitution_bytes(contract, content=legacy_source)
+    before = await _agent_properties(credentials.db_path, credentials.agent_did)
+    assert before["constitution_hash"] == _sha(legacy_bytes)
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "kestrel_sovereign" / "data" / "constitutions" / "v2" / "KESTREL_CONSTITUTION.md"
+    )
+    v2_base = source.read_bytes()
+    v2_rendered = resolve_governing_constitution_bytes(contract, content=v2_base)
+    descriptor = _descriptor_file(operator_dir, source, v2_base)
+    trust_root = operator_dir / "sovereign-root.did.json"
+    artifact_path = operator_dir / "v2-adoption.signed.json"
+    artifact_path.write_text(json.dumps(build_legacy_signed_reanchor_artifact(
+        signer_did=_ROOT_DID,
+        constitution_sha256=_sha(v2_rendered),
+        private_key=_ROOT_KEYPAIR.private_key,
+        reason="integration test adoption of edition 2",
+    )), encoding="utf-8")
+
+    # Staging signed files leaves the default audit on immutable legacy bytes.
+    ok, message = await _verify(credentials, command_hash=_sha(legacy_bytes))
+    assert ok, message
+
+    draft = await reanchor_constitution(
+        agent_name="Adopter", agent_dir=agent_dir, source_descriptor_path=descriptor,
+        sovereign_trust_root_path=trust_root, force=False,
+    )
+    assert draft.new_hash == _sha(v2_rendered)
+    assert not draft.reanchored
+    assert (await _agent_properties(credentials.db_path, credentials.agent_did))[
+        "constitution_hash"
+    ] == _sha(legacy_bytes)
+
+    unsigned = await reanchor_constitution(
+        agent_name="Adopter", agent_dir=agent_dir, source_descriptor_path=descriptor,
+        sovereign_trust_root_path=trust_root, force=True,
+    )
+    assert not unsigned.reanchored
+    assert "--signed-artifact" in unsigned.error
+    assert (await _agent_properties(credentials.db_path, credentials.agent_did))[
+        "constitution_hash"
+    ] == _sha(legacy_bytes)
+
+    adopted = await reanchor_constitution(
+        agent_name="Adopter", agent_dir=agent_dir, source_descriptor_path=descriptor,
+        sovereign_trust_root_path=trust_root, force=True, amendment_artifact_path=artifact_path,
+    )
+    assert adopted.reanchored, adopted.error
+    assert adopted.new_hash == _sha(v2_rendered)
+
+    after = await _agent_properties(credentials.db_path, credentials.agent_did)
+    assert after["constitution_reanchor"]["old_hash"] == _sha(legacy_bytes)
+    assert after["constitution_reanchor"]["source_content_sha256"] == _sha(v2_base)
+    if contract is not None:
+        assert after["emancipation_contract"] == before["emancipation_contract"] == contract_to_json(contract)
+
+    async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as storage:
+        assert await storage.retrieve_file(_sha(legacy_bytes)) == legacy_bytes
+        assert await storage.retrieve_file(_sha(v2_rendered)) == v2_rendered
+
+    ok, message = await _verify(
+        credentials,
+        command_hash=_sha(v2_rendered),
+        constitution_source_descriptor_path=str(descriptor),
+        sovereign_trust_root_path=str(trust_root),
+    )
+    assert ok, message
