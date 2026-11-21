@@ -78,11 +78,13 @@ class PostCeremonyTemplate:
         )
 
 
-def build_post_ceremony_template(storage_dir: Path) -> PostCeremonyTemplate:
+def build_post_ceremony_template(
+    storage_dir: Path, *, legacy_keypair: Keypair | None = None,
+) -> PostCeremonyTemplate:
     """Build one real, fully persisted legacy-to-hybrid rotation."""
     storage = SecureKeyStorage(storage_dir=storage_dir)
     secp = Secp256k1Suite()
-    legacy_keypair = secp.generate_keypair()
+    legacy_keypair = legacy_keypair or secp.generate_keypair()
     address = public_key_to_ethereum_address(legacy_keypair.public_key)
     legacy_did = f"did:pkh:eip155:1:{address}"
     legacy_key_id = f"kestrel_{address}"

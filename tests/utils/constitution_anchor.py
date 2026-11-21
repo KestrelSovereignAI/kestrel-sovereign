@@ -38,6 +38,23 @@ def sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def with_v1_role_note(content: bytes, note: str) -> bytes:
+    """Change only the delegated Book IV body of the packaged v1 fixture."""
+    before, heading, after = content.partition(b"\n---\n\n## The Amendment Process\n")
+    if not heading or b"\n## Book IV: Agent Identity\n" not in before:
+        raise ValueError("Packaged v1 fixture lacks its Book IV and Amendment Process headings")
+    return before + b"\n" + note.encode("utf-8") + b"\n" + heading + after
+
+
+def isolate_v1_governance_fixture(monkeypatch) -> None:
+    """Use project fixture authority even when pytest loaded an operator dotenv."""
+    from kestrel_sovereign.constitution.source_descriptor import CONSTITUTION_SOURCE_DESCRIPTOR_ENV
+    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
+    from tests.shared.environment_guard import unset_environment
+
+    unset_environment(monkeypatch, SOVEREIGN_TRUST_ROOT_ENV, CONSTITUTION_SOURCE_DESCRIPTOR_ENV)
+
+
 def agent_did(name: str) -> str:
     return f"did:test:{name}"
 
