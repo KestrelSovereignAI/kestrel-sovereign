@@ -381,7 +381,7 @@ Wrong key provided:
 
 Constitution verification failed:
 - For the first-edition setup described here, the packaged source is `kestrel_sovereign/data/KESTREL_CONSTITUTION.md`. If the agent has a Sovereign-signed source descriptor, use the source it identifies.
-- Compare the hash of the selected file’s exact bytes with the agent’s anchored hash.
+- Compare the agent’s anchor with the SHA-256 of its resolved governing text, including any active contract terms rendered at inception. If you have a signed descriptor, its `content_sha256` lets you verify the raw source file separately.
 
 ### Docker Build Fails
 
