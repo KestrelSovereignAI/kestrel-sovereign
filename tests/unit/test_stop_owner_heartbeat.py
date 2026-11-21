@@ -187,7 +187,17 @@ async def test_a_dead_heartbeat_lets_the_lease_expire_and_fences_within_it(
     try:
         await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
         generation_id = _generation_of(registry, agent, "orphaned-turn")
-        await _wait_for(lambda: registry._heartbeat.latest() is not None)
+
+        def heartbeat_saw_invocation() -> bool:
+            sample = registry._heartbeat.latest()
+            return (
+                sample is not None
+                and sample.poll is not None
+                and generation_id in sample.poll.live_generation_ids
+            )
+
+        # An initial poll may have run before the invocation registered.
+        await _wait_for(heartbeat_saw_invocation)
 
         kill.set()
         await _wait_for(lambda: not registry._heartbeat.alive)

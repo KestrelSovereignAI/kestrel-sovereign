@@ -139,6 +139,11 @@ class MCPTaskRecord:
         return {key: value for key, value in observation['inputRequests'].items() if key not in consumed}
 
     @property
+    def cancel_requested(self) -> bool:
+        return any(receipt['intent']['method'] == 'tasks/cancel'
+                   for receipt in self.control['mutations'].values())
+
+    @property
     def observation(self) -> dict | None:
         envelope = self.envelope
         return envelope.get('observation') if envelope is not None else None

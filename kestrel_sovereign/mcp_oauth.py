@@ -30,6 +30,7 @@ from kestrel_sdk.storage.database import DatabaseBackend
 from kestrel_sovereign.auth import CallerContext, caller_context_scope, caller_identity_digest, current_caller_context
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.mcp_task_actions import MCPTaskMutationRound
 from kestrel_sovereign.mcp_task_store import (
     MCPTaskConflict, MCPTaskObservationRefused, MCPTaskPayloadLimit, RECOVERABLE_OBSERVATION_BLOCKS,
 )
@@ -160,6 +161,7 @@ class MCPOAuthAction(StrEnum):
     CANCEL = "mcp-oauth.cancel"
     DISCONNECT = "mcp-oauth.disconnect"
     OBSERVE_TASK = "mcp-oauth.observe-task"
+    MUTATE_TASK = "mcp-oauth.mutate-task"
 
 
 @dataclass
@@ -408,11 +410,12 @@ class MCPOAuthConnectionLease:
 
 
 class MCPOAuthTaskLease:
-    """Finite host-owned authority for one authenticated Task observation."""
+    """Finite host-owned authority for one authenticated native Task operation."""
 
-    def __init__(self, host, task_host, record, submission, policy):
+    def __init__(self, host, task_host, record, submission, policy, *, mutation=None):
         self._host, self._task_host, self._record = host, task_host, record
         self._submission, self._policy = submission, policy
+        self._mutation = mutation
         self._epoch = host.agent._get_privacy_policy_epoch()
         self._publication = getattr(host.agent, "_host_context_publication_state", None)
         self._generation = getattr(self._publication, "generation", None)
@@ -455,6 +458,8 @@ class MCPOAuthTaskLease:
                 or getattr(self._publication, "generation", None) != self._generation
                 or host._require_policy() is not self._policy):
             raise HostCapabilityAccessDenied("original MCP Task observation authority expired or changed")
+        if self._mutation is not None:
+            self._mutation.require_transport_current()
 
     @asynccontextmanager
     async def operation(self):
@@ -464,10 +469,12 @@ class MCPOAuthTaskLease:
             raise HostCapabilityAccessDenied("original MCP Task observation is single use")
         self._entered = True
         host = self._host
-        action = MCPOAuthAction.OBSERVE_TASK
+        mutation = self._mutation
+        action = MCPOAuthAction.OBSERVE_TASK if mutation is None else MCPOAuthAction.MUTATE_TASK
+        principal = "service:mcp-task-observation" if mutation is None else mutation.operator_id
         context = OperatorContext(
             tenant_id=host._agent_id, acting_agent_id=host._agent_id,
-            principal_id="service:mcp-task-observation",
+            principal_id=principal,
             granted_actions=frozenset({action.value}), granted_capabilities=frozenset({"mcp-oauth"}),
             permitted_boundary_ids=frozenset({host._agent_id}),
             correlation_id=uuid4().hex, issued_at=host.authority.clock(), expires_at=self._deadline,
@@ -508,6 +515,8 @@ class MCPOAuthTaskLease:
     async def record(self, observation: dict, *, withheld=None):
         """Write one validated native observation under the active original operation."""
         check = self._require_operation()
+        if self._mutation is not None:
+            raise HostCapabilityAccessDenied('The original MCP Task mutation cannot record an observation')
         try:
             recorded = await self._task_host.store.observe(self._record, observation, withheld=withheld,
                 poll_not_before=self._task_host.next_observation_at(observation))
@@ -525,6 +534,8 @@ class MCPOAuthTaskLease:
     async def pace(self) -> None:
         """Persist the next permitted attempt before refresh or native transport."""
         check = self._require_operation()
+        if self._mutation is not None:
+            raise HostCapabilityAccessDenied('The original MCP Task mutation cannot defer observation')
         native = self._record.observation or self._record.envelope['native']
         try:
             self._record = await self._task_host.store.defer_observation(self._record,
@@ -533,23 +544,18 @@ class MCPOAuthTaskLease:
             raise ResourceConflict("original MCP Task observation revision changed") from error
         check()
 
-    def expired(self) -> bool:
+    def scheduled_observation_expired(self) -> bool:
         self._require_operation()
-        native = self._record.observation or self._record.envelope['native']
-        ttl = native.get('ttlMs')
-        if type(ttl) is not int or ttl < 0:
-            return False
-        try:
-            created = datetime.fromisoformat(native['createdAt'])
-        except (KeyError, TypeError, ValueError):
-            return False
-        if created.utcoffset() is None:
-            return False
-        return self._task_host.input_host.authority.clock().timestamp() >= created.timestamp() + ttl / 1000
+        now = self._task_host.input_host.authority.clock().timestamp()
+        if not self._task_host.observation_due(self._record, now):
+            raise ResourceConflict("original MCP Task is not due for observation")
+        return self._task_host.observation_expired(self._record, now)
 
     async def block(self, reason: str):
         """An observation failure does not settle the original remote Task."""
         check = self._require_operation()
+        if self._mutation is not None:
+            raise HostCapabilityAccessDenied('The original MCP Task mutation cannot block observation')
         try:
             recorded = await self._task_host.store.block_observation(self._record,
                 reason=reason, blocked_at=self._host.authority.clock().timestamp(),
@@ -665,28 +671,39 @@ class MCPOAuthHost:
         if handle in self._task_leases or len(self._task_leases) >= policy.max_operations:
             raise ResourceConflict("original MCP Task observation capacity is occupied")
 
-    @asynccontextmanager
-    async def borrow_task_observation(self, task_host, handle, *, scheduled=False):
+    def borrow_task_observation(self, task_host, handle, *, scheduled=False):
         """Authenticate retained custody and share one finite operation with Feature."""
+        return self._borrow_task(task_host, handle, scheduled=scheduled)
+
+    def borrow_task_mutation(self, mutation):
+        if type(mutation) is not MCPTaskMutationRound:
+            raise HostCapabilityAccessDenied('Original governed MCP Task mutation is required')
+        mutation.require_current()
+        return self._borrow_task(mutation.host, mutation.record.handle, mutation=mutation)
+
+    @asynccontextmanager
+    async def _borrow_task(self, task_host, handle, *, scheduled=False, mutation=None):
         async with require_durable_persistence_gate(self.agent).shared():
             self._require_task_owner(task_host)
             policy = self._require_policy()
             record = await task_host.store.read_handle(handle)
             if record is None or record.phase != "ATTACHED" or record.remote_task_id is None:
                 raise ResourceConflict("original remote MCP Task is unavailable for observation")
-            not_before = record.local['poll_not_before']
-            if (scheduled and not_before is not None
-                    and not_before > task_host.input_host.authority.clock().timestamp()):
+            if mutation is not None and (mutation.record.binding != record.binding
+                    or mutation.record.remote_task_id != record.remote_task_id):
+                raise HostCapabilityAccessDenied('Original MCP Task mutation target changed')
+            if scheduled and not task_host.observation_due(
+                    record, task_host.input_host.authority.clock().timestamp()):
                 raise ResourceConflict("original MCP Task is not due for observation")
             submission = await task_host.store.open_submission(record)
             self._require_task_owner(task_host)
             self._require_policy()
             self._require_observation_capacity(handle, policy)
-            lease = MCPOAuthTaskLease(self, task_host, record, submission, policy)
+            lease = MCPOAuthTaskLease(self, task_host, record, submission, policy, mutation=mutation)
             self._task_leases[handle] = lease
             try:
                 blocked = record.local['observation_block']
-                if blocked is not None:
+                if blocked is not None and mutation is None:
                     if (blocked['reason'] not in RECOVERABLE_OBSERVATION_BLOCKS
                             or not self._fresh_task_principal(submission.authorization, blocked)):
                         raise ResourceConflict("original MCP Task observation is blocked")
@@ -713,7 +730,8 @@ class MCPOAuthHost:
             deadline = min(deadline, authentication.expires_at)
         return OperatorContext(tenant_id=self._agent_id, acting_agent_id=self._agent_id,
             principal_id=caller_identity_digest(authentication.caller),
-            granted_actions=frozenset(action.value for action in MCPOAuthAction if action is not MCPOAuthAction.OBSERVE_TASK),
+            granted_actions=frozenset(action.value for action in MCPOAuthAction
+                if action not in {MCPOAuthAction.OBSERVE_TASK, MCPOAuthAction.MUTATE_TASK}),
             granted_capabilities=frozenset({"mcp-oauth"}),
             permitted_boundary_ids=frozenset({self._agent_id}),
             correlation_id=uuid4().hex, issued_at=now, expires_at=deadline)
