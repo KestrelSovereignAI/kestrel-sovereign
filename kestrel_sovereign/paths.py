@@ -81,6 +81,12 @@ def package_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+
+def agent_workspace_path(storage_path: str | os.PathLike[str]) -> Path:
+    """Return the designated workspace beside an agent's storage file."""
+    return Path(storage_path).parent / "workspace"
+
+
 def project_dir() -> Path:
     """Resolve the user's Kestrel project directory.
 

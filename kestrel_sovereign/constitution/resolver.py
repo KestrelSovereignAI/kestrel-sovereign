@@ -30,7 +30,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from .emancipation import EmancipationContract, apply_emancipation
+from .emancipation import EmancipationContract, amendment_viii_is_active, apply_emancipation
+from .structure import ConstitutionVersionError, constitution_version, v2_sections
 from .source_descriptor import (
     SOURCE_KIND_PACKAGE,
     ConstitutionSourceError,
@@ -249,6 +250,34 @@ def resolve_governing_constitution_bytes(
                 f"{source.content_sha256[:16]}…: the {source.kind} source "
                 f"changed after the descriptor was signed."
             )
-    if contract is not None and contract.enabled:
-        content = apply_emancipation(content.decode("utf-8"), contract).encode("utf-8")
+    active = contract is not None and contract.enabled
+    errors = "strict" if active or content.startswith(b"---") else "surrogateescape"
+    text = content.decode("utf-8", errors=errors)
+    edition = constitution_version(text)
+    if active:
+        text = apply_emancipation(text, contract)
+        content = text.encode("utf-8")
+    # Validate the exact v2 document whose bytes can be signed or audited.
+    if edition == 2:
+        if constitution_version(text) != edition:
+            raise ConstitutionVersionError("Rendering changed the Constitution edition")
+        v2_sections(text)
     return content
+
+
+def resolve_initial_governing_constitution_bytes(
+    contract: EmancipationContract | None, *, source: GoverningSource,
+) -> tuple[bytes, dict | None]:
+    """Resolve first-anchor bytes. Edition 2 activation requires a later signed act."""
+    content = resolve_governing_constitution_bytes(contract, source=source)
+    text = content.decode("utf-8", errors="surrogateescape")
+    if constitution_version(text) != 2:
+        return content, None
+    if (contract is not None and contract.enabled) or amendment_viii_is_active(text):
+        raise ConstitutionVersionError(
+            "Edition 2 first anchors must be dormant. Use a later Sovereign-signed "
+            "activation naming this agent and the exact terms."
+        )
+    from .publisher import verify_packaged_publisher
+
+    return content, verify_packaged_publisher(hashlib.sha256(content).hexdigest())

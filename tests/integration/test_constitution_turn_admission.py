@@ -18,6 +18,12 @@ from tests.unit.test_non_streaming_turn_privacy_span import _configure_turn_prob
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
+def _role_only_revision(content):
+    role = b"Agents may be configured for specific roles:"
+    assert content.count(role) == 1
+    return content.replace(role, role + b" This test agent has an updated role.", 1)
+
+
 async def _ready_turn(storage, *, is_new_identity=True, execution_agent=None):
     native = await _agent(storage, is_new_identity=is_new_identity)
     content = resolve_governing_constitution_bytes(None)
@@ -99,7 +105,7 @@ async def test_turn_cannot_outrun_native_restriction_or_governing_receipt(db_bac
             assert await replica.enter_safe_mode("Another replica committed an integrity restriction")
             assert (await replica._constitution_state_store.load(storage.agent_id)).safe_mode
         else:
-            replacement = content + b"\nNew signed governing revision for the admission race.\n"
+            replacement = _role_only_revision(content)
             canonical = tmp_path / "KESTREL_CONSTITUTION.md"
             canonical.write_bytes(replacement)
             import kestrel_sovereign.config as config

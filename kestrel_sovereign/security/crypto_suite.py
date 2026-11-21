@@ -596,11 +596,10 @@ class SLHDSASHA2128sSuite(CryptoSuite):
     check because public key (32), secret key (64) and signature (7856)
     lengths are identical across the change.
 
-    Migrating was therefore an algorithm change, not a rename. It was safe
-    here only because no signature predating it exists to strand (#2966);
-    anything signed by the old module would have become permanently
-    unverifiable, including release manifests checked by
-    ``kestrel release verify``.
+    The May 2026 agent rotations predate that algorithm change (#2966).
+    Constitution adoption verifies their unmodified archival signatures in
+    an explicitly selected pqcrypto 0.4.0 environment. See
+    ``scripts/verification/legacy-sphincs/README.md``.
 
     Multikey shape
     --------------

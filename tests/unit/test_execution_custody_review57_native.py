@@ -134,9 +134,12 @@ async def test_early_signed_reanchor_native_committed_receipt_is_not_an_unbound_
     from kestrel_sovereign.storage.async_storage import AsyncStorage
     from tests.integration.test_constitution_turn_admission import _ready_turn
     from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
+    from tests.utils.constitution_anchor import isolate_v1_governance_fixture, with_v1_role_note
+
+    isolate_v1_governance_fixture(monkeypatch)
     async with AsyncStorage(str(tmp_path / "early-reanchor.db"), agent_id="did:test:early-reanchor57") as storage:
         agent, content = await _ready_turn(storage)
-        replacement = content + b"\nOffline signed review57 amendment.\n"
+        replacement = with_v1_role_note(content, "The assigned role is to review native graph custody.")
         path = tmp_path / "KESTREL_CONSTITUTION.md"
         path.write_bytes(replacement)
         import kestrel_sovereign.config as config

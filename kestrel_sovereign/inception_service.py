@@ -1219,7 +1219,7 @@ async def create_kestrel_identity_async(
             # exactly what verification later recomputes.
             from kestrel_sovereign.constitution.resolver import (
                 is_authoritative_governing_source,
-                resolve_governing_constitution_bytes,
+                resolve_initial_governing_constitution_bytes,
                 resolve_governing_source,
             )
             governing_source = resolve_governing_source(
@@ -1249,7 +1249,7 @@ async def create_kestrel_identity_async(
                         f"or configure a Sovereign-signed constitution source "
                         f"descriptor naming this file (#2553)."
                     )
-            constitution_content = resolve_governing_constitution_bytes(
+            constitution_content, publisher_evidence = resolve_initial_governing_constitution_bytes(
                 emancipation_contract,
                 source=governing_source,
             )
@@ -1306,6 +1306,8 @@ async def create_kestrel_identity_async(
                     auditor=genesis_auditor,
                     provenance=audit_provenance,
                 )
+            if publisher_evidence is not None:
+                genesis_audit["publisher"] = publisher_evidence
 
             constitution_hash = expected_constitution_hash
             if constitution_hash != genesis_audit["constitution_hash"]:

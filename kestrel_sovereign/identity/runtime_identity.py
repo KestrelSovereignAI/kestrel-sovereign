@@ -624,9 +624,10 @@ def _find_succession_statement(storage_dir: Path) -> Optional[Path]:
     explicitly when that ships).
     """
     successions_dir = storage_dir / "successions"
-    if not successions_dir.is_dir():
+    try:
+        candidates = sorted(path for path in successions_dir.iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
         return None
-    candidates = sorted(successions_dir.glob("*.json"))
     if not candidates:
         return None
     if len(candidates) > 1:
@@ -637,6 +638,54 @@ def _find_succession_statement(storage_dir: Path) -> Optional[Path]:
             f"and re-archive."
         )
     return candidates[0]
+
+
+def read_recorded_succession(storage_dir: Path) -> Optional[SuccessionStatement]:
+    """Read the local public rotation evidence without loading private keys."""
+    if not storage_dir.is_dir():
+        raise RuntimeIdentityError("No local identity directory is available for the target")
+    path = _find_succession_statement(storage_dir)
+    if path is None:
+        return None
+    return SuccessionStatement.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def read_legacy_only_genesis_document(storage_dir: Path, target_did: str) -> dict:
+    """Establish affirmative classical custody without reading private key bytes."""
+    from kestrel_sovereign.identity.signing import get_key_id
+
+    indicators = ("*_did.json", "*_ed25519.key.enc", "*_mldsa65.bytes.enc",
+                  "*_archival_slhdsa*.bytes.enc")
+    if any(any(storage_dir.glob(pattern)) for pattern in indicators):
+        raise RuntimeIdentityError("Hybrid custody evidence survives; restore the recorded public succession")
+    key_id = get_key_id(target_did)
+    path = storage_dir / f"{key_id}.json"
+    if set(storage_dir.glob("kestrel_0x*.json")) != {path} or not path.is_file() or not any(
+        (storage_dir / f"{key_id}{suffix}").is_file() for suffix in (".key.enc", ".pem")
+    ):
+        raise RuntimeIdentityError("The target has no affirmative legacy-only Genesis custody")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or document.get("id") != target_did:
+        raise RuntimeIdentityError("The retained Genesis document does not bind to the target DID")
+    return document
+
+
+def read_recorded_archival_pin(storage_dir: Path, succession: SuccessionStatement) -> str:
+    """Read only the public archival sidecar for the recorded ceremony."""
+    from kestrel_sovereign.security.multikey import public_key_to_multibase
+
+    path = _find_succession_statement(storage_dir)
+    if path is None or SuccessionStatement.from_dict(
+        json.loads(path.read_text(encoding="utf-8"))
+    ).to_dict() != succession.to_dict():
+        raise RuntimeIdentityError("The recorded succession changed while resolving its archival pin")
+    storage = SecureKeyStorage(storage_dir=storage_dir)
+    key_id = f"{path.stem}_archival_slhdsa_pub"
+    if not storage.has_secret_bytes(key_id):
+        raise RuntimeIdentityError("The recorded succession has no archival public key sidecar")
+    return public_key_to_multibase(
+        get_suite(ALG_SLH_DSA_SHA2_128S), storage.load_secret_bytes(key_id),
+    )
 
 
 def _load_hybrid_part(
@@ -762,6 +811,18 @@ def _find_born_hybrid_did_doc(storage_dir: Path) -> Optional[Path]:
             f"exactly one identity."
         )
     return candidates[0]
+
+
+def read_born_hybrid_genesis_document(storage_dir: Path, target_did: str) -> dict:
+    """Read the public inception witness without loading either signing key."""
+    from kestrel_sovereign.identity import did_web
+
+    path = _find_born_hybrid_did_doc(storage_dir)
+    if path is None:
+        raise RuntimeIdentityError("The born-hybrid target has no local Genesis DID document")
+    if path.name.removesuffix("_did.json") != _detect_hybrid_slug(storage_dir):
+        raise RuntimeIdentityError("The Genesis document does not match the local hybrid custody")
+    return did_web.parse_resolved_document(target_did, path.read_bytes())
 
 
 def _load_born_hybrid(
@@ -1024,4 +1085,5 @@ __all__ = [
     "IdentityReadinessError",
     "RuntimeIdentityError",
     "load_agent_identity",
+    "read_recorded_succession",
 ]

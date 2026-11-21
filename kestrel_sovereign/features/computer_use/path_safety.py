@@ -116,13 +116,19 @@ def match_allow_list(
     return MatchResult(False, "no_match")
 
 
-def _matches(candidate: str, pattern: str | Path) -> bool:
-    pat_str = str(pattern)
-    expanded = os.path.expanduser(pat_str)
+def path_pattern_identity(pattern: str | Path) -> tuple[str, str]:
+    """Use the same canonical selector identity for enforcement and signing."""
+    expanded = os.path.expanduser(str(pattern))
     if any(c in expanded for c in "*?["):
+        return "glob", expanded
+    resolved = os.path.realpath(expanded) if os.path.exists(expanded) else expanded
+    return "prefix", resolved.rstrip("/")
+
+
+def _matches(candidate: str, pattern: str | Path) -> bool:
+    kind, expanded = path_pattern_identity(pattern)
+    if kind == "glob":
         return fnmatch.fnmatchcase(candidate, expanded) or fnmatch.fnmatchcase(
             candidate, expanded.rstrip("/") + "/*"
         )
-    expanded = os.path.realpath(expanded) if os.path.exists(expanded) else expanded
-    expanded = expanded.rstrip("/")
     return candidate == expanded or candidate.startswith(expanded + "/")

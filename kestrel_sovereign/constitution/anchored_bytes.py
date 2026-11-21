@@ -237,6 +237,70 @@ def historical_anchor_hash(
     return next(iter(candidates), None)
 
 
+async def check_retained_emancipation_promises(
+    db, hashes: Iterable[str], *, current_hash: str | None, new_hash: str, new_text: str,
+    anchored_contract=None,
+) -> None:
+    """Protect recorded promises across intervening governing editions."""
+    from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+    from kestrel_sovereign.constitution.emancipation import (
+        AmbiguousAmendmentVIII, matches_recorded_emancipation_contract, unwitnessed_emancipation_downgrade,
+    )
+    from kestrel_sovereign.constitution.structure import ConstitutionVersionError, constitution_version
+    from kestrel_sovereign.constitution.v1_prior import known_published_v1, witnessed_v1_render
+
+    if current_hash == new_hash:
+        return
+    requires_exact_history = constitution_version(new_text) == 2
+    preserved_contract = (
+        anchored_contract
+        if anchored_contract is not None and matches_recorded_emancipation_contract(new_text, anchored_contract)
+        else None
+    )
+    for digest in sorted(set(hashes).difference({current_hash, new_hash})):
+        text, present = await read_anchored_constitution(db, digest)
+        if requires_exact_history and text is None and not present and not known_published_v1(digest):
+            recovered = witnessed_v1_render(preserved_contract) if preserved_contract is not None else None
+            if recovered is None or hashlib.sha256(recovered.encode("utf-8")).hexdigest() != digest:
+                raise AmendmentArtifactError(
+                    f"Retained governing constitution {digest} is unavailable. Restore its exact "
+                    "bytes or independently authenticated emancipation terms before changing the governing digest."
+                )
+            text, present = recovered, True
+        try:
+            independently_matched = (
+                text is not None and preserved_contract is not None
+                and matches_recorded_emancipation_contract(text, preserved_contract)
+            )
+        except (AmbiguousAmendmentVIII, ConstitutionVersionError) as exc:
+            raise AmendmentArtifactError(f"Cannot establish retained emancipation terms at {digest}") from exc
+        refusal = unwitnessed_emancipation_downgrade(
+            anchored_contract=preserved_contract if independently_matched else None,
+            anchored_text=text, anchored_present=present,
+            old_hash=digest, new_hash=new_hash, new_text=new_text,
+        )
+        if refusal is not None:
+            raise AmendmentArtifactError(str(refusal))
+
+
+async def visible_governance_history_targets(
+    db, agent_did: str, targets: Iterable[str], *, new_hash: str,
+) -> tuple[str, ...]:
+    """Witness digest-addressed prior edges owned by this agent before pruning."""
+    from kestrel_sovereign.constitution.reanchor_receipt import is_constitution_hash
+
+    prior_targets = {digest for digest in targets if digest != new_hash and is_constitution_hash(digest)}
+    if not prior_targets:
+        return ()
+    rows = await db.fetchall(
+        "SELECT target_id FROM graph_edge_owners WHERE source_id = ? "
+        "AND label = 'governed_by' AND agent_id = ?",
+        (agent_did, agent_did),
+    )
+    owners = {row[0] for row in rows}
+    return tuple(sorted(prior_targets & owners))
+
+
 def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str]) -> dict:
     """Snapshot the exact governing facts validated by signed repair preflight.
 
@@ -249,7 +313,7 @@ def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str])
         # receipt/history fields: shared evidence admission correctly rejects
         # those, whereas an identity with no prior receipt can first-anchor.
         "properties": deepcopy({key: properties[key] for key in (
-            "constitution_hash", "emancipation_contract", "genesis_audit",
+            "constitution_hash", "constitution_overlay_hash", "emancipation_contract", "genesis_audit",
             "genesis_audit_history", "constitution_reanchor", "constitution_reanchor_history",
         ) if key in properties}),
         "governed_by_targets": sorted(set(governed_by_targets)),

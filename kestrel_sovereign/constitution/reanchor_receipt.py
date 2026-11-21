@@ -45,18 +45,30 @@ def is_constitution_hash(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
-def reanchor_prior_pointer_fields(pointer: Any, historical_hash: str | None) -> dict:
-    """Keep an observed corrupt pointer separate from a typed prior digest.
+def reanchor_prior_pointer_fields(pointer: Any, historical_hash: str | None, *, pointer_present: bool = True) -> dict:
+    """Keep the observed pointer state separate from a verified prior digest.
 
     Recovery evidence is not signing authority. Both public writers must first
     inspect readable historical bytes and independently verify the new artifact.
     Existing malformed receipts are never normalized by this new-event builder.
     """
-    if pointer is None or pointer == "" or is_constitution_hash(pointer):
-        return {"old_hash": pointer or None}
+    if is_constitution_hash(pointer):
+        return {"old_hash": pointer}
+    if pointer is None or pointer == "":
+        if not is_constitution_hash(historical_hash):
+            return {"old_hash": None}
+        observed = "missing" if not pointer_present else "null" if pointer is None else "empty"
+        return {
+            "old_hash": historical_hash,
+            "repaired_constitution_pointer": pointer,
+            "repaired_constitution_pointer_state": observed,
+        }
     if not isinstance(pointer, str) or len(pointer) > 256 or not is_constitution_hash(historical_hash):
         raise ValueError("Malformed anchor pointer has unreadable historical governance; restore its exact prior pointer before signed repair")
-    return {"old_hash": historical_hash, "repaired_constitution_pointer": pointer}
+    return {
+        "old_hash": historical_hash, "repaired_constitution_pointer": pointer,
+        "repaired_constitution_pointer_state": "malformed",
+    }
 
 
 def _receipt_hash(value: Any, field: str) -> None:
@@ -79,6 +91,20 @@ def validate_constitution_reanchor_receipt(receipt: Any) -> None:
         _receipt_hash(receipt["old_hash"], "old_hash")
     if "signed_artifact_hash" in receipt:
         _receipt_hash(receipt["signed_artifact_hash"], "signed_artifact_hash")
+    if "prior_role_artifact_sha256" in receipt:
+        _receipt_hash(receipt["prior_role_artifact_sha256"], "prior Book IV admission artifact")
+    observations = receipt.get("historical_promises", [])
+    if not isinstance(observations, list) or len(observations) > 8:
+        raise ValueError("Malformed historical emancipation promise receipt")
+    for observation in observations:
+        if not isinstance(observation, Mapping):
+            raise ValueError("Malformed historical emancipation promise receipt")
+        _receipt_hash(observation.get("constitution_sha256"), "historical promise")
+    retained_targets = receipt.get("retained_governed_by", [])
+    if not isinstance(retained_targets, list) or len(retained_targets) > MAX_REANCHOR_RECEIPT_HISTORY:
+        raise ValueError("Malformed or excessive retained governing edges")
+    for digest in retained_targets:
+        _receipt_hash(digest, "retained governing edge")
 
 
 def validate_constitution_reanchor_evidence(properties: Mapping[str, Any], *, superseding: bool = False) -> list:
@@ -98,6 +124,33 @@ def validate_constitution_reanchor_evidence(properties: Mapping[str, Any], *, su
         if superseding and len(history) >= MAX_REANCHOR_RECEIPT_HISTORY:
             raise ValueError("Reanchor history cannot archive another receipt; existing evidence is preserved")
     return history
+
+
+def retained_constitution_hashes(properties: Mapping[str, Any]) -> set[str]:
+    """Find the governing editions named by the native reanchor history."""
+    history = validate_constitution_reanchor_evidence(properties)
+    receipts = [entry["receipt"] for entry in history]
+    if current := properties.get(CONSTITUTION_REANCHOR_KEY):
+        receipts.append(current)
+    hashes = {
+        digest for receipt in receipts
+        for digest in (receipt["new_hash"], receipt.get("old_hash"))
+        if is_constitution_hash(digest)
+    }
+    for receipt in receipts:
+        hashes.update(observation["constitution_sha256"] for observation in receipt.get("historical_promises", []))
+        hashes.update(receipt.get("retained_governed_by", []))
+    genesis = properties.get("genesis_audit")
+    if isinstance(genesis, Mapping) and is_constitution_hash(genesis.get("constitution_hash")):
+        hashes.add(genesis["constitution_hash"])
+    from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+    from kestrel_sovereign.constitution.genesis_audit import GenesisAuditError, _validated_genesis_history
+
+    try:
+        hashes.update(entry["receipt"]["constitution_hash"] for entry in _validated_genesis_history(properties))
+    except GenesisAuditError as exc:
+        raise AmendmentArtifactError(str(exc)) from exc
+    return hashes
 
 
 def supersede_constitution_reanchor(
