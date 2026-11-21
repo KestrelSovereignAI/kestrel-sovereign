@@ -37,7 +37,9 @@ Two halves of one fact (#3300):
   transport can say what happened without reflecting any error text. The
   error carries the token usage the provider reported for the attempt, and
   none of its text, so the failed attempt is recorded with the tokens it
-  consumed (:func:`reported_usage`, #3577).
+  consumed (:func:`reported_usage`, #3577). An error of any other kind that
+  ends an attempt after its provider reported usage carries it too
+  (:func:`attach_reported_usage`, #4198).
 
 Whether a generation may become a turn's answer at all is decided in one
 place, :func:`kestrel_sovereign.llm.generation_gate.judge_generation`, from
@@ -185,18 +187,74 @@ def _usage_report(
     )
 
 
+#: Runtime attribute holding the usage :func:`attach_reported_usage` recorded.
+_REPORTED_USAGE_ATTR = "_kestrel_reported_usage"
+
+
+def attach_reported_usage(
+    error: BaseException, usage: Optional[LLMResponse],
+) -> BaseException:
+    """Record on ``error`` the usage its provider reported for the attempt
+    ``error`` ends, and return ``error``.
+
+    For an error that is not an :class:`IncompleteGenerationError` and so has
+    no :attr:`~IncompleteGenerationError.usage` of its own: the cancellation
+    an inactivity watchdog causes and wraps in its timeout, or any other
+    failure after the provider's terminal response reported the attempt's
+    counts (#4198). The error itself is unchanged and is raised as itself.
+    ``None`` records nothing, so usage the provider never reported stays
+    unknown, never zero.
+    """
+    if isinstance(usage, LLMResponse):
+        setattr(error, _REPORTED_USAGE_ATTR, usage)
+    return error
+
+
 def reported_usage(error: BaseException) -> Optional[LLMResponse]:
     """The usage reported for the unfinished attempt ``error`` is or wraps.
 
     An adapter that refuses an unfinished generation itself raises before it
     returns a response, so the attempt's usage arrives on the error
     (:attr:`IncompleteGenerationError.usage`) rather than on a response. The
-    LLM service records a failed attempt with it (#3577). ``None`` when
-    ``error`` is not an incomplete generation, or carries no usage.
+    LLM service records a failed attempt with it (#3577). An error of another
+    kind may carry it too (:func:`attach_reported_usage`).
+
+    The first error along the explicit links :func:`incomplete_generation`
+    follows (``__cause__``, ``original_error``, ``underlying``, never
+    ``__context__``) that carries usage decides. A wrapper carrying none,
+    such as the watchdog's timeout around the cancellation it caused,
+    therefore reports the usage of the error it wraps (#4198). An aggregate
+    of several routes' errors reports its verdict's usage and is not read
+    past. ``None`` when no error along the links carries usage.
     """
-    found = incomplete_generation(error)
-    usage = getattr(found, "usage", None)
-    return usage if isinstance(usage, LLMResponse) else None
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        usage = (
+            getattr(current, "usage", None)
+            if isinstance(current, IncompleteGenerationError)
+            else None
+        )
+        if not isinstance(usage, LLMResponse):
+            usage = getattr(current, _REPORTED_USAGE_ATTR, None)
+        if isinstance(usage, LLMResponse):
+            return usage
+        if hasattr(current, "declined_wait"):
+            verdict = getattr(current, INCOMPLETE_ATTEMPT_ATTR, None)
+            usage = getattr(verdict, "usage", None)
+            return usage if isinstance(usage, LLMResponse) else None
+        for link in (
+            current.__cause__,
+            getattr(current, "original_error", None),
+            getattr(current, "underlying", None),
+        ):
+            if isinstance(link, BaseException):
+                pending.append(link)
+    return None
 
 
 #: Runtime attribute on an aggregate of several routes' errors: its
@@ -393,6 +451,7 @@ __all__ = [
     "OutputCapReachedError",
     "OutputCeilingUnknownError",
     "OutputCeilings",
+    "attach_reported_usage",
     "attach_stop_reason",
     "context_window_notice",
     "incomplete_generation",

@@ -4891,8 +4891,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             except ExecutionAuthorityError:
                 raise
             except asyncio.CancelledError:
-                # No usage evidence exists on a non-streaming cancelled call.  Keep
-                # the historical cancellation contract and do not fabricate a row.
+                # A cancelled call is not a failed attempt: keep the historical
+                # cancellation contract and write no row, even when its provider
+                # had already reported usage (#4198). An inactivity watchdog's
+                # timeout is an ordinary failure, recorded below with that usage.
                 raise
             except Exception as exc:
                 if is_execution_control_error(exc):

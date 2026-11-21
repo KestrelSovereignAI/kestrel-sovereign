@@ -1013,6 +1013,10 @@ def request_text_chars(body: Mapping[str, Any]) -> int:
 #: ``continuation.reason`` for a request that continues a chain the turn retired.
 RETIRED = "retired"
 
+#: ``continuation.status`` for a request that continues no snapshot and
+#: crosses no boundary: it sends the caller's messages as they are.
+FRESH = "fresh"
+
 
 def prepare_responses_request(
     *,
@@ -1104,7 +1108,7 @@ def prepare_responses_request(
     ordinary, omitted = _ordinary_items(messages)
     if boundary is None and any(_has_tool_history(message) for message in messages):
         boundary = {"reason": "no_snapshot" if registry is not None else "outside_turn"}
-    continuation = {"status": "fresh"}
+    continuation = {"status": FRESH}
     if boundary is not None:
         continuation = {"status": "boundary", **boundary, "omitted_tool_items": omitted}
         logger.warning(
@@ -1560,6 +1564,7 @@ TURN_ENDED = "turn_ended"  # the turn's registry expired before the reply
 
 
 __all__ = [
+    "FRESH",
     "OUTSIDE_TURN",
     "RESPONSES_API",
     "RESPONSES_FUNCTION_TOOL_MODEL_PATTERN",

@@ -4,7 +4,9 @@
 request exactly as the SDK serialized it and answers ``POST /v1/responses``
 with a server-sent event stream built from a scripted :class:`Reply`, chosen by
 a ``script`` callable from the parsed request body. Both of the adapter's
-entry points stream, so one wire serves both.
+entry points stream, so one wire serves both. Given a ``chat_script``, it also
+answers ``POST /v1/chat/completions`` with a scripted :class:`ChatReply`, as
+an ordinary completion or a stream, whichever the request asked for.
 """
 
 from __future__ import annotations
@@ -19,6 +21,9 @@ import openai
 
 MODEL = "gpt-6.2-sol"
 SERVED = "gpt-6.2-sol-2026-11-01"
+#: A chat-completions default and the dated model the provider says served it.
+CHAT_MODEL = "gpt-4.1-mini"
+CHAT_SERVED = "gpt-4.1-mini-2025-04-14"
 
 
 def reasoning(item_id: str, encrypted: str) -> Dict[str, Any]:
@@ -49,9 +54,11 @@ class Reply:
     the terminal response's usage, omitted when ``None``.
     ``disconnect_after_created`` ends the body with a transport error right
     after ``response.created``; ``disconnect_after_terminal`` ends it with one
-    after the terminal event, before the stream's clean end. ``error_event``
-    sends a stream ``error`` event instead of a terminal response.
-    ``after_terminal`` events follow the terminal one.
+    after the terminal event, before the stream's clean end.
+    ``stall_after_created`` and ``stall_after_terminal`` leave the stream open
+    and silent at the same two points instead. ``error_event`` sends a stream
+    ``error`` event instead of a terminal response. ``after_terminal`` events
+    follow the terminal one.
     """
 
     output: List[Dict[str, Any]]
@@ -68,6 +75,8 @@ class Reply:
     })
     disconnect_after_created: bool = False
     disconnect_after_terminal: bool = False
+    stall_after_created: bool = False
+    stall_after_terminal: bool = False
     error_event: Optional[Dict[str, Any]] = None
     after_terminal: List[Dict[str, Any]] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -89,7 +98,7 @@ class Reply:
 
     def events(self) -> Iterator[Dict[str, Any]]:
         yield {"type": "response.created", "response": self.response("in_progress", [])}
-        if self.disconnect_after_created:
+        if self.disconnect_after_created or self.stall_after_created:
             return
         if self.error_event is not None:
             yield {"type": "error", **self.error_event}
@@ -135,6 +144,105 @@ class _DisconnectingBody(httpx.AsyncByteStream):
         return None
 
 
+class SilentBody(httpx.AsyncByteStream):
+    """Sends ``data``, then never another byte: the stream a provider that
+    stopped answering leaves open. ``stalled`` is set once everything was
+    sent; ``closed`` once the client released the stream."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.stalled = asyncio.Event()
+        self.closed = False
+
+    async def __aiter__(self):
+        yield self._data
+        self.stalled.set()
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@dataclass
+class ChatReply:
+    """One scripted chat completion: its text, its id and the model the
+    provider says served it. ``None`` leaves that field out of the reply.
+
+    ``tool_arguments`` adds a call to ``lookup`` with that argument text.
+    On a stream, ``disconnect_before_usage`` ends the body with a transport
+    error right after the first chunk, and ``disconnect_after_usage`` right
+    after the usage chunk, before ``[DONE]``; ``stall_before_usage`` and
+    ``stall_after_usage`` leave it open and silent at the same two points
+    instead. An ordinary completion is one body, so either disconnect, or
+    either stall, ends it before any of it arrived.
+    """
+
+    text: str
+    response_id: Optional[str]
+    model: Optional[str] = CHAT_SERVED
+    usage: Dict[str, Any] = field(default_factory=lambda: {
+        "prompt_tokens": 40, "completion_tokens": 6, "total_tokens": 46,
+    })
+    tool_arguments: Optional[str] = None
+    disconnect_before_usage: bool = False
+    disconnect_after_usage: bool = False
+    stall_before_usage: bool = False
+    stall_after_usage: bool = False
+
+    @property
+    def disconnects(self) -> bool:
+        return self.disconnect_before_usage or self.disconnect_after_usage
+
+    @property
+    def stalls(self) -> bool:
+        return self.stall_before_usage or self.stall_after_usage
+
+    @property
+    def _finish_reason(self) -> str:
+        return "stop" if self.tool_arguments is None else "tool_calls"
+
+    def _identified(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        named = {"id": self.response_id, "model": self.model}
+        return {**{key: value for key, value in named.items() if value is not None}, **body}
+
+    def completion(self) -> Dict[str, Any]:
+        message: Dict[str, Any] = {"role": "assistant", "content": self.text}
+        if self.tool_arguments is not None:
+            message["tool_calls"] = [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": self.tool_arguments},
+            }]
+        return self._identified({
+            "object": "chat.completion", "created": 0, "usage": self.usage,
+            "choices": [{"index": 0, "finish_reason": self._finish_reason, "message": message}],
+        })
+
+    def chunks(self) -> bytes:
+        deltas: List[Dict[str, Any]] = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": self.text},
+                          "finish_reason": None}]},
+        ]
+        if self.tool_arguments is not None:
+            deltas.append({"choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": self.tool_arguments},
+            }]}}]})
+        if not (self.disconnect_before_usage or self.stall_before_usage):
+            deltas += [
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": self._finish_reason}]},
+                {"choices": [], "usage": self.usage},
+            ]
+        data = "".join(
+            "data: " + json.dumps(self._identified({
+                "object": "chat.completion.chunk", "created": 0, **delta,
+            })) + "\n\n"
+            for delta in deltas
+        )
+        if not (self.disconnects or self.stalls):
+            data += "data: [DONE]\n\n"
+        return data.encode()
+
+
 def sse(events: Iterator[Dict[str, Any]]) -> bytes:
     chunks = []
     for sequence, event in enumerate(events):
@@ -161,17 +269,25 @@ class _StallingBody(httpx.AsyncByteStream):
 
 
 class ResponsesWire:
-    """The fake server. ``script(body, index)`` picks each request's reply.
+    """The fake server. ``script(body, index)`` picks each request's reply,
+    and ``chat_script(body, index)`` each chat completion's, if given.
 
     ``issued`` is the ``(model, response id)`` of every reply it sent, in
-    order: what each call was actually served.
+    order, on either endpoint: what each call was actually served.
+    ``silent`` holds the body of each reply that went silent, in order.
     """
 
-    def __init__(self, script: Callable[[Dict[str, Any], int], Reply]) -> None:
+    def __init__(
+        self,
+        script: Callable[[Dict[str, Any], int], Reply],
+        chat_script: Optional[Callable[[Dict[str, Any], int], ChatReply]] = None,
+    ) -> None:
         self.script = script
+        self.chat_script = chat_script
         self.requests: List[httpx.Request] = []
         self.unexpected: List[str] = []
         self.issued: List[Any] = []
+        self.silent: List[SilentBody] = []
 
     def bodies(self, path: str = "/v1/responses") -> List[Dict[str, Any]]:
         return [json.loads(r.content) for r in self.requests if r.url.path == path]
@@ -188,6 +304,23 @@ class ResponsesWire:
         if request.url.path == "/v1/embeddings":
             # No embedding model: stored rows stay searchable by keyword only.
             return httpx.Response(404, json={"error": {"message": "not found"}})
+        if request.url.path == "/v1/chat/completions" and self.chat_script is not None:
+            body = json.loads(request.content)
+            chat = self.chat_script(body, len(self.bodies("/v1/chat/completions")) - 1)
+            self.issued.append((chat.model, chat.response_id))
+            if body.get("stream"):
+                headers, data = {"content-type": "text/event-stream"}, chat.chunks()
+            else:
+                headers, data = {"content-type": "application/json"}, b""
+                if not (chat.disconnects or chat.stalls):
+                    data = json.dumps(chat.completion()).encode()
+            if chat.disconnects:
+                return httpx.Response(200, headers=headers, stream=_DisconnectingBody(data))
+            if chat.stalls:
+                silent = SilentBody(data)
+                self.silent.append(silent)
+                return httpx.Response(200, headers=headers, stream=silent)
+            return httpx.Response(200, headers=headers, content=data)
         if request.url.path != "/v1/responses":
             self.unexpected.append(f"{request.method} {request.url.path}")
             return httpx.Response(404, json={"error": {"message": "not found"}})
@@ -198,6 +331,10 @@ class ResponsesWire:
         headers = {"content-type": "text/event-stream"}
         if reply.disconnect_after_created or reply.disconnect_after_terminal:
             return httpx.Response(200, headers=headers, stream=_DisconnectingBody(data))
+        if reply.stall_after_created or reply.stall_after_terminal:
+            silent = SilentBody(data)
+            self.silent.append(silent)
+            return httpx.Response(200, headers=headers, stream=silent)
         return httpx.Response(200, headers=headers, content=data)
 
     def client(self) -> openai.AsyncOpenAI:

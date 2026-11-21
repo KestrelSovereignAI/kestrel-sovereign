@@ -33,8 +33,11 @@ from kestrel_sdk.tools import ToolResult
 from kestrel_sovereign.features.state_of_mind import StateOfMindFeature
 from kestrel_sovereign.llm.service import LLMService
 from tests.shared.openai_responses_wire import (
+    CHAT_MODEL,
+    CHAT_SERVED,
     MODEL,
     SERVED,
+    ChatReply,
     Reply,
     ResponsesWire,
     StallingWire,
@@ -121,7 +124,7 @@ def _openai_route(agent, wire: ResponsesWire, model: str = CONFIGURED) -> dict:
 
 
 @contextlib.asynccontextmanager
-async def _agent(tmp_path, monkeypatch, wire: ResponsesWire, *, name: str):
+async def _agent(tmp_path, monkeypatch, wire: ResponsesWire, *, name: str, configured: str = CONFIGURED):
     from tests.shared.booted_agent import booted_agent
 
     async with booted_agent(
@@ -129,7 +132,7 @@ async def _agent(tmp_path, monkeypatch, wire: ResponsesWire, *, name: str):
         features={"StateOfMindFeature"},
     ) as agent:
         service = agent.llm_service
-        provider = _openai_route(agent, wire)
+        provider = _openai_route(agent, wire, configured)
         monkeypatch.setattr(service, "providers", [provider])
         monkeypatch.setattr(service, "config", {
             **(service.config or {}), "route_priority": [provider["name"]],
@@ -598,6 +601,7 @@ async def test_timeout_keeps_created_identity(tmp_path, monkeypatch, llm_rows, p
         assert (served.get("model"), served.get("response_id")) == (SERVED, "resp_stall"), row
         # No terminal response arrived: the usage is unknown, never zero.
         assert (row["input_tokens"], row["output_tokens"]) == (None, None)
+        assert row["usage_available"] is False
 
 
 @PATHS
@@ -627,3 +631,227 @@ async def test_a_disconnect_after_the_terminal_event_records_its_usage(
         else:
             assert counts == (None, None, None)
             assert row["usage_available"] is False
+
+
+@PATHS
+async def test_terminal_stall_keeps_reported_usage(tmp_path, monkeypatch, llm_rows, path):
+    """The terminal response reported its usage and the stream then went
+    silent before its clean end, so the inactivity watchdog cancelled it
+    (#4205). The failed attempt's row keeps the usage the provider reported
+    and the identity it gave; ``test_timeout_keeps_created_identity`` is the
+    same stall before any terminal response, whose usage stays unknown."""
+    from kestrel_sovereign.agent.orchestrator_engine import LLMCallWatchdog
+
+    monkeypatch.setattr(LLMCallWatchdog, "for_call", classmethod(
+        lambda cls, *args, **kwargs: cls(1.0, attempt_timeout=lambda route: 1.0)))
+    wire = ResponsesWire(lambda body, index: Reply(
+        [message("msg", "Done.")], "resp_terminal_stall", stall_after_terminal=True,
+    ))
+    async with _agent(tmp_path, monkeypatch, wire, name="TerminalStall") as agent:
+        await _failed_turn(agent, path, f"terminal-stall-{path}")
+
+    assert wire.silent and all(body.closed for body in wire.silent)
+    rows = [row for row in llm_rows if row["provider"] == "openai:api" and row["model"] == MODEL]
+    assert rows, llm_rows
+    for row in rows:
+        assert row["success"] is False
+        served = row["metadata"]["provider_served"]
+        assert (served["model"], served["response_id"]) == (SERVED, "resp_terminal_stall")
+        counts = (row["input_tokens"], row["output_tokens"], row["cache_read_input_tokens"])
+        assert counts == (100, 30, 20), counts
+        assert row["usage_available"] is True
+
+
+# ---------------------------------------------------------------------------
+# A Sol tool turn, then the configured chat-completions default (#4205)
+# ---------------------------------------------------------------------------
+
+
+def _chat_answer(body: Dict[str, Any], _index: int) -> ChatReply:
+    """The default model knows the value only if the request carried it."""
+    seen = _token_in(json.dumps(body))
+    text = f"It was {seen}." if seen else "I do not know of any value."
+    return ChatReply(text, f"chatcmpl-{uuid.uuid4().hex[:10]}")
+
+
+@PATHS
+async def test_a_sol_tool_turn_then_the_chat_default_in_one_session(
+    tmp_path, monkeypatch, fresh_token, llm_rows, path,
+):
+    """Turn one asks for ``gpt-6.2-sol`` and runs a real tool call on the
+    Responses API; turn two, in the same session, is served by the agent's
+    configured non-Sol default on chat completions. Turn two replays nothing
+    opaque: the value reaches it only as turn one's answer in the session's
+    history. Every row records the model and response id its own reply named,
+    and the configured preference is unchanged."""
+    wire = ResponsesWire(_tool_turn_script, chat_script=_chat_answer)
+    session = f"sol-then-default-{path}"
+    async with _agent(tmp_path, monkeypatch, wire, name="SolThenDefault", configured=CHAT_MODEL) as agent:
+        preference = agent.llm_service.get_model_preference()
+        first = await _turn(agent, path, "How are you?", session, OVERRIDE)
+        responses_sent = len(wire.raw())
+        rows_one = len(llm_rows)
+        answer = await _turn(agent, path, QUESTION, session)
+        assert agent.llm_service.get_model_preference() == preference
+
+    assert not wire.unexpected
+    assert fresh_token in first
+    # Turn one's own tool call ran on the Responses API.
+    turn_one = [json.loads(body) for body in wire.raw()]
+    assert any(
+        fresh_token in output for body in turn_one for output in _outputs(body)
+    ), "turn one never ran its tool"
+    assert all(body["model"] == MODEL for body in turn_one)
+    # Turn two never touched the Responses API.
+    assert len(wire.raw()) == responses_sent
+    chats = wire.raw("/v1/chat/completions")
+    assert chats, "turn two was not served by the chat-completions default"
+    for raw in chats:
+        body = json.loads(raw)
+        assert body["model"] == CHAT_MODEL
+        assert b"ENC-" not in raw and b"encrypted_content" not in raw
+        assert b'"function_call"' not in raw and b'"reasoning"' not in raw
+        assert all(m["role"] != "tool" and not m.get("tool_calls") for m in body["messages"])
+    question = [json.loads(raw) for raw in chats if QUESTION.encode() in raw]
+    assert question
+    carriers = [
+        m["role"] for body in question for m in body["messages"]
+        if fresh_token in json.dumps(m.get("content"))
+    ]
+    assert carriers and set(carriers) == {"assistant"}, carriers
+    assert fresh_token in answer
+
+    served_rows = [row for row in llm_rows if "provider_served" in (row.get("metadata") or {})]
+    assert [
+        (row["metadata"]["provider_served"].get("model"), row["metadata"]["provider_served"].get("response_id"))
+        for row in served_rows
+    ] == wire.issued
+    turn_two = [row for row in llm_rows[rows_one:] if row in served_rows]
+    assert turn_two
+    for row in turn_two:
+        served = row["metadata"]["provider_served"]
+        assert (row["model"], served["api"], served["model"]) == (CHAT_MODEL, "chat_completions", CHAT_SERVED)
+        assert served["continuation"] == {"status": "fresh"}
+        assert row["success"] is True
+    for row in served_rows[: len(served_rows) - len(turn_two)]:
+        assert row["model"] == MODEL and row["metadata"]["provider_served"]["api"] == "responses"
+
+
+@PATHS
+async def test_a_cancelled_attempt_is_not_recorded_as_failed_after_its_usage_arrived(
+    tmp_path, monkeypatch, llm_rows, path,
+):
+    """The caller cancels the turn after the terminal response reported its
+    usage and before the stream ended. The adapter's cancellation carries
+    that usage (``test_every_exit_keeps_what_the_provider_reported``), but a
+    cancelled attempt is not a failed one on either path (#3938): the
+    cancellation is re-raised and no row is written for the attempt."""
+    import asyncio
+
+    wire = ResponsesWire(lambda body, index: Reply(
+        [message("msg", "Done.")], "resp_cancelled", stall_after_terminal=True,
+    ))
+    async with _agent(tmp_path, monkeypatch, wire, name="Cancelled") as agent:
+        turn = asyncio.create_task(_turn(agent, path, "How are you?", f"cancelled-{path}", OVERRIDE))
+
+        async def silent():
+            while not wire.silent:
+                await asyncio.sleep(0.01)
+            await wire.silent[0].stalled.wait()
+
+        try:
+            await asyncio.wait_for(silent(), timeout=10)
+        finally:
+            turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    assert wire.silent[0].closed
+    assert [row for row in llm_rows if row["model"] == MODEL] == []
+
+
+@pytest.mark.parametrize("path, failure", [
+    ("invoke", "protocol_error"),
+    ("stream", "protocol_error"),
+    ("stream", "transport_after_usage"),
+])
+async def test_a_failed_chat_default_turn_records_what_its_reply_reported(
+    tmp_path, monkeypatch, llm_rows, path, failure,
+):
+    """On the configured chat-completions default, the reply named its model
+    and id and reported its usage before the attempt failed: with tool
+    arguments that are not JSON, or with a stream that broke after its usage
+    chunk (#4205). The failed attempt's row keeps all of it, never the
+    requested alias in place of the served model."""
+    usage = {
+        "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150,
+        "prompt_tokens_details": {"cached_tokens": 20},
+    }
+    ending = (
+        {"tool_arguments": '{"key": '} if failure == "protocol_error"
+        else {"disconnect_after_usage": True}
+    )
+    wire = ResponsesWire(
+        lambda body, index: Reply([], "unused"),
+        chat_script=lambda body, index: ChatReply(
+            "Partial.", f"chatcmpl-failed-{index}", usage=usage, **ending,
+        ),
+    )
+    async with _agent(tmp_path, monkeypatch, wire, name="ChatFailed", configured=CHAT_MODEL) as agent:
+        with contextlib.suppress(Exception):
+            await _turn(agent, path, "How are you?", f"chat-failed-{path}-{failure}")
+
+    assert not wire.unexpected and not wire.raw(), "the chat default reached the Responses API"
+    rows = [row for row in llm_rows if row["model"] == CHAT_MODEL]
+    assert rows, llm_rows
+    assert [
+        (row["metadata"]["provider_served"]["model"], row["metadata"]["provider_served"]["response_id"])
+        for row in rows
+    ] == wire.issued
+    for row in rows:
+        assert row["success"] is False
+        served = row["metadata"]["provider_served"]
+        assert (served["api"], served["model"]) == ("chat_completions", CHAT_SERVED)
+        assert served["continuation"] == {"status": "fresh"}
+        counts = (row["input_tokens"], row["output_tokens"], row["cache_read_input_tokens"])
+        assert counts == (100, 30, 20), counts
+        assert row["usage_available"] is True
+
+
+@PATHS
+async def test_a_cancelled_chat_default_attempt_is_not_recorded_as_failed(
+    tmp_path, monkeypatch, llm_rows, path,
+):
+    """The caller cancels a turn on the configured chat-completions default
+    once its reply went silent: on a stream, after the usage chunk and before
+    ``[DONE]``, so the adapter's cancellation carries that usage
+    (``test_every_chat_exit_keeps_what_the_provider_reported``). As on the
+    Responses route, a cancelled attempt is not a failed one (#3938, #4205):
+    the cancellation is re-raised and no row is written for the attempt."""
+    import asyncio
+
+    wire = ResponsesWire(
+        lambda body, index: Reply([], "unused"),
+        chat_script=lambda body, index: ChatReply("Done.", "chatcmpl-cancelled", stall_after_usage=True),
+    )
+    async with _agent(tmp_path, monkeypatch, wire, name="ChatCancelled", configured=CHAT_MODEL) as agent:
+        turn = asyncio.create_task(_turn(agent, path, "How are you?", f"chat-cancelled-{path}"))
+
+        async def silent():
+            while not wire.silent:
+                await asyncio.sleep(0.01)
+            await wire.silent[0].stalled.wait()
+
+        try:
+            await asyncio.wait_for(silent(), timeout=10)
+        finally:
+            turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    assert not wire.raw(), "the chat default reached the Responses API"
+    [request] = wire.bodies("/v1/chat/completions")
+    # Only a stream had sent its usage chunk before going silent.
+    assert bool(request.get("stream")) is (path == "stream")
+    assert wire.silent[0].closed
+    assert [row for row in llm_rows if row["model"] == CHAT_MODEL] == []

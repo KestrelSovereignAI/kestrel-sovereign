@@ -70,19 +70,22 @@ except ImportError:  # pragma: no cover - compatibility with SDK v4 checkouts.
 from .call_progress import report_call_progress
 from .gpt5_overlay import prepend_gpt5_overlay
 from .openai_responses import (
+    FRESH,
     ResponsesEventState,
     ResponsesRoute,
     ResponsesStreamInterrupted,
     prepare_responses_request,
     requires_responses_api,
 )
-from .provider_served import attach_provider_served, provider_served
+from .provider_served import ProviderServed, attach_provider_served, provider_served
 from .model_metadata import ModelInfo, ModelCategory
 from .output_ceiling import (
+    attach_reported_usage,
     attach_stop_reason,
     join_output_ceiling_notice,
     output_ceiling_notice_chunk,
     output_limit_cut_notice,
+    reported_usage,
 )
 from .retry import with_retry
 from kestrel_sovereign.execution_custody import (
@@ -98,6 +101,9 @@ logger = logging.getLogger(__name__)
 #: Only these, after the terminal response arrived, lose a finished stream
 #: (#4198); anything else, a parsing bug included, is raised as itself.
 _STREAM_TRANSPORT_ERRORS = (openai.APIConnectionError, httpx.TransportError, httpx.StreamError)
+
+#: The value ``provider_served.api`` takes for a chat-completions call.
+CHAT_COMPLETIONS_API = "chat_completions"
 
 #: The chat-completions ``finish_reason`` for a response cut at the output
 #: limit (OpenRouter forwards every upstream's cut as this value too).
@@ -267,14 +273,70 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _protocol_failure_usage(usage: Any, stop_reason: Optional[str]) -> Optional[LLMResponse]:
-    """Retain only reported token counts when native response parsing fails."""
+def _chat_completion_identified(
+    served: Optional[ProviderServed], source: Any,
+) -> Optional[ProviderServed]:
+    """``served`` with the model and response id a chat-completions reply, or
+    one chunk of its stream, names (#4198); ``None`` stays ``None``."""
+    if served is None:
+        return None
+    return served.with_response(
+        model=getattr(source, "model", None), response_id=getattr(source, "id", None),
+    )
+
+
+def _reported_chat_usage(
+    usage: Any, stop_reason: Optional[str], served: Optional[ProviderServed],
+) -> Optional[LLMResponse]:
+    """The token counts a chat-completions reply reported, never its text,
+    for an attempt that failed after they arrived, with the provider's
+    identification of the reply (#4198). ``None`` when it reported none:
+    unknown, never zero."""
     if usage is None:
         return None
     inputs, outputs, total, writes, reads = _normalized_openai_usage(usage)
-    return LLMResponse(input_tokens=inputs, output_tokens=outputs, total_tokens=total,
+    return attach_provider_served(LLMResponse(
+        input_tokens=inputs, output_tokens=outputs, total_tokens=total,
         cache_creation_input_tokens=writes, cache_read_input_tokens=reads,
-        stop_reason=stop_reason)
+        stop_reason=stop_reason,
+    ), served)
+
+
+def _retain_reported(
+    error: BaseException,
+    *,
+    served: Optional[ProviderServed],
+    usage: Optional[LLMResponse],
+) -> None:
+    """Record on ``error`` what its provider had reported by the time it was
+    raised, keeping whatever an error it wraps already carries (#4198).
+
+    ``served`` is the provider's identification of its reply, ``None`` while
+    it had given none; ``usage`` the counts it reported, ``None`` while it had
+    reported none, which stays unknown, never zero. Synchronous, so a caller
+    that re-raises ``error`` itself, cancellation included, does so with no
+    await in between.
+    """
+    if served is not None and provider_served(error) is None:
+        attach_provider_served(error, served)
+    if reported_usage(error) is None:
+        attach_reported_usage(error, usage)
+
+
+def _log_chat_failure(error: Exception, *, streaming: bool) -> None:
+    """Log a failed chat-completions call by its kind, never its text."""
+    during = " during streaming with tools" if streaming else ""
+    kind = type(error).__name__
+    if isinstance(error, openai.RateLimitError):
+        logger.error("OpenAI rate limit exceeded%s: %s", during, kind)
+    elif isinstance(error, openai.APIConnectionError):
+        logger.error("OpenAI connection error%s: %s", during, kind)
+    elif isinstance(error, openai.APIError):
+        logger.error("OpenAI API error%s: %s", during, kind)
+    elif streaming:
+        logger.error("OpenAI streaming with tools failed: %s", kind)
+    else:
+        logger.error("OpenAI adapter failed: %s", kind)
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -587,6 +649,9 @@ class OpenAIAdapter(LLMAdapter):
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         reported_native_usage = None
         finish_reason = None
+        # The provider's identification of its chat-completions reply, from
+        # the moment the reply arrives (#4198).
+        served: Optional[ProviderServed] = None
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -642,6 +707,7 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
+            served = _chat_completion_identified(self._chat_completion_served(), response)
             reported_native_usage = getattr(response, "usage", None)
             choice = _single_choice(response.choices)
             message = choice.message
@@ -690,7 +756,7 @@ class OpenAIAdapter(LLMAdapter):
             if notice is not None:
                 content = join_output_ceiling_notice(content, notice)
 
-            return attach_stop_reason(LLMResponse(
+            return attach_provider_served(attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
@@ -699,27 +765,27 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), finish_reason)
+            ), finish_reason), served)
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
                 raise
-            raise GenerationProtocolError(
-                _protocol_failure_usage(reported_native_usage, finish_reason)
-            ) from error
-        except openai.RateLimitError as e:
-            logger.error("OpenAI rate limit exceeded: %s", type(e).__name__)
-            raise
-        except openai.APIConnectionError as e:
-            logger.error("OpenAI connection error: %s", type(e).__name__)
-            raise
-        except openai.APIError as e:
-            logger.error("OpenAI API error: %s", type(e).__name__)
-            raise
-        except Exception as e:
-            if is_execution_control_error(e):
-                raise
-            logger.error("OpenAI adapter failed: %s", type(e).__name__)
+            failure = GenerationProtocolError(
+                _reported_chat_usage(reported_native_usage, finish_reason, served)
+            )
+            attach_provider_served(failure, served)
+            raise failure from error
+        except BaseException as error:
+            # Every other exit keeps what the reply had reported (#4198).
+            # BaseException: a caller cancels a call too. Everything here is
+            # synchronous, and the original error is always re-raised.
+            if not is_execution_control_error(error):
+                _retain_reported(
+                    error, served=served,
+                    usage=_reported_chat_usage(reported_native_usage, finish_reason, served),
+                )
+                if isinstance(error, Exception):
+                    _log_chat_failure(error, streaming=False)
             raise
 
     async def get_streaming_response(
@@ -780,6 +846,9 @@ class OpenAIAdapter(LLMAdapter):
         retain_native_execution_http_client_close(getattr(client, "_client", None))
         reported_native_usage = None
         finish_reason = None
+        # The provider's identification of its chat-completions reply, from
+        # the stream's first chunk on; ``None`` until one arrives (#4198).
+        served: Optional[ProviderServed] = None
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -863,6 +932,9 @@ class OpenAIAdapter(LLMAdapter):
             try:
                 async for chunk in stream:
                     report_call_progress()
+                    served = _chat_completion_identified(
+                        served or self._chat_completion_served(), chunk,
+                    )
                     # Extract usage from final chunk (OpenAI sends it with stream_options)
                     if hasattr(chunk, 'usage') and chunk.usage:
                         reported_native_usage = chunk.usage
@@ -1016,7 +1088,7 @@ class OpenAIAdapter(LLMAdapter):
                 _raw["reasoning_content"] = reasoning_content
             if call_cost is not None:
                 _raw["cost"] = call_cost
-            yield attach_stop_reason(LLMResponse(
+            yield attach_provider_served(attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=parsed_tool_calls,
                 raw=_raw or None,
@@ -1025,26 +1097,54 @@ class OpenAIAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            ), finish_reason)
+            ), finish_reason), served or self._chat_completion_served())
 
         except LLMProtocolError as error:
             if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
                 raise
-            raise GenerationProtocolError(
-                _protocol_failure_usage(reported_native_usage, finish_reason)
-            ) from error
-        except openai.RateLimitError as e:
-            logger.error("OpenAI rate limit exceeded during streaming with tools: %s", type(e).__name__)
+            failure = GenerationProtocolError(
+                _reported_chat_usage(reported_native_usage, finish_reason, served)
+            )
+            attach_provider_served(failure, served)
+            raise failure from error
+        except BaseException as error:
+            # Every other exit keeps what the stream had reported (#4198):
+            # a transport failure, the inactivity watchdog's or a caller's
+            # cancellation, a consumer closing the stream, any other error.
+            # Everything here is synchronous, and the original error is
+            # always re-raised.
+            if not is_execution_control_error(error):
+                _retain_reported(
+                    error, served=served,
+                    usage=_reported_chat_usage(reported_native_usage, finish_reason, served),
+                )
+                if isinstance(error, Exception):
+                    _log_chat_failure(error, streaming=True)
             raise
-        except openai.APIConnectionError as e:
-            logger.error("OpenAI connection error during streaming with tools: %s", type(e).__name__)
-            raise
-        except openai.APIError as e:
-            logger.error("OpenAI API error during streaming with tools: %s", type(e).__name__)
-            raise
-        except Exception as e:
-            logger.error("OpenAI streaming with tools failed: %s", type(e).__name__)
-            raise
+
+    def _chat_completion_served(self) -> Optional[ProviderServed]:
+        """The evidence a native chat-completions call starts from (#4198).
+
+        The reply says which model served it and the id it gave the response
+        (:func:`_chat_completion_identified`); the model may be a dated
+        snapshot of the alias requested, and a value the reply does not name
+        stays unknown, never the requested model. A chat-completions request
+        replays no captured snapshot, so its continuation is always
+        ``fresh`` and nothing is stored for its reply.
+
+        The identification is taken the moment the reply, or a stream's first
+        chunk, arrives. Every exit after that keeps it, and the usage once the
+        reply reported it: the response, a broken protocol's
+        :class:`~.completion_protocol.GenerationProtocolError`, and any other
+        error, cancellation and a closed stream included
+        (:func:`_retain_reported`). An exit before then carries neither.
+
+        ``None`` off the native OpenAI route: a compatible server's reply
+        fields are not the provider's own identification of what it served.
+        """
+        if not self._native_openai:
+            return None
+        return ProviderServed(api=CHAT_COMPLETIONS_API, continuation={"status": FRESH})
 
     def _responses_route(self, client: Any) -> ResponsesRoute:
         """The route a Responses continuation snapshot is bound to: this
@@ -1091,16 +1191,23 @@ class OpenAIAdapter(LLMAdapter):
         """Run one Responses API call; yield what a stream shows, then one
         terminal :class:`LLMResponse` (see :mod:`.openai_responses`).
 
-        Every error raised after the provider identified the response carries
-        that identification (:func:`~.provider_served.provider_served`),
-        cancellation included: the inactivity watchdog's timeout wraps the
-        cancelled error, so the identification reaches the failed attempt's
-        row. The evidence is attached before the error is re-raised, with no
-        await in between, and the error is always re-raised. A failed or
-        unfinished response's error also carries its usage, and so does a
-        transport failure after the terminal response arrived
-        (:class:`~.openai_responses.ResponsesStreamInterrupted`); with no
-        terminal response the usage is unknown, never zero.
+        Every exit keeps what the provider had reported by then. An error
+        raised after the provider identified the response carries that
+        identification (:func:`~.provider_served.provider_served`), and one
+        raised after the terminal response arrived carries the usage it
+        reported (:func:`~.output_ceiling.reported_usage`): a failed or
+        unfinished response, a transport failure before the stream's clean
+        end (:class:`~.openai_responses.ResponsesStreamInterrupted`), a
+        cancellation (the caller's, or the inactivity watchdog's, whose
+        timeout wraps the cancelled error so both reach the failed attempt's
+        row, #4198) and any other error. With no terminal response the usage
+        is unknown, never zero. The evidence is attached before the error is
+        re-raised, with no await in between, and the error is always
+        re-raised, cancellation included. A consumer that closes the stream
+        receives nothing more; a ``prefix_mismatch`` the terminal response
+        reported has already ended its chain
+        (:meth:`~.openai_responses.ResponsesEventState.observe`), and no
+        snapshot is kept for a reply that was never returned.
 
         Tools reach this route through the typed ``tools`` parameter only:
         ``extra_body["tools"]`` on a native ``gpt-6.2-sol`` request is refused
@@ -1156,8 +1263,9 @@ class OpenAIAdapter(LLMAdapter):
             raise failure from error
         except BaseException as error:
             # BaseException: the inactivity watchdog stops a silent stream by
-            # cancelling it. Everything here is synchronous, and the original
-            # error (cancellation included) is always re-raised.
+            # cancelling it, and a caller may cancel or close it too.
+            # Everything here is synchronous, and the original error
+            # (cancellation included) is always re-raised.
             if is_execution_control_error(error):
                 raise
             if (
@@ -1168,8 +1276,11 @@ class OpenAIAdapter(LLMAdapter):
                 raise ResponsesStreamInterrupted(
                     model=model, usage=state.reported_usage(), served=state.served,
                 ) from error
-            if state.observed and provider_served(error) is None:
-                attach_provider_served(error, state.served)
+            _retain_reported(
+                error,
+                served=state.served if state.observed else None,
+                usage=attach_provider_served(state.reported_usage(), state.served),
+            )
             raise
         for chunk in chunks:
             yield chunk

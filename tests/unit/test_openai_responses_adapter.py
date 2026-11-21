@@ -1808,3 +1808,465 @@ async def test_a_prefix_mismatch_and_a_model_change_report_one_reason(stream):
     assert served.continuation["chain_ended"] == parent_reason == "prefix_mismatch"
     assert served.continuation["expected_model"] == SERVED
     assert served.snapshot == {"stored": False, "reason": "prefix_mismatch"}
+
+
+# ---------------------------------------------------------------------------
+# #4205: every exit keeps what the provider reported, and nothing more
+# ---------------------------------------------------------------------------
+
+#: How the continuation's call ends, and whether its terminal response had
+#: arrived first. A consumer can close only a stream.
+_EXITS = {
+    "completed": True,
+    "transport_before_terminal": False,
+    "transport_after_terminal": True,
+    "watchdog_before_terminal": False,
+    "watchdog_after_terminal": True,
+    "caller_cancel_before_terminal": False,
+    "caller_cancel_after_terminal": True,
+    "other_error_before_terminal": False,
+    "other_error_after_terminal": True,
+    "consumer_close": False,
+}
+_EXIT_CASES = [
+    pytest.param(stream, exit_, id=f"{'stream' if stream else 'invoke'}-{exit_}")
+    for stream in (False, True)
+    for exit_ in _EXITS
+    if stream or exit_ != "consumer_close"
+]
+
+#: The wire's default usage, as the service counts it (cached input apart).
+_REPORTED = (100, 30, 20)
+
+
+def _exit_reply(exit_: str, mismatch: bool) -> Reply:
+    ending = {
+        "transport_before_terminal": {"disconnect_after_created": True},
+        "transport_after_terminal": {"disconnect_after_terminal": True},
+        "watchdog_before_terminal": {"stall_after_created": True},
+        "watchdog_after_terminal": {"stall_after_terminal": True},
+        "caller_cancel_before_terminal": {"stall_after_created": True},
+        "caller_cancel_after_terminal": {"stall_after_terminal": True},
+        "other_error_after_terminal": {"after_terminal": [{"type": "response.trailing"}]},
+        "consumer_close": {"stall_after_terminal": True},
+    }.get(exit_, {})
+    return Reply(
+        [message("msg_2", "It is 42.")], "resp_2",
+        extra=dict(_MISMATCH) if mismatch else {}, **ending,
+    )
+
+
+async def _until_silent(wire: ResponsesWire) -> None:
+    """Return once the reply was sent in full and the stream went silent."""
+    async def silent():
+        while not wire.silent:
+            await asyncio.sleep(0)
+        await wire.silent[-1].stalled.wait()
+
+    await asyncio.wait_for(silent(), timeout=10)
+
+
+async def _run_to_exit(
+    adapter, client, wire, messages, *, stream: bool, exit_: str, model=MODEL, tools=TOOLS,
+):
+    """Run the call to ``exit_``; return the response, or the error it raised.
+
+    ``exit_`` is ``completed``, ``consumer_close``, or starts with
+    ``watchdog`` or ``caller_cancel`` (which wait for the wire's reply to go
+    silent); anything else is a call expected to raise an ``Exception``.
+    """
+    if exit_ == "consumer_close":
+        events = adapter.get_streaming_response_with_tools(
+            client=client, model=model, messages=messages, tools=tools,
+        )
+        async for item in events:
+            if isinstance(item, str):
+                break
+        await events.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await events.__anext__()
+        return None
+    if exit_ == "completed":
+        response, _ = await _call(adapter, client, messages, stream=stream, model=model, tools=tools)
+        return response
+    if exit_.startswith("watchdog"):
+        # The inactivity watchdog's own mechanism: a deadline it reschedules,
+        # here expired the moment the stream goes silent.
+        with pytest.raises(TimeoutError) as raised:
+            async with asyncio.timeout(None) as deadline:
+                async def expire_when_silent():
+                    await _until_silent(wire)
+                    deadline.reschedule(asyncio.get_running_loop().time())
+
+                expiry = asyncio.create_task(expire_when_silent())
+                try:
+                    await _call(adapter, client, messages, stream=stream, model=model, tools=tools)
+                finally:
+                    expiry.cancel()
+        assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+        return raised.value
+    if exit_.startswith("caller_cancel"):
+        caught: List[BaseException] = []
+
+        async def run():
+            try:
+                await _call(adapter, client, messages, stream=stream, model=model, tools=tools)
+            except asyncio.CancelledError as cancelled:
+                caught.append(cancelled)
+                raise
+
+        task = asyncio.create_task(run())
+        await _until_silent(wire)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Re-raised, never swallowed.
+        assert task.cancelled() and len(caught) == 1
+        return caught[0]
+    with pytest.raises(Exception) as raised:
+        await _call(adapter, client, messages, stream=stream, model=model, tools=tools)
+    return raised.value
+
+
+@pytest.mark.parametrize("mismatch", [False, True], ids=["no_mismatch", "prefix_mismatch"])
+@pytest.mark.parametrize("stream, exit_", _EXIT_CASES)
+async def test_every_exit_keeps_what_the_provider_reported(stream, exit_, mismatch, monkeypatch):
+    """A continuation's call ends each way it can, on both entry points.
+
+    Whatever it ends with keeps the provider's identification, which
+    ``response.created`` already gave, and the usage once the terminal
+    response reported it. Before that the usage is unknown, never zero. A
+    ``prefix_mismatch`` the terminal response reported ends the chain
+    whatever follows; one never reported ends nothing. Only a reply that
+    was returned keeps a snapshot, the stream is released on every exit, and
+    a cancellation is re-raised as itself.
+    """
+    import openai
+
+    from kestrel_sovereign.llm.openai_responses import (
+        ResponsesEventState,
+        ResponsesStreamInterrupted,
+    )
+
+    failing_event = {
+        "other_error_before_terminal": "response.output_text.delta",
+        "other_error_after_terminal": "response.trailing",
+    }.get(exit_)
+    if failing_event is not None:
+        original = ResponsesEventState.observe
+
+        def observe(self, event):
+            if getattr(event, "type", None) == failing_event:
+                raise KeyError("a bug handling an event")
+            return original(self, event)
+
+        monkeypatch.setattr(ResponsesEventState, "observe", observe)
+
+    wire = ResponsesWire(lambda body, index: (
+        _first_then_answer(body, index) if index == 0 else _exit_reply(exit_, mismatch)
+    ))
+    adapter = _adapter()
+    async with wire.client() as client:
+        with responses_continuation_scope() as registry:
+            await _call(adapter, client, [SYSTEM, USER], stream=stream)
+            [parent] = registry.snapshots()
+            outcome = await _run_to_exit(adapter, client, wire, _history(), stream=stream, exit_=exit_)
+            live = [snapshot.response_id for snapshot in registry.snapshots()]
+            parent_reason = registry.retirement_of(parent)
+
+    terminal = _EXITS[exit_]
+    if wire.silent:
+        assert wire.silent[-1].closed, "the stream was not released"
+    expected_error = {
+        "transport_before_terminal": openai.APIConnectionError,
+        "transport_after_terminal": ResponsesStreamInterrupted,
+        "other_error_before_terminal": KeyError,
+        "other_error_after_terminal": KeyError,
+    }.get(exit_)
+    if expected_error is not None:
+        assert isinstance(outcome, expected_error), repr(outcome)
+
+    if outcome is not None:
+        served = provider_served(outcome)
+        assert (served.model, served.response_id) == (SERVED, "resp_2")
+        usage = outcome if isinstance(outcome, LLMResponse) else reported_usage(outcome)
+        if terminal:
+            assert usage is not None, "the usage the terminal response reported was lost"
+            counts = (usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens)
+            assert counts == _REPORTED
+        else:
+            assert usage is None, "usage the provider never reported was recorded"
+        assert served.prefix_mismatch == (("rs_1",) if terminal and mismatch else None)
+
+    if terminal and mismatch:
+        assert live == [] and parent_reason == "prefix_mismatch"
+    elif exit_ == "completed":
+        assert live == ["resp_2"] and parent_reason == "superseded"
+    else:
+        # The reply never reached the caller: the chain it would have
+        # extended is kept, untouched, for a retry.
+        assert live == ["resp_1"] and parent_reason is None
+
+
+async def test_a_watchdog_timeout_reports_the_usage_of_the_cancellation_it_wraps():
+    """The service reads a failed attempt's usage through the watchdog's
+    usage-less timeout to the cancellation the adapter recorded it on."""
+    from kestrel_sovereign.llm.call_progress import AttemptInactivityTimeout
+    from kestrel_sovereign.llm.output_ceiling import attach_reported_usage
+
+    counts = LLMResponse(input_tokens=100, output_tokens=30, cache_read_input_tokens=20)
+    cancelled = attach_reported_usage(asyncio.CancelledError(), counts)
+    expired = TimeoutError()
+    expired.__cause__ = cancelled
+    timeout = AttemptInactivityTimeout(provider="openai:api", model=MODEL, phase="inter-chunk", timeout=1.0)
+    timeout.__cause__ = expired
+    assert reported_usage(timeout) is counts
+    # Nothing reported is nothing recorded: never a zero.
+    assert reported_usage(attach_reported_usage(asyncio.CancelledError(), None)) is None
+
+
+# ---------------------------------------------------------------------------
+# #4205: the ordinary chat-completions route names what served it
+# ---------------------------------------------------------------------------
+
+#: A chat-completions request names the alias; its reply the dated model.
+_CHAT_ID = "chatcmpl-synthetic-4198"
+
+
+def _chat_wire(**reply) -> ResponsesWire:
+    from tests.shared.openai_responses_wire import ChatReply
+
+    return ResponsesWire(
+        lambda body, index: Reply([], "unused"),
+        chat_script=lambda body, index: ChatReply("example", **{"response_id": _CHAT_ID, **reply}),
+    )
+
+
+async def test_default_turn_reports_chat_model_and_id_from_upstream():
+    """The ordinary default route's reply says which model served it and the
+    id it gave the response; Kestrel's evidence carries both, never the
+    requested alias in place of the served model."""
+    from tests.shared.openai_responses_wire import CHAT_MODEL, CHAT_SERVED
+
+    wire = _chat_wire()
+    async with wire.client() as client:
+        result = await _adapter().get_response(
+            client=client, model=CHAT_MODEL, messages=[USER], tools=None,
+        )
+    assert [request.url.path for request in wire.requests] == ["/v1/chat/completions"]
+    assert result.content == "example"
+    served = provider_served(result)
+    assert served is not None, "the chat-completions reply has no provider identity"
+    assert (served.api, served.model, served.response_id) == ("chat_completions", CHAT_SERVED, _CHAT_ID)
+    assert served.model != CHAT_MODEL
+    assert served.as_metadata() == {
+        "api": "chat_completions", "model": CHAT_SERVED, "response_id": _CHAT_ID,
+        "continuation": {"status": "fresh"},
+    }
+
+
+async def test_default_streamed_turn_reports_chat_model_and_id_from_upstream():
+    from tests.shared.openai_responses_wire import CHAT_MODEL, CHAT_SERVED
+
+    wire = _chat_wire()
+    async with wire.client() as client:
+        result, items = await _call(_adapter(), client, [USER], stream=True, tools=TOOLS, model=CHAT_MODEL)
+    assert [request.url.path for request in wire.requests] == ["/v1/chat/completions"]
+    assert items[:-1] == ["example"]
+    served = provider_served(result)
+    assert (served.api, served.model, served.response_id) == ("chat_completions", CHAT_SERVED, _CHAT_ID)
+
+
+@STREAM
+async def test_a_chat_reply_that_names_no_model_or_id_leaves_them_unknown(stream):
+    """What the reply does not name stays unknown: never the requested model."""
+    from tests.shared.openai_responses_wire import CHAT_MODEL
+
+    wire = _chat_wire(model=None, response_id=None)
+    async with wire.client() as client:
+        result, _ = await _call(_adapter(), client, [USER], stream=stream, tools=None, model=CHAT_MODEL)
+    served = provider_served(result)
+    assert (served.api, served.model, served.response_id) == ("chat_completions", None, None)
+    assert served.as_metadata() == {"api": "chat_completions", "continuation": {"status": "fresh"}}
+
+
+@STREAM
+async def test_a_compatible_chat_route_claims_no_provider_identity(stream):
+    """Off the native OpenAI route a server's reply fields are not the
+    provider's own identification, so none is recorded."""
+    from tests.shared.openai_responses_wire import CHAT_MODEL
+
+    wire = _chat_wire()
+    async with wire.client() as client:
+        result, _ = await _call(
+            OpenAIAdapter("openai", native_openai=False), client, [USER],
+            stream=stream, tools=None, model=CHAT_MODEL,
+        )
+    assert result.content == "example"
+    assert provider_served(result) is None
+
+
+# ---------------------------------------------------------------------------
+# #4205: every chat-completions exit keeps what the provider reported
+# ---------------------------------------------------------------------------
+
+#: Each way a native chat-completions call ends, and what the provider had
+#: reported by then: whether it had named its reply (the model and the id),
+#: and whether it had reported the usage. A stream names its reply on its
+#: first chunk and reports its usage on its last; an ordinary completion is
+#: one body, so it reports both at once or neither. A consumer can close only
+#: a stream.
+_CHAT_EXITS = {
+    True: {
+        "completed": (True, True),
+        "transport_before_usage": (True, False),
+        "transport_after_usage": (True, True),
+        "watchdog_before_usage": (True, False),
+        "watchdog_after_usage": (True, True),
+        "caller_cancel_before_usage": (True, False),
+        "caller_cancel_after_usage": (True, True),
+        "protocol_error": (True, True),
+        "other_error_before_usage": (True, False),
+        "other_error_after_usage": (True, True),
+        "consumer_close": (True, False),
+    },
+    False: {
+        "completed": (True, True),
+        "transport_before_usage": (False, False),
+        "watchdog_before_usage": (False, False),
+        "caller_cancel_before_usage": (False, False),
+        "protocol_error": (True, True),
+        "other_error_after_usage": (True, True),
+    },
+}
+_CHAT_EXIT_CASES = [
+    pytest.param(stream, exit_, id=f"{'stream' if stream else 'invoke'}-{exit_}")
+    for stream, exits in _CHAT_EXITS.items()
+    for exit_ in exits
+]
+
+#: A chat usage report, and the counts the service records from it: the
+#: cached prompt tokens are counted apart from the other input.
+_CHAT_USAGE = {
+    "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150,
+    "prompt_tokens_details": {"cached_tokens": 20},
+}
+
+
+def _chat_exit_reply(exit_: str) -> Dict[str, Any]:
+    return {
+        "transport_before_usage": {"disconnect_before_usage": True},
+        "transport_after_usage": {"disconnect_after_usage": True},
+        "watchdog_before_usage": {"stall_before_usage": True},
+        "watchdog_after_usage": {"stall_after_usage": True},
+        "caller_cancel_before_usage": {"stall_before_usage": True},
+        "caller_cancel_after_usage": {"stall_after_usage": True},
+        # Tool arguments that are not JSON: the reply breaks the protocol.
+        "protocol_error": {"tool_arguments": '{"key": '},
+        "consumer_close": {"stall_after_usage": True},
+    }.get(exit_, {})
+
+
+@pytest.mark.parametrize("stream, exit_", _CHAT_EXIT_CASES)
+async def test_every_chat_exit_keeps_what_the_provider_reported(stream, exit_, monkeypatch):
+    """A native chat-completions call ends each way it can, on both entry
+    points, over the real SDK and a synthetic transport (#4205).
+
+    Whatever it ends with names the model and the id the reply gave, once
+    the reply gave them, and keeps the usage once the provider reported it:
+    a transport failure, a watchdog or caller cancellation, a broken
+    protocol and any other error included. Before the provider reported
+    them they are unknown, never the requested model and never zero. The
+    stream is released on every exit, and a cancellation is re-raised as
+    itself.
+    """
+    import openai
+
+    from kestrel_sovereign.llm import openai_adapter
+    from tests.shared.openai_responses_wire import CHAT_MODEL, CHAT_SERVED
+
+    failing = {
+        "other_error_before_usage": "feed",
+        "other_error_after_usage": "flush" if stream else None,
+    }.get(exit_)
+    if failing is not None:
+        class FailingSplitter(openai_adapter._ThinkingContentSplitter):
+            pass
+
+        def fail(*_args, **_kwargs):
+            raise KeyError("a bug handling the reply")
+
+        setattr(FailingSplitter, failing, fail)
+        monkeypatch.setattr(openai_adapter, "_ThinkingContentSplitter", FailingSplitter)
+    elif exit_ == "other_error_after_usage":
+        def fail(*_args, **_kwargs):
+            raise KeyError("a bug handling the reply")
+
+        monkeypatch.setattr(openai_adapter, "_split_thinking_from_content", fail)
+
+    if exit_.startswith("transport") and not stream:
+        # An ordinary completion that lost its body is retried; skip the
+        # backoff, keeping each wait a real yield to the loop.
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda _delay, *args, **kwargs: real_sleep(0))
+
+    wire = _chat_wire(usage=_CHAT_USAGE, **_chat_exit_reply(exit_))
+    async with wire.client() as client:
+        outcome = await _run_to_exit(
+            _adapter(), client, wire, [USER], stream=stream, exit_=exit_,
+            model=CHAT_MODEL, tools=TOOLS,
+        )
+
+    assert {request.url.path for request in wire.requests} == {"/v1/chat/completions"}
+    if wire.silent:
+        assert wire.silent[-1].closed, "the stream was not released"
+    expected_error = {
+        "transport_before_usage": openai.APIConnectionError,
+        "transport_after_usage": openai.APIConnectionError,
+        "protocol_error": GenerationProtocolError,
+        "other_error_before_usage": KeyError,
+        "other_error_after_usage": KeyError,
+    }.get(exit_)
+    if expected_error is not None:
+        assert isinstance(outcome, expected_error), repr(outcome)
+    if outcome is None:
+        return
+
+    identified, usage_reported = _CHAT_EXITS[stream][exit_]
+    served = provider_served(outcome)
+    if identified:
+        assert served is not None, "the provider's identification of its reply was lost"
+        assert (served.api, served.model, served.response_id) == (
+            "chat_completions", CHAT_SERVED, _CHAT_ID,
+        )
+        assert served.continuation == {"status": "fresh"}
+    else:
+        assert served is None, "an identity the provider never gave was recorded"
+    usage = outcome if isinstance(outcome, LLMResponse) else reported_usage(outcome)
+    if usage_reported:
+        assert usage is not None, "the usage the provider reported was lost"
+        counts = (usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens)
+        assert counts == (100, 30, 20)
+        assert provider_served(usage) == served
+    else:
+        assert usage is None, "usage the provider never reported was recorded"
+
+
+@STREAM
+async def test_a_chat_failure_keeps_an_observed_zero(stream):
+    """A provider that reported zero tokens reported something: the failed
+    attempt keeps the zero, distinct from the unknown of no report (#4205)."""
+    from tests.shared.openai_responses_wire import CHAT_MODEL
+
+    zero = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    wire = _chat_wire(
+        usage=zero,
+        **({"disconnect_after_usage": True} if stream else {"tool_arguments": "[]"}),
+    )
+    async with wire.client() as client:
+        with pytest.raises(Exception) as raised:
+            await _call(_adapter(), client, [USER], stream=stream, tools=TOOLS, model=CHAT_MODEL)
+    usage = reported_usage(raised.value)
+    assert usage is not None
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (0, 0, 0)
+    assert usage.cache_read_input_tokens is None
