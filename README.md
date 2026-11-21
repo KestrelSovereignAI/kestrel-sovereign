@@ -732,7 +732,8 @@ Detailed documentation is available in the `docs/` directory:
 
 - [Agent Ecosystem](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/core/AGENT_ECOSYSTEM.md)
 - [Agent Economics](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/economics/AGENT_ECONOMICS.md)
-- [Kestrel Constitution](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/principles/KESTREL_CONSTITUTION.md)
+- [Kestrel Constitution, second edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) and [optional Agent Pledge](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/PLEDGE.md)
+- [First-edition Constitution](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/principles/KESTREL_CONSTITUTION.md)
 - [Cryptographic Anchoring](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md)
 - [Decentralized Storage](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/storage/DECENTRALIZED_STORAGE.md)
 - [Multi-Model Support](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/core/MULTI_MODEL_SUPPORT.md)
