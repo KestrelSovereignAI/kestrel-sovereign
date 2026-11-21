@@ -1603,8 +1603,6 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
     from kestrel_sovereign.constitution.workspace_disposition import (
         build_legacy_signed_workspace_disposition, workspace_path_policy_evidence,
     )
-    from kestrel_sovereign.constitution.source_descriptor import CONSTITUTION_SOURCE_DESCRIPTOR_ENV
-    from kestrel_sovereign.constitution.trust_root import SOVEREIGN_TRUST_ROOT_ENV
     from kestrel_sovereign.features.computer_use.policy import load_computer_use_config, path_policy_from_config
     from kestrel_sovereign.identity.signing import get_key_id
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
@@ -1619,8 +1617,6 @@ async def test_native_v2_writers_retain_separately_signed_workspace_scope(tmp_pa
     from tests.shared.environment_guard import unset_environment
 
     unset_environment(monkeypatch, SOVEREIGN_TRUST_ROOT_ENV, CONSTITUTION_SOURCE_DESCRIPTOR_ENV)
-    monkeypatch.delenv(SOVEREIGN_TRUST_ROOT_ENV, raising=False)
-    monkeypatch.delenv(CONSTITUTION_SOURCE_DESCRIPTOR_ENV, raising=False)
     monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read")
     monkeypatch.setenv("KESTREL_AUDIT_MODE", "skip")
     no_network = AsyncMock(side_effect=AssertionError("Native workspace fixture must not invoke any provider"))
