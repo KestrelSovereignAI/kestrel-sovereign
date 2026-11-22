@@ -11,18 +11,34 @@ on:
       - "kestrel_sovereign/data/constitutions/v2/**"
       - "scripts/build_docs_site.py"
       - "scripts/docs_okf.py"
+      - "scripts/docs_verify.py"
       - "tests/docs_site/**"
+      - "tests/unit/test_build_docs_site.py"
+      - "tests/unit/test_docs_site_workflow.py"
+      - ".github/workflows/docs-site.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "kestrel_sovereign/data/constitutions/v2/**"
+      - "scripts/build_docs_site.py"
+      - "scripts/docs_okf.py"
+      - "scripts/docs_verify.py"
+      - "tests/docs_site/**"
+      - "tests/unit/test_build_docs_site.py"
+      - "tests/unit/test_docs_site_workflow.py"
       - ".github/workflows/docs-site.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# Allow one concurrent deploy; don't cancel an in-progress run mid-publish.
+# Hold the publication lock from build through deployment so older builds
+# cannot publish after newer ones. PR checks use independent event/ref groups.
 concurrency:
-  group: pages
+  group: >-
+    ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    && 'pages' || format('docs-checks-{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: false
 
 jobs:
@@ -36,6 +52,9 @@ jobs:
 
       - name: Project OKF corpus -> Starlight site
         run: uv run python scripts/build_docs_site.py build
+
+      - name: Verify corpus selection and PR publication boundary
+        run: uv run pytest tests/unit/test_build_docs_site.py tests/unit/test_docs_site_workflow.py -q
 
       - uses: actions/setup-node@v4
         with:
@@ -53,11 +72,16 @@ jobs:
         run: uv run pytest tests/docs_site/test_constitution_handbook.py -q
 
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:
           path: site/dist
 
   deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
+    permissions:
+      pages: write
+      id-token: write
     runs-on: ubuntu-latest
     environment:
       name: github-pages

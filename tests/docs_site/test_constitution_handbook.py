@@ -131,6 +131,14 @@ def test_home_chooses_second_edition(handbook):
     assert (f"{base}/{FIRST}/", "The Kestrel Constitution") not in choices
 
 
+def test_current_edition_precedes_archive_in_home_and_sidebar(handbook):
+    site, base, _, _ = handbook
+    home = _read_page(site)
+    for sidebar in (False, True):
+        routes = [href.rstrip("/") for href, _, in_sidebar in home.links if sidebar == in_sidebar]
+        assert routes.index(f"{base}/{CURRENT}") < routes.index(f"{base}/{FIRST}")
+
+
 def test_sidebar_chooses_second_edition(handbook):
     site, base, _, _ = handbook
     for slug in ("", FIRST, PROPOSAL):
@@ -153,6 +161,27 @@ def test_search_indexes_second_edition_under_constitution_title(handbook):
     assert "Second constitutional release" in current[0]["content"]
     first = next(entry for entry in fragments if entry["url"].rstrip("/").endswith(f"/{FIRST}"))
     assert first["meta"]["title"] == "The Kestrel Constitution (first edition)"
+
+
+@pytest.mark.parametrize("query", ["Kestrel Constitution", "Constitution"])
+def test_pagefind_queries_prioritize_released_constitution(handbook, query):
+    site, base, _, _ = handbook
+    result = subprocess.run(
+        ["node", str(Path(__file__).with_name("query_pagefind.mjs")),
+         str(site / "dist"), base, query],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    hits = json.loads(result.stdout)
+    urls = [hit["url"].rstrip("/") for hit in hits[query]]
+    current = f"{base}/{CURRENT}"
+    assert current in urls, f"{query!r} must find the released edition in the top five: {hits[query]}"
+    # Leave headroom for corpus growth rather than barely passing at fifth.
+    assert urls.index(current) < 2, f"{query!r} should prioritize the current text: {hits[query]}"
+    assert hits[query][urls.index(current)]["title"] == "The Kestrel Constitution"
+    # Removing the UI adapter must fail too: a passing engine configured only
+    # by the test would say nothing about what the reader's dialog searches.
+    bundles = "\n".join(path.read_text() for path in (site / "dist/_astro").glob("*.js"))
+    assert "released_title" in bundles and "ranking:" in bundles
 
 
 def test_first_edition_bookmark_has_notice_and_direct_current_link(handbook):

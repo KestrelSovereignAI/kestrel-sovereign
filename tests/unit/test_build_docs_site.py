@@ -8,6 +8,8 @@ silently leak internal docs onto a public site.
 from __future__ import annotations
 
 import importlib.util
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -139,11 +141,11 @@ def test_mintlify_emitter_groups_by_type(docs: Path):
 
 
 @pytest.mark.parametrize("body", ["no metadata", "---\ninvalid: [\n---\n"])
-def test_release_source_requires_valid_metadata(docs: Path, tmp_path: Path, monkeypatch, body):
-    source = tmp_path / "constitution.md"
+def test_release_source_requires_valid_metadata(docs: Path, body):
+    shutil.copyfile(SCRIPTS.parent / "docs/README.md", docs / "README.md")
+    source = docs.parent / build_docs_site.CONSTITUTION_RELEASE_PATH
+    source.parent.mkdir(parents=True, exist_ok=True)
     source.write_text(body, encoding="utf-8")
-    monkeypatch.setattr(build_docs_site, "DEFAULT_DOCS_ROOT", docs)
-    monkeypatch.setattr(build_docs_site, "CONSTITUTION_RELEASE_SOURCE", source)
     with pytest.raises(ValueError, match="Published Constitution has invalid OKF metadata"):
         build_docs_site.select_pages(docs)
 
@@ -160,3 +162,60 @@ def test_package_source_links_use_projected_route_and_release_revision(tmp_path:
         repo_root=tmp_path, revision="constitution-v2.0.0",
     )
     assert rewritten == f"[pledge]({build_docs_site.GITHUB_REPO_URL}/blob/constitution-v2.0.0/PLEDGE.md)"
+
+
+def test_selected_corpus_owns_constitution_release(tmp_path: Path):
+    """CLI relocation keeps both editions and links in the selected checkout."""
+    root = SCRIPTS.parent
+    relocated = tmp_path / "relocated"
+    sources = (
+        "docs/README.md", "docs/principles/KESTREL_CONSTITUTION.md",
+        "docs/proposals/constitution-and-pledge/CONSTITUTION.md",
+        "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md",
+        "kestrel_sovereign/data/constitutions/v2/PLEDGE.md",
+    )
+    for rel in sources:
+        target = relocated / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / rel, target)
+    before = {rel: (relocated / rel).read_bytes() for rel in sources}
+    site = tmp_path / "site"
+    subprocess.run(
+        [sys.executable, str(SCRIPTS / "build_docs_site.py"), "build",
+         "--docs-root", str(relocated / "docs"), "--site-root", str(site)],
+        check=True, capture_output=True, text=True,
+    )
+    content = site / "src/content/docs"
+    current = content / "principles/kestrel-constitution-v2.md"
+    assert current.is_file(), "a relocated handbook must publish its adjacent released edition"
+    assert "published second edition" in current.read_text()
+    assert "constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/PLEDGE.md" in current.read_text()
+    assert "first edition" in (content / "principles/kestrel-constitution.md").read_text()
+    assert before == {rel: (relocated / rel).read_bytes() for rel in sources}
+    pages, _ = build_docs_site.select_pages(relocated / "docs")
+    assert all(p["src"].is_relative_to(relocated) for p in pages)
+    current_page = next(p for p in pages if p["rel"] == build_docs_site.CONSTITUTION_RELEASE_PAGE)
+    assert current_page["src"] == relocated / sources[3]
+
+    # Even identical leaf names and an adjacent package are not enough to
+    # turn someone else's corpus into the Kestrel handbook.
+    _write(relocated / "docs", "README.md", {
+        "title": "Custom handbook", "type": "Documentation Index",
+        "resource": "/docs/README.md", "privacy": "public", "status": "active",
+    })
+    pages, _ = build_docs_site.select_pages(relocated / "docs")
+    assert len(pages) == 3
+    first = next(p for p in pages if p["src"] == relocated / sources[1])
+    assert first["rel"] == build_docs_site.display_path(relocated / sources[1])
+    assert first["title"] == "The Kestrel Constitution"
+    assert "publication_notice" not in first
+    assert "repo_root" not in first
+    assert not any(p["rel"] == build_docs_site.CONSTITUTION_RELEASE_PAGE for p in pages)
+
+
+def test_relocated_handbook_never_borrows_another_checkouts_release(tmp_path: Path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    shutil.copyfile(SCRIPTS.parent / "docs/README.md", docs / "README.md")
+    with pytest.raises(FileNotFoundError):
+        build_docs_site.select_pages(docs)
