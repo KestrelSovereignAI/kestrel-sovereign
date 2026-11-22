@@ -101,13 +101,22 @@ def _stage_demo_seed(seed: DemoSeed, tenant: str) -> Iterator[Path]:
         yield staged_agent
 
 
-def restore_demo_seeds(seeds: Iterable[DemoSeed], *, tenant: str) -> None:
+def restore_demo_seeds(
+    seeds: Iterable[DemoSeed], *, tenant: str, roster_update: tuple[Path, Path] | None = None,
+) -> None:
     """Validate the whole roster before installing any demo into its runtime directory."""
     with ExitStack() as staging:
         prepared = [
             (seed.directory.absolute(), staging.enter_context(_stage_demo_seed(seed, tenant)))
             for seed in seeds
         ]
+        if roster_update is not None:
+            template, runtime_config = roster_update
+            directory = staging.enter_context(
+                tempfile.TemporaryDirectory(prefix=".demo-roster-", dir=runtime_config.parent),
+            )
+            staged_roster = Path(directory) / runtime_config.name
+            staged_roster.write_bytes(template.read_bytes())
         with ExitStack() as rollback:
             for agent_dir, staged_agent in prepared:
                 if not agent_dir.exists():
@@ -120,6 +129,8 @@ def restore_demo_seeds(seeds: Iterable[DemoSeed], *, tenant: str) -> None:
                     destination = agent_dir / artifact.name
                     os.replace(artifact, destination)
                     rollback.callback(os.replace, destination, artifact)
+            if roster_update is not None:
+                os.replace(staged_roster, runtime_config)
             rollback.pop_all()
 
 
@@ -144,6 +155,7 @@ async def read_seeded_signing_key_fingerprint(backend, tenant: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--runtime-config", type=Path, required=True)
     parser.add_argument("--seeds", type=Path, required=True)
     parser.add_argument("--agent-data-dir", type=Path, required=True)
     parser.add_argument("--host-control-dir", type=Path, required=True)
@@ -183,7 +195,7 @@ def main() -> None:
             soul_source=Path(seed["soul"]) if "soul" in seed else None,
         )
         for name, seed in seeds.items()
-    ), tenant=tenant)
+    ), tenant=tenant, roster_update=(args.config, args.runtime_config))
     print(tenant)
 
 

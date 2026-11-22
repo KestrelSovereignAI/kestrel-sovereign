@@ -112,6 +112,7 @@ class NativeDIDRequestGuard:
     replay_store: ReplayNonceStore
     lifecycle_lease: Callable[[], AbstractAsyncContextManager[object]]
     clock: Callable[[], float]
+    check_recipient_custody: Callable[[], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, NativeRecipientScope):
@@ -129,6 +130,10 @@ class NativeDIDRequestGuard:
             raise TypeError("Native admission requires request-owned policy authority")
         return authority
 
+    async def require_recipient_custody(self) -> None:
+        if self.check_recipient_custody is not None:
+            await self.check_recipient_custody()
+
     @asynccontextmanager
     async def hold_retained_authority(self, principal_id: str) -> AsyncIterator[None]:
         """Reauthorize a canonical callback creator under this publication lease.
@@ -143,6 +148,7 @@ class NativeDIDRequestGuard:
         async with self.lifecycle_lease():
             authority = self._new_authority()
             authority.require_current(None)
+            await self.require_recipient_custody()
             allowed = await authority.authorize_retained_principal(principal_id)
             authority.require_current(None)
             if allowed is not True:
@@ -190,6 +196,7 @@ class NativeDIDRequestGuard:
                 authority = self._new_authority()
                 refusal = self._current_decision(authority, None)
                 if refusal is None:
+                    await self.require_recipient_custody()
                     async with _original_authentication_io():
                         sender = await verify_native_request(
                             native_header_values(context, SENDER_PROOF_HEADER),
@@ -307,6 +314,7 @@ class NativeDIDRequestGuard:
         else:
             refused = None
             async with _native_persistence_errors(), OriginalContextExit(self.lifecycle_lease()):
+                await self.require_recipient_custody()
                 principal = await self._authorization_decision(admitted.authority, admitted.sender)
                 if isinstance(principal, StreamRefusal):
                     refused = principal

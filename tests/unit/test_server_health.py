@@ -937,10 +937,11 @@ def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
     health_feature.get_latest.assert_awaited_once()
 
 
-def test_public_health_does_not_surface_llm_reachability():
+def test_public_health_does_not_surface_llm_reachability(monkeypatch):
     """The public probe stays stable even when detailed routing data exists."""
     from server import app
 
+    monkeypatch.setenv("K_REVISION", "kestrel-dev-unit")
     @asynccontextmanager
     async def noop_lifespan(_app):
         yield
@@ -980,6 +981,7 @@ def test_public_health_does_not_surface_llm_reachability():
         app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 200
+    assert response.headers["X-Kestrel-Revision"] == "kestrel-dev-unit"
     assert response.json() == {"status": "ok", "agent_initialized": True}
     assert "ollama" not in response.text
 

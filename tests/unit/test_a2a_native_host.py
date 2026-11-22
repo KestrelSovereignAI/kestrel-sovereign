@@ -189,6 +189,8 @@ async def test_public_card_revalidates_the_exact_recipient_generation(
         detail = await http.get("/health/detailed")
         assert detail.status_code == 503
         assert detail.json()["missing_a2a_card_registrations"] == ["registered-agent"]
+        if fault != "registration":
+            assert "registered-agent" in detail.json()["agents"]
 
 
 async def test_native_publication_failure_withdraws_manager_registration(publication):
@@ -300,8 +302,14 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
     publication, tmp_path, changed,
 ):
     import httpx
+    import time
+    from uuid import uuid4
 
+    from google.protobuf.json_format import MessageToDict
+
+    from kestrel_sovereign.a2a.native_card import REQUIRED_NATIVE_EXTENSIONS
     from kestrel_sovereign.a2a.native_publication import prepare_hosted_native_publication
+    from kestrel_sovereign.a2a.native_sender import SENDER_PROOF_HEADER, sign_native_request
     from kestrel_sovereign.identity.demo_seed import DEMO_SEED_STATE_TABLE, demo_signing_key_fingerprint
     from kestrel_sovereign.server import health_check
 
@@ -357,6 +365,31 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
             await p.backend.execute(f"DELETE FROM {DEMO_SEED_STATE_TABLE}")
             assert (await http.get("/.well-known/agent-card.json")).status_code == 503
             assert (await http.get("/health")).status_code == 503
+            send_request = SendMessageRequest(
+                tenant=tenant, message=new_text_message("Seed marker was withdrawn", role=Role.ROLE_USER),
+            )
+            nonce, timestamp = uuid4().hex, int(time.time())
+            proof = sign_native_request(
+                p.signing[0], send_request, sender=SENDER, recipient=p.scope.recipient_id,
+                operation="SendMessage", timestamp=timestamp, nonce=nonce,
+                extensions=REQUIRED_NATIVE_EXTENSIONS, classical_kid="key-1", pq_kid="key-2",
+                policy=p.guard.proof_policy,
+            )
+            rpc = next(
+                interface.url for interface in card.supported_interfaces
+                if interface.protocol_binding == "JSONRPC"
+            )
+            response = await http.post(rpc, headers={
+                "A2A-Version": "1.0",
+                "A2A-Extensions": ",".join(sorted(REQUIRED_NATIVE_EXTENSIONS)),
+                SENDER_PROOF_HEADER: proof,
+            }, json={
+                "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+                "params": MessageToDict(send_request),
+            })
+            assert "Seeded demo database unavailable" in response.text
+            assert await p.recipient.task_manager.list_tasks(recipient_agent_id=p.scope.recipient_id) == []
+            assert await p.guard.replay_store.reserve(SENDER, nonce, now_ts=timestamp, ttl_seconds=300)
     finally:
         async with p.host.a2a_lifecycle_lease():
             native.withdraw()

@@ -88,6 +88,8 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),
         )
         if boot == "boot-one":
+            active_roster = tmp_path / "multi_agent.toml"
+            active_roster.write_text("# Existing runtime roster")
             missing_mount = dict(env, KESTREL_DATA_KEY=os.environ["KESTREL_DATA_KEY"])
             del missing_mount["KESTREL_DEMO_SEED_DATA_KEY_FILE"]
             rejected = subprocess.run(
@@ -108,6 +110,7 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             assert rejected.returncode != 0
             assert "collides with existing agent directory" in rejected.stderr
             assert not (data / "demo" / "kestrel_prime.db").exists()
+            assert active_roster.read_text() == "# Existing runtime roster"
         result = subprocess.run(
             ["bash", "-c", startup], cwd=tmp_path, env=env,
             capture_output=True, text=True, check=False, timeout=45,
@@ -184,6 +187,7 @@ def test_entrypoint_refuses_different_configured_discovery_storage(tmp_path, mon
     monkeypatch.setenv("KESTREL_AGENTS", "demo")
     monkeypatch.setattr(sys, "argv", [
         "demo_seed", "--config", str(registry), "--seeds", str(seeds),
+        "--runtime-config", str(registry),
         "--agent-data-dir", str(tmp_path / "data"),
         "--host-control-dir", str(tmp_path / "host"),
         "--registration", "demo",

@@ -22,6 +22,7 @@ from kestrel_sovereign.features.deploy.models import (
     ReadinessStatus,
 )
 from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
+from kestrel_sovereign.features.deploy.providers._health import CLOUD_RUN_REVISION_HEADER
 from tests.shared.environment_guard import unset_environment
 
 
@@ -414,12 +415,12 @@ def _serve(handler):
     return patch("httpx.AsyncClient", side_effect=client_factory)
 
 
-def _status(code: int, body: dict | None = None):
+def _status(code: int, body: dict | None = None, *, headers=None):
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL(f"{_SERVICE_URL}/health")
         if body is None:
             return httpx.Response(code, text="")
-        return httpx.Response(code, json=body)
+        return httpx.Response(code, json=body, headers=headers)
 
     return handler
 
@@ -452,6 +453,17 @@ _UNREADY_CASES = {
 
 class TestIssue2473ReadinessGatesDeploySuccess:
     """A created revision is not a successful deploy until it is ready."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("serving_revision", [None, "kestrel-dev-00006-old", "kestrel-dev-00007-abc"])
+    async def test_seeded_health_response_must_match_the_created_revision(self, serving_revision):
+        manager = _manager_with(_FakeProvider("update", serves_created_revision=True))
+        headers = {CLOUD_RUN_REVISION_HEADER: serving_revision} if serving_revision else None
+        with _serve(_status(200, {"status": "ok", "agent_initialized": True}, headers=headers)):
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+        expected = serving_revision == "kestrel-dev-00007-abc"
+        assert result["success"] is expected
+        assert result["readiness"]["failure"] == (None if expected else "different_serving_revision")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("operation", ["create", "update"])

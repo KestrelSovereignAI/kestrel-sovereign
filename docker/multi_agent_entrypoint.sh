@@ -98,10 +98,6 @@ if [[ -f "$seed_manifest" || -n "$seeded_demo" ]]; then
         exit 1
     fi
     : "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}"
-    # The server, operator CLI and feature reconciliation share the runtime roster.
-    if [[ ! "$seed_roster" -ef "$MULTI_AGENT_CONFIG" ]]; then
-        cp -- "$seed_roster" "$MULTI_AGENT_CONFIG"
-    fi
 fi
 configured_agent_dirs=()
 if [ -n "${KESTREL_AGENTS:-}" ]; then
@@ -127,7 +123,9 @@ if [ -n "${KESTREL_AGENTS:-}" ]; then
 fi
 
 # Generate multi_agent.toml from auto-discovery if not already present
-if [ ! -f "$MULTI_AGENT_CONFIG" ]; then
+if [[ -n "$seeded_demo" ]]; then
+    echo "Preparing demo runtime roster: $MULTI_AGENT_CONFIG"
+elif [ ! -f "$MULTI_AGENT_CONFIG" ]; then
     echo "No multi_agent.toml found. Auto-discovering agents in $AGENT_DATA_DIR..."
     export KESTREL_BOOTSTRAP_AGENT_DATA_DIR="$AGENT_DATA_DIR"
     export KESTREL_BOOTSTRAP_MULTI_AGENT_CONFIG="$MULTI_AGENT_CONFIG"
@@ -160,7 +158,8 @@ if [[ -n "$seeded_demo" ]]; then
     export KESTREL_DATA_KEY
     KESTREL_A2A_EPHEMERAL_TENANT="$(
         /app/.venv/bin/python -m kestrel_sovereign.identity.demo_seed \
-            --config "$MULTI_AGENT_CONFIG" --seeds "$seed_manifest" --agent-data-dir "$AGENT_DATA_DIR" \
+            --config "$seed_roster" --runtime-config "$MULTI_AGENT_CONFIG" \
+            --seeds "$seed_manifest" --agent-data-dir "$AGENT_DATA_DIR" \
             --host-control-dir "$HOST_CONTROL_DIR" \
             --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
     )"

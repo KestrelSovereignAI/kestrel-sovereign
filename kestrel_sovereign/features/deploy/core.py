@@ -323,6 +323,8 @@ class DeployManagerCore:
         service_url: str,
         timeout: Optional[int] = None,
         poll_interval: int = 5,
+        *,
+        expected_revision: str | None = None,
     ) -> ReadinessCheck:
         """
         Run the readiness gate against a deployed service.
@@ -364,6 +366,17 @@ class DeployManagerCore:
             attempts += 1
             last = result
             if result["healthy"]:
+                if expected_revision and result.get("serving_revision") != expected_revision:
+                    return ReadinessCheck(
+                        status=ReadinessStatus.UNKNOWN,
+                        gate=gate,
+                        health_url=health_url,
+                        timeout_seconds=timeout,
+                        attempts=attempts,
+                        last_status_code=result["status_code"],
+                        failure="different_serving_revision",
+                        detail="the health response did not come from the deployed revision",
+                    )
                 if monotonic() >= deadline:
                     logger.debug(
                         "Ignoring healthy response received after the deadline"
@@ -654,7 +667,12 @@ class DeployManagerCore:
                 )
             elif session.service_url:
                 logger.info(f"Verifying health of {session.service_url}...")
-                readiness = await self._verify_health(session.service_url)
+                if deploy_result.get("serves_created_revision") is True:
+                    readiness = await self._verify_health(
+                        session.service_url, expected_revision=session.revision,
+                    )
+                else:
+                    readiness = await self._verify_health(session.service_url)
             else:
                 readiness = ReadinessCheck(
                     status=ReadinessStatus.UNKNOWN,

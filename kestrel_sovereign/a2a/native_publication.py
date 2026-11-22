@@ -4,7 +4,7 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -298,6 +298,8 @@ class NativeA2APublication:
         guard = self._guard_factory()
         if not isinstance(guard, NativeDIDRequestGuard):
             raise TypeError("Native publication requires its canonical request guard")
+        if self._seeded_signing_key_fingerprint is not None:
+            guard = replace(guard, check_recipient_custody=self._require_seeded_database)
         card = self._build_card(self._profile)
         binding = NativeA2AHTTP(
             NativeA2ARequestHandler(
@@ -359,6 +361,18 @@ class NativeA2APublication:
             require_binding=require_binding, buffer_bytes=buffer_bytes,
         )
 
+    async def _require_seeded_database(self) -> None:
+        from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
+
+        try:
+            fingerprint = await read_seeded_signing_key_fingerprint(
+                self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=503, detail="Seeded demo database unavailable") from error
+        if fingerprint != self._seeded_signing_key_fingerprint:
+            raise HTTPException(status_code=503, detail="Seeded demo database unavailable")
+
     async def get_card(self, _base: AgentCard | None = None) -> AgentCard:
         """Refresh public display/skills under the same live identity/policy lease."""
         if self._guard is None or self._binding is None:
@@ -372,17 +386,7 @@ class NativeA2APublication:
                 )
             authority = self._guard.authority_factory()
             authority.require_current(None)
-            if self._seeded_signing_key_fingerprint is not None:
-                from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
-
-                try:
-                    fingerprint = await read_seeded_signing_key_fingerprint(
-                        self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
-                    )
-                except ValueError as error:
-                    raise HTTPException(status_code=503, detail="Seeded demo database unavailable") from error
-                if fingerprint != self._seeded_signing_key_fingerprint:
-                    raise HTTPException(status_code=503, detail="Seeded demo database unavailable")
+            await self._guard.require_recipient_custody()
             profile = await self.recipient.get_public_profile()
             card = self._build_card(profile)
             authority.require_current(None)

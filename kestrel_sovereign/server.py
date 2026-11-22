@@ -5319,7 +5319,7 @@ async def _missing_required_a2a_cards(app: FastAPI, manager) -> list[str]:
 
 
 @app.get("/health")
-async def health_check(request: Request):
+async def health_check(request: Request, response: Response):
     """Return a stable, public-safe readiness probe for load balancers.
 
     This endpoint deliberately exposes only aggregate readiness and whether a
@@ -5377,6 +5377,10 @@ async def health_check(request: Request):
                 "agent_initialized": any_initialized,
             },
         )
+    if any_initialized and (revision := os.environ.get("K_REVISION")):
+        from kestrel_sovereign.features.deploy.providers._health import CLOUD_RUN_REVISION_HEADER
+
+        response.headers[CLOUD_RUN_REVISION_HEADER] = revision
     if agent:
         return {"status": "ok", "agent_initialized": True}
     # In multi-agent mode, check if any agents are loaded
@@ -5692,17 +5696,19 @@ async def health_detailed(request: Request):
             ),
         )
     missing_cards = await _missing_required_a2a_cards(request.app, manager)
-    if missing_cards:
-        return JSONResponse(
-            status_code=503,
-            content=_with_host_feature_rejections(request.app.state, {
-                "status": "unhealthy",
-                "error": "Required A2A cards unavailable",
-                "missing_a2a_card_registrations": missing_cards,
-                "checks": [],
-                "tracing": tracing,
-            }),
-        )
+
+    def detailed_response(content, status_code=200):
+        if missing_cards:
+            if status_code == 200:
+                content["status"] = "unhealthy"
+            content.setdefault("error", "Required A2A cards unavailable")
+            content["missing_a2a_card_registrations"] = missing_cards
+            status_code = 503
+        content = _with_host_feature_rejections(request.app.state, content)
+        if status_code != 200:
+            return JSONResponse(status_code=status_code, content=content)
+        return content
+
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
     if safe_mode_records:
@@ -5725,10 +5731,7 @@ async def health_detailed(request: Request):
         rejections = _contribution_rejection_records(agent, manager)
         if rejections:
             content["features_not_loaded"] = rejections
-        return JSONResponse(
-            status_code=503,
-            content=_with_host_feature_rejections(request.app.state, content),
-        )
+        return detailed_response(content, status_code=503)
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
     )
@@ -5765,11 +5768,8 @@ async def health_detailed(request: Request):
             )
             content.setdefault("checks", [])
             content.setdefault("tracing", tracing)
-            return JSONResponse(
-                status_code=503,
-                content=_with_host_feature_rejections(request.app.state, content),
-            )
-        return _with_host_feature_rejections(request.app.state, result)
+            return detailed_response(content, status_code=503)
+        return detailed_response(result)
 
     # No singleton default agent (multi-agent deployments set app.state.agent to
     # None). Resolve health from the live fleet rather than reporting a false
@@ -5820,11 +5820,8 @@ async def health_detailed(request: Request):
                     "scheduler_readiness_failures": scheduler_failures,
                 }
             )
-            return JSONResponse(
-                status_code=503,
-                content=_with_host_feature_rejections(request.app.state, content),
-            )
-        return _with_host_feature_rejections(request.app.state, content)
+            return detailed_response(content, status_code=503)
+        return detailed_response(content)
 
     content = {
         "status": "unhealthy",
@@ -5840,13 +5837,10 @@ async def health_detailed(request: Request):
                 "scheduler_readiness_failures": scheduler_failures,
             }
         )
-        return JSONResponse(
-            status_code=503,
-            content=_with_host_feature_rejections(request.app.state, content),
-        )
+        return detailed_response(content, status_code=503)
     # Host features start independently of agent availability, so "no agent"
     # must still name a refused host feature rather than drop the diagnostic.
-    return _with_host_feature_rejections(request.app.state, content)
+    return detailed_response(content)
 
 
 def _enforce_host_csrf(request: Request):
