@@ -1356,10 +1356,14 @@ class SQLiteBackend(DatabaseBackend):
         """The inode retained at connection acquisition, not a fresh path stat."""
         return self._connected_file_identity
 
-    def assert_connected_file_still_valid(self) -> None:
+    def assert_connected_file_still_valid(
+        self, *, expected_identity: tuple[int, int] | None = None,
+    ) -> None:
         """Refuse file custody inferred from a replaced pathname or new cwd."""
         if self._connection is None:
             raise ConnectionError("SQLite file custody requires a connected backend")
+        if expected_identity is not None and self._connected_file_identity != expected_identity:
+            raise ConnectionError("SQLite connection does not own the installed database")
         if self._resolved_path is None:
             return
         try:

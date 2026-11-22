@@ -302,7 +302,9 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
     publication, tmp_path, changed,
 ):
     import httpx
+    import json
     import time
+    from pathlib import Path
     from uuid import uuid4
 
     from google.protobuf.json_format import MessageToDict
@@ -319,6 +321,7 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
     did = p.recipient.identity.signing_did
     tenant = p.recipient.task_manager.task_store.scope.tenant
     configured_tenant = "stale-tenant" if changed == "tenant" else tenant
+    database_status = Path(p.backend.db_path).stat()
     manifest = tmp_path / "demo.seeds.toml"
     pinned_did = "did:web:public.test:other" if changed == "signing DID" else did
     manifest.write_text(f'[registered-agent]\ndid = "{pinned_did}"\n')
@@ -337,6 +340,9 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
         "KESTREL_A2A_PUSH_ENABLED": "false",
         "KESTREL_A2A_EPHEMERAL_TENANT": configured_tenant,
         "KESTREL_DEMO_SEED_MANIFEST": str(manifest),
+        "KESTREL_DEMO_DATABASE_IDENTITIES": json.dumps({
+            "registered-agent": [database_status.st_dev, database_status.st_ino],
+        }),
     }
     preparation = prepare_hosted_native_publication(
         p.app, p.host, "registered-agent", p.recipient, environment,

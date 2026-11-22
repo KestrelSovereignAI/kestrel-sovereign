@@ -176,6 +176,7 @@ def test_dev_publication_selects_the_pinned_demo_registration(live_config):
         env,
         KESTREL_DEMO_SEED_MANIFEST=str(manifest.with_suffix(".seeds.toml")),
         KESTREL_A2A_EPHEMERAL_TENANT="demo-test",
+        KESTREL_DEMO_DATABASE_IDENTITIES='{"kestrel-demo":[1,2],"kestrel-a2a-peer":[1,3]}',
     )
     del boot_environment["KESTREL_DEMO_SEED_DATA_KEY_FILE"]
     config = NativeHostingConfiguration.from_environment(boot_environment)

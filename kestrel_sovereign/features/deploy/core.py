@@ -349,6 +349,7 @@ class DeployManagerCore:
         current_interval = poll_interval
         attempts = 0
         last: Optional[Dict[str, Any]] = None
+        unbound: Optional[Dict[str, Any]] = None
 
         logger.info(
             "Verifying health for %s at %s (timeout: %ss)",
@@ -367,6 +368,8 @@ class DeployManagerCore:
             revision_matches = expected_revision is None or result.get("serving_revision") == expected_revision
             if revision_matches:
                 last = result
+            else:
+                unbound = result
             if result["healthy"] and revision_matches:
                 if monotonic() >= deadline:
                     logger.debug(
@@ -401,17 +404,24 @@ class DeployManagerCore:
 
         logger.warning(f"Readiness gate did not pass within {timeout}s")
         if last is None:
-            failure = "different_serving_revision" if attempts else "not_probed"
-            detail = (
-                "no health response came from the deployed revision" if attempts
-                else "the readiness deadline elapsed before any probe ran"
-            )
+            if unbound is None:
+                failure = "not_probed"
+                detail = "the readiness deadline elapsed before any probe ran"
+            elif unbound.get("serving_revision"):
+                failure = "different_serving_revision"
+                detail = "no health response came from the deployed revision"
+            elif unbound["healthy"]:
+                failure = "missing_serving_revision"
+                detail = "the health response did not identify its revision"
+            else:
+                failure, detail = classify_health_failure(unbound)
             return ReadinessCheck(
                 status=ReadinessStatus.UNKNOWN,
                 gate=gate,
                 health_url=health_url,
                 timeout_seconds=timeout,
                 attempts=attempts,
+                last_status_code=unbound["status_code"] if unbound is not None else None,
                 failure=failure,
                 detail=detail,
             )

@@ -156,14 +156,16 @@ if [[ -n "$seeded_demo" ]]; then
     KESTREL_DATA_KEY="$(< "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}")"
     : "${KESTREL_DATA_KEY:?demo data key is empty}"
     export KESTREL_DATA_KEY
-    KESTREL_A2A_EPHEMERAL_TENANT="$(
+    seed_result="$(
         /app/.venv/bin/python -m kestrel_sovereign.identity.demo_seed \
             --config "$seed_roster" --runtime-config "$MULTI_AGENT_CONFIG" \
             --seeds "$seed_manifest" --agent-data-dir "$AGENT_DATA_DIR" \
             --host-control-dir "$HOST_CONTROL_DIR" \
             --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
     )"
+    IFS=$'\t' read -r KESTREL_A2A_EPHEMERAL_TENANT KESTREL_DEMO_DATABASE_IDENTITIES <<< "$seed_result"
     export KESTREL_A2A_EPHEMERAL_TENANT
+    export KESTREL_DEMO_DATABASE_IDENTITIES
     export KESTREL_DEMO_SEED_MANIFEST="$seed_manifest"
     unset KESTREL_DEMO_SEED_DATA_KEY_FILE
 fi

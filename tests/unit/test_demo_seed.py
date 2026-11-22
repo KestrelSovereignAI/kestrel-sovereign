@@ -1,5 +1,6 @@
 """The demo seed carries a pinned signer and only its own initial test state."""
 
+import json
 import lzma
 import os
 import shlex
@@ -68,6 +69,7 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
         "# Bootstrap identity and initialize DB for each agent data dir", 1
     )[0].replace("/app/.venv/bin/python", shlex.quote(sys.executable))
     startup += '\nprintf "A2A_TENANT=%s\\n" "$KESTREL_A2A_EPHEMERAL_TENANT"\n'
+    startup += '\nprintf "A2A_DATABASES=%s\\n" "$KESTREL_DEMO_DATABASE_IDENTITIES"\n'
     tenants = set()
     for boot in ("boot-one", "boot-two"):
         data = tmp_path / boot
@@ -118,6 +120,17 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             assert "collides with existing agent directory" in rejected.stderr
             assert not (data / "demo" / "kestrel_prime.db").exists()
             assert active_roster.read_text() == "# Existing runtime roster"
+            host_database = data / "host" / "host.db"
+            host_database.parent.mkdir()
+            host_database.write_bytes(b"host database")
+            unsafe_env = dict(env, KESTREL_MULTI_AGENT_CONFIG=str(host_database))
+            rejected = subprocess.run(
+                ["bash", "-c", startup], cwd=tmp_path, env=unsafe_env,
+                capture_output=True, text=True, check=False, timeout=45,
+            )
+            assert rejected.returncode != 0
+            assert "Runtime roster overlaps with demo or host custody" in rejected.stderr
+            assert host_database.read_bytes() == b"host database"
         result = subprocess.run(
             ["bash", "-c", startup], cwd=tmp_path, env=env,
             capture_output=True, text=True, check=False, timeout=45,
@@ -130,6 +143,12 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
         tenants.add(tenant)
         identity = load_agent_identity(None, storage_dir=data / "demo")
         assert identity.signing_did == did
+        database_status = (data / "demo" / "kestrel_prime.db").stat()
+        database_identities, = (
+            json.loads(line.removeprefix("A2A_DATABASES="))
+            for line in result.stdout.splitlines() if line.startswith("A2A_DATABASES=")
+        )
+        assert database_identities == {"demo": [database_status.st_dev, database_status.st_ino]}
         with closing(sqlite3.connect(data / "demo" / "kestrel_prime.db")) as db:
             assert db.execute(f"SELECT tenant, signing_keys FROM {DEMO_SEED_STATE_TABLE}").fetchall() == [
                 (tenant, demo_signing_key_fingerprint(identity)),
@@ -207,17 +226,28 @@ async def test_demo_refuses_a_live_sqlite_database_replaced_on_disk(tmp_path, de
                  sha256(database_seed.read_bytes()).hexdigest(), fingerprint),
     ], tenant="demo-test")
     database = directory / "kestrel_prime.db"
+    status = database.stat()
+    original = (status.st_dev, status.st_ino)
     backend = SQLiteBackend(str(database))
     await backend.connect()
     try:
-        assert await read_seeded_signing_key_fingerprint(backend, "demo-test") == fingerprint
+        assert await read_seeded_signing_key_fingerprint(
+            backend, "demo-test", database_identity=original,
+        ) == fingerprint
         replacement = database.with_suffix(".replacement")
         shutil.copyfile(database, replacement)
         replacement.replace(database)
         with pytest.raises(ValueError, match="original connected SQLite file"):
-            await read_seeded_signing_key_fingerprint(backend, "demo-test")
+            await read_seeded_signing_key_fingerprint(backend, "demo-test", database_identity=original)
     finally:
         await backend.close()
+    reloaded = SQLiteBackend(str(database))
+    await reloaded.connect()
+    try:
+        with pytest.raises(ValueError, match="original connected SQLite file"):
+            await read_seeded_signing_key_fingerprint(reloaded, "demo-test", database_identity=original)
+    finally:
+        await reloaded.close()
 
 
 def test_entrypoint_refuses_different_configured_discovery_storage(tmp_path, monkeypatch):

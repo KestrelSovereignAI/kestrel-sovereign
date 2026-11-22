@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import lzma
 import os
 import re
@@ -153,12 +154,14 @@ def read_demo_seed_manifest(path: Path) -> dict:
         return tomllib.load(source)
 
 
-async def read_seeded_signing_key_fingerprint(backend, tenant: str) -> str:
+async def read_seeded_signing_key_fingerprint(
+    backend, tenant: str, *, database_identity: tuple[int, int],
+) -> str:
     """Only a database restored by this host lifetime can publish a seeded route."""
     if backend.backend_type != "sqlite":
         raise ValueError("A seeded demo requires the database restored for its boot tenant")
     try:
-        backend.assert_connected_file_still_valid()
+        backend.assert_connected_file_still_valid(expected_identity=database_identity)
     except ConnectionError as error:
         raise ValueError("A seeded demo requires its original connected SQLite file") from error
     if not await backend.fetch_one(
@@ -205,6 +208,15 @@ def main() -> None:
         )
     ):
         raise IdentityCustodyError("Demo seed must bind to the configured discovery registration's data directory")
+    protected = [args.agent_data_dir, args.host_control_dir, args.seeds]
+    protected.extend(
+        Path(seed[item]) for seed in seeds.values()
+        for item in ("database", "identity", "soul") if item in seed
+    )
+    if key_file := os.environ.get("KESTREL_DEMO_SEED_DATA_KEY_FILE"):
+        protected.append(Path(key_file))
+    if any(paths_overlap_by_filesystem_identity(args.runtime_config, path) for path in protected):
+        raise IdentityCustodyError("Runtime roster overlaps with demo or host custody")
     tenant = "demo-" + uuid4().hex
     restore_demo_seeds((
         DemoSeed(
@@ -218,7 +230,11 @@ def main() -> None:
         )
         for name, seed in seeds.items()
     ), tenant=tenant, roster_update=(args.config, args.runtime_config))
-    print(tenant)
+    database_identities = {}
+    for name in seeds:
+        status = (args.agent_data_dir / name / "kestrel_prime.db").lstat()
+        database_identities[name] = (status.st_dev, status.st_ino)
+    print(f"{tenant}\t{json.dumps(database_identities, separators=(',', ':'))}")
 
 
 if __name__ == "__main__":

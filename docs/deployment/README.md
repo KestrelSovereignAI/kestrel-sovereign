@@ -558,8 +558,9 @@ the pinned encrypted identity bundles, matching data key and SQLite seeds
 from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
 Bootstrap checks the configured data directory, snapshot hash and signing
 keys before restoring each seed. The restored database records the boot
-tenant and signing-key fingerprint. Card reads and signed requests verify
-that they still use the restored database. The separate
+tenant and signing-key fingerprint. The host retains the installed file's
+identity for the boot lifetime and checks it during onboarding, card reads
+and signed requests. A replacement snapshot requires a fresh boot. The separate
 `multi_agent.a2a-dev.seeds.toml` manifest selects the demo registrations and
 remains in place when the runtime saves roster edits. The DEV host
 publishes native A2A for the two demo registrations. The existing Kestrel

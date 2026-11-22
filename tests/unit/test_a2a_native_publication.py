@@ -53,6 +53,7 @@ def test_host_publication_can_select_only_the_demo_registrations(tmp_path):
         "KESTREL_A2A_DISCOVERY_AGENT": "kestrel-demo",
         "KESTREL_A2A_EPHEMERAL_TENANT": "demo-tenant",
         "KESTREL_DEMO_SEED_MANIFEST": str(manifest),
+        "KESTREL_DEMO_DATABASE_IDENTITIES": '{"kestrel-demo":[1,2],"kestrel-a2a-peer":[1,3]}',
     })
     assert configuration.publishes("kestrel-demo")
     assert configuration.publishes("kestrel-a2a-peer")

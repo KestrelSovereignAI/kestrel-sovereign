@@ -465,7 +465,12 @@ class TestIssue2473ReadinessGatesDeploySuccess:
             result = await manager.deploy_profile("dev", tag="v1.2.3")
         if serving_revision != "kestrel-dev-00007-abc":
             assert result["readiness_status"] == "unknown"
-            assert result["readiness"]["failure"] == "different_serving_revision"
+            if serving_revision:
+                assert result["readiness"]["failure"] == "different_serving_revision"
+            else:
+                assert result["readiness"]["failure"] == (
+                    "missing_serving_revision" if status_code == 200 else "http_status"
+                )
         else:
             assert result["success"] is (status_code == 200)
             assert result["readiness_status"] == ("ready" if status_code == 200 else "unready")

@@ -1,5 +1,6 @@
 """Host-owned publication of one current recipient's signed native contract."""
 
+import json
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -77,6 +78,7 @@ def validate_native_fleet_options(environment: Mapping[str, str], *, fleet_host:
         for option in (
             "KESTREL_A2A_EPHEMERAL_TENANT",
             "KESTREL_DEMO_SEED_MANIFEST",
+            "KESTREL_DEMO_DATABASE_IDENTITIES",
         ):
             if option in environment:
                 raise ValueError(f"{option} requires a co-hosted agent fleet")
@@ -124,6 +126,7 @@ class NativeHostingConfiguration:
     push: NativePushPolicy | None = None
     seeded_signers: Mapping[str, str] | None = None
     ephemeral_tenant: str | None = None
+    seeded_database_identities: Mapping[str, tuple[int, int]] | None = None
 
     def __post_init__(self):
         if self.push is not None and not isinstance(self.push, NativePushPolicy):
@@ -138,6 +141,10 @@ class NativeHostingConfiguration:
         if self.seeded_signers is not None:
             if self.discovery_routing_key not in self.seeded_signers:
                 raise ValueError("The A2A discovery registration must have a pinned demo seed")
+            if self.seeded_database_identities is None or (
+                self.seeded_signers.keys() != self.seeded_database_identities.keys()
+            ):
+                raise ValueError("Each seeded publication requires its installed database identity")
             for routing_key in self.seeded_signers:
                 encode_agent_route_name(routing_key)
 
@@ -154,22 +161,34 @@ class NativeHostingConfiguration:
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
         manifest = environment.get("KESTREL_DEMO_SEED_MANIFEST")
         tenant = environment.get("KESTREL_A2A_EPHEMERAL_TENANT")
-        if (manifest is None) != (tenant is None) or "" in (manifest, tenant):
-            raise ValueError("Pinned demo publication requires both a seed manifest and a nonempty tenant")
+        database_evidence = environment.get("KESTREL_DEMO_DATABASE_IDENTITIES")
+        seed_configuration = (manifest, tenant, database_evidence)
+        if any(value is not None for value in seed_configuration) and not all(seed_configuration):
+            raise ValueError("Pinned demo publication requires a seed manifest, tenant and installed databases")
         if not host_publishes_native_a2a(environment):
             if discovery is not None or manifest is not None:
                 raise ValueError(f"A2A discovery requires {PUBLIC_BASE_URL_ENV}")
             return None
         seeded_signers = None
+        seeded_database_identities = None
         if manifest is not None:
             from kestrel_sovereign.identity.demo_seed import read_demo_seed_manifest
 
             seeded_signers = {
                 name: seed["did"] for name, seed in read_demo_seed_manifest(Path(manifest)).items()
             }
+            decoded = json.loads(database_evidence)
+            if not isinstance(decoded, dict) or any(
+                not isinstance(value, list) or len(value) != 2
+                or any(type(number) is not int or number < 0 for number in value)
+                for value in decoded.values()
+            ):
+                raise ValueError("Seeded demo database identities have an invalid format")
+            seeded_database_identities = {name: (identity[0], identity[1]) for name, identity in decoded.items()}
         return cls(
             base, discovery, NativePushPolicy.from_environment(environment),
             seeded_signers=seeded_signers, ephemeral_tenant=tenant,
+            seeded_database_identities=seeded_database_identities,
         )
 
 
@@ -216,6 +235,7 @@ class NativeA2APublication:
 
             seeded_signing_key_fingerprint = await read_seeded_signing_key_fingerprint(
                 recipient.task_manager.task_store.backend, configuration.ephemeral_tenant,
+                database_identity=configuration.seeded_database_identities[routing_key],
             )
         publication = cls(
             registry,
@@ -368,6 +388,7 @@ class NativeA2APublication:
         try:
             fingerprint = await read_seeded_signing_key_fingerprint(
                 self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
+                database_identity=self.configuration.seeded_database_identities[self.routing_key],
             )
         except ValueError as error:
             refusal = HTTPException(status_code=503, detail="Seeded demo database unavailable")
