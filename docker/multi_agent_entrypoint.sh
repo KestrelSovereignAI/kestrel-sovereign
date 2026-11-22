@@ -79,6 +79,21 @@ if [ "${KESTREL_ENV:-}" = "production" ] || [ "${KESTREL_ENV:-}" = "prod" ]; the
     exit 1
 fi
 
+# A pinned development demo keeps the same signing identity across revisions.
+# Its SQLite state starts from the explicit demo snapshot on every cold start.
+if [[ -n "${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_DID+x}${KESTREL_IDENTITY_BUNDLE+x}" ]]; then
+    seed_agent="${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
+    if [[ ! "$seed_agent" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || paths_overlap "$HOST_CONTROL_DIR" "$AGENT_DATA_DIR/$seed_agent"; then
+        echo "FATAL: demo seed discovery registration is not a safe agent directory." >&2
+        exit 1
+    fi
+    /app/.venv/bin/python -m kestrel_sovereign.identity.demo_seed \
+        --agent-dir "$AGENT_DATA_DIR/$seed_agent" \
+        --database-seed "${KESTREL_DEMO_SEED_DATABASE:?demo seed mount is required}" \
+        --expected-did "${KESTREL_DEMO_SEED_DID:?demo seed DID is required}"
+    unset KESTREL_IDENTITY_BUNDLE KESTREL_DEMO_SEED_DATABASE KESTREL_DEMO_SEED_DID
+fi
+
 # Provision agent directories from KESTREL_AGENTS env var
 # Format: comma-separated agent names, e.g. "claw,testbot,emma"
 if [ -n "${KESTREL_AGENTS:-}" ]; then

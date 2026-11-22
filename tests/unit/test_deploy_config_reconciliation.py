@@ -165,6 +165,23 @@ def test_dev_profile_uses_multi_agent_image(live_config):
     )
 
 
+def test_dev_publication_selects_the_pinned_demo_registration(live_config):
+    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+
+    profile = live_config["profiles"]["dev"]
+    env = profile["env_vars"]
+    config = NativeHostingConfiguration.from_environment(env)
+    assert config is not None
+    assert config.public_base_url == "https://kestrel-dev-7jpbsywhdq-uc.a.run.app"
+    assert config.discovery_routing_key == "kestrel-demo"
+    assert config.discovery_routing_key in env["KESTREL_AGENTS"].split(",")
+    assert env["KESTREL_DEMO_SEED_DID"] == "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
+    assert env["KESTREL_DEMO_SEED_DATABASE"] == "/var/run/kestrel-demo-seed/kestrel_prime.db.xz"
+    assert profile["secrets"]["KESTREL_IDENTITY_BUNDLE"] == "kestrel-dev-a2a-identity-bundle:1"
+    assert profile["secrets"]["KESTREL_DATA_KEY"] == "kestrel-dev-a2a-data-key:1"
+    assert config.push is None
+
+
 def test_prod_profile_has_bash_parity_secrets(live_config):
     """Prod keeps OAuth secrets and adds pinned durable custody."""
     manager = DeployManager(config=live_config)
