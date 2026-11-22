@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Project the OKF docs corpus into a published documentation site.
 
-This is a *projection*, not a migration: ``docs/`` stays the source of truth and
-this command emits a renderable static site (Starlight; Mintlify for preview)
-from OKF frontmatter.
+This is a *projection*, not a migration: ``docs/`` and the released package
+Constitution stay the sources of truth. This command emits a renderable static
+site (Starlight; Mintlify for preview) from OKF frontmatter.
 
 Publication routing is owned by ``scripts/docs_verify.render_channel``, which
 buckets every doc into ``public`` / ``internal`` / ``archive`` / ``exclude``
@@ -41,6 +41,47 @@ from docs_okf import (  # noqa: E402
 from docs_verify import render_channel  # noqa: E402
 
 DEFAULT_SITE_ROOT = PROJECT_ROOT / "site"
+GITHUB_REPO_URL = "https://github.com/KestrelSovereignAI/kestrel-sovereign"
+CONSTITUTION_RELEASE_TAG = "constitution-v2.0.0"
+CONSTITUTION_RELEASE_SOURCE = (
+    PROJECT_ROOT / "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md"
+)
+CONSTITUTION_RELEASE_PAGE = "docs/principles/KESTREL_CONSTITUTION_V2.md"
+CONSTITUTION_RELEASE_URL = (
+    f"{GITHUB_REPO_URL}/blob/{CONSTITUTION_RELEASE_TAG}/"
+    f"{CONSTITUTION_RELEASE_SOURCE.relative_to(PROJECT_ROOT).as_posix()}"
+)
+
+# Reader context belongs to the projection, never to signed or historical bytes.
+CONSTITUTION_READER_CONTEXT = {
+    CONSTITUTION_RELEASE_PAGE: {
+        "source_revision": CONSTITUTION_RELEASE_TAG,
+        "publication_notice": (
+            "info",
+            f"This is the published second edition, released as `{CONSTITUTION_RELEASE_TAG}`. "
+            f"[Published package source]({CONSTITUTION_RELEASE_URL}).",
+        ),
+    },
+    "docs/principles/KESTREL_CONSTITUTION.md": {
+        "title": "The Kestrel Constitution (first edition)",
+        "publication_notice": (
+            "info",
+            "This is the first edition, preserved for historical reference. "
+            f"Read the [published second edition]({CONSTITUTION_RELEASE_URL}) "
+            "for the current text.",
+        ),
+    },
+    "docs/proposals/constitution-and-pledge/CONSTITUTION.md": {
+        "title": "Proposed Kestrel Constitution (historical draft)",
+        "publication_notice": (
+            "info",
+            "This is historical drafting material for RFC 4187, preserved as an "
+            "unsigned proposal. "
+            f"Read the [published second edition]({CONSTITUTION_RELEASE_URL}) "
+            "for the current text.",
+        ),
+    },
+}
 
 # Publication routing is owned by scripts/docs_verify.py's render_channel():
 # every doc routes to public / internal / archive / exclude from its OKF
@@ -101,9 +142,16 @@ def select_pages(
     pages: list[dict[str, Any]] = []
     skipped: list[tuple[str, str]] = []
 
-    for path in markdown_files(docs_root):
-        rel = display_path(path)
+    sources = [(path, display_path(path)) for path in markdown_files(docs_root)]
+    # The public release lives outside docs/. Give it a handbook route without
+    # creating a second copy of the governing words or changing custom corpora.
+    if docs_root.resolve() == DEFAULT_DOCS_ROOT.resolve():
+        sources.append((CONSTITUTION_RELEASE_SOURCE, CONSTITUTION_RELEASE_PAGE))
+
+    for path, rel in sources:
         doc, error = read_okf_document(path)
+        if path == CONSTITUTION_RELEASE_SOURCE and (error or doc is None):
+            raise ValueError(f"Published Constitution has invalid OKF metadata: {error}")
         if error:
             skipped.append((rel, f"frontmatter error: {error}"))
             continue
@@ -128,6 +176,7 @@ def select_pages(
                 "description": fm.get("description", ""),
                 "body": doc.body,
                 "frontmatter": fm,
+                **CONSTITUTION_READER_CONTEXT.get(rel, {}),
             }
         )
 
@@ -147,7 +196,6 @@ def select_pages(
 # --------------------------------------------------------------------------- #
 SITE_TITLE = "Kestrel Sovereign"
 GITHUB_ORG_URL = "https://github.com/KestrelSovereignAI"
-GITHUB_REPO_URL = "https://github.com/KestrelSovereignAI/kestrel-sovereign"
 DEFAULT_BRANCH = "main"
 # Project-pages default. For a custom domain (CNAME) override to "" via --base.
 DEFAULT_PAGES_BASE = "/kestrel-sovereign"
@@ -231,6 +279,7 @@ def rewrite_local_links(
     base: str,
     published: dict[str, str],
     repo_root: Path,
+    revision: str = DEFAULT_BRANCH,
 ) -> str:
     """Repoint relative Markdown links so the published site has no dead links.
 
@@ -268,15 +317,15 @@ def rewrite_local_links(
             return f"{pre}{base}/{published[rel]}/{anchor}{title}{post}"
         if abs_path.exists():
             kind = "tree" if abs_path.is_dir() else "blob"
-            return f"{pre}{GITHUB_REPO_URL}/{kind}/{DEFAULT_BRANCH}/{rel}{anchor}{title}{post}"
+            return f"{pre}{GITHUB_REPO_URL}/{kind}/{revision}/{rel}{anchor}{title}{post}"
         return match.group(0)
 
     return _LINK_RE.sub(repl, body)
 
 
 def _published_map(pages: list[dict[str, Any]]) -> dict[str, str]:
-    """Map each published doc's repo-relative path to its site slug."""
-    return {page["rel"]: _site_slug(page["rel"]) for page in pages}
+    """Map each published source's actual repo path to its projected site slug."""
+    return {display_path(Path(page["src"])): _site_slug(page["rel"]) for page in pages}
 
 
 def _grouped(pages: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
@@ -307,7 +356,7 @@ class StarlightEmitter:
             lines += [f"description: {_yaml_quote(page['description'])}"]
         lines += ["---", ""]
 
-        banner = STATUS_BANNER.get(page["status"])
+        banner = page.get("publication_notice") or STATUS_BANNER.get(page["status"])
         if banner:
             kind, text = banner
             directive = {"warning": "caution", "info": "note"}.get(kind, "note")
@@ -325,7 +374,8 @@ class StarlightEmitter:
                 page["body"], src_dir, f"{self.base}/_assets"
             )
             body = rewrite_local_links(
-                body, src_dir, base=self.base, published=published, repo_root=PROJECT_ROOT
+                body, src_dir, base=self.base, published=published, repo_root=PROJECT_ROOT,
+                revision=page.get("source_revision", DEFAULT_BRANCH),
             )
             files[f"src/content/docs/{_site_slug(page['rel'])}.md"] = self.render_page(page, body)
             for name, src in assets.items():
@@ -389,7 +439,7 @@ class MintlifyEmitter:
         if page["description"]:
             lines += [f"description: {_yaml_quote(page['description'])}"]
         lines += ["---", ""]
-        banner = STATUS_BANNER.get(page["status"])
+        banner = page.get("publication_notice") or STATUS_BANNER.get(page["status"])
         if banner:
             kind, text = banner
             tag = {"warning": "Warning", "info": "Info"}.get(kind, "Note")
@@ -404,7 +454,8 @@ class MintlifyEmitter:
             src_dir = Path(page["src"]).parent
             body, assets, _ = rewrite_local_images(page["body"], src_dir, "/_assets")
             body = rewrite_local_links(
-                body, src_dir, base="", published=published, repo_root=PROJECT_ROOT
+                body, src_dir, base="", published=published, repo_root=PROJECT_ROOT,
+                revision=page.get("source_revision", DEFAULT_BRANCH),
             )
             files[f"{_site_slug(page['rel'])}.mdx"] = self.render_page(page, body)
             for name, src in assets.items():
