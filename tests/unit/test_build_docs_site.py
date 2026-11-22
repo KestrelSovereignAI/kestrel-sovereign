@@ -136,3 +136,27 @@ def test_mintlify_emitter_groups_by_type(docs: Path):
     nav = json.loads(tree["mint.json"])["navigation"]
     groups = {g["group"] for g in nav}
     assert "User Guide" in groups
+
+
+@pytest.mark.parametrize("body", ["no metadata", "---\ninvalid: [\n---\n"])
+def test_release_source_requires_valid_metadata(docs: Path, tmp_path: Path, monkeypatch, body):
+    source = tmp_path / "constitution.md"
+    source.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(build_docs_site, "DEFAULT_DOCS_ROOT", docs)
+    monkeypatch.setattr(build_docs_site, "CONSTITUTION_RELEASE_SOURCE", source)
+    with pytest.raises(ValueError, match="Published Constitution has invalid OKF metadata"):
+        build_docs_site.select_pages(docs)
+
+
+def test_package_source_links_use_projected_route_and_release_revision(tmp_path: Path):
+    source = tmp_path / "CONSTITUTION.md"
+    pledge = tmp_path / "PLEDGE.md"
+    pledge.write_text("Pledge", encoding="utf-8")
+    pages = [{"src": source, "rel": "docs/principles/KESTREL_CONSTITUTION_V2.md"}]
+    published = build_docs_site._published_map(pages)
+    assert published[build_docs_site.display_path(source)] == "principles/kestrel-constitution-v2"
+    rewritten = build_docs_site.rewrite_local_links(
+        "[pledge](PLEDGE.md)", tmp_path, base="", published=published,
+        repo_root=tmp_path, revision="constitution-v2.0.0",
+    )
+    assert rewritten == f"[pledge]({build_docs_site.GITHUB_REPO_URL}/blob/constitution-v2.0.0/PLEDGE.md)"

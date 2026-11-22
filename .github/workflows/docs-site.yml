@@ -1,16 +1,17 @@
 name: Publish docs site
 
-# Projects the OKF docs corpus (docs/**) into a Starlight static site and
-# deploys it to GitHub Pages. The site is a pure projection — docs/ stays the
-# source of truth; nothing here is hand-edited.
+# Projects the OKF docs corpus and released package Constitution into a
+# Starlight static site and deploys it to GitHub Pages.
 
 on:
   push:
     branches: [main]
     paths:
       - "docs/**"
+      - "kestrel_sovereign/data/constitutions/v2/**"
       - "scripts/build_docs_site.py"
       - "scripts/docs_okf.py"
+      - "tests/docs_site/**"
       - ".github/workflows/docs-site.yml"
   workflow_dispatch:
 
@@ -45,6 +46,11 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           npm run build
+
+      - name: Verify generated Constitution reader paths and source custody
+        env:
+          DOCS_SITE_NODE_MODULES: ${{ github.workspace }}/site/node_modules
+        run: uv run pytest tests/docs_site/test_constitution_handbook.py -q
 
       - uses: actions/upload-pages-artifact@v3
         with:
