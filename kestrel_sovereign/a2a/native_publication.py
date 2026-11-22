@@ -64,6 +64,14 @@ def host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
     return environment.get(PUBLIC_BASE_URL_ENV) is not None
 
 
+def validate_native_fleet_options(environment: Mapping[str, str], *, fleet_host: bool) -> None:
+    """Keep co-hosted publication and seed lifetime settings at their host boundary."""
+    if not fleet_host:
+        for option in ("KESTREL_A2A_PUBLISHED_AGENTS", "KESTREL_A2A_EPHEMERAL_TENANT"):
+            if option in environment:
+                raise ValueError(f"{option} requires a co-hosted agent fleet")
+
+
 def unpublished_cohost_warning(
     environment: Mapping[str, str], *, agents: int, host_port: int
 ) -> str | None:
@@ -127,9 +135,10 @@ class NativeHostingConfiguration:
 
     @classmethod
     def from_environment(
-        cls, environment: Mapping[str, str], *, require_published_discovery: bool = True,
+        cls, environment: Mapping[str, str], *, fleet_host: bool = True,
     ):
         """Unconfigured hosts run operator APIs without public peer discovery."""
+        validate_native_fleet_options(environment, fleet_host=fleet_host)
         base = environment.get(PUBLIC_BASE_URL_ENV)
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
         published = environment.get("KESTREL_A2A_PUBLISHED_AGENTS")
@@ -141,8 +150,7 @@ class NativeHostingConfiguration:
             None if published is None else frozenset(key.strip() for key in published.split(","))
         )
         if (
-            require_published_discovery
-            and published_keys is not None
+            published_keys is not None
             and discovery is not None
             and discovery not in published_keys
         ):

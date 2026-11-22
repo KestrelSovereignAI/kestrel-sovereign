@@ -561,7 +561,9 @@ directory before restoring it. The separate `multi_agent.a2a-dev.seeds.toml`
 manifest remains in place when the runtime saves roster edits. The DEV host
 publishes native A2A for the two demo registrations. The existing Kestrel
 registration still handles its DEV GitHub webhook and stays out of public A2A
-discovery.
+discovery. The published roster and ephemeral tenant settings apply to the
+co-hosted fleet. Per-agent process launchers configure discovery on each
+server individually.
 Cold starts restore the initial demo state and assign a fresh A2A tenant.
 Both signing DIDs stay stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.

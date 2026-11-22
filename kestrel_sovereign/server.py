@@ -1515,15 +1515,15 @@ async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
         install_a2a_inbound_sender_authorizer,
         mark_a2a_inbound_scoped_policy,
     )
+    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
     from kestrel_sovereign.a2a.native_standalone import (
         prepare_single_agent_native_publication,
-        single_agent_native_configuration,
         validate_native_peer_policy,
     )
 
     environment = dict(os.environ if environment is None else environment)
     peer_policy = validate_native_peer_policy(environment, fleet_host=False)
-    if single_agent_native_configuration(agent, environment) is None:
+    if NativeHostingConfiguration.from_environment(environment, fleet_host=False) is None:
         return None
     if peer_policy is None:
         router, requester = _hosted_peer_directory_context(
@@ -3478,6 +3478,9 @@ async def _lifespan_startup(app: FastAPI):
     app.state.fleet_host = fleet_host
     if fleet_host:
         _require_multi_agent_host_api_key(os.environ)
+    from kestrel_sovereign.a2a.native_publication import validate_native_fleet_options
+
+    validate_native_fleet_options(os.environ, fleet_host=fleet_host)
     if "KESTREL_A2A_PEER_POLICY" in os.environ:
         from kestrel_sovereign.a2a.native_standalone import validate_native_peer_policy
 

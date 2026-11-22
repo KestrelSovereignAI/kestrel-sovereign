@@ -116,6 +116,8 @@ SECRET_PATHS = (
     "backups/nightly.dump",
     "backups/cluster-dump.sql",
     "backups/cluster.sql.gz",
+    "kestrel_prime.db.xz",
+    "backups/kestrel_prime.db.xz",
 )
 
 #: Representative paths that must reach every channel. Without these, "exclude
