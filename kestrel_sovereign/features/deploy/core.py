@@ -123,6 +123,9 @@ class DeployManagerCore:
 
                 raw_secrets = data.get("secrets", {})
                 expanded_secrets = self._expand_env_vars(raw_secrets)
+                secret_files = self._expand_env_vars(data.get("secret_files", {}))
+                if secret_files and provider != DeployProviderType.CLOUD_RUN:
+                    raise DeployManagerError(f"profile '{key}' supports secret_files only on Cloud Run")
 
                 # Determine default dockerfile based on deployment mode
                 deployment_mode = data.get("deployment_mode", "agent")
@@ -148,7 +151,7 @@ class DeployManagerCore:
                     dockerfile=data.get("dockerfile", default_dockerfile),
                     env_vars=expanded_env,
                     secrets=expanded_secrets,
-                    secret_files=self._expand_env_vars(data.get("secret_files", {})),
+                    secret_files=secret_files,
                     gcp_project_id=data.get("gcp_project_id") or self.gcp_project_id,
                     azure_resource_group=data.get("azure_resource_group"),
                 )
@@ -203,6 +206,7 @@ class DeployManagerCore:
 
         _check("env_vars", raw_env, profile.env_vars)
         _check("secrets", raw_secrets, profile.secrets)
+        _check("secret_files", raw_profile.get("secret_files", {}), profile.secret_files)
 
         if unresolved or empty_after_expansion:
             details_unresolved = "; ".join(

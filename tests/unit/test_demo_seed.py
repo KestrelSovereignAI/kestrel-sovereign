@@ -3,6 +3,7 @@
 import lzma
 import os
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sovereign.identity.custody_bundle import (
     IdentityCustodyError,
@@ -25,8 +27,8 @@ from kestrel_sovereign.security.crypto_suite import MLDSA65Suite
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.asyncio
-async def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monkeypatch):
+@pytest_asyncio.fixture
+async def demo_seed(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
     source = tmp_path / "source"
     identity = await create_kestrel_identity_async(
@@ -38,7 +40,12 @@ async def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path
     bundle = create_identity_bundle(source, expected_did=did).encode()
     database_seed = tmp_path / "initial.db.xz"
     database_seed.write_bytes(lzma.compress(snapshot.read_bytes()))
+    return source, snapshot, did, bundle, database_seed
 
+
+@pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None, reason="container entrypoint requires Bash")
+def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, demo_seed):
+    _source, _snapshot, did, bundle, database_seed = demo_seed
     bundle_path = tmp_path / "identity.json"
     bundle_path.write_bytes(bundle)
     key_file = tmp_path / "data.key"
@@ -78,6 +85,9 @@ async def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path
         assert load_agent_identity(None, storage_dir=data / "demo").signing_did == did
     assert len(tenants) == 2
 
+
+def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monkeypatch, demo_seed):
+    source, snapshot, did, bundle, database_seed = demo_seed
     first = tmp_path / "first"
     first.mkdir()
     (first / "SOUL.md").write_text("Container demo profile")

@@ -561,6 +561,16 @@ Cold starts restore the initial demo state and assign a fresh A2A tenant.
 The signing DID stays stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.
 
+When provisioning DEV in a new GCP project, incept the named test/demo
+identity once and export its encrypted keys with
+`python -m kestrel_sovereign.identity.custody_bundle create`. Capture its
+closed SQLite database as an XZ file. Provision those files and the matching
+data key into the three Secret Manager entries specified by the profile.
+Grant the DEV runtime service account Secret Accessor on those entries and
+verify each referenced numeric version is enabled with
+`gcloud secrets versions describe` before deployment.
+The normal `kestrel deploy secrets sync` command manages env-var secrets.
+
 ## GitHub Actions
 
 | Workflow | Trigger | Purpose |

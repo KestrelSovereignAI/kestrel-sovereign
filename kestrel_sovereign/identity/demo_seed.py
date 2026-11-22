@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import lzma
 import os
-import shutil
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -63,15 +62,17 @@ def restore_demo_seed(agent_dir: Path, source: Path, bundle: bytes, *, expected_
         if not agent_dir.exists():
             os.replace(staged_agent, agent_dir)
             return
-        soul = agent_dir / "SOUL.md"
-        if soul.is_file():
-            shutil.copy2(soul, staged_agent / soul.name)
-        previous = Path(temp) / "previous"
-        os.replace(agent_dir, previous)
+        # A baked SOUL may leave the target directory on an overlay lower
+        # layer. Move the validated upper-layer artifacts, never that directory.
+        transferred = []
         try:
-            os.replace(staged_agent, agent_dir)
+            for artifact in staged_agent.iterdir():
+                destination = agent_dir / artifact.name
+                os.replace(artifact, destination)
+                transferred.append(destination)
         except OSError:
-            os.replace(previous, agent_dir)
+            for destination in reversed(transferred):
+                os.replace(destination, staged_agent / destination.name)
             raise
 
 
@@ -89,10 +90,17 @@ def main() -> None:
         args.config, auto_discover_fallback=False, runtime_base=Path.cwd()
     )
     registration = config.agents.get(args.registration)
+    roster = {name.strip() for name in os.environ.get("KESTREL_AGENTS", "").split(",")}
     expected_dir = args.agent_data_dir / args.registration
     if (
         not isinstance(registration, LocalAgentConfig)
         or not registration.autostart
+        or roster != set(config.agents)
+        or not all(
+            isinstance(agent, LocalAgentConfig)
+            and agent.resolve_data_dir(Path.cwd()) == args.agent_data_dir / name
+            for name, agent in config.agents.items()
+        )
         or registration.resolve_data_dir(Path.cwd()) != expected_dir
         or paths_overlap_by_filesystem_identity(args.host_control_dir, expected_dir)
     ):

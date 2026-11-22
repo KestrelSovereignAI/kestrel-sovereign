@@ -81,6 +81,12 @@ fi
 
 # Provision agent directories from KESTREL_AGENTS env var
 # Format: comma-separated agent names, e.g. "claw,testbot,emma"
+seeded_demo="${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_BUNDLE+x}${KESTREL_DEMO_SEED_DID+x}${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}"
+if [[ -n "$seeded_demo" && ! -f "$MULTI_AGENT_CONFIG" ]]; then
+    echo "FATAL: the pinned demo requires an explicit multi-agent roster." >&2
+    exit 1
+fi
+configured_agent_dirs=()
 if [ -n "${KESTREL_AGENTS:-}" ]; then
     echo "Provisioning agents from KESTREL_AGENTS: $KESTREL_AGENTS"
     IFS=',' read -ra AGENTS <<< "$KESTREL_AGENTS"
@@ -95,6 +101,7 @@ if [ -n "${KESTREL_AGENTS:-}" ]; then
             echo "  Creating agent directory: $agent_dir"
             mkdir -p "$agent_dir"
         fi
+        configured_agent_dirs+=("$agent_dir")
     done
 fi
 
@@ -123,7 +130,7 @@ fi
 
 # The pinned DEV demo restores a named seed. A fresh A2A tenant binds proofs
 # to this database lifetime even though the public signing DID is stable.
-if [[ -n "${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_BUNDLE+x}${KESTREL_DEMO_SEED_DID+x}${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}" ]]; then
+if [[ -n "$seeded_demo" ]]; then
     KESTREL_DATA_KEY="$(< "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}")"
     : "${KESTREL_DATA_KEY:?demo data key is empty}"
     export KESTREL_DATA_KEY
@@ -141,7 +148,12 @@ if [[ -n "${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_BUNDLE+x}${KESTREL_
 fi
 
 # Bootstrap identity and initialize DB for each agent data dir
-for dir in "$AGENT_DATA_DIR"/*/; do
+if [[ -n "${seeded_demo:-}" ]]; then
+    bootstrap_agent_dirs=("${configured_agent_dirs[@]}")
+else
+    bootstrap_agent_dirs=("$AGENT_DATA_DIR"/*/)
+fi
+for dir in "${bootstrap_agent_dirs[@]}"; do
     [ -d "$dir" ] || continue
     resolved_dir="$(canonicalize_path "$dir")"
     # The Hold database lives on the persistent agent-data volume, but its

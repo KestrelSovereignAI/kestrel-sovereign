@@ -44,12 +44,15 @@ def test_pinned_secret_files_are_created_and_reconciled(deployment_profile):
     assert volume.secret.secret == "demo-seed"
     item, = volume.secret.items
     assert (item.version, item.path) == ("2", "seed")
-    service.template.volumes.append(Volume(name="other"))
-    service.template.containers[0].volume_mounts.append(VolumeMount(name="other", mount_path="/separate"))
+    operator_volume = "kestrel-secret-file-operator"
+    service.template.volumes.append(Volume(name=operator_volume))
+    service.template.containers[0].volume_mounts.append(
+        VolumeMount(name=operator_volume, mount_path="/separate")
+    )
 
     _apply_managed_template(service, container, deployment_profile)
-    assert [volume.name for volume in service.template.volumes] == ["other"]
-    assert [mount.name for mount in service.template.containers[0].volume_mounts] == ["other"]
+    assert [volume.name for volume in service.template.volumes] == [operator_volume]
+    assert [mount.name for mount in service.template.containers[0].volume_mounts] == [operator_volume]
     with pytest.raises(DeployManagerError, match="pinned version"):
         _apply_managed_template(
             service, container, replace(profile, secret_files={mount_path: "demo-seed:latest"}),

@@ -41,7 +41,7 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
     script = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text()
 
     control_dir = script.index('HOST_CONTROL_DIR="$(dirname -- ')
-    agent_loop = script.index('for dir in "$AGENT_DATA_DIR"/*/')
+    agent_loop = script.index('for dir in "${bootstrap_agent_dirs[@]}"; do')
     resolver = script.index(
         'resolved_dir="$(canonicalize_path "$dir")"',
         agent_loop,

@@ -64,10 +64,17 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
 def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
     from google.cloud.run_v2.types import SecretVolumeSource, VersionToPath, Volume, VolumeMount
 
-    prefix = "kestrel-secret-file-"
     container = service.template.containers[0]
-    volumes = [volume for volume in service.template.volumes if not volume.name.startswith(prefix)]
-    mounts = [mount for mount in container.volume_mounts if not mount.name.startswith(prefix)]
+    secret_volume_names = {
+        volume.name for volume in service.template.volumes if volume.secret.secret
+    }
+    owned = {
+        mount.name for mount in container.volume_mounts
+        if mount.name in secret_volume_names and mount.name == _secret_file_volume_name(mount.mount_path)
+    }
+    volumes = [volume for volume in service.template.volumes if volume.name not in owned]
+    mounts = [mount for mount in container.volume_mounts if mount.name not in owned]
+    volume_names = {volume.name for volume in volumes}
     directories = {mount.mount_path for mount in mounts}
     for filename, reference in sorted(files.items()):
         path = PurePosixPath(filename)
@@ -78,10 +85,15 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
         ):
             raise DeployManagerError("Cloud Run secret files require an absolute file path and a pinned version")
         directory = str(path.parent)
-        if directory in directories:
+        if any(
+            PurePosixPath(other).is_relative_to(directory) or path.parent.is_relative_to(other)
+            for other in directories
+        ):
             raise DeployManagerError("Cloud Run secret file mount overlaps another volume")
         directories.add(directory)
-        name = prefix + hashlib.sha256(directory.encode()).hexdigest()[:16]
+        name = _secret_file_volume_name(directory)
+        if name in volume_names:
+            raise DeployManagerError("Cloud Run secret file conflicts with an existing volume")
         volumes.append(Volume(
             name=name,
             secret=SecretVolumeSource(
@@ -91,6 +103,10 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
         mounts.append(VolumeMount(name=name, mount_path=directory))
     service.template.volumes = volumes
     container.volume_mounts = mounts
+
+
+def _secret_file_volume_name(directory: str) -> str:
+    return "kestrel-secret-file-" + hashlib.sha256(directory.encode()).hexdigest()[:16]
 
 
 class CloudRunProvider(DeployProvider):
