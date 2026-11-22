@@ -645,7 +645,14 @@ class DeployManagerCore:
             session.revision = deploy_result.get("revision")
             session.last_updated = datetime.now(timezone.utc)
 
-            if session.service_url:
+            if deploy_result.get("serves_created_revision") is False:
+                readiness = ReadinessCheck(
+                    status=ReadinessStatus.UNKNOWN,
+                    gate=f"GET <revision_tag_url>{self.health_check_path}",
+                    failure="revision_not_serving",
+                    detail="the service URL does not serve this revision; verify its tagged URL",
+                )
+            elif session.service_url:
                 logger.info(f"Verifying health of {session.service_url}...")
                 readiness = await self._verify_health(session.service_url)
             else:

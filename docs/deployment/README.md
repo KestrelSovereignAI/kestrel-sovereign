@@ -570,7 +570,9 @@ Cold starts restore the initial demo state and assign a fresh A2A tenant.
 Both signing DIDs stay stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.
 Keep service traffic on one revision. The health check requires both public
-cards and the staging tag can be used at zero percent traffic before switching.
+cards. When traffic is still pinned to the previous revision, deploy reports
+the new revision's readiness as unknown. Verify the new revision's health
+and both cards using its zero-traffic tag before switching.
 
 When provisioning an independent DEV service in a new GCP project, first
 set its own HTTPS authority and signing DID, then publish that DID's

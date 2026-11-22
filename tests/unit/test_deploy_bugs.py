@@ -346,9 +346,13 @@ _SECRET_IN_ERROR = "token=sk-live-SECRET-should-not-leak"
 class _FakeProvider:
     """Stands in for Cloud Run: the control plane always creates a revision."""
 
-    def __init__(self, operation: str, *, service_url: str | None = _SERVICE_URL):
+    def __init__(
+        self, operation: str, *, service_url: str | None = _SERVICE_URL,
+        serves_created_revision: bool | None = None,
+    ):
         self.operation = operation
         self.service_url = service_url
+        self.serves_created_revision = serves_created_revision
         self.deploy_calls = 0
         self.teardown_calls = 0
 
@@ -359,6 +363,7 @@ class _FakeProvider:
             "revision": f"{service_name}-00007-abc",
             "status": "active",
             "operation": self.operation,
+            "serves_created_revision": self.serves_created_revision,
             "warnings": [],
         }
 
@@ -514,8 +519,16 @@ class TestIssue2473ReadinessGatesDeploySuccess:
         assert "SECRET" not in result["error"]
 
     @pytest.mark.asyncio
-    async def test_missing_service_url_is_unknown_and_not_success(self):
-        manager = _manager_with(_FakeProvider("create", service_url=None))
+    @pytest.mark.parametrize(
+        "service_url, serves_created_revision, failure",
+        [(None, None, "no_service_url"), (_SERVICE_URL, False, "revision_not_serving")],
+    )
+    async def test_no_url_for_created_revision_is_unknown_and_not_success(
+        self, service_url, serves_created_revision, failure,
+    ):
+        manager = _manager_with(_FakeProvider(
+            "create", service_url=service_url, serves_created_revision=serves_created_revision,
+        ))
 
         with patch(
             "kestrel_sovereign.features.deploy.core.probe_http_health"
@@ -526,7 +539,7 @@ class TestIssue2473ReadinessGatesDeploySuccess:
         assert result["success"] is False
         assert result["control_plane_status"] == "succeeded"
         assert result["readiness_status"] == "unknown"
-        assert result["readiness"]["failure"] == "no_service_url"
+        assert result["readiness"]["failure"] == failure
 
     @pytest.mark.asyncio
     async def test_gate_that_never_probed_is_unknown(self):

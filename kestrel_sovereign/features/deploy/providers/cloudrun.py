@@ -19,6 +19,10 @@ from .base import DeployProvider
 logger = logging.getLogger(__name__)
 
 
+def _is_seeded_demo(profile: DeploymentProfile) -> bool:
+    return "KESTREL_DEMO_SEED_DATA_KEY_FILE" in profile.env_vars
+
+
 def _apply_managed_template(service: Any, container: Any, profile: DeploymentProfile) -> None:
     """Write the revision-template fields Kestrel manages onto ``service``.
 
@@ -31,10 +35,19 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
         raise DeployManagerError("Cloud Run profile updates require a single-container service")
     if len(container.ports) != 1:
         raise DeployManagerError("Cloud Run profiles require one explicit ingress port")
-    if "KESTREL_DEMO_SEED_DATA_KEY_FILE" in profile.env_vars and (
-        profile.max_instances != 1 or sum(target.percent > 0 for target in service.traffic) > 1
-    ):
-        raise DeployManagerError("Seeded demo publication requires one instance and an unsplit traffic target")
+    if _is_seeded_demo(profile):
+        from google.cloud.run_v2.types import ServiceScaling
+
+        scaling = service.scaling
+        if (
+            profile.max_instances != 1
+            or sum(target.percent > 0 for target in service.traffic) > 1
+            or (
+                scaling.scaling_mode == ServiceScaling.ScalingMode.MANUAL
+                and scaling.manual_instance_count != 1
+            )
+        ):
+            raise DeployManagerError("Seeded demo publication requires one instance and an unsplit traffic target")
     if count == 1:
         current = service.template.containers[0]
         if len(current.ports) > 1:
@@ -69,19 +82,20 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
     from google.cloud.run_v2.types import SecretVolumeSource, VersionToPath, Volume, VolumeMount
 
     container = service.template.containers[0]
-    secret_volume_names = {
-        volume.name for volume in service.template.volumes if volume.secret.secret
+    original_volumes = {
+        volume.name: volume for volume in service.template.volumes
     }
     owned = {
         (mount.name, mount.mount_path) for mount in container.volume_mounts
-        if mount.name in secret_volume_names and mount.name == _secret_file_volume_name(mount.mount_path)
+        if (mount.name in original_volumes and original_volumes[mount.name].secret.secret
+            and mount.name == _secret_file_volume_name(mount.mount_path))
     }
     mounts = [mount for mount in container.volume_mounts if (mount.name, mount.mount_path) not in owned]
     referenced = {mount.name for mount in mounts}
     owned_names = {name for name, _ in owned}
     volumes = {
-        volume.name: volume for volume in service.template.volumes
-        if volume.name not in owned_names or volume.name in referenced
+        name: volume for name, volume in original_volumes.items()
+        if name not in owned_names or name in referenced
     }
     cloud_sql_volumes = {
         volume.name for volume in volumes.values() if volume.cloud_sql_instance.instances
@@ -106,9 +120,12 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
             raise DeployManagerError("Cloud Run secret file mount overlaps another volume")
         directories.add(directory)
         name = _secret_file_volume_name(directory)
+        previous = original_volumes[name].secret if name in owned_names else SecretVolumeSource()
+        mode = next((item.mode for item in previous.items if item.path == path.name), 0)
         volume = Volume(
             name=name, secret=SecretVolumeSource(
-                secret=secret, items=[VersionToPath(version=version, path=path.name)],
+                secret=secret, default_mode=previous.default_mode,
+                items=[VersionToPath(version=version, path=path.name, mode=mode)],
             ),
         )
         if name in volumes and volumes[name] != volume:
@@ -361,13 +378,24 @@ class CloudRunProvider(DeployProvider):
 
             logger.info(f"Deployment complete: {service_url}")
 
-            return {
+            deployment = {
                 "service_url": service_url,
                 "revision": result.latest_ready_revision,
                 "status": "active",
                 "operation": "update" if is_update else "create",
                 "warnings": [iam_warning] if iam_warning else [],
             }
+            if _is_seeded_demo(effective_profile):
+                revision = result.latest_created_revision.rsplit("/", 1)[-1]
+                active = [target for target in result.traffic_statuses if target.percent > 0]
+                deployment["revision"] = revision
+                deployment["serves_created_revision"] = (
+                    bool(revision)
+                    and len(active) == 1
+                    and active[0].percent == 100
+                    and active[0].revision.rsplit("/", 1)[-1] == revision
+                )
+            return deployment
 
         except ImportError as e:
             raise DeployManagerError(f"Missing dependency: {e}") from e

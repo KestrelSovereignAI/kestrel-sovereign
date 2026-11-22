@@ -44,6 +44,13 @@ def test_pinned_secret_files_are_created_and_reconciled(deployment_profile):
     assert volume.secret.secret == "demo-seed"
     item, = volume.secret.items
     assert (item.version, item.path) == ("2", "seed")
+    service.template.volumes[0].secret.default_mode = 0o440
+    service.template.volumes[0].secret.items[0].mode = 0o400
+    updated = replace(profile, secret_files={mount_path: "demo-seed:3"})
+    _apply_managed_template(service, container, updated)
+    assert service.template.volumes[0].secret.default_mode == 0o440
+    item, = service.template.volumes[0].secret.items
+    assert (item.version, item.mode) == ("3", 0o400)
     service.template.containers[0].volume_mounts.append(
         VolumeMount(name=volume.name, mount_path="/operator-alias")
     )
@@ -79,14 +86,19 @@ def test_secret_file_cannot_overlap_implicit_cloud_sql_mount(deployment_profile)
         )
 
 
-@pytest.mark.parametrize("max_instances, percentages", [(2, [100]), (1, [50, 50])])
+@pytest.mark.parametrize(
+    "max_instances, percentages, manual_count",
+    [(2, [100], None), (1, [50, 50], None), (1, [100], 2)],
+)
 def test_seeded_demo_deployment_refuses_multiple_serving_targets(
-    deployment_profile, max_instances, percentages,
+    deployment_profile, max_instances, percentages, manual_count,
 ):
     from google.cloud.run_v2 import Service
-    from google.cloud.run_v2.types import Container, ContainerPort
+    from google.cloud.run_v2.types import Container, ContainerPort, ServiceScaling
 
     service = Service(traffic=[{"percent": percent} for percent in percentages])
+    if manual_count is not None:
+        service.scaling = ServiceScaling(scaling_mode="MANUAL", manual_instance_count=manual_count)
     profile = replace(
         deployment_profile,
         max_instances=max_instances,
