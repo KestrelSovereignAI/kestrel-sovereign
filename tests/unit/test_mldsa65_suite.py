@@ -7,7 +7,7 @@ Covers:
 - Tampering rejection
 - Wrong-key rejection
 - Type validation (bytes-only API)
-- Multikey integration (multicodec 0x1207 ``ml-dsa-65-pub``)
+- Multikey integration (multicodec 0x1211 ``mldsa-65-pub``)
 - ``is_post_quantum = True`` (verify-policy classification)
 - Cross-suite isolation (ML-DSA sig ≠ secp256k1 sig)
 - Library-version smoke check (pqcrypto installed and usable)
@@ -231,16 +231,25 @@ def test_multikey_form_equals_legacy_form(suite, keypair):
 # ---------------------------------------------------------------------------
 
 def test_multikey_carries_mldsa65_codec(suite, keypair):
-    """Cross-implementation interop: multicodec 0x87 0x24 (varint of
-    0x1207 ml-dsa-65-pub, proposed) must precede the public-key bytes."""
+    """The registered mldsa-65-pub codec precedes the public-key bytes."""
     mb = public_key_to_multibase(suite, keypair.public_key)
     assert mb.startswith("z")
     raw = base58btc_decode(mb[1:])
-    assert raw[:2] == b"\x87\x24", (
-        f"ml-dsa-65 Multikey body must start with codec varint b'\\x87\\x24'; "
+    assert raw[:2] == b"\x91\x24", (
+        f"ml-dsa-65 Multikey body must start with codec varint b'\\x91\\x24'; "
         f"got {raw[:2]!r}"
     )
     assert len(raw[2:]) == 1952, "ml-dsa-65 public key body must be 1952 bytes"
+
+
+def test_existing_mldsa65_document_can_still_verify_signatures(suite, keypair):
+    from kestrel_sovereign.security.multikey import base58btc_encode
+
+    legacy = "z" + base58btc_encode(b"\x87\x24" + keypair.public_key)
+    rebuilt_suite, rebuilt_pub = multibase_to_public_key(legacy)
+    signature = suite.sign(b"existing-identity", keypair.private_key)
+    assert rebuilt_suite.verify(b"existing-identity", signature, rebuilt_pub)
+    assert public_key_to_multibase(rebuilt_suite, rebuilt_pub) != legacy
 
 
 def test_multikey_round_trip(suite, keypair):

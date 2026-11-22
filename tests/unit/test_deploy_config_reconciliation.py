@@ -177,7 +177,7 @@ def test_dev_publication_selects_the_pinned_demo_registration(live_config):
     assert config.discovery_routing_key in env["KESTREL_AGENTS"].split(",")
     assert env["KESTREL_DEMO_SEED_DID"] == "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
     assert env["KESTREL_DEMO_SEED_DATABASE"] == "/var/run/kestrel-demo-seed/kestrel_prime.db.xz"
-    assert profile["secrets"]["KESTREL_IDENTITY_BUNDLE"] == "kestrel-dev-a2a-identity-bundle:1"
+    assert profile["secrets"]["KESTREL_IDENTITY_BUNDLE"] == "kestrel-dev-a2a-identity-bundle:2"
     assert profile["secrets"]["KESTREL_DATA_KEY"] == "kestrel-dev-a2a-data-key:1"
     assert config.push is None
 
