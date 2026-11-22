@@ -12,6 +12,7 @@ playwright-report/
 test-results/
 node_modules/
 *.db
+*.db.xz
 *.capsule
 agent_data/
 # Secrets and credentials. `gcloud builds submit .` uploads this tree to Cloud

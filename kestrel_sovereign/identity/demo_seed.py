@@ -88,10 +88,13 @@ def restore_demo_seed(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--seeds", type=Path, required=True)
     parser.add_argument("--agent-data-dir", type=Path, required=True)
     parser.add_argument("--host-control-dir", type=Path, required=True)
     parser.add_argument("--registration", required=True)
     args = parser.parse_args()
+    if os.environ.get("KESTREL_DB_BACKEND") != "sqlite":
+        raise IdentityCustodyError("Pinned demo seeds require SQLite storage")
     config = MultiAgentConfig.load(
         args.config, auto_discover_fallback=False, runtime_base=Path.cwd()
     )
@@ -99,8 +102,8 @@ def main() -> None:
     published = {
         name.strip() for name in os.environ.get("KESTREL_A2A_PUBLISHED_AGENTS", "").split(",")
     }
-    with args.config.open("rb") as source:
-        seeds = tomllib.load(source).get("demo_seeds", {})
+    with args.seeds.open("rb") as source:
+        seeds = tomllib.load(source)
     if (
         not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) for name in roster)
         or roster != set(config.agents)

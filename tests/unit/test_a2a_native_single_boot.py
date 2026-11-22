@@ -52,6 +52,23 @@ async def test_operator_only_server_does_not_require_an_implicit_peer_identity(
     assert p.app.routes == []
 
 
+async def test_excluded_process_server_does_not_install_native_a2a(single_candidate):
+    from kestrel_sovereign.server import _onboard_single_agent_native
+
+    p = single_candidate
+    publication = await _onboard_single_agent_native(
+        p.app,
+        object(),
+        {
+            "KESTREL_BASE_URL": "https://single.native.test",
+            "KESTREL_A2A_DISCOVERY_AGENT": "private",
+            "KESTREL_A2A_PUBLISHED_AGENTS": "demo",
+        },
+    )
+    assert publication is None
+    assert p.app.routes == []
+
+
 async def test_process_onboarding_keeps_the_attested_signing_did_to_principal_mapping(
     single_candidate,
 ):

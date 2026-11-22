@@ -64,7 +64,9 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             '[agents.demo]\n'
             f'data_dir = "{data / "demo"}"\n'
             'port = 8801\nautostart = true\n'
-            f'[demo_seeds.demo]\ndid = "{did}"\n'
+        )
+        registry.with_suffix(".seeds.toml").write_text(
+            f'[demo]\ndid = "{did}"\n'
             f'database = "{database_seed}"\nidentity = "{bundle_path}"\n'
             f'soul = "{soul}"\n'
         )
@@ -74,9 +76,20 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             PYTHONPATH=str(REPO_ROOT), KESTREL_ENV="development",
             KESTREL_AGENT_DATA_DIR=str(data), KESTREL_HOST_DB_PATH=str(data / "host/host.db"),
             KESTREL_MULTI_AGENT_CONFIG=str(registry), KESTREL_AGENTS="demo",
-            KESTREL_DEPLOYMENT_PERSISTENCE="ephemeral_demo", KESTREL_A2A_DISCOVERY_AGENT="demo",
+            KESTREL_DB_BACKEND="sqlite", KESTREL_DEPLOYMENT_PERSISTENCE="ephemeral_demo",
+            KESTREL_A2A_DISCOVERY_AGENT="demo",
             KESTREL_A2A_PUBLISHED_AGENTS="demo", KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),
         )
+        if boot == "boot-one":
+            missing_mount = dict(env, KESTREL_DATA_KEY=os.environ["KESTREL_DATA_KEY"])
+            del missing_mount["KESTREL_DEMO_SEED_DATA_KEY_FILE"]
+            rejected = subprocess.run(
+                ["bash", "-c", startup], cwd=tmp_path, env=missing_mount,
+                capture_output=True, text=True, check=False, timeout=45,
+            )
+            assert rejected.returncode != 0
+            assert "demo data key mount is required" in rejected.stderr
+            assert not (data / "demo").exists()
         result = subprocess.run(
             ["bash", "-c", startup], cwd=tmp_path, env=env,
             capture_output=True, text=True, check=False, timeout=45,
@@ -127,17 +140,24 @@ def test_entrypoint_refuses_different_configured_discovery_storage(tmp_path, mon
         '[agents.demo]\n'
         f'data_dir = "{tmp_path / "other"}"\n'
         'port = 8801\nautostart = true\n'
-        '[demo_seeds.demo]\ndid = "did:web:agents.custody.test:demo"\n'
+    )
+    seeds = registry.with_suffix(".seeds.toml")
+    seeds.write_text(
+        '[demo]\ndid = "did:web:agents.custody.test:demo"\n'
         'database = "db.xz"\nidentity = "bundle"\n'
     )
     monkeypatch.setenv("KESTREL_AGENTS", "demo")
     monkeypatch.setenv("KESTREL_A2A_PUBLISHED_AGENTS", "demo")
     monkeypatch.setattr(sys, "argv", [
-        "demo_seed", "--config", str(registry),
+        "demo_seed", "--config", str(registry), "--seeds", str(seeds),
         "--agent-data-dir", str(tmp_path / "data"),
         "--host-control-dir", str(tmp_path / "host"),
         "--registration", "demo",
     ])
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    with pytest.raises(IdentityCustodyError, match="require SQLite"):
+        main()
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
     with pytest.raises(IdentityCustodyError, match="configured discovery registration"):
         main()
 

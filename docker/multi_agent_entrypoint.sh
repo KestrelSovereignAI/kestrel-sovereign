@@ -82,9 +82,14 @@ fi
 # Provision agent directories from KESTREL_AGENTS env var
 # Format: comma-separated agent names, e.g. "claw,testbot,emma"
 seeded_demo="${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}"
-if [[ -n "$seeded_demo" && ! -f "$MULTI_AGENT_CONFIG" ]]; then
-    echo "FATAL: the pinned demo requires an explicit multi-agent roster." >&2
-    exit 1
+seed_manifest="${MULTI_AGENT_CONFIG%.toml}.seeds.toml"
+if [[ -f "$seed_manifest" || -n "$seeded_demo" ]]; then
+    seeded_demo=1
+    if [[ ! -f "$MULTI_AGENT_CONFIG" || ! -f "$seed_manifest" ]]; then
+        echo "FATAL: the pinned demo requires an explicit multi-agent roster and seed manifest." >&2
+        exit 1
+    fi
+    : "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}"
 fi
 configured_agent_dirs=()
 if [ -n "${KESTREL_AGENTS:-}" ]; then
@@ -140,7 +145,7 @@ if [[ -n "$seeded_demo" ]]; then
     export KESTREL_DATA_KEY
     KESTREL_A2A_EPHEMERAL_TENANT="$(
         /app/.venv/bin/python -m kestrel_sovereign.identity.demo_seed \
-            --config "$MULTI_AGENT_CONFIG" --agent-data-dir "$AGENT_DATA_DIR" \
+            --config "$MULTI_AGENT_CONFIG" --seeds "$seed_manifest" --agent-data-dir "$AGENT_DATA_DIR" \
             --host-control-dir "$HOST_CONTROL_DIR" \
             --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
     )"

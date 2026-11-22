@@ -38,7 +38,10 @@ from kestrel_sovereign.features.storage_access import resolve_scoped_agent_did
 from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.a2a.native_publication import NativeA2APublication
+    from kestrel_sovereign.a2a.native_publication import (
+        NativeA2APublication,
+        NativeHostingConfiguration,
+    )
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
@@ -449,6 +452,23 @@ async def open_process_native_peer_session(
         yield session
 
 
+def single_agent_native_configuration(
+    recipient, environment: Mapping[str, str],
+) -> "tuple[NativeHostingConfiguration, str] | None":
+    """Select this process's publication, if its registration is public."""
+    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+
+    configuration = NativeHostingConfiguration.from_environment(
+        environment, require_published_discovery=False,
+    )
+    if configuration is None:
+        return None
+    routing_key = configuration.discovery_routing_key or resolve_scoped_agent_did(recipient)
+    if not configuration.publishes(routing_key):
+        return None
+    return configuration, routing_key
+
+
 async def prepare_single_agent_native_publication(
     app,
     recipient,
@@ -466,20 +486,15 @@ async def prepare_single_agent_native_publication(
     """
     from kestrel_sovereign.a2a.native_publication import (
         NativeA2APublication,
-        NativeHostingConfiguration,
         native_publication_registry,
     )
 
     environment = dict(environment)
     validate_native_peer_policy(environment, fleet_host=False)
-    configuration = NativeHostingConfiguration.from_environment(
-        environment, require_published_discovery=False,
-    )
-    if configuration is None:
+    selected = single_agent_native_configuration(recipient, environment)
+    if selected is None:
         return None
-    routing_key = configuration.discovery_routing_key or resolve_scoped_agent_did(recipient)
-    if not configuration.publishes(routing_key):
-        return None
+    configuration, routing_key = selected
     require_execution_work(recipient)
     _configure_single_agent_native_peer_policy(
         recipient, environment,

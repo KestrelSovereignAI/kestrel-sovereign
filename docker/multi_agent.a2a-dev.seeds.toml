@@ -1,0 +1,10 @@
+[kestrel-demo]
+did = "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
+database = "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz"
+identity = "/var/run/kestrel-demo-seed/identity/identity.json"
+
+[kestrel-a2a-peer]
+did = "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a-peer"
+database = "/var/run/kestrel-demo-seed/peer-state/kestrel_prime.db.xz"
+identity = "/var/run/kestrel-demo-seed/peer-identity/identity.json"
+soul = "/app/docker/a2a-dev-peer.SOUL.md"
