@@ -150,7 +150,7 @@ fi
 # The pinned DEV demo restores a named seed. A fresh A2A tenant binds proofs
 # to this database lifetime even though the public signing DID is stable.
 if [[ -n "$seeded_demo" ]]; then
-    for dir in "$HOST_CONTROL_DIR" "$AGENT_DATA_DIR"/*/; do
+    for dir in "$AGENT_DATA_DIR"/*/; do
         refuse_host_control_agent_collision "$dir"
     done
     KESTREL_DATA_KEY="$(< "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}")"

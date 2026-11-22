@@ -73,6 +73,9 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
     tenants = set()
     for boot in ("boot-one", "boot-two"):
         data = tmp_path / boot
+        host_database = tmp_path / f"{boot}-control" / "kestrel_prime.db"
+        host_database.parent.mkdir()
+        host_database.write_bytes(b"host database")
         registry = data.with_suffix(".toml")
         registry.write_text(
             '[agents.demo]\n'
@@ -89,7 +92,7 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
         del env["KESTREL_DATA_KEY"]
         env.update(
             PYTHONPATH=str(REPO_ROOT), KESTREL_ENV="development",
-            KESTREL_AGENT_DATA_DIR=str(data), KESTREL_HOST_DB_PATH=str(data / "host/host.db"),
+            KESTREL_AGENT_DATA_DIR=str(data), KESTREL_HOST_DB_PATH=str(host_database),
             KESTREL_MULTI_AGENT_CONFIG=str(tmp_path / "multi_agent.toml"), KESTREL_AGENTS="demo",
             KESTREL_DEMO_SEED_ROSTER_TEMPLATE=str(registry),
             KESTREL_DB_BACKEND="sqlite", KESTREL_DEPLOYMENT_PERSISTENCE="ephemeral_demo",
@@ -120,9 +123,6 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             assert "collides with existing agent directory" in rejected.stderr
             assert not (data / "demo" / "kestrel_prime.db").exists()
             assert active_roster.read_text() == "# Existing runtime roster"
-            host_database = data / "host" / "host.db"
-            host_database.parent.mkdir()
-            host_database.write_bytes(b"host database")
             unsafe_env = dict(env, KESTREL_MULTI_AGENT_CONFIG=str(host_database))
             rejected = subprocess.run(
                 ["bash", "-c", startup], cwd=tmp_path, env=unsafe_env,
@@ -189,6 +189,17 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
         with closing(sqlite3.connect(agent_dir / snapshot.name)) as db:
             assert db.execute("SELECT node_id FROM graph_nodes WHERE node_type = 'agent'").fetchall() == [(did,)]
     assert (first / "SOUL.md").read_text() == "Container demo profile"
+    if os.name != "nt":
+        operator_roster = tmp_path / "operator-roster.toml"
+        operator_roster.write_text("# Old roster")
+        operator_roster.chmod(0o600)
+        alias = tmp_path / "active-roster.toml"
+        alias.symlink_to(operator_roster)
+        restore_demo_seeds([seed_inputs(tmp_path / "through-link", database_seed)],
+                           tenant="demo-test", roster_update=(roster, alias))
+        assert alias.is_symlink()
+        assert operator_roster.read_bytes() == roster.read_bytes()
+        assert operator_roster.stat().st_mode & 0o777 == 0o600
 
     with pytest.raises(IdentityCustodyError, match="existing agent state"):
         restore_demo_seeds([seed_inputs(first, database_seed)], tenant="demo-test")

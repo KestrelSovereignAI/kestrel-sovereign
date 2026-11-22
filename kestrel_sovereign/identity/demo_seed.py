@@ -8,6 +8,7 @@ import lzma
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import tomllib
 from collections.abc import Iterable, Iterator
@@ -126,12 +127,19 @@ def restore_demo_seeds(
         staged_roster = None
         if roster_update is not None:
             template, runtime_config = roster_update
+            runtime_config = runtime_config.resolve()
             if not (runtime_config.exists() and template.samefile(runtime_config)):
                 directory = staging.enter_context(
                     tempfile.TemporaryDirectory(prefix=".demo-roster-", dir=runtime_config.parent),
                 )
                 staged_roster = Path(directory) / runtime_config.name
                 staged_roster.write_bytes(template.read_bytes())
+                if runtime_config.exists():
+                    previous = runtime_config.stat()
+                    current = staged_roster.stat()
+                    if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
+                        os.chown(staged_roster, previous.st_uid, previous.st_gid)
+                    staged_roster.chmod(stat.S_IMODE(previous.st_mode))
         with ExitStack() as rollback:
             for agent_dir, staged_agent in prepared:
                 if not agent_dir.exists():

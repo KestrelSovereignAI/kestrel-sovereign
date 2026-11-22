@@ -3487,7 +3487,7 @@ async def _lifespan_startup(app: FastAPI):
     app.state.required_a2a_card_keys = frozenset()
     if "KESTREL_DEMO_SEED_MANIFEST" in os.environ:
         native_config = NativeHostingConfiguration.from_environment(os.environ, fleet_host=fleet_host)
-        app.state.required_a2a_card_keys = frozenset(native_config.seeded_signers)
+        app.state.required_a2a_card_keys = frozenset(native_config.seeded_registrations)
     if "KESTREL_A2A_PEER_POLICY" in os.environ:
         from kestrel_sovereign.a2a.native_standalone import validate_native_peer_policy
 

@@ -320,13 +320,15 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
         pytest.skip("The seeded DEV profile uses SQLite")
     did = p.recipient.identity.signing_did
     tenant = p.recipient.task_manager.task_store.scope.tenant
-    configured_tenant = "stale-tenant" if changed == "tenant" else tenant
+    configured_tenant = "stale-tenant" if changed == "tenant" else tenant.rsplit("-", 1)[0]
     database_status = Path(p.backend.db_path).stat()
     manifest = tmp_path / "demo.seeds.toml"
     pinned_did = "did:web:public.test:other" if changed == "signing DID" else did
-    manifest.write_text(f'[registered-agent]\ndid = "{pinned_did}"\n')
+    fingerprint = demo_signing_key_fingerprint(p.recipient.identity)
+    manifest.write_text(
+        f'[registered-agent]\ndid = "{pinned_did}"\nsigning_key_fingerprint = "{fingerprint}"\n'
+    )
     if changed != "database":
-        fingerprint = demo_signing_key_fingerprint(p.recipient.identity)
         await p.backend.execute(
             f"CREATE TABLE {DEMO_SEED_STATE_TABLE} (tenant TEXT, signing_keys TEXT)"
         )
@@ -988,11 +990,12 @@ async def test_host_primary_service_constructor_refusal_retires_actual_storage(
         await backend.close()
 
 
-@pytest.mark.parametrize("broken_session_schema", [False, True])
+@pytest.mark.parametrize("broken_session_schema, ephemeral", [(True, False), (False, False), (False, True)])
 async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
     native_a2a_backend_factory,
     tmp_path,
     broken_session_schema,
+    ephemeral,
     monkeypatch,
 ):
     # Imports happen after the suite has isolated every runtime/config path.
@@ -1007,6 +1010,9 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
     # Real service construction must not discover cloud instance credentials
     # during this offline native storage/signal test.
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    if ephemeral:
+        monkeypatch.setenv("KESTREL_A2A_EPHEMERAL_TENANT", "demo-boot")
+        monkeypatch.setenv("KESTREL_DEPLOYMENT_PERSISTENCE", "ephemeral_demo")
     services = AsyncExitStack()
     ctx = None
     try:
@@ -1038,7 +1044,12 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         else:
             await agent._boot_phase_a2a_observability_signals(ctx)
             manager = agent.task_manager
-            assert manager.task_store.scope == NativeRecipientScope(agent.did)
+            if ephemeral:
+                scope = manager.task_store.scope
+                assert scope.recipient_id == agent.did and scope.tenant.startswith("demo-boot-")
+                assert scope != NativeRecipientScope.for_ephemeral_activation(agent.did, "demo-boot")
+            else:
+                assert manager.task_store.scope == NativeRecipientScope(agent.did)
             assert (
                 manager.context_store.backend is manager.task_store.backend is backend
             )
@@ -1083,6 +1094,13 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         assert agent.task_manager is None
         assert backend.is_connected
         assert await backend.fetch_one("SELECT 1") == (1,)
+        if ephemeral:
+            ctx = BootContext(custody=agent._custody)
+            await agent._boot_phase_a2a_observability_signals(ctx)
+            assert agent.task_manager.task_store.scope.tenant.startswith("demo-boot-")
+            assert agent.task_manager.task_store.scope != scope
+            await ctx.run_rollback()
+            assert not ctx.rollback_errors
     finally:
         try:
             if ctx is not None:

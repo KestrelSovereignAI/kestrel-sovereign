@@ -118,15 +118,21 @@ def unpublished_peer_detail(environment: Mapping[str, str]) -> str:
 
 
 @dataclass(frozen=True)
+class SeededNativeRegistration:
+    signing_did: str
+    signing_key_fingerprint: str
+    database_identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class NativeHostingConfiguration:
     """No public URL or discovery recipient is inferred from an incoming request."""
 
     public_base_url: str
     discovery_routing_key: str | None = None
     push: NativePushPolicy | None = None
-    seeded_signers: Mapping[str, str] | None = None
+    seeded_registrations: Mapping[str, SeededNativeRegistration] | None = None
     ephemeral_tenant: str | None = None
-    seeded_database_identities: Mapping[str, tuple[int, int]] | None = None
 
     def __post_init__(self):
         if self.push is not None and not isinstance(self.push, NativePushPolicy):
@@ -138,18 +144,14 @@ class NativeHostingConfiguration:
         )
         if self.discovery_routing_key is not None:
             encode_agent_route_name(self.discovery_routing_key)
-        if self.seeded_signers is not None:
-            if self.discovery_routing_key not in self.seeded_signers:
+        if self.seeded_registrations is not None:
+            if self.discovery_routing_key not in self.seeded_registrations:
                 raise ValueError("The A2A discovery registration must have a pinned demo seed")
-            if self.seeded_database_identities is None or (
-                self.seeded_signers.keys() != self.seeded_database_identities.keys()
-            ):
-                raise ValueError("Each seeded publication requires its installed database identity")
-            for routing_key in self.seeded_signers:
+            for routing_key in self.seeded_registrations:
                 encode_agent_route_name(routing_key)
 
     def publishes(self, routing_key: str) -> bool:
-        return self.seeded_signers is None or routing_key in self.seeded_signers
+        return self.seeded_registrations is None or routing_key in self.seeded_registrations
 
     @classmethod
     def from_environment(
@@ -169,14 +171,11 @@ class NativeHostingConfiguration:
             if discovery is not None or manifest is not None:
                 raise ValueError(f"A2A discovery requires {PUBLIC_BASE_URL_ENV}")
             return None
-        seeded_signers = None
-        seeded_database_identities = None
+        seeded_registrations = None
         if manifest is not None:
             from kestrel_sovereign.identity.demo_seed import read_demo_seed_manifest
 
-            seeded_signers = {
-                name: seed["did"] for name, seed in read_demo_seed_manifest(Path(manifest)).items()
-            }
+            seeds = read_demo_seed_manifest(Path(manifest))
             decoded = json.loads(database_evidence)
             if not isinstance(decoded, dict) or any(
                 not isinstance(value, list) or len(value) != 2
@@ -184,11 +183,18 @@ class NativeHostingConfiguration:
                 for value in decoded.values()
             ):
                 raise ValueError("Seeded demo database identities have an invalid format")
-            seeded_database_identities = {name: (identity[0], identity[1]) for name, identity in decoded.items()}
+            if seeds.keys() != decoded.keys():
+                raise ValueError("Each seeded publication requires its installed database identity")
+            seeded_registrations = {
+                name: SeededNativeRegistration(
+                    seed["did"], seed["signing_key_fingerprint"],
+                    (decoded[name][0], decoded[name][1]),
+                )
+                for name, seed in seeds.items()
+            }
         return cls(
             base, discovery, NativePushPolicy.from_environment(environment),
-            seeded_signers=seeded_signers, ephemeral_tenant=tenant,
-            seeded_database_identities=seeded_database_identities,
+            seeded_registrations=seeded_registrations, ephemeral_tenant=tenant,
         )
 
 
@@ -209,7 +215,6 @@ class NativeA2APublication:
         profile: dict[str, str],
         *,
         guard_factory: Callable[[], NativeDIDRequestGuard],
-        seeded_signing_key_fingerprint: str | None = None,
     ):
         if not callable(guard_factory):
             raise TypeError("Native publication requires its host-owned guard factory")
@@ -219,7 +224,10 @@ class NativeA2APublication:
         self.routing_key = routing_key
         self.configuration = configuration
         self._profile = profile
-        self._seeded_signing_key_fingerprint = seeded_signing_key_fingerprint
+        self._seeded_registration = (
+            configuration.seeded_registrations[routing_key]
+            if configuration.seeded_registrations is not None else None
+        )
         self._binding: NativeA2AHTTP | None = None
         self._guard = None
         self._push_service = None
@@ -229,14 +237,6 @@ class NativeA2APublication:
         cls, registry, recipient, routing_key, configuration, *, guard_factory
     ):
         profile = await recipient.get_public_profile()
-        seeded_signing_key_fingerprint = None
-        if configuration.seeded_signers is not None:
-            from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
-
-            seeded_signing_key_fingerprint = await read_seeded_signing_key_fingerprint(
-                recipient.task_manager.task_store.backend, configuration.ephemeral_tenant,
-                database_identity=configuration.seeded_database_identities[routing_key],
-            )
         publication = cls(
             registry,
             recipient,
@@ -244,8 +244,8 @@ class NativeA2APublication:
             configuration,
             profile,
             guard_factory=guard_factory,
-            seeded_signing_key_fingerprint=seeded_signing_key_fingerprint,
         )
+        await publication._verify_seeded_database()
         # Bad configuration, keys or skills refuse private onboarding, before
         # AgentManager installs any routing entry for this candidate.
         publication._build_card(profile, preparing=True)
@@ -277,14 +277,14 @@ class NativeA2APublication:
     ) -> AgentCard:
         identity = self.recipient.identity
         scope = self.recipient.task_manager.task_store.scope
-        if self.configuration.seeded_signers is not None:
+        if self._seeded_registration is not None:
             from kestrel_sovereign.identity.demo_seed import demo_signing_key_fingerprint
 
-            if getattr(identity, "signing_did", None) != self.configuration.seeded_signers[self.routing_key]:
+            if getattr(identity, "signing_did", None) != self._seeded_registration.signing_did:
                 raise ValueError("A seeded demo must publish with its pinned signing DID")
-            if demo_signing_key_fingerprint(identity) != self._seeded_signing_key_fingerprint:
+            if demo_signing_key_fingerprint(identity) != self._seeded_registration.signing_key_fingerprint:
                 raise ValueError("A seeded demo must publish with its pinned signing keys")
-            if scope.tenant != self.configuration.ephemeral_tenant:
+            if not scope.tenant.startswith(f"{self.configuration.ephemeral_tenant}-"):
                 raise ValueError("A seeded demo must publish within its current boot tenant")
         service = self.recipient.task_manager.push_service
         if service is not None:
@@ -319,7 +319,7 @@ class NativeA2APublication:
         guard = self._guard_factory()
         if not isinstance(guard, NativeDIDRequestGuard):
             raise TypeError("Native publication requires its canonical request guard")
-        if self._seeded_signing_key_fingerprint is not None:
+        if self._seeded_registration is not None:
             guard = replace(guard, check_recipient_custody=self._seeded_database_refusal)
         card = self._build_card(self._profile)
         binding = NativeA2AHTTP(
@@ -382,20 +382,25 @@ class NativeA2APublication:
             require_binding=require_binding, buffer_bytes=buffer_bytes,
         )
 
-    async def _seeded_database_refusal(self) -> StreamRefusal | None:
+    async def _verify_seeded_database(self) -> None:
+        if self._seeded_registration is None:
+            return
         from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
 
+        fingerprint = await read_seeded_signing_key_fingerprint(
+            self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
+            database_identity=self._seeded_registration.database_identity,
+        )
+        if fingerprint != self._seeded_registration.signing_key_fingerprint:
+            raise ValueError("A seeded demo requires its pinned signing keys")
+
+    async def _seeded_database_refusal(self) -> StreamRefusal | None:
         try:
-            fingerprint = await read_seeded_signing_key_fingerprint(
-                self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
-                database_identity=self.configuration.seeded_database_identities[self.routing_key],
-            )
+            await self._verify_seeded_database()
         except ValueError as error:
             refusal = HTTPException(status_code=503, detail="Seeded demo database unavailable")
             refusal.__cause__ = error
             return StreamRefusal(refusal)
-        if fingerprint != self._seeded_signing_key_fingerprint:
-            return StreamRefusal(HTTPException(status_code=503, detail="Seeded demo database unavailable"))
         return None
 
     async def get_card(self, _base: AgentCard | None = None) -> AgentCard:

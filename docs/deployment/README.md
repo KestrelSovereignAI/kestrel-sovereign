@@ -558,9 +558,9 @@ the pinned encrypted identity bundles, matching data key and SQLite seeds
 from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
 Bootstrap checks the configured data directory, snapshot hash and signing
 keys before restoring each seed. The restored database records the boot
-tenant and signing-key fingerprint. The host retains the installed file's
+identifier and signing-key fingerprint. The host retains the installed file's
 identity for the boot lifetime and checks it during onboarding, card reads
-and signed requests. A replacement snapshot requires a fresh boot. The separate
+and signed requests. Replacing the SQLite file requires a fresh host boot. The separate
 `multi_agent.a2a-dev.seeds.toml` manifest selects the demo registrations and
 remains in place when the runtime saves roster edits. The DEV host
 publishes native A2A for the two demo registrations. The existing Kestrel
@@ -568,7 +568,8 @@ registration still handles its DEV GitHub webhook and stays out of public A2A
 discovery. The published roster and ephemeral tenant settings apply to the
 co-hosted fleet. Per-agent process launchers configure discovery on each
 server individually.
-Cold starts restore the initial demo state and assign a fresh A2A tenant.
+Cold starts restore the initial demo state. Each agent initialization
+assigns a fresh A2A tenant, including when an agent is reloaded.
 Both signing DIDs stay stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.
 Keep service traffic on one revision. The health check requires both public

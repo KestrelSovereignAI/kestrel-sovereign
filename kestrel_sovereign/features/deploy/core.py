@@ -670,7 +670,7 @@ class DeployManagerCore:
                     status=ReadinessStatus.UNKNOWN,
                     gate=f"GET <revision_tag_url>{self.health_check_path}",
                     failure="revision_not_serving",
-                    detail="the service URL does not serve this revision; verify its tagged URL",
+                    detail="the service URL does not serve this revision; assign a zero-traffic tag and probe its URL",
                 )
             elif session.service_url:
                 logger.info(f"Verifying health of {session.service_url}...")

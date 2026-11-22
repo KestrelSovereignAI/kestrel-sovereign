@@ -45,8 +45,8 @@ def test_public_discovery_recipient_is_an_explicit_registration_key():
 def test_host_publication_can_select_only_the_demo_registrations(tmp_path):
     manifest = tmp_path / "demo.seeds.toml"
     manifest.write_text(
-        '[kestrel-demo]\ndid = "did:web:host.test:demo"\n'
-        '[kestrel-a2a-peer]\ndid = "did:web:host.test:peer"\n'
+        '[kestrel-demo]\ndid = "did:web:host.test:demo"\nsigning_key_fingerprint = "primary"\n'
+        '[kestrel-a2a-peer]\ndid = "did:web:host.test:peer"\nsigning_key_fingerprint = "peer"\n'
     )
     configuration = NativeHostingConfiguration.from_environment({
         "KESTREL_BASE_URL": "https://host.test",
