@@ -52,6 +52,7 @@ def test_host_publication_can_select_only_the_demo_registrations():
     assert configuration.publishes("kestrel-a2a-peer")
     assert not configuration.publishes("Kestrel")
 
+
 @pytest.mark.parametrize(
     "environment",
     [
@@ -64,6 +65,8 @@ def test_host_publication_can_select_only_the_demo_registrations():
         {"KESTREL_BASE_URL": "https://host.test#fragment"},
         {"KESTREL_BASE_URL": "https://host.test?token=secret"},
         {"KESTREL_BASE_URL": "https://host.test", "KESTREL_A2A_DISCOVERY_AGENT": ""},
+        {"KESTREL_BASE_URL": "https://host.test", "KESTREL_A2A_EPHEMERAL_TENANT": "demo-tenant"},
+        {"KESTREL_BASE_URL": "https://host.test", "KESTREL_DEMO_SEED_MANIFEST": "demo.seeds.toml"},
     ],
 )
 def test_invalid_discovery_configuration_refuses_publication(environment):

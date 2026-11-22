@@ -85,6 +85,11 @@ def restore_demo_seed(
             raise
 
 
+def read_demo_seed_manifest(path: Path) -> dict:
+    with path.open("rb") as source:
+        return tomllib.load(source)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -102,8 +107,7 @@ def main() -> None:
     published = {
         name.strip() for name in os.environ.get("KESTREL_A2A_PUBLISHED_AGENTS", "").split(",")
     }
-    with args.seeds.open("rb") as source:
-        seeds = tomllib.load(source)
+    seeds = read_demo_seed_manifest(args.seeds)
     if (
         not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) for name in roster)
         or roster != set(config.agents)

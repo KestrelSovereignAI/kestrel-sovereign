@@ -50,9 +50,8 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
         'if paths_overlap "$HOST_CONTROL_DIR" "$resolved_dir"; then',
         resolver,
     )
-    collision = script.index('[ -f "$dir/kestrel_prime.db" ]', exclusion)
-    refusal = script.index("collides with existing agent directory", collision)
-    skip = script.index("continue", refusal)
+    collision = script.index('refuse_host_control_agent_collision "$resolved_dir"', exclusion)
+    skip = script.index("continue", collision)
     inception = script.index("create_kestrel_identity", agent_loop)
 
     assert (
@@ -61,7 +60,6 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
         < resolver
         < exclusion
         < collision
-        < refusal
         < skip
         < inception
     )

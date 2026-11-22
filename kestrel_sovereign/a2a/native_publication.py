@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -67,7 +68,11 @@ def host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
 def validate_native_fleet_options(environment: Mapping[str, str], *, fleet_host: bool) -> None:
     """Keep co-hosted publication and seed lifetime settings at their host boundary."""
     if not fleet_host:
-        for option in ("KESTREL_A2A_PUBLISHED_AGENTS", "KESTREL_A2A_EPHEMERAL_TENANT"):
+        for option in (
+            "KESTREL_A2A_PUBLISHED_AGENTS",
+            "KESTREL_A2A_EPHEMERAL_TENANT",
+            "KESTREL_DEMO_SEED_MANIFEST",
+        ):
             if option in environment:
                 raise ValueError(f"{option} requires a co-hosted agent fleet")
 
@@ -113,6 +118,8 @@ class NativeHostingConfiguration:
     discovery_routing_key: str | None = None
     push: NativePushPolicy | None = None
     published_routing_keys: frozenset[str] | None = None
+    seeded_signers: Mapping[str, str] | None = None
+    ephemeral_tenant: str | None = None
 
     def __post_init__(self):
         if self.push is not None and not isinstance(self.push, NativePushPolicy):
@@ -129,6 +136,8 @@ class NativeHostingConfiguration:
                 raise ValueError("Native A2A publication requires at least one routing key")
             for routing_key in self.published_routing_keys:
                 encode_agent_route_name(routing_key)
+        if self.seeded_signers is not None and self.seeded_signers.keys() != self.published_routing_keys:
+            raise ValueError("The pinned demo signers must match the published A2A roster")
 
     def publishes(self, routing_key: str) -> bool:
         return self.published_routing_keys is None or routing_key in self.published_routing_keys
@@ -142,8 +151,12 @@ class NativeHostingConfiguration:
         base = environment.get(PUBLIC_BASE_URL_ENV)
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
         published = environment.get("KESTREL_A2A_PUBLISHED_AGENTS")
+        manifest = environment.get("KESTREL_DEMO_SEED_MANIFEST")
+        tenant = environment.get("KESTREL_A2A_EPHEMERAL_TENANT")
+        if (manifest is None) != (tenant is None) or "" in (manifest, tenant):
+            raise ValueError("Pinned demo publication requires both a seed manifest and a nonempty tenant")
         if not host_publishes_native_a2a(environment):
-            if discovery is not None or published is not None:
+            if discovery is not None or published is not None or manifest is not None:
                 raise ValueError(f"A2A discovery requires {PUBLIC_BASE_URL_ENV}")
             return None
         published_keys = (
@@ -155,7 +168,17 @@ class NativeHostingConfiguration:
             and discovery not in published_keys
         ):
             raise ValueError("The A2A discovery registration must be in the published roster")
-        return cls(base, discovery, NativePushPolicy.from_environment(environment), published_keys)
+        seeded_signers = None
+        if manifest is not None:
+            from kestrel_sovereign.identity.demo_seed import read_demo_seed_manifest
+
+            seeded_signers = {
+                name: seed["did"] for name, seed in read_demo_seed_manifest(Path(manifest)).items()
+            }
+        return cls(
+            base, discovery, NativePushPolicy.from_environment(environment), published_keys,
+            seeded_signers=seeded_signers, ephemeral_tenant=tenant,
+        )
 
 
 class NativeA2APublication:
@@ -230,6 +253,13 @@ class NativeA2APublication:
     def _build_card(
         self, profile: dict[str, str], *, preparing: bool = False
     ) -> AgentCard:
+        identity = self.recipient.identity
+        scope = self.recipient.task_manager.task_store.scope
+        if self.configuration.seeded_signers is not None:
+            if getattr(identity, "signing_did", None) != self.configuration.seeded_signers[self.routing_key]:
+                raise ValueError("A seeded demo must publish with its pinned signing DID")
+            if scope.tenant != self.configuration.ephemeral_tenant:
+                raise ValueError("A seeded demo must publish within its current boot tenant")
         service = self.recipient.task_manager.push_service
         if service is not None:
             service.require_ready()
@@ -242,8 +272,8 @@ class NativeA2APublication:
                 "Published push configuration differs from its bound service"
             )
         return create_native_agent_card(
-            identity=self.recipient.identity,
-            scope=self.recipient.task_manager.task_store.scope,
+            identity=identity,
+            scope=scope,
             routing_key=self.routing_key,
             public_base_url=self.configuration.public_base_url,
             name=self.recipient.resolve_effective_name(default=profile["name"]),

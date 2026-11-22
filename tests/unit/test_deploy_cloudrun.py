@@ -64,6 +64,21 @@ def test_pinned_secret_files_are_created_and_reconciled(deployment_profile):
         )
 
 
+def test_secret_file_cannot_overlap_implicit_cloud_sql_mount(deployment_profile):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import Container, ContainerPort
+
+    service = Service(template={
+        "containers": [{"image": "demo", "volume_mounts": [{"name": "database"}]}],
+        "volumes": [{"name": "database", "cloud_sql_instance": {"instances": ["project:region:db"]}}],
+    })
+    profile = replace(deployment_profile, secret_files={"/cloudsql/demo/key": "demo-seed:2"})
+    with pytest.raises(DeployManagerError, match="overlaps another volume"):
+        _apply_managed_template(
+            service, Container(image="demo", ports=[ContainerPort(container_port=8080)]), profile,
+        )
+
+
 @pytest.fixture
 def mock_services_client():
     """Mock google-cloud-run ServicesClient."""

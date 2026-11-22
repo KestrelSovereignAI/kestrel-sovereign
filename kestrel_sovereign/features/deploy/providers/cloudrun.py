@@ -79,7 +79,13 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
         volume.name: volume for volume in service.template.volumes
         if volume.name not in owned_names or volume.name in referenced
     }
-    directories = {mount.mount_path for mount in mounts}
+    cloud_sql_volumes = {
+        volume.name for volume in volumes.values() if volume.cloud_sql_instance.instances
+    }
+    directories = {
+        "/cloudsql" if not mount.mount_path and mount.name in cloud_sql_volumes else mount.mount_path
+        for mount in mounts
+    }
     for filename, reference in sorted(files.items()):
         path = PurePosixPath(filename)
         secret, _, version = reference.rpartition(":")

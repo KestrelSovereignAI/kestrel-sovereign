@@ -90,6 +90,17 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             assert rejected.returncode != 0
             assert "demo data key mount is required" in rejected.stderr
             assert not (data / "demo").exists()
+            unlisted = data / "retired"
+            unlisted.mkdir(parents=True)
+            (unlisted / "kestrel_prime.db").touch()
+            overlapping_env = dict(env, KESTREL_HOST_DB_PATH=str(unlisted / "control" / "host.db"))
+            rejected = subprocess.run(
+                ["bash", "-c", startup], cwd=tmp_path, env=overlapping_env,
+                capture_output=True, text=True, check=False, timeout=45,
+            )
+            assert rejected.returncode != 0
+            assert "collides with existing agent directory" in rejected.stderr
+            assert not (data / "demo" / "kestrel_prime.db").exists()
         result = subprocess.run(
             ["bash", "-c", startup], cwd=tmp_path, env=env,
             capture_output=True, text=True, check=False, timeout=45,

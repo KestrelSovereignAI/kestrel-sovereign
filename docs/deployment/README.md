@@ -557,7 +557,9 @@ has its own DID and per-agent card. The DEV profile loads
 the pinned encrypted identity bundles, matching data key and SQLite seeds
 from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
 Bootstrap verifies the seed's DID and the discovery registration's data
-directory before restoring it. The separate `multi_agent.a2a-dev.seeds.toml`
+directory before restoring it. Every card publication checks that its
+signing DID and tenant match the boot configuration. The separate
+`multi_agent.a2a-dev.seeds.toml`
 manifest remains in place when the runtime saves roster edits. The DEV host
 publishes native A2A for the two demo registrations. The existing Kestrel
 registration still handles its DEV GitHub webhook and stays out of public A2A

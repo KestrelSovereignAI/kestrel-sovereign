@@ -52,6 +52,13 @@ raise SystemExit(
 )
 PY
 }
+refuse_host_control_agent_collision() {
+    local dir="$1"
+    if [[ -f "$dir/kestrel_prime.db" ]] && paths_overlap "$HOST_CONTROL_DIR" "$dir"; then
+        echo "FATAL: host control path $HOST_CONTROL_DIR collides with existing agent directory $dir; move that agent or set KESTREL_HOST_DB_PATH outside agent_data before restarting." >&2
+        exit 1
+    fi
+}
 AGENT_DATA_DIR="$(canonicalize_path "$AGENT_DATA_DIR")"
 if [ -n "${KESTREL_HOST_DB_PATH:-}" ]; then
     # An operator-selected path owns its migration policy. Never let an
@@ -140,6 +147,9 @@ fi
 # The pinned DEV demo restores a named seed. A fresh A2A tenant binds proofs
 # to this database lifetime even though the public signing DID is stable.
 if [[ -n "$seeded_demo" ]]; then
+    for dir in "$HOST_CONTROL_DIR" "$AGENT_DATA_DIR"/*/; do
+        refuse_host_control_agent_collision "$dir"
+    done
     KESTREL_DATA_KEY="$(< "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}")"
     : "${KESTREL_DATA_KEY:?demo data key is empty}"
     export KESTREL_DATA_KEY
@@ -150,15 +160,12 @@ if [[ -n "$seeded_demo" ]]; then
             --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
     )"
     export KESTREL_A2A_EPHEMERAL_TENANT
+    export KESTREL_DEMO_SEED_MANIFEST="$seed_manifest"
     unset KESTREL_DEMO_SEED_DATA_KEY_FILE
 fi
 
 # Bootstrap identity and initialize DB for each agent data dir
 if [[ -n "${seeded_demo:-}" ]]; then
-    if [[ -f "$HOST_CONTROL_DIR/kestrel_prime.db" ]]; then
-        echo "FATAL: host control path $HOST_CONTROL_DIR collides with existing agent directory." >&2
-        exit 1
-    fi
     bootstrap_agent_dirs=("${configured_agent_dirs[@]}")
 else
     bootstrap_agent_dirs=("$AGENT_DATA_DIR"/*/)
@@ -170,10 +177,7 @@ for dir in "${bootstrap_agent_dirs[@]}"; do
     # directory is host infrastructure. A restart must not mint an identity or
     # an agent database inside it.
     if paths_overlap "$HOST_CONTROL_DIR" "$resolved_dir"; then
-        if [ -f "$dir/kestrel_prime.db" ]; then
-            echo "FATAL: host control path $HOST_CONTROL_DIR collides with existing agent directory $dir; move that agent or set KESTREL_HOST_DB_PATH outside agent_data before restarting." >&2
-            exit 1
-        fi
+        refuse_host_control_agent_collision "$resolved_dir"
         continue
     fi
     agent_name=$(basename "$dir")
@@ -225,7 +229,7 @@ PY
         unset KESTREL_BOOTSTRAP_DB_PATH
     fi
 done
-unset -f canonicalize_path paths_overlap
+unset -f canonicalize_path paths_overlap refuse_host_control_agent_collision
 
 echo "Starting Kestrel MultiAgent Host on port $PORT..."
 # Consolidated onto server:app in multi-agent mode (#2382). The legacy

@@ -285,6 +285,46 @@ async def test_native_preparation_refuses_registry_from_another_app(publication)
     assert other_app.routes == publication.app.routes == []
 
 
+@pytest.mark.parametrize("changed", ["signing DID", "tenant", None])
+async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
+    publication, tmp_path, changed,
+):
+    from kestrel_sovereign.a2a.native_publication import prepare_hosted_native_publication
+
+    p = publication
+    did = p.recipient.identity.signing_did
+    tenant = p.recipient.task_manager.task_store.scope.tenant
+    manifest = tmp_path / "demo.seeds.toml"
+    pinned_did = "did:web:public.test:other" if changed == "signing DID" else did
+    manifest.write_text(f'[registered-agent]\ndid = "{pinned_did}"\n')
+    environment = {
+        "KESTREL_BASE_URL": "https://native.test",
+        "KESTREL_A2A_DISCOVERY_AGENT": "registered-agent",
+        "KESTREL_A2A_PUBLISHED_AGENTS": "registered-agent",
+        "KESTREL_A2A_PUSH_ENABLED": "false",
+        "KESTREL_A2A_EPHEMERAL_TENANT": "stale-tenant" if changed == "tenant" else tenant,
+        "KESTREL_DEMO_SEED_MANIFEST": str(manifest),
+    }
+    preparation = prepare_hosted_native_publication(
+        p.app, p.host, "registered-agent", p.recipient, environment,
+    )
+    if changed is not None:
+        with pytest.raises(ValueError, match=changed):
+            await preparation
+        assert p.app.routes == []
+        return
+    native = await preparation
+    p.recipient._native_a2a_publication = native
+    try:
+        async with p.host.a2a_lifecycle_lease():
+            p.host._register_agent("registered-agent", p.recipient)
+        card = await native.get_card()
+        assert {interface.tenant for interface in card.supported_interfaces} == {tenant}
+    finally:
+        async with p.host.a2a_lifecycle_lease():
+            native.withdraw()
+
+
 async def test_policy_revocation_precedes_route_cleanup_failure(publication):
     from starlette.exceptions import HTTPException
 
