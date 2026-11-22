@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
-from kestrel_sovereign.features.security.approval_queue import DecisionResult
+from kestrel_sovereign.features.security.approval_queue import ApprovalRequest, DecisionResult
 
 
 def _prepare_app(agent):
@@ -75,13 +75,12 @@ def _make_security_feature():
     permission_store.clear_session_overrides = MagicMock()
     approval_queue = MagicMock(
         pending_requests=[
-            SimpleNamespace(
+            ApprovalRequest(
                 id="req-1",
                 feature_name="files",
                 tool_name="write",
                 tool_args={"path": "/tmp/demo"},
                 created_at=datetime(2026, 3, 17, 12, 0, tzinfo=timezone.utc),
-                native_action=None,
             )
         ]
     )
