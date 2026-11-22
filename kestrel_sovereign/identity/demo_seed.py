@@ -115,8 +115,22 @@ def _stage_demo_seed(seed: DemoSeed, tenant: str) -> Iterator[Path]:
         yield staged_agent
 
 
+@dataclass(frozen=True)
+class DemoRosterSnapshot:
+    template: Path
+    destination: Path
+    contents: bytes
+    source_stat: os.stat_result
+
+    @classmethod
+    def read(cls, template: Path, destination: Path) -> DemoRosterSnapshot:
+        template = template.resolve()
+        with template.open("rb") as source:
+            return cls(template, destination, source.read(), os.fstat(source.fileno()))
+
+
 def restore_demo_seeds(
-    seeds: Iterable[DemoSeed], *, tenant: str, roster_update: tuple[Path, Path] | None = None,
+    seeds: Iterable[DemoSeed], *, tenant: str, roster_update: DemoRosterSnapshot | None = None,
 ) -> None:
     """Validate the whole roster before installing any demo into its runtime directory."""
     with ExitStack() as staging:
@@ -126,16 +140,20 @@ def restore_demo_seeds(
         ]
         staged_roster = None
         if roster_update is not None:
-            template, runtime_config = roster_update
-            runtime_config = runtime_config.resolve()
-            if not (runtime_config.exists() and template.samefile(runtime_config)):
+            runtime_config = roster_update.destination.resolve()
+            previous = runtime_config.stat() if runtime_config.exists() else None
+            if runtime_config == roster_update.template or (
+                previous is not None and os.path.samestat(previous, roster_update.source_stat)
+            ):
+                if runtime_config.read_bytes() != roster_update.contents:
+                    raise IdentityCustodyError("Mounted demo roster changed during seed validation")
+            else:
                 directory = staging.enter_context(
                     tempfile.TemporaryDirectory(prefix=".demo-roster-", dir=runtime_config.parent),
                 )
                 staged_roster = Path(directory) / runtime_config.name
-                staged_roster.write_bytes(template.read_bytes())
-                if runtime_config.exists():
-                    previous = runtime_config.stat()
+                staged_roster.write_bytes(roster_update.contents)
+                if previous is not None:
                     current = staged_roster.stat()
                     if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
                         os.chown(staged_roster, previous.st_uid, previous.st_gid)
@@ -194,8 +212,9 @@ def main() -> None:
     args = parser.parse_args()
     if os.environ.get("KESTREL_DB_BACKEND") != "sqlite":
         raise IdentityCustodyError("Pinned demo seeds require SQLite storage")
-    config = MultiAgentConfig.load(
-        args.config, auto_discover_fallback=False, runtime_base=Path.cwd()
+    roster_snapshot = DemoRosterSnapshot.read(args.config, args.runtime_config)
+    config = MultiAgentConfig.from_toml(
+        roster_snapshot.contents.decode("utf-8"), source=args.config, runtime_base=Path.cwd(),
     )
     roster = {name.strip() for name in os.environ.get("KESTREL_AGENTS", "").split(",")}
     seeds = read_demo_seed_manifest(args.seeds)
@@ -237,7 +256,7 @@ def main() -> None:
             soul_source=Path(seed["soul"]) if "soul" in seed else None,
         )
         for name, seed in seeds.items()
-    ), tenant=tenant, roster_update=(args.config, args.runtime_config))
+    ), tenant=tenant, roster_update=roster_snapshot)
     database_identities = {}
     for name in seeds:
         status = (args.agent_data_dir / name / "kestrel_prime.db").lstat()

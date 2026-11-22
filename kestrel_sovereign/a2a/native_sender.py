@@ -265,7 +265,7 @@ def _proof_refusal(error: NativeSenderProofError, refusal_values: bool) -> Nativ
     return error
 
 
-async def verify_native_request(
+async def authenticate_native_request(
     headers: list[str],
     params: ProtoMessage,
     *,
@@ -273,19 +273,11 @@ async def verify_native_request(
     operation: str,
     extensions: Iterable[str],
     resolver: Resolver,
-    replay_store: ReplayNonceStore,
     policy: NativeProofPolicy,
     now_ts: int,
     refusal_values: bool = False,
 ) -> NativeVerifiedSender | NativeSenderProofError:
-    """Authenticate, then spend the nonce in the mandatory shared store.
-
-    Only explicit pure proof decisions may return refusal data. BOTH the
-    resolver call/await and the actual replay reservation remain outside any
-    conversion catch, including errors using the same domain exception class.
-    Default callers retain the raising contract. No unsigned/local fallback,
-    uncertain-reservation release, or automatic replay is permitted.
-    """
+    """Authenticate the request without consuming its nonce."""
     try:
         claims, encoded, classical, pq = _parse_native_request_proof(
             headers, params, recipient=recipient, operation=operation,
@@ -321,12 +313,51 @@ async def verify_native_request(
         denied = NativeSenderProofError("Sender DID document cannot be fingerprinted")
         denied.__cause__ = error
         return _proof_refusal(denied, refusal_values)
+    return NativeVerifiedSender(claims.sender, claims.nonce, fingerprint)
+
+
+async def reserve_native_sender_nonce(
+    sender: NativeVerifiedSender,
+    *,
+    replay_store: ReplayNonceStore,
+    policy: NativeProofPolicy,
+    now_ts: int,
+    refusal_values: bool = False,
+) -> NativeVerifiedSender | NativeSenderProofError:
+    """Spend the nonce in the shared store. Original I/O errors propagate."""
     reserved = await replay_store.reserve(
-        claims.sender,
-        claims.nonce,
+        sender.sender,
+        sender.nonce,
         now_ts=now_ts,
         ttl_seconds=2 * policy.max_age_seconds,
     )
     if reserved is not True:
         return _proof_refusal(NativeSenderProofError("Sender proof nonce was already consumed"), refusal_values)
-    return NativeVerifiedSender(claims.sender, claims.nonce, fingerprint)
+    return sender
+
+
+async def verify_native_request(
+    headers: list[str],
+    params: ProtoMessage,
+    *,
+    recipient: str,
+    operation: str,
+    extensions: Iterable[str],
+    resolver: Resolver,
+    replay_store: ReplayNonceStore,
+    policy: NativeProofPolicy,
+    now_ts: int,
+    refusal_values: bool = False,
+) -> NativeVerifiedSender | NativeSenderProofError:
+    """Authenticate a complete request and consume its nonce."""
+    sender = await authenticate_native_request(
+        headers, params, recipient=recipient, operation=operation,
+        extensions=extensions, resolver=resolver, policy=policy,
+        now_ts=now_ts, refusal_values=refusal_values,
+    )
+    if isinstance(sender, NativeSenderProofError):
+        return sender
+    return await reserve_native_sender_nonce(
+        sender, replay_store=replay_store, policy=policy,
+        now_ts=now_ts, refusal_values=refusal_values,
+    )

@@ -298,6 +298,7 @@ async def test_native_preparation_refuses_registry_from_another_app(publication)
 
 
 @pytest.mark.parametrize("changed", ["signing DID", "signing keys", "tenant", "database", None])
+@pytest.mark.parametrize("native_a2a_backend_factory", ["sqlite"], indirect=True)
 async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
     publication, tmp_path, changed,
 ):
@@ -316,8 +317,6 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
     from kestrel_sovereign.server import health_check
 
     p = publication
-    if p.backend.backend_type != "sqlite":
-        pytest.skip("The seeded DEV profile uses SQLite")
     did = p.recipient.identity.signing_did
     tenant = p.recipient.task_manager.task_store.scope.tenant
     configured_tenant = "stale-tenant" if changed == "tenant" else tenant.rsplit("-", 1)[0]
@@ -388,15 +387,22 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
                     extensions=REQUIRED_NATIVE_EXTENSIONS, classical_kid="key-1", pq_kid="key-2",
                     policy=p.guard.proof_policy,
                 )
-                response = await http.post(rpc, headers={
+                headers = {
                     "Accept": "application/json, text/event-stream",
                     "A2A-Version": "1.0",
                     "A2A-Extensions": ",".join(sorted(REQUIRED_NATIVE_EXTENSIONS)),
-                    SENDER_PROOF_HEADER: proof,
-                }, json={
+                }
+                body = {
                     "jsonrpc": "2.0", "id": 1, "method": operation,
                     "params": MessageToDict(send_request),
-                })
+                }
+                malformed = await http.post(
+                    rpc, headers={**headers, SENDER_PROOF_HEADER: "malformed"}, json=body,
+                )
+                assert "A2A sender proof was not accepted" in malformed.text
+                response = await http.post(
+                    rpc, headers={**headers, SENDER_PROOF_HEADER: proof}, json=body,
+                )
                 assert "Seeded demo database unavailable" in response.text
                 assert await p.guard.replay_store.reserve(SENDER, nonce, now_ts=timestamp, ttl_seconds=300)
             assert await p.recipient.task_manager.list_tasks(recipient_agent_id=p.scope.recipient_id) == []

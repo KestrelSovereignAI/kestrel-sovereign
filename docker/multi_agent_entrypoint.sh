@@ -93,6 +93,10 @@ seed_roster="${KESTREL_DEMO_SEED_ROSTER_TEMPLATE:-$MULTI_AGENT_CONFIG}"
 seed_manifest="${seed_roster%.toml}.seeds.toml"
 if [[ -f "$seed_manifest" || -n "$seeded_demo" ]]; then
     seeded_demo=1
+    if [[ "${WEB_CONCURRENCY-1}" != 1 ]]; then
+        echo "FATAL: the pinned demo requires one server worker." >&2
+        exit 1
+    fi
     if [[ ! -f "$seed_roster" || ! -f "$seed_manifest" ]]; then
         echo "FATAL: the pinned demo requires an explicit multi-agent roster and seed manifest." >&2
         exit 1

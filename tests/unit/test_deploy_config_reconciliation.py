@@ -28,10 +28,12 @@ import pytest
 
 from kestrel_sovereign.features.deploy.manager import DeployManager
 from kestrel_sovereign.features.deploy.models import (
+    DeployManagerError,
     DeployProviderType,
     ReadinessCheck,
     ReadinessStatus,
 )
+from kestrel_sovereign.features.deploy.providers.azure_container import AzureContainerProvider
 
 
 # Repo root: tests/unit/<this_file> -> ../../ -> repo root.
@@ -162,6 +164,18 @@ def test_dev_profile_uses_multi_agent_image(live_config):
         f"got {ref!r}. build_image_reference may have lost the multi_agent "
         f"suffix logic."
     )
+
+
+async def test_azure_mount_rejection_is_scoped_to_its_deploy(live_config):
+    live_config["profiles"]["azure-dev"]["secret_files"] = {
+        "/run/secrets/demo": "demo-seed:1",
+    }
+    manager = DeployManager(config=live_config)
+    assert manager.get_profile("dev").provider is DeployProviderType.CLOUD_RUN
+    profile = manager.get_profile("azure-dev")
+    provider = AzureContainerProvider(subscription_id="test", resource_group="test")
+    with pytest.raises(DeployManagerError, match="secret_files is supported only on Cloud Run"):
+        await provider.deploy("registry.test/kestrel:demo", profile.service_name, profile)
 
 
 def test_dev_publication_selects_the_pinned_demo_registration(live_config):

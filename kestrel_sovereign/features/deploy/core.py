@@ -124,8 +124,6 @@ class DeployManagerCore:
                 raw_secrets = data.get("secrets", {})
                 expanded_secrets = self._expand_env_vars(raw_secrets)
                 secret_files = self._expand_env_vars(data.get("secret_files", {}))
-                if secret_files and provider != DeployProviderType.CLOUD_RUN:
-                    raise DeployManagerError(f"profile '{key}' supports secret_files only on Cloud Run")
 
                 # Determine default dockerfile based on deployment mode
                 deployment_mode = data.get("deployment_mode", "agent")

@@ -572,7 +572,8 @@ Cold starts restore the initial demo state. Each agent initialization
 assigns a fresh A2A tenant, including when an agent is reloaded.
 Both signing DIDs stay stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.
-Keep service traffic on one revision. The health check requires both public
+The seeded profile requires one server worker per instance. Keep service
+traffic on one revision. The health check requires both public
 cards and identifies the responding Cloud Run revision. When traffic is still
 pinned to the previous revision, deploy reports
 the new revision's readiness as unknown. Verify the new revision's health

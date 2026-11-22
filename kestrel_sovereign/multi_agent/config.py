@@ -413,10 +413,25 @@ class MultiAgentConfig(BaseModel):
         if not path.exists():
             raise FileNotFoundError(f"MultiAgent config not found: {path}")
 
+        return cls.from_toml(
+            path.read_text(encoding="utf-8"), source=path,
+            runtime_env=runtime_env, runtime_base=runtime_base,
+        )
+
+    @classmethod
+    def from_toml(
+        cls,
+        contents: str,
+        *,
+        source: Path,
+        runtime_env: Optional[Mapping[str, str]] = None,
+        runtime_base: Optional[Path] = None,
+    ) -> "MultiAgentConfig":
+        """Validate a captured TOML snapshot against its target runtime."""
         try:
-            data = toml.load(path)
+            data = toml.loads(contents)
         except toml.TomlDecodeError as e:
-            raise ValueError(f"Invalid TOML in {path}: {e}")
+            raise ValueError(f"Invalid TOML in {source}: {e}") from e
 
         # Parse host config
         host_data = data.get("host", {})
@@ -441,7 +456,7 @@ class MultiAgentConfig(BaseModel):
 
         config = cls(host=host, agents=agents)
         target_base = (
-            path.parent.resolve(strict=False)
+            source.parent.resolve(strict=False)
             if runtime_base is None
             else runtime_base.resolve(strict=False)
         )

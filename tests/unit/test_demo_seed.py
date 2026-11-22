@@ -22,6 +22,7 @@ from kestrel_sovereign.identity.custody_bundle import (
 )
 from kestrel_sovereign.identity.demo_seed import (
     DEMO_SEED_STATE_TABLE,
+    DemoRosterSnapshot,
     DemoSeed,
     demo_signing_key_fingerprint,
     main,
@@ -111,6 +112,13 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             assert rejected.returncode != 0
             assert "demo data key mount is required" in rejected.stderr
             assert not (data / "demo").exists()
+            rejected = subprocess.run(
+                ["bash", "-c", startup], cwd=tmp_path, env=dict(env, WEB_CONCURRENCY="2"),
+                capture_output=True, text=True, check=False, timeout=45,
+            )
+            assert rejected.returncode != 0
+            assert "requires one server worker" in rejected.stderr
+            assert not (data / "demo").exists()
             unlisted = data / "retired"
             unlisted.mkdir(parents=True)
             (unlisted / "kestrel_prime.db").touch()
@@ -177,7 +185,7 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     original_roster_inode = roster.stat().st_ino
     restore_demo_seeds(
         (seed_inputs(directory, database_seed) for directory in (first, second)),
-        tenant="demo-test", roster_update=(roster, roster),
+        tenant="demo-test", roster_update=DemoRosterSnapshot.read(roster, roster),
     )
     assert roster.stat().st_ino == original_roster_inode
     for agent_dir in (first, second):
@@ -195,10 +203,17 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
         operator_roster.chmod(0o600)
         alias = tmp_path / "active-roster.toml"
         alias.symlink_to(operator_roster)
-        restore_demo_seeds([seed_inputs(tmp_path / "through-link", database_seed)],
-                           tenant="demo-test", roster_update=(roster, alias))
+        roster_snapshot = DemoRosterSnapshot.read(roster, alias)
+
+        def mutate_template_while_staging():
+            yield seed_inputs(tmp_path / "through-link", database_seed)
+            roster.write_text("# Replaced template")
+
+        restore_demo_seeds(
+            mutate_template_while_staging(), tenant="demo-test", roster_update=roster_snapshot,
+        )
         assert alias.is_symlink()
-        assert operator_roster.read_bytes() == roster.read_bytes()
+        assert operator_roster.read_bytes() == roster_snapshot.contents
         assert operator_roster.stat().st_mode & 0o777 == 0o600
 
     with pytest.raises(IdentityCustodyError, match="existing agent state"):

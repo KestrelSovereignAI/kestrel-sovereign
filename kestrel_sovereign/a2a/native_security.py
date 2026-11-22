@@ -28,7 +28,8 @@ from kestrel_sovereign.a2a.native_sender import (
     NativeVerifiedSender,
     ReplayNonceStore,
     Resolver,
-    verify_native_request,
+    authenticate_native_request,
+    reserve_native_sender_nonce,
 )
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import (
@@ -140,6 +141,29 @@ class NativeDIDRequestGuard:
         if refusal is not None:
             raise refusal.error
 
+    async def _authenticate_with_recipient_custody(
+        self, request: ProtoMessage, operation: str, context: ServerCallContext,
+        authority: NativeRequestAuthority, extensions: frozenset[str],
+    ) -> NativeVerifiedSender | NativeSenderProofError | StreamRefusal:
+        now_ts = int(self.clock())
+        async with _original_authentication_io():
+            sender = await authenticate_native_request(
+                native_header_values(context, SENDER_PROOF_HEADER), request,
+                recipient=self.scope.recipient_id, operation=operation,
+                extensions=extensions, resolver=authority.resolver,
+                policy=self.proof_policy, now_ts=now_ts, refusal_values=True,
+            )
+        if isinstance(sender, NativeSenderProofError):
+            return sender
+        refusal = await self._recipient_custody_refusal()
+        if refusal is not None:
+            return refusal
+        async with _original_authentication_io():
+            return await reserve_native_sender_nonce(
+                sender, replay_store=self.replay_store, policy=self.proof_policy,
+                now_ts=now_ts, refusal_values=True,
+            )
+
     @asynccontextmanager
     async def hold_retained_authority(self, principal_id: str) -> AsyncIterator[None]:
         """Reauthorize a canonical callback creator under this publication lease.
@@ -202,22 +226,12 @@ class NativeDIDRequestGuard:
                 authority = self._new_authority()
                 refusal = self._current_decision(authority, None)
                 if refusal is None:
-                    refusal = await self._recipient_custody_refusal()
-                if refusal is None:
-                    async with _original_authentication_io():
-                        sender = await verify_native_request(
-                            native_header_values(context, SENDER_PROOF_HEADER),
-                            request,
-                            recipient=self.scope.recipient_id,
-                            operation=operation,
-                            extensions=activated_extensions,
-                            resolver=authority.resolver,
-                            replay_store=self.replay_store,
-                            policy=self.proof_policy,
-                            now_ts=int(self.clock()),
-                            refusal_values=True,
-                        )
-                    if isinstance(sender, NativeSenderProofError):
+                    sender = await self._authenticate_with_recipient_custody(
+                        request, operation, context, authority, activated_extensions
+                    )
+                    if isinstance(sender, StreamRefusal):
+                        refusal = sender
+                    elif isinstance(sender, NativeSenderProofError):
                         denied = HTTPException(
                             status_code=401,
                             detail="A2A sender proof was not accepted",
