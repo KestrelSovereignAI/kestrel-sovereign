@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-11-21
-**Scope:** 3897 tracked files (2998 `.py`, 387 `.md`, 512 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-11-22
+**Scope:** 3906 tracked files (3003 `.py`, 390 `.md`, 513 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -379,6 +379,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/core_lock.py** — Core's ``uv.lock`` as the declaration of what the host venv holds (#3502).
   - `class LockReportError`; `class CoreLockError`; `class LockedPackage`; `class CoreLock`; `def checkout_hold_line(name, checkout)`; `class LockDrift`; `class LockForcer`; `class LockDowngrade`; `…`
 - **kestrel_sovereign/data/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — ## Preamble
+- **kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — *Second constitutional release.
+- **kestrel_sovereign/data/constitutions/v2/PLEDGE.md** — The Kestrel agent’s pledge — *An optional pledge, spoken by an agent to the person or organization that holds its root keys.*
 - **kestrel_sovereign/data/feature_registry.toml** — (configuration)
 - **kestrel_sovereign/data/feature_template/README.md.tpl** — —
 - **kestrel_sovereign/data/feature_template/SKILL.md.tpl** — —
@@ -1239,8 +1241,12 @@ Repo entry points and standard project files.
   - `class MCPToolCaller`; `async def bind_native_mcp_tool_caller(publication, context, required_scope)`; `def native_mcp_write_lifetime(publication, context, required_scope)`
 - **kestrel_sovereign/mcp_server/transport.py** — Official Streamable HTTP transport and standard per-resource OAuth discovery.
   - `class NativeMCPServer`; `class NativeMCPHTTP`; `class NativeMCPHTTPRegistry`
+- **kestrel_sovereign/mcp_task_actions.py** — Original-authority dispatch for native Task mutations.
+  - `class MCPTaskActions`; `class MCPTaskMutationRound`
 - **kestrel_sovereign/mcp_task_input.py** — One durable commit for original-method MCP input and Task issuance.
   - `class MCPTaskInputCustody`
+- **kestrel_sovereign/mcp_task_results.py** — Private native Task outcomes for the original conversation or App View.
+  - `class MCPTaskResults`
 - **kestrel_sovereign/mcp_task_store.py** — Private MCP Task custody; neither a handle nor an issuer grants permission.
   - `def task_routing_payload(binding, task_id, envelope, continuity, …)`; `class MCPTaskConflict`; `class MCPTaskIntegrityError`; `class MCPTaskObservationRefused`; `class MCPTaskPayloadLimit`; `class MCPTaskBinding`; `class MCPTaskRecord`; `class MCPTaskIssuance`; `…`
 - **kestrel_sovereign/mcp_task_submission.py** — Private immutable Task submission evidence; none of these DTOs grant authority.
@@ -2547,6 +2553,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.66.6.md** — 0.66.6 — Cloud Run update preservation — Candidate release notes; publication, deployment health and downstream acceptance remain separate gates.
 - **docs/releases/v0.66.7.md** — 0.66.7 — Native MCP custody foundation — Candidate release notes.
 - **docs/releases/v0.66.8.md** — 0.66.8 — Native MCP Task observation — - Supply the original installation's OAuth client identity during agent startup so background Task reads can verify it independently of a browser session.
+- **docs/releases/v0.66.9.md** — 0.66.9 — Native MCP Task controls — - Govern Task input updates and cancellations through the original tool registration, operator permission and durable effect journal.
 - **docs/research/4097-plan-allowance-step0.md** — Plan allowance, step 0: what the anthropic:plan route and the Claude CLI report — **Issue:** #4097, step 0 only.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
@@ -3291,6 +3298,8 @@ Repo entry points and standard project files.
   - `async def test_stdio_permission_peer_writes_only_after_native_tool_dispatch(tmp_path)`; `async def test_stdio_permission_peer_rejects_incompatible_options(tmp_path, arguments, message)`; `async def test_stdio_refusal_retires_the_original_child(tmp_path, monkeypatch, exit_path)`
 - **tests/integration/test_mcp_permission_unknown_restart.py** — A repeated transport identity cannot repeat an unconfirmed remote effect.
   - `async def test_restarted_host_does_not_replay_a_lost_remote_effect(host_campaign)`
+- **tests/integration/test_mcp_task_actions.py** — Authenticated Task action dispatch retains the exact approved SQL intent.
+  - `async def test_task_mutation_stays_in_its_original_approval_and_operator_scope(task_boundary, case)`
 - **tests/integration/test_mcp_task_host.py** — Core custody on actual governed HTTP dispatch, not Task-wire acceptance.
   - `async def task_boundary(apps_boundary, request)`; `def initial(b)`; `async def invoke(b, marker)`; `async def admit(host, selected, lease)`; `async def test_durable_task_borrow_needs_no_interactive_request_and_fences_obsolete_rows(task_boundary)`; `async def test_independent_task_borrow_denies_publication_and_policy_replacement(task_boundary)`; `async def test_task_maintenance_visits_one_page_per_tick_and_wraps(task_boundary, monkeypatch)`; `async def test_task_maintenance_rejects_duplicate_authenticated_operations_across_pages(task_boundary)`; `…`
 - **tests/integration/test_mcp_task_input_custody.py** — Joint credentials and input expiry on actual native SQLite/PostgreSQL stores.
@@ -3299,6 +3308,8 @@ Repo entry points and standard project files.
   - `def inputs()`; `def response(value)`; `async def waiting(store)`; `async def test_input_identity_survives_gaps_and_connections_and_canonical_type_changes(custody, key)`; `async def test_partial_inputs_are_durably_consumed_before_wire_and_acks_preserve_newer_state(custody)`; `async def test_original_binding_revision_and_consumption_govern_new_mutation_custody(custody, case)`; `async def test_native_writers_cannot_reuse_inputs_or_a_governed_operation_across_tasks(custody, same_task)`; `async def test_cancel_ack_is_only_intent_and_never_releases_active_capacity(custody)`; `…`
 - **tests/integration/test_mcp_task_observations.py** — Native detailed observations retain creation custody and confirmed outcomes.
   - `async def test_observation_blocks_persist_without_settling_the_original_task(custody, reason)`; `async def test_withheld_completion_keeps_the_exact_native_receipt(custody)`; `async def test_nonterminal_observation_preserves_original_claim_across_connections(custody, status)`; `async def test_confirmed_terminal_observation_releases_active_slot_and_keeps_remote_consumed(custody, status)`; `async def test_invalid_native_observation_cannot_change_current_custody(custody, changes)`; `async def test_reader_labels_cannot_retarget_an_observation(custody, field, value)`; `async def test_terminal_or_stale_revision_never_regresses_or_overwrites_the_original_result(custody)`; `async def test_two_native_observers_cannot_overwrite_a_terminal_winner(custody)`; `…`
+- **tests/integration/test_mcp_task_results.py** — Native App Task results remain bound to the original physical View.
+  - `async def test_task_result_disclosure_requires_the_original_physical_app_view(task_boundary)`
 - **tests/integration/test_mcp_task_store.py** — Private Task custody on real SQLite/PostgreSQL and actual encryption keys.
   - `async def test_retained_inventory_pages_authenticate_original_rows_with_bounded_work(custody, monkeypatch)`; `async def test_reservation_and_exact_private_claim_survive_fresh_connections(custody, task_id)`; `async def test_identifiers_never_replace_original_binding_or_issuance(custody, field, value)`; `async def test_two_native_writers_share_active_capacity_and_lowered_limits_keep_inventory(custody)`; `async def test_confirmed_initial_outcome_releases_active_slot_but_keeps_consumed_identity(custody, disposition)`; `async def test_duplicate_remote_identity_and_oversize_claim_never_reopen_initial_dispatch(custody)`; `async def test_every_retained_routing_or_cas_column_is_authenticated_before_new_admission(custody, column, value, authenticated)`; `async def test_lost_original_envelope_or_key_is_never_silently_replaced(custody, failure)`; `…`
 - **tests/integration/test_mcp_task_submissions.py** — Original submission custody on independent native SQLite/PostgreSQL connections.
@@ -4573,6 +4584,8 @@ Repo entry points and standard project files.
   - `def test_record_echo_verified_increments_per_source()`; `def test_record_echo_missing_independent_per_source()`; `def test_record_doctrine_bundle_drift()`; `def test_record_calls_no_op_when_prometheus_unavailable(monkeypatch)`; `def test_metric_names_match_design_spec()`
 - **tests/unit/test_constitution_platform_authority_contract.py** — The packaged base distinguishes platform authorship from agent adoption.
   - `def test_platform_base_is_the_packaged_source_and_docs_match()`; `def test_agent_root_adopts_but_cannot_author_platform_base()`; `def test_privacy_and_enterprise_rules_do_not_create_implicit_exceptions()`; `def test_fixed_book_two_guarantees_are_not_agent_amendments()`; `def test_harm_balancing_does_not_override_severe_harm_protection()`
+- **tests/unit/test_constitution_release_workflow.py** — Exercise the packaging step used to attest a constitutional release.
+  - `def test_publisher_attests_only_the_named_edition_from_main(tmp_path, autocrlf)`
 - **tests/unit/test_constitution_runtime_migration.py** — Concurrent sovereign replicas must share one successful schema upgrade.
   - `async def test_independent_sqlite_replicas_upgrade_missing_column_once(tmp_path, missing_column)`; `async def test_interrupted_sqlite_trigger_installation_is_completed(tmp_path)`
 - **tests/unit/test_constitution_runtime_timestamps.py** — Runtime state must preserve TIMESTAMPTZ intent through the actual adapter.
@@ -6794,6 +6807,7 @@ Repo entry points and standard project files.
 - **.github/instructions/github-copilot-instructions.instructions.md** — Global Standards — **🐢 See [`docs/TORTOISE_DOCTRINE.md`](../../docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and complete coding standards.**
 - **.github/workflows/ci.yml** — (configuration)
 - **.github/workflows/clean-install.yml** — (configuration)
+- **.github/workflows/constitution-release.yml** — (configuration)
 - **.github/workflows/deploy.yml** — (configuration)
 - **.github/workflows/docs-okf.yml** — (configuration)
 - **.github/workflows/docs-site.yml** — (configuration)
