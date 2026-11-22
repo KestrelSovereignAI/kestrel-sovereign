@@ -80,7 +80,8 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
         env.update(
             PYTHONPATH=str(REPO_ROOT), KESTREL_ENV="development",
             KESTREL_AGENT_DATA_DIR=str(data), KESTREL_HOST_DB_PATH=str(data / "host/host.db"),
-            KESTREL_MULTI_AGENT_CONFIG=str(registry), KESTREL_AGENTS="demo",
+            KESTREL_MULTI_AGENT_CONFIG=str(tmp_path / "multi_agent.toml"), KESTREL_AGENTS="demo",
+            KESTREL_DEMO_SEED_ROSTER_TEMPLATE=str(registry),
             KESTREL_DB_BACKEND="sqlite", KESTREL_DEPLOYMENT_PERSISTENCE="ephemeral_demo",
             KESTREL_A2A_DISCOVERY_AGENT="demo",
             KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),

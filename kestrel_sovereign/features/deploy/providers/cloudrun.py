@@ -331,7 +331,7 @@ class CloudRunProvider(DeployProvider):
                 # update mask) silently reset all of them out-of-band (F174).
                 service = existing_service
                 service.name = service_path
-                _apply_managed_template(service, container, profile)
+                _apply_managed_template(service, container, effective_profile)
                 operation = await asyncio.to_thread(
                     client.update_service, service=service
                 )
@@ -339,7 +339,7 @@ class CloudRunProvider(DeployProvider):
                 # Create new service from a fresh spec.
                 service = Service()
                 service.name = service_name
-                _apply_managed_template(service, container, profile)
+                _apply_managed_template(service, container, effective_profile)
                 operation = await asyncio.to_thread(
                     client.create_service, parent=parent, service=service, service_id=service_name
                 )

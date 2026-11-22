@@ -169,10 +169,21 @@ def test_dev_publication_selects_the_pinned_demo_registration(live_config):
 
     profile = live_config["profiles"]["dev"]
     env = profile["env_vars"]
-    config = NativeHostingConfiguration.from_environment(env)
+    assert env["KESTREL_MULTI_AGENT_CONFIG"] == "/app/multi_agent.toml"
+    template = env["KESTREL_DEMO_SEED_ROSTER_TEMPLATE"]
+    manifest = Path(__file__).resolve().parents[2] / template.removeprefix("/app/")
+    boot_environment = dict(
+        env,
+        KESTREL_DEMO_SEED_MANIFEST=str(manifest.with_suffix(".seeds.toml")),
+        KESTREL_A2A_EPHEMERAL_TENANT="demo-test",
+    )
+    del boot_environment["KESTREL_DEMO_SEED_DATA_KEY_FILE"]
+    config = NativeHostingConfiguration.from_environment(boot_environment)
     assert config is not None
     assert config.public_base_url == "https://kestrel-dev-7jpbsywhdq-uc.a.run.app"
     assert config.discovery_routing_key == "kestrel-demo"
+    assert config.publishes("kestrel-a2a-peer")
+    assert not config.publishes("Kestrel")
     assert config.discovery_routing_key in env["KESTREL_AGENTS"].split(",")
     assert profile["secret_files"] == {
         "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz": "kestrel-dev-a2a-db-seed:1",

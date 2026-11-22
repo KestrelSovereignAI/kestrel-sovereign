@@ -59,6 +59,16 @@ def test_host_publication_can_select_only_the_demo_registrations(tmp_path):
     assert not configuration.publishes("Kestrel")
 
 
+@pytest.mark.parametrize("option", ["KESTREL_DEMO_SEED_DATA_KEY_FILE", "KESTREL_DEMO_SEED_ROSTER_TEMPLATE"])
+def test_seeded_deployment_must_run_bootstrap_before_publication(option):
+    with pytest.raises(ValueError, match="Complete demo seed bootstrap"):
+        NativeHostingConfiguration.from_environment({
+            "KESTREL_BASE_URL": "https://public.test",
+            "KESTREL_A2A_DISCOVERY_AGENT": "demo",
+            option: "mounted-seed-input",
+        })
+
+
 @pytest.mark.parametrize(
     "environment",
     [

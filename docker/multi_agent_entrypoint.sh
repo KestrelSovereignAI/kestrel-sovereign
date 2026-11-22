@@ -88,15 +88,20 @@ fi
 
 # Provision agent directories from KESTREL_AGENTS env var
 # Format: comma-separated agent names, e.g. "claw,testbot,emma"
-seeded_demo="${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}"
-seed_manifest="${MULTI_AGENT_CONFIG%.toml}.seeds.toml"
+seeded_demo="${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}${KESTREL_DEMO_SEED_ROSTER_TEMPLATE+x}"
+seed_roster="${KESTREL_DEMO_SEED_ROSTER_TEMPLATE:-$MULTI_AGENT_CONFIG}"
+seed_manifest="${seed_roster%.toml}.seeds.toml"
 if [[ -f "$seed_manifest" || -n "$seeded_demo" ]]; then
     seeded_demo=1
-    if [[ ! -f "$MULTI_AGENT_CONFIG" || ! -f "$seed_manifest" ]]; then
+    if [[ ! -f "$seed_roster" || ! -f "$seed_manifest" ]]; then
         echo "FATAL: the pinned demo requires an explicit multi-agent roster and seed manifest." >&2
         exit 1
     fi
     : "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}"
+    # The server, operator CLI and feature reconciliation share the runtime roster.
+    if [[ ! "$seed_roster" -ef "$MULTI_AGENT_CONFIG" ]]; then
+        cp -- "$seed_roster" "$MULTI_AGENT_CONFIG"
+    fi
 fi
 configured_agent_dirs=()
 if [ -n "${KESTREL_AGENTS:-}" ]; then
@@ -159,11 +164,6 @@ if [[ -n "$seeded_demo" ]]; then
             --host-control-dir "$HOST_CONTROL_DIR" \
             --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
     )"
-    # The server, operator CLI and feature reconciliation share the runtime roster.
-    if [[ ! "$MULTI_AGENT_CONFIG" -ef "$PWD/multi_agent.toml" ]]; then
-        cp -- "$MULTI_AGENT_CONFIG" "$PWD/multi_agent.toml"
-    fi
-    MULTI_AGENT_CONFIG="$PWD/multi_agent.toml"
     export KESTREL_A2A_EPHEMERAL_TENANT
     export KESTREL_DEMO_SEED_MANIFEST="$seed_manifest"
     unset KESTREL_DEMO_SEED_DATA_KEY_FILE

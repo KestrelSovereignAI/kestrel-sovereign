@@ -67,6 +67,11 @@ def host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
 
 def validate_native_fleet_options(environment: Mapping[str, str], *, fleet_host: bool) -> None:
     """Keep co-hosted publication and seed lifetime settings at their host boundary."""
+    if "KESTREL_DEMO_SEED_DATA_KEY_FILE" in environment or (
+        "KESTREL_DEMO_SEED_ROSTER_TEMPLATE" in environment
+        and "KESTREL_DEMO_SEED_MANIFEST" not in environment
+    ):
+        raise ValueError("Complete demo seed bootstrap before serving the fleet")
     if not fleet_host:
         for option in (
             "KESTREL_A2A_EPHEMERAL_TENANT",

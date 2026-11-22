@@ -145,8 +145,13 @@ async def test_public_card_revalidates_the_exact_recipient_generation(
     from starlette.exceptions import HTTPException
 
     from kestrel_sovereign.a2a.native_routes import native_card_path
+    from kestrel_sovereign.server import health_check, health_detailed
 
     p = publication
+    p.app.state.agent_manager = p.host
+    p.app.state.required_a2a_card_keys = frozenset({"registered-agent"})
+    p.app.add_api_route("/health", health_check)
+    p.app.add_api_route("/health/detailed", health_detailed)
     async with p.host.a2a_lifecycle_lease():
         p.host._register_agent("registered-agent", p.recipient)
     paths = (native_card_path("registered-agent"), "/.well-known/agent-card.json")
@@ -155,6 +160,7 @@ async def test_public_card_revalidates_the_exact_recipient_generation(
     ) as http:
         original = [await http.get(path) for path in paths]
         assert all(response.status_code == 200 for response in original)
+        assert (await http.get("/health")).status_code == 200
         async with p.host.a2a_lifecycle_lease():
             if fault == "policy":
                 p.host.install_a2a_hosted_policy(
@@ -179,6 +185,10 @@ async def test_public_card_revalidates_the_exact_recipient_generation(
         with pytest.raises(HTTPException) as denied:
             await p.publication.get_card()
         assert denied.value.status_code == 403
+        assert (await http.get("/health")).status_code == 503
+        detail = await http.get("/health/detailed")
+        assert detail.status_code == 503
+        assert detail.json()["missing_a2a_card_registrations"] == ["registered-agent"]
 
 
 async def test_native_publication_failure_withdraws_manager_registration(publication):

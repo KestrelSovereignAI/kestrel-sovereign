@@ -5293,8 +5293,31 @@ async def get_bootstrap_key(request: Request):
     return response
 
 
+async def _missing_required_a2a_cards(app: FastAPI, manager) -> list[str]:
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    required = getattr(app.state, "required_a2a_card_keys", frozenset())
+    if not required:
+        return []
+    agents = manager.list_agents() if manager is not None else {}
+    missing = []
+    for key in sorted(required):
+        publication = getattr(agents.get(key), "_native_a2a_publication", None)
+        if publication is not None and publication.routing_key == key:
+            try:
+                await publication.get_card()
+            except (StarletteHTTPException, ValueError, ExecutionAuthorityError):
+                pass
+            else:
+                continue
+        missing.append(key)
+    return missing
+
+
 @app.get("/health")
-def health_check(request: Request):
+async def health_check(request: Request):
     """Return a stable, public-safe readiness probe for load balancers.
 
     This endpoint deliberately exposes only aggregate readiness and whether a
@@ -5334,11 +5357,6 @@ def health_check(request: Request):
     scheduler_failures = _scheduler_readiness_failures(request.app)
     constitution_safe_mode = _constitution_safe_mode_records(agent, manager)
     any_initialized = bool(agent) or bool(manager and manager.list_agents())
-    required_cards = getattr(request.app.state, "required_a2a_card_keys", frozenset())
-    card_registry = getattr(request.app.state, "native_a2a_http", None)
-    missing_required_cards = required_cards and (
-        card_registry is None or not required_cards <= card_registry.published_card_keys()
-    )
     if (
         mandatory_failures
         or identity_failures
@@ -5346,7 +5364,7 @@ def health_check(request: Request):
         or scheduler_failures
         or not scheduler_workers_available
         or not invocation_owners_healthy
-        or missing_required_cards
+        or await _missing_required_a2a_cards(request.app, manager)
     ):
         return JSONResponse(
             status_code=503,
@@ -5670,6 +5688,18 @@ async def health_detailed(request: Request):
                     "tracing": tracing,
                 },
             ),
+        )
+    missing_cards = await _missing_required_a2a_cards(request.app, manager)
+    if missing_cards:
+        return JSONResponse(
+            status_code=503,
+            content=_with_host_feature_rejections(request.app.state, {
+                "status": "unhealthy",
+                "error": "Required A2A cards unavailable",
+                "missing_a2a_card_registrations": missing_cards,
+                "checks": [],
+                "tracing": tracing,
+            }),
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
