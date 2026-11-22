@@ -9,6 +9,9 @@ now reports ``awaiter_gone=True`` and pops the request itself.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
 
 from kestrel_sovereign.features.security.approval_queue import (
     ApprovalQueue,
@@ -150,6 +153,90 @@ async def test_normal_approval_still_awaiter_gone_false():
     approved, scope = await task
     assert approved is True
     assert scope == "once"
+
+
+@pytest.mark.parametrize("decide", [True, False])
+async def test_tagged_kite_exact_once_approval_does_not_grant_future_calls(tmp_path, decide):
+    from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
+    from kestrel_sovereign.features.inference_lease.offer_evidence import allow_prepared_approval_queue
+    from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+
+    feature, tool = "InferenceLeaseFeature", "inference_lease_acquire_prepared"
+    args = {"request_id": "exact-prepared", "offer_digest": "sha256:" + "1" * 64}
+    agent = SimpleNamespace(is_test_instance=True)
+    store = PermissionStore(str(tmp_path / "permissions.db"))
+    await store.initialize()
+    await store.set_permission(feature, tool, PermissionLevel.ALWAYS_ASK)
+    added = asyncio.Event()
+
+    async def notify(_):
+        added.set()
+
+    queue = ApprovalQueue(agent=agent, permission_store=store, on_request_added=notify)
+    provenance = request_provenance(source_kind="http_request", source_locator="/agent/invoke")
+    with allow_prepared_approval_queue(agent, "owned-turn", provenance, **args):
+        with invocation_scope("wrong-turn", provenance=provenance):
+            assert await queue.request_approval(feature, tool, args) == (False, "no_approver")
+        with invocation_scope("owned-turn", provenance=provenance):
+            assert await queue.request_approval(
+                feature, tool, args, allow_blocking=False,
+            ) == (False, "no_approver")
+            assert await queue.request_approval(
+                feature, "inference_lease_acquire", args,
+            ) == (False, "no_approver")
+            waiter = asyncio.create_task(queue.request_approval(feature, tool, args))
+            try:
+                await asyncio.wait_for(added.wait(), 2)
+                approval, = queue.pending_requests
+                assert approval.once_only and approval.timeout_seconds == 60
+                assert approval.tool_args == args
+                assert await queue.request_approval(feature, tool, args) == (False, "no_approver")
+                refused = await queue.submit_decision(approval.id, True, "always")
+                assert not refused.in_memory
+                if decide:
+                    accepted = await queue.submit_decision(approval.id, True, "once")
+                    assert accepted.in_memory and not accepted.awaiter_gone
+                    assert await waiter == (True, "once")
+                else:
+                    waiter.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await waiter
+                    assert not (await queue.submit_decision(approval.id, True, "once")).in_memory
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+    assert queue.pending_count == 0
+    assert await store.get_permission(feature, tool) is PermissionLevel.ALWAYS_ASK
+
+
+async def test_tagged_kite_deadline_includes_unresponsive_notification(tmp_path):
+    from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
+    from kestrel_sovereign.features.inference_lease.offer_evidence import allow_prepared_approval_queue
+    from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+
+    feature, tool = "InferenceLeaseFeature", "inference_lease_acquire_prepared"
+    args = {"request_id": "exact-prepared", "offer_digest": "sha256:" + "1" * 64}
+    agent = SimpleNamespace(is_test_instance=True)
+    store = PermissionStore(str(tmp_path / "permissions.db"))
+    await store.initialize()
+    await store.set_permission(feature, tool, PermissionLevel.ALWAYS_ASK)
+    notices = []
+
+    async def hung_notification(request):
+        notices.append(request.id)
+        await asyncio.Event().wait()
+
+    queue = ApprovalQueue(agent=agent, permission_store=store, on_request_added=hung_notification)
+    provenance = request_provenance(source_kind="http_request", source_locator="/agent/invoke")
+    with allow_prepared_approval_queue(agent, "bounded-turn", provenance, **args):
+        with invocation_scope("bounded-turn", provenance=provenance):
+            assert await asyncio.wait_for(
+                queue.request_approval(feature, tool, args, timeout=0.05), 2,
+            ) == (False, "timeout")
+    expired, = notices
+    assert queue.pending_count == 0
+    assert not (await queue.submit_decision(expired, True)).in_memory
 
 
 class _BlockingPermissionStore:

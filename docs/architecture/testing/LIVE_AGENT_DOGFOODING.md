@@ -65,6 +65,16 @@ Run it in **multi-agent mode** so the agent is addressed by name in the URL.
   (`limit must be an integer, got 'axolotl'`); pass the limit first, e.g.
   `!memory episodes 10 axolotl` for a topic recall (the trailing words become the query).
 
+For the private inference benchmark, keep Kite tagged as a test instance.
+With the isolated inference-offer evidence opt-in, a sovereign API-key
+request over direct loopback can carry `kite_prepared_inference_approval`
+with the exact `request_id` and `offer_digest` returned in the signed offer.
+This lets that invoke queue one matching `inference_lease_acquire_prepared`
+call for up to 60 seconds; it does not approve it. Verify the pending call
+with the security API and submit only a once decision, without remembering
+it. Background turns and all other headless tools retain their existing
+behavior. Reproduce the exchange with a denial before approving live spend.
+
 Minimal probe helper — **fetch the key once** (repeatedly hitting `/api/auth/key` returns HTTP 429):
 
 ```python

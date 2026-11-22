@@ -453,6 +453,9 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
     if data.approved and pending_req is not None and pending_req.native_action is not None and (
             data.scope != 'once' or data.remember):
         raise HTTPException(status_code=400, detail='Native actions accept only once approvals')
+    if data.approved and pending_req is not None and pending_req.once_only and (
+            data.scope != "once" or data.remember):
+        raise HTTPException(status_code=400, detail="Kite prepared offers accept only once approvals")
 
     decision = await security.approval_queue.submit_decision(
         data.approval_id, data.approved, data.scope

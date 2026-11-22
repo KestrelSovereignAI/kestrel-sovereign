@@ -93,6 +93,8 @@ class ApprovalRequest:
     decision_operation: Optional["OwnedOperation"] = field(default=None, repr=False)
     native_action: NativeActionContext | None = None
     invocation_id: str | None = None
+    once_only: bool = False
+    decision_deadline: float | None = None
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -267,6 +269,16 @@ class ApprovalQueue:
     def pending_requests(self) -> List[ApprovalRequest]:
         """Get all pending requests."""
         return list(self._pending.values())
+
+    async def _notify_request_added(self, request: ApprovalRequest) -> None:
+        if self._on_request_added is None:
+            return
+        try:
+            await self._on_request_added(request)
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logger.warning("Failed to notify UI of approval request: %s", error, exc_info=True)
 
     async def request_approval(
         self,
@@ -488,8 +500,8 @@ class ApprovalQueue:
         # ``spawn_agent`` call (ASK-gated) bricks the agent. Reaching here also
         # means global auto-mode is OFF — the AUTO fast-path above returns
         # before this — i.e. the operator did NOT opt this test instance into
-        # non-interactive auto-approve (KESTREL_TEST_AUTO_APPROVE, #1936). So
-        # there is genuinely no approver: return an honest, non-blocking
+        # non-interactive auto-approve (KESTREL_TEST_AUTO_APPROVE, #1936). Except
+        # for exact loopback Kite benchmark consent, there is no approver: return an honest, non-blocking
         # ``no_approver`` result instead of queuing forever. Production /
         # sovereign agents (``is_test_instance`` falsy) are unaffected — their
         # Sovereign answers asynchronously via the Mews approval panel, so a
@@ -499,6 +511,18 @@ class ApprovalQueue:
         # that context, and blocking would wedge the background loop forever.
         non_interactive = not allow_blocking
         headless_test = bool(getattr(self._agent, "is_test_instance", False))
+        kite_prepared = False
+        if (
+            headless_test and not non_interactive and always_ask
+            and (feature_name, tool_name) == ("InferenceLeaseFeature", "inference_lease_acquire_prepared")
+        ):
+            from kestrel_sovereign.features.inference_lease.offer_evidence import claim_prepared_approval_queue
+
+            kite_prepared = claim_prepared_approval_queue(self._agent, tool_args)
+            if kite_prepared:
+                timeout = 60.0 if timeout is None else min(timeout, 60.0)
+                tool_args = deepcopy(tool_args)
+                headless_test = False
         if non_interactive or headless_test:
             await self._persist_decision(
                 feature_name=feature_name,
@@ -523,6 +547,7 @@ class ApprovalQueue:
 
         from kestrel_sovereign.agent.invocation import current_invocation_id
 
+        deadline = asyncio.get_running_loop().time() + timeout if kite_prepared else None
         request = ApprovalRequest(
             id=str(uuid4()),
             feature_name=feature_name,
@@ -533,6 +558,8 @@ class ApprovalQueue:
             audit_action=audit_action,
             native_action=native_action,
             invocation_id=current_invocation_id(),
+            once_only=kite_prepared,
+            decision_deadline=deadline,
         )
 
         self._pending[request.id] = request
@@ -561,27 +588,15 @@ class ApprovalQueue:
         local_error: BaseException | None = None
         try:
             try:
-                # Notify UI via SSE
-                if self._on_request_added:
-                    try:
-                        await self._on_request_added(request)
-                    except (ConnectionError, TimeoutError) as e:
-                        if is_execution_control_error(e):
-                            raise
-                        logger.warning(f"Failed to notify UI of approval request (network error): {e}", exc_info=True)
-                    except (TypeError, AttributeError) as e:
-                        if is_execution_control_error(e):
-                            raise
-                        logger.warning(f"Failed to notify UI of approval request (callback error): {e}", exc_info=True)
-                    except Exception as e:
-                        if is_execution_control_error(e):
-                            raise
-                        logger.warning(f"Failed to notify UI of approval request: {e}", exc_info=True)
-
-                await asyncio.wait_for(
-                    request.resume_event.wait(),
-                    timeout=timeout
-                )
+                if deadline is None:
+                    await self._notify_request_added(request)
+                    await asyncio.wait_for(request.resume_event.wait(), timeout=timeout)
+                else:
+                    # Time spent notifying a listener also consumes the approval
+                    # window. An unresponsive SSE callback cannot extend it.
+                    async with asyncio.timeout_at(deadline):
+                        await self._notify_request_added(request)
+                        await request.resume_event.wait()
 
                 if request.awaiter_error is not None:
                     raise request.awaiter_error
@@ -651,18 +666,17 @@ class ApprovalQueue:
         finally:
             cleanup_error = None
             try:
-                # Only remove the request on a true success (resume_event
-                # fired) or timeout. Cancellation leaves it for the user.
-                if request.resume_event.is_set() or timed_out:
+                # Ordinary requests remain visible after cancellation; the
+                # isolated consent is meaningful only to its original waiter.
+                withdrawn = request.once_only and request.status is ApprovalStatus.AWAITER_GONE
+                if request.resume_event.is_set() or timed_out or withdrawn:
                     popped = self._pending.pop(request.id, None)
                 else:
                     popped = None
-                # Notify UI ONLY when we genuinely abandon the request via
-                # timeout. Successful user-submit closes its own modal;
-                # cancellation no longer triggers withdrawal at all.
-                if popped is not None and timed_out and self._on_request_withdrawn:
+                # Successful user-submit closes its own modal.
+                if popped is not None and (timed_out or withdrawn) and self._on_request_withdrawn:
                     try:
-                        await self._on_request_withdrawn(popped, "timeout")
+                        await self._on_request_withdrawn(popped, "timeout" if timed_out else "cancelled")
                     except (ConnectionError, TimeoutError) as e:
                         if is_execution_control_error(e):
                             raise
@@ -827,6 +841,14 @@ class ApprovalQueue:
         if request.native_action is not None and approved and scope != 'once':
             return DecisionResult(in_memory=False, persisted=False,
                                   error='Native actions accept only once approvals')
+        if request.once_only and approved and scope != "once":
+            return DecisionResult(in_memory=False, persisted=False,
+                                  error="Kite prepared offers accept only once approvals")
+        if request.once_only and (
+            request.status is not ApprovalStatus.PENDING or request.decision_deadline is None
+            or asyncio.get_running_loop().time() >= request.decision_deadline
+        ):
+            return DecisionResult(in_memory=False, persisted=False, error="Kite approval expired")
 
         # Idempotency / CAS: a request that already has a decision must
         # not accept another one. Without this guard, callers that race
