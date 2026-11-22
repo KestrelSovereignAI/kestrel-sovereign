@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import lzma
 import os
+import re
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -95,6 +96,7 @@ def main() -> None:
     if (
         not isinstance(registration, LocalAgentConfig)
         or not registration.autostart
+        or not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) for name in roster)
         or roster != set(config.agents)
         or not all(
             isinstance(agent, LocalAgentConfig)

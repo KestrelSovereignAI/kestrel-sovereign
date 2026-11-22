@@ -556,13 +556,17 @@ at `/.well-known/agent-card.json`. Its public signing DID is
 the pinned encrypted identity bundle, matching data key and SQLite seed
 from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
 Bootstrap verifies the seed's DID and the discovery registration's data
-directory before restoring it. The DEV host contains two demo registrations.
+directory before restoring it. The DEV host publishes native A2A for the two
+demo registrations. The existing Kestrel registration still handles its
+DEV GitHub webhook and stays out of public A2A discovery.
 Cold starts restore the initial demo state and assign a fresh A2A tenant.
 The signing DID stays stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.
 
-When provisioning DEV in a new GCP project, incept the named test/demo
-identity once and export its encrypted keys with
+When provisioning an independent DEV service in a new GCP project, first
+set its own HTTPS authority and signing DID, then publish that DID's
+verification document. Incept the test/demo identity once and export its
+encrypted keys with
 `python -m kestrel_sovereign.identity.custody_bundle create`. Capture its
 closed SQLite database as an XZ file. Provision those files and the matching
 data key into the three Secret Manager entries specified by the profile.

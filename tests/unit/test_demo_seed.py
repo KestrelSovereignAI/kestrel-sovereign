@@ -123,6 +123,7 @@ def test_entrypoint_refuses_different_configured_discovery_storage(tmp_path, mon
         f'data_dir = "{tmp_path / "other"}"\n'
         'port = 8801\nautostart = true\n'
     )
+    monkeypatch.setenv("KESTREL_AGENTS", "demo")
     monkeypatch.setattr(sys, "argv", [
         "demo_seed", "--config", str(registry),
         "--agent-data-dir", str(tmp_path / "data"),
@@ -149,4 +150,5 @@ async def test_mldsa_codec_change_preserves_signed_identity_packages(tmp_path, m
             did=identity.agent_did, agent_name="Legacy Demo", created_at="2026-01-01",
             constitution_hash="demo-hash", constitution_text="Demo constitution",
         ), storage_dir=tmp_path)
-    assert verify_package_signature(package, storage_dir=tmp_path)
+    verified, message = verify_package_signature(package, storage_dir=tmp_path)
+    assert verified, message

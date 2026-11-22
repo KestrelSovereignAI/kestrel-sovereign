@@ -92,6 +92,10 @@ if [ -n "${KESTREL_AGENTS:-}" ]; then
     IFS=',' read -ra AGENTS <<< "$KESTREL_AGENTS"
     for agent in "${AGENTS[@]}"; do
         agent=$(echo "$agent" | xargs)  # trim whitespace
+        if [[ -n "$seeded_demo" && ! "$agent" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+            echo "FATAL: pinned demo roster keys must name one agent directory." >&2
+            exit 1
+        fi
         agent_dir="$(canonicalize_path "$AGENT_DATA_DIR/$agent")"
         if paths_overlap "$HOST_CONTROL_DIR" "$agent_dir"; then
             echo "FATAL: requested agent '$agent' collides with host control path $HOST_CONTROL_DIR; choose another agent name or set KESTREL_HOST_DB_PATH outside that agent directory." >&2

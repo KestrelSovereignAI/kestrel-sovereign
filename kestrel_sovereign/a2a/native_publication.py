@@ -104,6 +104,7 @@ class NativeHostingConfiguration:
     public_base_url: str
     discovery_routing_key: str | None = None
     push: NativePushPolicy | None = None
+    published_routing_keys: frozenset[str] | None = None
 
     def __post_init__(self):
         if self.push is not None and not isinstance(self.push, NativePushPolicy):
@@ -115,17 +116,34 @@ class NativeHostingConfiguration:
         )
         if self.discovery_routing_key is not None:
             encode_agent_route_name(self.discovery_routing_key)
+        if self.published_routing_keys is not None:
+            if not self.published_routing_keys:
+                raise ValueError("Native A2A publication requires at least one routing key")
+            for routing_key in self.published_routing_keys:
+                encode_agent_route_name(routing_key)
+            if (
+                self.discovery_routing_key is not None
+                and self.discovery_routing_key not in self.published_routing_keys
+            ):
+                raise ValueError("The A2A discovery registration must be in the published roster")
+
+    def publishes(self, routing_key: str) -> bool:
+        return self.published_routing_keys is None or routing_key in self.published_routing_keys
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]):
         """Unconfigured hosts run operator APIs without public peer discovery."""
         base = environment.get(PUBLIC_BASE_URL_ENV)
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
+        published = environment.get("KESTREL_A2A_PUBLISHED_AGENTS")
         if not host_publishes_native_a2a(environment):
-            if discovery is not None:
+            if discovery is not None or published is not None:
                 raise ValueError(f"A2A discovery requires {PUBLIC_BASE_URL_ENV}")
             return None
-        return cls(base, discovery, NativePushPolicy.from_environment(environment))
+        published_keys = (
+            None if published is None else frozenset(key.strip() for key in published.split(","))
+        )
+        return cls(base, discovery, NativePushPolicy.from_environment(environment), published_keys)
 
 
 class NativeA2APublication:
@@ -337,7 +355,7 @@ async def prepare_hosted_native_publication(
 
     validate_native_peer_policy(environment, fleet_host=True)
     configuration = NativeHostingConfiguration.from_environment(environment)
-    if configuration is None:
+    if configuration is None or not configuration.publishes(routing_key):
         return None
     registry = native_publication_registry(app)
     return await NativeA2APublication.prepare(

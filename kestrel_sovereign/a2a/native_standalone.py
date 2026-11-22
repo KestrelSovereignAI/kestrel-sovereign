@@ -485,6 +485,8 @@ async def prepare_single_agent_native_publication(
     if routing_key is None:
         routing_key = resolve_scoped_agent_did(recipient)
         configuration = replace(configuration, discovery_routing_key=routing_key)
+    if not configuration.publishes(routing_key):
+        return None
     owner = SingleAgentNativeAuthority(
         recipient, routing_key, proof_policy=NativeProofPolicy(), clock=clock
     )
