@@ -80,10 +80,13 @@ async def test_kite_native_save_and_delete_have_original_journal_ownership(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
-@pytest.mark.parametrize("via_feature", [False, True])
+@pytest.mark.parametrize("via_feature,tagged_test,approved", [
+    (False, False, False), (True, False, False), (False, True, False), (False, True, True),
+])
 async def test_kite_invoke_signs_only_the_real_completed_offer(
-    tmp_path, monkeypatch, via_feature
+    tmp_path, monkeypatch, via_feature, tagged_test, approved
 ):
+    from kestrel_sovereign.endpoints.security import router as security_router
     from kestrel_sovereign.features.inference_lease import feature
     from kestrel_sovereign.features.security.permissions import PermissionLevel
     from kestrel_sovereign.server import auth_middleware
@@ -144,7 +147,7 @@ async def test_kite_invoke_signs_only_the_real_completed_offer(
     async with booted_agent(
         tmp_path,
         name="Kite",
-        is_test_instance=False,
+        is_test_instance=tagged_test,
         provenance="test:4193-kite-inference-offer",
         features={"InferenceLeaseFeature"},
     ) as agent:
@@ -174,6 +177,7 @@ async def test_kite_invoke_signs_only_the_real_completed_offer(
         app.middleware("http")(auth_middleware)
         app.add_middleware(SessionMiddleware, secret_key=key)
         app.include_router(router)
+        app.include_router(security_router)
         register_api_error_handlers(app)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://kite"
@@ -275,15 +279,39 @@ async def test_kite_invoke_signs_only_the_real_completed_offer(
                 "request_id": "real-offer-request",
                 "offer_digest": observation["offer"]["offer_digest"],
             }
+            acquire = {
+                "input": "Request approval for the exact offer.",
+                "request_id": "exact-acquisition-turn",
+                "session_id": "real-offer-session",
+            }
+            if tagged_test:
+                intent = {"kite_prepared_inference_approval": paid_args}
+                req = "/api/agent/invoke"
+                assert (await client.post(req, json={**acquire, **intent})).status_code == 401
+                assert (await client.post(
+                    req, json={**acquire, **intent},
+                    headers={**owned, "Forwarded": "for=192.0.2.1"},
+                )).status_code == 404
+                for name, override in (
+                    ("default-headless", {}),
+                    ("different-digest", {"kite_prepared_inference_approval": {
+                        **paid_args, "offer_digest": "sha256:" + "0" * 64,
+                    }}),
+                ):
+                    response = await client.post(
+                        req, headers=owned,
+                        json={**acquire, **override, "request_id": name},
+                    )
+                    assert response.status_code == 200, response.text
+                    assert not next_event.done()
+                    assert security.approval_queue.pending_count == 0
+                    sent_calls.discard("inference_lease_acquire_prepared")
+                acquire.update(intent)
             turn = asyncio.create_task(
                 client.post(
                     "/api/agent/invoke",
                     headers=owned,
-                    json={
-                        "input": "Request approval for the exact offer.",
-                        "request_id": "exact-acquisition-turn",
-                        "session_id": "real-offer-session",
-                    },
+                    json=acquire,
                 )
             )
             try:
@@ -292,14 +320,30 @@ async def test_kite_invoke_signs_only_the_real_completed_offer(
                 assert approval["feature"] == "InferenceLeaseFeature"
                 assert approval["tool"] == "inference_lease_acquire_prepared"
                 assert approval["args"] == paid_args
-                assert await security.approval_queue.submit_decision(
-                    approval["id"], approved=False
+                approve = {"approval_id": approval["id"], "approved": True}
+                if tagged_test:
+                    for override in ({"scope": "session"}, {"scope": "always"}, {"remember": True}):
+                        rejected = await client.post(
+                            "/api/security/approve", headers=owned, json={**approve, **override},
+                        )
+                        assert rejected.status_code == 400, rejected.text
+                    assert security.approval_queue.pending_count == 1
+                    assert provider.acquire_calls == 0
+                decision = await client.post(
+                    "/api/security/approve", headers=owned,
+                    json={**approve, "approved": approved, "scope": "once"},
                 )
+                assert decision.status_code == 200, decision.text
                 response = await turn
                 assert response.status_code == 200, response.text
+                assert provider.acquire_calls == int(approved)
+                assert await security.permission_store.get_permission(
+                    approval["feature"], approval["tool"],
+                ) is PermissionLevel.ALWAYS_ASK
             finally:
                 agent.remove_event_listener(on_event)
                 if not turn.done():
                     turn.cancel()
                     await asyncio.gather(turn, return_exceptions=True)
-    assert provider.acquire_calls == 0 and provider.release_calls == 0
+    if not approved:
+        assert provider.acquire_calls == 0 and provider.release_calls == 0

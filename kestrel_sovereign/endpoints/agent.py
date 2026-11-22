@@ -561,6 +561,7 @@ async def invoke_agent(request: Request, http_response: Response):
         )
         offer_nonce = None
         offer_capture = nullcontext()
+        prepared_approval = nullcontext()
         if "kite_inference_offer_nonce" in data:
             from kestrel_sovereign.features.inference_lease.offer_evidence import capture_prepared_offer
 
@@ -572,6 +573,24 @@ async def invoke_agent(request: Request, http_response: Response):
                 raise _kite_evidence_error("Invalid Kite inference offer evidence request.")
             _consume_kite_evidence_nonce(offer_nonce)
             offer_capture = capture_prepared_offer(agent, request_id, invocation_provenance)
+        if "kite_prepared_inference_approval" in data:
+            from kestrel_sovereign.features.inference_lease.offer_evidence import allow_prepared_approval_queue
+
+            _require_kite_inference_offer_evidence(request, agent)
+            intent = data["kite_prepared_inference_approval"]
+            if (
+                not getattr(agent, "is_test_instance", False)
+                or user_input is None or kite_evidence_request is not None or offer_nonce is not None
+                or not isinstance(intent, dict) or set(intent) != {"request_id", "offer_digest"}
+                or not isinstance(intent["request_id"], str)
+                or not intent["request_id"].strip() or len(intent["request_id"]) > 256
+                or not isinstance(intent["offer_digest"], str)
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", intent["offer_digest"])
+            ):
+                raise _kite_evidence_error("Invalid Kite prepared inference approval intent.")
+            prepared_approval = allow_prepared_approval_queue(
+                agent, request_id, invocation_provenance, intent["request_id"], intent["offer_digest"],
+            )
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
             generation = register_request_delivery(agent, request_id, nested=False)
@@ -719,7 +738,7 @@ async def invoke_agent(request: Request, http_response: Response):
             effective_session_id = session_id  # fall back; never block the request
 
         try:
-            with offer_capture as captured_offer:
+            with offer_capture as captured_offer, prepared_approval:
                 response = await agent.process_input(
                     user_input,
                     model_override=model_override,

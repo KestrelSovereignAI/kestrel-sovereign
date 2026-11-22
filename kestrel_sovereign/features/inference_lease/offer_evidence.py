@@ -130,3 +130,68 @@ def observe_prepared_offer(
         capture.ambiguous = True
         return
     capture.candidate = _Candidate(coordinator, offer, receipt)
+
+
+@dataclass
+class _PreparedApproval:
+    owner: object
+    invocation_id: str
+    provenance: InvocationProvenance
+    request_id: str
+    offer_digest: str
+    active: bool = True
+    claimed: bool = False
+
+
+_approval: ContextVar[_PreparedApproval | None] = ContextVar(
+    "kestrel_current_kite_prepared_approval", default=None,
+)
+
+
+@contextmanager
+def _bind_approval(approval: _PreparedApproval | None) -> Iterator[None]:
+    token = _approval.set(approval)
+    try:
+        yield
+    finally:
+        _approval.reset(token)
+
+
+def _approval_for_owner(owner: object) -> _PreparedApproval | None:
+    approval = _approval.get()
+    return approval if approval is not None and approval.active and approval.owner is owner else None
+
+
+turn_scoped(
+    "private_inference_prepared_approval",
+    variables=(_approval,),
+    capture=_approval_for_owner,
+    bind=_bind_approval,
+)
+
+
+@contextmanager
+def allow_prepared_approval_queue(
+    owner: object, invocation_id: str, provenance: InvocationProvenance,
+    request_id: str, offer_digest: str,
+) -> Iterator[None]:
+    """Carry the transport's exact queue intent, never an approval decision."""
+    approval = _PreparedApproval(owner, invocation_id, provenance, request_id, offer_digest)
+    with _bind_approval(approval):
+        try:
+            yield
+        finally:
+            approval.active = False
+
+
+def claim_prepared_approval_queue(owner: object, tool_args: dict) -> bool:
+    approval = _approval_for_owner(owner)
+    if (
+        approval is None or approval.claimed
+        or current_invocation_id() != approval.invocation_id
+        or current_invocation_provenance() is not approval.provenance
+        or tool_args != {"request_id": approval.request_id, "offer_digest": approval.offer_digest}
+    ):
+        return False
+    approval.claimed = True
+    return True
