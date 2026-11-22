@@ -552,15 +552,16 @@ Dev service URL (stable): `https://kestrel-dev-7jpbsywhdq-uc.a.run.app`
 
 DEV publishes a signed A2A Agent Card for the `kestrel-demo` registration
 at `/.well-known/agent-card.json`. Its public signing DID is
-`did:web:agents.kestrelsovereign.com:kestrel-dev-a2a`. The DEV profile loads
-the pinned encrypted identity bundle, matching data key and SQLite seed
+`did:web:agents.kestrelsovereign.com:kestrel-dev-a2a`. The companion demo
+has its own DID and per-agent card. The DEV profile loads
+the pinned encrypted identity bundles, matching data key and SQLite seeds
 from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
 Bootstrap verifies the seed's DID and the discovery registration's data
 directory before restoring it. The DEV host publishes native A2A for the two
 demo registrations. The existing Kestrel registration still handles its
 DEV GitHub webhook and stays out of public A2A discovery.
 Cold starts restore the initial demo state and assign a fresh A2A tenant.
-The signing DID stays stable. A2A requests signed for a previous tenant
+Both signing DIDs stay stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.
 
 When provisioning an independent DEV service in a new GCP project, first
@@ -569,7 +570,8 @@ verification document. Incept the test/demo identity once and export its
 encrypted keys with
 `python -m kestrel_sovereign.identity.custody_bundle create`. Capture its
 closed SQLite database as an XZ file. Provision those files and the matching
-data key into the three Secret Manager entries specified by the profile.
+data key into the Secret Manager entries specified by the profile. Repeat
+identity and database provisioning for the companion demo.
 Grant the DEV runtime service account Secret Accessor on those entries and
 verify each referenced numeric version is enabled with
 `gcloud secrets versions describe` before deployment.

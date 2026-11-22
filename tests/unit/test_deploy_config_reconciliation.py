@@ -174,11 +174,12 @@ def test_dev_publication_selects_the_pinned_demo_registration(live_config):
     assert config.public_base_url == "https://kestrel-dev-7jpbsywhdq-uc.a.run.app"
     assert config.discovery_routing_key == "kestrel-demo"
     assert config.discovery_routing_key in env["KESTREL_AGENTS"].split(",")
-    assert env["KESTREL_DEMO_SEED_DID"] == "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
     assert profile["secret_files"] == {
-        env["KESTREL_DEMO_SEED_DATABASE"]: "kestrel-dev-a2a-db-seed:1",
-        env["KESTREL_DEMO_SEED_BUNDLE"]: "kestrel-dev-a2a-identity-bundle:2",
+        "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz": "kestrel-dev-a2a-db-seed:1",
+        "/var/run/kestrel-demo-seed/identity/identity.json": "kestrel-dev-a2a-identity-bundle:2",
         env["KESTREL_DEMO_SEED_DATA_KEY_FILE"]: "kestrel-dev-a2a-data-key:1",
+        "/var/run/kestrel-demo-seed/peer-state/kestrel_prime.db.xz": "kestrel-dev-a2a-peer-db-seed:1",
+        "/var/run/kestrel-demo-seed/peer-identity/identity.json": "kestrel-dev-a2a-peer-identity-bundle:1",
     }
     assert "KESTREL_IDENTITY_BUNDLE" not in profile["secrets"]
     assert "KESTREL_DATA_KEY" not in profile["secrets"]

@@ -69,12 +69,16 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
         volume.name for volume in service.template.volumes if volume.secret.secret
     }
     owned = {
-        mount.name for mount in container.volume_mounts
+        (mount.name, mount.mount_path) for mount in container.volume_mounts
         if mount.name in secret_volume_names and mount.name == _secret_file_volume_name(mount.mount_path)
     }
-    volumes = [volume for volume in service.template.volumes if volume.name not in owned]
-    mounts = [mount for mount in container.volume_mounts if mount.name not in owned]
-    volume_names = {volume.name for volume in volumes}
+    mounts = [mount for mount in container.volume_mounts if (mount.name, mount.mount_path) not in owned]
+    referenced = {mount.name for mount in mounts}
+    owned_names = {name for name, _ in owned}
+    volumes = {
+        volume.name: volume for volume in service.template.volumes
+        if volume.name not in owned_names or volume.name in referenced
+    }
     directories = {mount.mount_path for mount in mounts}
     for filename, reference in sorted(files.items()):
         path = PurePosixPath(filename)
@@ -92,16 +96,16 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
             raise DeployManagerError("Cloud Run secret file mount overlaps another volume")
         directories.add(directory)
         name = _secret_file_volume_name(directory)
-        if name in volume_names:
-            raise DeployManagerError("Cloud Run secret file conflicts with an existing volume")
-        volumes.append(Volume(
-            name=name,
-            secret=SecretVolumeSource(
+        volume = Volume(
+            name=name, secret=SecretVolumeSource(
                 secret=secret, items=[VersionToPath(version=version, path=path.name)],
             ),
-        ))
+        )
+        if name in volumes and volumes[name] != volume:
+            raise DeployManagerError("Cloud Run secret file conflicts with an existing volume")
+        volumes[name] = volume
         mounts.append(VolumeMount(name=name, mount_path=directory))
-    service.template.volumes = volumes
+    service.template.volumes = list(volumes.values())
     container.volume_mounts = mounts
 
 

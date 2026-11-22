@@ -50,6 +50,8 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
     bundle_path.write_bytes(bundle)
     key_file = tmp_path / "data.key"
     key_file.write_text(os.environ["KESTREL_DATA_KEY"])
+    soul = tmp_path / "demo-soul.md"
+    soul.write_text("Ready for DEV interoperability")
     startup = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text().split(
         "# Bootstrap identity and initialize DB for each agent data dir", 1
     )[0].replace("/app/.venv/bin/python", shlex.quote(sys.executable))
@@ -62,6 +64,9 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             '[agents.demo]\n'
             f'data_dir = "{data / "demo"}"\n'
             'port = 8801\nautostart = true\n'
+            f'[demo_seeds.demo]\ndid = "{did}"\n'
+            f'database = "{database_seed}"\nidentity = "{bundle_path}"\n'
+            f'soul = "{soul}"\n'
         )
         env = dict(os.environ)
         del env["KESTREL_DATA_KEY"]
@@ -70,8 +75,7 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             KESTREL_AGENT_DATA_DIR=str(data), KESTREL_HOST_DB_PATH=str(data / "host/host.db"),
             KESTREL_MULTI_AGENT_CONFIG=str(registry), KESTREL_AGENTS="demo",
             KESTREL_DEPLOYMENT_PERSISTENCE="ephemeral_demo", KESTREL_A2A_DISCOVERY_AGENT="demo",
-            KESTREL_DEMO_SEED_DID=did, KESTREL_DEMO_SEED_DATABASE=str(database_seed),
-            KESTREL_DEMO_SEED_BUNDLE=str(bundle_path), KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),
+            KESTREL_A2A_PUBLISHED_AGENTS="demo", KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),
         )
         result = subprocess.run(
             ["bash", "-c", startup], cwd=tmp_path, env=env,
@@ -83,6 +87,7 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
         assert tenant.startswith("demo-")
         tenants.add(tenant)
         assert load_agent_identity(None, storage_dir=data / "demo").signing_did == did
+        assert (data / "demo" / "SOUL.md").read_bytes() == soul.read_bytes()
     assert len(tenants) == 2
 
 
@@ -122,16 +127,16 @@ def test_entrypoint_refuses_different_configured_discovery_storage(tmp_path, mon
         '[agents.demo]\n'
         f'data_dir = "{tmp_path / "other"}"\n'
         'port = 8801\nautostart = true\n'
+        '[demo_seeds.demo]\ndid = "did:web:agents.custody.test:demo"\n'
+        'database = "db.xz"\nidentity = "bundle"\n'
     )
     monkeypatch.setenv("KESTREL_AGENTS", "demo")
+    monkeypatch.setenv("KESTREL_A2A_PUBLISHED_AGENTS", "demo")
     monkeypatch.setattr(sys, "argv", [
         "demo_seed", "--config", str(registry),
         "--agent-data-dir", str(tmp_path / "data"),
         "--host-control-dir", str(tmp_path / "host"),
         "--registration", "demo",
-        "--database-seed", str(tmp_path / "db.xz"),
-        "--bundle-seed", str(tmp_path / "bundle"),
-        "--expected-did", "did:web:agents.custody.test:demo",
     ])
     with pytest.raises(IdentityCustodyError, match="configured discovery registration"):
         main()

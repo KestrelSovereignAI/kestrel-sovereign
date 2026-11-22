@@ -57,9 +57,6 @@ KESTREL_BASE_URL = "https://kestrel-dev-7jpbsywhdq-uc.a.run.app"
 KESTREL_A2A_DISCOVERY_AGENT = "kestrel-demo"
 KESTREL_A2A_PUBLISHED_AGENTS = "kestrel-demo,kestrel-a2a-peer"
 KESTREL_A2A_PUSH_ENABLED = "false"
-KESTREL_DEMO_SEED_DID = "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
-KESTREL_DEMO_SEED_DATABASE = "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz"
-KESTREL_DEMO_SEED_BUNDLE = "/var/run/kestrel-demo-seed/identity/identity.json"
 KESTREL_DEMO_SEED_DATA_KEY_FILE = "/var/run/kestrel-demo-seed/key/data.key"
 KESTREL_REQUIRE_OAUTH = "true"
 # ``${KESTREL_ALLOWED_EMAILS}`` is expanded by DeployManagerCore._expand_env_vars
@@ -87,6 +84,8 @@ GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz" = "kestrel-dev-a2a-db-seed:1"
 "/var/run/kestrel-demo-seed/identity/identity.json" = "kestrel-dev-a2a-identity-bundle:2"
 "/var/run/kestrel-demo-seed/key/data.key" = "kestrel-dev-a2a-data-key:1"
+"/var/run/kestrel-demo-seed/peer-state/kestrel_prime.db.xz" = "kestrel-dev-a2a-peer-db-seed:1"
+"/var/run/kestrel-demo-seed/peer-identity/identity.json" = "kestrel-dev-a2a-peer-identity-bundle:1"
 
 # Production Profile - Cloud Run (durable single-agent, scales to zero)
 #

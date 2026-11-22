@@ -81,7 +81,7 @@ fi
 
 # Provision agent directories from KESTREL_AGENTS env var
 # Format: comma-separated agent names, e.g. "claw,testbot,emma"
-seeded_demo="${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_BUNDLE+x}${KESTREL_DEMO_SEED_DID+x}${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}"
+seeded_demo="${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}"
 if [[ -n "$seeded_demo" && ! -f "$MULTI_AGENT_CONFIG" ]]; then
     echo "FATAL: the pinned demo requires an explicit multi-agent roster." >&2
     exit 1
@@ -142,17 +142,18 @@ if [[ -n "$seeded_demo" ]]; then
         /app/.venv/bin/python -m kestrel_sovereign.identity.demo_seed \
             --config "$MULTI_AGENT_CONFIG" --agent-data-dir "$AGENT_DATA_DIR" \
             --host-control-dir "$HOST_CONTROL_DIR" \
-            --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}" \
-            --database-seed "${KESTREL_DEMO_SEED_DATABASE:?demo seed database mount is required}" \
-            --bundle-seed "${KESTREL_DEMO_SEED_BUNDLE:?demo identity bundle mount is required}" \
-            --expected-did "${KESTREL_DEMO_SEED_DID:?demo seed DID is required}"
+            --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
     )"
     export KESTREL_A2A_EPHEMERAL_TENANT
-    unset KESTREL_DEMO_SEED_DATABASE KESTREL_DEMO_SEED_BUNDLE KESTREL_DEMO_SEED_DID KESTREL_DEMO_SEED_DATA_KEY_FILE
+    unset KESTREL_DEMO_SEED_DATA_KEY_FILE
 fi
 
 # Bootstrap identity and initialize DB for each agent data dir
 if [[ -n "${seeded_demo:-}" ]]; then
+    if [[ -f "$HOST_CONTROL_DIR/kestrel_prime.db" ]]; then
+        echo "FATAL: host control path $HOST_CONTROL_DIR collides with existing agent directory." >&2
+        exit 1
+    fi
     bootstrap_agent_dirs=("${configured_agent_dirs[@]}")
 else
     bootstrap_agent_dirs=("$AGENT_DATA_DIR"/*/)

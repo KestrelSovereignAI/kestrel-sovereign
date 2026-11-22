@@ -121,17 +121,14 @@ class NativeHostingConfiguration:
                 raise ValueError("Native A2A publication requires at least one routing key")
             for routing_key in self.published_routing_keys:
                 encode_agent_route_name(routing_key)
-            if (
-                self.discovery_routing_key is not None
-                and self.discovery_routing_key not in self.published_routing_keys
-            ):
-                raise ValueError("The A2A discovery registration must be in the published roster")
 
     def publishes(self, routing_key: str) -> bool:
         return self.published_routing_keys is None or routing_key in self.published_routing_keys
 
     @classmethod
-    def from_environment(cls, environment: Mapping[str, str]):
+    def from_environment(
+        cls, environment: Mapping[str, str], *, require_published_discovery: bool = True,
+    ):
         """Unconfigured hosts run operator APIs without public peer discovery."""
         base = environment.get(PUBLIC_BASE_URL_ENV)
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
@@ -143,6 +140,13 @@ class NativeHostingConfiguration:
         published_keys = (
             None if published is None else frozenset(key.strip() for key in published.split(","))
         )
+        if (
+            require_published_discovery
+            and published_keys is not None
+            and discovery is not None
+            and discovery not in published_keys
+        ):
+            raise ValueError("The A2A discovery registration must be in the published roster")
         return cls(base, discovery, NativePushPolicy.from_environment(environment), published_keys)
 
 

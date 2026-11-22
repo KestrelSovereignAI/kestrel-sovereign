@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import tomllib
 from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
@@ -22,7 +23,10 @@ from kestrel_sovereign.security.path_identity import paths_overlap_by_filesystem
 MAX_DATABASE_BYTES = 8 * 1024 * 1024
 
 
-def restore_demo_seed(agent_dir: Path, source: Path, bundle: bytes, *, expected_did: str) -> None:
+def restore_demo_seed(
+    agent_dir: Path, source: Path, bundle: bytes, *,
+    expected_did: str, soul_source: Path | None = None,
+) -> None:
     """Verify both pinned inputs before admitting a demo to the startup roster."""
     agent_dir = agent_dir.absolute()
     if agent_dir.is_symlink() or (
@@ -33,6 +37,8 @@ def restore_demo_seed(agent_dir: Path, source: Path, bundle: bytes, *, expected_
         )
     ):
         raise IdentityCustodyError("Demo seed refuses to replace existing agent state")
+    if soul_source is not None and (agent_dir / "SOUL.md").exists():
+        raise IdentityCustodyError("Demo seed refuses to replace the existing SOUL")
 
     agent_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".demo-restore-", dir=agent_dir.parent) as temp:
@@ -59,6 +65,8 @@ def restore_demo_seed(agent_dir: Path, source: Path, bundle: bytes, *, expected_
             ).fetchall()
         if integrity != [("ok",)] or demos != [(expected_did, 1, 1)]:
             raise IdentityCustodyError("Demo seed database does not bind to the pinned test identity")
+        if soul_source is not None:
+            (staged_agent / "SOUL.md").write_bytes(soul_source.read_bytes())
 
         if not agent_dir.exists():
             os.replace(staged_agent, agent_dir)
@@ -83,34 +91,40 @@ def main() -> None:
     parser.add_argument("--agent-data-dir", type=Path, required=True)
     parser.add_argument("--host-control-dir", type=Path, required=True)
     parser.add_argument("--registration", required=True)
-    parser.add_argument("--database-seed", type=Path, required=True)
-    parser.add_argument("--bundle-seed", type=Path, required=True)
-    parser.add_argument("--expected-did", required=True)
     args = parser.parse_args()
     config = MultiAgentConfig.load(
         args.config, auto_discover_fallback=False, runtime_base=Path.cwd()
     )
-    registration = config.agents.get(args.registration)
     roster = {name.strip() for name in os.environ.get("KESTREL_AGENTS", "").split(",")}
-    expected_dir = args.agent_data_dir / args.registration
+    published = {
+        name.strip() for name in os.environ.get("KESTREL_A2A_PUBLISHED_AGENTS", "").split(",")
+    }
+    with args.config.open("rb") as source:
+        seeds = tomllib.load(source).get("demo_seeds", {})
     if (
-        not isinstance(registration, LocalAgentConfig)
-        or not registration.autostart
-        or not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) for name in roster)
+        not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) for name in roster)
         or roster != set(config.agents)
+        or args.registration not in seeds
+        or published != set(seeds)
+        or not published <= roster
         or not all(
             isinstance(agent, LocalAgentConfig)
             and agent.resolve_data_dir(Path.cwd()) == args.agent_data_dir / name
             for name, agent in config.agents.items()
         )
-        or registration.resolve_data_dir(Path.cwd()) != expected_dir
-        or paths_overlap_by_filesystem_identity(args.host_control_dir, expected_dir)
+        or any(
+            not config.agents[name].autostart
+            or paths_overlap_by_filesystem_identity(args.host_control_dir, args.agent_data_dir / name)
+            for name in seeds
+        )
     ):
         raise IdentityCustodyError("Demo seed must bind to the configured discovery registration's data directory")
-    restore_demo_seed(
-        expected_dir, args.database_seed, args.bundle_seed.read_bytes(),
-        expected_did=args.expected_did,
-    )
+    for name, seed in seeds.items():
+        restore_demo_seed(
+            args.agent_data_dir / name, Path(seed["database"]),
+            Path(seed["identity"]).read_bytes(), expected_did=seed["did"],
+            soul_source=Path(seed["soul"]) if "soul" in seed else None,
+        )
     print("demo-" + uuid4().hex)
 
 
