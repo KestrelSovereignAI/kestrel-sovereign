@@ -372,6 +372,17 @@ class NativeA2APublication:
                 )
             authority = self._guard.authority_factory()
             authority.require_current(None)
+            if self._seeded_signing_key_fingerprint is not None:
+                from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
+
+                try:
+                    fingerprint = await read_seeded_signing_key_fingerprint(
+                        self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
+                    )
+                except ValueError as error:
+                    raise HTTPException(status_code=503, detail="Seeded demo database unavailable") from error
+                if fingerprint != self._seeded_signing_key_fingerprint:
+                    raise HTTPException(status_code=503, detail="Seeded demo database unavailable")
             profile = await self.recipient.get_public_profile()
             card = self._build_card(profile)
             authority.require_current(None)

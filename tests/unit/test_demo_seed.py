@@ -19,9 +19,10 @@ from kestrel_sovereign.identity.custody_bundle import (
 )
 from kestrel_sovereign.identity.demo_seed import (
     DEMO_SEED_STATE_TABLE,
+    DemoSeed,
     demo_signing_key_fingerprint,
     main,
-    restore_demo_seed,
+    restore_demo_seeds,
 )
 from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
 from kestrel_sovereign.identity.runtime_identity import load_agent_identity
@@ -134,8 +135,11 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     (first / "SOUL.md").write_text("Container demo profile")
     monkeypatch.chdir(tmp_path)
     second = Path("second")
+    restore_demo_seeds(
+        (DemoSeed(directory, database_seed, bundle, did) for directory in (first, second)),
+        tenant="demo-test",
+    )
     for agent_dir in (first, second):
-        restore_demo_seed(agent_dir, database_seed, bundle, expected_did=did, tenant="demo-test")
         restored = load_agent_identity(None, storage_dir=agent_dir)
         assert restored.signing_did == did
         assert restored.new_verification_methods == load_agent_identity(
@@ -146,15 +150,22 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     assert (first / "SOUL.md").read_text() == "Container demo profile"
 
     with pytest.raises(IdentityCustodyError, match="existing agent state"):
-        restore_demo_seed(first, database_seed, bundle, expected_did=did, tenant="demo-test")
+        restore_demo_seeds([DemoSeed(first, database_seed, bundle, did)], tenant="demo-test")
+    valid_database = tmp_path / "valid.db.xz"
+    shutil.copyfile(database_seed, valid_database)
     with closing(sqlite3.connect(snapshot)) as db:
         with db:
             db.execute("UPDATE graph_nodes SET properties = '{}' WHERE node_id = ?", (did,))
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     database_seed.write_bytes(lzma.compress(snapshot.read_bytes()))
+    earlier = tmp_path / "not-installed"
     unrelated = tmp_path / "unrelated"
     with pytest.raises(IdentityCustodyError, match="does not bind to the pinned test identity"):
-        restore_demo_seed(unrelated, database_seed, bundle, expected_did=did, tenant="demo-test")
+        restore_demo_seeds([
+            DemoSeed(earlier, valid_database, bundle, did),
+            DemoSeed(unrelated, database_seed, bundle, did),
+        ], tenant="demo-test")
+    assert not earlier.exists()
     assert not unrelated.exists()
 
 

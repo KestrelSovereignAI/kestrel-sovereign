@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def _is_seeded_demo(profile: DeploymentProfile) -> bool:
-    return "KESTREL_DEMO_SEED_DATA_KEY_FILE" in profile.env_vars
+    return any(
+        setting in profile.env_vars or setting in profile.secrets
+        for setting in ("KESTREL_DEMO_SEED_DATA_KEY_FILE", "KESTREL_DEMO_SEED_ROSTER_TEMPLATE")
+    )
 
 
 def _apply_managed_template(service: Any, container: Any, profile: DeploymentProfile) -> None:

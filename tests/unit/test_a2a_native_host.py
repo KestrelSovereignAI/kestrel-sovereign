@@ -354,6 +354,9 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
             assert (await http.get("/health")).status_code == 503
             p.app.state.required_a2a_card_keys = frozenset({"registered-agent"})
             assert (await http.get("/health")).status_code == 200
+            await p.backend.execute(f"DELETE FROM {DEMO_SEED_STATE_TABLE}")
+            assert (await http.get("/.well-known/agent-card.json")).status_code == 503
+            assert (await http.get("/health")).status_code == 503
     finally:
         async with p.host.a2a_lifecycle_lease():
             native.withdraw()

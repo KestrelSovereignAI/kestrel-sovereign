@@ -87,11 +87,12 @@ def test_secret_file_cannot_overlap_implicit_cloud_sql_mount(deployment_profile)
 
 
 @pytest.mark.parametrize(
-    "max_instances, percentages, manual_count",
-    [(2, [100], None), (1, [50, 50], None), (1, [100], 2)],
+    "max_instances, percentages, manual_count, key_source",
+    [(2, [100], None, "env_vars"), (1, [50, 50], None, "env_vars"),
+     (1, [100], 2, "env_vars"), (1, [50, 50], None, "secrets")],
 )
 def test_seeded_demo_deployment_refuses_multiple_serving_targets(
-    deployment_profile, max_instances, percentages, manual_count,
+    deployment_profile, max_instances, percentages, manual_count, key_source,
 ):
     from google.cloud.run_v2 import Service
     from google.cloud.run_v2.types import Container, ContainerPort, ServiceScaling
@@ -102,7 +103,7 @@ def test_seeded_demo_deployment_refuses_multiple_serving_targets(
     profile = replace(
         deployment_profile,
         max_instances=max_instances,
-        env_vars={"KESTREL_DEMO_SEED_DATA_KEY_FILE": "/var/run/demo/data.key"},
+        **{key_source: {"KESTREL_DEMO_SEED_DATA_KEY_FILE": "mounted-key:1"}},
     )
     with pytest.raises(DeployManagerError, match="one instance and an unsplit traffic target"):
         _apply_managed_template(

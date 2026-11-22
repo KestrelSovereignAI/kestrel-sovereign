@@ -9,7 +9,9 @@ import re
 import sqlite3
 import tempfile
 import tomllib
-from contextlib import closing
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -33,12 +35,18 @@ def demo_signing_key_fingerprint(identity) -> str:
     })
 
 
-def restore_demo_seed(
-    agent_dir: Path, source: Path, bundle: bytes, *,
-    expected_did: str, tenant: str, soul_source: Path | None = None,
-) -> None:
-    """Verify both pinned inputs before admitting a demo to the startup roster."""
-    agent_dir = agent_dir.absolute()
+@dataclass(frozen=True)
+class DemoSeed:
+    directory: Path
+    database: Path
+    bundle: bytes
+    did: str
+    soul_source: Path | None = None
+
+
+@contextmanager
+def _stage_demo_seed(seed: DemoSeed, tenant: str) -> Iterator[Path]:
+    agent_dir = seed.directory.absolute()
     if agent_dir.is_symlink() or (
         agent_dir.exists()
         and any(
@@ -47,16 +55,16 @@ def restore_demo_seed(
         )
     ):
         raise IdentityCustodyError("Demo seed refuses to replace existing agent state")
-    if soul_source is not None and (agent_dir / "SOUL.md").exists():
+    if seed.soul_source is not None and (agent_dir / "SOUL.md").exists():
         raise IdentityCustodyError("Demo seed refuses to replace the existing SOUL")
 
     agent_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".demo-restore-", dir=agent_dir.parent) as temp:
         staged_agent = Path(temp) / "agent"
-        restore_identity_bundle(bundle, staged_agent, expected_did=expected_did)
+        restore_identity_bundle(seed.bundle, staged_agent, expected_did=seed.did)
 
         database = staged_agent / "kestrel_prime.db"
-        with lzma.open(source, "rb") as compressed:
+        with lzma.open(seed.database, "rb") as compressed:
             contents = compressed.read(MAX_DATABASE_BYTES + 1)
         if len(contents) > MAX_DATABASE_BYTES:
             raise IdentityCustodyError("Demo seed database exceeds the restore limit")
@@ -73,7 +81,7 @@ def restore_demo_seed(
                 FROM graph_nodes WHERE node_type = 'agent'
                 """
             ).fetchall()
-        if integrity != [("ok",)] or demos != [(expected_did, 1, 1)]:
+        if integrity != [("ok",)] or demos != [(seed.did, 1, 1)]:
             raise IdentityCustodyError("Demo seed database does not bind to the pinned test identity")
         identity = load_agent_identity(None, storage_dir=staged_agent)
         with closing(sqlite3.connect(database)) as db, db:
@@ -88,24 +96,31 @@ def restore_demo_seed(
                 f"INSERT INTO {DEMO_SEED_STATE_TABLE} VALUES (1, ?, ?)",
                 (tenant, demo_signing_key_fingerprint(identity)),
             )
-        if soul_source is not None:
-            (staged_agent / "SOUL.md").write_bytes(soul_source.read_bytes())
+        if seed.soul_source is not None:
+            (staged_agent / "SOUL.md").write_bytes(seed.soul_source.read_bytes())
+        yield staged_agent
 
-        if not agent_dir.exists():
-            os.replace(staged_agent, agent_dir)
-            return
-        # A baked SOUL may leave the target directory on an overlay lower
-        # layer. Move the validated upper-layer artifacts, never that directory.
-        transferred = []
-        try:
-            for artifact in staged_agent.iterdir():
-                destination = agent_dir / artifact.name
-                os.replace(artifact, destination)
-                transferred.append(destination)
-        except OSError:
-            for destination in reversed(transferred):
-                os.replace(destination, staged_agent / destination.name)
-            raise
+
+def restore_demo_seeds(seeds: Iterable[DemoSeed], *, tenant: str) -> None:
+    """Validate the whole roster before installing any demo into its runtime directory."""
+    with ExitStack() as staging:
+        prepared = [
+            (seed.directory.absolute(), staging.enter_context(_stage_demo_seed(seed, tenant)))
+            for seed in seeds
+        ]
+        with ExitStack() as rollback:
+            for agent_dir, staged_agent in prepared:
+                if not agent_dir.exists():
+                    os.replace(staged_agent, agent_dir)
+                    rollback.callback(os.replace, agent_dir, staged_agent)
+                    continue
+                # A baked SOUL can leave an overlay directory on a lower layer.
+                # Move only the validated upper-layer artifacts in that case.
+                for artifact in staged_agent.iterdir():
+                    destination = agent_dir / artifact.name
+                    os.replace(artifact, destination)
+                    rollback.callback(os.replace, destination, artifact)
+            rollback.pop_all()
 
 
 def read_demo_seed_manifest(path: Path) -> dict:
@@ -159,12 +174,16 @@ def main() -> None:
     ):
         raise IdentityCustodyError("Demo seed must bind to the configured discovery registration's data directory")
     tenant = "demo-" + uuid4().hex
-    for name, seed in seeds.items():
-        restore_demo_seed(
-            args.agent_data_dir / name, Path(seed["database"]),
-            Path(seed["identity"]).read_bytes(), expected_did=seed["did"], tenant=tenant,
+    restore_demo_seeds((
+        DemoSeed(
+            directory=args.agent_data_dir / name,
+            database=Path(seed["database"]),
+            bundle=Path(seed["identity"]).read_bytes(),
+            did=seed["did"],
             soul_source=Path(seed["soul"]) if "soul" in seed else None,
         )
+        for name, seed in seeds.items()
+    ), tenant=tenant)
     print(tenant)
 
 

@@ -5294,6 +5294,7 @@ async def get_bootstrap_key(request: Request):
 
 
 async def _missing_required_a2a_cards(app: FastAPI, manager) -> list[str]:
+    from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
     from starlette.exceptions import HTTPException as StarletteHTTPException
 
     from kestrel_sovereign.storage.db.interface import DatabaseError
@@ -5308,7 +5309,7 @@ async def _missing_required_a2a_cards(app: FastAPI, manager) -> list[str]:
         if publication is not None and publication.routing_key == key:
             try:
                 await publication.get_card()
-            except (StarletteHTTPException, ValueError, DatabaseError) as error:
+            except (StarletteHTTPException, ValueError, DatabaseError, InvalidParamsError) as error:
                 if is_execution_control_error(error):
                     raise
             else:
