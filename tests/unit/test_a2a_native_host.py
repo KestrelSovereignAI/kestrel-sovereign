@@ -623,15 +623,23 @@ async def test_hosted_native_guard_uses_actual_directory_and_stable_principal(
 
 
 @pytest.mark.parametrize(
-    "fault", ["policy", "recipient", "recipient-identity", "task-manager", "task-store"]
+    "fault, seeded",
+    [("policy", False), ("recipient", False), ("recipient-identity", False),
+     ("task-manager", False), ("task-store", False), ("task-manager", True)],
 )
 async def test_retired_host_generation_never_admits_or_revalidates_a_request(
-    hosted, fault
+    hosted, fault, seeded,
 ):
     from starlette.exceptions import HTTPException
 
     params = send(hosted)
-    async with hosted.guard.admit(
+    guard = hosted.guard
+    if seeded:
+        async def check_recipient_custody():
+            await hosted.recipient.task_manager.task_store.backend.fetch_one("SELECT 1")
+
+        guard = replace(guard, check_recipient_custody=check_recipient_custody)
+    async with guard.admit(
         params, "SendMessage", signed_context(hosted, params)
     ) as admitted:
         pass
@@ -661,11 +669,11 @@ async def test_retired_host_generation_never_admits_or_revalidates_a_request(
                 hosted.backend, scope=hosted.scope, owns_backend=False
             )
     with pytest.raises(HTTPException) as denied:
-        async with hosted.guard.hold_authority(admitted):
+        async with guard.hold_authority(admitted):
             pytest.fail("An old request retained a retired host generation")
     assert denied.value.status_code == 403
     with pytest.raises(HTTPException) as denied:
-        async with hosted.guard.admit(
+        async with guard.admit(
             params, "SendMessage", signed_context(hosted, params)
         ):
             pytest.fail("A retired host generation admitted a new request")

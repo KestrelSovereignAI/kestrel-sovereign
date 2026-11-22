@@ -456,15 +456,19 @@ class TestIssue2473ReadinessGatesDeploySuccess:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("serving_revision", [None, "kestrel-dev-00006-old", "kestrel-dev-00007-abc"])
-    async def test_seeded_health_response_must_match_the_created_revision(self, serving_revision):
+    @pytest.mark.parametrize("status_code", [200, 503])
+    async def test_seeded_health_response_must_match_the_created_revision(self, serving_revision, status_code):
         manager = _manager_with(_FakeProvider("update", serves_created_revision=True))
         manager.health_check_timeout = 0.2
         headers = {CLOUD_RUN_REVISION_HEADER: serving_revision} if serving_revision else None
-        with _serve(_status(200, {"status": "ok", "agent_initialized": True}, headers=headers)):
+        with _serve(_status(status_code, {"status": "ok", "agent_initialized": True}, headers=headers)):
             result = await manager.deploy_profile("dev", tag="v1.2.3")
-        expected = serving_revision == "kestrel-dev-00007-abc"
-        assert result["success"] is expected
-        assert result["readiness"]["failure"] == (None if expected else "different_serving_revision")
+        if serving_revision != "kestrel-dev-00007-abc":
+            assert result["readiness_status"] == "unknown"
+            assert result["readiness"]["failure"] == "different_serving_revision"
+        else:
+            assert result["success"] is (status_code == 200)
+            assert result["readiness_status"] == ("ready" if status_code == 200 else "unready")
 
     @pytest.mark.asyncio
     async def test_seeded_health_retries_stale_revision_before_deadline(self):

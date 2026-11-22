@@ -321,7 +321,10 @@ class NativeDIDRequestGuard:
         else:
             refused = None
             async with _native_persistence_errors(), OriginalContextExit(self.lifecycle_lease()):
-                refused = await self._recipient_custody_refusal()
+                if self.check_recipient_custody is not None:
+                    refused = self._current_decision(admitted.authority, admitted.sender)
+                    if refused is None:
+                        refused = await self._recipient_custody_refusal()
                 if refused is None:
                     principal = await self._authorization_decision(admitted.authority, admitted.sender)
                     if isinstance(principal, StreamRefusal):

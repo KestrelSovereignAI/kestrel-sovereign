@@ -12,6 +12,8 @@ import tomllib
 from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +25,7 @@ from kestrel_sovereign.identity.custody_bundle import (
 from kestrel_sovereign.identity.runtime_identity import load_agent_identity
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.security.path_identity import paths_overlap_by_filesystem_identity
+from kestrel_sovereign.storage.db.interface import ConnectionError
 
 MAX_DATABASE_BYTES = 8 * 1024 * 1024
 DEMO_SEED_STATE_TABLE = "a2a_demo_seed_lifetime"
@@ -41,6 +44,8 @@ class DemoSeed:
     database: Path
     bundle: bytes
     did: str
+    database_sha256: str
+    signing_key_fingerprint: str
     soul_source: Path | None = None
 
 
@@ -64,8 +69,12 @@ def _stage_demo_seed(seed: DemoSeed, tenant: str) -> Iterator[Path]:
         restore_identity_bundle(seed.bundle, staged_agent, expected_did=seed.did)
 
         database = staged_agent / "kestrel_prime.db"
-        with lzma.open(seed.database, "rb") as compressed:
-            contents = compressed.read(MAX_DATABASE_BYTES + 1)
+        with seed.database.open("rb") as source:
+            compressed = source.read(MAX_DATABASE_BYTES + 1)
+        if len(compressed) > MAX_DATABASE_BYTES or sha256(compressed).hexdigest() != seed.database_sha256:
+            raise IdentityCustodyError("Demo seed database differs from its pinned snapshot")
+        with lzma.open(BytesIO(compressed), "rb") as source:
+            contents = source.read(MAX_DATABASE_BYTES + 1)
         if len(contents) > MAX_DATABASE_BYTES:
             raise IdentityCustodyError("Demo seed database exceeds the restore limit")
         database.write_bytes(contents)
@@ -84,6 +93,9 @@ def _stage_demo_seed(seed: DemoSeed, tenant: str) -> Iterator[Path]:
         if integrity != [("ok",)] or demos != [(seed.did, 1, 1)]:
             raise IdentityCustodyError("Demo seed database does not bind to the pinned test identity")
         identity = load_agent_identity(None, storage_dir=staged_agent)
+        fingerprint = demo_signing_key_fingerprint(identity)
+        if fingerprint != seed.signing_key_fingerprint:
+            raise IdentityCustodyError("Demo seed identity differs from its pinned signing keys")
         with closing(sqlite3.connect(database)) as db, db:
             db.execute(
                 f"""CREATE TABLE {DEMO_SEED_STATE_TABLE} (
@@ -94,7 +106,7 @@ def _stage_demo_seed(seed: DemoSeed, tenant: str) -> Iterator[Path]:
             )
             db.execute(
                 f"INSERT INTO {DEMO_SEED_STATE_TABLE} VALUES (1, ?, ?)",
-                (tenant, demo_signing_key_fingerprint(identity)),
+                (tenant, fingerprint),
             )
         if seed.soul_source is not None:
             (staged_agent / "SOUL.md").write_bytes(seed.soul_source.read_bytes())
@@ -143,7 +155,13 @@ def read_demo_seed_manifest(path: Path) -> dict:
 
 async def read_seeded_signing_key_fingerprint(backend, tenant: str) -> str:
     """Only a database restored by this host lifetime can publish a seeded route."""
-    if backend.backend_type != "sqlite" or not await backend.fetch_one(
+    if backend.backend_type != "sqlite":
+        raise ValueError("A seeded demo requires the database restored for its boot tenant")
+    try:
+        backend.assert_connected_file_still_valid()
+    except ConnectionError as error:
+        raise ValueError("A seeded demo requires its original connected SQLite file") from error
+    if not await backend.fetch_one(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
         (DEMO_SEED_STATE_TABLE,),
     ):
@@ -194,6 +212,8 @@ def main() -> None:
             database=Path(seed["database"]),
             bundle=Path(seed["identity"]).read_bytes(),
             did=seed["did"],
+            database_sha256=seed["database_sha256"],
+            signing_key_fingerprint=seed["signing_key_fingerprint"],
             soul_source=Path(seed["soul"]) if "soul" in seed else None,
         )
         for name, seed in seeds.items()

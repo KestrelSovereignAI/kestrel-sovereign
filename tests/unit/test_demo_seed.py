@@ -8,6 +8,8 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
+from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,7 @@ from kestrel_sovereign.identity.demo_seed import (
     DemoSeed,
     demo_signing_key_fingerprint,
     main,
+    read_seeded_signing_key_fingerprint,
     restore_demo_seeds,
 )
 from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
@@ -29,6 +32,7 @@ from kestrel_sovereign.identity.runtime_identity import load_agent_identity
 from kestrel_sovereign.identity.signing import sign_package, verify_package_signature
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.security.crypto_suite import MLDSA65Suite
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -51,7 +55,9 @@ async def demo_seed(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None, reason="container entrypoint requires Bash")
 def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, demo_seed):
-    _source, _snapshot, did, bundle, database_seed = demo_seed
+    source, _snapshot, did, bundle, database_seed = demo_seed
+    signing_fingerprint = demo_signing_key_fingerprint(load_agent_identity(None, storage_dir=source))
+    database_digest = sha256(database_seed.read_bytes()).hexdigest()
     bundle_path = tmp_path / "identity.json"
     bundle_path.write_bytes(bundle)
     key_file = tmp_path / "data.key"
@@ -74,6 +80,7 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
         registry.with_suffix(".seeds.toml").write_text(
             f'[demo]\ndid = "{did}"\n'
             f'database = "{database_seed}"\nidentity = "{bundle_path}"\n'
+            f'database_sha256 = "{database_digest}"\nsigning_key_fingerprint = "{signing_fingerprint}"\n'
             f'soul = "{soul}"\n'
         )
         env = dict(os.environ)
@@ -133,6 +140,14 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
 
 def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monkeypatch, demo_seed):
     source, snapshot, did, bundle, database_seed = demo_seed
+    signing_fingerprint = demo_signing_key_fingerprint(load_agent_identity(None, storage_dir=source))
+
+    def seed_inputs(destination, database):
+        return DemoSeed(
+            destination, database, bundle, did,
+            sha256(database.read_bytes()).hexdigest(), signing_fingerprint,
+        )
+
     first = tmp_path / "first"
     first.mkdir()
     (first / "SOUL.md").write_text("Container demo profile")
@@ -142,7 +157,7 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     roster.write_text("# Mounted roster")
     original_roster_inode = roster.stat().st_ino
     restore_demo_seeds(
-        (DemoSeed(directory, database_seed, bundle, did) for directory in (first, second)),
+        (seed_inputs(directory, database_seed) for directory in (first, second)),
         tenant="demo-test", roster_update=(roster, roster),
     )
     assert roster.stat().st_ino == original_roster_inode
@@ -157,7 +172,13 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     assert (first / "SOUL.md").read_text() == "Container demo profile"
 
     with pytest.raises(IdentityCustodyError, match="existing agent state"):
-        restore_demo_seeds([DemoSeed(first, database_seed, bundle, did)], tenant="demo-test")
+        restore_demo_seeds([seed_inputs(first, database_seed)], tenant="demo-test")
+    mismatched = seed_inputs(tmp_path / "mismatched", database_seed)
+    with pytest.raises(IdentityCustodyError, match="pinned signing keys"):
+        restore_demo_seeds([replace(mismatched, signing_key_fingerprint="wrong")], tenant="demo-test")
+    with pytest.raises(IdentityCustodyError, match="pinned snapshot"):
+        restore_demo_seeds([replace(mismatched, database_sha256="wrong")], tenant="demo-test")
+    assert not mismatched.directory.exists()
     valid_database = tmp_path / "valid.db.xz"
     shutil.copyfile(database_seed, valid_database)
     with closing(sqlite3.connect(snapshot)) as db:
@@ -169,11 +190,34 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     unrelated = tmp_path / "unrelated"
     with pytest.raises(IdentityCustodyError, match="does not bind to the pinned test identity"):
         restore_demo_seeds([
-            DemoSeed(earlier, valid_database, bundle, did),
-            DemoSeed(unrelated, database_seed, bundle, did),
+            seed_inputs(earlier, valid_database),
+            seed_inputs(unrelated, database_seed),
         ], tenant="demo-test")
     assert not earlier.exists()
     assert not unrelated.exists()
+
+
+@pytest.mark.asyncio
+async def test_demo_refuses_a_live_sqlite_database_replaced_on_disk(tmp_path, demo_seed):
+    source, _snapshot, did, bundle, database_seed = demo_seed
+    directory = tmp_path / "running"
+    fingerprint = demo_signing_key_fingerprint(load_agent_identity(None, storage_dir=source))
+    restore_demo_seeds([
+        DemoSeed(directory, database_seed, bundle, did,
+                 sha256(database_seed.read_bytes()).hexdigest(), fingerprint),
+    ], tenant="demo-test")
+    database = directory / "kestrel_prime.db"
+    backend = SQLiteBackend(str(database))
+    await backend.connect()
+    try:
+        assert await read_seeded_signing_key_fingerprint(backend, "demo-test") == fingerprint
+        replacement = database.with_suffix(".replacement")
+        shutil.copyfile(database, replacement)
+        replacement.replace(database)
+        with pytest.raises(ValueError, match="original connected SQLite file"):
+            await read_seeded_signing_key_fingerprint(backend, "demo-test")
+    finally:
+        await backend.close()
 
 
 def test_entrypoint_refuses_different_configured_discovery_storage(tmp_path, monkeypatch):

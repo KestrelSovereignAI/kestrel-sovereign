@@ -556,11 +556,12 @@ at `/.well-known/agent-card.json`. Its public signing DID is
 has its own DID and per-agent card. The DEV profile loads
 the pinned encrypted identity bundles, matching data key and SQLite seeds
 from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
-Bootstrap verifies the seed's DID and the discovery registration's data
-directory before restoring it. The restored database records the boot tenant
-and signing keys. Card reads and signed requests verify that they still use
-the restored database. The separate `multi_agent.a2a-dev.seeds.toml` manifest selects the demo
-registrations and remains in place when the runtime saves roster edits. The DEV host
+Bootstrap checks the configured data directory, snapshot hash and signing
+keys before restoring each seed. The restored database records the boot
+tenant and signing-key fingerprint. Card reads and signed requests verify
+that they still use the restored database. The separate
+`multi_agent.a2a-dev.seeds.toml` manifest selects the demo registrations and
+remains in place when the runtime saves roster edits. The DEV host
 publishes native A2A for the two demo registrations. The existing Kestrel
 registration still handles its DEV GitHub webhook and stays out of public A2A
 discovery. The published roster and ephemeral tenant settings apply to the
@@ -581,8 +582,10 @@ verification document. Create a private ceremony directory outside the image
 build context with `mktemp -d`. Incept each test/demo identity there and
 export its encrypted keys with
 `python -m kestrel_sovereign.identity.custody_bundle create`. Capture its
-closed SQLite database as an XZ file. Provision those files and the matching
-data key into the Secret Manager entries specified by the profile. Repeat
+closed SQLite database as an XZ file. Record the compressed file's SHA-256
+digest and the DID document's signing-key fingerprint in the seed manifest.
+Provision those files and the matching data key into the Secret Manager
+entries specified by the profile. Repeat
 identity and database provisioning for the companion demo.
 Grant the DEV runtime service account Secret Accessor on those entries and
 verify each referenced numeric version is enabled with

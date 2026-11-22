@@ -5297,6 +5297,7 @@ async def _missing_required_a2a_cards(app: FastAPI, manager) -> list[str]:
     from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
     from starlette.exceptions import HTTPException as StarletteHTTPException
 
+    from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
     from kestrel_sovereign.storage.db.interface import DatabaseError
 
     required = getattr(app.state, "required_a2a_card_keys", frozenset())
@@ -5309,7 +5310,7 @@ async def _missing_required_a2a_cards(app: FastAPI, manager) -> list[str]:
         if publication is not None and publication.routing_key == key:
             try:
                 await publication.get_card()
-            except (StarletteHTTPException, ValueError, DatabaseError, InvalidParamsError) as error:
+            except (StarletteHTTPException, ValueError, DatabaseError, InvalidParamsError, PushServiceUnavailable) as error:
                 if is_execution_control_error(error):
                     raise
             else:
@@ -5328,6 +5329,10 @@ async def health_check(request: Request, response: Response):
     failure records, reachability, exception strings, paths, or capacities to
     this response.
     """
+    if revision := os.environ.get("K_REVISION"):
+        from kestrel_sovereign.features.deploy.providers._health import CLOUD_RUN_REVISION_HEADER
+
+        response.headers[CLOUD_RUN_REVISION_HEADER] = revision
     startup_error = getattr(request.app.state, "startup_error", None)
     agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
     mandatory_failures = getattr(
@@ -5347,6 +5352,7 @@ async def health_check(request: Request, response: Response):
     if startup_error:
         return JSONResponse(
             status_code=503,
+            headers=response.headers,
             content={"status": "unhealthy", "agent_initialized": False},
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
@@ -5370,6 +5376,7 @@ async def health_check(request: Request, response: Response):
     ):
         return JSONResponse(
             status_code=503,
+            headers=response.headers,
             content={
                 # Do not reveal whether the cause is identity, a mandatory
                 # feature, safe mode, or a pending constitutional audit.
@@ -5377,10 +5384,6 @@ async def health_check(request: Request, response: Response):
                 "agent_initialized": any_initialized,
             },
         )
-    if any_initialized and (revision := os.environ.get("K_REVISION")):
-        from kestrel_sovereign.features.deploy.providers._health import CLOUD_RUN_REVISION_HEADER
-
-        response.headers[CLOUD_RUN_REVISION_HEADER] = revision
     if agent:
         return {"status": "ok", "agent_initialized": True}
     # In multi-agent mode, check if any agents are loaded
@@ -5391,6 +5394,7 @@ async def health_check(request: Request, response: Response):
         }
     return JSONResponse(
         status_code=503,
+        headers=response.headers,
         content={
             "status": "unhealthy" if startup_error else "degraded",
             "agent_initialized": False,
