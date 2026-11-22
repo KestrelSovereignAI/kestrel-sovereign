@@ -56,7 +56,7 @@ async def test_operator_only_server_does_not_require_an_implicit_peer_identity(
 
 @pytest.mark.parametrize(
     ("option", "value"),
-    [("KESTREL_A2A_PUBLISHED_AGENTS", "demo"), ("KESTREL_A2A_EPHEMERAL_TENANT", "demo-tenant")],
+    [("KESTREL_DEMO_SEED_MANIFEST", "demo.seeds.toml"), ("KESTREL_A2A_EPHEMERAL_TENANT", "demo-tenant")],
 )
 async def test_single_server_rejects_cohosted_options(single_candidate, option, value):
     from kestrel_sovereign.server import _onboard_single_agent_native

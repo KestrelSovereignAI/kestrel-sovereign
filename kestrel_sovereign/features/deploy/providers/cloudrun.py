@@ -31,6 +31,10 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
         raise DeployManagerError("Cloud Run profile updates require a single-container service")
     if len(container.ports) != 1:
         raise DeployManagerError("Cloud Run profiles require one explicit ingress port")
+    if "KESTREL_DEMO_SEED_DATA_KEY_FILE" in profile.env_vars and (
+        profile.max_instances != 1 or sum(target.percent > 0 for target in service.traffic) > 1
+    ):
+        raise DeployManagerError("Seeded demo publication requires one instance and an unsplit traffic target")
     if count == 1:
         current = service.template.containers[0]
         if len(current.ports) > 1:

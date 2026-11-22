@@ -159,6 +159,11 @@ if [[ -n "$seeded_demo" ]]; then
             --host-control-dir "$HOST_CONTROL_DIR" \
             --registration "${KESTREL_A2A_DISCOVERY_AGENT:?a demo seed requires an explicit discovery registration}"
     )"
+    # The server, operator CLI and feature reconciliation share the runtime roster.
+    if [[ ! "$MULTI_AGENT_CONFIG" -ef "$PWD/multi_agent.toml" ]]; then
+        cp -- "$MULTI_AGENT_CONFIG" "$PWD/multi_agent.toml"
+    fi
+    MULTI_AGENT_CONFIG="$PWD/multi_agent.toml"
     export KESTREL_A2A_EPHEMERAL_TENANT
     export KESTREL_DEMO_SEED_MANIFEST="$seed_manifest"
     unset KESTREL_DEMO_SEED_DATA_KEY_FILE

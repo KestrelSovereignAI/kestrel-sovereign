@@ -198,6 +198,11 @@ class NativeA2AHTTPRegistry(NativeHTTPRegistry[NativeA2AHTTP]):
     def __init__(self, app: Starlette):
         super().__init__(app, protocol="A2A")
 
+    def published_card_keys(self) -> frozenset[str]:
+        return frozenset(
+            binding.routing_key for binding in self._current_bindings() if binding.card_routes
+        )
+
     def admits_public_card(self, scope: Scope) -> bool:
         self.require_application(scope.get("app"))
         return any(binding.admits_public_card(scope) for binding in self._current_bindings())

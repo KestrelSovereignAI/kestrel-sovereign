@@ -23,7 +23,7 @@ health_check_path = "/health"
 # Development Profile - Cloud Run (multi-agent host, always warm)
 #
 # Mirrors legacy scripts/cloudrun/deploy_dev.sh. The dev profile runs the
-# multi-agent host (``Kestrel,kestrel-demo``) and so deploys the
+# multi-agent host and so deploys the
 # ``kestrel-multi_agent`` image — DeployManagerCore.build_image_reference
 # derives that suffix from ``deployment_mode = "multi_agent"``. The legacy
 # bash deploy_dev.sh referenced ``kestrel-multi-agent`` (hyphen) which no
@@ -55,7 +55,6 @@ KESTREL_MULTI_AGENT_CONFIG = "/app/docker/multi_agent.a2a-dev.toml"
 # The deployment's pinned demo seed binds the exact registered route to its DID.
 KESTREL_BASE_URL = "https://kestrel-dev-7jpbsywhdq-uc.a.run.app"
 KESTREL_A2A_DISCOVERY_AGENT = "kestrel-demo"
-KESTREL_A2A_PUBLISHED_AGENTS = "kestrel-demo,kestrel-a2a-peer"
 KESTREL_A2A_PUSH_ENABLED = "false"
 KESTREL_DEMO_SEED_DATA_KEY_FILE = "/var/run/kestrel-demo-seed/key/data.key"
 KESTREL_REQUIRE_OAUTH = "true"

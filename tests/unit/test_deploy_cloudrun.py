@@ -79,6 +79,25 @@ def test_secret_file_cannot_overlap_implicit_cloud_sql_mount(deployment_profile)
         )
 
 
+@pytest.mark.parametrize("max_instances, percentages", [(2, [100]), (1, [50, 50])])
+def test_seeded_demo_deployment_refuses_multiple_serving_targets(
+    deployment_profile, max_instances, percentages,
+):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import Container, ContainerPort
+
+    service = Service(traffic=[{"percent": percent} for percent in percentages])
+    profile = replace(
+        deployment_profile,
+        max_instances=max_instances,
+        env_vars={"KESTREL_DEMO_SEED_DATA_KEY_FILE": "/var/run/demo/data.key"},
+    )
+    with pytest.raises(DeployManagerError, match="one instance and an unsplit traffic target"):
+        _apply_managed_template(
+            service, Container(image="demo", ports=[ContainerPort(container_port=8080)]), profile,
+        )
+
+
 @pytest.fixture
 def mock_services_client():
     """Mock google-cloud-run ServicesClient."""

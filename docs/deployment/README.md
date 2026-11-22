@@ -557,10 +557,10 @@ has its own DID and per-agent card. The DEV profile loads
 the pinned encrypted identity bundles, matching data key and SQLite seeds
 from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
 Bootstrap verifies the seed's DID and the discovery registration's data
-directory before restoring it. Every card publication checks that its
-signing DID and tenant match the boot configuration. The separate
-`multi_agent.a2a-dev.seeds.toml`
-manifest remains in place when the runtime saves roster edits. The DEV host
+directory before restoring it. The restored database records the boot tenant
+and signing keys. Every card publication checks those values and the pinned
+DID. The separate `multi_agent.a2a-dev.seeds.toml` manifest selects the demo
+registrations and remains in place when the runtime saves roster edits. The DEV host
 publishes native A2A for the two demo registrations. The existing Kestrel
 registration still handles its DEV GitHub webhook and stays out of public A2A
 discovery. The published roster and ephemeral tenant settings apply to the
@@ -569,6 +569,8 @@ server individually.
 Cold starts restore the initial demo state and assign a fresh A2A tenant.
 Both signing DIDs stay stable. A2A requests signed for a previous tenant
 cannot reach the new task and replay stores.
+Keep service traffic on one revision. The health check requires both public
+cards and the staging tag can be used at zero percent traffic before switching.
 
 When provisioning an independent DEV service in a new GCP project, first
 set its own HTTPS authority and signing DID, then publish that DID's

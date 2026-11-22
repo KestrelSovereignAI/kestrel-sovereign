@@ -42,11 +42,17 @@ def test_public_discovery_recipient_is_an_explicit_registration_key():
     )
 
 
-def test_host_publication_can_select_only_the_demo_registrations():
+def test_host_publication_can_select_only_the_demo_registrations(tmp_path):
+    manifest = tmp_path / "demo.seeds.toml"
+    manifest.write_text(
+        '[kestrel-demo]\ndid = "did:web:host.test:demo"\n'
+        '[kestrel-a2a-peer]\ndid = "did:web:host.test:peer"\n'
+    )
     configuration = NativeHostingConfiguration.from_environment({
         "KESTREL_BASE_URL": "https://host.test",
         "KESTREL_A2A_DISCOVERY_AGENT": "kestrel-demo",
-        "KESTREL_A2A_PUBLISHED_AGENTS": "kestrel-demo,kestrel-a2a-peer",
+        "KESTREL_A2A_EPHEMERAL_TENANT": "demo-tenant",
+        "KESTREL_DEMO_SEED_MANIFEST": str(manifest),
     })
     assert configuration.publishes("kestrel-demo")
     assert configuration.publishes("kestrel-a2a-peer")
@@ -57,9 +63,6 @@ def test_host_publication_can_select_only_the_demo_registrations():
     "environment",
     [
         {"KESTREL_A2A_DISCOVERY_AGENT": "configured"},
-        {"KESTREL_A2A_PUBLISHED_AGENTS": "demo"},
-        {"KESTREL_BASE_URL": "https://host.test",
-         "KESTREL_A2A_DISCOVERY_AGENT": "not-published", "KESTREL_A2A_PUBLISHED_AGENTS": "demo"},
         {"KESTREL_BASE_URL": ""},
         {"KESTREL_BASE_URL": "https://user:password@host.test"},
         {"KESTREL_BASE_URL": "https://host.test#fragment"},

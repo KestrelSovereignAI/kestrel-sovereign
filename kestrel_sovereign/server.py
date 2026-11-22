@@ -3478,9 +3478,16 @@ async def _lifespan_startup(app: FastAPI):
     app.state.fleet_host = fleet_host
     if fleet_host:
         _require_multi_agent_host_api_key(os.environ)
-    from kestrel_sovereign.a2a.native_publication import validate_native_fleet_options
+    from kestrel_sovereign.a2a.native_publication import (
+        NativeHostingConfiguration,
+        validate_native_fleet_options,
+    )
 
     validate_native_fleet_options(os.environ, fleet_host=fleet_host)
+    app.state.required_a2a_card_keys = frozenset()
+    if "KESTREL_DEMO_SEED_MANIFEST" in os.environ:
+        native_config = NativeHostingConfiguration.from_environment(os.environ, fleet_host=fleet_host)
+        app.state.required_a2a_card_keys = frozenset(native_config.seeded_signers)
     if "KESTREL_A2A_PEER_POLICY" in os.environ:
         from kestrel_sovereign.a2a.native_standalone import validate_native_peer_policy
 
@@ -5327,6 +5334,11 @@ def health_check(request: Request):
     scheduler_failures = _scheduler_readiness_failures(request.app)
     constitution_safe_mode = _constitution_safe_mode_records(agent, manager)
     any_initialized = bool(agent) or bool(manager and manager.list_agents())
+    required_cards = getattr(request.app.state, "required_a2a_card_keys", frozenset())
+    card_registry = getattr(request.app.state, "native_a2a_http", None)
+    missing_required_cards = required_cards and (
+        card_registry is None or not required_cards <= card_registry.published_card_keys()
+    )
     if (
         mandatory_failures
         or identity_failures
@@ -5334,6 +5346,7 @@ def health_check(request: Request):
         or scheduler_failures
         or not scheduler_workers_available
         or not invocation_owners_healthy
+        or missing_required_cards
     ):
         return JSONResponse(
             status_code=503,

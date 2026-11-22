@@ -17,7 +17,12 @@ from kestrel_sovereign.identity.custody_bundle import (
     IdentityCustodyError,
     create_identity_bundle,
 )
-from kestrel_sovereign.identity.demo_seed import main, restore_demo_seed
+from kestrel_sovereign.identity.demo_seed import (
+    DEMO_SEED_STATE_TABLE,
+    demo_signing_key_fingerprint,
+    main,
+    restore_demo_seed,
+)
 from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
 from kestrel_sovereign.identity.runtime_identity import load_agent_identity
 from kestrel_sovereign.identity.signing import sign_package, verify_package_signature
@@ -78,7 +83,7 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             KESTREL_MULTI_AGENT_CONFIG=str(registry), KESTREL_AGENTS="demo",
             KESTREL_DB_BACKEND="sqlite", KESTREL_DEPLOYMENT_PERSISTENCE="ephemeral_demo",
             KESTREL_A2A_DISCOVERY_AGENT="demo",
-            KESTREL_A2A_PUBLISHED_AGENTS="demo", KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),
+            KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),
         )
         if boot == "boot-one":
             missing_mount = dict(env, KESTREL_DATA_KEY=os.environ["KESTREL_DATA_KEY"])
@@ -106,11 +111,17 @@ def test_demo_container_restores_mounted_key_and_sets_unique_tenant(tmp_path, de
             capture_output=True, text=True, check=False, timeout=45,
         )
         assert result.returncode == 0, result.stderr
+        assert (tmp_path / "multi_agent.toml").read_bytes() == registry.read_bytes()
         tenant, = (line.removeprefix("A2A_TENANT=") for line in result.stdout.splitlines()
                    if line.startswith("A2A_TENANT="))
         assert tenant.startswith("demo-")
         tenants.add(tenant)
-        assert load_agent_identity(None, storage_dir=data / "demo").signing_did == did
+        identity = load_agent_identity(None, storage_dir=data / "demo")
+        assert identity.signing_did == did
+        with closing(sqlite3.connect(data / "demo" / "kestrel_prime.db")) as db:
+            assert db.execute(f"SELECT tenant, signing_keys FROM {DEMO_SEED_STATE_TABLE}").fetchall() == [
+                (tenant, demo_signing_key_fingerprint(identity)),
+            ]
         assert (data / "demo" / "SOUL.md").read_bytes() == soul.read_bytes()
     assert len(tenants) == 2
 
@@ -123,17 +134,18 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     monkeypatch.chdir(tmp_path)
     second = Path("second")
     for agent_dir in (first, second):
-        restore_demo_seed(agent_dir, database_seed, bundle, expected_did=did)
+        restore_demo_seed(agent_dir, database_seed, bundle, expected_did=did, tenant="demo-test")
         restored = load_agent_identity(None, storage_dir=agent_dir)
         assert restored.signing_did == did
         assert restored.new_verification_methods == load_agent_identity(
             None, storage_dir=source
         ).new_verification_methods
-        assert (agent_dir / snapshot.name).read_bytes() == snapshot.read_bytes()
+        with closing(sqlite3.connect(agent_dir / snapshot.name)) as db:
+            assert db.execute("SELECT node_id FROM graph_nodes WHERE node_type = 'agent'").fetchall() == [(did,)]
     assert (first / "SOUL.md").read_text() == "Container demo profile"
 
     with pytest.raises(IdentityCustodyError, match="existing agent state"):
-        restore_demo_seed(first, database_seed, bundle, expected_did=did)
+        restore_demo_seed(first, database_seed, bundle, expected_did=did, tenant="demo-test")
     with closing(sqlite3.connect(snapshot)) as db:
         with db:
             db.execute("UPDATE graph_nodes SET properties = '{}' WHERE node_id = ?", (did,))
@@ -141,7 +153,7 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     database_seed.write_bytes(lzma.compress(snapshot.read_bytes()))
     unrelated = tmp_path / "unrelated"
     with pytest.raises(IdentityCustodyError, match="does not bind to the pinned test identity"):
-        restore_demo_seed(unrelated, database_seed, bundle, expected_did=did)
+        restore_demo_seed(unrelated, database_seed, bundle, expected_did=did, tenant="demo-test")
     assert not unrelated.exists()
 
 
@@ -158,7 +170,6 @@ def test_entrypoint_refuses_different_configured_discovery_storage(tmp_path, mon
         'database = "db.xz"\nidentity = "bundle"\n'
     )
     monkeypatch.setenv("KESTREL_AGENTS", "demo")
-    monkeypatch.setenv("KESTREL_A2A_PUBLISHED_AGENTS", "demo")
     monkeypatch.setattr(sys, "argv", [
         "demo_seed", "--config", str(registry), "--seeds", str(seeds),
         "--agent-data-dir", str(tmp_path / "data"),

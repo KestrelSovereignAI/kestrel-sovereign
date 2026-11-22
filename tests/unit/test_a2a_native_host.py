@@ -285,24 +285,39 @@ async def test_native_preparation_refuses_registry_from_another_app(publication)
     assert other_app.routes == publication.app.routes == []
 
 
-@pytest.mark.parametrize("changed", ["signing DID", "tenant", None])
+@pytest.mark.parametrize("changed", ["signing DID", "signing keys", "tenant", "database", None])
 async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
     publication, tmp_path, changed,
 ):
+    import httpx
+
     from kestrel_sovereign.a2a.native_publication import prepare_hosted_native_publication
+    from kestrel_sovereign.identity.demo_seed import DEMO_SEED_STATE_TABLE, demo_signing_key_fingerprint
+    from kestrel_sovereign.server import health_check
 
     p = publication
+    if p.backend.backend_type != "sqlite":
+        pytest.skip("The seeded DEV profile uses SQLite")
     did = p.recipient.identity.signing_did
     tenant = p.recipient.task_manager.task_store.scope.tenant
+    configured_tenant = "stale-tenant" if changed == "tenant" else tenant
     manifest = tmp_path / "demo.seeds.toml"
     pinned_did = "did:web:public.test:other" if changed == "signing DID" else did
     manifest.write_text(f'[registered-agent]\ndid = "{pinned_did}"\n')
+    if changed != "database":
+        fingerprint = demo_signing_key_fingerprint(p.recipient.identity)
+        await p.backend.execute(
+            f"CREATE TABLE {DEMO_SEED_STATE_TABLE} (tenant TEXT, signing_keys TEXT)"
+        )
+        await p.backend.execute(
+            f"INSERT INTO {DEMO_SEED_STATE_TABLE} VALUES (?, ?)",
+            (configured_tenant, "different-keys" if changed == "signing keys" else fingerprint),
+        )
     environment = {
         "KESTREL_BASE_URL": "https://native.test",
         "KESTREL_A2A_DISCOVERY_AGENT": "registered-agent",
-        "KESTREL_A2A_PUBLISHED_AGENTS": "registered-agent",
         "KESTREL_A2A_PUSH_ENABLED": "false",
-        "KESTREL_A2A_EPHEMERAL_TENANT": "stale-tenant" if changed == "tenant" else tenant,
+        "KESTREL_A2A_EPHEMERAL_TENANT": configured_tenant,
         "KESTREL_DEMO_SEED_MANIFEST": str(manifest),
     }
     preparation = prepare_hosted_native_publication(
@@ -320,6 +335,15 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
             p.host._register_agent("registered-agent", p.recipient)
         card = await native.get_card()
         assert {interface.tenant for interface in card.supported_interfaces} == {tenant}
+        p.app.state.agent_manager = p.host
+        p.app.add_api_route("/health", health_check)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(p.app), base_url="https://native.test",
+        ) as http:
+            p.app.state.required_a2a_card_keys = frozenset({"registered-agent", "missing-peer"})
+            assert (await http.get("/health")).status_code == 503
+            p.app.state.required_a2a_card_keys = frozenset({"registered-agent"})
+            assert (await http.get("/health")).status_code == 200
     finally:
         async with p.host.a2a_lifecycle_lease():
             native.withdraw()

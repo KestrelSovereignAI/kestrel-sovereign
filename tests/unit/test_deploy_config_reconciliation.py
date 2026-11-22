@@ -184,7 +184,6 @@ def test_dev_publication_selects_the_pinned_demo_registration(live_config):
     assert "KESTREL_IDENTITY_BUNDLE" not in profile["secrets"]
     assert "KESTREL_DATA_KEY" not in profile["secrets"]
     assert env["KESTREL_AGENTS"] == "Kestrel,kestrel-demo,kestrel-a2a-peer"
-    assert env["KESTREL_A2A_PUBLISHED_AGENTS"] == "kestrel-demo,kestrel-a2a-peer"
     assert config.push is None
 
 
