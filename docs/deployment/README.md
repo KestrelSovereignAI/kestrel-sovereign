@@ -553,14 +553,13 @@ Dev service URL (stable): `https://kestrel-dev-7jpbsywhdq-uc.a.run.app`
 DEV publishes a signed A2A Agent Card for the `kestrel-demo` registration
 at `/.well-known/agent-card.json`. Its public signing DID is
 `did:web:agents.kestrelsovereign.com:kestrel-dev-a2a`. The DEV profile loads
-the pinned encrypted identity bundle and matching data key from Secret Manager.
-The service template also mounts Secret Manager
-`kestrel-dev-a2a-db-seed:1` read-only at
-`/var/run/kestrel-demo-seed/kestrel_prime.db.xz`. The deployment provider
-preserves this mount across updates. Bootstrap verifies that the SQLite
-snapshot is bound to the same demo DID before restoring the registration.
-The demo resets to its initial state on each cold start. The identity and its
-public verification key remain stable across revisions.
+the pinned encrypted identity bundle, matching data key and SQLite seed
+from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
+Bootstrap verifies the seed's DID and the discovery registration's data
+directory before restoring it. The DEV host contains two demo registrations.
+Cold starts restore the initial demo state and assign a fresh A2A tenant.
+The signing DID stays stable. A2A requests signed for a previous tenant
+cannot reach the new task and replay stores.
 
 ## GitHub Actions
 

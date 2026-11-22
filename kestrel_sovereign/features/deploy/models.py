@@ -125,6 +125,7 @@ class DeploymentProfile:
     dockerfile: str = "docker/Dockerfile.cloudrun"
     env_vars: Dict[str, str] = field(default_factory=dict)
     secrets: Dict[str, str] = field(default_factory=dict)
+    secret_files: Dict[str, str] = field(default_factory=dict)
 
     # Provider-specific fields
     gcp_project_id: Optional[str] = None

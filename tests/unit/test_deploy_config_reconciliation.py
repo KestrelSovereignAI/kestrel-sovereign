@@ -99,7 +99,6 @@ def test_dev_profile_has_bash_parity_secrets(live_config):
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "KESTREL_API_KEY",
-        "KESTREL_DATA_KEY",
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
         "KESTREL_SESSION_SECRET",
@@ -176,9 +175,14 @@ def test_dev_publication_selects_the_pinned_demo_registration(live_config):
     assert config.discovery_routing_key == "kestrel-demo"
     assert config.discovery_routing_key in env["KESTREL_AGENTS"].split(",")
     assert env["KESTREL_DEMO_SEED_DID"] == "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
-    assert env["KESTREL_DEMO_SEED_DATABASE"] == "/var/run/kestrel-demo-seed/kestrel_prime.db.xz"
-    assert profile["secrets"]["KESTREL_IDENTITY_BUNDLE"] == "kestrel-dev-a2a-identity-bundle:2"
-    assert profile["secrets"]["KESTREL_DATA_KEY"] == "kestrel-dev-a2a-data-key:1"
+    assert profile["secret_files"] == {
+        env["KESTREL_DEMO_SEED_DATABASE"]: "kestrel-dev-a2a-db-seed:1",
+        env["KESTREL_DEMO_SEED_BUNDLE"]: "kestrel-dev-a2a-identity-bundle:2",
+        env["KESTREL_DATA_KEY_FILE"]: "kestrel-dev-a2a-data-key:1",
+    }
+    assert "KESTREL_IDENTITY_BUNDLE" not in profile["secrets"]
+    assert "KESTREL_DATA_KEY" not in profile["secrets"]
+    assert env["KESTREL_AGENTS"] == "kestrel-demo,kestrel-a2a-peer"
     assert config.push is None
 
 

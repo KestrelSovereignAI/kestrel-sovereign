@@ -148,6 +148,7 @@ class DeployManagerCore:
                     dockerfile=data.get("dockerfile", default_dockerfile),
                     env_vars=expanded_env,
                     secrets=expanded_secrets,
+                    secret_files=self._expand_env_vars(data.get("secret_files", {})),
                     gcp_project_id=data.get("gcp_project_id") or self.gcp_project_id,
                     azure_resource_group=data.get("azure_resource_group"),
                 )

@@ -28,6 +28,34 @@ from kestrel_sovereign.features.deploy.providers.cloudrun import (
 )
 
 
+def test_pinned_secret_files_are_created_and_reconciled(deployment_profile):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import Container, ContainerPort, Volume, VolumeMount
+
+    mount_path = "/var/run/demo/seed"
+    profile = replace(deployment_profile, secret_files={mount_path: "demo-seed:2"})
+    service = Service()
+    container = Container(image="demo", ports=[ContainerPort(container_port=8080)])
+    _apply_managed_template(service, container, profile)
+    volume, = service.template.volumes
+    mount, = service.template.containers[0].volume_mounts
+    assert volume.name == mount.name
+    assert mount.mount_path == "/var/run/demo"
+    assert volume.secret.secret == "demo-seed"
+    item, = volume.secret.items
+    assert (item.version, item.path) == ("2", "seed")
+    service.template.volumes.append(Volume(name="other"))
+    service.template.containers[0].volume_mounts.append(VolumeMount(name="other", mount_path="/separate"))
+
+    _apply_managed_template(service, container, deployment_profile)
+    assert [volume.name for volume in service.template.volumes] == ["other"]
+    assert [mount.name for mount in service.template.containers[0].volume_mounts] == ["other"]
+    with pytest.raises(DeployManagerError, match="pinned version"):
+        _apply_managed_template(
+            service, container, replace(profile, secret_files={mount_path: "demo-seed:latest"}),
+        )
+
+
 @pytest.fixture
 def mock_services_client():
     """Mock google-cloud-run ServicesClient."""

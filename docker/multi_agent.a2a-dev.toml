@@ -1,0 +1,15 @@
+[host]
+port = 8080
+bind = "0.0.0.0"
+
+[agents.kestrel-demo]
+data_dir = "/app/agent_data/kestrel-demo"
+port = 8801
+autostart = true
+features = ["BootstrapFeature", "MemoryFeature"]
+
+[agents.kestrel-a2a-peer]
+data_dir = "/app/agent_data/kestrel-a2a-peer"
+port = 8802
+autostart = true
+features = ["BootstrapFeature", "MemoryFeature"]

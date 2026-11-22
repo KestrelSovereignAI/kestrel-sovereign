@@ -10,17 +10,21 @@ import sqlite3
 import tempfile
 from contextlib import closing
 from pathlib import Path
+from uuid import uuid4
 
 from kestrel_sovereign.identity.custody_bundle import (
     IdentityCustodyError,
-    restore_identity_bundle_from_env,
+    restore_identity_bundle,
 )
+from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
+from kestrel_sovereign.security.path_identity import paths_overlap_by_filesystem_identity
 
 MAX_DATABASE_BYTES = 8 * 1024 * 1024
 
 
-def restore_demo_seed(agent_dir: Path, source: Path, *, expected_did: str) -> None:
+def restore_demo_seed(agent_dir: Path, source: Path, bundle: bytes, *, expected_did: str) -> None:
     """Verify both pinned inputs before admitting a demo to the startup roster."""
+    agent_dir = agent_dir.absolute()
     if agent_dir.is_symlink() or (
         agent_dir.exists()
         and any(
@@ -33,7 +37,7 @@ def restore_demo_seed(agent_dir: Path, source: Path, *, expected_did: str) -> No
     agent_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".demo-restore-", dir=agent_dir.parent) as temp:
         staged_agent = Path(temp) / "agent"
-        restore_identity_bundle_from_env(staged_agent, expected_did=expected_did)
+        restore_identity_bundle(bundle, staged_agent, expected_did=expected_did)
 
         database = staged_agent / "kestrel_prime.db"
         with lzma.open(source, "rb") as compressed:
@@ -73,11 +77,31 @@ def restore_demo_seed(agent_dir: Path, source: Path, *, expected_did: str) -> No
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent-dir", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--agent-data-dir", type=Path, required=True)
+    parser.add_argument("--host-control-dir", type=Path, required=True)
+    parser.add_argument("--registration", required=True)
     parser.add_argument("--database-seed", type=Path, required=True)
+    parser.add_argument("--bundle-seed", type=Path, required=True)
     parser.add_argument("--expected-did", required=True)
     args = parser.parse_args()
-    restore_demo_seed(args.agent_dir, args.database_seed, expected_did=args.expected_did)
+    config = MultiAgentConfig.load(
+        args.config, auto_discover_fallback=False, runtime_base=Path.cwd()
+    )
+    registration = config.agents.get(args.registration)
+    expected_dir = args.agent_data_dir / args.registration
+    if (
+        not isinstance(registration, LocalAgentConfig)
+        or not registration.autostart
+        or registration.resolve_data_dir(Path.cwd()) != expected_dir
+        or paths_overlap_by_filesystem_identity(args.host_control_dir, expected_dir)
+    ):
+        raise IdentityCustodyError("Demo seed must bind to the configured discovery registration's data directory")
+    restore_demo_seed(
+        expected_dir, args.database_seed, args.bundle_seed.read_bytes(),
+        expected_did=args.expected_did,
+    )
+    print("demo-" + uuid4().hex)
 
 
 if __name__ == "__main__":

@@ -3290,7 +3290,10 @@ class KestrelAgent(
         # Native admission and context ownership share the primary connection.
         # AsyncStorage owns this backend; every A2A store borrows it so partial
         # boot rollback cannot retire storage still held by other services.
-        scope = NativeRecipientScope(self.did)
+        tenant = os.environ.get("KESTREL_A2A_EPHEMERAL_TENANT")
+        if tenant is not None and os.environ.get("KESTREL_DEPLOYMENT_PERSISTENCE") != "ephemeral_demo":
+            raise ValueError("An ephemeral A2A tenant requires ephemeral_demo persistence")
+        scope = NativeRecipientScope(self.did) if tenant is None else NativeRecipientScope(self.did, tenant)
         await self._initialize_tool_effect_store()
         self.task_manager = TaskManager.from_backend(
             self._raw_storage._backend,

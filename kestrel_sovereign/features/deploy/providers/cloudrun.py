@@ -5,9 +5,11 @@ Implements deployment to Google Cloud Run using the google-cloud-run SDK.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 from dataclasses import replace
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from ..models import DeployManagerError, DeploymentProfile
@@ -52,10 +54,43 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
         current.resources.limits.update(container.resources.limits)
     else:
         service.template.containers = [container]
+    _apply_secret_files(service, profile.secret_files)
     service.template.scaling.min_instance_count = profile.min_instances
     service.template.scaling.max_instance_count = profile.max_instances
     service.template.timeout = f"{profile.timeout}s"
     service.template.max_instance_request_concurrency = profile.concurrency
+
+
+def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
+    from google.cloud.run_v2.types import SecretVolumeSource, VersionToPath, Volume, VolumeMount
+
+    prefix = "kestrel-secret-file-"
+    container = service.template.containers[0]
+    volumes = [volume for volume in service.template.volumes if not volume.name.startswith(prefix)]
+    mounts = [mount for mount in container.volume_mounts if not mount.name.startswith(prefix)]
+    directories = {mount.mount_path for mount in mounts}
+    for filename, reference in sorted(files.items()):
+        path = PurePosixPath(filename)
+        secret, _, version = reference.rpartition(":")
+        if (
+            not path.is_absolute() or ".." in path.parts or len(path.parts) < 3
+            or not secret or not version.isascii() or not version.isdecimal() or int(version) < 1
+        ):
+            raise DeployManagerError("Cloud Run secret files require an absolute file path and a pinned version")
+        directory = str(path.parent)
+        if directory in directories:
+            raise DeployManagerError("Cloud Run secret file mount overlaps another volume")
+        directories.add(directory)
+        name = prefix + hashlib.sha256(directory.encode()).hexdigest()[:16]
+        volumes.append(Volume(
+            name=name,
+            secret=SecretVolumeSource(
+                secret=secret, items=[VersionToPath(version=version, path=path.name)],
+            ),
+        ))
+        mounts.append(VolumeMount(name=name, mount_path=directory))
+    service.template.volumes = volumes
+    container.volume_mounts = mounts
 
 
 class CloudRunProvider(DeployProvider):
