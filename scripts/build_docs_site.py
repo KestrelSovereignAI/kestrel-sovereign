@@ -43,19 +43,19 @@ from docs_verify import render_channel  # noqa: E402
 DEFAULT_SITE_ROOT = PROJECT_ROOT / "site"
 GITHUB_REPO_URL = "https://github.com/KestrelSovereignAI/kestrel-sovereign"
 CONSTITUTION_RELEASE_TAG = "constitution-v2.0.0"
-CONSTITUTION_RELEASE_SOURCE = (
-    PROJECT_ROOT / "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md"
-)
+CONSTITUTION_RELEASE_PATH = Path("kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md")
 CONSTITUTION_RELEASE_PAGE = "docs/principles/KESTREL_CONSTITUTION_V2.md"
 CONSTITUTION_RELEASE_URL = (
     f"{GITHUB_REPO_URL}/blob/{CONSTITUTION_RELEASE_TAG}/"
-    f"{CONSTITUTION_RELEASE_SOURCE.relative_to(PROJECT_ROOT).as_posix()}"
+    f"{CONSTITUTION_RELEASE_PATH.as_posix()}"
 )
 
 # Reader context belongs to the projection, never to signed or historical bytes.
 CONSTITUTION_READER_CONTEXT = {
     CONSTITUTION_RELEASE_PAGE: {
         "source_revision": CONSTITUTION_RELEASE_TAG,
+        "navigation_order": -1,
+        "search_title": True,
         "publication_notice": (
             "info",
             f"This is the published second edition, released as `{CONSTITUTION_RELEASE_TAG}`. "
@@ -127,6 +127,19 @@ GROUP_ORDER = [
 # --------------------------------------------------------------------------- #
 # Selection
 # --------------------------------------------------------------------------- #
+def _is_kestrel_handbook(docs_root: Path) -> bool:
+    """Recognize the corpus by its own index, independently of this script's home."""
+    index = docs_root / "README.md"
+    if not index.is_file():
+        return False
+    doc, error = read_okf_document(index)
+    return bool(
+        not error and doc is not None
+        and doc.frontmatter.get("resource") == "/docs/README.md"
+        and doc.frontmatter.get("title") == "Kestrel Documentation Index"
+    )
+
+
 def select_pages(
     docs_root: Path,
     *,
@@ -142,15 +155,22 @@ def select_pages(
     pages: list[dict[str, Any]] = []
     skipped: list[tuple[str, str]] = []
 
-    sources = [(path, display_path(path)) for path in markdown_files(docs_root)]
+    docs_root = docs_root.resolve()
+    repo_root = docs_root.parent
+    is_handbook = _is_kestrel_handbook(docs_root)
+    sources = [
+        (path, f"docs/{path.relative_to(docs_root).as_posix()}" if is_handbook else display_path(path))
+        for path in markdown_files(docs_root)
+    ]
     # The public release lives outside docs/. Give it a handbook route without
-    # creating a second copy of the governing words or changing custom corpora.
-    if docs_root.resolve() == DEFAULT_DOCS_ROOT.resolve():
-        sources.append((CONSTITUTION_RELEASE_SOURCE, CONSTITUTION_RELEASE_PAGE))
+    # borrowing bytes from this script's checkout or changing custom corpora.
+    release_source = repo_root / CONSTITUTION_RELEASE_PATH
+    if is_handbook:
+        sources.append((release_source, CONSTITUTION_RELEASE_PAGE))
 
     for path, rel in sources:
         doc, error = read_okf_document(path)
-        if path == CONSTITUTION_RELEASE_SOURCE and (error or doc is None):
+        if is_handbook and path == release_source and (error or doc is None):
             raise ValueError(f"Published Constitution has invalid OKF metadata: {error}")
         if error:
             skipped.append((rel, f"frontmatter error: {error}"))
@@ -168,6 +188,7 @@ def select_pages(
         pages.append(
             {
                 "src": path,
+                **({"repo_root": repo_root} if is_handbook else {}),
                 "rel": rel,
                 "type": str(fm.get("type", "")).strip(),
                 "status": str(fm.get("status", "")).strip().lower(),
@@ -176,7 +197,7 @@ def select_pages(
                 "description": fm.get("description", ""),
                 "body": doc.body,
                 "frontmatter": fm,
-                **CONSTITUTION_READER_CONTEXT.get(rel, {}),
+                **(CONSTITUTION_READER_CONTEXT.get(rel, {}) if is_handbook else {}),
             }
         )
 
@@ -325,7 +346,11 @@ def rewrite_local_links(
 
 def _published_map(pages: list[dict[str, Any]]) -> dict[str, str]:
     """Map each published source's actual repo path to its projected site slug."""
-    return {display_path(Path(page["src"])): _site_slug(page["rel"]) for page in pages}
+    return {
+        (Path(page["src"]).relative_to(page["repo_root"]).as_posix()
+         if "repo_root" in page else display_path(Path(page["src"]))): _site_slug(page["rel"])
+        for page in pages
+    }
 
 
 def _grouped(pages: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
@@ -337,7 +362,9 @@ def _grouped(pages: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]
         return (GROUP_ORDER.index(name) if name in GROUP_ORDER else len(GROUP_ORDER), name)
 
     return [
-        (group, sorted(by_group[group], key=lambda p: _site_slug(p["rel"])))
+        (group, sorted(by_group[group], key=lambda p: (
+            p.get("navigation_order", 0), _site_slug(p["rel"])
+        )))
         for group in sorted(by_group, key=group_key)
     ]
 
@@ -354,6 +381,12 @@ class StarlightEmitter:
         lines = ["---", f"title: {_yaml_quote(page['title'])}"]
         if page["description"]:
             lines += [f"description: {_yaml_quote(page['description'])}"]
+        if page.get("search_title"):
+            lines += [
+                "head:", "  - tag: meta", "    attrs:",
+                "      data-pagefind-meta: released_title[content]",
+                f"      content: {_yaml_quote(page['title'])}",
+            ]
         lines += ["---", ""]
 
         banner = page.get("publication_notice") or STATUS_BANNER.get(page["status"])
@@ -374,7 +407,8 @@ class StarlightEmitter:
                 page["body"], src_dir, f"{self.base}/_assets"
             )
             body = rewrite_local_links(
-                body, src_dir, base=self.base, published=published, repo_root=PROJECT_ROOT,
+                body, src_dir, base=self.base, published=published,
+                repo_root=page.get("repo_root", PROJECT_ROOT),
                 revision=page.get("source_revision", DEFAULT_BRANCH),
             )
             files[f"src/content/docs/{_site_slug(page['rel'])}.md"] = self.render_page(page, body)
@@ -385,6 +419,8 @@ class StarlightEmitter:
         files["src/content/docs/index.md"] = self._landing(pages)
         files["astro.config.mjs"] = self._astro_config(pages)
         files["src/content.config.ts"] = _STARLIGHT_CONTENT_CONFIG
+        files["src/pagefind-ui.js"] = _STARLIGHT_SEARCH_UI
+        files["src/search-ranking.js"] = _STARLIGHT_SEARCH_RANKING
         files["package.json"] = _STARLIGHT_PACKAGE_JSON
         files["tsconfig.json"] = _STARLIGHT_TSCONFIG
         files[".gitignore"] = "node_modules/\ndist/\n.astro/\n"
@@ -454,7 +490,8 @@ class MintlifyEmitter:
             src_dir = Path(page["src"]).parent
             body, assets, _ = rewrite_local_images(page["body"], src_dir, "/_assets")
             body = rewrite_local_links(
-                body, src_dir, base="", published=published, repo_root=PROJECT_ROOT,
+                body, src_dir, base="", published=published,
+                repo_root=page.get("repo_root", PROJECT_ROOT),
                 revision=page.get("source_revision", DEFAULT_BRANCH),
             )
             files[f"{_site_slug(page['rel'])}.mdx"] = self.render_page(page, body)
@@ -488,7 +525,9 @@ _STARLIGHT_PACKAGE_JSON = """{
   },
   "dependencies": {
     "@astrojs/starlight": "^0.30.0",
+    "@pagefind/default-ui": "^1.5.2",
     "astro": "^5.1.0",
+    "pagefind": "^1.5.2",
     "sharp": "^0.33.5"
   }
 }
@@ -508,14 +547,36 @@ export const collections = {
 };
 """
 
+_STARLIGHT_SEARCH_RANKING = """// Prefer the current release title over references in long guides.
+export const searchRanking = { metaWeights: { released_title: 20 } };
+"""
+
+_STARLIGHT_SEARCH_UI = """import { PagefindUI as DefaultUI } from '@pagefind/default-ui/npm_dist/mjs/ui-core.mjs';
+import { searchRanking } from './search-ranking.js';
+
+// Keep Starlight's dialog, accessibility, translations and result rendering.
+export class PagefindUI extends DefaultUI {
+  constructor(options) {
+    super({ ...options, ranking: searchRanking });
+  }
+}
+"""
+
 _STARLIGHT_ASTRO_CONFIG = """// @ts-check
 import {{ defineConfig }} from 'astro/config';
+import {{ fileURLToPath }} from 'node:url';
 import starlight from '@astrojs/starlight';
 
 // Generated by scripts/build_docs_site.py — do not edit by hand.
 export default defineConfig({{
   site: 'https://kestrelsovereignai.github.io',
   base: '{base}',
+  vite: {{
+    resolve: {{ alias: [{{
+      find: /^@pagefind\\/default-ui$/,
+      replacement: fileURLToPath(new URL('./src/pagefind-ui.js', import.meta.url)),
+    }}] }},
+  }},
   integrations: [
     starlight({{
       title: {title},
