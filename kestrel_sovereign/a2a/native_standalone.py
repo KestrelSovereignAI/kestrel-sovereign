@@ -472,18 +472,17 @@ async def prepare_single_agent_native_publication(
 
     environment = dict(environment)
     validate_native_peer_policy(environment, fleet_host=False)
-    configuration = NativeHostingConfiguration.from_environment(environment)
+    configuration = NativeHostingConfiguration.from_environment(environment, fleet_host=False)
     if configuration is None:
         return None
+    routing_key = configuration.discovery_routing_key or resolve_scoped_agent_did(recipient)
     require_execution_work(recipient)
     _configure_single_agent_native_peer_policy(
         recipient, environment,
         router=getattr(recipient, "peer_directory_router", None),
         requester=getattr(recipient, "peer_requester", None),
     )
-    routing_key = configuration.discovery_routing_key
-    if routing_key is None:
-        routing_key = resolve_scoped_agent_did(recipient)
+    if configuration.discovery_routing_key is None:
         configuration = replace(configuration, discovery_routing_key=routing_key)
     owner = SingleAgentNativeAuthority(
         recipient, routing_key, proof_policy=NativeProofPolicy(), clock=clock

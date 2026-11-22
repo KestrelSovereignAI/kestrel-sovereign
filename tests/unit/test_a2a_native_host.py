@@ -145,8 +145,13 @@ async def test_public_card_revalidates_the_exact_recipient_generation(
     from starlette.exceptions import HTTPException
 
     from kestrel_sovereign.a2a.native_routes import native_card_path
+    from kestrel_sovereign.server import health_check, health_detailed
 
     p = publication
+    p.app.state.agent_manager = p.host
+    p.app.state.required_a2a_card_keys = frozenset({"registered-agent"})
+    p.app.add_api_route("/health", health_check)
+    p.app.add_api_route("/health/detailed", health_detailed)
     async with p.host.a2a_lifecycle_lease():
         p.host._register_agent("registered-agent", p.recipient)
     paths = (native_card_path("registered-agent"), "/.well-known/agent-card.json")
@@ -155,6 +160,7 @@ async def test_public_card_revalidates_the_exact_recipient_generation(
     ) as http:
         original = [await http.get(path) for path in paths]
         assert all(response.status_code == 200 for response in original)
+        assert (await http.get("/health")).status_code == 200
         async with p.host.a2a_lifecycle_lease():
             if fault == "policy":
                 p.host.install_a2a_hosted_policy(
@@ -179,6 +185,12 @@ async def test_public_card_revalidates_the_exact_recipient_generation(
         with pytest.raises(HTTPException) as denied:
             await p.publication.get_card()
         assert denied.value.status_code == 403
+        assert (await http.get("/health")).status_code == 503
+        detail = await http.get("/health/detailed")
+        assert detail.status_code == 503
+        assert detail.json()["missing_a2a_card_registrations"] == ["registered-agent"]
+        if fault != "registration":
+            assert "registered-agent" in detail.json()["agents"]
 
 
 async def test_native_publication_failure_withdraws_manager_registration(publication):
@@ -283,6 +295,120 @@ async def test_native_preparation_refuses_registry_from_another_app(publication)
             {"KESTREL_BASE_URL": "https://native.test"},
         )
     assert other_app.routes == publication.app.routes == []
+
+
+@pytest.mark.parametrize("changed", ["signing DID", "signing keys", "tenant", "database", None])
+@pytest.mark.parametrize("native_a2a_backend_factory", ["sqlite"], indirect=True)
+async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
+    publication, tmp_path, changed,
+):
+    import httpx
+    import json
+    import time
+    from pathlib import Path
+    from uuid import uuid4
+
+    from google.protobuf.json_format import MessageToDict
+
+    from kestrel_sovereign.a2a.native_card import REQUIRED_NATIVE_EXTENSIONS
+    from kestrel_sovereign.a2a.native_publication import prepare_hosted_native_publication
+    from kestrel_sovereign.a2a.native_sender import SENDER_PROOF_HEADER, sign_native_request
+    from kestrel_sovereign.identity.demo_seed import DEMO_SEED_STATE_TABLE, demo_signing_key_fingerprint
+    from kestrel_sovereign.server import health_check
+
+    p = publication
+    did = p.recipient.identity.signing_did
+    tenant = p.recipient.task_manager.task_store.scope.tenant
+    configured_tenant = "stale-tenant" if changed == "tenant" else tenant.rsplit("-", 1)[0]
+    database_status = Path(p.backend.db_path).stat()
+    manifest = tmp_path / "demo.seeds.toml"
+    pinned_did = "did:web:public.test:other" if changed == "signing DID" else did
+    fingerprint = demo_signing_key_fingerprint(p.recipient.identity)
+    manifest.write_text(
+        f'[registered-agent]\ndid = "{pinned_did}"\nsigning_key_fingerprint = "{fingerprint}"\n'
+    )
+    if changed != "database":
+        await p.backend.execute(
+            f"CREATE TABLE {DEMO_SEED_STATE_TABLE} (tenant TEXT, signing_keys TEXT)"
+        )
+        await p.backend.execute(
+            f"INSERT INTO {DEMO_SEED_STATE_TABLE} VALUES (?, ?)",
+            (configured_tenant, "different-keys" if changed == "signing keys" else fingerprint),
+        )
+    environment = {
+        "KESTREL_BASE_URL": "https://native.test",
+        "KESTREL_A2A_DISCOVERY_AGENT": "registered-agent",
+        "KESTREL_A2A_PUSH_ENABLED": "false",
+        "KESTREL_A2A_EPHEMERAL_TENANT": configured_tenant,
+        "KESTREL_DEMO_SEED_MANIFEST": str(manifest),
+        "KESTREL_DEMO_DATABASE_IDENTITIES": json.dumps({
+            "registered-agent": [database_status.st_dev, database_status.st_ino],
+        }),
+    }
+    preparation = prepare_hosted_native_publication(
+        p.app, p.host, "registered-agent", p.recipient, environment,
+    )
+    if changed is not None:
+        with pytest.raises(ValueError, match=changed):
+            await preparation
+        assert p.app.routes == []
+        return
+    native = await preparation
+    p.recipient._native_a2a_publication = native
+    try:
+        async with p.host.a2a_lifecycle_lease():
+            p.host._register_agent("registered-agent", p.recipient)
+        card = await native.get_card()
+        assert {interface.tenant for interface in card.supported_interfaces} == {tenant}
+        p.app.state.agent_manager = p.host
+        p.app.add_api_route("/health", health_check)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(p.app), base_url="https://native.test",
+        ) as http:
+            p.app.state.required_a2a_card_keys = frozenset({"registered-agent", "missing-peer"})
+            assert (await http.get("/health")).status_code == 503
+            p.app.state.required_a2a_card_keys = frozenset({"registered-agent"})
+            assert (await http.get("/health")).status_code == 200
+            await p.backend.execute(f"DELETE FROM {DEMO_SEED_STATE_TABLE}")
+            assert (await http.get("/.well-known/agent-card.json")).status_code == 503
+            assert (await http.get("/health")).status_code == 503
+            send_request = SendMessageRequest(
+                tenant=tenant, message=new_text_message("Seed marker was withdrawn", role=Role.ROLE_USER),
+            )
+            rpc = next(
+                interface.url for interface in card.supported_interfaces
+                if interface.protocol_binding == "JSONRPC"
+            )
+            for operation in ("SendMessage", "SendStreamingMessage"):
+                nonce, timestamp = uuid4().hex, int(time.time())
+                proof = sign_native_request(
+                    p.signing[0], send_request, sender=SENDER, recipient=p.scope.recipient_id,
+                    operation=operation, timestamp=timestamp, nonce=nonce,
+                    extensions=REQUIRED_NATIVE_EXTENSIONS, classical_kid="key-1", pq_kid="key-2",
+                    policy=p.guard.proof_policy,
+                )
+                headers = {
+                    "Accept": "application/json, text/event-stream",
+                    "A2A-Version": "1.0",
+                    "A2A-Extensions": ",".join(sorted(REQUIRED_NATIVE_EXTENSIONS)),
+                }
+                body = {
+                    "jsonrpc": "2.0", "id": 1, "method": operation,
+                    "params": MessageToDict(send_request),
+                }
+                malformed = await http.post(
+                    rpc, headers={**headers, SENDER_PROOF_HEADER: "malformed"}, json=body,
+                )
+                assert "A2A sender proof was not accepted" in malformed.text
+                response = await http.post(
+                    rpc, headers={**headers, SENDER_PROOF_HEADER: proof}, json=body,
+                )
+                assert "Seeded demo database unavailable" in response.text
+                assert await p.guard.replay_store.reserve(SENDER, nonce, now_ts=timestamp, ttl_seconds=300)
+            assert await p.recipient.task_manager.list_tasks(recipient_agent_id=p.scope.recipient_id) == []
+    finally:
+        async with p.host.a2a_lifecycle_lease():
+            native.withdraw()
 
 
 async def test_policy_revocation_precedes_route_cleanup_failure(publication):
@@ -511,15 +637,23 @@ async def test_hosted_native_guard_uses_actual_directory_and_stable_principal(
 
 
 @pytest.mark.parametrize(
-    "fault", ["policy", "recipient", "recipient-identity", "task-manager", "task-store"]
+    "fault, seeded",
+    [("policy", False), ("recipient", False), ("recipient-identity", False),
+     ("task-manager", False), ("task-store", False), ("task-manager", True)],
 )
 async def test_retired_host_generation_never_admits_or_revalidates_a_request(
-    hosted, fault
+    hosted, fault, seeded,
 ):
     from starlette.exceptions import HTTPException
 
     params = send(hosted)
-    async with hosted.guard.admit(
+    guard = hosted.guard
+    if seeded:
+        async def check_recipient_custody():
+            await hosted.recipient.task_manager.task_store.backend.fetch_one("SELECT 1")
+
+        guard = replace(guard, check_recipient_custody=check_recipient_custody)
+    async with guard.admit(
         params, "SendMessage", signed_context(hosted, params)
     ) as admitted:
         pass
@@ -549,11 +683,11 @@ async def test_retired_host_generation_never_admits_or_revalidates_a_request(
                 hosted.backend, scope=hosted.scope, owns_backend=False
             )
     with pytest.raises(HTTPException) as denied:
-        async with hosted.guard.hold_authority(admitted):
+        async with guard.hold_authority(admitted):
             pytest.fail("An old request retained a retired host generation")
     assert denied.value.status_code == 403
     with pytest.raises(HTTPException) as denied:
-        async with hosted.guard.admit(
+        async with guard.admit(
             params, "SendMessage", signed_context(hosted, params)
         ):
             pytest.fail("A retired host generation admitted a new request")
@@ -862,11 +996,12 @@ async def test_host_primary_service_constructor_refusal_retires_actual_storage(
         await backend.close()
 
 
-@pytest.mark.parametrize("broken_session_schema", [False, True])
+@pytest.mark.parametrize("broken_session_schema, ephemeral", [(True, False), (False, False), (False, True)])
 async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
     native_a2a_backend_factory,
     tmp_path,
     broken_session_schema,
+    ephemeral,
     monkeypatch,
 ):
     # Imports happen after the suite has isolated every runtime/config path.
@@ -881,6 +1016,9 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
     # Real service construction must not discover cloud instance credentials
     # during this offline native storage/signal test.
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    if ephemeral:
+        monkeypatch.setenv("KESTREL_A2A_EPHEMERAL_TENANT", "demo-boot")
+        monkeypatch.setenv("KESTREL_DEPLOYMENT_PERSISTENCE", "ephemeral_demo")
     services = AsyncExitStack()
     ctx = None
     try:
@@ -912,7 +1050,12 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         else:
             await agent._boot_phase_a2a_observability_signals(ctx)
             manager = agent.task_manager
-            assert manager.task_store.scope == NativeRecipientScope(agent.did)
+            if ephemeral:
+                scope = manager.task_store.scope
+                assert scope.recipient_id == agent.did and scope.tenant.startswith("demo-boot-")
+                assert scope != NativeRecipientScope.for_ephemeral_activation(agent.did, "demo-boot")
+            else:
+                assert manager.task_store.scope == NativeRecipientScope(agent.did)
             assert (
                 manager.context_store.backend is manager.task_store.backend is backend
             )
@@ -957,6 +1100,13 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         assert agent.task_manager is None
         assert backend.is_connected
         assert await backend.fetch_one("SELECT 1") == (1,)
+        if ephemeral:
+            ctx = BootContext(custody=agent._custody)
+            await agent._boot_phase_a2a_observability_signals(ctx)
+            assert agent.task_manager.task_store.scope.tenant.startswith("demo-boot-")
+            assert agent.task_manager.task_store.scope != scope
+            await ctx.run_rollback()
+            assert not ctx.rollback_errors
     finally:
         try:
             if ctx is not None:

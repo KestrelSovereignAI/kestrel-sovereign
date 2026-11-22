@@ -234,7 +234,10 @@ def multibase_to_public_key(multibase_str: str):
     )
 
     for suite in _REGISTRY.values():
-        if getattr(suite, "public_key_multicodec", b"") == codec_bytes:
+        if (
+            suite.public_key_multicodec == codec_bytes
+            or codec_bytes in suite.legacy_public_key_multicodecs
+        ):
             return suite, suite.deserialize_public_key_from_multikey(pub_bytes)
 
     raise CryptoSuiteError(

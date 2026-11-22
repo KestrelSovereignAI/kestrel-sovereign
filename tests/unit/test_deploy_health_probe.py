@@ -3,6 +3,7 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from kestrel_sovereign.features.deploy.core import DeployManagerCore
@@ -40,7 +41,7 @@ def test_build_health_url_normalizes_boundary_slashes(
 async def test_probe_classifies_status_and_uses_monotonic_elapsed_time(
     status_code: int, healthy: bool
 ) -> None:
-    response = MagicMock(status_code=status_code)
+    response = httpx.Response(status_code)
 
     with (
         patch("httpx.AsyncClient") as client_class,

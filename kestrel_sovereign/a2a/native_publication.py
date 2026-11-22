@@ -1,17 +1,20 @@
 """Host-owned publication of one current recipient's signed native contract."""
 
+import json
 import os
 import time
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
 from kestrel_sdk.native_a2a.client import A2ACardResolver
 from kestrel_sdk.native_a2a.types import AgentCard
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
@@ -64,6 +67,23 @@ def host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
     return environment.get(PUBLIC_BASE_URL_ENV) is not None
 
 
+def validate_native_fleet_options(environment: Mapping[str, str], *, fleet_host: bool) -> None:
+    """Keep co-hosted publication and seed lifetime settings at their host boundary."""
+    if "KESTREL_DEMO_SEED_DATA_KEY_FILE" in environment or (
+        "KESTREL_DEMO_SEED_ROSTER_TEMPLATE" in environment
+        and "KESTREL_DEMO_SEED_MANIFEST" not in environment
+    ):
+        raise ValueError("Complete demo seed bootstrap before serving the fleet")
+    if not fleet_host:
+        for option in (
+            "KESTREL_A2A_EPHEMERAL_TENANT",
+            "KESTREL_DEMO_SEED_MANIFEST",
+            "KESTREL_DEMO_DATABASE_IDENTITIES",
+        ):
+            if option in environment:
+                raise ValueError(f"{option} requires a co-hosted agent fleet")
+
+
 def unpublished_cohost_warning(
     environment: Mapping[str, str], *, agents: int, host_port: int
 ) -> str | None:
@@ -98,12 +118,21 @@ def unpublished_peer_detail(environment: Mapping[str, str]) -> str:
 
 
 @dataclass(frozen=True)
+class SeededNativeRegistration:
+    signing_did: str
+    signing_key_fingerprint: str
+    database_identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class NativeHostingConfiguration:
     """No public URL or discovery recipient is inferred from an incoming request."""
 
     public_base_url: str
     discovery_routing_key: str | None = None
     push: NativePushPolicy | None = None
+    seeded_registrations: Mapping[str, SeededNativeRegistration] | None = None
+    ephemeral_tenant: str | None = None
 
     def __post_init__(self):
         if self.push is not None and not isinstance(self.push, NativePushPolicy):
@@ -115,17 +144,58 @@ class NativeHostingConfiguration:
         )
         if self.discovery_routing_key is not None:
             encode_agent_route_name(self.discovery_routing_key)
+        if self.seeded_registrations is not None:
+            if self.discovery_routing_key not in self.seeded_registrations:
+                raise ValueError("The A2A discovery registration must have a pinned demo seed")
+            for routing_key in self.seeded_registrations:
+                encode_agent_route_name(routing_key)
+
+    def publishes(self, routing_key: str) -> bool:
+        return self.seeded_registrations is None or routing_key in self.seeded_registrations
 
     @classmethod
-    def from_environment(cls, environment: Mapping[str, str]):
+    def from_environment(
+        cls, environment: Mapping[str, str], *, fleet_host: bool = True,
+    ):
         """Unconfigured hosts run operator APIs without public peer discovery."""
+        validate_native_fleet_options(environment, fleet_host=fleet_host)
         base = environment.get(PUBLIC_BASE_URL_ENV)
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
+        manifest = environment.get("KESTREL_DEMO_SEED_MANIFEST")
+        tenant = environment.get("KESTREL_A2A_EPHEMERAL_TENANT")
+        database_evidence = environment.get("KESTREL_DEMO_DATABASE_IDENTITIES")
+        seed_configuration = (manifest, tenant, database_evidence)
+        if any(value is not None for value in seed_configuration) and not all(seed_configuration):
+            raise ValueError("Pinned demo publication requires a seed manifest, tenant and installed databases")
         if not host_publishes_native_a2a(environment):
-            if discovery is not None:
+            if discovery is not None or manifest is not None:
                 raise ValueError(f"A2A discovery requires {PUBLIC_BASE_URL_ENV}")
             return None
-        return cls(base, discovery, NativePushPolicy.from_environment(environment))
+        seeded_registrations = None
+        if manifest is not None:
+            from kestrel_sovereign.identity.demo_seed import read_demo_seed_manifest
+
+            seeds = read_demo_seed_manifest(Path(manifest))
+            decoded = json.loads(database_evidence)
+            if not isinstance(decoded, dict) or any(
+                not isinstance(value, list) or len(value) != 2
+                or any(type(number) is not int or number < 0 for number in value)
+                for value in decoded.values()
+            ):
+                raise ValueError("Seeded demo database identities have an invalid format")
+            if seeds.keys() != decoded.keys():
+                raise ValueError("Each seeded publication requires its installed database identity")
+            seeded_registrations = {
+                name: SeededNativeRegistration(
+                    seed["did"], seed["signing_key_fingerprint"],
+                    (decoded[name][0], decoded[name][1]),
+                )
+                for name, seed in seeds.items()
+            }
+        return cls(
+            base, discovery, NativePushPolicy.from_environment(environment),
+            seeded_registrations=seeded_registrations, ephemeral_tenant=tenant,
+        )
 
 
 class NativeA2APublication:
@@ -154,6 +224,10 @@ class NativeA2APublication:
         self.routing_key = routing_key
         self.configuration = configuration
         self._profile = profile
+        self._seeded_registration = (
+            configuration.seeded_registrations[routing_key]
+            if configuration.seeded_registrations is not None else None
+        )
         self._binding: NativeA2AHTTP | None = None
         self._guard = None
         self._push_service = None
@@ -171,6 +245,7 @@ class NativeA2APublication:
             profile,
             guard_factory=guard_factory,
         )
+        await publication._verify_seeded_database()
         # Bad configuration, keys or skills refuse private onboarding, before
         # AgentManager installs any routing entry for this candidate.
         publication._build_card(profile, preparing=True)
@@ -200,6 +275,17 @@ class NativeA2APublication:
     def _build_card(
         self, profile: dict[str, str], *, preparing: bool = False
     ) -> AgentCard:
+        identity = self.recipient.identity
+        scope = self.recipient.task_manager.task_store.scope
+        if self._seeded_registration is not None:
+            from kestrel_sovereign.identity.demo_seed import demo_signing_key_fingerprint
+
+            if getattr(identity, "signing_did", None) != self._seeded_registration.signing_did:
+                raise ValueError("A seeded demo must publish with its pinned signing DID")
+            if demo_signing_key_fingerprint(identity) != self._seeded_registration.signing_key_fingerprint:
+                raise ValueError("A seeded demo must publish with its pinned signing keys")
+            if not scope.tenant.startswith(f"{self.configuration.ephemeral_tenant}-"):
+                raise ValueError("A seeded demo must publish within its current boot tenant")
         service = self.recipient.task_manager.push_service
         if service is not None:
             service.require_ready()
@@ -212,8 +298,8 @@ class NativeA2APublication:
                 "Published push configuration differs from its bound service"
             )
         return create_native_agent_card(
-            identity=self.recipient.identity,
-            scope=self.recipient.task_manager.task_store.scope,
+            identity=identity,
+            scope=scope,
             routing_key=self.routing_key,
             public_base_url=self.configuration.public_base_url,
             name=self.recipient.resolve_effective_name(default=profile["name"]),
@@ -233,6 +319,8 @@ class NativeA2APublication:
         guard = self._guard_factory()
         if not isinstance(guard, NativeDIDRequestGuard):
             raise TypeError("Native publication requires its canonical request guard")
+        if self._seeded_registration is not None:
+            guard = replace(guard, check_recipient_custody=self._seeded_database_refusal)
         card = self._build_card(self._profile)
         binding = NativeA2AHTTP(
             NativeA2ARequestHandler(
@@ -294,6 +382,27 @@ class NativeA2APublication:
             require_binding=require_binding, buffer_bytes=buffer_bytes,
         )
 
+    async def _verify_seeded_database(self) -> None:
+        if self._seeded_registration is None:
+            return
+        from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
+
+        fingerprint = await read_seeded_signing_key_fingerprint(
+            self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
+            database_identity=self._seeded_registration.database_identity,
+        )
+        if fingerprint != self._seeded_registration.signing_key_fingerprint:
+            raise ValueError("A seeded demo requires its pinned signing keys")
+
+    async def _seeded_database_refusal(self) -> StreamRefusal | None:
+        try:
+            await self._verify_seeded_database()
+        except ValueError as error:
+            refusal = HTTPException(status_code=503, detail="Seeded demo database unavailable")
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
+        return None
+
     async def get_card(self, _base: AgentCard | None = None) -> AgentCard:
         """Refresh public display/skills under the same live identity/policy lease."""
         if self._guard is None or self._binding is None:
@@ -307,6 +416,7 @@ class NativeA2APublication:
                 )
             authority = self._guard.authority_factory()
             authority.require_current(None)
+            await self._guard.require_recipient_custody()
             profile = await self.recipient.get_public_profile()
             card = self._build_card(profile)
             authority.require_current(None)
@@ -337,7 +447,7 @@ async def prepare_hosted_native_publication(
 
     validate_native_peer_policy(environment, fleet_host=True)
     configuration = NativeHostingConfiguration.from_environment(environment)
-    if configuration is None:
+    if configuration is None or not configuration.publishes(routing_key):
         return None
     registry = native_publication_registry(app)
     return await NativeA2APublication.prepare(

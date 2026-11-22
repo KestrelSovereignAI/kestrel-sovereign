@@ -128,6 +128,8 @@ class AzureContainerProvider(DeployProvider):
         secrets: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Deploy to Azure Container Apps."""
+        if profile.secret_files:
+            raise DeployManagerError("secret_files is supported only on Cloud Run")
         try:
             from azure.core.exceptions import ResourceNotFoundError
             from azure.mgmt.appcontainers.models import (

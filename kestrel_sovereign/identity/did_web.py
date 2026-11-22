@@ -282,9 +282,17 @@ def build_did_document(
 
 
 def parse_did_document(doc: dict) -> List[Tuple[str, CryptoSuite, Any]]:
-    """Extract every Multikey verification method.
+    """Return the signing key ID, suite and public key for each Multikey."""
+    return [
+        (method["id"], suite, key)
+        for method, suite, key in parse_signing_verification_methods(doc)
+    ]
 
-    Returns a list of ``(kid, suite, public_key)`` triples. Non-Multikey
+
+def parse_signing_verification_methods(doc: dict) -> List[Tuple[dict, CryptoSuite, Any]]:
+    """Decode signing Multikeys while retaining the original published methods.
+
+    Non-Multikey
     methods are ignored — DID documents may legitimately carry multiple
     types and we don't want to break on unknown ones. Methods with an
     unknown multicodec raise :class:`DidWebError` (vs. silent skip)
@@ -296,7 +304,7 @@ def parse_did_document(doc: dict) -> List[Tuple[str, CryptoSuite, Any]]:
             f"verificationMethod must be a list; got {type(methods).__name__}"
         )
 
-    out: List[Tuple[str, CryptoSuite, Any]] = []
+    out: List[Tuple[dict, CryptoSuite, Any]] = []
     for i, m in enumerate(methods):
         if not isinstance(m, dict):
             raise DidWebError(f"verificationMethod[{i}] is not an object")
@@ -328,7 +336,7 @@ def parse_did_document(doc: dict) -> List[Tuple[str, CryptoSuite, Any]]:
                     f"verificationMethod[{i}] (id={kid!r}): {e}"
                 ) from e
             continue
-        out.append((kid, suite, pub))
+        out.append((m, suite, pub))
     return out
 
 

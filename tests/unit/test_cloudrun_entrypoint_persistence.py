@@ -41,7 +41,7 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
     script = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text()
 
     control_dir = script.index('HOST_CONTROL_DIR="$(dirname -- ')
-    agent_loop = script.index('for dir in "$AGENT_DATA_DIR"/*/')
+    agent_loop = script.index('for dir in "${bootstrap_agent_dirs[@]}"; do')
     resolver = script.index(
         'resolved_dir="$(canonicalize_path "$dir")"',
         agent_loop,
@@ -50,9 +50,8 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
         'if paths_overlap "$HOST_CONTROL_DIR" "$resolved_dir"; then',
         resolver,
     )
-    collision = script.index('[ -f "$dir/kestrel_prime.db" ]', exclusion)
-    refusal = script.index("collides with existing agent directory", collision)
-    skip = script.index("continue", refusal)
+    collision = script.index('refuse_host_control_agent_collision "$resolved_dir"', exclusion)
+    skip = script.index("continue", collision)
     inception = script.index("create_kestrel_identity", agent_loop)
 
     assert (
@@ -61,7 +60,6 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
         < resolver
         < exclusion
         < collision
-        < refusal
         < skip
         < inception
     )

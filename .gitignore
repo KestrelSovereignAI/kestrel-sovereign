@@ -115,6 +115,7 @@ generated_images/
 logs/
 feedback/
 *.db
+**/*.db.xz
 *.db-wal
 *.db-shm
 *.db-journal

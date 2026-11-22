@@ -129,6 +129,7 @@ class DeploymentProfile:
     # Provider-specific fields
     gcp_project_id: Optional[str] = None
     azure_resource_group: Optional[str] = None
+    secret_files: Dict[str, str] = field(default_factory=dict)
 
     @property
     def is_scale_to_zero(self) -> bool:

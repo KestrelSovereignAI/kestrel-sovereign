@@ -60,6 +60,7 @@ llm_config.toml.*
 
 # Ignore local databases
 *.db
+**/*.db.xz
 *.db-shm
 *.db-wal
 *.sqlite

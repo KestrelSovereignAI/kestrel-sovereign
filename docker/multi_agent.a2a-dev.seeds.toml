@@ -1,0 +1,14 @@
+[kestrel-demo]
+did = "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
+database = "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz"
+database_sha256 = "a9d6532b21762037eee005e84f307b082bdd0d52d7a37934578d77763c3a8366"
+identity = "/var/run/kestrel-demo-seed/identity/identity.json"
+signing_key_fingerprint = "7dd0aef374aba1f363867fb36b22946d506fdfd344aa3d507e3417c1265e6f1e"
+
+[kestrel-a2a-peer]
+did = "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a-peer"
+database = "/var/run/kestrel-demo-seed/peer-state/kestrel_prime.db.xz"
+database_sha256 = "a85616d673b8fb4ed4a2843e2b8cf8710a725629485ae9fcbaf154a62861afb7"
+identity = "/var/run/kestrel-demo-seed/peer-identity/identity.json"
+signing_key_fingerprint = "f4b53c66cac1e1e9b3ac4f23304005ba1bc71537b778e13e944994303185b7b6"
+soul = "/app/docker/a2a-dev-peer.SOUL.md"

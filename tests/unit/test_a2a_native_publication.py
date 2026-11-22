@@ -42,6 +42,34 @@ def test_public_discovery_recipient_is_an_explicit_registration_key():
     )
 
 
+def test_host_publication_can_select_only_the_demo_registrations(tmp_path):
+    manifest = tmp_path / "demo.seeds.toml"
+    manifest.write_text(
+        '[kestrel-demo]\ndid = "did:web:host.test:demo"\nsigning_key_fingerprint = "primary"\n'
+        '[kestrel-a2a-peer]\ndid = "did:web:host.test:peer"\nsigning_key_fingerprint = "peer"\n'
+    )
+    configuration = NativeHostingConfiguration.from_environment({
+        "KESTREL_BASE_URL": "https://host.test",
+        "KESTREL_A2A_DISCOVERY_AGENT": "kestrel-demo",
+        "KESTREL_A2A_EPHEMERAL_TENANT": "demo-tenant",
+        "KESTREL_DEMO_SEED_MANIFEST": str(manifest),
+        "KESTREL_DEMO_DATABASE_IDENTITIES": '{"kestrel-demo":[1,2],"kestrel-a2a-peer":[1,3]}',
+    })
+    assert configuration.publishes("kestrel-demo")
+    assert configuration.publishes("kestrel-a2a-peer")
+    assert not configuration.publishes("Kestrel")
+
+
+@pytest.mark.parametrize("option", ["KESTREL_DEMO_SEED_DATA_KEY_FILE", "KESTREL_DEMO_SEED_ROSTER_TEMPLATE"])
+def test_seeded_deployment_must_run_bootstrap_before_publication(option):
+    with pytest.raises(ValueError, match="Complete demo seed bootstrap"):
+        NativeHostingConfiguration.from_environment({
+            "KESTREL_BASE_URL": "https://public.test",
+            "KESTREL_A2A_DISCOVERY_AGENT": "demo",
+            option: "mounted-seed-input",
+        })
+
+
 @pytest.mark.parametrize(
     "environment",
     [
@@ -51,6 +79,8 @@ def test_public_discovery_recipient_is_an_explicit_registration_key():
         {"KESTREL_BASE_URL": "https://host.test#fragment"},
         {"KESTREL_BASE_URL": "https://host.test?token=secret"},
         {"KESTREL_BASE_URL": "https://host.test", "KESTREL_A2A_DISCOVERY_AGENT": ""},
+        {"KESTREL_BASE_URL": "https://host.test", "KESTREL_A2A_EPHEMERAL_TENANT": "demo-tenant"},
+        {"KESTREL_BASE_URL": "https://host.test", "KESTREL_DEMO_SEED_MANIFEST": "demo.seeds.toml"},
     ],
 )
 def test_invalid_discovery_configuration_refuses_publication(environment):

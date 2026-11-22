@@ -28,6 +28,89 @@ from kestrel_sovereign.features.deploy.providers.cloudrun import (
 )
 
 
+def test_pinned_secret_files_are_created_and_reconciled(deployment_profile):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import Container, ContainerPort, Volume, VolumeMount
+
+    mount_path = "/var/run/demo/seed"
+    profile = replace(deployment_profile, secret_files={mount_path: "demo-seed:2"})
+    service = Service()
+    container = Container(image="demo", ports=[ContainerPort(container_port=8080)])
+    _apply_managed_template(service, container, profile)
+    volume, = service.template.volumes
+    mount, = service.template.containers[0].volume_mounts
+    assert volume.name == mount.name
+    assert mount.mount_path == "/var/run/demo"
+    assert volume.secret.secret == "demo-seed"
+    item, = volume.secret.items
+    assert (item.version, item.path) == ("2", "seed")
+    service.template.volumes[0].secret.default_mode = 0o440
+    service.template.volumes[0].secret.items[0].mode = 0o400
+    updated = replace(profile, secret_files={mount_path: "demo-seed:3"})
+    _apply_managed_template(service, container, updated)
+    assert service.template.volumes[0].secret.default_mode == 0o440
+    item, = service.template.volumes[0].secret.items
+    assert (item.version, item.mode) == ("3", 0o400)
+    service.template.containers[0].volume_mounts.append(
+        VolumeMount(name=volume.name, mount_path="/operator-alias")
+    )
+    operator_volume = "kestrel-secret-file-operator"
+    service.template.volumes.append(Volume(name=operator_volume))
+    service.template.containers[0].volume_mounts.append(
+        VolumeMount(name=operator_volume, mount_path="/separate")
+    )
+
+    _apply_managed_template(service, container, deployment_profile)
+    assert [item.name for item in service.template.volumes] == [volume.name, operator_volume]
+    assert [item.mount_path for item in service.template.containers[0].volume_mounts] == [
+        "/operator-alias", "/separate",
+    ]
+    with pytest.raises(DeployManagerError, match="pinned version"):
+        _apply_managed_template(
+            service, container, replace(profile, secret_files={mount_path: "demo-seed:latest"}),
+        )
+
+
+def test_secret_file_cannot_overlap_implicit_cloud_sql_mount(deployment_profile):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import Container, ContainerPort
+
+    service = Service(template={
+        "containers": [{"image": "demo", "volume_mounts": [{"name": "database"}]}],
+        "volumes": [{"name": "database", "cloud_sql_instance": {"instances": ["project:region:db"]}}],
+    })
+    profile = replace(deployment_profile, secret_files={"/cloudsql/demo/key": "demo-seed:2"})
+    with pytest.raises(DeployManagerError, match="overlaps another volume"):
+        _apply_managed_template(
+            service, Container(image="demo", ports=[ContainerPort(container_port=8080)]), profile,
+        )
+
+
+@pytest.mark.parametrize(
+    "max_instances, percentages, manual_count, key_source",
+    [(2, [100], None, "env_vars"), (1, [50, 50], None, "env_vars"),
+     (1, [100], 2, "env_vars"), (1, [50, 50], None, "secrets")],
+)
+def test_seeded_demo_deployment_refuses_multiple_serving_targets(
+    deployment_profile, max_instances, percentages, manual_count, key_source,
+):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import Container, ContainerPort, ServiceScaling
+
+    service = Service(traffic=[{"percent": percent} for percent in percentages])
+    if manual_count is not None:
+        service.scaling = ServiceScaling(scaling_mode="MANUAL", manual_instance_count=manual_count)
+    profile = replace(
+        deployment_profile,
+        max_instances=max_instances,
+        **{key_source: {"KESTREL_DEMO_SEED_DATA_KEY_FILE": "mounted-key:1"}},
+    )
+    with pytest.raises(DeployManagerError, match="one instance and an unsplit traffic target"):
+        _apply_managed_template(
+            service, Container(image="demo", ports=[ContainerPort(container_port=8080)]), profile,
+        )
+
+
 @pytest.fixture
 def mock_services_client():
     """Mock google-cloud-run ServicesClient."""

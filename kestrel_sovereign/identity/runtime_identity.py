@@ -823,9 +823,9 @@ def _load_born_hybrid(
         )
     pq_priv_bytes = storage.load_secret_bytes(pq_key_id)
 
-    from kestrel_sovereign.identity.did_web import DidWebError, parse_did_document
+    from kestrel_sovereign.identity.did_web import DidWebError, parse_signing_verification_methods
     try:
-        parsed_vms = parse_did_document(did_document)
+        parsed_vms = parse_signing_verification_methods(did_document)
     except DidWebError as e:
         raise RuntimeIdentityError(
             f"born-hybrid DID document at {did_doc_path} failed to parse: {e}"
@@ -869,20 +869,16 @@ def _load_born_hybrid(
     # signing — it must contain ONLY signing methods. A DID document may
     # also publish KEM keyAgreement methods (#2398 sealed-capsule
     # recipients); including those would make hybrid package signatures
-    # unverifiable (the verifier rejects VMs whose multicodec isn't a
-    # signing suite). Reconstruct the signing VMs canonically from the
-    # decoded signing entries — an id-based filter over the raw array
-    # would pull a KEM VM back in if it reused a signing method's id
-    # (e.g. a malformed doc publishing #key-1 for a KEM key).
-    from kestrel_sovereign.security.multikey import public_key_to_multibase
+    # unverifiable. Keep the parsed signing entries' original encodings
+    # because historical identity packages bind those exact strings.
     signing_vms = [
         {
-            "id": kid,
+            "id": method["id"],
             "type": "Multikey",
             "controller": new_did,
-            "publicKeyMultibase": public_key_to_multibase(suite, pub),
+            "publicKeyMultibase": method["publicKeyMultibase"],
         }
-        for kid, suite, pub in parsed_vms
+        for method, _suite, _pub in parsed_vms
     ]
 
     _validate_hybrid_key_binding(

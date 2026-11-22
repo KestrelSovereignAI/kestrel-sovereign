@@ -5,9 +5,11 @@ Implements deployment to Google Cloud Run using the google-cloud-run SDK.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 from dataclasses import replace
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from ..models import DeployManagerError, DeploymentProfile
@@ -15,6 +17,13 @@ from ..persistence import validate_cloudrun_persistence
 from .base import DeployProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _is_seeded_demo(profile: DeploymentProfile) -> bool:
+    return any(
+        setting in profile.env_vars or setting in profile.secrets
+        for setting in ("KESTREL_DEMO_SEED_DATA_KEY_FILE", "KESTREL_DEMO_SEED_ROSTER_TEMPLATE")
+    )
 
 
 def _apply_managed_template(service: Any, container: Any, profile: DeploymentProfile) -> None:
@@ -29,6 +38,19 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
         raise DeployManagerError("Cloud Run profile updates require a single-container service")
     if len(container.ports) != 1:
         raise DeployManagerError("Cloud Run profiles require one explicit ingress port")
+    if _is_seeded_demo(profile):
+        from google.cloud.run_v2.types import ServiceScaling
+
+        scaling = service.scaling
+        if (
+            profile.max_instances != 1
+            or sum(target.percent > 0 for target in service.traffic) > 1
+            or (
+                scaling.scaling_mode == ServiceScaling.ScalingMode.MANUAL
+                and scaling.manual_instance_count != 1
+            )
+        ):
+            raise DeployManagerError("Seeded demo publication requires one instance and an unsplit traffic target")
     if count == 1:
         current = service.template.containers[0]
         if len(current.ports) > 1:
@@ -52,10 +74,73 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
         current.resources.limits.update(container.resources.limits)
     else:
         service.template.containers = [container]
+    _apply_secret_files(service, profile.secret_files)
     service.template.scaling.min_instance_count = profile.min_instances
     service.template.scaling.max_instance_count = profile.max_instances
     service.template.timeout = f"{profile.timeout}s"
     service.template.max_instance_request_concurrency = profile.concurrency
+
+
+def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
+    from google.cloud.run_v2.types import SecretVolumeSource, VersionToPath, Volume, VolumeMount
+
+    container = service.template.containers[0]
+    original_volumes = {
+        volume.name: volume for volume in service.template.volumes
+    }
+    owned = {
+        (mount.name, mount.mount_path) for mount in container.volume_mounts
+        if (mount.name in original_volumes and original_volumes[mount.name].secret.secret
+            and mount.name == _secret_file_volume_name(mount.mount_path))
+    }
+    mounts = [mount for mount in container.volume_mounts if (mount.name, mount.mount_path) not in owned]
+    referenced = {mount.name for mount in mounts}
+    owned_names = {name for name, _ in owned}
+    volumes = {
+        name: volume for name, volume in original_volumes.items()
+        if name not in owned_names or name in referenced
+    }
+    cloud_sql_volumes = {
+        volume.name for volume in volumes.values() if volume.cloud_sql_instance.instances
+    }
+    directories = {
+        "/cloudsql" if not mount.mount_path and mount.name in cloud_sql_volumes else mount.mount_path
+        for mount in mounts
+    }
+    for filename, reference in sorted(files.items()):
+        path = PurePosixPath(filename)
+        secret, _, version = reference.rpartition(":")
+        if (
+            not path.is_absolute() or ".." in path.parts or len(path.parts) < 3
+            or not secret or not version.isascii() or not version.isdecimal() or int(version) < 1
+        ):
+            raise DeployManagerError("Cloud Run secret files require an absolute file path and a pinned version")
+        directory = str(path.parent)
+        if any(
+            PurePosixPath(other).is_relative_to(directory) or path.parent.is_relative_to(other)
+            for other in directories
+        ):
+            raise DeployManagerError("Cloud Run secret file mount overlaps another volume")
+        directories.add(directory)
+        name = _secret_file_volume_name(directory)
+        previous = original_volumes[name].secret if name in owned_names else SecretVolumeSource()
+        mode = next((item.mode for item in previous.items if item.path == path.name), 0)
+        volume = Volume(
+            name=name, secret=SecretVolumeSource(
+                secret=secret, default_mode=previous.default_mode,
+                items=[VersionToPath(version=version, path=path.name, mode=mode)],
+            ),
+        )
+        if name in volumes and volumes[name] != volume:
+            raise DeployManagerError("Cloud Run secret file conflicts with an existing volume")
+        volumes[name] = volume
+        mounts.append(VolumeMount(name=name, mount_path=directory))
+    service.template.volumes = list(volumes.values())
+    container.volume_mounts = mounts
+
+
+def _secret_file_volume_name(directory: str) -> str:
+    return "kestrel-secret-file-" + hashlib.sha256(directory.encode()).hexdigest()[:16]
 
 
 class CloudRunProvider(DeployProvider):
@@ -266,7 +351,7 @@ class CloudRunProvider(DeployProvider):
                 # update mask) silently reset all of them out-of-band (F174).
                 service = existing_service
                 service.name = service_path
-                _apply_managed_template(service, container, profile)
+                _apply_managed_template(service, container, effective_profile)
                 operation = await asyncio.to_thread(
                     client.update_service, service=service
                 )
@@ -274,7 +359,7 @@ class CloudRunProvider(DeployProvider):
                 # Create new service from a fresh spec.
                 service = Service()
                 service.name = service_name
-                _apply_managed_template(service, container, profile)
+                _apply_managed_template(service, container, effective_profile)
                 operation = await asyncio.to_thread(
                     client.create_service, parent=parent, service=service, service_id=service_name
                 )
@@ -296,13 +381,24 @@ class CloudRunProvider(DeployProvider):
 
             logger.info(f"Deployment complete: {service_url}")
 
-            return {
+            deployment = {
                 "service_url": service_url,
                 "revision": result.latest_ready_revision,
                 "status": "active",
                 "operation": "update" if is_update else "create",
                 "warnings": [iam_warning] if iam_warning else [],
             }
+            if _is_seeded_demo(effective_profile):
+                revision = result.latest_created_revision.rsplit("/", 1)[-1]
+                active = [target for target in result.traffic_statuses if target.percent > 0]
+                deployment["revision"] = revision
+                deployment["serves_created_revision"] = (
+                    bool(revision)
+                    and len(active) == 1
+                    and active[0].percent == 100
+                    and active[0].revision.rsplit("/", 1)[-1] == revision
+                )
+            return deployment
 
         except ImportError as e:
             raise DeployManagerError(f"Missing dependency: {e}") from e

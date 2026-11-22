@@ -1523,7 +1523,7 @@ async def _onboard_single_agent_native(app: FastAPI, agent, environment=None):
 
     environment = dict(os.environ if environment is None else environment)
     peer_policy = validate_native_peer_policy(environment, fleet_host=False)
-    if NativeHostingConfiguration.from_environment(environment) is None:
+    if NativeHostingConfiguration.from_environment(environment, fleet_host=False) is None:
         return None
     if peer_policy is None:
         router, requester = _hosted_peer_directory_context(
@@ -3478,6 +3478,16 @@ async def _lifespan_startup(app: FastAPI):
     app.state.fleet_host = fleet_host
     if fleet_host:
         _require_multi_agent_host_api_key(os.environ)
+    from kestrel_sovereign.a2a.native_publication import (
+        NativeHostingConfiguration,
+        validate_native_fleet_options,
+    )
+
+    validate_native_fleet_options(os.environ, fleet_host=fleet_host)
+    app.state.required_a2a_card_keys = frozenset()
+    if "KESTREL_DEMO_SEED_MANIFEST" in os.environ:
+        native_config = NativeHostingConfiguration.from_environment(os.environ, fleet_host=fleet_host)
+        app.state.required_a2a_card_keys = frozenset(native_config.seeded_registrations)
     if "KESTREL_A2A_PEER_POLICY" in os.environ:
         from kestrel_sovereign.a2a.native_standalone import validate_native_peer_policy
 
@@ -5283,8 +5293,34 @@ async def get_bootstrap_key(request: Request):
     return response
 
 
+async def _missing_required_a2a_cards(app: FastAPI, manager) -> list[str]:
+    from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
+    from kestrel_sovereign.storage.db.interface import DatabaseError
+
+    required = getattr(app.state, "required_a2a_card_keys", frozenset())
+    if not required:
+        return []
+    agents = manager.list_agents() if manager is not None else {}
+    missing = []
+    for key in sorted(required):
+        publication = getattr(agents.get(key), "_native_a2a_publication", None)
+        if publication is not None and publication.routing_key == key:
+            try:
+                await publication.get_card()
+            except (StarletteHTTPException, ValueError, DatabaseError, InvalidParamsError, PushServiceUnavailable) as error:
+                if is_execution_control_error(error):
+                    raise
+            else:
+                continue
+        missing.append(key)
+    return missing
+
+
 @app.get("/health")
-def health_check(request: Request):
+async def health_check(request: Request, response: Response):
     """Return a stable, public-safe readiness probe for load balancers.
 
     This endpoint deliberately exposes only aggregate readiness and whether a
@@ -5293,6 +5329,10 @@ def health_check(request: Request):
     failure records, reachability, exception strings, paths, or capacities to
     this response.
     """
+    if revision := os.environ.get("K_REVISION"):
+        from kestrel_sovereign.features.deploy.providers._health import CLOUD_RUN_REVISION_HEADER
+
+        response.headers[CLOUD_RUN_REVISION_HEADER] = revision
     startup_error = getattr(request.app.state, "startup_error", None)
     agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
     mandatory_failures = getattr(
@@ -5312,6 +5352,7 @@ def health_check(request: Request):
     if startup_error:
         return JSONResponse(
             status_code=503,
+            headers=response.headers,
             content={"status": "unhealthy", "agent_initialized": False},
         )
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
@@ -5331,9 +5372,11 @@ def health_check(request: Request):
         or scheduler_failures
         or not scheduler_workers_available
         or not invocation_owners_healthy
+        or await _missing_required_a2a_cards(request.app, manager)
     ):
         return JSONResponse(
             status_code=503,
+            headers=response.headers,
             content={
                 # Do not reveal whether the cause is identity, a mandatory
                 # feature, safe mode, or a pending constitutional audit.
@@ -5351,6 +5394,7 @@ def health_check(request: Request):
         }
     return JSONResponse(
         status_code=503,
+        headers=response.headers,
         content={
             "status": "unhealthy" if startup_error else "degraded",
             "agent_initialized": False,
@@ -5655,6 +5699,23 @@ async def health_detailed(request: Request):
                 },
             ),
         )
+    missing_cards = await _missing_required_a2a_cards(request.app, manager)
+
+    def detailed_response(content, status_code=200):
+        if missing_cards:
+            content = dict(content)
+            if status_code == 200:
+                content["status"] = "unhealthy"
+            if "overall_healthy" in content:
+                content["overall_healthy"] = False
+            content.setdefault("error", "Required A2A cards unavailable")
+            content["missing_a2a_card_registrations"] = missing_cards
+            status_code = 503
+        content = _with_host_feature_rejections(request.app.state, content)
+        if status_code != 200:
+            return JSONResponse(status_code=status_code, content=content)
+        return content
+
     _latch_active_scheduler_runner_failures(request.app, agent, manager)
     safe_mode_records = _constitution_safe_mode_records(agent, manager)
     if safe_mode_records:
@@ -5677,10 +5738,7 @@ async def health_detailed(request: Request):
         rejections = _contribution_rejection_records(agent, manager)
         if rejections:
             content["features_not_loaded"] = rejections
-        return JSONResponse(
-            status_code=503,
-            content=_with_host_feature_rejections(request.app.state, content),
-        )
+        return detailed_response(content, status_code=503)
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
     )
@@ -5717,11 +5775,8 @@ async def health_detailed(request: Request):
             )
             content.setdefault("checks", [])
             content.setdefault("tracing", tracing)
-            return JSONResponse(
-                status_code=503,
-                content=_with_host_feature_rejections(request.app.state, content),
-            )
-        return _with_host_feature_rejections(request.app.state, result)
+            return detailed_response(content, status_code=503)
+        return detailed_response(result)
 
     # No singleton default agent (multi-agent deployments set app.state.agent to
     # None). Resolve health from the live fleet rather than reporting a false
@@ -5772,11 +5827,8 @@ async def health_detailed(request: Request):
                     "scheduler_readiness_failures": scheduler_failures,
                 }
             )
-            return JSONResponse(
-                status_code=503,
-                content=_with_host_feature_rejections(request.app.state, content),
-            )
-        return _with_host_feature_rejections(request.app.state, content)
+            return detailed_response(content, status_code=503)
+        return detailed_response(content)
 
     content = {
         "status": "unhealthy",
@@ -5792,13 +5844,10 @@ async def health_detailed(request: Request):
                 "scheduler_readiness_failures": scheduler_failures,
             }
         )
-        return JSONResponse(
-            status_code=503,
-            content=_with_host_feature_rejections(request.app.state, content),
-        )
+        return detailed_response(content, status_code=503)
     # Host features start independently of agent availability, so "no agent"
     # must still name a refused host feature rather than drop the diagnostic.
-    return _with_host_feature_rejections(request.app.state, content)
+    return detailed_response(content)
 
 
 def _enforce_host_csrf(request: Request):

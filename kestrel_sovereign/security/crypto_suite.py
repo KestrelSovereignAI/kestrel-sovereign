@@ -115,6 +115,7 @@ class CryptoSuite(abc.ABC):
 
     alg_id: ClassVar[str]
     public_key_multicodec: ClassVar[bytes] = b""
+    legacy_public_key_multicodecs: ClassVar[tuple[bytes, ...]] = ()
     is_post_quantum: ClassVar[bool] = False
 
     @abc.abstractmethod
@@ -456,10 +457,8 @@ class MLDSA65Suite(CryptoSuite):
     --------------
 
     - ``alg_id``: ``"ml-dsa-65"``
-    - ``public_key_multicodec``: ``b"\\x87\\x24"`` (multicodec 0x1207
-      ``ml-dsa-65-pub``, varint-encoded). The W3C/IETF multicodec
-      table entry is currently *proposed*; treat as experimental until
-      finalized. Wire format will stay byte-stable as the spec firms up.
+    - ``public_key_multicodec``: ``b"\\x91\\x24"`` (multicodec 0x1211
+      ``mldsa-65-pub``, varint-encoded).
     - Public key bytes: 1952 raw bytes (pqcrypto returns these directly).
 
     Sign/verify failure semantics
@@ -475,9 +474,11 @@ class MLDSA65Suite(CryptoSuite):
     """
 
     alg_id: ClassVar[str] = ALG_ML_DSA_65
-    # Multicodec 0x1207 (ml-dsa-65-pub, proposed), varint-encoded.
+    # Multicodec 0x1211 (mldsa-65-pub), varint-encoded.
     # See https://github.com/multiformats/multicodec for the registry.
-    public_key_multicodec: ClassVar[bytes] = b"\x87\x24"
+    public_key_multicodec: ClassVar[bytes] = b"\x91\x24"
+    # Deployed identities and signed historical documents used the old prefix.
+    legacy_public_key_multicodecs: ClassVar[tuple[bytes, ...]] = (b"\x87\x24",)
     is_post_quantum: ClassVar[bool] = True
 
     # NIST FIPS 204 Cat-3 sizes — pinned as class attributes so callers

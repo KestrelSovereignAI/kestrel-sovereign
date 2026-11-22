@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_STABLE_AGENT_ID_FIELD,
     ProcessA2ADidResolver,
@@ -49,6 +51,21 @@ async def test_operator_only_server_does_not_require_an_implicit_peer_identity(
 
     p = single_candidate
     assert await _onboard_single_agent_native(p.app, object(), {}) is None
+    assert p.app.routes == []
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("KESTREL_DEMO_SEED_MANIFEST", "demo.seeds.toml"), ("KESTREL_A2A_EPHEMERAL_TENANT", "demo-tenant")],
+)
+async def test_single_server_rejects_cohosted_options(single_candidate, option, value):
+    from kestrel_sovereign.server import _onboard_single_agent_native
+
+    p = single_candidate
+    with pytest.raises(ValueError, match=f"{option} requires a co-hosted agent fleet"):
+        await _onboard_single_agent_native(
+            p.app, object(), {"KESTREL_BASE_URL": "https://single.native.test", option: value},
+        )
     assert p.app.routes == []
 
 

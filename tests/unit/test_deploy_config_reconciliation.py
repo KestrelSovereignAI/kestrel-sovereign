@@ -28,10 +28,12 @@ import pytest
 
 from kestrel_sovereign.features.deploy.manager import DeployManager
 from kestrel_sovereign.features.deploy.models import (
+    DeployManagerError,
     DeployProviderType,
     ReadinessCheck,
     ReadinessStatus,
 )
+from kestrel_sovereign.features.deploy.providers.azure_container import AzureContainerProvider
 
 
 # Repo root: tests/unit/<this_file> -> ../../ -> repo root.
@@ -99,7 +101,6 @@ def test_dev_profile_has_bash_parity_secrets(live_config):
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "KESTREL_API_KEY",
-        "KESTREL_DATA_KEY",
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
         "KESTREL_SESSION_SECRET",
@@ -163,6 +164,53 @@ def test_dev_profile_uses_multi_agent_image(live_config):
         f"got {ref!r}. build_image_reference may have lost the multi_agent "
         f"suffix logic."
     )
+
+
+async def test_azure_mount_rejection_is_scoped_to_its_deploy(live_config):
+    live_config["profiles"]["azure-dev"]["secret_files"] = {
+        "/run/secrets/demo": "demo-seed:1",
+    }
+    manager = DeployManager(config=live_config)
+    assert manager.get_profile("dev").provider is DeployProviderType.CLOUD_RUN
+    profile = manager.get_profile("azure-dev")
+    provider = AzureContainerProvider(subscription_id="test", resource_group="test")
+    with pytest.raises(DeployManagerError, match="secret_files is supported only on Cloud Run"):
+        await provider.deploy("registry.test/kestrel:demo", profile.service_name, profile)
+
+
+def test_dev_publication_selects_the_pinned_demo_registration(live_config):
+    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+
+    profile = live_config["profiles"]["dev"]
+    env = profile["env_vars"]
+    assert env["KESTREL_MULTI_AGENT_CONFIG"] == "/app/multi_agent.toml"
+    template = env["KESTREL_DEMO_SEED_ROSTER_TEMPLATE"]
+    manifest = Path(__file__).resolve().parents[2] / template.removeprefix("/app/")
+    boot_environment = dict(
+        env,
+        KESTREL_DEMO_SEED_MANIFEST=str(manifest.with_suffix(".seeds.toml")),
+        KESTREL_A2A_EPHEMERAL_TENANT="demo-test",
+        KESTREL_DEMO_DATABASE_IDENTITIES='{"kestrel-demo":[1,2],"kestrel-a2a-peer":[1,3]}',
+    )
+    del boot_environment["KESTREL_DEMO_SEED_DATA_KEY_FILE"]
+    config = NativeHostingConfiguration.from_environment(boot_environment)
+    assert config is not None
+    assert config.public_base_url == "https://kestrel-dev-7jpbsywhdq-uc.a.run.app"
+    assert config.discovery_routing_key == "kestrel-demo"
+    assert config.publishes("kestrel-a2a-peer")
+    assert not config.publishes("Kestrel")
+    assert config.discovery_routing_key in env["KESTREL_AGENTS"].split(",")
+    assert profile["secret_files"] == {
+        "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz": "kestrel-dev-a2a-db-seed:1",
+        "/var/run/kestrel-demo-seed/identity/identity.json": "kestrel-dev-a2a-identity-bundle:2",
+        env["KESTREL_DEMO_SEED_DATA_KEY_FILE"]: "kestrel-dev-a2a-data-key:1",
+        "/var/run/kestrel-demo-seed/peer-state/kestrel_prime.db.xz": "kestrel-dev-a2a-peer-db-seed:1",
+        "/var/run/kestrel-demo-seed/peer-identity/identity.json": "kestrel-dev-a2a-peer-identity-bundle:1",
+    }
+    assert "KESTREL_IDENTITY_BUNDLE" not in profile["secrets"]
+    assert "KESTREL_DATA_KEY" not in profile["secrets"]
+    assert env["KESTREL_AGENTS"] == "Kestrel,kestrel-demo,kestrel-a2a-peer"
+    assert config.push is None
 
 
 def test_prod_profile_has_bash_parity_secrets(live_config):

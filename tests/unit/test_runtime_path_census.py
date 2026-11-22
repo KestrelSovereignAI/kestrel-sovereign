@@ -54,6 +54,9 @@ NOT_STORAGE_ROOTS: dict[str, str] = {
     # A launcher-written peer DID registry file the child reads and verifies
     # against a pinned digest; nothing is written there.
     "KESTREL_A2A_PEER_IDENTITY_DOCUMENTS_FILE": "read-only attested registry file",
+    # Cloud Run mounts this input read-only. Demo bootstrap checks that its
+    # writable roster destination cannot alias the mounted key.
+    "KESTREL_DEMO_SEED_DATA_KEY_FILE": "read-only demo seed key mount",
     # Credential stores owned by other tools (Claude Code, the Codex CLI).
     # Kestrel reads (Codex: symlinks) their existing credentials; it does not
     # create state there, and redirecting them would sign tests out.

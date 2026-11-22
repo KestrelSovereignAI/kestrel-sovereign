@@ -22,6 +22,7 @@ from kestrel_sovereign.features.deploy.models import (
     ReadinessStatus,
 )
 from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
+from kestrel_sovereign.features.deploy.providers._health import CLOUD_RUN_REVISION_HEADER
 from tests.shared.environment_guard import unset_environment
 
 
@@ -346,9 +347,13 @@ _SECRET_IN_ERROR = "token=sk-live-SECRET-should-not-leak"
 class _FakeProvider:
     """Stands in for Cloud Run: the control plane always creates a revision."""
 
-    def __init__(self, operation: str, *, service_url: str | None = _SERVICE_URL):
+    def __init__(
+        self, operation: str, *, service_url: str | None = _SERVICE_URL,
+        serves_created_revision: bool | None = None,
+    ):
         self.operation = operation
         self.service_url = service_url
+        self.serves_created_revision = serves_created_revision
         self.deploy_calls = 0
         self.teardown_calls = 0
 
@@ -359,6 +364,7 @@ class _FakeProvider:
             "revision": f"{service_name}-00007-abc",
             "status": "active",
             "operation": self.operation,
+            "serves_created_revision": self.serves_created_revision,
             "warnings": [],
         }
 
@@ -409,12 +415,12 @@ def _serve(handler):
     return patch("httpx.AsyncClient", side_effect=client_factory)
 
 
-def _status(code: int, body: dict | None = None):
+def _status(code: int, body: dict | None = None, *, headers=None):
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL(f"{_SERVICE_URL}/health")
         if body is None:
             return httpx.Response(code, text="")
-        return httpx.Response(code, json=body)
+        return httpx.Response(code, json=body, headers=headers)
 
     return handler
 
@@ -447,6 +453,43 @@ _UNREADY_CASES = {
 
 class TestIssue2473ReadinessGatesDeploySuccess:
     """A created revision is not a successful deploy until it is ready."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("serving_revision", [None, "kestrel-dev-00006-old", "kestrel-dev-00007-abc"])
+    @pytest.mark.parametrize("status_code", [200, 503])
+    async def test_seeded_health_response_must_match_the_created_revision(self, serving_revision, status_code):
+        manager = _manager_with(_FakeProvider("update", serves_created_revision=True))
+        manager.health_check_timeout = 0.2
+        headers = {CLOUD_RUN_REVISION_HEADER: serving_revision} if serving_revision else None
+        with _serve(_status(status_code, {"status": "ok", "agent_initialized": True}, headers=headers)):
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+        if serving_revision != "kestrel-dev-00007-abc":
+            assert result["readiness_status"] == "unknown"
+            if serving_revision:
+                assert result["readiness"]["failure"] == "different_serving_revision"
+            else:
+                assert result["readiness"]["failure"] == (
+                    "missing_serving_revision" if status_code == 200 else "http_status"
+                )
+        else:
+            assert result["success"] is (status_code == 200)
+            assert result["readiness_status"] == ("ready" if status_code == 200 else "unready")
+
+    @pytest.mark.asyncio
+    async def test_seeded_health_retries_stale_revision_before_deadline(self):
+        manager = _manager_with(_FakeProvider("update", serves_created_revision=True))
+        reports = iter(("kestrel-dev-00006-old", "kestrel-dev-00007-abc"))
+
+        def handler(request):
+            return _status(200, {"status": "ok", "agent_initialized": True}, headers={
+                CLOUD_RUN_REVISION_HEADER: next(reports),
+            })(request)
+
+        with _serve(handler):
+            check = await manager._verify_health(
+                _SERVICE_URL, timeout=1, poll_interval=0, expected_revision="kestrel-dev-00007-abc",
+            )
+        assert check.ready and check.attempts == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("operation", ["create", "update"])
@@ -514,8 +557,16 @@ class TestIssue2473ReadinessGatesDeploySuccess:
         assert "SECRET" not in result["error"]
 
     @pytest.mark.asyncio
-    async def test_missing_service_url_is_unknown_and_not_success(self):
-        manager = _manager_with(_FakeProvider("create", service_url=None))
+    @pytest.mark.parametrize(
+        "service_url, serves_created_revision, failure",
+        [(None, None, "no_service_url"), (_SERVICE_URL, False, "revision_not_serving")],
+    )
+    async def test_no_url_for_created_revision_is_unknown_and_not_success(
+        self, service_url, serves_created_revision, failure,
+    ):
+        manager = _manager_with(_FakeProvider(
+            "create", service_url=service_url, serves_created_revision=serves_created_revision,
+        ))
 
         with patch(
             "kestrel_sovereign.features.deploy.core.probe_http_health"
@@ -526,7 +577,7 @@ class TestIssue2473ReadinessGatesDeploySuccess:
         assert result["success"] is False
         assert result["control_plane_status"] == "succeeded"
         assert result["readiness_status"] == "unknown"
-        assert result["readiness"]["failure"] == "no_service_url"
+        assert result["readiness"]["failure"] == failure
 
     @pytest.mark.asyncio
     async def test_gate_that_never_probed_is_unknown(self):

@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from uuid import uuid4
 
 _TENANT_SEGMENT = re.compile(r"[A-Za-z0-9._~-]*\Z")
 
@@ -20,6 +21,13 @@ class NativeRecipientScope:
 
     recipient_id: str
     tenant: str = ""
+
+    @classmethod
+    def for_ephemeral_activation(
+        cls, recipient_id: str, boot_identifier: str,
+    ) -> "NativeRecipientScope":
+        """An agent activation never inherits a retired demo task scope."""
+        return cls(recipient_id, f"{boot_identifier}-{uuid4().hex}")
 
     def __post_init__(self) -> None:
         if not isinstance(self.recipient_id, str) or not self.recipient_id.strip():

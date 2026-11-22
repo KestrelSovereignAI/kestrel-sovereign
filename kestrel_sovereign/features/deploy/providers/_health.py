@@ -7,6 +7,9 @@ from time import monotonic
 from typing import NotRequired, TypedDict
 
 
+CLOUD_RUN_REVISION_HEADER = "X-Kestrel-Revision"
+
+
 class HealthCheckResult(TypedDict):
     """Stable result returned by deployment health checks."""
 
@@ -20,6 +23,7 @@ class HealthCheckResult(TypedDict):
     # Present only when the body is a JSON object carrying the Kestrel
     # ``/health`` ``agent_initialized`` flag.
     agent_initialized: NotRequired[bool]
+    serving_revision: NotRequired[str]
 
 
 def build_health_url(service_url: str, path: str = "/health") -> str:
@@ -73,6 +77,8 @@ async def probe_http_health(
         "status_code": response.status_code,
         "response_time": max(0.0, monotonic() - started_at),
     }
+    if revision := response.headers.get(CLOUD_RUN_REVISION_HEADER):
+        result["serving_revision"] = revision
     agent_initialized = _reported_agent_initialized(response)
     if agent_initialized is not None:
         result["agent_initialized"] = agent_initialized

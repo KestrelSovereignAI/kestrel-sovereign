@@ -123,6 +123,7 @@ class DeployManagerCore:
 
                 raw_secrets = data.get("secrets", {})
                 expanded_secrets = self._expand_env_vars(raw_secrets)
+                secret_files = self._expand_env_vars(data.get("secret_files", {}))
 
                 # Determine default dockerfile based on deployment mode
                 deployment_mode = data.get("deployment_mode", "agent")
@@ -148,6 +149,7 @@ class DeployManagerCore:
                     dockerfile=data.get("dockerfile", default_dockerfile),
                     env_vars=expanded_env,
                     secrets=expanded_secrets,
+                    secret_files=secret_files,
                     gcp_project_id=data.get("gcp_project_id") or self.gcp_project_id,
                     azure_resource_group=data.get("azure_resource_group"),
                 )
@@ -202,6 +204,7 @@ class DeployManagerCore:
 
         _check("env_vars", raw_env, profile.env_vars)
         _check("secrets", raw_secrets, profile.secrets)
+        _check("secret_files", raw_profile.get("secret_files", {}), profile.secret_files)
 
         if unresolved or empty_after_expansion:
             details_unresolved = "; ".join(
@@ -318,6 +321,8 @@ class DeployManagerCore:
         service_url: str,
         timeout: Optional[int] = None,
         poll_interval: int = 5,
+        *,
+        expected_revision: str | None = None,
     ) -> ReadinessCheck:
         """
         Run the readiness gate against a deployed service.
@@ -342,6 +347,7 @@ class DeployManagerCore:
         current_interval = poll_interval
         attempts = 0
         last: Optional[Dict[str, Any]] = None
+        unbound: Optional[Dict[str, Any]] = None
 
         logger.info(
             "Verifying health for %s at %s (timeout: %ss)",
@@ -357,8 +363,12 @@ class DeployManagerCore:
                 timeout=min(10.0, remaining),
             )
             attempts += 1
-            last = result
-            if result["healthy"]:
+            revision_matches = expected_revision is None or result.get("serving_revision") == expected_revision
+            if revision_matches:
+                last = result
+            else:
+                unbound = result
+            if result["healthy"] and revision_matches:
                 if monotonic() >= deadline:
                     logger.debug(
                         "Ignoring healthy response received after the deadline"
@@ -392,13 +402,26 @@ class DeployManagerCore:
 
         logger.warning(f"Readiness gate did not pass within {timeout}s")
         if last is None:
+            if unbound is None:
+                failure = "not_probed"
+                detail = "the readiness deadline elapsed before any probe ran"
+            elif unbound.get("serving_revision"):
+                failure = "different_serving_revision"
+                detail = "no health response came from the deployed revision"
+            elif unbound["healthy"]:
+                failure = "missing_serving_revision"
+                detail = "the health response did not identify its revision"
+            else:
+                failure, detail = classify_health_failure(unbound)
             return ReadinessCheck(
                 status=ReadinessStatus.UNKNOWN,
                 gate=gate,
                 health_url=health_url,
                 timeout_seconds=timeout,
-                failure="not_probed",
-                detail="the readiness deadline elapsed before any probe ran",
+                attempts=attempts,
+                last_status_code=unbound["status_code"] if unbound is not None else None,
+                failure=failure,
+                detail=detail,
             )
         if last["healthy"]:
             failure = "deadline_exceeded"
@@ -640,9 +663,21 @@ class DeployManagerCore:
             session.revision = deploy_result.get("revision")
             session.last_updated = datetime.now(timezone.utc)
 
-            if session.service_url:
+            if deploy_result.get("serves_created_revision") is False:
+                readiness = ReadinessCheck(
+                    status=ReadinessStatus.UNKNOWN,
+                    gate=f"GET <revision_tag_url>{self.health_check_path}",
+                    failure="revision_not_serving",
+                    detail="the service URL does not serve this revision; assign a zero-traffic tag and probe its URL",
+                )
+            elif session.service_url:
                 logger.info(f"Verifying health of {session.service_url}...")
-                readiness = await self._verify_health(session.service_url)
+                if deploy_result.get("serves_created_revision") is True:
+                    readiness = await self._verify_health(
+                        session.service_url, expected_revision=session.revision,
+                    )
+                else:
+                    readiness = await self._verify_health(session.service_url)
             else:
                 readiness = ReadinessCheck(
                     status=ReadinessStatus.UNKNOWN,

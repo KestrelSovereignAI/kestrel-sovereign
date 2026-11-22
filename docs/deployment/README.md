@@ -550,6 +550,51 @@ uv run kestrel deploy dev
 
 Dev service URL (stable): `https://kestrel-dev-7jpbsywhdq-uc.a.run.app`
 
+DEV publishes a signed A2A Agent Card for the `kestrel-demo` registration
+at `/.well-known/agent-card.json`. Its public signing DID is
+`did:web:agents.kestrelsovereign.com:kestrel-dev-a2a`. The companion demo
+has its own DID and per-agent card. The DEV profile loads
+the pinned encrypted identity bundles, matching data key and SQLite seeds
+from read-only Secret Manager mounts declared in `[profiles.dev.secret_files]`.
+Bootstrap checks the configured data directory, snapshot hash and signing
+keys before restoring each seed. The restored database records the boot
+identifier and signing-key fingerprint. The host retains the installed file's
+identity for the boot lifetime and checks it during onboarding, card reads
+and signed requests. Replacing the SQLite file requires a fresh host boot. The separate
+`multi_agent.a2a-dev.seeds.toml` manifest selects the demo registrations and
+remains in place when the runtime saves roster edits. The DEV host
+publishes native A2A for the two demo registrations. The existing Kestrel
+registration still handles its DEV GitHub webhook and stays out of public A2A
+discovery. The published roster and ephemeral tenant settings apply to the
+co-hosted fleet. Per-agent process launchers configure discovery on each
+server individually.
+Cold starts restore the initial demo state. Each agent initialization
+assigns a fresh A2A tenant, including when an agent is reloaded.
+Both signing DIDs stay stable. A2A requests signed for a previous tenant
+cannot reach the new task and replay stores.
+The seeded profile requires one server worker per instance. Keep service
+traffic on one revision. The health check requires both public
+cards and identifies the responding Cloud Run revision. When traffic is still
+pinned to the previous revision, deploy reports
+the new revision's readiness as unknown. Verify the new revision's health
+and both cards using its zero-traffic tag before switching.
+
+When provisioning an independent DEV service in a new GCP project, first
+set its own HTTPS authority and signing DID, then publish that DID's
+verification document. Create a private ceremony directory outside the image
+build context with `mktemp -d`. Incept each test/demo identity there and
+export its encrypted keys with
+`python -m kestrel_sovereign.identity.custody_bundle create`. Capture its
+closed SQLite database as an XZ file. Record the compressed file's SHA-256
+digest and the DID document's signing-key fingerprint in the seed manifest.
+Provision those files and the matching data key into the Secret Manager
+entries specified by the profile. Repeat
+identity and database provisioning for the companion demo.
+Grant the DEV runtime service account Secret Accessor on those entries and
+verify each referenced numeric version is enabled with
+`gcloud secrets versions describe` before deployment.
+The normal `kestrel deploy secrets sync` command manages env-var secrets.
+
 ## GitHub Actions
 
 | Workflow | Trigger | Purpose |

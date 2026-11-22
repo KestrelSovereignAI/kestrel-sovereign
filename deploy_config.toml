@@ -23,7 +23,7 @@ health_check_path = "/health"
 # Development Profile - Cloud Run (multi-agent host, always warm)
 #
 # Mirrors legacy scripts/cloudrun/deploy_dev.sh. The dev profile runs the
-# multi-agent host (``Kestrel,kestrel-demo``) and so deploys the
+# multi-agent host and so deploys the
 # ``kestrel-multi_agent`` image — DeployManagerCore.build_image_reference
 # derives that suffix from ``deployment_mode = "multi_agent"``. The legacy
 # bash deploy_dev.sh referenced ``kestrel-multi-agent`` (hyphen) which no
@@ -50,7 +50,14 @@ KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
 KESTREL_DEPLOYMENT_PERSISTENCE = "ephemeral_demo"
-KESTREL_AGENTS = "Kestrel,kestrel-demo"
+KESTREL_AGENTS = "Kestrel,kestrel-demo,kestrel-a2a-peer"
+KESTREL_MULTI_AGENT_CONFIG = "/app/multi_agent.toml"
+KESTREL_DEMO_SEED_ROSTER_TEMPLATE = "/app/docker/multi_agent.a2a-dev.toml"
+# The deployment's pinned demo seed binds the exact registered route to its DID.
+KESTREL_BASE_URL = "https://kestrel-dev-7jpbsywhdq-uc.a.run.app"
+KESTREL_A2A_DISCOVERY_AGENT = "kestrel-demo"
+KESTREL_A2A_PUSH_ENABLED = "false"
+KESTREL_DEMO_SEED_DATA_KEY_FILE = "/var/run/kestrel-demo-seed/key/data.key"
 KESTREL_REQUIRE_OAUTH = "true"
 # ``${KESTREL_ALLOWED_EMAILS}`` is expanded by DeployManagerCore._expand_env_vars
 # at deploy time. The legacy bash used ``${KESTREL_ALLOWED_EMAILS:?...}`` to
@@ -64,7 +71,6 @@ KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 ANTHROPIC_API_KEY = "kestrel-anthropic-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
-KESTREL_DATA_KEY = "kestrel-data-key:latest"
 LIGHTHOUSE_API_KEY = "kestrel-lighthouse-key:latest"
 GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
 GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
@@ -73,6 +79,13 @@ GITHUB_TOKEN = "github-read-kestrel:latest"
 GITHUB_APP_ID = "github-app-id:latest"
 GITHUB_APP_PRIVATE_KEY = "github-app-private-key:latest"
 GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
+
+[profiles.dev.secret_files]
+"/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz" = "kestrel-dev-a2a-db-seed:1"
+"/var/run/kestrel-demo-seed/identity/identity.json" = "kestrel-dev-a2a-identity-bundle:2"
+"/var/run/kestrel-demo-seed/key/data.key" = "kestrel-dev-a2a-data-key:1"
+"/var/run/kestrel-demo-seed/peer-state/kestrel_prime.db.xz" = "kestrel-dev-a2a-peer-db-seed:1"
+"/var/run/kestrel-demo-seed/peer-identity/identity.json" = "kestrel-dev-a2a-peer-identity-bundle:1"
 
 # Production Profile - Cloud Run (durable single-agent, scales to zero)
 #
