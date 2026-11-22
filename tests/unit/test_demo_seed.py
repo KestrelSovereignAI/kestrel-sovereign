@@ -138,10 +138,14 @@ def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monk
     (first / "SOUL.md").write_text("Container demo profile")
     monkeypatch.chdir(tmp_path)
     second = Path("second")
+    roster = tmp_path / "multi_agent.toml"
+    roster.write_text("# Mounted roster")
+    original_roster_inode = roster.stat().st_ino
     restore_demo_seeds(
         (DemoSeed(directory, database_seed, bundle, did) for directory in (first, second)),
-        tenant="demo-test",
+        tenant="demo-test", roster_update=(roster, roster),
     )
+    assert roster.stat().st_ino == original_roster_inode
     for agent_dir in (first, second):
         restored = load_agent_identity(None, storage_dir=agent_dir)
         assert restored.signing_did == did

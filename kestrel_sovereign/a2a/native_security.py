@@ -112,7 +112,7 @@ class NativeDIDRequestGuard:
     replay_store: ReplayNonceStore
     lifecycle_lease: Callable[[], AbstractAsyncContextManager[object]]
     clock: Callable[[], float]
-    check_recipient_custody: Callable[[], Awaitable[None]] | None = None
+    check_recipient_custody: Callable[[], Awaitable[StreamRefusal | None]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, NativeRecipientScope):
@@ -130,9 +130,15 @@ class NativeDIDRequestGuard:
             raise TypeError("Native admission requires request-owned policy authority")
         return authority
 
-    async def require_recipient_custody(self) -> None:
+    async def _recipient_custody_refusal(self) -> StreamRefusal | None:
         if self.check_recipient_custody is not None:
-            await self.check_recipient_custody()
+            return await self.check_recipient_custody()
+        return None
+
+    async def require_recipient_custody(self) -> None:
+        refusal = await self._recipient_custody_refusal()
+        if refusal is not None:
+            raise refusal.error
 
     @asynccontextmanager
     async def hold_retained_authority(self, principal_id: str) -> AsyncIterator[None]:
@@ -196,7 +202,8 @@ class NativeDIDRequestGuard:
                 authority = self._new_authority()
                 refusal = self._current_decision(authority, None)
                 if refusal is None:
-                    await self.require_recipient_custody()
+                    refusal = await self._recipient_custody_refusal()
+                if refusal is None:
                     async with _original_authentication_io():
                         sender = await verify_native_request(
                             native_header_values(context, SENDER_PROOF_HEADER),
@@ -314,19 +321,20 @@ class NativeDIDRequestGuard:
         else:
             refused = None
             async with _native_persistence_errors(), OriginalContextExit(self.lifecycle_lease()):
-                await self.require_recipient_custody()
-                principal = await self._authorization_decision(admitted.authority, admitted.sender)
-                if isinstance(principal, StreamRefusal):
-                    refused = principal
-                elif principal != admitted.principal_id:
-                    refused = StreamRefusal(
-                        HTTPException(
-                            status_code=403,
-                            detail="Native request principal changed while waiting",
+                refused = await self._recipient_custody_refusal()
+                if refused is None:
+                    principal = await self._authorization_decision(admitted.authority, admitted.sender)
+                    if isinstance(principal, StreamRefusal):
+                        refused = principal
+                    elif principal != admitted.principal_id:
+                        refused = StreamRefusal(
+                            HTTPException(
+                                status_code=403,
+                                detail="Native request principal changed while waiting",
+                            )
                         )
-                    )
-                else:
-                    yield None
+                    else:
+                        yield None
         if refused is not None:
             # Publish a known pre-effect decision only AFTER the actual lease
             # exits. Actual exit/I/O/body failures never become refusal values.

@@ -368,28 +368,30 @@ async def test_seeded_route_publishes_only_the_pinned_signer_and_boot_tenant(
             send_request = SendMessageRequest(
                 tenant=tenant, message=new_text_message("Seed marker was withdrawn", role=Role.ROLE_USER),
             )
-            nonce, timestamp = uuid4().hex, int(time.time())
-            proof = sign_native_request(
-                p.signing[0], send_request, sender=SENDER, recipient=p.scope.recipient_id,
-                operation="SendMessage", timestamp=timestamp, nonce=nonce,
-                extensions=REQUIRED_NATIVE_EXTENSIONS, classical_kid="key-1", pq_kid="key-2",
-                policy=p.guard.proof_policy,
-            )
             rpc = next(
                 interface.url for interface in card.supported_interfaces
                 if interface.protocol_binding == "JSONRPC"
             )
-            response = await http.post(rpc, headers={
-                "A2A-Version": "1.0",
-                "A2A-Extensions": ",".join(sorted(REQUIRED_NATIVE_EXTENSIONS)),
-                SENDER_PROOF_HEADER: proof,
-            }, json={
-                "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
-                "params": MessageToDict(send_request),
-            })
-            assert "Seeded demo database unavailable" in response.text
+            for operation in ("SendMessage", "SendStreamingMessage"):
+                nonce, timestamp = uuid4().hex, int(time.time())
+                proof = sign_native_request(
+                    p.signing[0], send_request, sender=SENDER, recipient=p.scope.recipient_id,
+                    operation=operation, timestamp=timestamp, nonce=nonce,
+                    extensions=REQUIRED_NATIVE_EXTENSIONS, classical_kid="key-1", pq_kid="key-2",
+                    policy=p.guard.proof_policy,
+                )
+                response = await http.post(rpc, headers={
+                    "Accept": "application/json, text/event-stream",
+                    "A2A-Version": "1.0",
+                    "A2A-Extensions": ",".join(sorted(REQUIRED_NATIVE_EXTENSIONS)),
+                    SENDER_PROOF_HEADER: proof,
+                }, json={
+                    "jsonrpc": "2.0", "id": 1, "method": operation,
+                    "params": MessageToDict(send_request),
+                })
+                assert "Seeded demo database unavailable" in response.text
+                assert await p.guard.replay_store.reserve(SENDER, nonce, now_ts=timestamp, ttl_seconds=300)
             assert await p.recipient.task_manager.list_tasks(recipient_agent_id=p.scope.recipient_id) == []
-            assert await p.guard.replay_store.reserve(SENDER, nonce, now_ts=timestamp, ttl_seconds=300)
     finally:
         async with p.host.a2a_lifecycle_lease():
             native.withdraw()

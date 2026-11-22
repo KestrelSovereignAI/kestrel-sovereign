@@ -110,13 +110,15 @@ def restore_demo_seeds(
             (seed.directory.absolute(), staging.enter_context(_stage_demo_seed(seed, tenant)))
             for seed in seeds
         ]
+        staged_roster = None
         if roster_update is not None:
             template, runtime_config = roster_update
-            directory = staging.enter_context(
-                tempfile.TemporaryDirectory(prefix=".demo-roster-", dir=runtime_config.parent),
-            )
-            staged_roster = Path(directory) / runtime_config.name
-            staged_roster.write_bytes(template.read_bytes())
+            if not (runtime_config.exists() and template.samefile(runtime_config)):
+                directory = staging.enter_context(
+                    tempfile.TemporaryDirectory(prefix=".demo-roster-", dir=runtime_config.parent),
+                )
+                staged_roster = Path(directory) / runtime_config.name
+                staged_roster.write_bytes(template.read_bytes())
         with ExitStack() as rollback:
             for agent_dir, staged_agent in prepared:
                 if not agent_dir.exists():
@@ -129,7 +131,7 @@ def restore_demo_seeds(
                     destination = agent_dir / artifact.name
                     os.replace(artifact, destination)
                     rollback.callback(os.replace, destination, artifact)
-            if roster_update is not None:
+            if staged_roster is not None:
                 os.replace(staged_roster, runtime_config)
             rollback.pop_all()
 

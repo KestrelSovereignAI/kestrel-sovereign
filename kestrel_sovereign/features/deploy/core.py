@@ -365,18 +365,8 @@ class DeployManagerCore:
             )
             attempts += 1
             last = result
-            if result["healthy"]:
-                if expected_revision and result.get("serving_revision") != expected_revision:
-                    return ReadinessCheck(
-                        status=ReadinessStatus.UNKNOWN,
-                        gate=gate,
-                        health_url=health_url,
-                        timeout_seconds=timeout,
-                        attempts=attempts,
-                        last_status_code=result["status_code"],
-                        failure="different_serving_revision",
-                        detail="the health response did not come from the deployed revision",
-                    )
+            revision_matches = expected_revision is None or result.get("serving_revision") == expected_revision
+            if result["healthy"] and revision_matches:
                 if monotonic() >= deadline:
                     logger.debug(
                         "Ignoring healthy response received after the deadline"
@@ -417,6 +407,17 @@ class DeployManagerCore:
                 timeout_seconds=timeout,
                 failure="not_probed",
                 detail="the readiness deadline elapsed before any probe ran",
+            )
+        if last["healthy"] and expected_revision and last.get("serving_revision") != expected_revision:
+            return ReadinessCheck(
+                status=ReadinessStatus.UNKNOWN,
+                gate=gate,
+                health_url=health_url,
+                timeout_seconds=timeout,
+                attempts=attempts,
+                last_status_code=last["status_code"],
+                failure="different_serving_revision",
+                detail="no healthy response came from the deployed revision",
             )
         if last["healthy"]:
             failure = "deadline_exceeded"

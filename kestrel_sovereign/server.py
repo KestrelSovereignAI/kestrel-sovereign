@@ -5699,8 +5699,11 @@ async def health_detailed(request: Request):
 
     def detailed_response(content, status_code=200):
         if missing_cards:
+            content = dict(content)
             if status_code == 200:
                 content["status"] = "unhealthy"
+            if "overall_healthy" in content:
+                content["overall_healthy"] = False
             content.setdefault("error", "Required A2A cards unavailable")
             content["missing_a2a_card_registrations"] = missing_cards
             status_code = 503

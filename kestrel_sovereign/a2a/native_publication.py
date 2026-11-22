@@ -13,6 +13,7 @@ from uuid import uuid4
 import httpx
 from kestrel_sdk.native_a2a.client import A2ACardResolver
 from kestrel_sdk.native_a2a.types import AgentCard
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
@@ -299,7 +300,7 @@ class NativeA2APublication:
         if not isinstance(guard, NativeDIDRequestGuard):
             raise TypeError("Native publication requires its canonical request guard")
         if self._seeded_signing_key_fingerprint is not None:
-            guard = replace(guard, check_recipient_custody=self._require_seeded_database)
+            guard = replace(guard, check_recipient_custody=self._seeded_database_refusal)
         card = self._build_card(self._profile)
         binding = NativeA2AHTTP(
             NativeA2ARequestHandler(
@@ -361,7 +362,7 @@ class NativeA2APublication:
             require_binding=require_binding, buffer_bytes=buffer_bytes,
         )
 
-    async def _require_seeded_database(self) -> None:
+    async def _seeded_database_refusal(self) -> StreamRefusal | None:
         from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
 
         try:
@@ -369,9 +370,12 @@ class NativeA2APublication:
                 self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,
             )
         except ValueError as error:
-            raise HTTPException(status_code=503, detail="Seeded demo database unavailable") from error
+            refusal = HTTPException(status_code=503, detail="Seeded demo database unavailable")
+            refusal.__cause__ = error
+            return StreamRefusal(refusal)
         if fingerprint != self._seeded_signing_key_fingerprint:
-            raise HTTPException(status_code=503, detail="Seeded demo database unavailable")
+            return StreamRefusal(HTTPException(status_code=503, detail="Seeded demo database unavailable"))
+        return None
 
     async def get_card(self, _base: AgentCard | None = None) -> AgentCard:
         """Refresh public display/skills under the same live identity/policy lease."""
