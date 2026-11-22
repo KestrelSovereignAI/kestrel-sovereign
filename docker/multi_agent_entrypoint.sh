@@ -123,7 +123,10 @@ fi
 
 # The pinned DEV demo restores a named seed. A fresh A2A tenant binds proofs
 # to this database lifetime even though the public signing DID is stable.
-if [[ -n "${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_BUNDLE+x}${KESTREL_DEMO_SEED_DID+x}" ]]; then
+if [[ -n "${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_BUNDLE+x}${KESTREL_DEMO_SEED_DID+x}${KESTREL_DEMO_SEED_DATA_KEY_FILE+x}" ]]; then
+    KESTREL_DATA_KEY="$(< "${KESTREL_DEMO_SEED_DATA_KEY_FILE:?demo data key mount is required}")"
+    : "${KESTREL_DATA_KEY:?demo data key is empty}"
+    export KESTREL_DATA_KEY
     KESTREL_A2A_EPHEMERAL_TENANT="$(
         /app/.venv/bin/python -m kestrel_sovereign.identity.demo_seed \
             --config "$MULTI_AGENT_CONFIG" --agent-data-dir "$AGENT_DATA_DIR" \
@@ -134,7 +137,7 @@ if [[ -n "${KESTREL_DEMO_SEED_DATABASE+x}${KESTREL_DEMO_SEED_BUNDLE+x}${KESTREL_
             --expected-did "${KESTREL_DEMO_SEED_DID:?demo seed DID is required}"
     )"
     export KESTREL_A2A_EPHEMERAL_TENANT
-    unset KESTREL_DEMO_SEED_DATABASE KESTREL_DEMO_SEED_BUNDLE KESTREL_DEMO_SEED_DID
+    unset KESTREL_DEMO_SEED_DATABASE KESTREL_DEMO_SEED_BUNDLE KESTREL_DEMO_SEED_DID KESTREL_DEMO_SEED_DATA_KEY_FILE
 fi
 
 # Bootstrap identity and initialize DB for each agent data dir

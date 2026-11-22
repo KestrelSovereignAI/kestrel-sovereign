@@ -59,7 +59,7 @@ KESTREL_A2A_PUSH_ENABLED = "false"
 KESTREL_DEMO_SEED_DID = "did:web:agents.kestrelsovereign.com:kestrel-dev-a2a"
 KESTREL_DEMO_SEED_DATABASE = "/var/run/kestrel-demo-seed/state/kestrel_prime.db.xz"
 KESTREL_DEMO_SEED_BUNDLE = "/var/run/kestrel-demo-seed/identity/identity.json"
-KESTREL_DATA_KEY_FILE = "/var/run/kestrel-demo-seed/key/data.key"
+KESTREL_DEMO_SEED_DATA_KEY_FILE = "/var/run/kestrel-demo-seed/key/data.key"
 KESTREL_REQUIRE_OAUTH = "true"
 # ``${KESTREL_ALLOWED_EMAILS}`` is expanded by DeployManagerCore._expand_env_vars
 # at deploy time. The legacy bash used ``${KESTREL_ALLOWED_EMAILS:?...}`` to

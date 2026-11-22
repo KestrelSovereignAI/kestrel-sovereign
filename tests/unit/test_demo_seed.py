@@ -1,7 +1,10 @@
 """The demo seed carries a pinned signer and only its own initial test state."""
 
 import lzma
+import os
+import shlex
 import sqlite3
+import subprocess
 import sys
 from contextlib import closing
 from pathlib import Path
@@ -19,6 +22,8 @@ from kestrel_sovereign.identity.signing import sign_package, verify_package_sign
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.security.crypto_suite import MLDSA65Suite
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 @pytest.mark.asyncio
 async def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path, monkeypatch):
@@ -33,6 +38,45 @@ async def test_demo_seed_reuses_pinned_keys_and_rejects_unrelated_state(tmp_path
     bundle = create_identity_bundle(source, expected_did=did).encode()
     database_seed = tmp_path / "initial.db.xz"
     database_seed.write_bytes(lzma.compress(snapshot.read_bytes()))
+
+    bundle_path = tmp_path / "identity.json"
+    bundle_path.write_bytes(bundle)
+    key_file = tmp_path / "data.key"
+    key_file.write_text(os.environ["KESTREL_DATA_KEY"])
+    startup = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text().split(
+        "# Bootstrap identity and initialize DB for each agent data dir", 1
+    )[0].replace("/app/.venv/bin/python", shlex.quote(sys.executable))
+    startup += '\nprintf "A2A_TENANT=%s\\n" "$KESTREL_A2A_EPHEMERAL_TENANT"\n'
+    tenants = set()
+    for boot in ("boot-one", "boot-two"):
+        data = tmp_path / boot
+        registry = data.with_suffix(".toml")
+        registry.write_text(
+            '[agents.demo]\n'
+            f'data_dir = "{data / "demo"}"\n'
+            'port = 8801\nautostart = true\n'
+        )
+        env = dict(os.environ)
+        del env["KESTREL_DATA_KEY"]
+        env.update(
+            PYTHONPATH=str(REPO_ROOT), KESTREL_ENV="development",
+            KESTREL_AGENT_DATA_DIR=str(data), KESTREL_HOST_DB_PATH=str(data / "host/host.db"),
+            KESTREL_MULTI_AGENT_CONFIG=str(registry), KESTREL_AGENTS="demo",
+            KESTREL_DEPLOYMENT_PERSISTENCE="ephemeral_demo", KESTREL_A2A_DISCOVERY_AGENT="demo",
+            KESTREL_DEMO_SEED_DID=did, KESTREL_DEMO_SEED_DATABASE=str(database_seed),
+            KESTREL_DEMO_SEED_BUNDLE=str(bundle_path), KESTREL_DEMO_SEED_DATA_KEY_FILE=str(key_file),
+        )
+        result = subprocess.run(
+            ["bash", "-c", startup], cwd=tmp_path, env=env,
+            capture_output=True, text=True, check=False, timeout=45,
+        )
+        assert result.returncode == 0, result.stderr
+        tenant, = (line.removeprefix("A2A_TENANT=") for line in result.stdout.splitlines()
+                   if line.startswith("A2A_TENANT="))
+        assert tenant.startswith("demo-")
+        tenants.add(tenant)
+        assert load_agent_identity(None, storage_dir=data / "demo").signing_did == did
+    assert len(tenants) == 2
 
     first = tmp_path / "first"
     first.mkdir()

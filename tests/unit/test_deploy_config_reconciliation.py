@@ -178,7 +178,7 @@ def test_dev_publication_selects_the_pinned_demo_registration(live_config):
     assert profile["secret_files"] == {
         env["KESTREL_DEMO_SEED_DATABASE"]: "kestrel-dev-a2a-db-seed:1",
         env["KESTREL_DEMO_SEED_BUNDLE"]: "kestrel-dev-a2a-identity-bundle:2",
-        env["KESTREL_DATA_KEY_FILE"]: "kestrel-dev-a2a-data-key:1",
+        env["KESTREL_DEMO_SEED_DATA_KEY_FILE"]: "kestrel-dev-a2a-data-key:1",
     }
     assert "KESTREL_IDENTITY_BUNDLE" not in profile["secrets"]
     assert "KESTREL_DATA_KEY" not in profile["secrets"]
