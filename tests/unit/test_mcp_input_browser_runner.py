@@ -45,13 +45,14 @@ def test_input_browser_support_matches_the_public_host_feature_minimum():
 def test_input_browser_runtime_install_resolves_candidate_dependencies():
     python = Path('/original runtime/bin/python')
     wheel = Path('/owned/candidate core.whl')
-    command = runner().runtime_install_command(python, '0.18.0', wheel)
+    fixture_version = '1.2.3'
+    command = runner().runtime_install_command(python, fixture_version, wheel)
     assert command[:3] == ['uv', 'pip', 'install']
     assert '--no-deps' not in command, (
         'Replacing Core without its declared dependencies leaves the base SDK installed')
     assert command[command.index('--python') + 1] == str(python)
     assert command[command.index('--index-url') + 1] == 'https://pypi.org/simple'
-    assert command[-2:] == ['kestrel-feature-mcp==0.18.0', str(wheel)]
+    assert command[-2:] == [f'kestrel-feature-mcp=={fixture_version}', str(wheel)]
 
 
 def test_native_browser_refuses_unknown_suite_before_building():
