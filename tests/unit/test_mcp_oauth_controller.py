@@ -176,6 +176,24 @@ async def test_bad_state_retires_original_handle_without_exchange(controller):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [{"code": "owned-code"}, {"error": "access_denied"}])
+async def test_foreign_issuer_retires_original_operation_before_feature_io(controller, outcome):
+    b = controller
+    started = await begin(b)
+    assert started.status_code == 200
+    identifier = started.json()["operation_id"]
+    response = await b.client.post(f"/api/mcp/oauth/authorizations/{identifier}/callback", json={
+        "state": callback_body(b)["state"],
+        "iss": "https://issuer.example/",
+        **outcome,
+    }, headers={"X-API-Key": API_KEY})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "mcp_oauth_callback_issuer_mismatch"
+    assert [call[0] for call in b.runtime.calls] == ["begin"]
+    assert identifier not in b.host._pending and len(b.runtime.retired) == 1
+
+
+@pytest.mark.asyncio
 async def test_consumed_unknown_exchange_is_never_replayed(controller):
     b = controller
     initial = await begin(b)

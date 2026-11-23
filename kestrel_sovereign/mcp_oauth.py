@@ -183,6 +183,7 @@ class _PendingAuthorization:
     expires_at: datetime
     handle: object = field(default_factory=object)
     state_hash: bytes | None = None
+    issuer: str | None = None
     consumed: bool = False
     finished: bool = False
     withdrawn: bool = False
@@ -1022,6 +1023,7 @@ class MCPOAuthHost:
             if pending.expires_at <= self.authority.clock():
                 raise MCPOAuthRequestError(410, "mcp_oauth_operation_expired")
             pending.state_hash = hashlib.sha256(started.state.encode("utf-8")).digest()
+            pending.issuer = started.issuer
             reader.opened_operation = identifier
             return JSONResponse({"operation_id": identifier, "authorization_url": started.authorization_url,
                 "issuer": started.issuer, "resource": started.resource, "scopes": started.scopes,
@@ -1037,6 +1039,9 @@ class MCPOAuthHost:
         if not hmac.compare_digest(pending.state_hash, hashlib.sha256(value.state.encode("utf-8")).digest()):
             await self._retire_pending(identifier, pending)
             raise MCPOAuthRequestError(400, "mcp_oauth_state_mismatch")
+        if value.iss != pending.issuer:
+            await self._retire_pending(identifier, pending)
+            raise MCPOAuthRequestError(400, "mcp_oauth_callback_issuer_mismatch")
         pending.consumed = True
         pending.in_flight = True
         try:
