@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 CANONICAL = Path(__file__).resolve().parent.parent / "kestrel_sovereign" / "data" / "KESTREL_CONSTITUTION.md"
-MIRROR = Path(__file__).resolve().parent.parent / "docs" / "principles" / "KESTREL_CONSTITUTION.md"
+MIRROR = Path(__file__).resolve().parent.parent / "doctrine" / "constitutions" / "v1" / "KESTREL_CONSTITUTION.md"
 
 
 @pytest.mark.parametrize("path", [CANONICAL, MIRROR], ids=["canonical", "mirror"])

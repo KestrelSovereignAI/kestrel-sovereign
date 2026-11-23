@@ -4643,8 +4643,7 @@
     },
     {
       "existing_code_refs": [
-        "kestrel_sovereign/constitution/hierarchy.py",
-        "kestrel_sovereign/identity/rotation_ceremony.py"
+        "kestrel_sovereign/data/KESTREL_CONSTITUTION.md"
       ],
       "findings": [],
       "missing_code_refs": [],
@@ -4652,8 +4651,8 @@
       "path": "docs/principles/KESTREL_CONSTITUTION.md",
       "privacy": "public",
       "render": "public",
-      "status": "active",
-      "title": "The Kestrel Constitution",
+      "status": "superseded",
+      "title": "The Kestrel Constitution (first edition)",
       "type": "Principle Document"
     },
     {

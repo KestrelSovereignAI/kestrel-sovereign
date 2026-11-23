@@ -249,3 +249,10 @@ def test_generator_refreshes_provider_discovery_before_default_resolution():
     assert model_name == "claude-sonnet-4-6"
     refresh.assert_called_once_with("anthropic")
     assert resolve.call_args.kwargs["cached_models"] == discovered
+
+
+def test_constitution_table_requires_its_canonical_references():
+    with pytest.raises(ValueError, match="missing Constitution and governance references"):
+        generate_feature_docs.normalize_constitution_row(
+            "No constitutional source section", "| Constitution & governance | stale source |",
+        )

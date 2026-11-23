@@ -207,7 +207,7 @@ def test_selected_corpus_owns_constitution_release(tmp_path: Path):
     assert len(pages) == 3
     first = next(p for p in pages if p["src"] == relocated / sources[1])
     assert first["rel"] == build_docs_site.display_path(relocated / sources[1])
-    assert first["title"] == "The Kestrel Constitution"
+    assert first["title"] == "The Kestrel Constitution (first edition)"
     assert "publication_notice" not in first
     assert "repo_root" not in first
     assert not any(p["rel"] == build_docs_site.CONSTITUTION_RELEASE_PAGE for p in pages)

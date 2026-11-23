@@ -30,7 +30,7 @@ RELEASE_URL = (
     f"constitution-v2.0.0/{RELEASE_SOURCE}"
 )
 PROTECTED = (
-    "docs/principles/KESTREL_CONSTITUTION.md",
+    "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md",
     "docs/proposals/constitution-and-pledge/CONSTITUTION.md",
     "kestrel_sovereign/data/KESTREL_CONSTITUTION.md",
     RELEASE_SOURCE,
@@ -192,7 +192,7 @@ def test_first_edition_bookmark_has_notice_and_direct_current_link(handbook):
     assert "second edition" in page.notices[0].lower()
     assert any(href == RELEASE_URL for href, _, sidebar in page.links if not sidebar)
     source = (site / f"src/content/docs/{FIRST}.md").read_text(encoding="utf-8")
-    assert source.index(":::note") < source.index("## Preamble")
+    assert source.index(":::note") < source.index("This bookmark")
 
 
 def test_proposal_has_historical_notice_and_direct_current_link(handbook):

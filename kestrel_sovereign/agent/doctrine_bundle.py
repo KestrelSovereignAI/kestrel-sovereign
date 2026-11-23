@@ -133,8 +133,11 @@ PROP_BUNDLE_ANCHORED_PATHS = "doctrine_anchored_paths"
 # caller resolves to absolute via ``project_root``. The order MATTERS
 # for the bundle hash — keeping it explicit so future appends don't
 # silently shift hashes for existing agents.
+LEGACY_CONSTITUTION_MIRROR_PATH = "docs/principles/KESTREL_CONSTITUTION.md"
+HISTORICAL_CONSTITUTION_MIRROR_PATH = "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md"
+
 DEFAULT_ANCHORED_PATHS: List[str] = [
-    "docs/principles/KESTREL_CONSTITUTION.md",
+    HISTORICAL_CONSTITUTION_MIRROR_PATH,
     "docs/TORTOISE_DOCTRINE.md",
     "AGENTS.md",
 ]
@@ -146,7 +149,8 @@ class DoctrineBundleSnapshot:
 
     A snapshot binds a hash to the exact list of files that contributed
     to it, in order. Anchoring stores the hash + file list; verification
-    rebuilds with the same list and compares hashes.
+    resolves current defaults and operator extras and compares hashes. Stored
+    file paths remain the original audit evidence, not a replay instruction.
     """
 
     hash: str
@@ -246,7 +250,9 @@ def resolve_anchored_paths(
     The defaults (``DEFAULT_ANCHORED_PATHS``) are always tried first;
     operator-extras follow in declaration order. All paths are repo-
     relative against ``project_root``; absolute paths in
-    ``extra_paths`` are honored as-is.
+    ``extra_paths`` are honored as-is. The historical default uses the old
+    location only in checkouts without the relocated mirror. Operator extras,
+    including the old reader path, are never redirected or deduplicated.
 
     Args:
         project_root: The repo root the paths are relative to.
@@ -258,7 +264,12 @@ def resolve_anchored_paths(
     """
     paths: List[Path] = []
     for rel in DEFAULT_ANCHORED_PATHS:
-        paths.append(project_root / rel)
+        path = project_root / rel
+        # Older/custom checkouts still keep their own mirror at the old path.
+        # Select one default in the same slot: basename and full bytes are hashed.
+        if rel == HISTORICAL_CONSTITUTION_MIRROR_PATH and not path.exists():
+            path = project_root / LEGACY_CONSTITUTION_MIRROR_PATH
+        paths.append(path)
     for rel in extra_paths or []:
         rel_path = Path(rel)
         if rel_path.is_absolute():

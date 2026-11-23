@@ -17,7 +17,7 @@ async def test_successful_inception(tmp_path):
     output_dir = tmp_path / "test_agent"
     
     # The constitution must exist relative to the execution path
-    constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
+    constitution_path = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
     assert constitution_path.exists(), "Test requires the Kestrel Constitution to exist at the project root."
 
     credentials = await create_kestrel_identity_async(str(output_dir))

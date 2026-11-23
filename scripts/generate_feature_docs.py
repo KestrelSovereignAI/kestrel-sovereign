@@ -429,6 +429,21 @@ def normalize_generated_links(text: str) -> str:
     return _INLINE_LINK_RE.sub(replace, text)
 
 
+def normalize_constitution_row(source: str, transformed: str) -> str:
+    """Keep the developer table's edition labels and links from its input."""
+    if not re.search(r"^\| Constitution & governance \|", transformed, re.M):
+        return transformed
+    match = re.search(r"^- Constitution and governance:\n((?:  - .+\n)+)", source, re.M)
+    if match is None:
+        raise ValueError("canonical inventory is missing Constitution and governance references")
+    references = ", ".join(line.removeprefix("  - ") for line in match[1].splitlines())
+    return re.sub(
+        r"^\| Constitution & governance \|.*$",
+        lambda _match: f"| Constitution & governance | {references} |",
+        transformed, flags=re.M,
+    )
+
+
 def compose_generated_body(source: str, transformed: str) -> str:
     """Validate audience prose and prepend both canonical contracts."""
     boundary_contract = extract_boundary_contract(source)
@@ -443,6 +458,7 @@ def compose_generated_body(source: str, transformed: str) -> str:
             "context honesty:\n- "
             + "\n- ".join(violations)
         )
+    transformed = normalize_constitution_row(source, transformed)
     transformed = normalize_generated_links(transformed)
     return f"{boundary_contract}\n\n{context_contract}\n\n{transformed}\n"
 

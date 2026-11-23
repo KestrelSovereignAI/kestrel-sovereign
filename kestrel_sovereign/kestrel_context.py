@@ -27,8 +27,8 @@ class KestrelContextLoader:
 
     # Essential docs referenced in AGENTS.md
     ESSENTIAL_DOCS = [
-        "docs/PROJECT_VISION.md",
         "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md",
+        "docs/PROJECT_VISION.md",  # Historical founding example; not operative terms
         "docs/principles/US_CONSTITUTION.md",
         "docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md",
         "docs/architecture/security/PRIVACY_MODES.md",

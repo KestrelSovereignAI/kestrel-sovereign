@@ -66,7 +66,7 @@ CONSTITUTION_READER_CONTEXT = {
         "title": "The Kestrel Constitution (first edition)",
         "publication_notice": (
             "info",
-            "This is the first edition, preserved for historical reference. "
+            "This bookmark identifies the first edition; its historical bytes are preserved separately. "
             f"Read the [published second edition]({CONSTITUTION_RELEASE_URL}) "
             "for the current text.",
         ),
