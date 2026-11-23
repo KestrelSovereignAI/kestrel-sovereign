@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md"
       - "kestrel_sovereign/data/constitutions/v2/**"
       - "scripts/build_docs_site.py"
       - "scripts/docs_okf.py"
@@ -20,6 +21,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md"
       - "kestrel_sovereign/data/constitutions/v2/**"
       - "scripts/build_docs_site.py"
       - "scripts/docs_okf.py"

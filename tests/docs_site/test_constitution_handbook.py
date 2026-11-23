@@ -17,6 +17,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
+from bs4 import BeautifulSoup
 
 from scripts.docs_okf import split_frontmatter
 
@@ -30,7 +31,7 @@ RELEASE_URL = (
     f"constitution-v2.0.0/{RELEASE_SOURCE}"
 )
 PROTECTED = (
-    "docs/principles/KESTREL_CONSTITUTION.md",
+    "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md",
     "docs/proposals/constitution-and-pledge/CONSTITUTION.md",
     "kestrel_sovereign/data/KESTREL_CONSTITUTION.md",
     RELEASE_SOURCE,
@@ -193,6 +194,26 @@ def test_first_edition_bookmark_has_notice_and_direct_current_link(handbook):
     assert any(href == RELEASE_URL for href, _, sidebar in page.links if not sidebar)
     source = (site / f"src/content/docs/{FIRST}.md").read_text(encoding="utf-8")
     assert source.index(":::note") < source.index("## Preamble")
+    _, archived_body, error = split_frontmatter((ROOT / PROTECTED[0]).read_text(encoding="utf-8"))
+    assert error is None
+    assert archived_body[archived_body.index("## Preamble"):].strip() in source
+    html = (site / "dist" / FIRST / "index.html").read_text(encoding="utf-8")
+    for anchor in ("preamble", "book-i-universal-values", "book-iv-agent-identity"):
+        assert f'id="{anchor}"' in html
+
+
+def test_developer_bookmark_offers_both_editions_in_the_foundation_table(handbook):
+    site, _, _, _ = handbook
+    html = (site / "dist/generated/features-developer/index.html").read_text(encoding="utf-8")
+    document = BeautifulSoup(html, "html.parser")
+    heading = document.find("h3", id="constitutional-and-sovereign-foundation")
+    assert heading is not None
+    table = heading.find_next(["table", "h2", "h3", "h4"])
+    assert table.name == "table"
+    row = next(row for row in table.select("tbody tr") if row.td.get_text(strip=True) == "Constitution & governance")
+    links = {link.get_text(strip=True): link["href"] for link in row.select("a[href]")}
+    assert links["Published second-edition Constitution"] == RELEASE_URL
+    assert links["Packaged first-edition default"].endswith("/blob/main/kestrel_sovereign/data/KESTREL_CONSTITUTION.md")
 
 
 def test_proposal_has_historical_notice_and_direct_current_link(handbook):

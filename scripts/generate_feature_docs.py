@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from markdown_it import MarkdownIt
+from markdown_it.tree import SyntaxTreeNode
 
 from kestrel_sovereign.llm.model_catalog import get_catalog_service
 from kestrel_sovereign.llm.model_metadata import ModelInfo
@@ -429,7 +431,83 @@ def normalize_generated_links(text: str) -> str:
     return _INLINE_LINK_RE.sub(replace, text)
 
 
-def compose_generated_body(source: str, transformed: str) -> str:
+_FOUNDATION_HEADING = "Constitutional and Sovereign Foundation"
+_PACKAGED_CONSTITUTION = "kestrel_sovereign/data/KESTREL_CONSTITUTION.md"
+
+
+def _markdown_tree(text: str) -> SyntaxTreeNode:
+    return SyntaxTreeNode(MarkdownIt().enable("table").parse(text))
+
+
+def _visible_text(node: SyntaxTreeNode) -> str:
+    return "".join(part.content for part in node.walk() if part.type in {"text", "code_inline"})
+
+
+def _links_to_packaged_constitution(node: SyntaxTreeNode) -> bool:
+    return node.type == "link" and node.attrGet("href").partition("#")[0].endswith(_PACKAGED_CONSTITUTION)
+
+
+def _packaged_reference_labels(text: str) -> set[str]:
+    return {_visible_text(node) for node in _markdown_tree(text).walk() if _links_to_packaged_constitution(node)}
+
+
+def _constitution_references(source: str) -> str:
+    match = re.search(r"^- Constitution and governance:\n((?:  - .+(?:\n|$))+)", source, re.M)
+    if match is None:
+        raise ValueError("canonical inventory is missing Constitution and governance references")
+    references = ", ".join(line.removeprefix("  - ") for line in match[1].splitlines())
+    return normalize_generated_links(references)
+
+
+def normalize_constitution_row(source: str, transformed: str) -> str:
+    """Place the canonical row at the bookmarked heading in rendered GFM."""
+    canonical = f"| Constitution & governance | {_constitution_references(source)} |"
+    document = _markdown_tree(transformed)
+    lines = transformed.split("\n")
+    heading_end = None
+    first_body_row = None
+    in_foundation = False
+    for block in document.children:
+        if block.type == "heading":
+            in_foundation = _visible_text(block).casefold() == _FOUNDATION_HEADING.casefold()
+            if in_foundation:
+                if heading_end is not None:
+                    raise ValueError("Generated developer document has duplicate Constitution foundation headings")
+                heading_end = block.map[1]
+        elif block.type == "table":
+            header = block.children[0].children[0]
+            columns = tuple(_visible_text(cell).strip().casefold() for cell in header.children)
+            if in_foundation and first_body_row is None and columns in {("concern", "key files"), ("area", "references")}:
+                first_body_row = block.map[0] + 2  # GFM header and delimiter
+            for row in block.walk():
+                if row.type != "tr" or row.children[0].type != "td":
+                    continue
+                heading = _visible_text(row.children[0]).strip().casefold()
+                if heading in {"constitution and governance", "constitution & governance"} or any(
+                    _links_to_packaged_constitution(link) for link in row.walk()
+                ):
+                    # Keep source line numbers stable until the insertion.
+                    lines[row.map[0]] = None
+
+    if first_body_row is not None:
+        lines.insert(first_body_row, canonical)
+    else:
+        table = ["| Area | References |", "| --- | --- |", canonical]
+        if heading_end is None:
+            lines.extend(["", f"## {_FOUNDATION_HEADING}", "", *table])
+        else:
+            lines[heading_end:heading_end] = ["", *table, ""]
+    return "\n".join(line for line in lines if line is not None)
+
+
+def _developer_reference_labels_current(source: str, text: str) -> bool:
+    references = _constitution_references(source)
+    labels = _packaged_reference_labels(text)
+    canonical_labels = _packaged_reference_labels(references)
+    return bool(canonical_labels) and labels == canonical_labels
+
+
+def compose_generated_body(source: str, transformed: str, *, audience: str | None = None) -> str:
     """Validate audience prose and prepend both canonical contracts."""
     boundary_contract = extract_boundary_contract(source)
     context_contract = extract_context_contract(source)
@@ -443,7 +521,11 @@ def compose_generated_body(source: str, transformed: str) -> str:
             "context honesty:\n- "
             + "\n- ".join(violations)
         )
+    if audience == "developer":
+        transformed = normalize_constitution_row(source, transformed)
     transformed = normalize_generated_links(transformed)
+    if audience == "developer" and not _developer_reference_labels_current(source, transformed):
+        raise ValueError("Generated developer document contains stale Constitution edition references")
     return f"{boundary_contract}\n\n{context_contract}\n\n{transformed}\n"
 
 
@@ -466,7 +548,7 @@ def sync_protected_contracts() -> list[Path]:
         path = OUTPUT_DIR / f"FEATURES_{audience}.md"
         current = path.read_text(encoding="utf-8")
         header, transformed = _split_frontmatter(current)
-        rendered = header + compose_generated_body(source, transformed)
+        rendered = header + compose_generated_body(source, transformed, audience=audience)
         if current != rendered:
             path.write_text(rendered, encoding="utf-8")
             updated.append(path)
@@ -515,6 +597,13 @@ def check_generated_docs() -> int:
         body = text.replace(boundary_contract, "", 1).replace(
             context_contract, "", 1
         )
+        if audience == "developer" and (
+            normalize_constitution_row(source, body) != body
+            or not _developer_reference_labels_current(source, body)
+        ):
+            failures.append(
+                f"{path.relative_to(PROJECT_ROOT)}: Constitution edition references are missing, duplicated, or stale"
+            )
         for violation in find_boundary_promotions(body, aliases):
             failures.append(f"{path.relative_to(PROJECT_ROOT)}: {violation}")
         for violation in find_context_overclaims(body):
@@ -680,7 +769,7 @@ def generate(
 
     print(f"Generating {audience} version via {provider}/{model_name}...")
     result = call_fn(profile["system"] + protected_rules, user_prompt)
-    body = compose_generated_body(source, result)
+    body = compose_generated_body(source, result, audience=audience)
 
     # Write output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

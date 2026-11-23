@@ -122,7 +122,7 @@ def build_evidence():
             "No changes needed for Feature 4.",
         ],
         architecture_docs=[
-            "docs/principles/KESTREL_CONSTITUTION.md",
+            "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md",
             "kestrel_sovereign/features/base.py (Feature ABC pattern)",
             "kestrel_sovereign/data/council_sessions/82ce894a-be4f-406a-b6d2-b19fbfbe91b8.json",
         ],

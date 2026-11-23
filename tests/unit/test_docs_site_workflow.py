@@ -19,7 +19,7 @@ def test_docs_pr_checks_are_read_only_and_deploy_is_main_only(workflow):
     assert events["pull_request"]["branches"] == ["main"]
     assert set(paths) == set(events["push"]["paths"])
     for changed in (
-        "docs/**", "kestrel_sovereign/data/constitutions/v2/**",
+        "docs/**", "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md", "kestrel_sovereign/data/constitutions/v2/**",
         "scripts/build_docs_site.py", "scripts/docs_okf.py", "scripts/docs_verify.py",
         "tests/docs_site/**", "tests/unit/test_build_docs_site.py",
         "tests/unit/test_docs_site_workflow.py", ".github/workflows/docs-site.yml",

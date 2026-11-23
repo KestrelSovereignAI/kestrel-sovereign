@@ -42,6 +42,8 @@ from docs_verify import render_channel  # noqa: E402
 
 DEFAULT_SITE_ROOT = PROJECT_ROOT / "site"
 GITHUB_REPO_URL = "https://github.com/KestrelSovereignAI/kestrel-sovereign"
+CONSTITUTION_FIRST_PAGE = "docs/principles/KESTREL_CONSTITUTION.md"
+CONSTITUTION_FIRST_ARCHIVE = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
 CONSTITUTION_RELEASE_TAG = "constitution-v2.0.0"
 CONSTITUTION_RELEASE_PATH = Path("kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md")
 CONSTITUTION_RELEASE_PAGE = "docs/principles/KESTREL_CONSTITUTION_V2.md"
@@ -62,11 +64,11 @@ CONSTITUTION_READER_CONTEXT = {
             f"[Published package source]({CONSTITUTION_RELEASE_URL}).",
         ),
     },
-    "docs/principles/KESTREL_CONSTITUTION.md": {
+    CONSTITUTION_FIRST_PAGE: {
         "title": "The Kestrel Constitution (first edition)",
         "publication_notice": (
             "info",
-            "This is the first edition, preserved for historical reference. "
+            "This page preserves the first edition and its original sections. "
             f"Read the [published second edition]({CONSTITUTION_RELEASE_URL}) "
             "for the current text.",
         ),
@@ -184,6 +186,14 @@ def select_pages(
             skipped.append((rel, f"render={channel}"))
             continue
 
+        body = doc.body
+        if is_handbook and rel == CONSTITUTION_FIRST_PAGE:
+            # Keep the original handbook URL and section anchors. The shorter
+            # navigation text belongs to the GitHub bookmark at this docs path.
+            archived, error = read_okf_document(repo_root / CONSTITUTION_FIRST_ARCHIVE)
+            if error or archived is None:
+                raise ValueError(f"First-edition Constitution has invalid OKF metadata: {error}")
+            body = archived.body
         fm = doc.frontmatter
         pages.append(
             {
@@ -195,7 +205,7 @@ def select_pages(
                 "channel": channel,
                 "title": fm.get("title") or first_h1(doc.body) or path.stem,
                 "description": fm.get("description", ""),
-                "body": doc.body,
+                "body": body,
                 "frontmatter": fm,
                 **(CONSTITUTION_READER_CONTEXT.get(rel, {}) if is_handbook else {}),
             }

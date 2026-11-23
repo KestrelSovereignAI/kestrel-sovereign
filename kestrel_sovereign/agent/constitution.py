@@ -2,6 +2,7 @@
 import asyncio
 import contextvars
 import hashlib
+import io
 import logging
 import os
 from collections import OrderedDict
@@ -167,6 +168,53 @@ def safe_mode_cognition_block(agent, user_input: str) -> str | None:
         "Use !safe-mode to check status or !verify-constitution to re-verify.\n\n"
         "Normal operation will resume once the restriction is cleared."
     )
+
+
+async def _doctrine_read_inputs(agent, project_root):
+    """Get the same configured paths, stored hash and bootstrap inputs for each reader."""
+    from kestrel_sovereign.agent.doctrine_bundle import (
+        PROP_BUNDLE_ANCHORED_PATHS, PROP_BUNDLE_HASH, resolve_anchored_paths,
+    )
+
+    extra_paths = []
+    anchored_hash = None
+    try:
+        agent_node = await agent.storage.get_node(agent.agent_id)
+        if agent_node is not None:
+            anchored_hash = agent_node.properties.get(PROP_BUNDLE_HASH)
+            extra_paths = (
+                agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
+            )
+    except Exception as control_error:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+
+        if is_execution_control_error(control_error):
+            raise
+        logging.exception(
+            "Doctrine reader: agent_node lookup failed; "
+            "computing bundle without operator-extra paths"
+        )
+
+    # Bootstrap files come from the context_builder when present.
+    bootstrap_files: "OrderedDict[str, str]" = OrderedDict()
+    cb = getattr(agent, "context_builder", None)
+    if cb is not None:
+        try:
+            bootstrap_files = OrderedDict(cb._bootstrap_files)
+        except Exception as control_error:
+            from kestrel_sovereign.execution_custody import (
+                is_execution_control_error,
+            )
+
+            if is_execution_control_error(control_error):
+                raise
+            logging.exception(
+                "Doctrine reader: bootstrap loader read failed"
+            )
+            bootstrap_files = OrderedDict()
+
+    paths = resolve_anchored_paths(project_root=project_root, extra_paths=extra_paths)
+    return paths, anchored_hash, bootstrap_files
 
 
 class ConstitutionMixin:
@@ -373,59 +421,16 @@ class ConstitutionMixin:
         "doctrine_anchored_paths"]`) + bootstrap files from
         `self.context_builder._bootstrap_files` if available.
         """
-        from kestrel_sovereign.agent.doctrine_bundle import (
-            PROP_BUNDLE_ANCHORED_PATHS,
-            compute_doctrine_bundle_hash,
-            resolve_anchored_paths,
-        )
+        from kestrel_sovereign.agent.doctrine_bundle import read_doctrine_bundle_for_receipt
 
         project_root = await self._resolve_project_root_for_doctrine()
         if project_root is None:
             return None
-
-        extra_paths = []
         try:
-            agent_node = await self.storage.get_node(self.agent_id)
-            if agent_node is not None:
-                extra_paths = (
-                    agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
-                )
-        except Exception as control_error:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-
-            if is_execution_control_error(control_error):
-                raise
-            logging.exception(
-                "compute_live_doctrine_bundle_hash: agent_node lookup failed; "
-                "computing bundle without operator-extra paths"
-            )
-
-        anchored_paths = resolve_anchored_paths(
-            project_root=project_root, extra_paths=extra_paths
-        )
-
-        # Bootstrap files come from the context_builder when present.
-        bootstrap_files: "OrderedDict[str, str]" = OrderedDict()
-        cb = getattr(self, "context_builder", None)
-        if cb is not None:
-            try:
-                bootstrap_files = OrderedDict(cb._bootstrap_files)
-            except Exception as control_error:
-                from kestrel_sovereign.execution_custody import (
-                    is_execution_control_error,
-                )
-
-                if is_execution_control_error(control_error):
-                    raise
-                logging.exception(
-                    "compute_live_doctrine_bundle_hash: bootstrap loader read failed"
-                )
-                bootstrap_files = OrderedDict()
-
-        try:
-            snapshot = compute_doctrine_bundle_hash(
-                anchored_files=anchored_paths,
-                bootstrap_files=bootstrap_files,
+            paths, anchored_hash, bootstrap_files = await _doctrine_read_inputs(self, project_root)
+            snapshot, _ = read_doctrine_bundle_for_receipt(
+                project_root=project_root, paths=paths, bootstrap_files=bootstrap_files,
+                anchored_hash=anchored_hash,
             )
             return snapshot.hash
         except Exception as control_error:
@@ -450,34 +455,12 @@ class ConstitutionMixin:
         wiring, full injection would record the doctrine bundle hash
         for audit but the model would never see the doctrine content.
         """
-        from kestrel_sovereign.agent.doctrine_bundle import (
-            PROP_BUNDLE_ANCHORED_PATHS,
-            resolve_anchored_paths,
-        )
+        from kestrel_sovereign.agent.doctrine_bundle import read_doctrine_bundle_for_receipt
 
         project_root = await self._resolve_project_root_for_doctrine()
         if project_root is None:
             return None
-
-        extra_paths = []
-        try:
-            agent_node = await self.storage.get_node(self.agent_id)
-            if agent_node is not None:
-                extra_paths = (
-                    agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
-                )
-        except Exception as control_error:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-
-            if is_execution_control_error(control_error):
-                raise
-            logging.exception(
-                "get_anchored_doctrine_files: agent_node lookup failed"
-            )
-
-        anchored_paths = resolve_anchored_paths(
-            project_root=project_root, extra_paths=extra_paths
-        )
+        anchored_paths, anchored_hash, bootstrap_files = await _doctrine_read_inputs(self, project_root)
 
         # Codex round-18 P2: skip the constitution itself when
         # building the anchored-doctrine injection map. The agent's
@@ -505,8 +488,12 @@ class ConstitutionMixin:
         # paths with the same basename get a logged warning and only
         # the FIRST occurrence wins (predictable, reproducible). The
         # alternative — silently overwriting — was the codex finding.
+        _, contents = read_doctrine_bundle_for_receipt(
+            project_root=project_root, paths=anchored_paths, bootstrap_files=bootstrap_files,
+            anchored_hash=anchored_hash,
+        )
         files: "OrderedDict[str, str]" = OrderedDict()
-        for path in anchored_paths:
+        for path, data in contents:
             if path.name in skip_names:
                 continue
             if path.name in files:
@@ -520,19 +507,9 @@ class ConstitutionMixin:
                     path,
                 )
                 continue
-            try:
-                files[path.name] = path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                # Match doctrine_bundle behavior — missing anchored
-                # files are skipped, not an error.
-                continue
-            except OSError as e:
-                logging.warning(
-                    "get_anchored_doctrine_files: cannot read %s: %s",
-                    path,
-                    e,
-                )
-                continue
+            # Match Path.read_text's UTF-8 decoding and universal newlines.
+            with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8") as reader:
+                files[path.name] = reader.read()
         return files
 
     async def _resolve_project_root_for_doctrine(self) -> Optional[Path]:

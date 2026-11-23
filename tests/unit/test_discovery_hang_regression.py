@@ -318,49 +318,34 @@ async def test_process_discovery_message_times_out_on_llm_hang():
 
 
 def test_constitution_feature_finds_package_shipped_constitution(tmp_path, monkeypatch):
-    """When CWD has no ``docs/principles/KESTREL_CONSTITUTION.md`` (the
-    pip-install case), the loader falls back to the
-    ``kestrel_sovereign/data/KESTREL_CONSTITUTION.md`` shipped in the
-    wheel."""
-    from kestrel_sovereign.config import CONSTITUTION_PATH
+    """The standalone reader uses the shipped release outside a checkout too."""
     from kestrel_sovereign.features.constitution import ConstitutionFeature
 
-    monkeypatch.chdir(tmp_path)  # CWD has no docs/ dir
-
+    monkeypatch.chdir(tmp_path)
     text = ConstitutionFeature._read_canonical_constitution()
-
-    assert "Kestrel" in text or "Constitution" in text or "Article" in text or "Book" in text, (
-        f"package-shipped constitution at {CONSTITUTION_PATH} read but content "
-        f"didn't match any expected token: first 200 chars = {text[:200]!r}"
-    )
+    assert "constitution_version: 2" in text
+    assert "## Whose rule applies" in text
 
 
-def test_constitution_feature_prefers_source_clone_path(tmp_path, monkeypatch):
-    """Source clones with a real ``docs/principles/KESTREL_CONSTITUTION.md``
-    in CWD still get THAT file (so ongoing edits are picked up without a
-    rebuild)."""
+def test_constitution_feature_ignores_cwd_reader_bookmark(tmp_path, monkeypatch):
     from kestrel_sovereign.features.constitution import ConstitutionFeature
 
-    docs = tmp_path / "docs" / "principles"
+    docs = tmp_path / "docs/principles"
     docs.mkdir(parents=True)
-    (docs / "KESTREL_CONSTITUTION.md").write_text("MARKER-SOURCE-CLONE-WINS\n")
+    (docs / "KESTREL_CONSTITUTION.md").write_text("MARKER-NOT-AUTHORITY\n")
     monkeypatch.chdir(tmp_path)
-
     text = ConstitutionFeature._read_canonical_constitution()
+    assert "MARKER-NOT-AUTHORITY" not in text
+    assert "constitution_version: 2" in text
 
-    assert "MARKER-SOURCE-CLONE-WINS" in text
 
+def test_constitution_feature_missing_release_does_not_fall_back_to_first_edition(tmp_path, monkeypatch):
+    from kestrel_sovereign.features import constitution as module
 
-def test_constitution_feature_reports_path_when_neither_exists(tmp_path, monkeypatch):
-    """Both candidate paths missing → raise with a clear list, not a
-    bare FileNotFoundError that hides the second candidate."""
-    from kestrel_sovereign.features import constitution as const_mod
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(const_mod, "CONSTITUTION_PATH", str(tmp_path / "nope.md"), raising=False)
-    # Patch the import-inside-function so the helper sees our fake CONSTITUTION_PATH.
-    import kestrel_sovereign.config as cfg_mod
-    monkeypatch.setattr(cfg_mod, "CONSTITUTION_PATH", str(tmp_path / "nope.md"))
-
-    with pytest.raises(FileNotFoundError, match="not found at any of"):
-        const_mod.ConstitutionFeature._read_canonical_constitution()
+    package = tmp_path / "package"
+    (package / "data").mkdir(parents=True)
+    (package / "data/KESTREL_CONSTITUTION.md").write_text("First edition is not the public release")
+    monkeypatch.setattr(module, "__file__", str(package / "features/constitution.py"))
+    with pytest.raises(FileNotFoundError) as missing:
+        module.ConstitutionFeature._read_canonical_constitution()
+    assert missing.value.filename == str(package / "data/constitutions/v2/KESTREL_CONSTITUTION.md")
