@@ -375,8 +375,8 @@ class ConstitutionMixin:
         """
         from kestrel_sovereign.agent.doctrine_bundle import (
             PROP_BUNDLE_ANCHORED_PATHS,
-            compute_doctrine_bundle_hash,
-            resolve_anchored_paths,
+            PROP_BUNDLE_HASH,
+            compute_doctrine_bundle_for_receipt,
         )
 
         project_root = await self._resolve_project_root_for_doctrine()
@@ -384,9 +384,11 @@ class ConstitutionMixin:
             return None
 
         extra_paths = []
+        anchored_hash = None
         try:
             agent_node = await self.storage.get_node(self.agent_id)
             if agent_node is not None:
+                anchored_hash = agent_node.properties.get(PROP_BUNDLE_HASH)
                 extra_paths = (
                     agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
                 )
@@ -399,10 +401,6 @@ class ConstitutionMixin:
                 "compute_live_doctrine_bundle_hash: agent_node lookup failed; "
                 "computing bundle without operator-extra paths"
             )
-
-        anchored_paths = resolve_anchored_paths(
-            project_root=project_root, extra_paths=extra_paths
-        )
 
         # Bootstrap files come from the context_builder when present.
         bootstrap_files: "OrderedDict[str, str]" = OrderedDict()
@@ -423,9 +421,10 @@ class ConstitutionMixin:
                 bootstrap_files = OrderedDict()
 
         try:
-            snapshot = compute_doctrine_bundle_hash(
-                anchored_files=anchored_paths,
+            snapshot = compute_doctrine_bundle_for_receipt(
+                project_root=project_root, extra_paths=extra_paths,
                 bootstrap_files=bootstrap_files,
+                anchored_hash=anchored_hash,
             )
             return snapshot.hash
         except Exception as control_error:

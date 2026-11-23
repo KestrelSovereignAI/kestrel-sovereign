@@ -32,6 +32,12 @@ async def test_native_first_edition_full_and_original_preserve_anchor(native_too
         assert result.status.value == "ok"
         assert result.confirmation.encode() == text
         assert hashlib.sha256(result.confirmation.encode()).hexdigest() == digest
+    for kwargs in ({"article": "summary"}, {"summary": True}):
+        brief = await feature.get_constitution(**kwargs)
+        assert brief.status.value == "ok"
+        assert "four Books" in brief.confirmation
+        assert "Book I (Universal Values" in brief.confirmation
+        assert "Whose rule applies" not in brief.confirmation
     assert (await storage.get_node(agent.agent_id)).properties == before
     assert await storage.get_edges_from(agent.agent_id) == edges
     assert await storage.retrieve_file(digest) == text

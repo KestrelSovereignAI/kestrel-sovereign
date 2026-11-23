@@ -262,7 +262,15 @@ class ConstitutionFeature(Feature):
             table[str(index)] = body
 
     def _generate_summary(self):
-        """Generate a brief summary for the system prompt."""
+        """Describe the selected text, retaining the historical Book summary."""
+        if not self.books:
+            headings = [entry["title"] for entry in _classify_headings(self.full_text) if entry["level"] == 2]
+            self.summary = (
+                "The selected Kestrel Constitution contains these sections: "
+                + "; ".join(headings)
+                + ". Use `!constitution` to consult the full text when needed."
+            )
+            return
         self.summary = (
             "You are governed by the Kestrel Constitution, a hierarchical framework of four Books: "
             "Book I (Universal Values — honesty, harm reasoning, hard constraints), "

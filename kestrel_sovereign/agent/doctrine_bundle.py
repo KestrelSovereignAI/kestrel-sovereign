@@ -135,6 +135,9 @@ PROP_BUNDLE_ANCHORED_PATHS = "doctrine_anchored_paths"
 # silently shift hashes for existing agents.
 LEGACY_CONSTITUTION_MIRROR_PATH = "docs/principles/KESTREL_CONSTITUTION.md"
 HISTORICAL_CONSTITUTION_MIRROR_PATH = "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md"
+# Independent pin of the complete #4220 navigation wrapper, not its runtime hash.
+# Only an existing receipt matching the entire historical bundle permits its alias.
+LEGACY_READER_WRAPPER_SHA256 = "61ee8bdea7c3ff2bfcf134c1254813a054629bba64964b89d88c8a8cdc27c558"
 
 DEFAULT_ANCHORED_PATHS: List[str] = [
     HISTORICAL_CONSTITUTION_MIRROR_PATH,
@@ -200,12 +203,14 @@ def compute_doctrine_bundle_hash(
         DoctrineBundleSnapshot with the hash, the ordered list of files
         that actually contributed, and total byte size.
     """
-    parts: List[bytes] = []
-    contributing_files: List[str] = []
-    total_bytes = 0
+    return _hash_doctrine_contents(
+        _read_anchored_files(anchored_files), bootstrap_files
+    )
 
-    # Anchored doctrine files first — operator-declared, deterministic order.
-    for path in anchored_files:
+
+def _read_anchored_files(paths: List[Path]) -> List[Tuple[Path, bytes]]:
+    contents = []
+    for path in paths:
         try:
             content = path.read_bytes()
         except FileNotFoundError:
@@ -214,6 +219,18 @@ def compute_doctrine_bundle_hash(
         except OSError as e:
             logger.warning(f"Doctrine bundle: cannot read {path}: {e}")
             continue
+        contents.append((path, content))
+    return contents
+
+
+def _hash_doctrine_contents(
+    anchored_contents: List[Tuple[Path, bytes]],
+    bootstrap_files: OrderedDict[str, str],
+) -> DoctrineBundleSnapshot:
+    parts: List[bytes] = []
+    contributing_files: List[str] = []
+    total_bytes = 0
+    for path, content in anchored_contents:
         section = _file_section(path, path.name, content)
         parts.append(section)
         contributing_files.append(str(path))
@@ -279,6 +296,72 @@ def resolve_anchored_paths(
     return paths
 
 
+def compute_doctrine_bundle_for_receipt(
+    *,
+    project_root: Path,
+    extra_paths: List[str],
+    bootstrap_files: OrderedDict[str, str],
+    anchored_hash: Optional[str],
+) -> DoctrineBundleSnapshot:
+    """Try literal selections first, then the receipt-verified reader mapping v1.
+
+    The exact shipped wrapper may stand for the relocated historical payload
+    only when the ENTIRE candidate digest equals the existing receipt. Nothing
+    is redirected for new anchors. Repeated selections keep their positions.
+    Older/custom checkouts may instead retain their literal old default when
+    a newly shipped archive would displace it, again only on a full hash match.
+    No operator configuration or stored audit evidence is rewritten.
+    """
+    paths = resolve_anchored_paths(project_root=project_root, extra_paths=extra_paths)
+    contents = _read_anchored_files(paths)
+    literal = _hash_doctrine_contents(contents, bootstrap_files)
+    if not anchored_hash or literal.hash == anchored_hash:
+        return literal
+
+    legacy = project_root / LEGACY_CONSTITUTION_MIRROR_PATH
+    archive = project_root / HISTORICAL_CONSTITUTION_MIRROR_PATH
+    # Compare the actual entry point through directory aliases and '..' spellings.
+    # Keep the selected paths themselves unchanged for hashing and audit evidence.
+    legacy_resolved = legacy.resolve()
+    # Reuse exactly the bytes read for the literal snapshot, including duplicates.
+    legacy_contents = [(path, data) for path, data in contents if path.resolve() == legacy_resolved]
+    if not legacy_contents:
+        legacy_contents = _read_anchored_files([legacy])
+    if not legacy_contents:
+        return literal
+    legacy_bytes = legacy_contents[0][1]
+    mappings = []
+    if all(hashlib.sha256(data).hexdigest() == LEGACY_READER_WRAPPER_SHA256 for _, data in legacy_contents):
+        archive_contents = [(path, data) for path, data in contents if path == archive]
+        if not archive_contents:
+            archive_contents = _read_anchored_files([archive])
+        if not archive_contents:
+            return literal
+        candidate_contents = []
+        for path, data in contents:
+            if path.resolve() == legacy_resolved:
+                mappings.append((str(path), str(archive)))
+                candidate_contents.append((archive, archive_contents[0][1]))
+            else:
+                candidate_contents.append((path, data))
+    elif contents and paths[0] == archive and contents[0][0] == archive:
+        # An older/custom checkout's selected mirror remains authoritative when
+        # the complete prior receipt proves it, even if a stock archive arrived.
+        candidate_contents = [(legacy, legacy_bytes), *contents[1:]]
+        mappings.append((str(archive), str(legacy)))
+    else:
+        return literal
+
+    candidate = _hash_doctrine_contents(candidate_contents, bootstrap_files)
+    if mappings and candidate.hash == anchored_hash:
+        logger.warning(
+            "Doctrine bundle historical reader mapping v1 verified: hash=%s selections=%s",
+            candidate.hash, mappings,
+        )
+        return candidate
+    return literal
+
+
 async def anchor_doctrine_bundle(
     agent: Any,
     *,
@@ -307,14 +390,12 @@ async def anchor_doctrine_bundle(
     expected_properties = deepcopy(agent_node.properties)
 
     extra_paths = agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
-    anchored_paths = resolve_anchored_paths(
-        project_root=project_root, extra_paths=extra_paths
-    )
-    snapshot = compute_doctrine_bundle_hash(
-        anchored_files=anchored_paths, bootstrap_files=bootstrap_files
+    existing = agent_node.properties.get(PROP_BUNDLE_HASH)
+    snapshot = compute_doctrine_bundle_for_receipt(
+        project_root=project_root, extra_paths=extra_paths,
+        bootstrap_files=bootstrap_files, anchored_hash=existing,
     )
 
-    existing = agent_node.properties.get(PROP_BUNDLE_HASH)
     if existing == snapshot.hash:
         # Already anchored to this exact bundle.
         logger.debug(f"Doctrine bundle already anchored: {snapshot.hash[:16]}...")
@@ -379,11 +460,9 @@ async def verify_doctrine_bundle(
         )
 
     extra_paths = agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
-    anchored_paths = resolve_anchored_paths(
-        project_root=project_root, extra_paths=extra_paths
-    )
-    snapshot = compute_doctrine_bundle_hash(
-        anchored_files=anchored_paths, bootstrap_files=bootstrap_files
+    snapshot = compute_doctrine_bundle_for_receipt(
+        project_root=project_root, extra_paths=extra_paths,
+        bootstrap_files=bootstrap_files, anchored_hash=anchored_hash,
     )
 
     if snapshot.hash != anchored_hash:

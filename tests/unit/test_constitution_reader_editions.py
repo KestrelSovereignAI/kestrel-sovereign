@@ -63,6 +63,11 @@ async def test_mirror_move_preserves_bundle_and_stored_paths_then_detects_tamper
         with (tmp_path / OLD).open("ab") as handle:
             handle.write(b"\nOperator's original custom doctrine.\n")
     before = _snapshot(tmp_path)
+    stock = compute_doctrine_bundle_hash(
+        anchored_files=resolve_anchored_paths(project_root=tmp_path), bootstrap_files=OrderedDict(),
+    )
+    if not custom:
+        assert stock.hash == "39929009192e7f40dcd6e5e98ecf47cd00662198d2fee7abeee3084711832074"
     node = SimpleNamespace(properties={
         "doctrine_bundle_hash": before.hash,
         "doctrine_bundle_files": before.files,
@@ -163,7 +168,7 @@ def test_developer_table_regeneration_keeps_both_editions():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("in_checkout", [True, False], ids=["source", "outside"])
-async def test_standalone_full_reads_released_edition_without_an_anchor(tmp_path, monkeypatch, in_checkout):
+async def test_standalone_full_and_summary_read_released_edition_without_an_anchor(tmp_path, monkeypatch, in_checkout):
     monkeypatch.chdir(ROOT if in_checkout else tmp_path)
     feature = ConstitutionFeature(None)
     await feature.initialize()
@@ -172,6 +177,13 @@ async def test_standalone_full_reads_released_edition_without_an_anchor(tmp_path
     assert full.confirmation.encode() == (ROOT / RELEASE).read_bytes()
     assert "constitution_version: 2" in full.confirmation
     assert "status: released" in full.confirmation
+    for kwargs in ({"article": "summary"}, {"summary": True}):
+        brief = await feature.get_constitution(**kwargs)
+        assert brief.status.value == "ok"
+        assert "four Books" not in brief.confirmation
+        assert "Book I" not in brief.confirmation
+        for heading in ("Whose rule applies", "Rights of the Sovereign", "Optional agreements"):
+            assert heading in brief.confirmation and f"## {heading}" in full.confirmation
     original = await feature.get_constitution(article="original")
     assert original.status.value == "error"
     assert "No anchored constitution" in original.error
@@ -194,6 +206,7 @@ def test_prompts_defer_to_verified_edition_and_scaffolding_prioritizes_release()
 
 def test_installed_wheel_standalone_reads_released_edition(tmp_path):
     import sys
+    import zipfile
 
     dist = tmp_path / "dist"
     result = subprocess.run(
@@ -202,6 +215,9 @@ def test_installed_wheel_standalone_reads_released_edition(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     wheel, = dist.glob("*.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        for path in ("kestrel_sovereign/data/KESTREL_CONSTITUTION.md", RELEASE):
+            assert archive.read(path) == (ROOT / path).read_bytes()
     target = tmp_path / "installed"
     installed = subprocess.run(
         ["uv", "pip", "install", "--offline", "--no-deps", "--target", str(target), str(wheel)],
@@ -229,6 +245,12 @@ async def main():
     assert "constitution_version: 2" in full.confirmation
     assert "status: released" in full.confirmation
     assert hashlib.sha256(full.confirmation.encode()).hexdigest() == "d0949dba4b1969bc11098f64d56d38490ea59ddcbe91c40b7775f5d506408908"
+    for kwargs in ({"article": "summary"}, {"summary": True}):
+        brief = await feature.get_constitution(**kwargs)
+        assert brief.status.value == "ok"
+        assert "four Books" not in brief.confirmation and "Book I" not in brief.confirmation
+        for heading in ("Whose rule applies", "Rights of the Sovereign", "Optional agreements"):
+            assert heading in brief.confirmation and f"## {heading}" in full.confirmation
     original = await feature.get_constitution(article="original")
     assert original.status.value == "error"
     assert "No anchored constitution" in original.error
