@@ -179,34 +179,16 @@ class ConstitutionFeature(Feature):
 
     @staticmethod
     def _read_canonical_constitution() -> str:
-        """Read the canonical constitution markdown.
+        """Read the published edition for an unanchored standalone reader.
 
-        Tries the source-clone path (``docs/principles/KESTREL_CONSTITUTION.md``,
-        relative to CWD) first so source-clone development picks up edits
-        without rebuilding the wheel, then falls back to the package-bundled
-        copy at ``kestrel_sovereign/data/KESTREL_CONSTITUTION.md`` so
-        pip-installed users actually get a constitution rather than
-        ``FileNotFoundError`` at agent boot.
+        Resolve against this package, never CWD: wheels already ship the release
+        and a documentation bookmark is not governing-text authority. Native
+        agents use their own verified governing reader instead of this path.
         """
         from pathlib import Path
 
-        from kestrel_sovereign.config import CONSTITUTION_PATH
-
-        candidates = [
-            Path("docs/principles/KESTREL_CONSTITUTION.md"),
-            Path(CONSTITUTION_PATH),
-        ]
-        for candidate in candidates:
-            try:
-                if candidate.is_file():
-                    return candidate.read_text(encoding="utf-8")
-            except OSError:
-                continue
-
-        searched = ", ".join(str(c) for c in candidates)
-        raise FileNotFoundError(
-            f"KESTREL_CONSTITUTION.md not found at any of: {searched}"
-        )
+        path = Path(__file__).resolve().parents[1] / "data/constitutions/v2/KESTREL_CONSTITUTION.md"
+        return path.read_text(encoding="utf-8")
 
     def _parse_structure(self) -> None:
         """Parse Books and their sub-units in a single pass.
@@ -280,7 +262,19 @@ class ConstitutionFeature(Feature):
             table[str(index)] = body
 
     def _generate_summary(self):
-        """Generate a brief summary for the system prompt."""
+        """Describe the selected text, retaining the historical Book summary."""
+        if not self.books:
+            headings = [entry["title"] for entry in _classify_headings(self.full_text) if entry["level"] == 2]
+            title = (
+                "The published second-edition Kestrel Constitution"
+                if self.agent is None else "The selected Kestrel Constitution"
+            )
+            self.summary = (
+                title + " contains these sections: "
+                + "; ".join(headings)
+                + ". Use `!constitution` to consult the full text when needed."
+            )
+            return
         self.summary = (
             "You are governed by the Kestrel Constitution, a hierarchical framework of four Books: "
             "Book I (Universal Values — honesty, harm reasoning, hard constraints), "

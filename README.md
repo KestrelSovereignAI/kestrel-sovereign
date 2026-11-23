@@ -631,7 +631,7 @@ Kestrel agents are built on several key components:
 - **Cryptographic identity**: each agent has a DID and signed identity lifecycle.
 - **Privacy-aware storage**: local SQL-backed memory, FTS, knowledge graphs, RAG, and provider-backed embeddings where the selected route supports them.
 - **Multi-provider LLM routing**: vendor/route/model configuration for built-in Anthropic/Claude Max, OpenAI/Codex, Gemini/Vertex AI, Ollama, and OpenRouter adapters, with additional providers discoverable through entry points.
-- **Constitutional governance**: immutable articles with governed interpretation and amendment paths.
+- **Constitutional governance**: duties, rights, and authority with explicit signed adoption and amendment paths.
 - **Local audit anchors**: optional persistent, tamper-evident integrity anchors and verification. Kestrel does not implement external blockchain anchoring.
 
 ## 📁 Project Structure
@@ -681,9 +681,9 @@ kestrel-sovereign/
 - **Bounded trust**: arbitrary network DID documents and package-declared keys are not implicitly trusted; third-party verification remains an explicit integration boundary
 
 ### 4. Constitutional Governance
-- **Immutable Articles**: Core principles that cannot be changed
-- **Interpretive Canons**: Flexible guidelines for decision-making
-- **Amendment Process**: Cryptographically-signed governance updates
+- **Published second edition**: [Duties, rights, and order of authority](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md)
+- **Adopted governing text**: Existing agents retain their established edition and promises until explicit signed adoption
+- **Governance updates**: Publisher revisions and agent-specific signed adoption follow the applicable edition’s rules
 
 ### 5. Data Sovereignty & Privacy Modes
 - **Ephemeral Mode**: True off-the-record conversations (nothing stored)

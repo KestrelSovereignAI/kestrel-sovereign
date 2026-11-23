@@ -18,7 +18,7 @@ from kestrel_sovereign.config import CONSTITUTION_PATH
 from kestrel_sovereign.features.constitution import ConstitutionFeature
 
 CANONICAL = Path(CONSTITUTION_PATH).read_text(encoding="utf-8")
-DOCS_MIRROR = Path("docs/principles/KESTREL_CONSTITUTION.md")
+DOCS_MIRROR = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
 
 
 def _feature(text: str = CANONICAL) -> ConstitutionFeature:

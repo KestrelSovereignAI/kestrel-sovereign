@@ -31,6 +31,7 @@ import pytest
 
 from kestrel_sovereign.agent.doctrine_bundle import (
     DEFAULT_ANCHORED_PATHS,
+    HISTORICAL_CONSTITUTION_MIRROR_PATH,
     DoctrineBundleDriftError,
     DoctrineBundleError,
     DoctrineBundleNotAnchoredError,
@@ -209,7 +210,7 @@ def test_per_file_sha256_in_section_header(tmp_path):
 
 def test_default_paths_are_three_canonical_files():
     assert DEFAULT_ANCHORED_PATHS == [
-        "docs/principles/KESTREL_CONSTITUTION.md",
+        HISTORICAL_CONSTITUTION_MIRROR_PATH,
         "docs/TORTOISE_DOCTRINE.md",
         "AGENTS.md",
     ]

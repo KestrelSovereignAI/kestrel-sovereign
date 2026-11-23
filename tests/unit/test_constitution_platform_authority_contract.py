@@ -9,7 +9,7 @@ from kestrel_sovereign.constitution.resolver import (
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = ROOT / "kestrel_sovereign/data/KESTREL_CONSTITUTION.md"
-MIRROR = ROOT / "docs/principles/KESTREL_CONSTITUTION.md"
+MIRROR = ROOT / "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md"
 
 
 def _body(path: Path) -> str:

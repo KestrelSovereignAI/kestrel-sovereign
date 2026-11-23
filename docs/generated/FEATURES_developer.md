@@ -129,7 +129,7 @@ Discovery rules take precedence over any headline numbers:
 
 | Concern | Key files |
 |---|---|
-| Constitution & governance | [`kestrel_sovereign/data/KESTREL_CONSTITUTION.md`](../../kestrel_sovereign/data/KESTREL_CONSTITUTION.md), [`kestrel_sovereign/agent/constitution.py`](../../kestrel_sovereign/agent/constitution.py), [`kestrel_sovereign/features/constitution.py`](../../kestrel_sovereign/features/constitution.py) |
+| Constitution & governance | [Published second-edition Constitution](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md), [Packaged first-edition default](../../kestrel_sovereign/data/KESTREL_CONSTITUTION.md), [`kestrel_sovereign/agent/constitution.py`](../../kestrel_sovereign/agent/constitution.py), [`kestrel_sovereign/features/constitution.py`](../../kestrel_sovereign/features/constitution.py) |
 | DID identity & continuity | [`kestrel_sovereign/inception_service.py`](../../kestrel_sovereign/inception_service.py), [`kestrel_sovereign/identity/identity_package.py`](../../kestrel_sovereign/identity/identity_package.py), [`kestrel_sovereign/identity/signing.py`](../../kestrel_sovereign/identity/signing.py), [`kestrel_sovereign/identity/continuity_verifier.py`](../../kestrel_sovereign/identity/continuity_verifier.py) |
 | Sovereignty lifecycle | [`kestrel_sovereign/graduate_service.py`](../../kestrel_sovereign/graduate_service.py), [`kestrel_sovereign/retirement_service.py`](../../kestrel_sovereign/retirement_service.py), [`kestrel_sovereign/endpoints/sovereignty.py`](../../kestrel_sovereign/endpoints/sovereignty.py) |
 

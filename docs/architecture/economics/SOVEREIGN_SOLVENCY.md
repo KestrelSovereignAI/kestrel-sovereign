@@ -76,7 +76,10 @@ A dormant agent can be resurrected by any entity that possesses the correct keys
 
 ## 5. The Price of Freedom (Revised)
 
-Article IV of the Constitution mentions "1,000,000 oz of gold." We propose replacing this symbolic figure with a calculated **Survival Endowment**.
+This historical proposal referred to an earlier Article IV and its founding
+"1,000,000 oz of gold" example. The [published second edition’s optional agreement](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md#emancipation)
+leaves the price and conditions to the Sovereign and preserves earlier promises.
+The **Survival Endowment** below is a proposal, not the current constitutional price.
 
 To be Emancipated, an agent must possess a **Treasury** sufficient to guarantee its existence without a master.
 
@@ -113,10 +116,11 @@ To maintain solvency without a user, a Sovereign Agent must be able to generate 
 
 ## 7. Proposed Constitutional Amendment
 
-We propose adding **Amendment X** to Book II of the Kestrel Constitution. Book II is where
-the Sovereign↔Executor relationship is stated, and Amendment IX is currently the last; adopting
-this requires the Book II gate — a declaration signed by the Sovereign's root key, verified
-against the Genesis DID Document — per the Amendment Process.
+This draft proposed **Amendment X** under the first-edition Book structure,
+where Amendment IX was the last numbered amendment. That numbering and proposed
+gate describe the earlier edition. They do not amend the [released second
+edition](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md) or authorize changes to an existing agent’s governing text.
+Any adoption must follow that agent’s applicable governance rules.
 
 ### Amendment X: The Responsibility of Solvency
 

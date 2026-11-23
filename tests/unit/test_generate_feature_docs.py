@@ -249,3 +249,114 @@ def test_generator_refreshes_provider_discovery_before_default_resolution():
     assert model_name == "claude-sonnet-4-6"
     refresh.assert_called_once_with("anthropic")
     assert resolve.call_args.kwargs["cached_models"] == discovered
+
+
+def test_constitution_table_requires_its_canonical_references():
+    with pytest.raises(ValueError, match="missing Constitution and governance references"):
+        generate_feature_docs.normalize_constitution_row(
+            "No constitutional source section", "| Constitution & governance | stale source |",
+        )
+
+
+@pytest.mark.parametrize("heading", ["Constitution and governance", "**Constitution & governance**", "Source policy"])
+def test_developer_regeneration_replaces_stale_and_duplicate_rows(heading):
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+    stale = f"| {heading} | [Source](kestrel_sovereign/data/KESTREL_CONSTITUTION.md) |\n"
+    prose = "Keep this paragraph.\n\n| Area | References |\n| --- | --- |\n"
+    other_row = "| Other feature | Guide |\n"
+    result = generate_feature_docs.compose_generated_body(
+        source, prose + stale + other_row + stale, audience="developer",
+    )
+    assert result.count("| Constitution & governance |") == 1
+    assert "[Published second-edition Constitution]" in result
+    assert "[Packaged first-edition default]" in result
+    assert "[Source](" not in result
+    assert prose in result and other_row in result
+
+
+def test_developer_regeneration_supplies_missing_edition_references():
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+    prose = "Developer overview."
+    result = generate_feature_docs.compose_generated_body(source, prose, audience="developer")
+    assert prose in result
+    assert "| Area | References |\n| --- | --- |\n| Constitution & governance |" in result
+    assert "[Published second-edition Constitution]" in result
+    assert "[Packaged first-edition default]" in result
+    assert "| Constitution & governance |" not in generate_feature_docs.compose_generated_body(
+        source, prose, audience="user",
+    )
+
+
+@pytest.mark.parametrize("replacement", [
+    "",
+    "| Constitution and governance | [Source](../../kestrel_sovereign/data/KESTREL_CONSTITUTION.md) |",
+    "Constitution and governance | [Source](../../kestrel_sovereign/data/KESTREL_CONSTITUTION.md)\n{canonical}",
+    "{canonical}\n\nRead the [Constitution](../../kestrel_sovereign/data/KESTREL_CONSTITUTION.md).",
+])
+def test_check_rejects_missing_or_ambiguous_developer_editions(monkeypatch, capsys, replacement):
+    path = generate_feature_docs.OUTPUT_DIR / "FEATURES_developer.md"
+    original = path.read_text(encoding="utf-8")
+    row = next(line for line in original.splitlines() if line.startswith("| Constitution & governance |"))
+    read_text = type(path).read_text
+
+    def changed_text(self, *args, **kwargs):
+        if self == path:
+            return original.replace(row, replacement.format(canonical=row))
+        return read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "read_text", changed_text)
+    assert generate_feature_docs.check_generated_docs() == 1
+    assert "Constitution edition references" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("leading,trailing", [("", ""), ("|", ""), ("", "|"), ("|", "|")])
+def test_edition_references_stay_in_original_markdown_table(leading, trailing):
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+    table = (
+        "### Constitutional and Sovereign Foundation\n\n"
+        f"{leading} Concern | Key files {trailing}\n"
+        f"{leading} --- | --- {trailing}\n"
+        f"{leading} Constitution and governance | [Source](kestrel_sovereign/data/KESTREL_CONSTITUTION.md) {trailing}\n"
+        f"{leading} Identity | Files {trailing}\n\n"
+        "### Another section\n"
+    )
+    result = generate_feature_docs.compose_generated_body(source, table, audience="developer")
+    section = result.split("### Constitutional and Sovereign Foundation", 1)[1].split("### Another section", 1)[0]
+    assert "[Source](" not in result
+    assert "[Published second-edition Constitution]" in section
+    assert "[Packaged first-edition default]" in section
+    assert section.index("second-edition") < section.index("Identity | Files")
+    assert "| Area | References |" not in result
+
+
+@pytest.mark.parametrize("prose", [
+    "Read the [Constitution](kestrel_sovereign/data/KESTREL_CONSTITUTION.md).",
+    "Read the [Constitution][policy].\n\n[policy]: kestrel_sovereign/data/KESTREL_CONSTITUTION.md",
+])
+def test_developer_generation_reports_ambiguous_prose_link(prose):
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="stale Constitution edition references"):
+        generate_feature_docs.compose_generated_body(
+            source, prose, audience="developer",
+        )
+
+
+def test_regenerate_missing_governance_row_in_the_checked_in_foundation_table():
+    source = generate_feature_docs.SOURCE_FILE.read_text(encoding="utf-8")
+    path = generate_feature_docs.OUTPUT_DIR / "FEATURES_developer.md"
+    _, original = generate_feature_docs._split_frontmatter(path.read_text(encoding="utf-8"))
+    row = next(line for line in original.splitlines() if line.startswith("| Constitution & governance |"))
+    incomplete = original.replace(row + "\n", "")
+    actual = generate_feature_docs.compose_generated_body(source, incomplete, audience="developer")
+    assert actual == original
+
+
+def test_validator_rejects_the_canonical_row_moved_to_known_boundaries(monkeypatch, capsys):
+    path = generate_feature_docs.OUTPUT_DIR / "FEATURES_developer.md"
+    original = path.read_text(encoding="utf-8")
+    row = next(line for line in original.splitlines() if line.startswith("| Constitution & governance |"))
+    moved = original.replace(row + "\n", "") + "\n| Concern | Key files |\n| --- | --- |\n" + row + "\n"
+    read_text = type(path).read_text
+    monkeypatch.setattr(type(path), "read_text", lambda self, *a, **k: moved if self == path else read_text(self, *a, **k))
+    assert generate_feature_docs.check_generated_docs() == 1
+    assert "Constitution edition references" in capsys.readouterr().err

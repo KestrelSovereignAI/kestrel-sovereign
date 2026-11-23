@@ -131,7 +131,7 @@ class TestLayeredConstitutionParsing:
     def test_parse_real_constitution(self):
         """Parse the actual KESTREL_CONSTITUTION.md file."""
         try:
-            with open("docs/principles/KESTREL_CONSTITUTION.md", "r") as f:
+            with open("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md", "r") as f:
                 text = f.read()
         except FileNotFoundError:
             pytest.skip("Constitution file not found")

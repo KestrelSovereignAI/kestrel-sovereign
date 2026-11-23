@@ -173,6 +173,7 @@ def test_selected_corpus_owns_constitution_release(tmp_path: Path):
         "docs/proposals/constitution-and-pledge/CONSTITUTION.md",
         "kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md",
         "kestrel_sovereign/data/constitutions/v2/PLEDGE.md",
+        "doctrine/constitutions/v1/KESTREL_CONSTITUTION.md",
     )
     for rel in sources:
         target = relocated / rel
@@ -190,7 +191,8 @@ def test_selected_corpus_owns_constitution_release(tmp_path: Path):
     assert current.is_file(), "a relocated handbook must publish its adjacent released edition"
     assert "published second edition" in current.read_text()
     assert "constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/PLEDGE.md" in current.read_text()
-    assert "first edition" in (content / "principles/kestrel-constitution.md").read_text()
+    first = (content / "principles/kestrel-constitution.md").read_text()
+    assert "first edition" in first and "## Book I: Universal Values" in first
     assert before == {rel: (relocated / rel).read_bytes() for rel in sources}
     pages, _ = build_docs_site.select_pages(relocated / "docs")
     assert all(p["src"].is_relative_to(relocated) for p in pages)
@@ -207,7 +209,7 @@ def test_selected_corpus_owns_constitution_release(tmp_path: Path):
     assert len(pages) == 3
     first = next(p for p in pages if p["src"] == relocated / sources[1])
     assert first["rel"] == build_docs_site.display_path(relocated / sources[1])
-    assert first["title"] == "The Kestrel Constitution"
+    assert first["title"] == "The Kestrel Constitution (first edition)"
     assert "publication_notice" not in first
     assert "repo_root" not in first
     assert not any(p["rel"] == build_docs_site.CONSTITUTION_RELEASE_PAGE for p in pages)

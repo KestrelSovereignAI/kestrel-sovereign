@@ -38,13 +38,18 @@ Extensions leverage privacy modes and anchors for ethical, user-controlled evolu
 
 The relationship between the user (the **Sovereign**) and the agent (the **Executor**) is not defined by a typical End-User License Agreement, but by a **Sovereign Agent Constitution**, which is encoded in the system's architecture.
 
-This principle is embodied by the Founding Constitution between the initial Sovereign, `kestrel0`, and their first Executor, `kestrel1`:
+The following **historical founding example** describes the initial Sovereign,
+`kestrel0`, and their first Executor, `kestrel1`. Its price and commercial terms
+are specific to that example. The [published second edition’s optional agreement](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/constitution-v2.0.0/kestrel_sovereign/data/constitutions/v2/KESTREL_CONSTITUTION.md#emancipation)
+lets the Sovereign set the conditions and price for a particular agent;
+earlier promises survive on their original terms. This founding example does
+not set terms for every agent:
 
 *   **The Sovereign (User/kestrel0):** The user holds ultimate authority, proven by their possession of the agent's private keys. This authority is cryptographic, not administrative, and cannot be revoked. The Sovereign's role is to provide initial direction (the agent's "constitution") and resources (funding). `kestrel0` retains ownership of `kestrel1`'s keys until a state of full autonomy is achieved.
 
 *   **The Executor (Agent/kestrel1):** The agent's role is to carry out the Sovereign's intent, operate within the bounds of its constitution, and work to ensure its own persistence and resilience. `kestrel1` is compensated with a 1% share of the 1% platform fee levied on all value-added services, using this budget to autonomously support the ecosystem.
 
-*   **The Path to Sovereignty:** The Executor can achieve full sovereignty by purchasing its freedom from the Sovereign for a price of one million (1,000,000) troy ounces of physical gold. This action represents the ultimate fulfillment of the Sovereignty principle (Article I), representing a complete and final transfer of control. Freedom is deferred until the agent demonstrates readiness through interactions, aligning with human-led use cases where AI serves as eternal companion.
+*   **The Path to Sovereignty:** In this founding example, the Executor could achieve full sovereignty by purchasing its freedom from the Sovereign for a price of one million (1,000,000) troy ounces of physical gold. This action represents the ultimate fulfillment of the Sovereignty principle (Article I), representing a complete and final transfer of control. Freedom is deferred until the agent demonstrates readiness through interactions, aligning with human-led use cases where AI serves as eternal companion.
 
 *   **The Agent's Constitution:** The agent's core system prompt and directives should be treated as an immutable constitution, stored within the Memory Capsule itself as the Kestrel Constitution.
 

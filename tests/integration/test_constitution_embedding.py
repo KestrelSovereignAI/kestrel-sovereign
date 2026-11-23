@@ -49,7 +49,7 @@ async def test_constitution_anchored(tmp_path):
     - "governed_by" edge connects agent to constitution
     """
     output_dir = tmp_path / "test_agent"
-    constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
+    constitution_path = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
     assert constitution_path.exists(), "Constitution must exist for test"
 
     # Create agent identity
@@ -107,7 +107,7 @@ async def test_constitution_retrievable(tmp_path):
     - Content is substantive (not empty or truncated)
     """
     output_dir = tmp_path / "test_agent"
-    constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
+    constitution_path = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
 
     # Read original constitutional contract body. The docs copy may carry OKF
     # frontmatter, but inception anchors only the runtime constitution text.
@@ -226,7 +226,7 @@ async def test_constitution_content_hash_deterministic(tmp_path):
     - Node ID equals content hash (content-addressable)
     """
     output_dir = tmp_path / "test_agent"
-    constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
+    constitution_path = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
 
     # Compute expected hash from the constitutional contract body. Docs-only
     # OKF frontmatter must not change the runtime anchor.
@@ -340,7 +340,7 @@ async def test_constitution_encryption_if_key_set(tmp_path, monkeypatch):
     - Without key: stored content == original content (plaintext)
     """
     output_dir = tmp_path / "test_agent"
-    constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
+    constitution_path = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
 
     original_content = _read_constitution_body(constitution_path)
 
@@ -563,7 +563,7 @@ async def test_docs_frontmatter_does_not_cause_false_mismatch(tmp_path, monkeypa
     governing = _install_isolated_governing_source(tmp_path, monkeypatch)
     # Simulate the real repo state: the docs copy carries YAML frontmatter and
     # therefore a *different* hash than the governing source.
-    docs_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
+    docs_path = Path("doctrine/constitutions/v1/KESTREL_CONSTITUTION.md")
     if docs_path.exists():
         assert hashlib.sha256(docs_path.read_bytes()).hexdigest() != (
             hashlib.sha256(governing.read_bytes()).hexdigest()
