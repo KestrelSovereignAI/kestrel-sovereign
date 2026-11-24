@@ -739,8 +739,21 @@ def _owners_held(agent) -> set:
     return {custody._held[name] for name in custody.held}
 
 
-async def _stop(agent) -> None:
-    await asyncio.wait_for(agent.shutdown(), timeout=30)
+async def _stop(agent, *, native_backend=None) -> None:
+    if native_backend is None or native_backend._connection is None:
+        await asyncio.wait_for(agent.shutdown(), timeout=30)
+        return
+    from tests.utils.aiosqlite_workers import normal_close_schedule
+
+    # These assertions concern rollback custody, not loaded-host disk speed.
+    # Join the SAME original close/worker on the canonical normal schedule;
+    # never extend production deadlines or turn retained native error into ACK.
+    assert agent._raw_storage.db.backend is native_backend
+    async with normal_close_schedule() as finish:
+        await finish(
+            native_backend._connection, agent.shutdown(),
+            retained_closes=native_backend._retired_connection_closes,
+        )
 
 
 async def _fail_last_phase(_ctx):
@@ -1122,7 +1135,7 @@ async def test_a_failed_task_manager_close_keeps_custody_until_a_retry_closes_it
             assert _owners_held(agent) == {"task_manager", "storage"}
             _assert_guards_report_this_process(tmp_path)
 
-            await _stop(agent)
+            await _stop(agent, native_backend=native_boot_backend)
 
             assert not store.is_connected
             assert agent._resource_custody().held == ()
@@ -1132,8 +1145,9 @@ async def test_a_failed_task_manager_close_keeps_custody_until_a_retry_closes_it
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slow_native_close", [False, True])
 async def test_a_failed_task_manager_rollback_keeps_the_manager_for_shutdown(
-    tmp_path, monkeypatch, native_boot_backend
+    tmp_path, monkeypatch, native_boot_backend, slow_native_close
 ):
     _trust_every_owner_but_the_task_manager(monkeypatch)
     agent = _make_agent(tmp_path)
@@ -1161,7 +1175,35 @@ async def test_a_failed_task_manager_rollback_keeps_the_manager_for_shutdown(
             assert "serving record" in agent._boot_context.retained_resources
             _assert_guards_report_this_process(tmp_path)
 
-            await _stop(agent)
+            release = None
+            delay_owner = None
+            if slow_native_close:
+                import threading
+                import time
+                from tests.utils.aiosqlite_workers import block_aiosqlite_native_close
+                from tests.utils.virtual_clock import HANG_GUARD_SECONDS
+
+                entered, release = block_aiosqlite_native_close(
+                    native_boot_backend._connection, after_native_close=True,
+                )
+                delay = native_boot_backend.minimum_close_timeout_s + 0.2
+                assert delay < HANG_GUARD_SECONDS
+                def release_original_epilogue():
+                    try:
+                        if entered.wait(HANG_GUARD_SECONDS):
+                            time.sleep(delay)
+                    finally:
+                        release.set()
+                delay_owner = threading.Thread(target=release_original_epilogue, name="original-boot-close-epilogue")
+                delay_owner.start()
+            try:
+                await _stop(agent, native_backend=native_boot_backend)
+            finally:
+                if release is not None:
+                    release.set()
+                if delay_owner is not None:
+                    await asyncio.to_thread(delay_owner.join, HANG_GUARD_SECONDS)
+                    assert not delay_owner.is_alive()
 
             assert not store.is_connected
             assert agent._resource_custody().held == ()

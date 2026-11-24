@@ -21,6 +21,7 @@ from kestrel_sovereign.features.compute.models import ComputeScript, ScriptState
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 from tests.shared.booted_agent import booted_agent
 from tests.shared.agent_http import authenticated_agent_app
+from tests.shared.native_task_diagnostics import original_task_tails
 from tests.utils.native_tool_effects import drive_native
 
 
@@ -100,7 +101,10 @@ class NativePermissionCase:
             self.security.approval_queue.cancel_all()
             if calls:
                 done, pending = await asyncio.wait(calls, timeout=10)
-                assert not pending, "Native permission case retained invocation tasks after bounded cleanup"
+                assert not pending, (
+                    "Native permission case retained invocation tasks after bounded cleanup",
+                    original_task_tails(pending),
+                )
                 await asyncio.gather(*done, return_exceptions=True)
                 self._calls.clear()
         finally:
