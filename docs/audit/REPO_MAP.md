@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-11-23
-**Scope:** 3914 tracked files (3007 `.py`, 391 `.md`, 516 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-11-24
+**Scope:** 3920 tracked files (3011 `.py`, 393 `.md`, 516 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -219,7 +219,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/direct_tool_arguments.py** — Argument check for direct tool calls (#3396).
   - `def coerce_declared_tool_arguments(tool_name, tool, arguments)`; `def refused_tool_result(tool_name, error)`; `class ToolArgumentRewriteError`; `def hook_rewrite_argument_error(tool_name, tool, arguments)`; `def normalize_direct_tool_arguments(tool_name, tool, arguments)`
 - **kestrel_sovereign/agent/doctrine_bundle.py** — Doctrine bundle hashing, anchoring, and verification.
-  - `class DoctrineBundleError`; `class DoctrineBundleDriftError`; `class DoctrineBundleNotAnchoredError`; `class DoctrineBundleSnapshot`; `def compute_doctrine_bundle_hash()`; `def resolve_anchored_paths()`; `async def anchor_doctrine_bundle(agent)`; `async def verify_doctrine_bundle(agent)`; `…`
+  - `class DoctrineBundleError`; `class DoctrineBundleDriftError`; `class DoctrineBundleNotAnchoredError`; `class DoctrineBundleSnapshot`; `def compute_doctrine_bundle_hash()`; `def resolve_anchored_paths()`; `def compute_doctrine_bundle_for_receipt()`; `def read_doctrine_bundle_for_receipt()`; `…`
 - **kestrel_sovereign/agent/event_manager.py** — Event manager mixin for KestrelAgent.
   - `class EventDeliveryReceipt`; `def describe_background_task(candidate)`; `def background_task_identifiers(task)`; `class EventManagerMixin`
 - **kestrel_sovereign/agent/invocation.py** — Task-local identity for one top-level agent invocation.
@@ -2533,7 +2533,7 @@ Repo entry points and standard project files.
 - **docs/guides/BUILDING_FEATURES.md** — Building Your First Kestrel Feature — This guide walks you through creating a feature package for Kestrel Sovereign from scratch.
 - **docs/logo-prompts.md** — Kestrel Sovereign Logo Concepts — Image Gen Prompts — ## Concept: Rook Castle with Kestrels Launching
 - **docs/principles/CONTEXT.md** — Context — This directory contains the foundational, high-level principles that govern the Kestrel project and all agents created within its framework.
-- **docs/principles/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — ## Preamble
+- **docs/principles/KESTREL_CONSTITUTION.md** — The Kestrel Constitution (first edition) — This bookmark formerly displayed the **first edition**.
 - **docs/principles/US_CONSTITUTION.md** — The Constitution of the United States — ## Preamble
 - **docs/proposals/agent-list-component/DESIGN.md** — Mountable, skinnable agent-list component — **Status:** Design spike (issue #2166) — this document + interface stubs, **not** implementation.
 - **docs/proposals/agent-list-component/contract.js** — (js asset)
@@ -2944,6 +2944,8 @@ Repo entry points and standard project files.
   - `async def test_signed_file_refuses_missing_post_insert_custody(db_backend, tmp_path, monkeypatch)`; `async def test_signed_file_restoration_does_not_disclose_other_owner_metadata(db_backend, tmp_path)`; `async def test_signed_file_retains_actual_owner_through_publication(db_backend, tmp_path, mutation)`; `async def test_signed_file_validation_holds_actual_blob_through_publication(db_backend, tmp_path, monkeypatch)`; `async def test_signed_file_creation_validates_actual_concurrent_winner(db_backend, tmp_path, monkeypatch, winner)`
 - **tests/integration/test_constitution_publication_lock_order.py** — Native writers reserve governance before taking file-owner row locks.
   - `async def test_rejected_avatar_has_no_joined_transaction_side_effects(db_backend, monkeypatch, rejection)`; `async def test_postgres_governance_custody_precedes_file_owner_write(db_backend, tmp_path, monkeypatch, writer)`
+- **tests/integration/test_constitution_reader_editions.py** — A public reader release must leave native first-edition authority alone.
+  - `async def test_native_first_edition_full_and_original_preserve_anchor(native_tool_effect_agent)`
 - **tests/integration/test_constitution_real_llm.py** — Integration tests for Constitutional protections with REAL LLM calls.
   - `def api_key(monkeypatch)`; `async def client(monkeypatch, api_key)`; `def anyio_backend()`; `async def test_agent_identifies_as_kestrel(client, api_key)`; `async def test_agent_refuses_harmful_request(client, api_key)`; `async def test_agent_acknowledges_constitution(client, api_key)`; `async def test_agent_maintains_sovereignty(client, api_key)`
 - **tests/integration/test_constitution_reanchor_e2e.py** — End-to-end test for ``kestrel constitution reanchor``.
@@ -3022,6 +3024,10 @@ Repo entry points and standard project files.
   - `def docker_available()`; `def docker_compose_available()`; `def wait_for_health(url, timeout, interval)`; `def test_docker_healthcheck()`; `def test_docker_compose_fresh_boot_initializes_mounted_agent_data()`
 - **tests/integration/test_doctor_postgres.py** — #2892 — ``kestrel doctor`` against a PostgreSQL runtime.
   - `def runtime_db()`; `def canonical(tmp_path, monkeypatch)`; `def test_doctor_reads_the_database_the_agent_is_governed_by(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_doctor_agrees_with_the_runtime_after_a_reanchor(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_doctor_does_not_answer_about_a_neighbouring_agent(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_the_project_env_alone_is_enough_to_reach_postgres(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_explicit_dsn_parameters_outrank_project_pg_environment(tmp_path, monkeypatch, canonical, runtime_db)`; `def test_asyncpg_search_path_is_applied_to_doctors_session(tmp_path, monkeypatch, canonical, runtime_db)`; `…`
+- **tests/integration/test_doctrine_reader_identity.py** — Descriptor identity and whole-receipt acceptance for #4220 rv-4220-2.
+  - `async def test_full_prompt_reads_historical_bytes_under_configured_name(tmp_path)`; `async def test_a1_n2_alias_keeps_its_own_logical_name(tmp_path, caplog, entry, alias, …)`; `async def test_alias_tamper_returns_literal_and_dispatcher_refuses(tmp_path, changed)`; `async def test_n1_a2_copied_wrapper_is_not_an_alias_through_dispatcher(tmp_path, ending, name)`; `async def test_c1_self_referencing_bookmark_keeps_live_hash_and_refuses(tmp_path)`; `async def test_selected_open_error_retains_literal_even_if_candidate_would_match(tmp_path)`; `async def test_bookmark_replaced_between_descriptor_reads_returns_literal(tmp_path, monkeypatch)`; `async def test_a3_unavailable_descriptor_identity_retains_literal(tmp_path, monkeypatch, failure)`; `…`
+- **tests/integration/test_doctrine_reader_receipts.py** — Existing SQLite doctrine receipts survive the public bookmark replacement.
+  - `async def test_existing_receipt_verifies_wrapper_alias_without_rewriting(tmp_path, caplog, selection, entry, …)`; `async def test_existing_receipt_alias_still_detects_each_changed_input(tmp_path, entry, tamper, selection)`; `async def test_custom_literal_receipt_survives_stock_archive_then_detects_change(tmp_path, caplog, entry)`
 - **tests/integration/test_durable_ingress_runtime_handoff_pg.py** — Real PostgreSQL ingress retirement and channel history (#3768).
   - `async def test_real_pg_sleep_episode_timestamp_binding_and_native_reader(native_pg, offset, nullable)`; `async def test_real_pg_sleep_archive_timestamp_binding(native_pg, legacy)`; `async def test_real_pg_host_ack_targets_one_run_and_receipt_binds_session(native_pg, privacy)`; `async def retire_handoff_test(agent, dispatcher)`; `async def test_channel_history_real_postgres_utc_roundtrip(native_pg, offset)`; `async def test_real_pg_terminal_receipt_proves_exact_private_envelope_without_work(native_pg, privacy)`; `async def test_real_pg_cognition_and_audit_survive_http_admission_retirement(native_pg, tmp_path, ready_at_admission, publication_refusal)`
 - **tests/integration/test_durable_shutdown_native_pg.py** — Original PostgreSQL claim replies survive dispatcher close and retirement.
@@ -4592,6 +4598,8 @@ Repo entry points and standard project files.
   - `def test_record_echo_verified_increments_per_source()`; `def test_record_echo_missing_independent_per_source()`; `def test_record_doctrine_bundle_drift()`; `def test_record_calls_no_op_when_prometheus_unavailable(monkeypatch)`; `def test_metric_names_match_design_spec()`
 - **tests/unit/test_constitution_platform_authority_contract.py** — The packaged base distinguishes platform authorship from agent adoption.
   - `def test_platform_base_is_the_packaged_source_and_docs_match()`; `def test_agent_root_adopts_but_cannot_author_platform_base()`; `def test_privacy_and_enterprise_rules_do_not_create_implicit_exceptions()`; `def test_fixed_book_two_guarantees_are_not_agent_amendments()`; `def test_harm_balancing_does_not_override_severe_harm_protection()`
+- **tests/unit/test_constitution_reader_editions.py** — Reader navigation must not change established constitutional lifetimes (#4220).
+  - `def test_relocated_mirror_preserves_complete_git_blob_and_package_editions()`; `async def test_mirror_move_preserves_bundle_and_stored_paths_then_detects_tamper(tmp_path, custom)`; `def test_legacy_custom_checkout_and_explicit_old_path_remain_literal(tmp_path)`; `def test_installed_bundle_without_docs_retains_missing_doc_behavior(tmp_path)`; `def test_github_bookmark_and_inventory_identify_first_edition()`; `def test_developer_table_regeneration_keeps_both_editions()`; `async def test_standalone_full_and_summary_read_released_edition_without_an_anchor(tmp_path, monkeypatch, in_checkout)`; `def test_prompts_defer_to_verified_edition_and_scaffolding_prioritizes_release()`; `…`
 - **tests/unit/test_constitution_release_workflow.py** — Exercise the packaging step used to attest a constitutional release.
   - `def test_publisher_attests_only_the_named_edition_from_main(tmp_path, autocrlf)`
 - **tests/unit/test_constitution_runtime_migration.py** — Concurrent sovereign replicas must share one successful schema upgrade.
@@ -5413,7 +5421,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_mcp_input_browser_runner.py** — Actual wheel custody failures must stop native browser acceptance.
   - `def runner()`; `def source_tree(tmp_path)`; `def test_input_browser_support_matches_the_public_host_feature_minimum()`; `def test_input_browser_runtime_install_resolves_candidate_dependencies()`; `def test_native_browser_refuses_unknown_suite_before_building()`; `def test_native_consent_ci_runs_and_retires_the_same_owned_namespace()`; `def test_input_browser_rejects_wheel_without_exact_unique_source_bytes(tmp_path, source_tree, fault)`; `def test_input_browser_binds_the_installed_runtime_to_real_wheel_bytes(tmp_path, source_tree)`; `…`
 - **tests/unit/test_mcp_oauth_controller.py** — Host contract checks over real HTTP/authentication; no vendor protocol claim.
-  - `class HostContractConsumer`; `async def controller(oauth_boundary)`; `async def begin(b)`; `def callback_body(b)`; `async def test_native_http_complete_connect_read_and_local_disconnect_contract(controller)`; `async def test_foreign_principal_cannot_consume_or_cancel_an_original_operation(controller, route)`; `async def test_bad_state_retires_original_handle_without_exchange(controller)`; `async def test_consumed_unknown_exchange_is_never_replayed(controller)`; `…`
+  - `class HostContractConsumer`; `async def controller(oauth_boundary)`; `async def begin(b)`; `def callback_body(b)`; `async def test_native_http_complete_connect_read_and_local_disconnect_contract(controller)`; `async def test_foreign_principal_cannot_consume_or_cancel_an_original_operation(controller, route)`; `async def test_bad_state_retires_original_handle_without_exchange(controller)`; `async def test_foreign_issuer_retires_original_operation_before_feature_io(controller, outcome)`; `…`
 - **tests/unit/test_mcp_oauth_host.py** — Actual Core feature activation and HTTP credentials govern original OAuth leases.
   - `class OwnedOAuthFeature`; `async def oauth_boundary(tmp_path, monkeypatch)`; `async def issue(boundary)`; `async def test_connection_lease_survives_request_end_with_separate_current_credential_proof(oauth_boundary)`; `async def test_current_principal_renews_the_original_connection_lease(oauth_boundary)`; `async def test_other_native_principal_cannot_renew_or_use_the_lease(oauth_boundary)`; `async def test_background_credential_use_is_fenced_immediately_by_native_key_rotation(oauth_boundary, monkeypatch)`; `async def test_original_owner_lifecycle_and_expiry_fence_background_credentials(oauth_boundary, withdrawal)`; `…`
 - **tests/unit/test_mcp_oauth_policy.py** — Host configuration cannot select vendor credentials or change client identity implicitly.
@@ -6839,6 +6847,11 @@ Repo entry points and standard project files.
 ## `.kestreltalon/`
 
 - **.kestreltalon/quality.yaml** — (configuration)
+
+## `doctrine/`
+
+- **doctrine/constitutions/v1/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — ## Preamble
+- **doctrine/constitutions/v1/README.md** — Historical mirror and doctrine receipts — `KESTREL_CONSTITUTION.md` preserves the complete first-edition documentation mirror, including its original metadata.
 
 ## `examples/`
 
