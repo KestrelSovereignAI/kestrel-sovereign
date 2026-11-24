@@ -460,13 +460,16 @@ async def test_all_restrictions_suppress_even_explicit_old_lender_capture(bounda
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("factory", [False, True])
+@pytest.mark.parametrize("factory", ["direct", "privacy", "callback"])
 async def test_stream_paths_use_original_producer_receipt_and_captured_root(factory):
     from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator
 
     host = CapacityLoan(capacity=1)
     receipt = OwnedSourceAdmission()
     lock = ReentrantTransitionLock()
+    scope = OwnedCallbackScope()
+    def start_callback(body, context, *, admission, lender_capture):
+        return scope.start(body, context=context, admission=admission, lender_capture=lender_capture)
     producer = []
     async def source():
         producer.append(asyncio.current_task())
@@ -479,7 +482,8 @@ async def test_stream_paths_use_original_producer_receipt_and_captured_root(fact
     with ownership.bind_owned_task_lender(host):
         iterator = await create_owned_iterator(
             source, operation="lender-direct-stream", source_admission=receipt,
-            owner_factory=lock.capture_native_work_factory() if factory else None,
+            owner_factory=(lock.capture_native_work_factory() if factory == "privacy" else
+                           start_callback if factory == "callback" else None),
         )
         try:
             assert iterator.producer_task is receipt.producer.task

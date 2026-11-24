@@ -220,7 +220,8 @@ class OwnedCallbackScope:
         for coordinator in self.coordinators:
             coordinator.register_callback_scope(self)
 
-    def start(self, operation, *, name=None, context=None, on_completion=None):
+    def start(self, operation, *, name=None, context=None, on_completion=None,
+              admission=None, lender_capture=_AUTOMATIC_TASK_LENDER):
         """Accept original work with an explicitly selected execution context.
 
         The retained privacy factory owns resource-lifetime admission separately;
@@ -238,11 +239,13 @@ class OwnedCallbackScope:
                 raise opening
             return await operation()
 
+        capture = self._lender if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture
         task = (self.factories[0](run, name=name, context=context,
-                                 on_completion=on_completion) if self.factories else
+                                 on_completion=on_completion, admission=admission,
+                                 lender_capture=capture) if self.factories else
                 create_owned_task(run(), name=name, context=context,
                                   retain_originals=True, on_completion=on_completion,
-                                  lender_capture=self._lender))
+                                  admission=admission, lender_capture=capture))
         # Physical acceptance precedes cohort publication. Keep that exact
         # owner even when an observer/coordinator refuses its publication.
         self.tasks.add(task)
