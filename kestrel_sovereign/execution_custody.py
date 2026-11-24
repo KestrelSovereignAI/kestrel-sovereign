@@ -1899,6 +1899,7 @@ class _ExecutionForwarder:
         # A deferred HTTP response may never be consumed at all.
         self._owner_context = context
         self._source_admission = OwnedSourceAdmission(retirement=OwnedTaskAdmission())
+        self._source_admission._state.resource_required = True
         self._source_lender = capture_owned_task_lender()
         self._iterator = None
         self._consumer_started = asyncio.Event()
@@ -2102,10 +2103,14 @@ class _ExecutionForwarder:
                     try:
                         await close()
                     except BaseException as cleanup_error:
+                        from kestrel_sovereign._async_ownership import _record_source_retirement
+                        _record_source_retirement(self._source_admission, failure=cleanup_error)
                         self._source_exhausted = False
                         self._cleanup_state.requested = True
                         raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
             self._source_closed = True
+            from kestrel_sovereign._async_ownership import _record_source_retirement
+            _record_source_retirement(self._source_admission, closed=True)
 
     async def aclose(self):
         # Normal EOF completes this source, not a queued child's independent
@@ -2162,11 +2167,17 @@ class _ExecutionForwarder:
 
     async def _close_unstarted_source(self):
         if not self._source_closed:
-            await close_execution_stream(
-                self._runtime_owner, self._source, self._scopes,
-                retain_cancellations=self._withdrawal is not None,
-            )
+            from kestrel_sovereign._async_ownership import _record_source_retirement
+            try:
+                await close_execution_stream(
+                    self._runtime_owner, self._source, self._scopes,
+                    retain_cancellations=self._withdrawal is not None,
+                )
+            except BaseException as failure:
+                _record_source_retirement(self._source_admission, failure=failure)
+                raise
             self._source_closed = True
+            _record_source_retirement(self._source_admission, closed=True)
 
 
 async def close_execution_stream(

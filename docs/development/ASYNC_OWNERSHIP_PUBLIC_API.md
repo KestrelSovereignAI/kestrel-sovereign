@@ -180,10 +180,15 @@ PostgreSQL COMMIT/ROLLBACK, pool reset/close and advisory-session close suppress
 WORK lending through the same cleanup restriction; physical retirement cannot
 depend on spare WORK capacity. This does not relax standalone execution checks.
 
-Only the exact, unambiguous native wrapper on the original running loop can
-receive a loan. Custom-factory construction is reconciled before admission;
-the wrapper additionally verifies its executing Task before entering payload.
-Ambiguous acceptance remains UNKNOWN even if one returned Task finishes.
+Only the original native CPython selector/proactor or installed uvloop default
+constructor can receive a loan, with no configured task factory. Core checks
+implementation identity before reservation and again before allocation; it
+never silently bypasses or replaces an unsupported factory. This restriction
+applies only to live, unsuppressed host loans. Generic non-lender creation keeps
+its existing factory semantics and ambiguous-acceptance reconciliation. A
+one-turn Task snapshot or first-entry identity check cannot prove the lifetime
+of a coroutine retained by an arbitrary constructor. The exact accepted Task
+and first-entry checks remain additional safeguards, not that missing proof.
 Gate cancellation/refusal is settled inside the original admission transaction
 before lending or dispatch; the physical cancellation remains on that receipt.
 
@@ -196,6 +201,19 @@ factories accept the same explicit handoff. A forwarder checks producer capacity
 before allocating its watcher/closer, while source dispatch remains gated until
 all construction/registration finishes. Cooperative Event-only idle waits and
 physical closers do not consume extra WORK loans.
+
+The original source admission also retains physical-retirement facts separately
+from exception presentation. An observed failed close keeps reconciliation
+UNKNOWN and the host loan outstanding even when its producer Task is done;
+an ordinary body failure followed by successful physical close can retire.
+The same record retains producer, watcher, and original closer receipts. Native
+completion and actual close progress re-evaluate the original one-shot retirement
+publisher, including when completion notification preceded source settlement.
+No observer timeout, lost callback, exception spelling, or replacement owner
+can manufacture an acknowledgment. A failed constructor uses a fresh pending
+source carrier rather than decorating its original refusal. The existing join
+settles that construction fact only after the exact accepted owners settled;
+independent capture, epilogue, watcher, and physical-close failures remain.
 
 ## Task completion is not process-tree drain
 

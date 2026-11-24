@@ -392,6 +392,8 @@ jobs:
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
       - name: Install the locked native host
         run: uv sync --python ${{ matrix.python-version }} --locked
+      - name: Install the exact optional Frinz production loop for qualification
+        run: uv pip install --python .venv/bin/python 'uvloop==0.23.0'
       - name: Verify original task lending and physical PostgreSQL epilogues
         run: >-
           uv run --python ${{ matrix.python-version }} --no-sync python -m pytest

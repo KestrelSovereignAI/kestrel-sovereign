@@ -65,6 +65,210 @@ class CapacityLoan:
         self.retired.append(retirement)
 
 
+@pytest.mark.parametrize("flavor", ["asyncio", "auto"])
+@pytest.mark.parametrize("substitute", [False, True])
+def test_actual_uvicorn_loop_selection_preserves_native_loan_ownership(flavor, substitute, monkeypatch):
+    import importlib.util
+    import uvicorn
+    loop = uvicorn.Config("unused:app", loop=flavor, log_config=None).get_loop_factory()()
+    if flavor == "auto" and importlib.util.find_spec("uvloop") is not None:
+        import uvloop
+        assert isinstance(loop, uvloop.Loop), "the installed production loop was not qualified"
+    async def scenario():
+        host = CapacityLoan()
+        allocated = []
+        original_create = loop.create_task
+        def replacement(coroutine, **options):
+            allocated.append(coroutine)
+            return original_create(coroutine, **options)
+        async def body():
+            assert ownership.capture_owned_task_lender() is not None
+            assert asyncio.get_running_loop() is loop
+        try:
+            if substitute:
+                monkeypatch.setattr(loop, "create_task", replacement)
+            with ownership.bind_owned_task_lender(host):
+                if substitute:
+                    with pytest.raises(RuntimeError, match="canonical native constructor"):
+                        ownership.create_owned_task(body())
+                else:
+                    await ownership.create_owned_task(body())
+            assert not allocated and not host.outstanding
+            assert len(host.retired) == (0 if substitute else 1)
+        finally:
+            monkeypatch.undo()
+    try:
+        loop.run_until_complete(scenario())
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["direct", "forwarder"])
+@pytest.mark.parametrize("failed_close", [False, True])
+async def test_known_source_close_failure_retains_loan_without_changing_original_error(tmp_path, profile, failed_close):
+    from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator
+    host = CapacityLoan()
+    source_admission = OwnedSourceAdmission()
+    original = OSError("original physical close" if failed_close else "original body refusal")
+    handle = (tmp_path / "original-source-resource").open("wb")
+    closes = []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            if not failed_close:
+                raise original
+            raise StopAsyncIteration
+        async def aclose(self):
+            closes.append(asyncio.current_task())
+            if failed_close:
+                raise original
+            handle.close()
+    stream = None
+    try:
+        with ownership.bind_owned_task_lender(host):
+            if profile == "direct":
+                stream = await create_owned_iterator(lambda: Source(), operation="source-retirement-proof",
+                    source_admission=source_admission)
+            else:
+                stream = execution_stream(None, Source())
+                source_admission = stream._source_admission
+            with pytest.raises(BaseException) as caught:
+                await anext(stream)
+            assert original in execution_evidence_carriers(caught.value)
+            if profile == "direct":
+                assert caught.value is original
+            outcome = ownership.reconcile_owned_task_admission(source_admission.producer)
+            assert outcome.state == ("unknown" if failed_close else "complete")
+            if failed_close:
+                assert original in source_admission._state.failures
+                assert original in execution_evidence_carriers(outcome.error)
+                assert "_kestrel_native_retirement_debts" not in vars(original)
+            assert len(host.outstanding) == (1 if failed_close else 0)
+            assert len(host.retired) == (0 if failed_close else 1)
+            assert handle.closed is not failed_close
+            assert len(closes) == 1
+    finally:
+        if stream is not None:
+            try:
+                await stream.aclose()
+            except BaseException as closed:
+                assert original in execution_evidence_carriers(closed)
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_source_lend_veto_retires_original_partial_without_decorating_veto():
+    from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator
+    host = CapacityLoan()
+    original = OSError("original source loan veto")
+    host.denial = original
+    source_admission = OwnedSourceAdmission()
+    entered = []
+    async def body():
+        entered.append(asyncio.current_task())
+        yield
+    with ownership.bind_owned_task_lender(host):
+        with pytest.raises(BaseException) as caught:
+            await create_owned_iterator(body, operation="source-lend-veto", source_admission=source_admission)
+        assert original in execution_evidence_carriers(caught.value)
+    assert "_kestrel_native_retirement_debts" not in vars(original)
+    assert "_kestrel_failed_owned_iterator" not in vars(original)
+    assert not entered and not host.outstanding and len(host.retired) == 1
+    assert ownership.reconcile_owned_task_admission(source_admission.producer).state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_unknown_original_watcher_keeps_the_producer_loan_after_producer_join():
+    from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+    host = CapacityLoan()
+    source_admission = OwnedSourceAdmission()
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    refusal = OSError("original watcher allocation is uncertain")
+    refused = []
+    entered = []
+    def refuse_watcher(loop, coroutine, **options):
+        refused.append(coroutine)
+        raise refusal
+    lend = host.lend
+    def publish_then_change_factory(*args, **options):
+        lend(*args, **options)
+        # The producer already has its canonical native constructor. This
+        # subsequent structural watcher is deliberately not a WORK loan.
+        loop.set_task_factory(refuse_watcher)
+    host.lend = publish_then_change_factory
+    async def source():
+        entered.append(asyncio.current_task())
+        yield
+    try:
+        with ownership.bind_owned_task_lender(host):
+            with pytest.raises(BaseException) as caught:
+                await create_owned_iterator(source, operation="unknown-original-watcher",
+                    source_admission=source_admission)
+        loop.set_task_factory(previous)
+        assert refusal in execution_evidence_carriers(caught.value)
+        assert not entered and source_admission.producer.task.done()
+        assert len(refused) == 1 and refused[0].cr_frame is None
+        assert source_admission.watcher.task is None
+        assert ownership.reconcile_owned_task_admission(source_admission.producer).state == "unknown"
+        assert len(host.outstanding) == 1 and not host.retired
+        debts = execution_cleanup_debts(caught.value)
+        assert debts and all(task is not source_admission.producer.task for _, task in debts)
+        assert "_kestrel_native_retirement_debts" not in vars(refusal)
+    finally:
+        loop.set_task_factory(previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["configured_factory", "substituted_constructor", "changed_during_reserve"])
+async def test_loan_requires_canonical_constructor_before_any_borrower_allocation(boundary, monkeypatch):
+    host = CapacityLoan()
+    receipt = ownership.OwnedTaskAdmission()
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    native_create = asyncio.create_task
+    allocated = []
+    def factory(loop, coroutine, **options):
+        task = asyncio.Task(coroutine, loop=loop, **options)
+        allocated.append(task)
+        return task
+    def substitute(coroutine, **options):
+        task = native_create(coroutine, **options)
+        allocated.append(task)
+        return task
+    reserve = host.reserve
+    def change_during_reserve(**options):
+        reservation = reserve(**options)
+        loop.set_task_factory(factory)
+        return reservation
+    async def body():
+        pytest.fail("noncanonical constructor entered a borrowed payload")
+    payload = body()
+    try:
+        if boundary == "configured_factory":
+            loop.set_task_factory(factory)
+        elif boundary == "substituted_constructor":
+            monkeypatch.setattr(asyncio, "create_task", substitute)
+        else:
+            host.reserve = change_during_reserve
+        with ownership.bind_owned_task_lender(host):
+            with pytest.raises(RuntimeError, match="canonical native constructor"):
+                ownership.create_owned_task(payload, admission=receipt)
+    finally:
+        loop.set_task_factory(previous)
+        monkeypatch.undo()
+        if allocated:
+            await asyncio.gather(*allocated, return_exceptions=True)
+    assert not allocated and receipt.task is None and payload.cr_frame is None
+    assert ownership.reconcile_owned_task_admission(receipt).state == "nonacceptance"
+    assert not host.outstanding
+    assert len(host.retired) == (1 if boundary == "changed_during_reserve" else 0), (
+        "an unsupported constructor must be rejected before reserving the host resource")
+
+
 @pytest.mark.asyncio
 async def test_lends_exact_task_before_payload_and_retains_physical_finalizer():
     host = CapacityLoan()
@@ -136,25 +340,18 @@ async def test_explicit_fresh_context_lends_to_child_but_inherited_route_does_no
 @pytest.mark.asyncio
 async def test_capacity_refusal_precedes_any_native_allocation():
     host = CapacityLoan(capacity=0)
-    loop = asyncio.get_running_loop()
-    previous = loop.get_task_factory()
-    allocations = []
-
-    def factory(loop, coroutine, **kwargs):
-        allocations.append(coroutine)
-        return asyncio.Task(coroutine, loop=loop, **kwargs)
+    original_tasks = asyncio.all_tasks()
+    receipt = ownership.OwnedTaskAdmission()
 
     async def body():
         pytest.fail("refused payload entered")
 
+    payload = body()
     with ownership.bind_owned_task_lender(host):
-        loop.set_task_factory(factory)
-        try:
-            with pytest.raises(RuntimeError, match="test host capacity exhausted"):
-                ownership.create_owned_task(body())
-        finally:
-            loop.set_task_factory(previous)
-    assert not allocations and not host.outstanding
+        with pytest.raises(RuntimeError, match="test host capacity exhausted"):
+            ownership.create_owned_task(payload, admission=receipt)
+    assert asyncio.all_tasks() == original_tasks and receipt.task is None
+    assert payload.cr_frame is None and not host.outstanding
 
 
 @pytest.mark.asyncio
@@ -181,7 +378,7 @@ async def test_refused_lend_keeps_original_receipt_through_pre_entry_cancellatio
 
 
 @pytest.mark.asyncio
-async def test_opaque_factory_keeps_unknown_loan_without_dispatching_payload():
+async def test_opaque_factory_is_refused_before_borrower_acceptance():
     host = CapacityLoan()
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
@@ -201,18 +398,14 @@ async def test_opaque_factory_keeps_unknown_loan_without_dispatching_payload():
     with ownership.bind_owned_task_lender(host):
         loop.set_task_factory(factory)
         try:
-            with pytest.raises(RuntimeError, match="original native operation admission failed") as opening:
+            with pytest.raises(RuntimeError, match="canonical native constructor"):
                 ownership.create_owned_task(body(), admission=receipt)
-            assert any("opaque native task" in str(error)
-                       for error in execution_evidence_carriers(opening.value))
         finally:
             loop.set_task_factory(previous)
-        assert receipt.task is not None
-        with pytest.raises(RuntimeError, match="original native operation admission failed"):
-            await receipt.task
+        assert receipt.task is None
     assert not invoked and not host.retired
-    assert len(host.outstanding) == 1
-    assert ownership.reconcile_owned_task_admission(receipt).state == "unknown"
+    assert not host.outstanding
+    assert ownership.reconcile_owned_task_admission(receipt).state == "nonacceptance"
 
 
 @pytest.mark.asyncio
@@ -351,14 +544,14 @@ async def test_ambiguous_exact_wrapper_never_receives_a_loan_or_dispatches():
     with ownership.bind_owned_task_lender(host):
         loop.set_task_factory(duplicate)
         try:
-            with pytest.raises(RuntimeError, match="original native operation admission failed"):
+            with pytest.raises(RuntimeError, match="canonical native constructor"):
                 ownership.create_owned_task(body(), admission=receipt)
         finally:
             loop.set_task_factory(previous)
             await asyncio.gather(*accepted, return_exceptions=True)
-    assert not entered
-    assert ownership.reconcile_owned_task_admission(receipt).state == "unknown"
-    assert not host.retired and all(task is None for _, task, _ in host.outstanding.values())
+    assert not entered and not accepted
+    assert ownership.reconcile_owned_task_admission(receipt).state == "nonacceptance"
+    assert not host.retired and not host.outstanding
 
 
 @pytest.mark.asyncio
@@ -380,14 +573,14 @@ async def test_late_eager_wrapper_substitution_cannot_enter_the_payload():
     with ownership.bind_owned_task_lender(host):
         loop.set_task_factory(factory)
         try:
-            task = ownership.create_owned_task(body(), admission=receipt)
+            with pytest.raises(RuntimeError, match="canonical native constructor"):
+                ownership.create_owned_task(body(), admission=receipt)
         finally:
             loop.set_task_factory(previous)
-        await asyncio.gather(task, return_exceptions=True)
         await asyncio.gather(*accepted, return_exceptions=True)
-    assert not entered
-    assert ownership.reconcile_owned_task_admission(receipt).state == "unknown"
-    assert not host.retired and len(host.outstanding) == 1
+    assert not entered and not accepted
+    assert ownership.reconcile_owned_task_admission(receipt).state == "nonacceptance"
+    assert not host.retired and not host.outstanding
 
 
 def test_foreign_loop_exact_wrapper_is_not_accepted_as_the_original_task():
@@ -411,11 +604,11 @@ def test_foreign_loop_exact_wrapper_is_not_accepted_as_the_original_task():
         with ownership.bind_owned_task_lender(host):
             loop.set_task_factory(wrong_loop)
             try:
-                with pytest.raises(RuntimeError, match="original native operation admission failed"):
+                with pytest.raises(RuntimeError, match="canonical native constructor"):
                     ownership.create_owned_task(body(), admission=receipt)
             finally:
                 loop.set_task_factory(previous)
-        assert ownership.reconcile_owned_task_admission(receipt).state == "unknown"
+        assert ownership.reconcile_owned_task_admission(receipt).state == "nonacceptance"
         assert all(task is None for _, task, _ in host.outstanding.values())
 
     try:
@@ -426,7 +619,7 @@ def test_foreign_loop_exact_wrapper_is_not_accepted_as_the_original_task():
                 await asyncio.gather(*accepted, return_exceptions=True)
             foreign.run_until_complete(join_originals())
         foreign.close()
-    assert not entered
+    assert not entered and not accepted
 
 
 @pytest.mark.asyncio
@@ -583,7 +776,7 @@ async def test_unfenced_physical_close_needs_no_spare_work_loan(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["reserve", "publication", "lend", "before_step"])
-async def test_retained_work_check_stays_live_through_admission_and_first_step(phase):
+async def test_retained_work_check_stays_live_through_admission_and_first_step(phase, monkeypatch):
     from kestrel_sovereign.execution_custody import _StreamCleanupState, _bind_stream_cleanup
     host = CapacityLoan()
     state = _StreamCleanupState((ProcessRuntimeExecutionFence("lender-admission-withdrawal"),))
@@ -602,28 +795,27 @@ async def test_retained_work_check_stays_live_through_admission_and_first_step(p
     host.reserve, host.lend = reserve_and_withdraw, lend_and_withdraw
     receipt = ownership.OwnedTaskAdmission()
     entered = []
-    loop = asyncio.get_running_loop()
-    previous = loop.get_task_factory()
-    class WithdrawingTask(asyncio.Task):
-        def add_done_callback(self, callback, *, context=None):
-            if getattr(callback, "__name__", "") == "close_unstarted":
-                state.requested = True
-            return super().add_done_callback(callback, context=context)
-    def factory(loop, operation, **options):
-        return WithdrawingTask(operation, loop=loop, **options)
+    from contextlib import ExitStack
+    from kestrel_sovereign._async_ownership import bind_owned_coordinator
+    coordinator = ReentrantTransitionLock()
+    original_admit = coordinator.admit_owned_task
+    def withdraw_after_publication(*args):
+        admitted = original_admit(*args)
+        state.requested = True
+        return admitted
     async def body():
         entered.append(asyncio.current_task())
-    with _bind_stream_cleanup((state,)), ownership.bind_owned_task_lender(host):
+    with _bind_stream_cleanup((state,)), ownership.bind_owned_task_lender(host), ExitStack() as stack:
         try:
             if phase == "publication":
-                loop.set_task_factory(factory)
+                monkeypatch.setattr(coordinator, "admit_owned_task", withdraw_after_publication)
+                stack.enter_context(bind_owned_coordinator(coordinator))
             with pytest.raises(ExecutionAuthorityError, match="cleanup"):
                 task = ownership.create_owned_task(body(), admission=receipt)
                 if phase == "before_step":
                     state.requested = True
                     await task
         finally:
-            loop.set_task_factory(previous)
             if receipt.task is not None:
                 await asyncio.gather(receipt.task, return_exceptions=True)
     assert not entered and not host.outstanding and len(host.retired) == 1
@@ -667,7 +859,7 @@ async def test_stream_paths_use_original_producer_receipt_and_captured_root(fact
 
 
 @pytest.mark.asyncio
-async def test_eager_gate_withdrawal_does_not_lend_or_escape_admission_settlement():
+async def test_eager_factory_is_refused_without_constructing_a_borrower():
     if not hasattr(asyncio, "eager_task_factory"):
         pytest.skip("eager task factory unavailable")
     host = CapacityLoan()
@@ -685,46 +877,44 @@ async def test_eager_gate_withdrawal_does_not_lend_or_escape_admission_settlemen
     with ownership.bind_owned_task_lender(host):
         loop.set_task_factory(factory)
         try:
-            with pytest.raises(RuntimeError, match="start gate"):
+            with pytest.raises(RuntimeError, match="canonical native constructor"):
                 ownership.create_owned_task(body(), admission=receipt)
             assert all(task is None for _, task, _ in host.outstanding.values())
         finally:
             loop.set_task_factory(previous)
             if receipt.task is not None:
                 await asyncio.gather(receipt.task, return_exceptions=True)
-    assert not host.outstanding and host.retired
-    assert any(isinstance(error, asyncio.CancelledError)
-               and error.args == ("original factory cancellation",)
-               for error in execution_evidence_carriers(host.retired[0].error))
+    assert not host.outstanding and not host.retired and receipt.task is None
+    assert ownership.reconcile_owned_task_admission(receipt).state == "nonacceptance"
 
 
 @pytest.mark.asyncio
-async def test_stream_capacity_is_checked_before_any_structural_allocation():
+async def test_stream_capacity_is_checked_before_any_structural_allocation(monkeypatch):
     host = CapacityLoan(capacity=0)
-    loop = asyncio.get_running_loop()
-    previous = loop.get_task_factory()
+    import kestrel_sovereign._async_ownership as canonical
+    original_create = canonical.create_owned_task
     events = []
     original_reserve = host.reserve
     def reserve(**options):
         events.append("reserve")
         return original_reserve(**options)
     host.reserve = reserve
-    def factory(loop, coroutine, **options):
-        events.append("allocate")
-        return asyncio.Task(coroutine, loop=loop, **options)
+    def observe_structural_entry(operation, **options):
+        if options.get("lender_capture") is None:
+            events.append("structural-construction")
+        return original_create(operation, **options)
+    monkeypatch.setattr(canonical, "create_owned_task", observe_structural_entry)
     async def source():
         pytest.fail("capacity-refused producer dispatched")
         yield
 
     with ownership.bind_owned_task_lender(host):
         stream = execution_stream(None, source())
-        loop.set_task_factory(factory)
         try:
             with pytest.raises(RuntimeError, match="test host capacity exhausted"):
                 await anext(stream)
         finally:
             await stream.aclose()
-            loop.set_task_factory(previous)
     assert events[0] == "reserve", events
 
 
