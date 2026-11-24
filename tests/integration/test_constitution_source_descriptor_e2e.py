@@ -18,10 +18,12 @@ from __future__ import annotations
 
 from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
+import asyncio
 import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -1101,9 +1103,10 @@ async def test_v2_birth_restores_missing_governing_bytes_with_original_authority
 @pytest.mark.asyncio
 @pytest.mark.parametrize("unavailable", [b"", b"---\nconstitution_version: 2\n"])
 async def test_diagnostic_boot_keeps_cognition_gated_until_selected_source_is_restored(
-    tmp_path, operator_dir, unavailable,
+    tmp_path, operator_dir, unavailable, monkeypatch,
 ):
     from kestrel_sovereign.command_handler import CommandHandler
+    from kestrel_sovereign.constitution import grants
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
@@ -1129,5 +1132,75 @@ async def test_diagnostic_boot_keeps_cognition_gated_until_selected_source_is_re
         selected.write_bytes(content)
         assert "integrity verified" in (await diagnostics.handle("!verify-constitution")).lower()
         assert not agent._constitution_governing_replay_pending
+
+        prior_baseline = agent._constitution_host_grant_baseline
+        assert prior_baseline.verified_governing_anchor == (agent.agent_id, _sha(content))
+        started, resume = asyncio.Event(), asyncio.Event()
+        real_replay = grants.load_anchored_grant_baseline
+
+        async def paused_replay(*args, **kwargs):
+            started.set()
+            await resume.wait()
+            return await real_replay(*args, **kwargs)
+
+        monkeypatch.setattr(grants, "load_anchored_grant_baseline", paused_replay)
+        reaudit = asyncio.create_task(agent._verify_constitution_integrity())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert not agent._constitution_governing_replay_pending
+            assert agent._constitution_host_grant_baseline is prior_baseline
+        finally:
+            resume.set()
+            verified, message = await reaudit
+        assert verified, message
+
+        node = await agent._raw_storage.get_node(agent.agent_id)
+        node.properties["genesis_audit"] = {**node.properties["genesis_audit"], "publisher": {}}
+        verified, _ = await agent._refresh_constitution_host_grants(node, governing_text=content.decode())
+        assert not verified
+        assert agent._constitution_governing_replay_pending
+        assert agent._constitution_host_grant_baseline.verified_governing_anchor is None
+    finally:
+        await shutdown_fixture_agent(agent)
+
+
+@pytest.mark.asyncio
+async def test_legacy_anchor_remains_ready_during_reaudit(tmp_path, operator_dir, monkeypatch):
+    from kestrel_sovereign.constitution import grants
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.service import LLMService
+
+    selected = operator_dir / "legacy.md"
+    content = (Path(__file__).resolve().parents[2] / "kestrel_sovereign/data/KESTREL_CONSTITUTION.md").read_bytes()
+    selected.write_bytes(content)
+    descriptor = _descriptor_file(operator_dir, selected, content)
+    root = operator_dir / "sovereign-root.did.json"
+    selection = dict(constitution_source_descriptor_path=str(descriptor), sovereign_trust_root_path=str(root))
+    credentials = await create_kestrel_identity_async(output_dir=str(tmp_path / "legacy"), **selection)
+    agent = KestrelAgent(did=credentials.agent_did, storage_path=credentials.db_path, llm_service=LLMService(), **selection)
+    await agent.initialize()
+    try:
+        assert agent._constitution_verified_legacy_anchor == (agent.agent_id, _sha(content))
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        resume = threading.Event()
+        real_history = grants.require_legacy_governing_history
+
+        def paused_history(*args, **kwargs):
+            loop.call_soon_threadsafe(started.set)
+            if not resume.wait(5):
+                raise TimeoutError("Test did not release the real history verification")
+            return real_history(*args, **kwargs)
+
+        monkeypatch.setattr(grants, "require_legacy_governing_history", paused_history)
+        reaudit = asyncio.create_task(agent._verify_constitution_integrity())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert not agent._constitution_governing_replay_pending
+            assert agent._constitution_host_grant_baseline is None
+        finally:
+            resume.set()
+            verified, message = await reaudit
+        assert verified, message
     finally:
         await shutdown_fixture_agent(agent)

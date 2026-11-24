@@ -484,7 +484,10 @@ async def load_reanchor_prior_state(
         if candidate is None and contract is not None and contract.enabled:
             raise AmendmentArtifactError("Restore the exact prior governing bytes before changing a personal agreement")
     if candidate is None or constitution_version(candidate) == 1:
-        require_legacy_governing_history(properties, historical_hash=historical_hash, retained_targets=retained_targets)
+        await asyncio.to_thread(
+            require_legacy_governing_history, properties,
+            historical_hash=historical_hash, retained_targets=retained_targets,
+        )
     if candidate is None and historical_hash and historical_hash != new_hash:
         try:
             restored = await _recorded_legacy_restoration(db, governance, historical_hash, new_hash)
@@ -644,7 +647,7 @@ async def load_anchored_grant_baseline(
     standalone_genesis = receipt is None and not history and not genesis_history and not unknown_prior_edition
     prior_baselines = []
     if isinstance(original_genesis, Mapping) and ("publisher" in original_genesis or standalone_genesis):
-        birth_hash = _publisher_birth_anchor(original_genesis)
+        birth_hash = await asyncio.to_thread(_publisher_birth_anchor, original_genesis)
         verified_anchors.add(birth_hash)
         birth_baseline = GrantResolution(
             frozenset(), "edition 2 default deny at genesis",
@@ -811,8 +814,9 @@ async def _verify_baseline_ancestry(
     if receipt.get("signed_artifact_signer") != credential.get("id"):
         raise AmendmentArtifactError("Native reanchor receipt does not identify the verified signer")
     if old_hash in verified_anchors:
-        verify_recorded_publisher(
-            artifact.get("publisher_release"), source_hash, governing_text=governing_text, contract=contract,
+        await asyncio.to_thread(
+            verify_recorded_publisher, artifact.get("publisher_release"), source_hash,
+            governing_text=governing_text, contract=contract,
         )
         verify_reanchor_receipt_chronology(artifact, receipt)
         from .emancipation import validate_v2_emancipation_activation

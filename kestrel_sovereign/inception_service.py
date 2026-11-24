@@ -1249,7 +1249,8 @@ async def create_kestrel_identity_async(
                         f"or configure a Sovereign-signed constitution source "
                         f"descriptor naming this file (#2553)."
                     )
-            constitution_content, publisher_evidence = resolve_initial_governing_constitution_bytes(
+            constitution_content, publisher_evidence = await asyncio.to_thread(
+                resolve_initial_governing_constitution_bytes,
                 emancipation_contract,
                 source=governing_source,
             )

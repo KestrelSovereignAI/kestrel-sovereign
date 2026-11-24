@@ -1639,8 +1639,16 @@ class ConstitutionMixin:
 
         properties = agent_node.properties if agent_node else {}
         current_hash = properties.get("constitution_hash")
-        self._constitution_host_grant_baseline = unavailable_host_grants()
-        self._constitution_governing_replay_pending = True
+        anchor = (self.agent_id, current_hash) if current_hash else None
+        previous = getattr(self, "_constitution_host_grant_baseline", None)
+        verified_anchor = (
+            getattr(self, "_constitution_verified_legacy_anchor", None)
+            if previous is None else previous.verified_governing_anchor
+        )
+        if anchor is None or anchor != verified_anchor:
+            self._constitution_host_grant_baseline = unavailable_host_grants()
+            self._constitution_governing_replay_pending = True
+        verified = False
         try:
             if governing_text is None:
                 contract = contract_from_json(properties.get("emancipation_contract"))
@@ -1649,33 +1657,40 @@ class ConstitutionMixin:
                         contract, source=ConstitutionMixin._governing_constitution_source(self),
                     )
                 except ValueError as exc:
-                    return False, str(exc)
+                    raise AmendmentArtifactError(str(exc)) from exc
                 if current_hash:
                     if hashlib.sha256(source).hexdigest() != current_hash:
-                        return False, "Current Constitution anchor differs from the authoritative source"
+                        raise AmendmentArtifactError("Current Constitution anchor differs from the authoritative source")
                     governing_text, _ = await read_anchored_constitution(self._raw_storage.db, current_hash)
                     if governing_text is None:
-                        return False, "Current anchored Constitution bytes are unavailable"
+                        raise AmendmentArtifactError("Current anchored Constitution bytes are unavailable")
                 else:
                     governing_text = source.decode("utf-8")
-            if constitution_version(governing_text) == 1:
-                require_legacy_governing_history(properties)
-                self._constitution_host_grant_baseline = None
-                self._constitution_governing_replay_pending = False
-                return True, ""
-            baseline = await load_anchored_grant_baseline(
-                self._raw_storage.db,
-                target_did=self.agent_id,
-                properties=properties,
-                trusted_did_document=self._trusted_sovereign_did_document(agent_node),
-            )
-            if baseline is None:
-                raise AmendmentArtifactError("Edition 2 governing adoption evidence is unavailable")
+            legacy = constitution_version(governing_text) == 1
+            if legacy:
+                await asyncio.to_thread(require_legacy_governing_history, properties)
+                baseline = None
+            else:
+                baseline = await load_anchored_grant_baseline(
+                    self._raw_storage.db,
+                    target_did=self.agent_id,
+                    properties=properties,
+                    trusted_did_document=self._trusted_sovereign_did_document(agent_node),
+                )
+                if baseline is None:
+                    raise AmendmentArtifactError("Edition 2 governing adoption evidence is unavailable")
+            verified = True
         except (
             AmendmentArtifactError, ConstitutionSourceError, ConstitutionVersionError,
             EmancipationConfigError, SovereignTrustRootError, OSError, QueryError, UnicodeDecodeError,
         ) as exc:
             return False, str(exc)
+        finally:
+            if not verified:
+                self._constitution_verified_legacy_anchor = None
+                self._constitution_host_grant_baseline = unavailable_host_grants()
+                self._constitution_governing_replay_pending = True
+        self._constitution_verified_legacy_anchor = anchor if legacy else None
         self._constitution_host_grant_baseline = baseline
         self._constitution_governing_replay_pending = False
         return True, ""
@@ -2894,13 +2909,15 @@ class ConstitutionMixin:
                 await self._raw_storage.add_node(agent_node, capability=acquire_control_plane_capability())
                 consumed = await ConstitutionMixin._consume_initial_anchor_custody(self)
             if proposed_baseline is not None:
-                from dataclasses import replace
-
                 self._constitution_host_grant_baseline = replace(
                     proposed_baseline, baseline_sha256=artifact_hash, baseline_signer=verification.signer,
+                    verified_governing_anchor=(self.agent_id, new_hash),
                 )
-            elif getattr(self, "_constitution_governing_replay_pending", False) is True:
-                self._constitution_host_grant_baseline = None
+                self._constitution_verified_legacy_anchor = None
+            else:
+                self._constitution_verified_legacy_anchor = (self.agent_id, new_hash)
+                if getattr(self, "_constitution_governing_replay_pending", False) is True:
+                    self._constitution_host_grant_baseline = None
             self._constitution_governing_replay_pending = False
             ConstitutionMixin._publish_consumed_anchor_custody(self, consumed)
         except BaseException as e:
@@ -3104,7 +3121,8 @@ class ConstitutionMixin:
                 return f"Error: Anchored emancipation contract is corrupted: {e}"
 
             try:
-                constitution_content, publisher_evidence = resolve_initial_governing_constitution_bytes(
+                constitution_content, publisher_evidence = await asyncio.to_thread(
+                    resolve_initial_governing_constitution_bytes,
                     anchor_contract,
                     source=ConstitutionMixin._governing_constitution_source(self),
                 )

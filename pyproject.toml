@@ -175,6 +175,7 @@ dependencies = [
     # Floor at 48.0.1 clears the vulnerable bundled OpenSSL advisory while
     # staying above the earlier subgroup-validation fixed floor.
     "cryptography>=48.0.1",
+    "sigstore>=4.6.0,<5",
     "pycryptodome==3.23.0",
     # Auth and security
     # >=2.13.0 rejects a public-key JWK being accepted as an HMAC secret

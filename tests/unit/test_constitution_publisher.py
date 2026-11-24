@@ -42,13 +42,14 @@ def test_archive_uses_exact_git_members_and_commit(tmp_path):
         _verify_members(tree, {**expected, names[0]: "0" * 64}, commit)
 
 
-def test_offline_attestation_binds_the_real_source_commit_and_both_assets():
+def test_offline_attestation_binds_the_real_source_commit_and_both_assets(monkeypatch):
+    monkeypatch.setenv("PATH", "")
     edition = _edition()
     source = hashlib.sha256(edition.joinpath("KESTREL_CONSTITUTION.md").read_bytes()).hexdigest()
     publication = _publication()
     manifest = json.loads(publication.joinpath("release.json").read_bytes())
     verified = verify_packaged_publisher(source, declared_commit=manifest["publisher_commit"])
-    assert "issued_at" in verified
+    assert verified["issued_at"] == "2026-11-21T17:37:39+00:00"
     assert {k: verified[k] for k in manifest if k in verified} == {k: manifest[k] for k in
                         ("publisher_commit", "source_sha256", "archive_sha256", "attestation_sha256")}
     assert hashlib.sha256(edition.joinpath("PLEDGE.md").read_bytes()).hexdigest() == manifest["pledge_sha256"]
@@ -66,6 +67,17 @@ def test_attested_archive_cannot_be_substituted(tmp_path):
     with pytest.raises(AmendmentArtifactError, match="did not verify"):
         _verify_attestation(changed, publication.joinpath("attestation.jsonl"),
                             publication.joinpath("trusted-root.jsonl"), manifest["publisher_commit"])
+
+
+def test_actual_attestation_refuses_a_different_workflow_commit():
+    publication = _publication()
+    with pytest.raises(AmendmentArtifactError, match="did not verify"):
+        _verify_attestation(
+            publication.joinpath("constitution-v2.tar.gz"),
+            publication.joinpath("attestation.jsonl"),
+            publication.joinpath("trusted-root.jsonl"),
+            "a" * 40,
+        )
 
 
 def test_replay_finds_the_recorded_release_after_the_default_changes(tmp_path, monkeypatch):

@@ -10,11 +10,21 @@ export KESTREL_HISTORICAL_SPHINCS_PYTHON="$HOME/.kestrel/verification/sphincs-0.
 uv pip install --python "$KESTREL_HISTORICAL_SPHINCS_PYTHON" --only-binary :all: --require-hashes -r scripts/verification/legacy-sphincs/requirements.txt
 ```
 
-Set this interpreter path in the operator environment used for verification. The signed adoption receipt selects the historical algorithm and pins the archival public key. The verifier takes public data, runs offline with an empty environment, and checks the original signed payload. Existing FIPS 205 operations use the normal runtime. Store the historical rotation record with the adoption evidence so either party can repeat the check.
+Set this interpreter path in the operator environment used for adoption and in
+each runtime that replays these historical receipts during boot or audit. The
+signed adoption receipt selects the historical algorithm and pins the archival
+public key. The verifier takes public data, runs offline with an empty
+environment, and checks the original signed payload. Existing FIPS 205
+operations use the normal runtime. Store the historical rotation record with the
+adoption evidence so either party can repeat the check.
 
 ## Verify the second edition’s publisher
 
-Install the GitHub CLI (`gh`) on the operator host. Its `attestation verify` command must support `--bundle`, `--custom-trusted-root`, `--source-digest`, and `--signer-digest`. Kestrel checks the released archive against the publisher’s main-branch workflow, repository identity, source commit, and recorded SHA-256 digests. The distribution includes the archive, its public attestation, and the independently obtained Sigstore trusted roots. Verification runs offline and requires no GitHub login.
+Kestrel uses the Sigstore Python verifier for the publisher’s main-branch
+workflow, repository identity, source commit, and archive SHA-256. The
+distribution includes the archive, its attestation, and independently obtained
+Sigstore trusted roots. Publisher verification runs offline at adoption and
+during runtime verification of the recorded governing evidence.
 
 To repeat that check from an installed Kestrel environment, run this command.
 

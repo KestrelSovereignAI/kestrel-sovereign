@@ -6,12 +6,15 @@ from datetime import datetime, timezone
 import hashlib
 from importlib.resources import as_file, files
 import json
-import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import tarfile
+from tempfile import TemporaryDirectory
+
+from sigstore.errors import Error as SigstoreError
+from sigstore.errors import VerificationError
+from sigstore.models import Bundle, TrustedRoot
+from sigstore.verify import Verifier, policy
 
 from .amendment_artifact import AmendmentArtifactError
 from .emancipation import EmancipationContract, apply_emancipation
@@ -19,7 +22,9 @@ from .emancipation import EmancipationContract, apply_emancipation
 
 _REPOSITORY = "KestrelSovereignAI/kestrel-sovereign"
 _REPOSITORY_ID = "1147541224"
-_WORKFLOW = f"{_REPOSITORY}/.github/workflows/constitution-release.yml"
+_REPOSITORY_URL = f"https://github.com/{_REPOSITORY}"
+_WORKFLOW = f"{_REPOSITORY_URL}/.github/workflows/constitution-release.yml"
+_SOURCE_REF = "refs/heads/main"
 _EDITION = "kestrel_sovereign/data/constitutions/v2/"
 _CONSTITUTION = _EDITION + "KESTREL_CONSTITUTION.md"
 _PLEDGE = _EDITION + "PLEDGE.md"
@@ -135,36 +140,56 @@ def _verify_members(archive: Path, expected: dict[str, str], commit: str) -> byt
 
 
 def _verify_attestation(archive: Path, bundle: Path, roots: Path, commit: str) -> str:
-    executable = shutil.which("gh")
-    if executable is None:
-        raise AmendmentArtifactError("Install GitHub CLI with offline attestation support to verify the publisher")
-    args = [
-        executable, "attestation", "verify", str(archive), "--bundle", str(bundle),
-        "--custom-trusted-root", str(roots), "--repo", _REPOSITORY,
-        "--signer-workflow", _WORKFLOW, "--source-ref", "refs/heads/main",
-        "--source-digest", commit, "--signer-digest", commit,
-        "--deny-self-hosted-runners", "--format", "json",
-        "--jq", "[.[] | .verificationResult | {repository: .signature.certificate.sourceRepositoryIdentifier,"
-                " timestamps: [.verifiedTimestamps[].timestamp]}]",
-    ]
-    # Offline verification needs neither an operator token nor a network client.
-    env = {name: os.environ[name] for name in ("SystemRoot", "WINDIR") if name in os.environ}
+    workflow = f"{_WORKFLOW}@{_SOURCE_REF}"
+    claims = policy.AllOf([
+        policy.Identity(identity=workflow, issuer="https://token.actions.githubusercontent.com"),
+        policy.OIDCBuildSignerURI(workflow),
+        policy.OIDCBuildSignerDigest(commit),
+        policy.OIDCSourceRepositoryURI(_REPOSITORY_URL),
+        policy.OIDCSourceRepositoryDigest(commit),
+        policy.OIDCSourceRepositoryRef(_SOURCE_REF),
+        policy.OIDCSourceRepositoryIdentifier(_REPOSITORY_ID),
+        policy.OIDCRunnerEnvironment("github-hosted"),
+    ])
+    failure = "The official publisher's workflow and repository identity did not verify"
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=30, env=env, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise AmendmentArtifactError("Could not run the offline publisher attestation verifier") from exc
-    if result.returncode:
-        raise AmendmentArtifactError("The official publisher's workflow and repository identity did not verify")
-    try:
-        witnesses = json.loads(result.stdout)
-        if not witnesses or any(witness["repository"] != _REPOSITORY_ID for witness in witnesses):
-            raise ValueError("Unexpected publisher repository")
-        timestamps = [
-            datetime.fromisoformat(value)
-            for witness in witnesses for value in witness["timestamps"]
-        ]
-        if not timestamps or any(stamp.utcoffset() is None for stamp in timestamps):
-            raise ValueError("Missing authenticated publisher timestamp")
-        return min(timestamps).astimezone(timezone.utc).isoformat()
-    except (ValueError, TypeError, KeyError) as exc:
-        raise AmendmentArtifactError("The publisher identity or authenticated issuance time did not verify") from exc
+        attestation = bundle.read_bytes()
+        sigstore_bundle = Bundle.from_json(attestation)
+        # GitHub's offline trust export contains one JSON document per trust
+        # root. The verifier accepts only the packaged roots and uses no login.
+        with TemporaryDirectory() as directory:
+            trust_file = Path(directory) / "trusted-root.json"
+            for root in roots.read_bytes().splitlines():
+                trust_file.write_bytes(root)
+                trusted_root = TrustedRoot.from_file(str(trust_file))
+                try:
+                    media_type, payload = Verifier(trusted_root=trusted_root).verify_dsse(
+                        sigstore_bundle, claims,
+                    )
+                except VerificationError:
+                    continue
+                break
+            else:
+                raise AmendmentArtifactError(failure)
+        statement = json.loads(payload)
+        expected_subject = {
+            "name": "constitution-v2.tar.gz",
+            "digest": {"sha256": hashlib.sha256(archive.read_bytes()).hexdigest()},
+        }
+        if (
+            media_type != "application/vnd.in-toto+json"
+            or statement["_type"] != "https://in-toto.io/Statement/v1"
+            or statement["predicateType"] != "https://slsa.dev/provenance/v1"
+            or statement["subject"] != [expected_subject]
+        ):
+            raise AmendmentArtifactError("The signed publisher archive digest did not verify")
+        # The installed releases use a Rekor v1 signed inclusion promise.
+        # Sigstore verifies that promise, including its integrated timestamp.
+        entry, = json.loads(attestation)["verificationMaterial"]["tlogEntries"]
+        if not entry["inclusionPromise"]["signedEntryTimestamp"]:
+            raise AmendmentArtifactError("The authenticated publisher issuance time did not verify")
+        return datetime.fromtimestamp(int(entry["integratedTime"]), tz=timezone.utc).isoformat()
+    except AmendmentArtifactError:
+        raise
+    except (SigstoreError, ValueError, TypeError, KeyError, OverflowError) as exc:
+        raise AmendmentArtifactError(failure) from exc
