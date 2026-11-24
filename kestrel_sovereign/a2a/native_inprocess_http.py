@@ -141,26 +141,28 @@ class _Exchange:
             self.receiving = False
 
     async def retire_request(self) -> None:
-        errors = []
-        if self.request_source is not None:
-            try:
-                await self.request_source.aclose()
-            except BaseException as error:
-                errors.append(error)
-        if not self.request_acquired:
-            # A stopped or refused input owner may never enter its factory.
-            # Its ORIGINAL parent still owns this untransferred public stream.
-            # Canonical retirement attempts the same retained closer once and
-            # validates its actual result; it is not a replacement owner.
-            resources = SourceAcquisition()
-            resources.retain(self.request_stream, self.request_stream_close)
-            errors.extend(await resources.retire())
-        if self.request_read is not None:
-            outcome = await self.request_read.observe()
-            errors.extend((outcome.error, outcome.cancellation))
-        terminal = execution_observation_error(*errors)
-        if terminal is not None:
-            raise terminal
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            errors = []
+            if self.request_source is not None:
+                try:
+                    await self.request_source.aclose()
+                except BaseException as error:
+                    errors.append(error)
+            if not self.request_acquired:
+                # A stopped or refused input owner may never enter its factory.
+                # Its ORIGINAL parent still owns this untransferred public stream.
+                # Canonical retirement attempts the same retained closer once and
+                # validates its actual result; it is not a replacement owner.
+                resources = SourceAcquisition()
+                resources.retain(self.request_stream, self.request_stream_close)
+                errors.extend(await resources.retire())
+            if self.request_read is not None:
+                outcome = await self.request_read.observe()
+                errors.extend((outcome.error, outcome.cancellation))
+            terminal = execution_observation_error(*errors)
+            if terminal is not None:
+                raise terminal
 
     async def retire(self) -> None:
         errors = []
@@ -268,63 +270,65 @@ class _Exchange:
         return value
 
     async def close(self) -> None:
-        self.disconnected.set()
-        if self.source is not None:
-            self.source.request_stop()
-        if self.request_source is not None:
-            self.request_source.request_stop()
-        if self.close_admission is None:
-            self.close_admission = OwnedTaskAdmission()
-            if self.retirement_deadline is None:
-                self.retirement_deadline = asyncio.get_running_loop().time() + self.read_timeout
-            try:
-                self.close_task = create_owned_task(
-                    self.retire(), admission=self.close_admission,
-                    retirement_resource=self, retain_originals=True,
-                )
-            except BaseException as error:
-                self.close_opening = error
-                self.close_task = self.close_admission.task
-        sources = tuple(source for source in (self.source, self.request_source) if source is not None)
-        source_tasks = tuple(task for source in sources for task in (source.producer_task, source.owner_task))
-        if self.request_read is not None and self.request_read.task is not None:
-            source_tasks = (*source_tasks, self.request_read.task)
-        original_tasks = ((self.close_task, *source_tasks)
-                          if self.close_task is not None else source_tasks)
-        observed = await wait_owned_tasks_until(original_tasks, deadline=self.retirement_deadline)
-        debt = pending_owned_retirement_error(
-            self, original_tasks,
-            message="Original native ASGI source retirement is still pending",
-        )
-        request_outcome = None
-        if self.request_read is not None and (self.request_read.task is None or self.request_read.task.done()):
-            request_outcome = await self.request_read.observe()
-        request_error = (execution_observation_error(request_outcome.error, request_outcome.cancellation)
-                         if request_outcome is not None else None)
-        if debt is not None:
-            raise execution_observation_error(
-                self.close_opening, *(source.terminal_error for source in sources), request_error,
-                observed.cancellation, debt,
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            self.disconnected.set()
+            if self.source is not None:
+                self.source.request_stop()
+            if self.request_source is not None:
+                self.request_source.request_stop()
+            if self.close_admission is None:
+                self.close_admission = OwnedTaskAdmission()
+                if self.retirement_deadline is None:
+                    self.retirement_deadline = asyncio.get_running_loop().time() + self.read_timeout
+                try:
+                    self.close_task = create_owned_task(
+                        self.retire(), admission=self.close_admission,
+                        retirement_resource=self, retain_originals=True,
+                    )
+                except BaseException as error:
+                    self.close_opening = error
+                    self.close_task = self.close_admission.task
+            sources = tuple(source for source in (self.source, self.request_source) if source is not None)
+            source_tasks = tuple(task for source in sources for task in (source.producer_task, source.owner_task))
+            if self.request_read is not None and self.request_read.task is not None:
+                source_tasks = (*source_tasks, self.request_read.task)
+            original_tasks = ((self.close_task, *source_tasks)
+                              if self.close_task is not None else source_tasks)
+            observed = await wait_owned_tasks_until(original_tasks, deadline=self.retirement_deadline)
+            debt = pending_owned_retirement_error(
+                self, original_tasks,
+                message="Original native ASGI source retirement is still pending",
             )
-        # An accepted close task can fail publication before its body runs, or
-        # allocation can refuse it entirely. The SAME source owners can still
-        # finish their original cleanup. Harvest those outcomes independently
-        # so a later physical failure never disappears behind admission failure.
-        source_outcomes = [await source.join_source_owners(closing=True) for source in sources]
-        outcome = await await_owned_task(self.close_task) if self.close_task is not None else None
-        terminal = execution_observation_error(
-            self.close_opening, *(error for source in source_outcomes for error in (source.error, source.cancellation)),
-            request_error,
-            outcome.error if outcome is not None else None,
-            outcome.cancellation if outcome is not None else None,
-            observed.cancellation,
-        )
-        # Settled failure is not pending physical retirement. Concurrent
-        # observers still retain this exact exchange/close task and outcome.
-        if self.close_task is not None:
-            self.transport.exchanges.discard(self)
-        if terminal is not None:
-            raise terminal
+            request_outcome = None
+            if self.request_read is not None and (self.request_read.task is None or self.request_read.task.done()):
+                request_outcome = await self.request_read.observe()
+            request_error = (execution_observation_error(request_outcome.error, request_outcome.cancellation)
+                             if request_outcome is not None else None)
+            if debt is not None:
+                raise execution_observation_error(
+                    self.close_opening, *(source.terminal_error for source in sources), request_error,
+                    observed.cancellation, debt,
+                )
+            # An accepted close task can fail publication before its body runs, or
+            # allocation can refuse it entirely. The SAME source owners can still
+            # finish their original cleanup. Harvest those outcomes independently
+            # so a later physical failure never disappears behind admission failure.
+            source_outcomes = [await source.join_source_owners(closing=True) for source in sources]
+            outcome = await await_owned_task(self.close_task) if self.close_task is not None else None
+            terminal = execution_observation_error(
+                self.close_opening, *(error for source in source_outcomes for error in (source.error, source.cancellation)),
+                request_error,
+                outcome.error if outcome is not None else None,
+                outcome.cancellation if outcome is not None else None,
+                observed.cancellation,
+            )
+            # Settled failure is not pending physical retirement. Concurrent
+            # observers still retain this exact exchange/close task and outcome.
+            if self.close_task is not None:
+                self.transport.exchanges.discard(self)
+            if terminal is not None:
+                raise terminal
 
 
 class _ResponseBody(httpx.AsyncByteStream):

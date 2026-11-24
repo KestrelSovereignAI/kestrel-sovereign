@@ -893,24 +893,26 @@ class PostgresBackend(DatabaseBackend):
         an ordinary close failure or permission to skip the independent pool.
         Borrowed primary pools are only detached; their caller retains custody.
         """
-        from .original_result_custody import _drain_original_results
-        await _drain_original_results(self)
-        errors: list[BaseException | None] = [await self._retire_runtime_owner_renewal_pool()]
-        for attribute in ("_advisory_pool", "_pool"):
-            pool = getattr(self, attribute)
-            if pool is None:
-                continue
-            if attribute == "_pool" and not self._owns_pool:
-                if self._pool is pool:
-                    self._pool = None
-                continue
-            errors.append(await self._retire_owned_pool(attribute, pool))
-        terminal = execution_terminal_error(
-            *errors, retain_originals=True, prefer_cancellation=True,
-            isolate_control_originals=True,
-        )
-        if terminal is not None:
-            raise terminal
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            from .original_result_custody import _drain_original_results
+            await _drain_original_results(self)
+            errors: list[BaseException | None] = [await self._retire_runtime_owner_renewal_pool()]
+            for attribute in ("_advisory_pool", "_pool"):
+                pool = getattr(self, attribute)
+                if pool is None:
+                    continue
+                if attribute == "_pool" and not self._owns_pool:
+                    if self._pool is pool:
+                        self._pool = None
+                    continue
+                errors.append(await self._retire_owned_pool(attribute, pool))
+            terminal = execution_terminal_error(
+                *errors, retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
+            if terminal is not None:
+                raise terminal
 
     def _runtime_owner_renewal_lock(self) -> asyncio.Lock:
         """Held by each renewal across its write, and by close (#4001).

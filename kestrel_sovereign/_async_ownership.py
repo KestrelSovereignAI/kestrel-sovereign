@@ -418,6 +418,9 @@ class OwnedTaskLender(Protocol):
     The host validates the exact root, creator and original parent. Its
     reservation is atomic: refusal must not create an unreturned reservation.
     An accepted reservation stays with the original admission even on errors.
+    Core alone invokes retire through that original receipt's one-shot
+    publisher. Hosts may join and read-only reconcile, but must never retire
+    the same reservation independently from an observer or drain loop.
     """
 
     def reserve(self, *, creator: asyncio.Task | None, original_parent: asyncio.Task,
@@ -495,11 +498,16 @@ def _require_fresh_owned_task_admission(admission, *, for_operation=False):
 
 
 def _has_original_native_constructor(loop, owner_loop):
+    native_method = getattr(owner_loop.create_task, "__func__", None)
+    standard = (native_method is _NATIVE_LOOP_CREATE_TASK
+        and _NATIVE_LOOP_CREATE_TASK.__code__ is _NATIVE_LOOP_CREATE_TASK_CODE)
+    uvloop = (_NATIVE_UVLOOP is not None and isinstance(owner_loop, _NATIVE_UVLOOP)
+        and native_method is _NATIVE_UVLOOP_CREATE_TASK
+        and getattr(owner_loop.create_task, "__self__", None) is owner_loop)
     return (
         (loop is not None or (asyncio.create_task is _NATIVE_CREATE_TASK
             and _NATIVE_CREATE_TASK.__code__ is _NATIVE_CREATE_TASK_CODE))
-        and getattr(owner_loop.create_task, "__func__", None) is _NATIVE_LOOP_CREATE_TASK
-        and _NATIVE_LOOP_CREATE_TASK.__code__ is _NATIVE_LOOP_CREATE_TASK_CODE
+        and (standard or uvloop)
         and asyncio.tasks.Task is _NATIVE_TASK)
 
 
@@ -507,15 +515,7 @@ def _require_canonical_loan_constructor(loop, owner_loop):
     # Generic non-lender work keeps its configured factory semantics. A host
     # loan cannot rely on a snapshot of a factory that retains the coroutine
     # and may resume it in another Task after that snapshot or first dispatch.
-    native_function = (loop is not None or (
-        asyncio.create_task is _NATIVE_CREATE_TASK
-        and _NATIVE_CREATE_TASK.__code__ is _NATIVE_CREATE_TASK_CODE))
-    native_loop = (_has_original_native_constructor(loop, owner_loop) or (
-        _NATIVE_UVLOOP is not None and isinstance(owner_loop, _NATIVE_UVLOOP)
-        and getattr(owner_loop.create_task, "__func__", None) is _NATIVE_UVLOOP_CREATE_TASK
-        and getattr(owner_loop.create_task, "__self__", None) is owner_loop
-        and asyncio.tasks.Task is _NATIVE_TASK))
-    if owner_loop.get_task_factory() is not None or not native_function or not native_loop:
+    if owner_loop.get_task_factory() is not None or not _has_original_native_constructor(loop, owner_loop):
         raise RuntimeError("host loans require a canonical native constructor without a task factory")
 
 

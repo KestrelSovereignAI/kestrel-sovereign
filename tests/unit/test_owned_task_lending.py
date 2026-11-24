@@ -87,6 +87,10 @@ def test_actual_uvicorn_loop_selection_preserves_native_loan_ownership(flavor, s
         try:
             if substitute:
                 monkeypatch.setattr(loop, "create_task", replacement)
+            else:
+                def forbid_global_task_scan(*args, **options):
+                    pytest.fail("qualified native constructor scanned unrelated live Tasks")
+                monkeypatch.setattr(asyncio, "all_tasks", forbid_global_task_scan)
             with ownership.bind_owned_task_lender(host):
                 if substitute:
                     with pytest.raises(RuntimeError, match="canonical native constructor"):
@@ -180,7 +184,7 @@ async def test_source_lend_veto_retires_original_partial_without_decorating_veto
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource", ["http-response", "http-inline", "database-facade", "database-backend"])
+@pytest.mark.parametrize("resource", ["http-response", "http-inline", "database-facade", "database-backend", "database-owned-wrapper", "hold-preflight"])
 @pytest.mark.parametrize("fenced", [False, True])
 async def test_public_physical_closers_do_not_reserve_new_work(tmp_path, resource, fenced):
     from contextlib import nullcontext
@@ -238,7 +242,14 @@ async def test_public_physical_closers_do_not_reserve_new_work(tmp_path, resourc
         try:
             assert worker.is_alive()
             with scope, ownership.bind_owned_task_lender(host):
-                await (database.close() if resource == "database-facade" else database._backend.close())
+                if resource == "hold-preflight":
+                    from kestrel_sovereign.hold.state import _close_postgres_preflight_backends
+                    assert await _close_postgres_preflight_backends(database._backend) == ()
+                elif resource == "database-owned-wrapper":
+                    from kestrel_sovereign.storage.async_database import _close_owned_database
+                    await _close_owned_database(database)
+                else:
+                    await (database.close() if resource == "database-facade" else database._backend.close())
                 assert ownership.capture_owned_task_lender() is not None
                 require_execution_work()
             assert not worker.is_alive()
@@ -247,6 +258,173 @@ async def test_public_physical_closers_do_not_reserve_new_work(tmp_path, resourc
             # acknowledgement to the host policy under test.
             await database.close()
     assert not host.outstanding and not host.retired
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["factory-close", "driver-retirement"])
+async def test_sqla_original_workers_retire_without_work_capacity(entry):
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from kestrel_sovereign.storage.sqla.session import SovereignSqlaSessionFactory
+    factory = SovereignSqlaSessionFactory(create_async_engine("sqlite+aiosqlite:///:memory:"))
+    host = CapacityLoan(capacity=0)
+    try:
+        async with factory.engine.connect() as connection:
+            assert await connection.scalar(text("SELECT 1")) == 1
+        workers = tuple(getattr(connection, "_thread", connection)
+                        for connection in factory._sqlite_connections)
+        assert workers and all(worker.is_alive() for worker in workers)
+        if entry == "driver-retirement":
+            # The synchronous pool hook requires the actual original engine
+            # disposal owner, not a fabricated completed acknowledgement.
+            factory._engine_dispose_task = ownership.create_owned_task(
+                factory.engine.dispose(), lender_capture=None,
+            )
+        with ownership.bind_owned_task_lender(host):
+            if entry == "driver-retirement":
+                factory._begin_sqlite_connection_retirement()
+                # Observe the SAME accepted native closers before final engine
+                # disposal; no work-capacity refusal can stand in for retirement.
+                for task in tuple(factory._driver_close_tasks):
+                    outcome = await ownership.await_owned_task(task)
+                    assert outcome.error is None
+            await factory.close()
+        assert all(not worker.is_alive() for worker in workers)
+        assert not host.outstanding and not host.retired
+    finally:
+        await factory.close()
+
+
+@pytest.mark.asyncio
+async def test_native_http_exchange_retirement_needs_no_work_capacity(tmp_path):
+    import httpx
+    from kestrel_sovereign.a2a.native_inprocess_http import _NativeInProcessHTTPTransport
+    handle = (tmp_path / "original-native-upload").open("w+b")
+    retired = asyncio.Event()
+    host = CapacityLoan(capacity=0)
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"original upload"
+
+        async def aclose(self):
+            assert ownership.capture_owned_task_lender() is None
+            handle.close()
+
+    async def app(scope, receive, send):
+        try:
+            await send({"type": "http.response.start", "status": 200})
+            await send({"type": "http.response.body", "body": b"original response", "more_body": True})
+            while (await receive())["type"] != "http.disconnect":
+                pass
+        finally:
+            retired.set()
+
+    transport = _NativeInProcessHTTPTransport(application=app, public_base_url="https://native.test",
+        require_binding=lambda scope: None, buffer_bytes=65536)
+    try:
+        async with httpx.AsyncClient(transport=transport) as client:
+            request = httpx.Request("POST", "https://native.test/native", stream=Body(), headers={"Host": "native.test"},
+                extensions={"timeout": {"read": 5, "write": 5}})
+            response = await client.send(request, stream=True)
+            try:
+                assert await anext(response.aiter_raw()) == b"original response"
+                with ownership.bind_owned_task_lender(host):
+                    # Public transport disposal also reaches the exchange
+                    # without HTTPX's separate response-close cleanup scope.
+                    await transport.aclose()
+            finally:
+                await response.aclose()
+        assert retired.is_set() and handle.closed and not transport.exchanges
+        assert not host.outstanding and not host.retired
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_original_rollback_drain_needs_no_work_capacity(tmp_path):
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    backend = SQLiteBackend(str(tmp_path / "rollback-drain.sqlite"))
+    await backend.connect()
+    connection = backend._connection
+    worker = getattr(connection, "_thread", connection)
+    await backend.execute("CREATE TABLE original_effect(value INTEGER)")
+    await connection.execute("BEGIN")
+    await connection.execute("INSERT INTO original_effect VALUES (1)")
+    host = CapacityLoan(capacity=0)
+    try:
+        with ownership.bind_owned_task_lender(host):
+            backend._handoff_cancelled_write(connection)
+            drain = backend._cancelled_write_drain
+            assert drain is not None
+            outcome = await ownership.await_owned_task(drain)
+            assert outcome.error is None and backend._cancelled_write_drain_error is None
+        assert not connection.in_transaction
+        row = await backend.fetch_one("SELECT COUNT(*) AS count FROM original_effect")
+        assert row[0] == 0 and not host.outstanding and not host.retired
+    finally:
+        # Observe the original close even on the negative admission run. Any
+        # retained admission error is evidence, not a reason to skip disposal.
+        retained_error = backend._cancelled_write_drain_error
+        closer = ownership.create_owned_task(backend.close(), lender_capture=None)
+        closed = await ownership.await_owned_task(closer)
+        assert not worker.is_alive()
+        if closed.error is not None:
+            assert retained_error in execution_evidence_carriers(closed.error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_sqlite_retained_physical_close_reaper_needs_no_work_capacity(tmp_path):
+    import threading
+    import time
+    import aiosqlite
+    from kestrel_sovereign.storage.db.sqlite import _close_aiosqlite_connection
+    connection = await aiosqlite.connect(str(tmp_path / "retained-worker.sqlite"))
+    worker = getattr(connection, "_thread", connection)
+    entered, release = threading.Event(), threading.Event()
+    retained = {}
+    host = CapacityLoan(capacity=0)
+
+    def hold():
+        entered.set()
+        if not release.wait(10):
+            raise TimeoutError("original native worker was not released")
+        return 1
+
+    def original_query():
+        cursor = connection._conn.execute("SELECT original_hold()")
+        try:
+            return cursor.fetchone()
+        finally:
+            cursor.close()
+
+    await connection.create_function("original_hold", 0, hold)
+    query = ownership.create_owned_task(connection._execute(original_query), lender_capture=None)
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        with ownership.bind_owned_task_lender(host):
+            with pytest.raises(BaseException):
+                await _close_aiosqlite_connection(connection, retained_closes=retained,
+                    deadline=time.monotonic() + 0.03, cancel_close_task_on_timeout=False)
+            original = retained[connection]
+            assert original.retirement_task is not None, "original retirement reaper requested WORK capacity"
+        assert not host.outstanding and not host.retired
+    finally:
+        release.set()
+        queried = await ownership.await_owned_task(query)
+        if queried.error is not None:
+            import sqlite3
+            assert isinstance(queried.error, sqlite3.OperationalError)
+        original = retained.get(connection)
+        if original is not None and original.close_task is not None:
+            await ownership.await_owned_task(original.close_task)
+        else:
+            await connection.close()
+        if original is not None and original.retirement_task is not None:
+            await ownership.await_owned_task(original.retirement_task)
+        await asyncio.to_thread(worker.join, 3)
+        assert not worker.is_alive()
 
 
 @pytest.mark.asyncio

@@ -962,90 +962,92 @@ async def _close_aiosqlite_connection(
     ``diagnostics`` is what an overrun reports; a caller that knows the
     database passes it, taken before its close began.
     """
-    loop = asyncio.get_running_loop()
-    if diagnostics is None:
-        diagnostics = _capture_close_diagnostics(None, None)
-    if deadline is None:
-        deadline = loop.time() + _minimum_close_timeout_s()
-    opening = None
-    try:
-        if close_task is None:
-            existing = retained_closes.get(connection)
-            if existing is not None:
-                _capture_retained_close(existing)
-                if existing.close_task is None:
-                    # A coordinating caller (including SQLAlchemy) cannot
-                    # mistake a retained absence for permission to retry.
-                    if existing.control_error is not None:
-                        raise existing.control_error
-                    raise ConnectionError("Original SQLite closer was never admitted; explicit retirement reconciliation required")
-                close_task = existing.close_task
-        if close_task is None:
-            from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
-            from kestrel_sovereign.execution_custody import bind_execution_cleanup
-            receipt = OwnedTaskAdmission()
-            try:
-                closer = connection.close() if acquisition is None else _close_acquired_sqlite_connection(connection, acquisition)
-                with bind_execution_cleanup(connection):
-                    close_task = create_owned_task(closer, retain_originals=True,
-                        admission=receipt, retirement_resource=connection)
-            except BaseException as error:
-                close_task = receipt.task
-                opening = error
-                _retain_aiosqlite_close(connection, close_task, retained_closes,
-                                       control_error=error, acquisition=acquisition)
-                if close_task is None:
-                    raise
-        await _finish_aiosqlite_connection_close(
-            connection,
-            close_task=close_task,
-            deadline=deadline,
-            retained_closes=retained_closes,
-            cancel_close_task_on_timeout=cancel_close_task_on_timeout,
-            diagnostics=diagnostics,
-            acquisition=acquisition,
-        )
-        if opening is not None:
-            raise opening
-    except BaseException as error:
-        # Repeated cancellation can interrupt either bounded retry. Never let
-        # an exit shed ownership of a still-live non-daemon worker.
-        if (_aiosqlite_worker_is_alive(connection) or (close_task is not None and not close_task.done())
-                or acquisition is not None and not acquisition.retirement_confirmed):
-            _retain_aiosqlite_close(
-                connection, close_task, retained_closes, control_error=opening,
+    from kestrel_sovereign.execution_custody import bind_execution_cleanup
+    with bind_execution_cleanup(connection):
+        loop = asyncio.get_running_loop()
+        if diagnostics is None:
+            diagnostics = _capture_close_diagnostics(None, None)
+        if deadline is None:
+            deadline = loop.time() + _minimum_close_timeout_s()
+        opening = None
+        try:
+            if close_task is None:
+                existing = retained_closes.get(connection)
+                if existing is not None:
+                    _capture_retained_close(existing)
+                    if existing.close_task is None:
+                        # A coordinating caller (including SQLAlchemy) cannot
+                        # mistake a retained absence for permission to retry.
+                        if existing.control_error is not None:
+                            raise existing.control_error
+                        raise ConnectionError("Original SQLite closer was never admitted; explicit retirement reconciliation required")
+                    close_task = existing.close_task
+            if close_task is None:
+                from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
+                from kestrel_sovereign.execution_custody import bind_execution_cleanup
+                receipt = OwnedTaskAdmission()
+                try:
+                    closer = connection.close() if acquisition is None else _close_acquired_sqlite_connection(connection, acquisition)
+                    with bind_execution_cleanup(connection):
+                        close_task = create_owned_task(closer, retain_originals=True,
+                            admission=receipt, retirement_resource=connection)
+                except BaseException as error:
+                    close_task = receipt.task
+                    opening = error
+                    _retain_aiosqlite_close(connection, close_task, retained_closes,
+                                           control_error=error, acquisition=acquisition)
+                    if close_task is None:
+                        raise
+            await _finish_aiosqlite_connection_close(
+                connection,
+                close_task=close_task,
+                deadline=deadline,
+                retained_closes=retained_closes,
+                cancel_close_task_on_timeout=cancel_close_task_on_timeout,
+                diagnostics=diagnostics,
                 acquisition=acquisition,
             )
-        from kestrel_sovereign._async_ownership import owned_task_error
-        close_error = owned_task_error(close_task) if close_task is not None and close_task.done() else None
-        terminal = execution_terminal_error(opening, close_error, error, retain_originals=True, isolate_control_originals=True)
-        retained = retained_closes.get(connection)
-        if acquisition is not None and not acquisition.retirement_confirmed:
-            resource = acquisition.native.result() if acquisition.native.done() else connection
-            debt = RuntimeError("original acquired SQLite connection retirement remains unresolved")
-            debt._kestrel_native_retirement_debts = ((resource, close_task),)
-            terminal = execution_terminal_error(terminal, debt, retain_originals=True, isolate_control_originals=True)
+            if opening is not None:
+                raise opening
+        except BaseException as error:
+            # Repeated cancellation can interrupt either bounded retry. Never let
+            # an exit shed ownership of a still-live non-daemon worker.
+            if (_aiosqlite_worker_is_alive(connection) or (close_task is not None and not close_task.done())
+                    or acquisition is not None and not acquisition.retirement_confirmed):
+                _retain_aiosqlite_close(
+                    connection, close_task, retained_closes, control_error=opening,
+                    acquisition=acquisition,
+                )
+            from kestrel_sovereign._async_ownership import owned_task_error
+            close_error = owned_task_error(close_task) if close_task is not None and close_task.done() else None
+            terminal = execution_terminal_error(opening, close_error, error, retain_originals=True, isolate_control_originals=True)
+            retained = retained_closes.get(connection)
+            if acquisition is not None and not acquisition.retirement_confirmed:
+                resource = acquisition.native.result() if acquisition.native.done() else connection
+                debt = RuntimeError("original acquired SQLite connection retirement remains unresolved")
+                debt._kestrel_native_retirement_debts = ((resource, close_task),)
+                terminal = execution_terminal_error(terminal, debt, retain_originals=True, isolate_control_originals=True)
+                if retained is not None:
+                    retained.control_error = execution_terminal_error(retained.control_error, terminal, retain_originals=True, isolate_control_originals=True)
+                    retained.control_reported = False
             if retained is not None:
-                retained.control_error = execution_terminal_error(retained.control_error, terminal, retain_originals=True, isolate_control_originals=True)
-                retained.control_reported = False
-        if retained is not None:
-            # The exact accepted closer (or None) remains private while its
-            # worker is alive, including a refused unstarted close recipe.
-            if is_execution_control_error(terminal) and (
-                _aiosqlite_worker_is_alive(connection)
-                or (close_task is not None and not close_task.done())
-            ):
-                debt = RuntimeError("original SQLite inner close remains unresolved")
-                debt._kestrel_native_retirement_debts = ((connection, close_task),)
-                terminal = execution_terminal_error(terminal, debt,
-                    retain_originals=True, isolate_control_originals=True)
-                retained.control_error = execution_terminal_error(retained.control_error,
-                    terminal, retain_originals=True, isolate_control_originals=True)
-                retained.control_reported = False
-            _capture_retained_close(retained)
-            if terminal is retained.control_error:
-                retained.control_reported = True
-        raise terminal
+                # The exact accepted closer (or None) remains private while its
+                # worker is alive, including a refused unstarted close recipe.
+                if is_execution_control_error(terminal) and (
+                    _aiosqlite_worker_is_alive(connection)
+                    or (close_task is not None and not close_task.done())
+                ):
+                    debt = RuntimeError("original SQLite inner close remains unresolved")
+                    debt._kestrel_native_retirement_debts = ((connection, close_task),)
+                    terminal = execution_terminal_error(terminal, debt,
+                        retain_originals=True, isolate_control_originals=True)
+                    retained.control_error = execution_terminal_error(retained.control_error,
+                        terminal, retain_originals=True, isolate_control_originals=True)
+                    retained.control_reported = False
+                _capture_retained_close(retained)
+                if terminal is retained.control_error:
+                    retained.control_reported = True
+            raise terminal
 
 
 async def _close_acquired_sqlite_connection(
@@ -1907,194 +1909,196 @@ class SQLiteBackend(DatabaseBackend):
     
     async def close(self) -> None:
         """Close database connection and wait for background thread to stop."""
-        from .original_result_custody import _drain_original_results
-        await _drain_original_results(self)
-        loop = asyncio.get_running_loop()
-        # A renewal still waiting for SQLite's writer slot sees this between
-        # attempts and ends having written nothing, so the join below waits
-        # only for one that already holds the slot (#4040).
-        self._runtime_owner_renewal_retired = True
-        # Renewal's own connection first (#4001). Every connection's close
-        # shares the deadline taken after that join, which never consumes it.
-        (
-            close_deadline, renewal_failure, pending_cancellation,
-        ) = await self._retire_runtime_owner_renewal()
-        conn = self._connection
-        failure = (
-            self._cancelled_write_drain_error
-            if self._cancelled_write_drain_error is not None
-            and is_execution_control_error(self._cancelled_write_drain_error)
-            else None
-        )
-        if renewal_failure is not None:
-            failure = execution_terminal_error(
-                failure, renewal_failure,
-                retain_originals=True, isolate_control_originals=True,
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            from .original_result_custody import _drain_original_results
+            await _drain_original_results(self)
+            loop = asyncio.get_running_loop()
+            # A renewal still waiting for SQLite's writer slot sees this between
+            # attempts and ends having written nothing, so the join below waits
+            # only for one that already holds the slot (#4040).
+            self._runtime_owner_renewal_retired = True
+            # Renewal's own connection first (#4001). Every connection's close
+            # shares the deadline taken after that join, which never consumes it.
+            (
+                close_deadline, renewal_failure, pending_cancellation,
+            ) = await self._retire_runtime_owner_renewal()
+            conn = self._connection
+            failure = (
+                self._cancelled_write_drain_error
+                if self._cancelled_write_drain_error is not None
+                and is_execution_control_error(self._cancelled_write_drain_error)
+                else None
             )
-        if conn is None:
-            try:
-                self._raise_if_connection_retirement_pending()
-            except BaseException as error:
-                raise execution_terminal_error(
-                    failure, error, pending_cancellation, retain_originals=True,
+            if renewal_failure is not None:
+                failure = execution_terminal_error(
+                    failure, renewal_failure,
+                    retain_originals=True, isolate_control_originals=True,
+                )
+            if conn is None:
+                try:
+                    self._raise_if_connection_retirement_pending()
+                except BaseException as error:
+                    raise execution_terminal_error(
+                        failure, error, pending_cancellation, retain_originals=True,
+                        isolate_control_originals=True,
+                    )
+                self._cancelled_write_drain = None
+                self._cancelled_write_drain_started_at = None
+                self._cancelled_write_drain_error = None
+                terminal = execution_terminal_error(
+                    failure, pending_cancellation, retain_originals=True,
                     isolate_control_originals=True,
                 )
-            self._cancelled_write_drain = None
-            self._cancelled_write_drain_started_at = None
-            self._cancelled_write_drain_error = None
+                if terminal is not None:
+                    raise terminal
+                return
+
+            diagnostics = self._close_diagnostics()
+            # Fence new cancellation handoffs before sampling the retained drain.
+            # A write cancelled from this point onward is retired by connection
+            # close itself, so spawning a rollback task would orphan it after the
+            # final state reset below.
+            self._closing = True
+            try:
+                drain = self._cancelled_write_drain
+                # Cancelling the Python rollback task does not stop a SQLite VM
+                # already executing in aiosqlite's worker.  Interrupt the actual
+                # connection before waiting for the retained drain so rollback and
+                # close can both fit inside the advertised shutdown reservation.
+                # Do not interrupt an idle connection: SQLite then leaves its WAL
+                # uncheckpointed on close even though the worker terminates.
+                if (
+                    drain is not None
+                    or self._in_transaction
+                    or self._active_write_operations > 0
+                ):
+                    try:
+                        await conn.interrupt()
+                    except asyncio.CancelledError as exc:
+                        # Cancellation cannot transfer ownership of the primary
+                        # non-daemon worker. Preserve it for delivery only after
+                        # the connection has completed its bounded retirement.
+                        pending_cancellation = execution_terminal_error(
+                            pending_cancellation, exc, retain_originals=True,
+                            prefer_cancellation=True, isolate_control_originals=True,
+                        )
+                    except ValueError as exc:
+                        if is_execution_control_error(exc):
+                            failure = execution_terminal_error(failure, exc, retain_originals=True, isolate_control_originals=True)
+                        if "no active connection" not in str(exc):
+                            logger.warning(
+                                "Could not interrupt SQLite before close: %s",
+                                exc,
+                            )
+                    except Exception as exc:
+                        if is_execution_control_error(exc):
+                            failure = execution_terminal_error(failure, exc, retain_originals=True, isolate_control_originals=True)
+                        # Interrupt is an acceleration path. Its failure must not
+                        # skip the lifecycle-owned close that follows.
+                        logger.warning(
+                            "Could not interrupt SQLite before close",
+                            exc_info=True,
+                        )
+                    except BaseException as error:
+                        failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
+                if drain is not None and drain is not asyncio.current_task():
+                    from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
+                    try:
+                        async with asyncio.timeout(
+                            min(
+                                AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S,
+                                max(0.0, close_deadline - loop.time()),
+                            )
+                        ):
+                            # A completion wait never raises the CHILD's
+                            # cancellation. A CancelledError here can only be the
+                            # close caller's, including one pending before entry.
+                            await asyncio.wait({drain})
+                    except (TimeoutError, asyncio.CancelledError) as exc:
+                        # The connection close remains responsible for the queued
+                        # SQLite work.  Retire the Python task so loop teardown
+                        # cannot strand a backend-owned cleanup task.
+                        if isinstance(exc, asyncio.CancelledError):
+                            pending_cancellation = execution_terminal_error(
+                                pending_cancellation, exc, retain_originals=True,
+                                prefer_cancellation=True, isolate_control_originals=True,
+                            )
+                        drain.cancel()
+                        # Retire the Python drain separately from observing its
+                        # original result. A new caller cancellation can interrupt
+                        # a stubborn drain once; repeated cancellation cannot
+                        # abandon this owner or replace native control evidence.
+                        outcome = await await_owned_task(drain, cancel_on_caller_cancellation=True)
+                        observation = outcome.error
+                        if isinstance(observation, asyncio.CancelledError) and not is_execution_control_error(observation):
+                            # Close itself interrupted this drain after its bound;
+                            # that physical child cancellation is not withdrawal of
+                            # the caller or an independent observation failure.
+                            observation = None
+                        failure = execution_terminal_error(
+                            failure, observation, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
+                        pending_cancellation = execution_terminal_error(
+                            pending_cancellation, outcome.cancellation, retain_originals=True,
+                            prefer_cancellation=True, isolate_control_originals=True,
+                        )
+                    # Harvest the original terminal error only after completion;
+                    # ordinary drain cancellation is not caller cancellation.
+                    error = owned_task_error(drain)
+                    if error is not None and (
+                        not isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)
+                    ):
+                        failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
+
+                # A grouped drain failure cannot skip the independently owned
+                # native close, or erase its original carrier after the join.
+                failure = execution_terminal_error(
+                    failure, self._cancelled_write_drain_error
+                    if self._cancelled_write_drain_error is not None
+                    and is_execution_control_error(self._cancelled_write_drain_error)
+                    else None,
+                    retain_originals=True, isolate_control_originals=True,
+                )
+                try:
+                    await _close_aiosqlite_connection(
+                        conn,
+                        retained_closes=self._retired_connection_closes,
+                        deadline=close_deadline,
+                        diagnostics=diagnostics,
+                    )
+                except BaseException as error:
+                    failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
+                # Handoff cannot replace an already-retained native close error
+                # through implicit exception context. Both owners settle first.
+                try:
+                    self._hand_worker_exit_hooks_to_retirement(conn)
+                except BaseException as error:
+                    failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
+                try:
+                    self._raise_if_connection_retirement_pending()
+                except BaseException as error:
+                    failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
+                logger.debug(f"Closed SQLite connection: {self.db_path}")
+            finally:
+                self._connection = None
+                self._connected_file_identity = None
+                self._journal_mode = None
+                self._page_size = None
+                self._cancelled_write_drain = None
+                self._cancelled_write_drain_started_at = None
+                self._cancelled_write_drain_error = None
+                self._abandoned_read_cursors.clear()
+                self._closing = False
+                self._connection_generation = None
+
             terminal = execution_terminal_error(
                 failure, pending_cancellation, retain_originals=True,
                 isolate_control_originals=True,
             )
             if terminal is not None:
                 raise terminal
-            return
-
-        diagnostics = self._close_diagnostics()
-        # Fence new cancellation handoffs before sampling the retained drain.
-        # A write cancelled from this point onward is retired by connection
-        # close itself, so spawning a rollback task would orphan it after the
-        # final state reset below.
-        self._closing = True
-        try:
-            drain = self._cancelled_write_drain
-            # Cancelling the Python rollback task does not stop a SQLite VM
-            # already executing in aiosqlite's worker.  Interrupt the actual
-            # connection before waiting for the retained drain so rollback and
-            # close can both fit inside the advertised shutdown reservation.
-            # Do not interrupt an idle connection: SQLite then leaves its WAL
-            # uncheckpointed on close even though the worker terminates.
-            if (
-                drain is not None
-                or self._in_transaction
-                or self._active_write_operations > 0
-            ):
-                try:
-                    await conn.interrupt()
-                except asyncio.CancelledError as exc:
-                    # Cancellation cannot transfer ownership of the primary
-                    # non-daemon worker. Preserve it for delivery only after
-                    # the connection has completed its bounded retirement.
-                    pending_cancellation = execution_terminal_error(
-                        pending_cancellation, exc, retain_originals=True,
-                        prefer_cancellation=True, isolate_control_originals=True,
-                    )
-                except ValueError as exc:
-                    if is_execution_control_error(exc):
-                        failure = execution_terminal_error(failure, exc, retain_originals=True, isolate_control_originals=True)
-                    if "no active connection" not in str(exc):
-                        logger.warning(
-                            "Could not interrupt SQLite before close: %s",
-                            exc,
-                        )
-                except Exception as exc:
-                    if is_execution_control_error(exc):
-                        failure = execution_terminal_error(failure, exc, retain_originals=True, isolate_control_originals=True)
-                    # Interrupt is an acceleration path. Its failure must not
-                    # skip the lifecycle-owned close that follows.
-                    logger.warning(
-                        "Could not interrupt SQLite before close",
-                        exc_info=True,
-                    )
-                except BaseException as error:
-                    failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
-            if drain is not None and drain is not asyncio.current_task():
-                from kestrel_sovereign._async_ownership import await_owned_task, owned_task_error
-                try:
-                    async with asyncio.timeout(
-                        min(
-                            AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S,
-                            max(0.0, close_deadline - loop.time()),
-                        )
-                    ):
-                        # A completion wait never raises the CHILD's
-                        # cancellation. A CancelledError here can only be the
-                        # close caller's, including one pending before entry.
-                        await asyncio.wait({drain})
-                except (TimeoutError, asyncio.CancelledError) as exc:
-                    # The connection close remains responsible for the queued
-                    # SQLite work.  Retire the Python task so loop teardown
-                    # cannot strand a backend-owned cleanup task.
-                    if isinstance(exc, asyncio.CancelledError):
-                        pending_cancellation = execution_terminal_error(
-                            pending_cancellation, exc, retain_originals=True,
-                            prefer_cancellation=True, isolate_control_originals=True,
-                        )
-                    drain.cancel()
-                    # Retire the Python drain separately from observing its
-                    # original result. A new caller cancellation can interrupt
-                    # a stubborn drain once; repeated cancellation cannot
-                    # abandon this owner or replace native control evidence.
-                    outcome = await await_owned_task(drain, cancel_on_caller_cancellation=True)
-                    observation = outcome.error
-                    if isinstance(observation, asyncio.CancelledError) and not is_execution_control_error(observation):
-                        # Close itself interrupted this drain after its bound;
-                        # that physical child cancellation is not withdrawal of
-                        # the caller or an independent observation failure.
-                        observation = None
-                    failure = execution_terminal_error(
-                        failure, observation, retain_originals=True,
-                        isolate_control_originals=True,
-                    )
-                    pending_cancellation = execution_terminal_error(
-                        pending_cancellation, outcome.cancellation, retain_originals=True,
-                        prefer_cancellation=True, isolate_control_originals=True,
-                    )
-                # Harvest the original terminal error only after completion;
-                # ordinary drain cancellation is not caller cancellation.
-                error = owned_task_error(drain)
-                if error is not None and (
-                    not isinstance(error, asyncio.CancelledError) or is_execution_control_error(error)
-                ):
-                    failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
-
-            # A grouped drain failure cannot skip the independently owned
-            # native close, or erase its original carrier after the join.
-            failure = execution_terminal_error(
-                failure, self._cancelled_write_drain_error
-                if self._cancelled_write_drain_error is not None
-                and is_execution_control_error(self._cancelled_write_drain_error)
-                else None,
-                retain_originals=True, isolate_control_originals=True,
-            )
-            try:
-                await _close_aiosqlite_connection(
-                    conn,
-                    retained_closes=self._retired_connection_closes,
-                    deadline=close_deadline,
-                    diagnostics=diagnostics,
-                )
-            except BaseException as error:
-                failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
-            # Handoff cannot replace an already-retained native close error
-            # through implicit exception context. Both owners settle first.
-            try:
-                self._hand_worker_exit_hooks_to_retirement(conn)
-            except BaseException as error:
-                failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
-            try:
-                self._raise_if_connection_retirement_pending()
-            except BaseException as error:
-                failure = execution_terminal_error(failure, error, retain_originals=True, isolate_control_originals=True)
-            logger.debug(f"Closed SQLite connection: {self.db_path}")
-        finally:
-            self._connection = None
-            self._connected_file_identity = None
-            self._journal_mode = None
-            self._page_size = None
-            self._cancelled_write_drain = None
-            self._cancelled_write_drain_started_at = None
-            self._cancelled_write_drain_error = None
-            self._abandoned_read_cursors.clear()
-            self._closing = False
-            self._connection_generation = None
-
-        terminal = execution_terminal_error(
-            failure, pending_cancellation, retain_originals=True,
-            isolate_control_originals=True,
-        )
-        if terminal is not None:
-            raise terminal
     
     def _require_execution_backend(self) -> None:
         require_execution_backend("sqlite", _identity_anchor_access=self._identity_anchor_access)
@@ -2633,48 +2637,50 @@ class SQLiteBackend(DatabaseBackend):
         ``_write_lock``; ``_write_guard`` fences all later operations on the
         retained task instead.
         """
-        # ``close`` owns every queued operation after it fences handoffs. A
-        # stale/cancelled caller must not install a task against a connection
-        # that is already closing or no longer belongs to this backend.
-        if self._closing or self._connection is not conn:
-            return
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            # ``close`` owns every queued operation after it fences handoffs. A
+            # stale/cancelled caller must not install a task against a connection
+            # that is already closing or no longer belongs to this backend.
+            if self._closing or self._connection is not conn:
+                return
 
-        drain = self._cancelled_write_drain
-        if drain is not None and not drain.done():
-            # The shared-connection lock permits only one operation unit or
-            # transaction to reach this path, so a second live drain signals an
-            # invariant bug.
-            self._cancelled_write_drain_error = RuntimeError(
-                "overlapping SQLite cancellation drains"
-            )
-            logger.error("Overlapping SQLite cancellation drains detected")
-            return
+            drain = self._cancelled_write_drain
+            if drain is not None and not drain.done():
+                # The shared-connection lock permits only one operation unit or
+                # transaction to reach this path, so a second live drain signals an
+                # invariant bug.
+                self._cancelled_write_drain_error = RuntimeError(
+                    "overlapping SQLite cancellation drains"
+                )
+                logger.error("Overlapping SQLite cancellation drains detected")
+                return
 
-        started_at = time.monotonic()
-        self._cancelled_write_drain_error = None
-        self._cancelled_write_drain_started_at = started_at
-        from kestrel_sovereign._async_ownership import (
-            OwnedTaskAdmission, create_owned_task, owned_task_admission_error,
-        )
+            started_at = time.monotonic()
+            self._cancelled_write_drain_error = None
+            self._cancelled_write_drain_started_at = started_at
+            from kestrel_sovereign._async_ownership import (
+                OwnedTaskAdmission, create_owned_task, owned_task_admission_error,
+            )
 
-        admission = OwnedTaskAdmission()
-        try:
-            self._cancelled_write_drain = create_owned_task(
-                self._drain_cancelled_write(conn, started_at=started_at),
-                name=f"sqlite-cancelled-write-drain:{self.db_path}",
-                retirement_resource=conn, retain_originals=True,
-                admission=admission,
-            )
-        except BaseException as admission_error:
-            self._cancelled_write_drain = admission.task
-            terminal = execution_terminal_error(
-                error, owned_task_admission_error(conn, admission, admission_error), retain_originals=True,
-                isolate_control_originals=True,
-            )
-            # Accepted original or actual no-Task refusal stays fenced. Close
-            # and cleanup observers join the SAME stored drain if accepted.
-            self._cancelled_write_drain_error = terminal
-            raise terminal
+            admission = OwnedTaskAdmission()
+            try:
+                self._cancelled_write_drain = create_owned_task(
+                    self._drain_cancelled_write(conn, started_at=started_at),
+                    name=f"sqlite-cancelled-write-drain:{self.db_path}",
+                    retirement_resource=conn, retain_originals=True,
+                    admission=admission,
+                )
+            except BaseException as admission_error:
+                self._cancelled_write_drain = admission.task
+                terminal = execution_terminal_error(
+                    error, owned_task_admission_error(conn, admission, admission_error), retain_originals=True,
+                    isolate_control_originals=True,
+                )
+                # Accepted original or actual no-Task refusal stays fenced. Close
+                # and cleanup observers join the SAME stored drain if accepted.
+                self._cancelled_write_drain_error = terminal
+                raise terminal
 
     async def _drain_cancelled_write(
         self, conn: aiosqlite.Connection, *, started_at: float

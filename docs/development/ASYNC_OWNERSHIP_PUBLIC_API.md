@@ -165,8 +165,12 @@ cleanup and reports its exact outcome; no new work grant is made there.
 For complete native retirement or proven nonacceptance, Core publishes one
 canonical observation to the host. UNKNOWN retains the admission and its
 original errors for the host. Callbacks are notification, not the resource's
-owner: a host must still retain and reconcile its own receipts if publication
-fails. No callback runs a replacement task or acknowledges an external
+owner: a host must retain and read-only reconcile its own receipts if publication
+fails. Core's original one-shot publisher is the sole caller of policy `retire`.
+A host drain joins original Tasks and waits for its retirement-change signal;
+it must not call `retire` independently, even after observing physical COMPLETE.
+This prevents a drain racing the already-queued original completion callback.
+No callback runs a replacement task or acknowledges an external
 resource. Opaque factory wrappers never receive a loan. Exhausted or revoked
 policies must refuse synchronously, without allocating another owner or
 reattributing an existing resource. A reservation refusal is atomic.
