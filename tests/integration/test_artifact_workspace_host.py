@@ -217,6 +217,66 @@ async def test_lost_install_ack_returns_original_receipt_without_installing_twic
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('direction', ['export', 'import'])
+async def test_original_workspace_error_survives_native_cleanup_allocation_refusal(workspace_host, monkeypatch, direction):
+    from kestrel_sdk.workspaces import WorkspaceImportRequest
+    from kestrel_sovereign.auth import CallerContext, caller_context_scope
+    from kestrel_sovereign.artifacts.service import ArtifactAction
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    h = workspace_host
+    current = await session(h)
+    feature = h.agents['kite'].features['ArtifactsFeature']
+    body_error = ResourceOutcomeUnknown('original workspace acknowledgement was lost')
+    allocation_error = MemoryError('original native cleanup allocation refused')
+    loop = asyncio.get_running_loop()
+    original_factory = loop.get_task_factory()
+
+    def refuse_original_cleanup(loop, operation, **options):
+        raise allocation_error
+
+    if direction == 'export':
+        original = feature._service.commit
+        request = WorkspaceExportRequest.model_validate_json(json.dumps(export_request(current)))
+        action = ArtifactAction.WRITE
+        async def lose_ack(*args, **kwargs):
+            await original(*args, **kwargs)
+            loop.set_task_factory(refuse_original_cleanup)
+            raise body_error
+        monkeypatch.setattr(feature._service, 'commit', lose_ack)
+    else:
+        ref, _ = await publish(h.client)
+        revision = (await h.client.get(path()+f"/{ref['artifact_id']}/revisions/{ref['revision_id']}", headers=AUTH)).json()
+        incoming = {key:value for key,value in export_request(current, 'refused-cleanup-import').items()
+                    if key not in {'paths', 'entrypoint'}}
+        incoming.update(source=ref, manifest=revision['manifest'], workspace_id='original-import')
+        request = WorkspaceImportRequest.model_validate_json(json.dumps(incoming))
+        action = ArtifactAction.READ
+        original = h.transfer.commit_import
+        async def lose_ack(*args, **kwargs):
+            await original(*args, **kwargs)
+            loop.set_task_factory(refuse_original_cleanup)
+            raise body_error
+        monkeypatch.setattr(h.transfer, 'commit_import', lose_ack)
+    try:
+        with caller_context_scope(CallerContext.sovereign(credential=KEY)):
+            async with feature._workspace_binding() as binding:
+                async with binding.broker.operation(binding.contexts, request.session_id, action) as lease:
+                    with pytest.raises(BaseException) as observed:
+                        try:
+                            if direction == 'export':
+                                await binding.broker.publish(lease, request, title='Original workspace', publication_key='original-refusal')
+                            else:
+                                await binding.broker.materialize(lease, request)
+                        finally:
+                            loop.set_task_factory(original_factory)
+                    assert body_error in execution_evidence_carriers(observed.value)
+                    assert allocation_error in execution_evidence_carriers(observed.value)
+    finally:
+        loop.set_task_factory(original_factory)
+
+
+@pytest.mark.asyncio
 async def test_revocation_after_export_read_prevents_staging_but_retained_cleanup_runs(workspace_host):
     h=workspace_host;current=await session(h)
     async def revoke():h.cfg['granted_actions'].remove('visual.transfer')

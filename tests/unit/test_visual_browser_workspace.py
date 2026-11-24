@@ -59,6 +59,48 @@ def incoming(session, *, transfer_id="import", workspace_id="fresh", path="neste
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["export", "import"])
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_broker_retires_original_filesystem_transfer_without_work_capacity(transport, direction, fenced):
+    import asyncio
+    from contextlib import nullcontext
+    from kestrel_sovereign import async_ownership as ownership
+    from kestrel_sovereign.artifacts.workspace import ArtifactWorkspaceBroker, _Lease
+    from kestrel_sovereign.artifacts.service import ArtifactAction
+    from kestrel_sovereign.execution_custody import (
+        ProcessRuntimeExecutionFence, bind_execution_custody, require_execution_work,
+    )
+    from tests.unit.test_owned_task_lending import CapacityLoan
+
+    value, session, _ = transport
+    if direction == "export":
+        request = export(session)
+        await value.prepare_export(session, request)
+        method, area = value.release_export, value._area("exports", request.transfer_id)
+    else:
+        request, _, _ = incoming(session)
+        value.prepare_import(session, request)
+        method, area = value.abort_import, value._area("imports", request.transfer_id)
+    assert area.exists(), "the original transfer must physically exist before retirement"
+    lease = _Lease(None, session, value, ArtifactAction.READ, lambda: None, asyncio.current_task())
+    async def close(original_session, original_id):
+        assert original_session is session and original_id == request.transfer_id
+        assert ownership.capture_owned_task_lender() is None
+        return method(original_session, original_id)
+    host = CapacityLoan(capacity=0)
+    scope = (bind_execution_custody(ProcessRuntimeExecutionFence("workspace-cleanup"))
+             if fenced else nullcontext())
+    try:
+        with scope, ownership.bind_owned_task_lender(host):
+            assert await ArtifactWorkspaceBroker(None, None, None)._cleanup(lease, close, request.transfer_id)
+            require_execution_work()
+        assert not area.exists() and not host.outstanding and not host.retired
+    finally:
+        # Test-owner reconciliation after a negative, not a fabricated host ACK.
+        method(session, request.transfer_id)
+
+
+@pytest.mark.asyncio
 async def test_export_is_frozen_idempotent_and_released_ids_do_not_reexport(transport):
     value, session, page = transport
     request = export(session)

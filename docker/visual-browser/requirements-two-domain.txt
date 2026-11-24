@@ -1460,7 +1460,7 @@ kestrel-llms==0.2.0 \
     #   Core uv.lock (shared versions)
     #   kestrel-sovereign
 kestrel-sovereign==0.66.11 \
-    --hash=sha256:5f780c0486d57cb8fa8230616ea81ce707cf67440099e703afbbd53fa3952df3
+    --hash=sha256:54210ce0b105122cf57223d526ebd8039ffa8cb8212b5640140b0666c3c7a548
     # via
     #   Core uv.lock (shared versions)
     #   -r requirements-two-domain.in

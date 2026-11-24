@@ -410,6 +410,7 @@ class OwnedTaskRetirement:
     task: asyncio.Task | None
     state: Literal["unknown", "nonacceptance", "pending", "complete"]
     error: BaseException | None
+    pending_tasks: tuple[asyncio.Task, ...] = ()
 
 
 class OwnedTaskLender(Protocol):
@@ -543,7 +544,7 @@ def _reconcile_owned_task_admission(admission, *, include_source=True):
         state = "nonacceptance" if admission._nonacceptance_proven else "unknown"
         return OwnedTaskRetirement(admission, None, state, admission.error)
     if not _NATIVE_TASK.done(task):
-        return OwnedTaskRetirement(admission, task, "pending", admission.error)
+        return OwnedTaskRetirement(admission, task, "pending", admission.error, (task,))
     error = owned_task_error(task, admission=admission)
     state = "unknown" if (not admission._completion_capture_registered
         or execution_cleanup_debts(error)) else "complete"
@@ -551,6 +552,7 @@ def _reconcile_owned_task_admission(admission, *, include_source=True):
     if source is not None and source.producer is admission:
         facts = source._state
         errors = [error, *facts.failures]
+        pending = []
         if facts.construction_pending or (facts.resource_required and not facts.resource_closed):
             state = "unknown"
         if facts.failures:
@@ -560,9 +562,17 @@ def _reconcile_owned_task_admission(admission, *, include_source=True):
                 continue
             observation = _reconcile_owned_task_admission(other, include_source=False)
             errors.append(observation.error)
+            pending.extend(observation.pending_tasks)
             if observation.state not in {"complete", "nonacceptance"}:
                 state = "unknown"
+        if pending:
+            # A joined producer is not a final UNKNOWN while its ORIGINAL
+            # watcher/closer still runs. Expose those exact native owners so a
+            # host can join them and re-read, even when final failure publishes
+            # no retirement ACK/change signal.
+            state = "pending"
         error = execution_observation_error(*errors)
+        return OwnedTaskRetirement(admission, task, state, error, tuple(dict.fromkeys(pending)))
     return OwnedTaskRetirement(admission, task, state, error)
 
 

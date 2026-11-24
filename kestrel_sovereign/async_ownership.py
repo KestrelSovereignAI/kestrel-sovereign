@@ -16,13 +16,16 @@ from ._async_ownership import (
     await_owned_task,
     bind_owned_task_lender,
     capture_owned_task_lender,
+    cancel_owned_task,
     create_owned_task,
+    is_owned_task_cancellation,
     owned_task_error,
     pending_owned_retirement_error,
     raise_owned_outcome,
     reconcile_owned_task_admission,
     run_blocking_operation,
     wait_owned_tasks_until,
+    without_owned_coordinators,
 )
 
 __all__ = [
@@ -36,11 +39,14 @@ __all__ = [
     "await_owned_task",
     "bind_owned_task_lender",
     "capture_owned_task_lender",
+    "cancel_owned_task",
     "create_owned_task",
+    "is_owned_task_cancellation",
     "owned_task_error",
     "pending_owned_retirement_error",
     "raise_owned_outcome",
     "reconcile_owned_task_admission",
     "run_blocking_operation",
     "wait_owned_tasks_until",
+    "without_owned_coordinators",
 ]

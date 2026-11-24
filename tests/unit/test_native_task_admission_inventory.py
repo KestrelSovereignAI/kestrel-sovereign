@@ -3,6 +3,7 @@ import ast
 from pathlib import Path
 
 _RETIREMENT_ENTRIES = {
+    "artifacts/workspace.py": {("ArtifactWorkspaceBroker._cleanup", "create_owned_task")},
     "execution_custody.py": {("close_native_execution_stream", "create_owned_task")},
     "hold/state.py": {( "_close_postgres_preflight_backends", "create_owned_task")},
     "kestrel_agent.py": {("KestrelAgent._run_durable_shutdown_tail._bounded", "create_owned_task")},

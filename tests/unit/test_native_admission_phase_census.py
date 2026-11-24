@@ -40,7 +40,6 @@ WORK | a2a/task_manager.py | TaskManager._finish_status_projection | create_owne
 WORK | agent/invocation.py | admit_request_operation | create_owned_task
 WORK | artifacts/preview.py | DockerArtifactRenderer._command_native | create_owned_task
 WORK | artifacts/preview.py | DockerArtifactRenderer._command_native | create_owned_task
-WORK | artifacts/workspace.py | ArtifactWorkspaceBroker._cleanup | create_owned_task
 WORK | execution_sync_http.py | await_native_sync_http | await_owned_operation
 WORK | features/health/feature.py | HealthFeature._run_health | create_owned_task
 WORK | features/hosted_telegram_dispatch.py | start_dispatch | create_owned_task

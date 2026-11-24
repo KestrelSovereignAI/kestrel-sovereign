@@ -752,6 +752,56 @@ async def test_join_cannot_replace_failed_original_completion_capture(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_running_original_source_closer_is_pending_not_final_unknown(tmp_path):
+    from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator
+    from kestrel_sovereign._async_ownership import _record_source_retirement
+
+    handle = (tmp_path / "original-structural-source").open("w+b")
+    source = OwnedSourceAdmission(retirement=ownership.OwnedTaskAdmission())
+    host = CapacityLoan()
+    entered, release = asyncio.Event(), asyncio.Event()
+    source._state.resource_required = True
+    async def retire_file():
+        entered.set()
+        await release.wait()
+        handle.close()
+        _record_source_retirement(source, closed=True)
+    async def body():
+        if False:
+            yield
+    closer = ownership.create_owned_task(retire_file(), admission=source.retirement,
+        lender_capture=None, retirement_resource=handle)
+    iterator = None
+    try:
+        with ownership.bind_owned_task_lender(host):
+            iterator = await create_owned_iterator(body, operation="original-structural-closer",
+                source_admission=source)
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+            await entered.wait()
+            await ownership.await_owned_task(source.producer.task)
+            assert source.producer.task.done() and not closer.done() and not handle.closed
+            retirement = ownership.reconcile_owned_task_admission(source.producer)
+            assert retirement.state == "pending"
+            assert closer in retirement.pending_tasks
+            assert source.producer.task not in retirement.pending_tasks
+            assert len(host.outstanding) == 1 and not host.retired
+            release.set()
+            await ownership.await_owned_task(closer)
+            async with asyncio.timeout(3):
+                while host.outstanding:
+                    host.retirement_changed.clear()
+                    await host.retirement_changed.wait()
+            assert handle.closed and len(host.retired) == 1
+    finally:
+        release.set()
+        await ownership.await_owned_task(closer)
+        if iterator is not None:
+            await iterator.aclose()
+        handle.close()
+
+
+@pytest.mark.asyncio
 async def test_unknown_original_watcher_keeps_the_producer_loan_after_producer_join():
     from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator
     from kestrel_sovereign.execution_custody import execution_cleanup_debts

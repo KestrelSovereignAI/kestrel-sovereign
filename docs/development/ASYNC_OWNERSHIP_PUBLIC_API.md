@@ -167,12 +167,36 @@ entering the supplied Context, including a Context already active in its caller.
 The original admitted owner still retains its physical
 cleanup and reports its exact outcome; no new work grant is made there.
 
+`without_owned_coordinators()` is the canonical independent-owner boundary,
+not permission to evade an enclosing resource budget. The host must reserve
+that independent lifetime's resource charge before admitting its Task, retain
+its exact original owner through exit, and preserve/recheck the original
+execution-work admission. Detachment removes enclosing coordinator/loan routing;
+it does not remove execution custody or grant ordinary Work. This permits a
+separately charged SQL lifetime to retain an UNKNOWN exclusion after its request
+returns without pinning an outer reader's Work loan forever.
+
+`cancel_owned_task()` requests cancellation with the exact native admission's
+private token. `is_owned_task_cancellation()` authenticates that same original
+receipt's otherwise-unadorned cancellation; a different cancellation or attached
+execution-control evidence does not match. Hosts may normalize their own
+acquisition abort only AFTER the original native exit has physically joined.
+Observer withdrawal and unresolved retirement remain separate evidence, never
+a release acknowledgment.
+
 For complete native retirement or proven nonacceptance, Core publishes one
 canonical observation to the host. UNKNOWN retains the admission and its
 original errors for the host. Callbacks are notification, not the resource's
 owner: a host must retain and read-only reconcile its own receipts if publication
 fails. Core's original one-shot publisher is the sole caller of policy `retire`.
-A host drain joins original Tasks and waits for its retirement-change signal;
+A PENDING observation exposes `pending_tasks`, the exact unfinished native
+producer/watcher/closer Tasks; hosts join those originals and reconcile again.
+The producer's `task` identity is never replaced by a structural owner.
+A final UNKNOWN has no pending native owners to await and need not produce a
+retirement-change signal. Surface that original debt while retaining its
+reservation and physical resource; do not wait indefinitely or invent an ACK.
+For a COMPLETE observation preceding its already-queued publisher callback,
+a host drain waits for its retirement-change signal;
 it must not call `retire` independently, even after observing physical COMPLETE.
 This prevents a drain racing the already-queued original completion callback.
 No callback runs a replacement task or acknowledges an external
