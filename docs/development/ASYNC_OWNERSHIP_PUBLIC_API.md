@@ -146,8 +146,13 @@ cross-task resource-loan policy; physical custodians still own those obligations
 The embedding resource owner provides the one synchronous `OwnedTaskLender`
 policy and validates the actual creator, original admitted parent, resource
 occurrence and capacity. Core reserves against the exact admission before
-native allocation and calls `lend` before opening the payload gate. A copied
-or fresh context does not supply a captured parent. Pass the exact capture to
+native allocation and calls `lend` before opening the payload gate.
+The original parent must be live at reservation and lending. Once accepted,
+the child's own receipt owns its loan: creator completion alone cannot revoke
+it before the first payload step. Binding exit and withdrawal of the original
+work authority still deny that step. A completed parent's old capture cannot
+reserve another child. A copied or fresh context does not supply a captured
+parent. Pass the exact capture to
 explicitly delegate across a fresh execution context; pass `None` to suppress
 lending. Native privacy factories and callback scopes retain the capture at
 creation, independently of privacy scope. A detached boundary suppresses it.

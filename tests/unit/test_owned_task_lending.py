@@ -31,6 +31,7 @@ class CapacityLoan:
         self.capacity = capacity
         self.outstanding = {}
         self.retired = []
+        self.retirement_changed = asyncio.Event()
         self.denial = None
 
     def reserve(self, *, creator, original_parent, admission, structural_role):
@@ -63,6 +64,7 @@ class CapacityLoan:
             assert task is None and retirement.task is None
         del self.outstanding[reservation]
         self.retired.append(retirement)
+        self.retirement_changed.set()
 
 
 @pytest.mark.parametrize("flavor", ["asyncio", "auto"])
@@ -619,6 +621,73 @@ async def test_explicit_fresh_context_lends_to_child_but_inherited_route_does_no
     finally:
         marker.reset(token)
     assert not host.outstanding and len(host.retired) == 2
+
+
+@pytest.mark.asyncio
+async def test_already_lent_child_can_start_after_its_original_creator_finishes():
+    host = CapacityLoan(capacity=2)
+    children, captures, entered = [], [], []
+
+    async def child():
+        entered.append(asyncio.current_task())
+        require_execution_work()
+
+    async def creator():
+        captures.append(ownership.capture_owned_task_lender())
+        children.append(ownership.create_owned_task(child()))
+        # No yield: the creator is done before the child's first native step.
+
+    with ownership.bind_owned_task_lender(host):
+        parent = ownership.create_owned_task(creator())
+        await parent
+        outcome = await ownership.await_owned_task(children[0])
+        assert outcome.error is None and outcome.cancellation is None
+        assert entered == children and parent.done()
+        # An already-admitted child owns its loan; an old dead-parent capture
+        # still cannot reserve NEW work after that parent's completion.
+        with pytest.raises(RuntimeError, match="no longer live"):
+            ownership.create_owned_task(child(), lender_capture=captures[0])
+        async with asyncio.timeout(3):
+            while host.outstanding:
+                host.retirement_changed.clear()
+                await host.retirement_changed.wait()
+    assert not host.outstanding and len(host.retired) == 2
+
+
+@pytest.mark.parametrize("flavor", ["asyncio", "auto"])
+def test_foreign_loop_bound_native_constructor_is_refused_before_reserve(flavor, monkeypatch):
+    import uvicorn
+    loop = uvicorn.Config("unused:app", loop=flavor, log_config=None).get_loop_factory()()
+    foreign = asyncio.new_event_loop()
+    entered = []
+
+    async def scenario():
+        host = CapacityLoan()
+        async def body():
+            entered.append(asyncio.current_task())
+        with ownership.bind_owned_task_lender(host):
+            monkeypatch.setattr(loop, "create_task", foreign.create_task)
+            try:
+                with pytest.raises(RuntimeError, match="canonical native constructor"):
+                    ownership.create_owned_task(body())
+            finally:
+                monkeypatch.undo()
+        assert not entered and not host.outstanding and not host.retired
+        assert not asyncio.all_tasks(foreign), "foreign native allocation preceded refusal"
+
+    try:
+        loop.run_until_complete(scenario())
+    finally:
+        monkeypatch.undo()
+        # The negative pre-fix case still owns its exact isolated foreign loop
+        # and all original wrappers allocated there; observe them before close.
+        originals = tuple(asyncio.all_tasks(foreign))
+        if originals:
+            async def join_originals():
+                await asyncio.gather(*originals, return_exceptions=True)
+            foreign.run_until_complete(join_originals())
+        foreign.close()
+        loop.close()
 
 
 @pytest.mark.asyncio

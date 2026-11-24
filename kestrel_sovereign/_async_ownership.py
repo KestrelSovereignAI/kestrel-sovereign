@@ -481,9 +481,9 @@ def capture_owned_task_lender() -> OwnedTaskLenderCapture | None:
     return None
 
 
-def _require_live_owned_task_lender(capture, owner_loop):
+def _require_live_owned_task_lender(capture, owner_loop, *, require_live_parent=True):
     if (type(capture) is not OwnedTaskLenderCapture or not capture._binding.active
-            or _NATIVE_TASK.done(capture._parent)
+            or (require_live_parent and _NATIVE_TASK.done(capture._parent))
             or asyncio.Future.get_loop(capture._parent) is not owner_loop):
         raise RuntimeError("original owned task lender is no longer live")
     capture._require_work()
@@ -500,7 +500,8 @@ def _require_fresh_owned_task_admission(admission, *, for_operation=False):
 def _has_original_native_constructor(loop, owner_loop):
     native_method = getattr(owner_loop.create_task, "__func__", None)
     standard = (native_method is _NATIVE_LOOP_CREATE_TASK
-        and _NATIVE_LOOP_CREATE_TASK.__code__ is _NATIVE_LOOP_CREATE_TASK_CODE)
+        and _NATIVE_LOOP_CREATE_TASK.__code__ is _NATIVE_LOOP_CREATE_TASK_CODE
+        and getattr(owner_loop.create_task, "__self__", None) is owner_loop)
     uvloop = (_NATIVE_UVLOOP is not None and isinstance(owner_loop, _NATIVE_UVLOOP)
         and native_method is _NATIVE_UVLOOP_CREATE_TASK
         and getattr(owner_loop.create_task, "__self__", None) is owner_loop)
@@ -738,7 +739,10 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                     raise owned_task_admission_error(admission, admission,
                         RuntimeError("host loan payload requires its exact accepted native Task"))
                 if loan is not None:
-                    _require_live_owned_task_lender(capture, owner_loop)
+                    # Reserve and lend already validated the live creator.
+                    # This child's original receipt now owns its accepted loan;
+                    # creator completion alone cannot revoke that admission.
+                    _require_live_owned_task_lender(capture, owner_loop, require_live_parent=False)
                 started = True
                 reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
                     (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
