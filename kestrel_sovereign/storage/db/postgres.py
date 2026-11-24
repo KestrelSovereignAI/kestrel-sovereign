@@ -34,6 +34,7 @@ from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskAdmission,
+    _disable_owned_task_lending,
     acquire_lock_keeping_cancellation,
     await_owned_task,
     create_owned_task,
@@ -1009,10 +1010,11 @@ class PostgresBackend(DatabaseBackend):
             record = [pool, None, None]
             owners[attribute] = record
             try:
-                record[1] = create_owned_task(
-                    pool.close(), retirement_resource=pool, retain_originals=True,
-                    admission=admission,
-                )
+                with _disable_owned_task_lending(True):
+                    record[1] = create_owned_task(
+                        pool.close(), retirement_resource=pool, retain_originals=True,
+                        admission=admission,
+                    )
             except BaseException as error:
                 record[1] = admission.task
                 record[2] = owned_task_admission_error(pool, admission, error)
@@ -1344,12 +1346,13 @@ class PostgresBackend(DatabaseBackend):
         with observation.phase(checkout) if observation is not None else nullcontext() as phase:
             admission = OwnedTaskAdmission()
             try:
-                retirement = create_owned_task(checkout.__aexit__(
-                    type(body_failure) if body_failure is not None else None,
-                    body_failure,
-                    body_failure.__traceback__ if body_failure is not None else None,
-                ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset",
-                    retain_originals=True, admission=admission)
+                with _disable_owned_task_lending(True):
+                    retirement = create_owned_task(checkout.__aexit__(
+                        type(body_failure) if body_failure is not None else None,
+                        body_failure,
+                        body_failure.__traceback__ if body_failure is not None else None,
+                    ), name=f"{asyncio.current_task().get_name()}:postgres-original-pool-reset",
+                        retain_originals=True, admission=admission)
             except BaseException as refusal:
                 accepted = admission.task
                 if phase is not None:
@@ -1535,12 +1538,13 @@ class PostgresBackend(DatabaseBackend):
         with observation.phase(transaction) if observation is not None else nullcontext() as phase:
             admission = OwnedTaskAdmission()
             try:
-                completion = create_owned_task(transaction.__aexit__(
-                    type(body_failure) if body_failure is not None else None,
-                    body_failure,
-                    body_failure.__traceback__ if body_failure is not None else None,
-                ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit",
-                    retain_originals=True, admission=admission)
+                with _disable_owned_task_lending(True):
+                    completion = create_owned_task(transaction.__aexit__(
+                        type(body_failure) if body_failure is not None else None,
+                        body_failure,
+                        body_failure.__traceback__ if body_failure is not None else None,
+                    ), name=f"{asyncio.current_task().get_name()}:postgres-original-transaction-exit",
+                        retain_originals=True, admission=admission)
             except BaseException as refusal:
                 accepted = admission.task
                 if phase is not None:
@@ -2034,10 +2038,11 @@ class PostgresBackend(DatabaseBackend):
         resource = _NativePostgresRetirement(connection, connection, native)
         admission = OwnedTaskAdmission()
         try:
-            closer = create_owned_task(
-                connection.close(), name="postgres-original-advisory-retirement",
-                retirement_resource=resource, retain_originals=True, admission=admission,
-            )
+            with _disable_owned_task_lending(True):
+                closer = create_owned_task(
+                    connection.close(), name="postgres-original-advisory-retirement",
+                    retirement_resource=resource, retain_originals=True, admission=admission,
+                )
         except BaseException as refusal:
             accepted = admission.task
             if accepted is not None:

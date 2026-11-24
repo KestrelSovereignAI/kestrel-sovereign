@@ -155,6 +155,10 @@ Core's cleanup-only custody suppresses WORK lending even for previously
 captured factories, including shared stream withdrawal and restored turn
 custody. Detachment also suppresses old explicit captures; an independent
 resource owner may bind its own new policy, but cleanup-only work may not.
+The detachment occurrence is retained separately from that active policy and
+carried through the selected body context, so binding the new owner cannot
+revive a capture from before detachment. Context restrictions are read without
+entering the supplied Context, including a Context already active in its caller.
 The original admitted owner still retains its physical
 cleanup and reports its exact outcome; no new work grant is made there.
 
@@ -166,6 +170,15 @@ fails. No callback runs a replacement task or acknowledges an external
 resource. Opaque factory wrappers never receive a loan. Exhausted or revoked
 policies must refuse synchronously, without allocating another owner or
 reattributing an existing resource. A reservation refusal is atomic.
+
+Captures retain Core's canonical read-only execution-work check, including the
+same mutable stream-withdrawal records, not a new context-derived work grant.
+Admission rechecks that evidence before reservation/allocation, before and after
+lending, and at the actual first payload step. A retained callback in a fresh
+context cannot borrow from its still-unwinding withdrawn producer. Exact native
+PostgreSQL COMMIT/ROLLBACK, pool reset/close and advisory-session close suppress
+WORK lending through the same cleanup restriction; physical retirement cannot
+depend on spare WORK capacity. This does not relax standalone execution checks.
 
 Only the exact, unambiguous native wrapper on the original running loop can
 receive a loan. Custom-factory construction is reconciled before admission;

@@ -913,9 +913,11 @@ _STREAM_CLEANUP: ContextVar[tuple[_StreamCleanupState, ...]] = ContextVar(
 )
 
 
-def _execution_cleanup_requested() -> bool:
-    return _CLEANUP_ONLY.get() or any(
-        state.requested and bool(state.scopes) for state in _STREAM_CLEANUP.get()
+def _execution_cleanup_requested(*, context=None) -> bool:
+    cleanup = _CLEANUP_ONLY.get() if context is None else context.get(_CLEANUP_ONLY, False)
+    streams = _STREAM_CLEANUP.get() if context is None else context.get(_STREAM_CLEANUP, ())
+    return cleanup or any(
+        state.requested and bool(state.scopes) for state in streams
     )
 
 
@@ -1827,7 +1829,7 @@ def bind_execution_cleanup(
     try:
         # The original physical owner carries this cleanup. It cannot request
         # a fresh WORK loan, including through a previously captured factory.
-        with _disable_owned_task_lending(cleanup_only):
+        with _disable_owned_task_lending(True):
             yield
     finally:
         _CLEANUP_ONLY.reset(cleanup_token)

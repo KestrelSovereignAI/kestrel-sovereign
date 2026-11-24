@@ -44,8 +44,10 @@ _NATIVE_LOOP_CREATE_TASK_CODE = asyncio.BaseEventLoop.create_task.__code__
 # original native admission; inheriting this context grants no membership.
 _OWNED_COORDINATORS = contextvars.ContextVar("kestrel_owned_coordinators", default=())
 _OWNED_TASK_LENDER = contextvars.ContextVar("kestrel_owned_task_lender", default=None)
+_OWNED_TASK_LENDING_BOUNDARY = contextvars.ContextVar("kestrel_owned_task_lending_boundary", default=None)
 _LENDING_DISABLED = object()
 _LENDING_DETACHED = object()
+_PRESERVE_LENDING_BOUNDARY = object()
 
 
 class _AutomaticTaskLender:
@@ -137,9 +139,11 @@ def without_owned_coordinators():
     reset_lender = _OWNED_TASK_LENDER.set(
         _LENDING_DISABLED if _owned_task_lending_suppression() is _LENDING_DISABLED else _LENDING_DETACHED,
     )
+    reset_boundary = _OWNED_TASK_LENDING_BOUNDARY.set(object())
     try:
         yield
     finally:
+        _OWNED_TASK_LENDING_BOUNDARY.reset(reset_boundary)
         _OWNED_TASK_LENDER.reset(reset_lender)
         _OWNED_COORDINATORS.reset(reset)
 
@@ -151,22 +155,27 @@ def _disable_owned_task_lending(disabled: bool):
 
 
 @contextmanager
-def _bind_owned_task_lending_suppression(suppression):
+def _bind_owned_task_lending_suppression(suppression, *, boundary=_PRESERVE_LENDING_BOUNDARY):
+    reset_boundary = (_OWNED_TASK_LENDING_BOUNDARY.set(boundary)
+                      if boundary is not _PRESERVE_LENDING_BOUNDARY else None)
     reset = _OWNED_TASK_LENDER.set(suppression) if suppression is not None else None
     try:
         yield
     finally:
         if reset is not None:
             _OWNED_TASK_LENDER.reset(reset)
+        if reset_boundary is not None:
+            _OWNED_TASK_LENDING_BOUNDARY.reset(reset_boundary)
 
 
-def _owned_task_lending_suppression():
+def _owned_task_lending_suppression(context=None):
     # Shared stream withdrawal and restored turn custody are authoritative even
     # when a task/factory carries an older explicit parent capture.
     from kestrel_sovereign.execution_custody import _execution_cleanup_requested
-    if _execution_cleanup_requested() or _OWNED_TASK_LENDER.get() is _LENDING_DISABLED:
+    lender = _OWNED_TASK_LENDER.get() if context is None else context.get(_OWNED_TASK_LENDER, None)
+    if _execution_cleanup_requested(context=context) or lender is _LENDING_DISABLED:
         return _LENDING_DISABLED
-    if _OWNED_TASK_LENDER.get() is _LENDING_DETACHED:
+    if lender is _LENDING_DETACHED:
         return _LENDING_DETACHED
     return None
 
@@ -414,6 +423,7 @@ class OwnedTaskLender(Protocol):
 @dataclass(eq=False, slots=True)
 class _OwnedTaskLenderBinding:
     policy: OwnedTaskLender
+    detachment: object | None = None
     active: bool = True
 
 
@@ -423,6 +433,7 @@ class OwnedTaskLenderCapture:
 
     _binding: _OwnedTaskLenderBinding
     _parent: asyncio.Task
+    _require_work: Callable[[], None]
 
 
 @contextmanager
@@ -433,8 +444,9 @@ def bind_owned_task_lender(policy: OwnedTaskLender):
     parent = asyncio.current_task()
     if parent is None:
         raise RuntimeError("owned task lender needs an original Task")
-    binding = _OwnedTaskLenderBinding(policy)
-    reset = _OWNED_TASK_LENDER.set(OwnedTaskLenderCapture(binding, parent))
+    from kestrel_sovereign.execution_custody import capture_execution_work_check
+    binding = _OwnedTaskLenderBinding(policy, _OWNED_TASK_LENDING_BOUNDARY.get())
+    reset = _OWNED_TASK_LENDER.set(OwnedTaskLenderCapture(binding, parent, capture_execution_work_check()))
     try:
         yield
     finally:
@@ -448,8 +460,21 @@ def capture_owned_task_lender() -> OwnedTaskLenderCapture | None:
     if (_owned_task_lending_suppression() is None
             and type(capture) is OwnedTaskLenderCapture and capture._binding.active
             and asyncio.current_task() is capture._parent):
-        return capture
+        from kestrel_sovereign.execution_custody import capture_execution_work_check
+        current_check = capture_execution_work_check()
+        def require_original_work():
+            capture._require_work()
+            current_check()
+        return OwnedTaskLenderCapture(capture._binding, capture._parent, require_original_work)
     return None
+
+
+def _require_live_owned_task_lender(capture, owner_loop):
+    if (type(capture) is not OwnedTaskLenderCapture or not capture._binding.active
+            or _NATIVE_TASK.done(capture._parent)
+            or asyncio.Future.get_loop(capture._parent) is not owner_loop):
+        raise RuntimeError("original owned task lender is no longer live")
+    capture._require_work()
 
 
 def _require_fresh_owned_task_admission(admission, *, for_operation=False):
@@ -647,18 +672,14 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     gate = None
     admitted_coordinators = ()
     admitted_lender = None
-    lending_suppression = _owned_task_lending_suppression()
-    if context is not None:
-        body_suppression = context.run(_owned_task_lending_suppression)
-        if lending_suppression is None or body_suppression is _LENDING_DISABLED:
-            lending_suppression = body_suppression
+    lending_suppression = lending_boundary = None
     loan = None
     loan_retirement_ready = False
     loan_retirement_started = False
     unstarted_closed = False
     async def run():
         nonlocal started
-        with _bind_owned_task_lending_suppression(lending_suppression):
+        with _bind_owned_task_lending_suppression(lending_suppression, boundary=lending_boundary):
             admission._wrapper_started = True
             observed = None
             try:
@@ -670,6 +691,8 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                     admission._acceptance_unknown = True
                     raise owned_task_admission_error(admission, admission,
                         RuntimeError("host loan payload requires its exact accepted native Task"))
+                if loan is not None:
+                    _require_live_owned_task_lender(capture, owner_loop)
                 started = True
                 reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
                     (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
@@ -806,23 +829,37 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                            for publisher in (on_completion, publisher_call))):
                 raise TypeError("native completion publisher must be a synchronous callable")
         owner_loop = asyncio.get_running_loop()
+        lending_suppression = _owned_task_lending_suppression()
+        caller_boundary = _OWNED_TASK_LENDING_BOUNDARY.get()
+        body_boundary = None
+        if context is not None:
+            if not isinstance(context, contextvars.Context):
+                raise TypeError("owned task context must be a Context")
+            body_suppression = _owned_task_lending_suppression(context)
+            if lending_suppression is None or body_suppression is _LENDING_DISABLED:
+                lending_suppression = body_suppression
+            body_boundary = context.get(_OWNED_TASK_LENDING_BOUNDARY, None)
+        lending_boundary = body_boundary if body_boundary is not None else caller_boundary
         gate = owner_loop.create_future()
         task_factory = owner_loop.get_task_factory()
         capture = ((capture_owned_task_lender() if context is None else None)
                    if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture)
         if lending_suppression is not None:
             capture = None
+        if type(capture) is OwnedTaskLenderCapture and any(
+            boundary is not None and capture._binding.detachment is not boundary
+            for boundary in (caller_boundary, body_boundary)
+        ):
+            capture = None
         if capture is not None:
-            if (type(capture) is not OwnedTaskLenderCapture or not capture._binding.active
-                    or _NATIVE_TASK.done(capture._parent)
-                    or asyncio.Future.get_loop(capture._parent) is not owner_loop):
-                raise RuntimeError("original owned task lender is no longer live")
+            _require_live_owned_task_lender(capture, owner_loop)
             policy = capture._binding.policy
             reservation = policy.reserve(
                 creator=asyncio.current_task(), original_parent=capture._parent,
                 admission=admission, structural_role=structural_role,
             )
             loan = policy, reservation
+            _require_live_owned_task_lender(capture, owner_loop)
         if loop is None:
             creation_attempted = True
             task = asyncio.create_task(wrapper, name=name, context=context)
@@ -966,11 +1003,13 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         if loan is not None:
             if gate.done() or _NATIVE_TASK.cancelling(task):
                 raise RuntimeError("owned task start gate was withdrawn before lending")
-            if not capture._binding.active or _NATIVE_TASK.done(task):
+            _require_live_owned_task_lender(capture, owner_loop)
+            if _NATIVE_TASK.done(task):
                 raise RuntimeError("owned task lender or its accepted Task is no longer live")
             policy, reservation = loan
             policy.lend(reservation, task=task, admission=admission)
-            admitted_lender = OwnedTaskLenderCapture(capture._binding, task)
+            _require_live_owned_task_lender(capture, owner_loop)
+            admitted_lender = OwnedTaskLenderCapture(capture._binding, task, capture._require_work)
         # Gate settlement belongs to admission too. A synchronous factory or
         # policy can cancel the exact accepted Task before returning to us.
         if gate is not None:

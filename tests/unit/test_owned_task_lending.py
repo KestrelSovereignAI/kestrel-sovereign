@@ -14,6 +14,7 @@ from kestrel_sovereign.execution_custody import (
     SourceWithdrawal,
     bind_execution_cleanup,
     bind_execution_custody,
+    close_execution_stream,
     execution_stream,
     execution_evidence_carriers,
     owned_execution_stream,
@@ -489,6 +490,146 @@ async def test_cleanup_suppression_covers_completion_publication_in_a_fresh_cont
             await ownership.create_owned_task(body(), context=contextvars.Context(), on_completion=completion)
         await asyncio.gather(*children)
     assert not host.outstanding and not host.retired
+
+
+@pytest.mark.asyncio
+async def test_retained_callback_rechecks_its_producers_shared_withdrawal():
+    host = CapacityLoan(capacity=2)
+    finalizing, release = asyncio.Event(), asyncio.Event()
+    scopes, entered = [], []
+    attempt = None
+    async def source():
+        scopes.append(OwnedCallbackScope())
+        try:
+            yield "original"
+        finally:
+            finalizing.set()
+            await release.wait()
+    async def work():
+        entered.append(asyncio.current_task())
+    with bind_execution_custody(ProcessRuntimeExecutionFence("retained-source-callback")):
+        with ownership.bind_owned_task_lender(host):
+            stream = execution_stream(None, source())
+            assert await anext(stream) == "original"
+            close = asyncio.create_task(stream.aclose())
+            try:
+                await asyncio.wait_for(finalizing.wait(), 1)
+                with pytest.raises(ExecutionAuthorityError, match="cleanup"):
+                    attempt = scopes[0].start(work, context=contextvars.Context())
+            finally:
+                release.set()
+                await close
+                if attempt is not None:
+                    await asyncio.gather(attempt, return_exceptions=True)
+                scopes[0].close()
+    assert not entered and not host.outstanding and len(host.retired) == 1
+
+
+@pytest.mark.asyncio
+async def test_independent_root_inside_detachment_cannot_revive_the_old_root():
+    old, new = CapacityLoan(), CapacityLoan()
+    async def independent():
+        assert ownership.capture_owned_task_lender() is None
+        assert not old.outstanding and not new.outstanding
+    async def new_work():
+        assert ownership.capture_owned_task_lender() is not None
+        assert not old.outstanding and len(new.outstanding) == 1
+    with ownership.bind_owned_task_lender(old):
+        captured = ownership.capture_owned_task_lender()
+        with without_owned_coordinators():
+            with ownership.bind_owned_task_lender(new):
+                await ownership.create_owned_task(independent(), lender_capture=captured)
+                await ownership.create_owned_task(new_work())
+    assert not old.retired and len(new.retired) == 1
+
+
+@pytest.mark.asyncio
+async def test_already_entered_body_context_remains_a_valid_non_eager_handoff():
+    context = contextvars.copy_context()
+    receipt = ownership.OwnedTaskAdmission()
+    marker = contextvars.ContextVar("same-entered-context", default=None)
+    context.run(marker.set, "original")
+    async def body():
+        assert marker.get() == "original"
+        return asyncio.current_task()
+    payload = body()
+    try:
+        task = context.run(ownership.create_owned_task, payload, context=context, admission=receipt)
+        assert await task is receipt.task
+        assert ownership.reconcile_owned_task_admission(receipt).state == "complete"
+    finally:
+        if receipt.task is None:
+            payload.close()
+
+
+@pytest.mark.asyncio
+async def test_unfenced_physical_close_needs_no_spare_work_loan(tmp_path):
+    host = CapacityLoan(capacity=0)
+    resource = (tmp_path / "original-unfenced-close").open("wb")
+    closed = []
+    class Source:
+        async def aclose(self):
+            require_execution_work()  # Standalone authority semantics stay unchanged.
+            assert ownership.capture_owned_task_lender() is None
+            resource.close()
+            closed.append(asyncio.current_task())
+    try:
+        with ownership.bind_owned_task_lender(host):
+            await close_execution_stream(None, Source())
+        assert resource.closed and len(closed) == 1 and not host.retired
+    finally:
+        resource.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["reserve", "publication", "lend", "before_step"])
+async def test_retained_work_check_stays_live_through_admission_and_first_step(phase):
+    from kestrel_sovereign.execution_custody import _StreamCleanupState, _bind_stream_cleanup
+    host = CapacityLoan()
+    state = _StreamCleanupState((ProcessRuntimeExecutionFence("lender-admission-withdrawal"),))
+    lends = []
+    reserve, lend = host.reserve, host.lend
+    def reserve_and_withdraw(**options):
+        reservation = reserve(**options)
+        if phase == "reserve":
+            state.requested = True
+        return reservation
+    def lend_and_withdraw(reservation, **options):
+        lends.append(options["task"])
+        lend(reservation, **options)
+        if phase == "lend":
+            state.requested = True
+    host.reserve, host.lend = reserve_and_withdraw, lend_and_withdraw
+    receipt = ownership.OwnedTaskAdmission()
+    entered = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    class WithdrawingTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "close_unstarted":
+                state.requested = True
+            return super().add_done_callback(callback, context=context)
+    def factory(loop, operation, **options):
+        return WithdrawingTask(operation, loop=loop, **options)
+    async def body():
+        entered.append(asyncio.current_task())
+    with _bind_stream_cleanup((state,)), ownership.bind_owned_task_lender(host):
+        try:
+            if phase == "publication":
+                loop.set_task_factory(factory)
+            with pytest.raises(ExecutionAuthorityError, match="cleanup"):
+                task = ownership.create_owned_task(body(), admission=receipt)
+                if phase == "before_step":
+                    state.requested = True
+                    await task
+        finally:
+            loop.set_task_factory(previous)
+            if receipt.task is not None:
+                await asyncio.gather(receipt.task, return_exceptions=True)
+    assert not entered and not host.outstanding and len(host.retired) == 1
+    if phase == "reserve":
+        assert receipt.task is None and host.retired[0].state == "nonacceptance"
+    assert len(lends) == (1 if phase in {"lend", "before_step"} else 0)
 
 
 @pytest.mark.asyncio
