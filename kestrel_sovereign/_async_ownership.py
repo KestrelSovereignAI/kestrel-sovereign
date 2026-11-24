@@ -1143,7 +1143,7 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
     return OwnedTaskOutcome((originals - pending, pending), None, withdrawal)
 
 
-async def acquire_lock_keeping_cancellation(lock: asyncio.Lock) -> BaseException | None:
+async def acquire_lock_keeping_cancellation(lock: asyncio.Lock | asyncio.Condition) -> BaseException | None:
     """Acquire ``lock`` however often the caller is cancelled meanwhile.
 
     For a closer that must still release what it owns after the lock's

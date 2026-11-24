@@ -17,6 +17,7 @@ retry policy, or altered default:
 | `OwnedTaskOutcome` | Original result, failure, and caller-cancellation observation. |
 | `OwnedTaskRetirement` | Read-only snapshot of one exact admission: unknown, proven task nonacceptance, pending, or complete with its original error. |
 | `await_owned_operation` | Admit and physically join one asynchronous operation at an existing unbounded join boundary, including failed task publication. |
+| `acquire_lock_keeping_cancellation` | Acquire an existing Lock or Condition despite repeated caller withdrawal; return the original cancellation evidence for delivery after the owner's synchronous accounting/cleanup and lock release. Does not grant Work or create a Task. |
 | `await_owned_task` | Observe the same original task despite repeated caller cancellation; existing borrowing and forwarding options retain their semantics. |
 | `bind_owned_task_lender` | Route the embedding host's own policy from its actual resource-owning Task. This binding never creates a resource or grants authority on its own. |
 | `capture_owned_task_lender` | Retain the current exact parent for a later, explicitly delegated native admission. A copied context does not carry the task identity. |

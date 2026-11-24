@@ -744,6 +744,7 @@ async def test_a_turn_keeps_only_whole_items_through_long_progress(tmp_path, mon
     arguments; and no partial call or progress artefact appears anywhere."""
     from kestrel_sovereign.agent import orchestrator_engine as oe
     from tests.shared.booted_agent import booted_agent
+    from tests.shared.native_task_diagnostics import original_task_tail_diagnostics
     from tests.utils.virtual_clock import pinned_loop_clock
 
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", BOUND)
@@ -794,11 +795,12 @@ async def test_a_turn_keeps_only_whole_items_through_long_progress(tmp_path, mon
 
             monkeypatch.setattr(service, "stream_with_tool_detection", plan_route)
             received: List[Tuple[float, Any]] = []
-            async for chunk in agent.process_input_streaming(
-                "Where does the constitution speak of sovereignty?",
-                session_id="s1",
-            ):
-                received.append((clock.time(), chunk))
+            with original_task_tail_diagnostics((asyncio.current_task(),)):
+                async for chunk in agent.process_input_streaming(
+                    "Where does the constitution speak of sovereignty?",
+                    session_id="s1",
+                ):
+                    received.append((clock.time(), chunk))
 
         # Both calls ran past twice their bound with nothing reaching the
         # consumer, and neither was cut.

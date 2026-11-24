@@ -33,6 +33,7 @@ def test_public_owned_tail_api_is_exact_canonical_identity_and_signature():
         "OwnedTaskLenderCapture",
         "OwnedTaskOutcome",
         "OwnedTaskRetirement",
+        "acquire_lock_keeping_cancellation",
         "await_owned_operation",
         "await_owned_task",
         "bind_owned_task_lender",
