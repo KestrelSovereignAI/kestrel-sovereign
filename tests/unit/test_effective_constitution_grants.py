@@ -115,6 +115,7 @@ async def test_anchored_tool_view_matches_gate_and_preserves_original(
         view = await tool.execute(article="amendment", search="IX")
         assert view["status"] == "ok", view
         data = view["data"]
+        assert data["workspace_policy_observation"] == {"enabled": False}
         assert set(data["effective_grants"]) == expected_grants
         assert set(data["effective_grants"]) == {
             capability for capability in DANGEROUS_CAPABILITIES if gate._constitution_allows(capability)
@@ -269,3 +270,418 @@ async def test_public_tool_accepts_integer_amendment_identifier(identifier, head
     view = await _constitution_tool(agent).execute(article="amendment", search=identifier)
     assert view["status"] == "ok", view
     assert heading in view["confirmation"]
+
+
+@pytest.mark.parametrize("overlay_present", [False, True], ids=["empty-package-falls-through", "verified-empty-overlay"])
+def test_edition_2_freezes_legacy_precedence_and_retains_evidence(
+    tmp_path, monkeypatch, overlay_present,
+):
+    from kestrel_sovereign.constitution.grants import (
+        build_grant_baseline,
+        preview_offline_legacy_grants,
+        resolve_amendment_ix_grants,
+        validate_grant_cutover,
+    )
+
+    package = tmp_path / "package.md"
+    package.write_text(_BASE)
+    monkeypatch.setattr(config, "CONSTITUTION_PATH", package)
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read,filesystem_write")
+    agent = SimpleNamespace()
+    target = "did:test:grant-baseline"
+    v2 = "---\nconstitution_version: 2\n---\n"
+    overlay_hash = None
+    if overlay_present:
+        raw = b""
+        (tmp_path / "CONSTITUTION.md").write_bytes(raw)
+        overlay_hash = hashlib.sha256(raw).hexdigest()
+
+    original = preview_offline_legacy_grants(tmp_path, overlay_hash=overlay_hash)
+    record = build_grant_baseline(target, original)
+    assert record["legacy_evidence"]["signer"] is None
+    assert record["legacy_evidence"]["sha256"] == overlay_hash
+    assert record["grants"] == ([] if overlay_present else ["filesystem_read", "filesystem_write"])
+    (tmp_path / "kestrel.toml").write_text("[features.computer_use]\nenabled = false\n")
+    agent._constitution_host_grant_baseline = validate_grant_cutover(
+        target_did=target, artifact={"grant_baseline": record}, prior_text=_BASE,
+        new_text=v2, legacy_resolution=lambda: original, storage_path=tmp_path,
+    )
+    assert resolve_amendment_ix_grants(agent).grants == set(record["grants"])
+
+    agent.granted_capabilities = {"shell_execution_host"}
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read,filesystem_outside_workspace")
+    package.write_text("### Amendment IX\n- [x] shell_execution_host\n")
+    effective = resolve_amendment_ix_grants(agent)
+    assert effective.grants == (set() if overlay_present else {"filesystem_read"})
+    assert effective.environment_narrowed is not overlay_present
+    assert effective.content_hash == overlay_hash
+    monkeypatch.delenv("KESTREL_CAPABILITY_GRANTS")
+    assert resolve_amendment_ix_grants(agent).grants == set()
+
+
+def test_edition_2_cutover_cannot_expand_remove_or_reattribute_legacy_grants(monkeypatch):
+    from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+    from kestrel_sovereign.constitution.grants import (
+        build_grant_baseline,
+        resolve_legacy_grants,
+        validate_grant_cutover,
+    )
+
+    agent = SimpleNamespace(granted_capabilities={"filesystem_read"})
+    target = "did:test:grant-baseline"
+    v2 = "---\nconstitution_version: 2\n---\n"
+    for grants in ([], ["filesystem_read", "filesystem_write"]):
+        record = build_grant_baseline(target, resolve_legacy_grants(agent))
+        record["grants"] = grants
+        with pytest.raises(AmendmentArtifactError, match="differs from the existing decision"):
+            validate_grant_cutover(
+                target_did=target, artifact={"grant_baseline": record},
+                prior_text=_BASE, new_text=v2,
+                legacy_resolution=lambda: resolve_legacy_grants(agent),
+            )
+    with pytest.raises(AmendmentArtifactError, match="Cannot restore legacy"):
+        validate_grant_cutover(
+            target_did=target, artifact={}, prior_text=v2, new_text=_BASE,
+            legacy_resolution=lambda: resolve_legacy_grants(agent),
+        )
+
+
+@pytest.mark.asyncio
+async def test_edition_2_runtime_refuses_altered_baseline_and_view_agrees(
+    tmp_path, monkeypatch,
+):
+    import json
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from kestrel_sovereign.constitution.amendment_artifact import (
+        build_legacy_signed_reanchor_artifact,
+        did_document_from_legacy_public_key,
+    )
+    from kestrel_sovereign.constitution.grants import build_grant_baseline, resolve_legacy_grants
+    from kestrel_sovereign.constitution.publisher import verify_packaged_publisher
+    from kestrel_sovereign.constitution.reanchor_receipt import CONSTITUTION_REANCHOR_KEY
+
+    v2_path = (
+        Path(__file__).resolve().parents[2] / "kestrel_sovereign" / "data"
+        / "constitutions" / "v2" / "KESTREL_CONSTITUTION.md"
+    )
+    v2_bytes = v2_path.read_bytes()
+    from datetime import datetime, timezone
+
+    from kestrel_sovereign.constitution.transition import (
+        TRANSITION_PURPOSE, build_transition, publisher_source_url,
+    )
+    from kestrel_sovereign.inception_service import public_key_to_ethereum_address
+
+    v1_bytes = Path(config.CONSTITUTION_PATH).read_bytes()
+    genesis_key = ec.generate_private_key(ec.SECP256K1())
+    target = "did:pkh:eip155:1:" + public_key_to_ethereum_address(genesis_key.public_key())
+    monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read")
+    agent = KestrelAgent(did=target, storage_path=str(tmp_path / "baseline.db"))
+    agent.extension = None
+    sovereign_key = ec.generate_private_key(ec.SECP256K1())
+    sovereign = did_document_from_legacy_public_key("did:test:external-root", sovereign_key.public_key())
+    monkeypatch.setattr(agent, "_trusted_sovereign_did_document", lambda *_: sovereign)
+
+    async with AsyncStorage(agent.storage_path, agent_id=agent.agent_id) as storage:
+        agent.storage = agent._raw_storage = storage
+        prior = await storage.store_file(v1_bytes, "prior-governing.md")
+        digest = await storage.store_file(v2_bytes, "governing.md")
+        publisher = verify_packaged_publisher(digest)
+        record = build_grant_baseline(agent.agent_id, resolve_legacy_grants(agent))
+        assert record["grants"] == ["filesystem_read"]
+        intent = {
+            "purpose": TRANSITION_PURPOSE, "target_did": target, "sovereign_did": sovereign["id"],
+            "prior_sha256": prior, "constitution_sha256": digest, "source_sha256": digest,
+            "publisher_commit": publisher["publisher_commit"],
+            "publisher_source_url": publisher_source_url(publisher["publisher_commit"]),
+            "admission_at": datetime.now(timezone.utc).isoformat(),
+        }
+        artifact = build_legacy_signed_reanchor_artifact(
+            signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
+            grant_baseline=record, publisher_release=publisher,
+            transition=build_transition(intent, genesis_private_key=genesis_key),
+        )
+
+        async def store_artifact(artifact, *, old_hash=prior):
+            artifact_hash = await storage.store_file(json.dumps(artifact).encode(), "signed-artifact.json")
+            node = GraphNode(
+                node_id=agent.agent_id,
+                node_type="agent",
+                label="Baseline",
+                properties={
+                    "constitution_hash": digest,
+                    CONSTITUTION_REANCHOR_KEY: {
+                        "new_hash": digest, "source_content_sha256": digest,
+                        "signed_artifact_hash": artifact_hash, "old_hash": old_hash,
+                        "signed_artifact_signer": sovereign["id"], "timestamp": artifact["created_at"],
+                    },
+                },
+            )
+            await storage.add_node(node)
+            return node, artifact_hash
+
+        tool = _constitution_tool(agent)
+        gate = ComputerUseFeature(agent)
+        node, artifact_hash = await store_artifact(artifact)
+        ok, message = await agent._refresh_constitution_host_grants(node)
+        assert not ok and "differs from the authoritative source" in message
+        assert not gate._constitution_allows("filesystem_read")
+        monkeypatch.setattr(config, "CONSTITUTION_PATH", v2_path)
+        ok, message = await agent._refresh_constitution_host_grants(node)
+        assert ok, message
+        monkeypatch.setenv("KESTREL_CAPABILITY_GRANTS", "filesystem_read,filesystem_write")
+        assert gate._constitution_allows("filesystem_read")
+        assert not gate._constitution_allows("filesystem_write")
+        no_transition = build_legacy_signed_reanchor_artifact(
+            signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
+            grant_baseline=record, publisher_release=publisher,
+        )
+        forged_node, _ = await store_artifact(no_transition)
+        ok, message = await agent._refresh_constitution_host_grants(forged_node)
+        assert not ok and "Genesis-verifiable" in message
+        assert not gate._constitution_allows("filesystem_read")
+        repair_node, _ = await store_artifact(no_transition, old_hash=digest)
+        ok, message = await agent._refresh_constitution_host_grants(repair_node)
+        assert not ok and "no verified Genesis adoption ancestry" in message
+        assert not gate._constitution_allows("filesystem_read")
+        await storage.add_node(node)
+        ok, message = await agent._refresh_constitution_host_grants(node)
+        assert ok, message
+        baseline_view = (await tool.execute(article="amendment", search="IX"))["data"]
+        assert baseline_view["effective_grants"] == ["filesystem_read"]
+        assert baseline_view["signer"] is None
+        assert baseline_view["baseline_signer"] == sovereign["id"]
+        assert baseline_view["baseline_sha256"] == artifact_hash
+
+        # Unknown absent history is not evidence that the receipt predates v2.
+        node.properties["constitution_reanchor_history"] = [{
+            "receipt": {"new_hash": "a" * 64},
+            "superseded_by_constitution_hash": digest,
+        }]
+        await storage.add_node(node)
+        ok, message = await agent._refresh_constitution_host_grants(node)
+        assert not ok and "no signed reanchor artifact" in message
+        assert not gate._constitution_allows("filesystem_read")
+        node.properties.pop("constitution_reanchor_history")
+
+        from copy import deepcopy
+
+        conflicting_record = deepcopy(record)
+        conflicting_record["grants"].append("filesystem_write")
+        conflicting_artifact = build_legacy_signed_reanchor_artifact(
+            signer_did=sovereign["id"], constitution_sha256=digest, private_key=sovereign_key,
+            grant_baseline=conflicting_record, publisher_release=publisher,
+        )
+        conflict_node, conflict_hash = await store_artifact(conflicting_artifact, old_hash=digest)
+        conflict_node.properties["constitution_reanchor_history"] = [{
+            "receipt": node.properties[CONSTITUTION_REANCHOR_KEY],
+            "superseded_by_constitution_hash": digest,
+            "superseded_by_artifact_hash": conflict_hash,
+        }]
+        await storage.add_node(conflict_node)
+        ok, message = await agent._refresh_constitution_host_grants(conflict_node)
+        assert ok, message
+        assert gate._constitution_allows("filesystem_read")
+        assert not gate._constitution_allows("filesystem_write")
+        conflict_view = (await tool.execute(article="amendment", search="IX"))["data"]
+        assert conflict_view["effective_grants"] == ["filesystem_read"]
+        assert conflict_view["conflicts"] == ["filesystem_write"]
+
+        record["grants"].append("filesystem_write")
+        tampered_node, _ = await store_artifact(artifact)
+        ok, message = await agent._refresh_constitution_host_grants(tampered_node)
+        assert not ok and "signature" in message
+        assert not gate._constitution_allows("filesystem_read")
+        assert not gate._constitution_allows("filesystem_write")
+        denied_view = (await tool.execute(article="amendment", search="IX"))["data"]
+        assert denied_view["effective_grants"] == []
+        assert denied_view["baseline_signer"] is None
+
+
+def test_grant_repair_classifies_only_exact_replacement_bytes():
+    from kestrel_sovereign.constitution.grants import prior_text_for_grant_repair
+
+    historical_hash = hashlib.sha256(_BASE.encode()).hexdigest()
+    assert prior_text_for_grant_repair(
+        anchored_text=None, historical_hash=historical_hash,
+        new_text=_BASE, new_hash=historical_hash,
+    ) == _BASE
+    assert prior_text_for_grant_repair(
+        anchored_text=None, historical_hash="0" * 64,
+        new_text=_BASE, new_hash=historical_hash,
+    ) is None
+
+
+def test_same_hash_edition_2_repair_still_requires_prior_baseline():
+    from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+    from kestrel_sovereign.constitution.grants import (
+        build_grant_baseline,
+        prior_text_for_grant_repair,
+        resolve_legacy_grants,
+        validate_grant_cutover,
+    )
+
+    edition_2 = "---\nconstitution_version: 2\n---\n"
+    digest = hashlib.sha256(edition_2.encode()).hexdigest()
+    prior_text = prior_text_for_grant_repair(
+        anchored_text=None, historical_hash=digest, new_text=edition_2, new_hash=digest,
+    )
+    target = "did:test:edition-2-repair"
+    legacy = resolve_legacy_grants(SimpleNamespace(granted_capabilities={"filesystem_read"}))
+    artifact = {"grant_baseline": build_grant_baseline(target, legacy)}
+    with pytest.raises(AmendmentArtifactError, match="differs from the existing decision"):
+        validate_grant_cutover(
+            target_did=target,
+            artifact=artifact,
+            prior_text=prior_text,
+            new_text=edition_2,
+            legacy_resolution=lambda: pytest.fail("edition 2 must not fall back to legacy grants"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_only_independently_pinned_admitted_grant_artifacts_survive_root_rotation(
+    tmp_path, monkeypatch,
+):
+    import json
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from kestrel_sovereign.constitution.amendment_artifact import (
+        AmendmentArtifactError, build_legacy_signed_reanchor_artifact,
+        did_document_from_legacy_public_key, verify_reanchor_artifact,
+    )
+    from kestrel_sovereign.constitution.grants import (
+        HISTORY_PIN_ENV, build_grant_baseline, load_anchored_grant_baseline,
+        resolve_legacy_grants, sovereign_document_fingerprint,
+    )
+
+    old_key, new_key, unrelated_key = (ec.generate_private_key(ec.SECP256K1()) for _ in range(3))
+    old = did_document_from_legacy_public_key("did:test:old-root", old_key.public_key())
+    new = did_document_from_legacy_public_key("did:test:new-root", new_key.public_key())
+    unrelated = did_document_from_legacy_public_key("did:test:new-root", unrelated_key.public_key())
+    from datetime import datetime, timezone
+    from importlib.resources import files
+    from kestrel_sovereign.constitution.publisher import verify_packaged_publisher
+
+    from kestrel_sovereign.constitution.transition import (
+        TRANSITION_PURPOSE, build_transition, publisher_source_url,
+    )
+    from kestrel_sovereign.inception_service import public_key_to_ethereum_address
+
+    genesis_key = ec.generate_private_key(ec.SECP256K1())
+    target = "did:pkh:eip155:1:" + public_key_to_ethereum_address(genesis_key.public_key())
+    data = files("kestrel_sovereign").joinpath("data")
+    prior_bytes = data.joinpath("KESTREL_CONSTITUTION.md").read_bytes()
+    prior_digest = hashlib.sha256(prior_bytes).hexdigest()
+    source = data.joinpath("constitutions", "v2", "KESTREL_CONSTITUTION.md").read_bytes()
+    digest = hashlib.sha256(source).hexdigest()
+    publisher = verify_packaged_publisher(digest)
+    baseline = build_grant_baseline(target, resolve_legacy_grants(SimpleNamespace(
+        granted_capabilities={"filesystem_read"},
+    )))
+
+    first_adoption = build_transition({
+        "purpose": TRANSITION_PURPOSE, "target_did": target, "sovereign_did": old["id"],
+        "prior_sha256": prior_digest, "constitution_sha256": digest, "source_sha256": digest,
+        "publisher_commit": publisher["publisher_commit"],
+        "publisher_source_url": publisher_source_url(publisher["publisher_commit"]),
+        "admission_at": datetime.now(timezone.utc).isoformat(),
+    }, genesis_private_key=genesis_key)
+
+    def artifact(signer, key, *, reason="preserve decision", transition=None):
+        return build_legacy_signed_reanchor_artifact(
+            signer_did=signer["id"], constitution_sha256=digest, private_key=key,
+            grant_baseline=baseline, reason=reason, publisher_release=publisher, transition=transition,
+        )
+
+    historic = artifact(old, old_key, transition=first_adoption)
+    latest = artifact(new, new_key)
+    assert not verify_reanchor_artifact(
+        historic, trusted_did_document=new, expected_constitution_sha256=digest,
+    ).ok
+    pin_path = tmp_path / "archived-grant-credentials.json"
+    env = {HISTORY_PIN_ENV: str(pin_path)}
+
+    async with AsyncStorage(str(tmp_path / "history.db"), agent_id=target) as storage:
+        await storage.store_file(prior_bytes, "prior-governing.md")
+        await storage.store_file(source, "governing.md")
+
+        async def receipt(value, *, previous=digest):
+            artifact_hash = await storage.store_file(json.dumps(value).encode(), "artifact.json")
+            return {
+                "source_content_sha256": digest, "old_hash": previous, "new_hash": digest,
+                "signed_artifact_hash": artifact_hash, "signed_artifact_signer": value["signer"],
+                "timestamp": value["created_at"],
+            }
+
+        prior = await receipt(historic, previous=prior_digest)
+        current = await receipt(latest)
+        properties = {
+            "constitution_hash": digest,
+            "constitution_reanchor": current,
+            "constitution_reanchor_history": [{
+                "receipt": prior, "superseded_by_constitution_hash": digest,
+                "superseded_by_artifact_hash": current["signed_artifact_hash"],
+            }],
+        }
+
+        async def load(root, properties=properties, environ=env):
+            return await load_anchored_grant_baseline(
+                storage.db, target_did=target, properties=properties,
+                trusted_did_document=root, environ=environ,
+            )
+
+        with pytest.raises(AmendmentArtifactError, match="signature verification"):
+            await load(new, environ={})
+        pin_path.write_text(json.dumps({
+            "active_document_sha256": sovereign_document_fingerprint(new),
+            "admitted_artifacts": {prior["signed_artifact_hash"]: old},
+        }))
+        loaded = await load(new)
+        assert loaded.grants == frozenset({"filesystem_read"})
+        assert loaded.baseline_signer == new["id"]
+
+        # Rotation preserves the original artifact even before a new repair writes one.
+        old_current = {"constitution_hash": digest, "constitution_reanchor": prior}
+        assert (await load(new, old_current)).baseline_signer == old["id"]
+        with pytest.raises(AmendmentArtifactError, match="do not bind"):
+            await load(unrelated, old_current)
+
+        # An archived public key alone cannot authorize a different artifact.
+        unadmitted = await receipt(artifact(old, old_key, reason="another signed artifact"))
+        with pytest.raises(AmendmentArtifactError, match="signature verification"):
+            await load(new, {"constitution_hash": digest, "constitution_reanchor": unadmitted})
+
+
+@pytest.mark.parametrize(
+    "observed_at, created_at, valid",
+    [
+        ("2000-01-01T00:00:00+00:00", "2000-01-02T00:00:00+00:00", True),
+        ("2000-01-02T00:00:00+00:00", "2000-01-01T00:00:00+00:00", False),
+        ("2000-01-01T00:00:00+00:00", "9999-01-02T00:00:00+00:00", False),
+        ("9999-01-01T00:00:00+00:00", "9999-01-02T00:00:00+00:00", False),
+    ],
+)
+def test_signed_offline_grant_observation_must_be_chronological(observed_at, created_at, valid):
+    from kestrel_sovereign.constitution.amendment_artifact import AmendmentArtifactError
+    from kestrel_sovereign.constitution.grants import (
+        GrantResolution, build_offline_grant_observation, require_offline_grant_observation,
+    )
+
+    prior = "1" * 64
+    resolution = GrantResolution(frozenset(), "default deny", "unavailable", "absent")
+    observation = build_offline_grant_observation(
+        target_did="did:test:agent", prior_sha256=prior, observed_at=observed_at, resolution=resolution,
+    )
+    artifact = {
+        "created_at": created_at, "grant_baseline": observation["baseline"],
+        "offline_grant_observation": observation,
+    }
+    if valid:
+        require_offline_grant_observation(artifact, prior_sha256=prior)
+    else:
+        with pytest.raises(AmendmentArtifactError, match="Invalid timestamp"):
+            require_offline_grant_observation(artifact, prior_sha256=prior)

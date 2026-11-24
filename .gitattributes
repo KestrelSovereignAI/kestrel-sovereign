@@ -4,7 +4,9 @@
 /kestrel_sovereign/data/semantic/** text eol=lf
 
 # Publishers and operators must obtain the same constitutional release bytes.
+/kestrel_sovereign/data/KESTREL_CONSTITUTION.md text eol=lf
 /kestrel_sovereign/data/constitutions/*/*.md text eol=lf
+/kestrel_sovereign/data/constitutions/*/publisher/** -text
 
 # Reproducible custody bytes, independent of an operator's Git line endings.
 tests/interop/a2a_tck/* text eol=lf

@@ -57,6 +57,7 @@ def _make_security_feature():
             {
                 "feature": "files",
                 "tool": "write",
+                "id": 27,
                 "action": "prompt",
                 "decision": "approved",
                 "user_choice": "session",
@@ -107,6 +108,7 @@ def test_security_tree_pending_and_audit_endpoints_serialize_expected_shapes():
         assert pending_response.json()["count"] == 1
         assert pending_response.json()["pending"][0]["id"] == "req-1"
         assert audit_response.status_code == 200
+        assert audit_response.json()["logs"][0]["id"] == 27
         assert audit_response.json()["logs"][0]["decision"] == "approved"
         security_feature.permission_store.get_audit_log.assert_awaited_once_with(25)
     finally:

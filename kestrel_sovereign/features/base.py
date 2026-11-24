@@ -63,6 +63,7 @@ from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.tools.deferred import DeferredToolResult
 from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown, observed_outcome_unknown
 
+from kestrel_sovereign.hooks.decision_gate import host_approval_scope
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     execution_evidence_carriers,
@@ -2231,6 +2232,7 @@ class Feature(_SdkFeature):
                 return result
         return _exec
 
+    @host_approval_scope()
     async def _execute_subagent_tool(
         self,
         *,

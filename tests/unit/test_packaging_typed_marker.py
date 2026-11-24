@@ -18,6 +18,8 @@ and the marker together; these tests fail on any mismatch between them.
 from __future__ import annotations
 
 import email
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -151,6 +153,18 @@ def test_isolated_preview_build_context_survives_both_distribution_formats(built
             assert wheel.read(name) == sdist.extractfile(members[name]).read() == expected
 
 
+def test_authenticated_v1_publications_ship_with_exact_bytes(built_distributions):
+    from kestrel_sovereign.constitution.v1_releases import V1_RELEASES
+
+    with zipfile.ZipFile(built_distributions["wheel"]) as wheel, tarfile.open(built_distributions["sdist"]) as sdist:
+        members = {member.name.split("/", 1)[1]: member for member in sdist.getmembers() if member.isfile()}
+        for release in V1_RELEASES:
+            name = f"kestrel_sovereign/{release.resource_path}"
+            content = wheel.read(name)
+            assert hashlib.sha256(content).hexdigest() == release.digest
+            assert sdist.extractfile(members[name]).read() == content
+
+
 def test_source_tree_carries_full_package_marker():
     marker = Path(kestrel_sovereign.__file__).resolve().parent / "py.typed"
     assert marker.is_file(), f"{marker} is missing; the Typed classifier is unbacked"
@@ -228,3 +242,22 @@ def test_clean_wheel_install_exposes_marker(built_wheel, tmp_path):
     installed_marker = Path(probe.stdout.strip())
     assert installed_marker.is_file()
     assert REPOSITORY not in installed_marker.resolve().parents
+
+
+def test_wheel_and_sdist_ship_each_constitution_edition(built_distributions):
+    edition = "kestrel_sovereign/data/constitutions/v2"
+    source_root = built_distributions["source"]
+    digest = hashlib.sha256((source_root / edition / "KESTREL_CONSTITUTION.md").read_bytes()).hexdigest()
+    selector = f"{edition}/publisher/{digest}/current.json"
+    commit = json.loads((source_root / selector).read_text())["publisher_commit"]
+    release = f"{edition}/publisher/{digest}/{commit}"
+    paths = (
+        "kestrel_sovereign/data/KESTREL_CONSTITUTION.md", f"{edition}/KESTREL_CONSTITUTION.md",
+        f"{edition}/PLEDGE.md", selector, f"{release}/release.json",
+        f"{release}/constitution-v2.tar.gz", f"{release}/attestation.jsonl", f"{release}/trusted-root.jsonl",
+    )
+    with zipfile.ZipFile(built_distributions["wheel"]) as wheel, tarfile.open(built_distributions["sdist"]) as sdist:
+        members = {member.name.split("/", 1)[1]: member for member in sdist.getmembers() if member.isfile()}
+        for path in paths:
+            expected = (built_distributions["source"] / path).read_bytes()
+            assert wheel.read(path) == sdist.extractfile(members[path]).read() == expected

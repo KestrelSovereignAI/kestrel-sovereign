@@ -406,18 +406,25 @@ def resolve(
     MUST equal the requested ``did`` per DID Core; we enforce that here
     so a misconfigured server can't pass off another agent's document.
     """
+    return resolve_document(did, fetcher=fetcher)[1]
+
+
+def resolve_document(did: str, *, fetcher: Optional[Fetcher] = None) -> tuple[bytes, dict]:
+    """Return exact HTTPS bytes alongside the checked did:web document."""
     url = did_to_url(did)
-    fetch = fetcher or _default_fetcher
-    raw = fetch(url)
+    raw = (fetcher or _default_fetcher)(url)
+    return raw, parse_resolved_document(did, raw)
+
+
+def parse_resolved_document(did: str, raw: bytes) -> dict:
+    """Check an exact stored did:web document without issuing a network request."""
+    url = did_to_url(did)
     try:
         doc = json.loads(raw)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise DidWebError(f"DID document at {url} is not JSON: {e}") from e
     if not isinstance(doc, dict):
-        raise DidWebError(
-            f"DID document at {url} must be a JSON object; got "
-            f"{type(doc).__name__}"
-        )
+        raise DidWebError(f"DID document at {url} must be a JSON object; got {type(doc).__name__}")
     if doc.get("id") != did:
         raise DidWebError(
             f"DID document at {url} has id={doc.get('id')!r}, "
