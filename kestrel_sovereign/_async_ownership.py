@@ -544,7 +544,8 @@ def _reconcile_owned_task_admission(admission, *, include_source=True):
     if not _NATIVE_TASK.done(task):
         return OwnedTaskRetirement(admission, task, "pending", admission.error)
     error = owned_task_error(task, admission=admission)
-    state = "unknown" if execution_cleanup_debts(error) else "complete"
+    state = "unknown" if (not admission._completion_capture_registered
+        or execution_cleanup_debts(error)) else "complete"
     source = admission._source if include_source else None
     if source is not None and source.producer is admission:
         facts = source._state

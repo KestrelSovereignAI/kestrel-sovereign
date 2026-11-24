@@ -32,8 +32,9 @@ pytestmark = pytest.mark.usefixtures("owned_sqlite_observers")
 
 class Body(httpx.AsyncByteStream, httpx2.AsyncByteStream):
     """Real SDK response resource whose native close must be physically joined."""
-    def __init__(self, chunk=b""):
+    def __init__(self, chunk=b"", close_delay=0):
         self.chunk = chunk
+        self.close_delay = close_delay
         self.close_entered = asyncio.Event()
         self.release_close = asyncio.Event()
         self.closed = False
@@ -44,6 +45,8 @@ class Body(httpx.AsyncByteStream, httpx2.AsyncByteStream):
         await asyncio.Event().wait()
 
     async def aclose(self):
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         self.close_entered.set()
         await self.release_close.wait()
         self.closed = True
@@ -138,14 +141,16 @@ async def test_native_sdk_handle_survives_post_open_authority_denial(provider, t
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 @pytest.mark.parametrize("provider", ["openai", "openrouter", "ollama"])
 @pytest.mark.parametrize("tools", [False, True])
-async def test_native_http_close_is_joined_through_every_adapter_forwarder(provider, tools):
+@pytest.mark.parametrize("close_delay", [0, 1.1], ids=["immediate", "delayed-native-close"])
+async def test_native_http_close_is_joined_through_every_adapter_forwarder(provider, tools, close_delay):
     native_http = httpx if provider == "ollama" else httpx2
     chunk = openai_chunk() if provider != "ollama" else json.dumps({
         "model": "offline", "message": {"role": "assistant", "content": "hello"}, "done": False,
     }).encode() + b"\n"
-    body = Body(chunk)
+    body = Body(chunk, close_delay=close_delay)
     async def transport(_request):
         return native_http.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
     http = native_http.AsyncClient(base_url="http://offline.invalid", transport=native_http.MockTransport(transport))
@@ -161,11 +166,16 @@ async def test_native_http_close_is_joined_through_every_adapter_forwarder(provi
         adapter = OpenAIAdapter() if provider == "openai" else OpenRouterAdapter()
     method = adapter.get_streaming_response_with_tools if tools else adapter.get_streaming_response
     iterator = method(client=client, model="offline", messages=[{"role": "user", "content": "hello"}])
-    close = None
+    close = close_observer = None
     try:
-        assert await asyncio.wait_for(anext(iterator), timeout=2) == "hello"
+        assert await anext(iterator) == "hello"
         close = asyncio.create_task(iterator.aclose())
-        await asyncio.wait_for(body.close_entered.wait(), timeout=1)
+        close_observer = asyncio.create_task(body.close_entered.wait())
+        # Observe lifecycle progress, not local scheduling/SDK speed. A close
+        # that escapes without native entry fails immediately; a missing entry
+        # is bounded by the whole test's timeout, including its cleanup.
+        done, _ = await asyncio.wait((close, close_observer), return_when=asyncio.FIRST_COMPLETED)
+        assert close_observer in done, "outer close escaped before entering native HTTP close"
         assert not close.done(), "outer adapter reported close while inner HTTP resource remained live"
         body.release_close.set()
         outcome = await await_owned_task(close)
@@ -173,6 +183,10 @@ async def test_native_http_close_is_joined_through_every_adapter_forwarder(provi
         assert body.closed
     finally:
         body.release_close.set()
+        if close_observer is not None:
+            if not close_observer.done():
+                close_observer.cancel()
+            await await_owned_task(close_observer)
         if close is not None:
             await await_owned_task(close)
         await iterator.aclose()

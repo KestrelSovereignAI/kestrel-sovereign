@@ -4073,14 +4073,16 @@ class AsyncDatabase:
         from kestrel_sovereign._async_ownership import (
             await_owned_operation,
         )
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
         errors = []
         # Independent resource retirement must finish even if an earlier owner
         # reports grouped control or the caller is cancelled during a join.
         for index, operation in enumerate((self.dispose_cached_sqla_factory, self._backend.close)):
-            outcome = await await_owned_operation(
-                operation(), retirement_resource=self, retain_originals=True,
-                cancel_on_caller_cancellation=index == 0,
-            )
+            with bind_execution_cleanup(self):
+                outcome = await await_owned_operation(
+                    operation(), retirement_resource=self, retain_originals=True,
+                    cancel_on_caller_cancellation=index == 0,
+                )
             errors.extend((outcome.error, outcome.cancellation))
         self._initialized = False
 

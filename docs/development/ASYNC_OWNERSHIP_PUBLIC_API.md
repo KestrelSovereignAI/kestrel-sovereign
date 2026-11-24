@@ -214,6 +214,16 @@ can manufacture an acknowledgment. A failed constructor uses a fresh pending
 source carrier rather than decorating its original refusal. The existing join
 settles that construction fact only after the exact accepted owners settled;
 independent capture, epilogue, watcher, and physical-close failures remain.
+Missing original completion-capture registration is UNKNOWN even if an
+unstarted wrapper's Task has since been joined; a later join does not replace
+that failed registration. Constructor debt names the uncertain original
+producer or watcher receipt, not a different Task that already retired.
+
+Physical HTTP-body close (including inline response close), database-facade
+disposal, and native SQLite connection close use the same cleanup-only lending
+restriction as PostgreSQL epilogues. They must retire their original resources
+even when no new WORK capacity is available, without granting new WORK authority
+or suppressing an actual failed close.
 
 ## Task completion is not process-tree drain
 

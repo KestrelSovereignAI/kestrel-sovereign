@@ -13,6 +13,7 @@ from kestrel_sovereign._async_ownership import (
     raise_owned_outcome,
 )
 from kestrel_sovereign.execution_custody import (
+    bind_execution_cleanup,
     execution_terminal_error,
     is_execution_control_error,
 )
@@ -57,7 +58,8 @@ class ClosingStreamingResponse(StreamingResponse):
         close = getattr(self.body_iterator, "aclose", None)
         if callable(close):
             try:
-                await close()
+                with bind_execution_cleanup(self.body_iterator):
+                    await close()
             except BaseException as error:
                 primary = execution_terminal_error(
                     primary, error, retain_originals=True,
@@ -103,13 +105,14 @@ class ClosingStreamingResponse(StreamingResponse):
         )
         if callable(close):
             from kestrel_sovereign._async_ownership import await_owned_operation
-            outcome = await await_owned_operation(
-                close(), name="closing_streaming_response:body",
-                retirement_resource=self.body_iterator, retain_originals=True,
-                pending_cancellation=(
-                    primary if isinstance(primary, asyncio.CancelledError) else None
-                ),
-            )
+            with bind_execution_cleanup(self.body_iterator):
+                outcome = await await_owned_operation(
+                    close(), name="closing_streaming_response:body",
+                    retirement_resource=self.body_iterator, retain_originals=True,
+                    pending_cancellation=(
+                        primary if isinstance(primary, asyncio.CancelledError) else None
+                    ),
+                )
 
         if any(
             error is not None and is_execution_control_error(error)

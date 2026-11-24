@@ -180,6 +180,112 @@ async def test_source_lend_veto_retires_original_partial_without_decorating_veto
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["http-response", "http-inline", "database-facade", "database-backend"])
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_public_physical_closers_do_not_reserve_new_work(tmp_path, resource, fenced):
+    from contextlib import nullcontext
+    host = CapacityLoan(capacity=0)
+    scope = (bind_execution_custody(ProcessRuntimeExecutionFence("public-physical-close"))
+             if fenced else nullcontext())
+    if resource.startswith("http-"):
+        from kestrel_sovereign.endpoints.closing_streaming_response import ClosingStreamingResponse
+        handle = (tmp_path / "response-body").open("w+b")
+        handle.write(b"original body")
+        handle.seek(0)
+        close_captures = []
+
+        class Body:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                chunk = handle.read(64)
+                if chunk:
+                    return chunk
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                close_captures.append(ownership.capture_owned_task_lender())
+                if fenced:
+                    with pytest.raises(ExecutionAuthorityError, match="cleanup"):
+                        require_execution_work()
+                else:
+                    require_execution_work()
+                handle.close()
+
+        body = Body()
+        response = ClosingStreamingResponse(body, close_in_stream_task=resource == "http-inline")
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            pass
+
+        try:
+            with scope, ownership.bind_owned_task_lender(host):
+                await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+                assert ownership.capture_owned_task_lender() is not None
+                require_execution_work()
+            assert handle.closed and close_captures and all(capture is None for capture in close_captures)
+        finally:
+            handle.close()
+    else:
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        database = await AsyncDatabase.sqlite(str(tmp_path / "original-database.sqlite"))
+        connection = database._backend._connection
+        worker = getattr(connection, "_thread", connection)
+        try:
+            assert worker.is_alive()
+            with scope, ownership.bind_owned_task_lender(host):
+                await (database.close() if resource == "database-facade" else database._backend.close())
+                assert ownership.capture_owned_task_lender() is not None
+                require_execution_work()
+            assert not worker.is_alive()
+        finally:
+            # Original resource disposal after a negative assertion is not an
+            # acknowledgement to the host policy under test.
+            await database.close()
+    assert not host.outstanding and not host.retired
+
+
+@pytest.mark.asyncio
+async def test_join_cannot_replace_failed_original_completion_capture(tmp_path):
+    receipt = ownership.OwnedTaskAdmission()
+    refusal = OSError("original completion capture registration failed")
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    path = tmp_path / "unadmitted-payload"
+
+    class UncapturedTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "close_unstarted":
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+
+    def factory(loop, coroutine, **options):
+        return UncapturedTask(coroutine, loop=loop, **options)
+
+    async def body():
+        path.write_text("unadmitted body ran")
+
+    payload = body()
+    try:
+        loop.set_task_factory(factory)
+        with pytest.raises(BaseException) as caught:
+            ownership.create_owned_task(payload, admission=receipt, lender_capture=None)
+    finally:
+        loop.set_task_factory(previous)
+    assert refusal in execution_evidence_carriers(caught.value)
+    assert receipt.task is not None
+    outcome = await ownership.await_owned_task(receipt.task)
+    assert refusal in execution_evidence_carriers(outcome.error)
+    assert receipt.task.done() and payload.cr_frame is None and not path.exists()
+    assert not receipt._completion_capture_registered
+    assert ownership.reconcile_owned_task_admission(receipt).state == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_unknown_original_watcher_keeps_the_producer_loan_after_producer_join():
     from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator
     from kestrel_sovereign.execution_custody import execution_cleanup_debts

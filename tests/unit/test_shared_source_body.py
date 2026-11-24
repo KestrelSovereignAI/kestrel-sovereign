@@ -40,6 +40,7 @@ async def test_resource_aware_constructor_refusal_joins_actual_accepted_tasks_be
     if eager and not hasattr(asyncio, "eager_task_factory"):
         pytest.skip("native eager Task requires Python 3.12")
     refusal = OSError("actual resource-aware constructor refused: " + phase)
+    source_admission = ownership.OwnedSourceAdmission()
     accepted, refused, descriptors = [], [], []
     path = tmp_path / "must-not-acquire"
     loop = asyncio.get_running_loop()
@@ -79,7 +80,8 @@ async def test_resource_aware_constructor_refusal_joins_actual_accepted_tasks_be
     try:
         loop.set_task_factory(native_factory)
         with pytest.raises(BaseException) as caught:
-            await ownership.create_owned_iterator(source_factory=acquire, operation="resource-aware admission")
+            await ownership.create_owned_iterator(source_factory=acquire, operation="resource-aware admission",
+                source_admission=source_admission)
         assert any(error is refusal for error in execution_evidence_carriers(caught.value))
         assert not descriptors and not path.exists()
         assert all(task.done() and inspect.getcoroutinestate(task.get_coro()) == inspect.CORO_CLOSED
@@ -95,8 +97,14 @@ async def test_resource_aware_constructor_refusal_joins_actual_accepted_tasks_be
         elif phase.endswith("-admission"):
             # A failed original completion-capture registration is not repaired
             # merely by this test seeing Task.done()/a closed Python coroutine.
-            assert any(type(resource) is OwnedAsyncIterator and resource.producer_task is task
-                       and task in accepted for resource, task in debts)
+            receipt = (source_admission.producer if phase.startswith("owner-")
+                       else source_admission.watcher)
+            assert receipt.task in accepted and not receipt._completion_capture_registered
+            assert ownership.reconcile_owned_task_admission(receipt).state == "unknown"
+            assert any(resource is source_admission._state.partial and task is receipt.task
+                       for resource, task in debts)
+            assert all(task is receipt.task for _, task in debts), (
+                "uncertain watcher retirement was relabelled as joined producer debt")
         else:
             assert not debts, "Post-admission original constructor owners were not reconciled"
     finally:

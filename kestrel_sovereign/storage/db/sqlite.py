@@ -982,11 +982,13 @@ async def _close_aiosqlite_connection(
                 close_task = existing.close_task
         if close_task is None:
             from kestrel_sovereign._async_ownership import OwnedTaskAdmission, create_owned_task
+            from kestrel_sovereign.execution_custody import bind_execution_cleanup
             receipt = OwnedTaskAdmission()
             try:
                 closer = connection.close() if acquisition is None else _close_acquired_sqlite_connection(connection, acquisition)
-                close_task = create_owned_task(closer, retain_originals=True,
-                    admission=receipt, retirement_resource=connection)
+                with bind_execution_cleanup(connection):
+                    close_task = create_owned_task(closer, retain_originals=True,
+                        admission=receipt, retirement_resource=connection)
             except BaseException as error:
                 close_task = receipt.task
                 opening = error
