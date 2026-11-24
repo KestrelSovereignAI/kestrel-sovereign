@@ -26,6 +26,27 @@ _BASE = f"# Governing text\n\n## Book II: Sovereign Amendments\n\n{_BASE_IX}"
 _OVERLAY = "### Amendment IX\n- [x] filesystem_write\n- [x] shell_execution_host\n"
 
 
+def test_governing_authorization_tracks_genesis_binding_and_rejection():
+    from kestrel_sovereign.constitution.anchored_bytes import governance_record_digest
+    from kestrel_sovereign.constitution.genesis_audit import pending_genesis_audit, utc_timestamp
+
+    digest = hashlib.sha256(b"published Constitution").hexdigest()
+    pending = pending_genesis_audit(digest, provenance="test:adoption")
+    pending["publisher"] = {"source_sha256": digest}
+    passed = dict(pending, status="passed", audited=True, risk_level=1, completed_at=utc_timestamp())
+    witness = governance_record_digest({"constitution_hash": digest, "genesis_audit": pending})
+    assert governance_record_digest({"constitution_hash": digest, "genesis_audit": passed}) == witness
+
+    for changed in (
+        dict(passed, status="failed", risk_level=3),
+        dict(passed, publisher={}),
+        dict(passed, constitution_hash="0" * 64),
+        {"constitution_hash": digest, "publisher": pending["publisher"]},
+        ["binding", {"constitution_hash": digest, "publisher": pending["publisher"]}],
+    ):
+        assert governance_record_digest({"constitution_hash": digest, "genesis_audit": changed}) != witness
+
+
 def _snapshot(path):
     with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as reader:
         return tuple(reader.iterdump())
