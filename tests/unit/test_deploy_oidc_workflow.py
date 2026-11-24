@@ -15,6 +15,23 @@ def _documents():
     return workflow, action
 
 
+def test_production_rollout_hold_preserves_explicit_dispatch_and_dev():
+    workflow, _ = _documents()
+    jobs = workflow["jobs"]
+    assert "if" not in jobs["deploy-dev"]
+    condition = " ".join(jobs["deploy-prod"]["if"].split())
+    automatic, explicit = condition.split(" || ")
+    assert automatic == (
+        "(github.event_name == 'workflow_run' && "
+        "startsWith(github.event.workflow_run.head_branch, 'v') && "
+        "vars.KESTREL_PROD_AUTO_DEPLOY != 'false')"
+    )
+    assert explicit == (
+        "(github.event_name == 'workflow_dispatch' && "
+        "github.event.inputs.environment == 'prod')"
+    )
+
+
 def test_all_cloud_deployment_jobs_use_the_shared_federated_identity():
     workflow, action = _documents()
     jobs = workflow["jobs"]
