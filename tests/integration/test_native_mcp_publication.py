@@ -99,6 +99,26 @@ async def test_prepared_mcp_routes_are_private_until_the_original_host_commit(pu
     assert response.json()["issuer"] == p.resource + "/oauth"
 
 
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_native_publication_retirement_does_not_borrow_work_capacity(publication, fenced):
+    from contextlib import nullcontext
+    from kestrel_sovereign import async_ownership as ownership
+    from kestrel_sovereign.agent.custody import ReleaseOutcome
+    from tests.unit.test_owned_task_lending import CapacityLoan
+
+    p, _ = publication
+    p.publish()
+    host = CapacityLoan(capacity=0)
+    scope = (bind_execution_custody(ProcessRuntimeExecutionFence("mcp-close"))
+             if fenced else nullcontext())
+    with scope, ownership.bind_owned_task_lender(host):
+        assert await p.close() is ReleaseOutcome.RELEASED
+        assert ownership.capture_owned_task_lender() is not None
+    assert not p.registry.is_current(p.binding)
+    assert p.agent._native_mcp_publication is None
+    assert not host.outstanding and not host.retired
+
+
 async def test_actual_mcp_lane_does_not_promote_an_added_owner_key(publication, monkeypatch):
     p, client = publication
     p.publish()

@@ -33,6 +33,7 @@ from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDispositi
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCustody,
+    bind_execution_cleanup,
     bind_execution_custody_snapshot, current_execution_custody,
     close_execution_stream, execution_terminal_error,
     execution_cleanup_debts, execution_denial_scopes,
@@ -95,7 +96,8 @@ class _TapResponseOwner:
                             else RequestCompletionDisposition.ABANDONED)
                         self.fence.owner._cleanup_cancelled_request(self.fence.request_id,
                             generation=self.fence.generation, disposition=disposition)
-            self._close_task = create_owned_task(retire())
+            with bind_execution_cleanup(self.fence.owner):
+                self._close_task = create_owned_task(retire())
         return raise_owned_outcome(await await_owned_task(self._close_task),
             operation="original tap response retirement")
 

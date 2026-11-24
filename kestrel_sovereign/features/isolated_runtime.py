@@ -38,7 +38,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import Executor, Future
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -82,6 +82,7 @@ from kestrel_sovereign.native_retirement import NativeExecutionObserver, bind_na
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
+    bind_execution_cleanup,
     bind_execution_custody_snapshot,
     current_execution_custody,
     execution_commit_outcome,
@@ -1311,6 +1312,7 @@ async def _await_owned_facade_lifecycle_operation(
     operation: Any,
     *,
     name: str,
+    cleanup: bool = False,
     on_completed: Callable[[], None] | None = None,
     on_timeout: Callable[[], None] | None = None,
     on_late_task: Callable[[_HostOwnedFacadeOperation], None],
@@ -1336,7 +1338,10 @@ async def _await_owned_facade_lifecycle_operation(
     settle during the acknowledgement window and leave no task behind.
     """
 
-    task = _create_host_owned_facade_task(operation, name=name)
+    # Only exact stop/retirement callers opt in. Start, quiesce and resume
+    # still require Work. Leave the scope before any observer can suspend.
+    with bind_execution_cleanup(None) if cleanup else nullcontext():
+        task = _create_host_owned_facade_task(operation, name=name)
     if on_admitted is not None:
         on_admitted(task)
     if task.foreign_loop:
@@ -9798,6 +9803,7 @@ class ProxyFeature(Feature):
                     await _await_owned_facade_lifecycle_operation(
                         client.stop(),
                         name=f"isolated-terminal-stop:{self.name}",
+                        cleanup=True,
                         on_completed=lambda client=client: self._release_terminal_retirement_client(
                             client
                         ),
@@ -9925,6 +9931,7 @@ class ProxyFeature(Feature):
                 await _await_owned_facade_lifecycle_operation(
                     previous_client.stop(),
                     name=f"isolated-replace-stop:{self.name}",
+                    cleanup=True,
                     on_completed=remember_previous_stop,
                     on_timeout=lambda previous_client=previous_client: self._fence_terminal_retirement_timeout(
                         previous_client
@@ -9989,9 +9996,10 @@ class ProxyFeature(Feature):
         resource = self if self._client is not None or self._terminal_retirement_clients else None
         attempt = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation, resource)
         self._terminal_cleanup_owner = attempt
-        attempt.start(self._terminal_cleanup_uninterrupted(
-            lifecycle_lock_held=False, retry_retirement=retry_retirement,
-        ), name=f"isolated-terminal-cleanup:{self.name}")
+        with bind_execution_cleanup(self.agent):
+            attempt.start(self._terminal_cleanup_uninterrupted(
+                lifecycle_lock_held=False, retry_retirement=retry_retirement,
+            ), name=f"isolated-terminal-cleanup:{self.name}")
         self._terminal_cleanup_task = attempt.admission.task
         return attempt
 
@@ -10060,9 +10068,10 @@ class ProxyFeature(Feature):
             attempt = _ProxyLifecycleAttempt(self._terminal_lifecycle_generation,
                 self if self._client is not None or self._terminal_retirement_clients else None)
             self._terminal_cleanup_owned_attempts.append(attempt)
-            attempt.start(self._terminal_cleanup_uninterrupted(
-                lifecycle_lock_held=True, retry_retirement=not best_effort,
-            ), name=f"isolated-terminal-cleanup-owned:{self.name}")
+            with bind_execution_cleanup(self.agent):
+                attempt.start(self._terminal_cleanup_uninterrupted(
+                    lifecycle_lock_held=True, retry_retirement=not best_effort,
+                ), name=f"isolated-terminal-cleanup-owned:{self.name}")
             # This owner-local task is not stored on the proxy.  It must drain
             # through cancellation; only the shared task in the branch below
             # can safely be handed back to KestrelAgent's deadline owner.
@@ -11350,6 +11359,7 @@ class ProxyFeature(Feature):
                     await _await_owned_facade_lifecycle_operation(
                         active_client.stop(),
                         name=f"isolated-fenced-recovery-stop:{self.name}",
+                        cleanup=True,
                         on_completed=remember_active_stop,
                         on_timeout=lambda active_client=active_client: self._fence_terminal_retirement_timeout(
                             active_client
@@ -15680,6 +15690,7 @@ class ProxyFeature(Feature):
                                 await _await_owned_facade_lifecycle_operation(
                                     client.stop(),
                                     name=f"isolated-supervisor-stop:{self.name}",
+                                    cleanup=True,
                                     on_completed=lambda completion=stop_completion: self._mark_terminal_stop_completed(
                                         completion
                                     ),

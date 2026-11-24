@@ -35,7 +35,7 @@ from kestrel_sdk.resources import (
 from kestrel_sovereign._async_ownership import (
     OwnedTaskAdmission, await_owned_operation, await_owned_task, create_owned_task, raise_owned_outcome,
 )
-from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.execution_custody import bind_execution_cleanup, execution_terminal_error
 from .docker import DockerBoundary, DockerCommandError, _identity, _json, _now, _record
 from .dispatch import native_dispatch, native_trace
 from .worker_profile import (
@@ -704,8 +704,9 @@ class _LocalWorkerResources:
         admission_failure = None
         if self._close_admission.task is None:
             try:
-                create_owned_task(self._retire(), admission=self._close_admission, retirement_resource=self,
-                                  retain_originals=True, name="original-two-domain-retirement")
+                with bind_execution_cleanup(self):
+                    create_owned_task(self._retire(), admission=self._close_admission, retirement_resource=self,
+                                      retain_originals=True, name="original-two-domain-retirement")
             except BaseException as error:
                 admission_failure = error
         if self._close_admission.task is None:

@@ -99,6 +99,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
     without_reserved_cancellation_receipt,
 )
 from kestrel_sovereign.execution_custody import (
+    bind_execution_cleanup,
     ExecutionCommitOutcomeError,
     execution_commit_outcome,
     execution_observation_error,
@@ -486,7 +487,9 @@ class TaskManager:
             if store is None:
                 continue
             try:
-                outcome = await await_owned_task(create_owned_task(store.close()))
+                with bind_execution_cleanup(self):
+                    closer = create_owned_task(store.close())
+                outcome = await await_owned_task(closer)
                 error = execution_terminal_error(outcome.error, outcome.cancellation)
                 if error is not None:
                     raise error

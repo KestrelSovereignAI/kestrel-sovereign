@@ -13,6 +13,7 @@ from kestrel_sovereign._async_ownership import (
 from kestrel_sovereign.agent.custody import ReleaseOutcome
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
+    bind_execution_cleanup,
     execution_finite_error,
     require_execution_work,
 )
@@ -231,8 +232,9 @@ class NativeMCPPublication:
                 if vars(self.agent).get("_native_mcp_publication") is self:
                     self.agent._native_mcp_publication = None
                 return ReleaseOutcome.RELEASED
-            self._close_operation = OwnedOperation(drain(), name="native-mcp-server-close:" + self.routing_key,
-                retain_originals=True, retirement_resource=self)
+            with bind_execution_cleanup(self.agent):
+                self._close_operation = OwnedOperation(drain(), name="native-mcp-server-close:" + self.routing_key,
+                    retain_originals=True, retirement_resource=self)
         # The publication retains the original physical owner. Finite shutdown
         # observers may withdraw; the agent's continuation joins this SAME
         # operation before closing its borrowed storage.

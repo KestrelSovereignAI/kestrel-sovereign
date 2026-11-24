@@ -186,7 +186,158 @@ async def test_source_lend_veto_retires_original_partial_without_decorating_veto
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource", ["http-response", "http-inline", "database-facade", "database-backend", "database-owned-wrapper", "hold-preflight"])
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_distributed_stop_retires_real_heartbeat_when_work_settlement_is_refused(tmp_path, fenced):
+    from contextlib import nullcontext
+    from kestrel_sovereign.stop.invocation import DistributedInvocationRegistry, DistributedInvocationStore
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    database = await AsyncDatabase.sqlite(str(tmp_path / "original-heartbeat.db"))
+    store = DistributedInvocationStore(database)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(store, poll_seconds=.05)
+    registry.start()
+    heartbeat = registry._heartbeat
+    assert heartbeat is not None and heartbeat.alive
+    host = CapacityLoan(capacity=0)
+    scope = (bind_execution_custody(ProcessRuntimeExecutionFence("heartbeat-close"))
+             if fenced else nullcontext())
+    try:
+        with scope, ownership.bind_owned_task_lender(host):
+            with pytest.raises(BaseException) as caught:
+                await registry.close()
+        # SQL abandonment IS Work and its refusal is still observable. The
+        # independent original heartbeat nevertheless has physically retired.
+        assert any("test host capacity exhausted" in str(error)
+                   for error in execution_evidence_carriers(caught.value))
+        assert not heartbeat.alive and heartbeat.unretired() is None
+        assert not host.outstanding and not host.retired
+    finally:
+        assert await heartbeat.stop(timeout=3)
+        await registry.close()
+        await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_real_sdk_subprocess_stop_needs_no_work_loan(fenced):
+    from contextlib import nullcontext
+    import signal
+    import sys
+    from kestrel_sdk.isolated_feature.client import SubprocessIsolatedFeatureClient
+    from kestrel_sovereign._async_process import start_async_process, _signal_process_tree, _process_tree_alive
+    from kestrel_sovereign.features.isolated_runtime import _await_owned_facade_lifecycle_operation
+
+    # A real SDK handle owns a real idle private child. This covers physical
+    # stop admission, not feature initialization/handshake or agent readiness.
+    command = [sys.executable, "-B", "-c", "import time; time.sleep(30)"]
+    process = await start_async_process(command)
+    client = SubprocessIsolatedFeatureClient(command, process=process)
+    host, late = CapacityLoan(capacity=0), []
+    scope = (bind_execution_custody(ProcessRuntimeExecutionFence("sdk-stop"))
+             if fenced else nullcontext())
+    try:
+        with scope, ownership.bind_owned_task_lender(host):
+            # Starting/resuming is still Work and must not take this path.
+            with pytest.raises(BaseException):
+                await _await_owned_facade_lifecycle_operation(
+                    asyncio.sleep(0), name="original-work-refused", on_late_task=late.append)
+            assert process.returncode is None and client.process is process
+            await _await_owned_facade_lifecycle_operation(
+                client.stop(), name="original-sdk-physical-stop", cleanup=True,
+                on_late_task=late.append)
+            require_execution_work()
+        assert process.returncode is not None and not _process_tree_alive(process)
+        assert client.process is None and not late and not host.outstanding
+    finally:
+        await client.stop()
+        if _process_tree_alive(process):
+            _signal_process_tree(process, signal.SIGKILL)
+        await asyncio.wait_for(process.wait(), 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_phoenix_proxy_original_http_client_closes_without_work_capacity(tmp_path, fenced):
+    from contextlib import nullcontext
+    from fastapi import FastAPI
+    from kestrel_sovereign.phoenix_supervisor import PhoenixSupervisor
+    from kestrel_sovereign.server import _shutdown_phoenix
+
+    supervisor = PhoenixSupervisor(working_dir=tmp_path / "original-phoenix")
+    client = supervisor._proxy_client()
+    app = FastAPI()
+    app.state.phoenix = supervisor
+    host = CapacityLoan(capacity=0)
+    scope = (bind_execution_custody(ProcessRuntimeExecutionFence("phoenix-close"))
+             if fenced else nullcontext())
+    try:
+        with scope, ownership.bind_owned_task_lender(host):
+            assert await _shutdown_phoenix(app) is False
+            require_execution_work()
+        assert client.is_closed and supervisor._client is None
+        assert app.state.phoenix is None and not host.outstanding
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_tap_eof_closes_original_file_without_work_capacity(native_tool_effect_agent, tmp_path, fenced):
+    from contextlib import nullcontext
+    from kestrel_sovereign.streams.tap import _TapRequestFence, _TapResponseOwner
+
+    agent = await native_tool_effect_agent(did="did:test:original-tap-retirement")
+    request = "original-tap-retirement"
+    generation = agent.register_active_request(request)
+    handle = (tmp_path / "original-tap-body").open("w+b")
+    handle.write(b"original body")
+    handle.seek(0)
+    closes = []
+
+    class Body:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            chunk = handle.read()
+            if chunk:
+                return chunk
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            closes.append(ownership.capture_owned_task_lender())
+            if fenced:
+                with pytest.raises(ExecutionAuthorityError, match="cleanup"):
+                    require_execution_work()
+            else:
+                require_execution_work()
+            handle.close()
+
+    stream = Body()
+    response = _TapResponseOwner(stream, _TapRequestFence(agent, request, generation), ())
+    host = CapacityLoan(capacity=0)
+    scope = (bind_execution_custody(ProcessRuntimeExecutionFence("tap-retirement"))
+             if fenced else nullcontext())
+    try:
+        with scope, ownership.bind_owned_task_lender(host):
+            assert [chunk async for chunk in response] == [b"original body"]
+            assert ownership.capture_owned_task_lender() is not None
+            require_execution_work()
+        assert handle.closed and closes == [None]
+        assert response.retired and not host.outstanding and not host.retired
+        # Tap retirement releases its retained delivery; the original request
+        # producer still owns the first registration until it also completes.
+        assert generation in agent._active_generations_for_request(request)
+        agent._cleanup_cancelled_request(request, generation=generation)
+        assert generation not in agent._active_generations_for_request(request)
+    finally:
+        handle.close()
+        agent._cleanup_cancelled_request(request, generation=generation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["http-response", "http-inline", "database-facade", "database-backend", "database-owned-wrapper", "hold-preflight", "a2a-task-manager", "host-context"])
 @pytest.mark.parametrize("fenced", [False, True])
 async def test_public_physical_closers_do_not_reserve_new_work(tmp_path, resource, fenced):
     from contextlib import nullcontext
@@ -241,10 +392,21 @@ async def test_public_physical_closers_do_not_reserve_new_work(tmp_path, resourc
         database = await AsyncDatabase.sqlite(str(tmp_path / "original-database.sqlite"))
         connection = database._backend._connection
         worker = getattr(connection, "_thread", connection)
+        if resource == "a2a-task-manager":
+            from kestrel_sovereign.a2a.scope import NativeRecipientScope
+            from kestrel_sovereign.a2a.task_manager import TaskManager
+            manager = TaskManager.from_backend(database._backend,
+                scope=NativeRecipientScope("did:test:original-close", "original-tenant"),
+                owns_backend=True, include_memory=False, include_feedback=False)
         try:
             assert worker.is_alive()
             with scope, ownership.bind_owned_task_lender(host):
-                if resource == "hold-preflight":
+                if resource == "a2a-task-manager":
+                    await manager.close()
+                elif resource == "host-context":
+                    from kestrel_sovereign.host_features.context import _close_partial_host_resources
+                    await _close_partial_host_resources(None, None, None, database, owners={})
+                elif resource == "hold-preflight":
                     from kestrel_sovereign.hold.state import _close_postgres_preflight_backends
                     assert await _close_postgres_preflight_backends(database._backend) == ()
                 elif resource == "database-owned-wrapper":
@@ -344,7 +506,7 @@ async def test_native_http_exchange_retirement_needs_no_work_capacity(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("profile", ["native-stream", "openai", "anthropic", "provider-client"])
+@pytest.mark.parametrize("profile", ["native-stream", "openai", "anthropic", "provider-client", "ollama-abandoned"])
 @pytest.mark.parametrize("withdrawn", [False, True])
 async def test_real_sdk_physical_close_uses_no_second_work_loan(tmp_path, profile, withdrawn):
     import json
@@ -412,6 +574,17 @@ async def test_real_sdk_physical_close_uses_no_second_work_loan(tmp_path, profil
                 # the failed original retirement into a host acknowledgement.
                 with bind_execution_cleanup(None):
                     await physical.aclose()
+        elif profile == "ollama-abandoned":
+            from kestrel_sovereign.llm.cancellation import await_or_cancelled
+            response = httpx.Response(200, stream=body)
+            async def opened():
+                return response
+            acquired = asyncio.create_task(opened())
+            await acquired
+            if withdrawn:
+                fence.retire()
+            await await_or_cancelled(acquired, lambda: True,
+                abandoned_result_cleanup=close_native_execution_stream)
         elif profile == "openai":
             import openai
             from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
@@ -432,7 +605,12 @@ async def test_real_sdk_physical_close_uses_no_second_work_loan(tmp_path, profil
         with bind_execution_custody(fence), ownership.bind_owned_task_lender(host):
             task = ownership.create_owned_task(original())
             result = await ownership.await_owned_task(task)
-            if withdrawn and profile in {"openai", "anthropic"}:
+            if profile == "ollama-abandoned":
+                terminal = result.error or result.cancellation
+                assert any(isinstance(error, asyncio.CancelledError)
+                           for error in execution_evidence_carriers(terminal))
+                assert not execution_cleanup_debts(terminal)
+            elif withdrawn and profile in {"openai", "anthropic"}:
                 assert any(isinstance(error, ExecutionAuthorityError)
                            for error in execution_evidence_carriers(result.error))
                 assert not execution_cleanup_debts(result.error)

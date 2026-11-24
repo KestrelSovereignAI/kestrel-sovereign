@@ -13,13 +13,15 @@ import hashlib
 import json
 import os
 import re
+import signal
 import struct
 import tempfile
 from uuid import uuid4
 import zlib
 
-from kestrel_sovereign._async_process import start_async_process, _terminate_and_await
-from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_process import start_async_process, _terminate_and_await, _drain_and_wait, _signal_process_tree
+from kestrel_sovereign._async_ownership import OwnedOperation, OwnedTaskAdmission, create_owned_task, await_owned_task, raise_owned_outcome, pending_owned_retirement_error
+from kestrel_sovereign.execution_custody import bind_execution_cleanup, execution_terminal_error
 from kestrel_sdk.resources import ResourceError
 from kestrel_sdk.operator import OperatorAuthorizationError
 
@@ -166,7 +168,8 @@ class DockerArtifactRenderer:
         process = await start_async_process(['docker', *arguments], env=environment,
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        native_wait = create_owned_task(process.wait(), name='preview-cli-exit')
+        native_wait = completion = None
+        wait_admission, io_admission = OwnedTaskAdmission(), OwnedTaskAdmission()
         async def write():
             if stdin is None:
                 return
@@ -186,17 +189,53 @@ class DockerArtifactRenderer:
                 error_output = group.create_task(_bounded_read(process.stderr, 8192))
                 group.create_task(wait_native())
             return process.returncode, output.result(), error_output.result()
-        completion = create_owned_task(collect(), name='preview-cli-io')
-        cancellation = None
+        failure = None
+        done = set()
+        admitting = True
         try:
+            native_wait = create_owned_task(process.wait(), name='preview-cli-exit', admission=wait_admission)
+            completion = create_owned_task(collect(), name='preview-cli-io', admission=io_admission)
+            admitting = False
             done, _ = await asyncio.wait({completion}, timeout=timeout)
-        except asyncio.CancelledError as error:
-            cancellation = error; done = set()
+        except BaseException as error:
+            failure = error
+            native_wait, completion = wait_admission.task, io_admission.task
         # Reuse the host's native private-process-group closer. The completion
         # and physical waiter remain owned until that tree has actually exited.
-        cleanup = create_owned_task(_terminate_and_await(process, completion,
-            terminate_grace=.1, reap_timeout=2), name='preview-cli-cleanup')
-        outcome = await await_owned_task(cleanup, cancellation)
+        # Admission can fail AFTER the process exists but BEFORE its ordinary
+        # I/O owner starts. In that case drain/reap only: never retry stdin Work.
+        original_completion = completion
+        with bind_execution_cleanup(None):
+            if admitting:
+                drain = OwnedOperation(_drain_and_wait(process),
+                    name='preview-cli-refused-drain', retirement_resource=process,
+                    retain_originals=True)
+                completion = drain.task
+                if completion is None:
+                    _signal_process_tree(process, signal.SIGKILL)
+                    pending = pending_owned_retirement_error(process,
+                        tuple(task for task in (native_wait, original_completion) if task is not None),
+                        message="original preview owners remain after refused native drain")
+                    raise execution_terminal_error(failure, drain.admission_error, pending, retain_originals=True)
+            cleanup = OwnedOperation(_terminate_and_await(process, completion,
+                terminate_grace=.1, reap_timeout=2), name='preview-cli-cleanup',
+                retirement_resource=process, retain_originals=True)
+        if cleanup.task is None:
+            # Even allocation failure cannot skip signalling this exact private
+            # group. This is NOT a native wait ACK: the error retains its debt.
+            _signal_process_tree(process, signal.SIGKILL)
+        outcome = await cleanup.observe()
+        # These are ORIGINAL accepted owners, not substitutes for their errors.
+        for original in (native_wait, original_completion if admitting else None):
+            if original is not None and (outcome.error is None or original.done()):
+                joined = await await_owned_task(original)
+                failure = execution_terminal_error(failure, joined.error, joined.cancellation, retain_originals=True)
+        pending = pending_owned_retirement_error(process,
+            tuple(task for task in (native_wait, original_completion, completion) if task is not None),
+            message="original preview owners remain after failed native reap")
+        terminal = execution_terminal_error(failure, outcome.error, outcome.cancellation, pending, retain_originals=True)
+        if terminal is not None:
+            raise terminal
         result = raise_owned_outcome(outcome, operation='preview CLI cleanup')
         if not done:
             raise TimeoutError('preview CLI deadline exceeded')
@@ -329,7 +368,8 @@ class DockerArtifactRenderer:
 
     async def _cleanup(self, pool, job):
         # Repeated caller cancellation cannot abandon an accepted native rm.
-        cleanup = create_owned_task(self._cleanup_native(pool, job), name='preview-container-cleanup')
+        with bind_execution_cleanup(None):
+            cleanup = create_owned_task(self._cleanup_native(pool, job), name='preview-container-cleanup')
         outcome = await await_owned_task(cleanup)
         raise_owned_outcome(outcome, operation='preview container cleanup')
 

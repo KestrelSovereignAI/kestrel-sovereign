@@ -51,6 +51,83 @@ TEST_DOMAIN = "agents.kestrel-sovereign.test"
 TEST_DATA_KEY = "test-master-key-for-encryption-32chars!"
 
 
+async def _close_database(database):
+    """Functional identity tests do not assert loaded-host disk close speed.
+
+    The canonical normal-schedule helper joins the actual close Task and its
+    actual worker before advancing the bounded closer's clock. Native errors
+    remain errors; production budgets and deadline-expiry tests are unchanged.
+    """
+    from tests.utils.aiosqlite_workers import normal_close_schedule
+
+    connection = database.backend._connection
+    if connection is None:
+        return await database.close()
+    async with normal_close_schedule() as finish:
+        await finish(
+            connection, database.close(),
+            retained_closes=database.backend._retired_connection_closes,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_failure", [False, True])
+async def test_functional_teardown_joins_original_slow_close_and_keeps_its_error(
+    tmp_path, monkeypatch, native_failure,
+):
+    import asyncio
+    import threading
+    import time
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.storage.db import sqlite as sqlite_module
+    from tests.utils.aiosqlite_workers import aiosqlite_worker
+    from tests.utils.virtual_clock import await_within_hang_guard
+
+    database = await AsyncDatabase.sqlite(str(tmp_path / "original-slow-teardown.db"))
+    connection = database.backend._connection
+    worker, real_close = aiosqlite_worker(connection), connection.close
+    original = OSError("original native close epilogue failed")
+    native_closed, release = asyncio.Event(), asyncio.Event()
+    originals = []
+    loop = asyncio.get_running_loop()
+
+    async def delayed_close():
+        originals.append(asyncio.current_task())
+        await real_close()
+        native_closed.set()
+        await release.wait()
+        if native_failure:
+            raise original
+    monkeypatch.setattr(connection, "close", delayed_close)
+    budget = sqlite_module._minimum_close_timeout_s()
+    # A sleeping timer models delayed completion publication, not CPU load.
+    # It uses real time independently of the fixture's pinned loop clock.
+    timer = threading.Timer(budget + .05, lambda: loop.call_soon_threadsafe(release.set))
+    started = time.monotonic()
+    owner = None
+    timer.start()
+    try:
+        owner = asyncio.create_task(_close_database(database))
+        await await_within_hang_guard(native_closed.wait(), step="original close reaching its epilogue")
+        await await_within_hang_guard(asyncio.to_thread(worker.join, 3), step="original worker exiting")
+        assert not worker.is_alive() and len(originals) == 1
+        assert not originals[0].done() and not owner.done(), "worker exit replaced the original Task ACK"
+        if native_failure:
+            with pytest.raises(BaseException) as caught:
+                await await_within_hang_guard(owner, step="original failing close epilogue")
+            assert original in execution_evidence_carriers(caught.value)
+        else:
+            await await_within_hang_guard(owner, step="original successful close epilogue")
+        assert time.monotonic() - started > budget
+        assert originals[0].done() and not worker.is_alive()
+    finally:
+        release.set()
+        timer.cancel()
+        await asyncio.to_thread(timer.join, 3)
+        if owner is not None:
+            await asyncio.gather(owner, return_exceptions=True)
+
+
 def test_replication_prelocks_graph_write_set_before_first_graph_write():
     """The outer transaction cannot acquire endpoint locks piecemeal."""
 
@@ -151,8 +228,8 @@ async def test_replication_puts_the_real_birth_record_in_the_runtime_database(
 
         assert await _chunk_count(runtime, creds.agent_did) == anchor_chunks
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -188,8 +265,8 @@ async def test_replicated_constitution_is_retrievable_from_the_runtime_database(
         assert copied_text == source_text
         assert "Kestrel" in copied_text
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -231,8 +308,8 @@ async def test_replication_carries_the_embeddings_it_does_not_recompute(
         ]
         assert [c.profile_id for c in copied] == ["profile-x", "profile-x"]
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -275,8 +352,8 @@ async def test_replication_repairs_an_existing_fabricated_placeholder(
             runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
         )
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -311,8 +388,8 @@ async def test_replication_is_idempotent_against_a_populated_target(
         node = await AsyncGraphStore(runtime).get_node(creds.agent_did)
         assert node.label == "Twice Bird"
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -366,8 +443,8 @@ async def test_repair_never_reverts_durable_post_inception_state(
             anchor, creds.agent_did,
         )
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -435,8 +512,8 @@ async def test_repair_does_not_re_add_a_superseded_governing_edge(
             await graph.get_node(creds.agent_did)
         ).properties["constitution_hash"] == new_hash
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -480,8 +557,8 @@ async def test_an_unowned_constitution_row_is_adopted_not_refused_forever(
             runtime, agent_id=creds.agent_did,
         ).get_node(constitution_hash) is not None
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -525,8 +602,8 @@ async def test_an_unowned_files_row_is_adopted_not_refused_forever(
         assert node is not None and node.label == "Orphan File Bird"
         assert await _chunk_count(runtime, creds.agent_did) > 0
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -561,8 +638,8 @@ async def test_an_unowned_files_row_whose_bytes_do_not_verify_is_refused(
         )
         assert int(owners[0]) == 0, "the impostor row must not have been claimed"
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -601,8 +678,8 @@ async def test_embedding_profile_rows_cross_with_the_birth_record(
         assert row is not None, "the registry row did not cross"
         assert row[0] == "ollama" and row[2] == 3
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -649,8 +726,8 @@ async def test_a_pruned_governing_edge_is_not_refilled_from_the_anchor(
             "the superseded constitution must not be re-attached"
         )
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -682,8 +759,8 @@ async def test_a_stale_unwitnessed_edge_does_not_refuse_a_healthy_agent(
             runtime_db=runtime, agent_did=creds.agent_did,
         )
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -718,8 +795,8 @@ async def test_replication_converges_after_an_interrupted_pass(
         )
         assert await _chunk_count(runtime, creds.agent_did) == full
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -778,7 +855,7 @@ async def test_two_agents_replicate_into_one_shared_runtime_database(
         assert owners == {creds_a.agent_did, creds_b.agent_did}
     finally:
         for db in (anchor_a, anchor_b, shared):
-            await db.close()
+            await _close_database(db)
 
 
 @pytest.mark.asyncio
@@ -811,8 +888,8 @@ async def test_replication_carries_a_child_edge_without_claiming_the_parent(
             runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
         )
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -835,8 +912,8 @@ async def test_diagnose_reports_nothing_when_the_record_is_already_present(
             runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
         )
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -855,8 +932,8 @@ async def test_diagnose_is_silent_when_the_anchor_holds_no_record(
             agent_did=f"did:web:{TEST_DOMAIN}:no-anchor-record",
         )
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -886,8 +963,8 @@ async def test_a_file_row_without_bytes_refuses_and_commits_nothing(
         assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
         assert await _chunk_count(runtime, creds.agent_did) == 0
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -907,8 +984,8 @@ async def test_an_edge_without_an_ownership_witness_refuses(tmp_path, hybrid_env
             )
         assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -944,8 +1021,8 @@ async def test_diagnosis_measures_only_what_replication_can_write(
             runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
         ), "an unreachable chunk must not produce a refusal no retry can clear"
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -972,8 +1049,8 @@ async def test_a_write_that_did_not_land_rolls_the_whole_copy_back(
         assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
         assert await _chunk_count(runtime, creds.agent_did) == 0
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1010,8 +1087,8 @@ async def test_a_dangling_governing_target_is_refused_not_committed(
             )
         assert await AsyncGraphStore(runtime).get_node(creds.agent_did) is None
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1043,8 +1120,8 @@ async def test_runtime_diagnosis_catches_a_governing_edge_with_no_target(
         assert shortfall
         assert "no such node is readable" in shortfall.describe()
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1092,8 +1169,8 @@ async def test_unrelated_chunks_do_not_satisfy_the_constitution_check(
         assert shortfall, "zero constitution chunks must not read as complete"
         assert "governing constitution" in shortfall.describe()
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1154,8 +1231,8 @@ async def test_a_shortfall_the_anchor_cannot_supply_does_not_brick_the_agent(
         assert check["status"] == "warn"
         assert check["details"]["missing"] == agent._birth_record_shortfall
     finally:
-        await anchor.close()
-        await runtime.close()
+        await _close_database(anchor)
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1185,7 +1262,7 @@ async def test_a_failed_copy_is_judged_by_what_the_runtime_is_short_of(
         await AsyncRAGStore(
             runtime, agent_id=creds.agent_did,
         ).delete_chunks_for_file(constitution_hash)
-        await anchor.close()
+        await _close_database(anchor)
 
         async def _boom(**_kwargs):
             raise ConnectionResetError("the database went away mid-copy")
@@ -1201,7 +1278,7 @@ async def test_a_failed_copy_is_judged_by_what_the_runtime_is_short_of(
         assert agent._agent_name == "Interrupted Copy Bird"
         assert agent._birth_record_shortfall
     finally:
-        await runtime.close()
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1241,7 +1318,7 @@ async def test_a_failed_copy_still_refuses_when_the_identity_is_missing(
         assert exc_info.value.failure == "birth_record"
         assert exc_info.value.cause_type == "BirthRecordIdentityMissing"
     finally:
-        await runtime.close()
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1280,7 +1357,7 @@ async def test_an_absent_identity_still_refuses_with_or_without_an_anchor(
                 await agent._boot_phase_storage_privacy(BootContext())
         assert exc_info.value.failure == "birth_record"
     finally:
-        await runtime.close()
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1305,7 +1382,7 @@ async def test_a_complete_runtime_record_never_opens_the_anchor(
                 runtime_db=runtime, anchor_db=anchor, agent_did=creds.agent_did,
             )
         finally:
-            await anchor.close()
+            await _close_database(anchor)
 
         # Corrupt the anchor: opening it now raises.
         (tmp_path / "kestrel_prime.db").write_bytes(b"not a database at all")
@@ -1320,7 +1397,7 @@ async def test_a_complete_runtime_record_never_opens_the_anchor(
         anchor_diagnose.assert_not_called()
         assert agent._agent_name == "Independent Bird"
     finally:
-        await runtime.close()
+        await _close_database(runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -1416,7 +1493,7 @@ async def test_runtime_database_is_the_anchor_on_a_sqlite_host(tmp_path):
         assert runtime_database_is_the_anchor(db, tmp_path / "." / "kestrel_prime.db")
         assert not runtime_database_is_the_anchor(db, tmp_path / "other.db")
     finally:
-        await db.close()
+        await _close_database(db)
 
 
 def test_local_anchor_path_requires_the_file_to_exist(tmp_path):
@@ -1497,7 +1574,7 @@ async def test_storage_phase_reconciles_before_the_agent_node_is_read(
         )
         assert await _chunk_count(runtime, creds.agent_did) > 0
     finally:
-        await runtime.close()
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1536,7 +1613,7 @@ async def test_storage_phase_refuses_when_replication_leaves_it_incomplete(
         assert exc_info.value.failure == "birth_record"
         assert exc_info.value.cause_type == "BirthRecordIdentityMissing"
     finally:
-        await runtime.close()
+        await _close_database(runtime)
 
 
 @pytest.mark.asyncio
@@ -1576,7 +1653,7 @@ async def test_storage_phase_does_not_touch_the_anchor_on_a_sqlite_host(
         diagnose.assert_not_called()
         assert agent._agent_name == "Plain Bird"
     finally:
-        await anchor.close()
+        await _close_database(anchor)
 
 
 # ---------------------------------------------------------------------------
@@ -1612,7 +1689,7 @@ async def test_precomputed_chunks_round_trip_with_their_vectors(tmp_path):
         assert read_back[1].embedding == pytest.approx([1.0, 0.0, -1.0])
         assert {c.profile_id for c in read_back} == {"profile-a"}
     finally:
-        await db.close()
+        await _close_database(db)
 
 
 @pytest.mark.asyncio
@@ -1635,7 +1712,7 @@ async def test_precomputed_chunks_replace_rather_than_accumulate(tmp_path):
             "alpha", "beta",
         ]
     finally:
-        await db.close()
+        await _close_database(db)
 
 
 @pytest.mark.asyncio
@@ -1667,7 +1744,7 @@ async def test_precomputed_chunks_store_text_when_there_is_no_vector(tmp_path):
         )
         assert int(row[0]) == 2
     finally:
-        await db.close()
+        await _close_database(db)
 
 
 @pytest.mark.asyncio
@@ -1680,4 +1757,4 @@ async def test_precomputed_chunks_refuse_a_file_outside_the_bound_agent(tmp_path
                 "not-a-file-this-agent-owns", [IndexedChunk("x", [0.1], "p")],
             )
     finally:
-        await db.close()
+        await _close_database(db)

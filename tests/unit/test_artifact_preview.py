@@ -60,6 +60,114 @@ async def test_missing_or_mutable_image_fails_before_docker_or_slot_admission(im
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["reap-error", "refuse-cleanup", "refuse-drain"])
+async def test_failed_original_preview_retirement_is_bounded_and_never_loses_its_child(monkeypatch, fault):
+    import asyncio
+    import signal
+    import sys
+    from kestrel_sovereign import async_ownership as ownership
+    from kestrel_sovereign._async_process import _signal_process_tree, _process_tree_alive, SubprocessCleanupError
+    from kestrel_sovereign.artifacts import preview
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers, execution_cleanup_debts
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    from tests.unit.test_owned_task_lending import CapacityLoan
+
+    original_start = preview.start_async_process
+    children = []
+    original = SubprocessCleanupError("original private CLI reap failed")
+    async def launch(arguments, **options):
+        child = await original_start([sys.executable, "-B", "-c", "import time;time.sleep(30)"], **options)
+        children.append(child)
+        return child
+    async def failed_reap(*args, **kwargs):
+        raise original
+    monkeypatch.setattr(preview, "start_async_process", launch)
+    if fault == "reap-error":
+        monkeypatch.setattr(preview, "_terminate_and_await", failed_reap)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        operation = _actual_operation(coroutine)
+        name = getattr(getattr(operation, "cr_code", None), "co_name", None)
+        if ((fault == "refuse-cleanup" and name == "_terminate_and_await")
+                or (fault == "refuse-drain" and name == "_drain_and_wait")):
+            raise original
+        return previous(loop, coroutine, **options) if previous else asyncio.Task(coroutine, loop=loop, **options)
+    async def run():
+        host = CapacityLoan(capacity=0 if fault == "refuse-drain" else 8)
+        with ownership.bind_owned_task_lender(host):
+            return await DockerArtifactRenderer(None)._command_native(
+                ["version"], environment=DockerArtifactRenderer._env(), timeout=.01)
+    command = None
+    try:
+        loop.set_task_factory(factory)
+        command = asyncio.create_task(run())
+        done, _ = await asyncio.wait({command}, timeout=.25)
+        loop.set_task_factory(previous)
+        assert command in done, "failed cleanup entered an unbounded original waiter join"
+        error = command.exception()
+        assert original in execution_evidence_carriers(error)
+        assert children and any(resource is children[0] for resource, _ in execution_cleanup_debts(error))
+        if fault != "reap-error":
+            # A refused closer still synchronously signals its exact private
+            # group; the test owner observes the real exit, never fakes an ACK.
+            await asyncio.wait_for(children[0].wait(), 2)
+            assert not _process_tree_alive(children[0])
+    finally:
+        loop.set_task_factory(previous)
+        for child in children:
+            if _process_tree_alive(child):
+                _signal_process_tree(child, signal.SIGKILL)
+            await asyncio.wait_for(child.wait(), 3)
+        if command is not None:
+            await asyncio.wait_for(asyncio.gather(command, return_exceptions=True), 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capacity", [0, 1, 2])
+async def test_preview_admission_refusal_reaps_the_already_acquired_private_process(monkeypatch, capacity):
+    import asyncio
+    import signal
+    import sys
+    from kestrel_sovereign import async_ownership as ownership
+    from kestrel_sovereign._async_process import _signal_process_tree, _process_tree_alive
+    from kestrel_sovereign.artifacts import preview
+    from tests.unit.test_owned_task_lending import CapacityLoan
+
+    original = preview.start_async_process
+    processes = []
+    async def launch(arguments, **options):
+        # An idle, bounded private child replaces only the external executable;
+        # the actual native process, pipes, waiter and cleanup stay production.
+        process = await original([sys.executable, "-B", "-c", "import time; time.sleep(30)"], **options)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(preview, "start_async_process", launch)
+    previous = set(asyncio.all_tasks())
+    host = CapacityLoan(capacity=capacity)
+    error = None
+    try:
+        with ownership.bind_owned_task_lender(host):
+            try:
+                await DockerArtifactRenderer(None)._command_native(
+                    ["version"], environment=DockerArtifactRenderer._env(), timeout=.02)
+            except BaseException as failure:
+                error = failure
+        assert error is not None, "refused/deadline-bound command reported success"
+        assert len(processes) == 1
+        assert processes[0].returncode is not None, "admission refusal orphaned its original process"
+        assert not _process_tree_alive(processes[0]), "original private process group survived"
+    finally:
+        for process in processes:
+            if _process_tree_alive(process):
+                _signal_process_tree(process, signal.SIGKILL)
+            await asyncio.wait_for(process.wait(), 3)
+        owned = [task for task in asyncio.all_tasks() - previous
+                 if task.get_name() in {"preview-cli-exit", "preview-cli-io", "preview-cli-cleanup"}]
+        if owned:
+            await asyncio.wait_for(asyncio.gather(*owned, return_exceptions=True), 3)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("message,rejected", [
     ("Error response from daemon: no command specified\n", True),
     ("Error response from daemon: unknown or invalid runtime name: owned-test-123\n", True),
