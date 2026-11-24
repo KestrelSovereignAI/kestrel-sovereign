@@ -321,8 +321,26 @@ def governance_evidence(properties: Mapping, governed_by_targets: Iterable[str])
 
 
 def governance_record_digest(properties: Mapping) -> str:
-    """Identify the exact governing records, including repairs that keep the same text."""
+    """Identify the governing authorization, including repairs that keep the same text."""
+    from .genesis_audit import GENESIS_AUDIT_FAILED, GenesisAuditError, reconcile_genesis_receipt
+    from .reanchor_receipt import is_constitution_hash
+
     records = governance_evidence(properties, ())["properties"]
+    genesis = records.get("genesis_audit")
+    anchor = records.get("constitution_hash")
+    if "genesis_audit" in records:
+        records["genesis_audit"] = ("receipt", genesis)
+    if isinstance(genesis, Mapping) and is_constitution_hash(anchor):
+        try:
+            receipt = reconcile_genesis_receipt({"genesis_audit": genesis}, anchor)
+        except GenesisAuditError:
+            receipt = None
+        if receipt is not None and receipt["status"] != GENESIS_AUDIT_FAILED:
+            # A retry or a successful audit leaves the binding and publisher
+            # unchanged. Native audit writes still compare the full receipt.
+            records["genesis_audit"] = ("binding", {
+                key: genesis[key] for key in ("constitution_hash", "publisher") if key in genesis
+            })
     return hashlib.sha256(json.dumps(records, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

@@ -625,7 +625,7 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
 ):
     from kestrel_sovereign.config import CONSTITUTION_PATH
     from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
-    from kestrel_sovereign.constitution.genesis_audit import utc_timestamp
+    from kestrel_sovereign.constitution.genesis_audit import evaluate_genesis_constitution, utc_timestamp
     from kestrel_sovereign.constitution.grants import (
         build_grant_baseline, build_offline_grant_observation, preview_offline_legacy_grants,
     )
@@ -924,6 +924,35 @@ async def test_signed_v2_adoption_preserves_prior_anchor_and_audits_each_edition
                     await resume.wait()
                 return result
 
+            async def auditor(_prompt):
+                return {"risk_level": 1, "reasoning": "Test auditor accepts the published governing text."}
+
+            with monkeypatch.context() as during_replay:
+                during_replay.setattr(grants, "load_anchored_grant_baseline", pause_after_verification)
+                replay = asyncio.create_task(agent._refresh_constitution_host_grants(node, governing_text=v2_rendered.decode()))
+                try:
+                    await asyncio.wait_for(checked.wait(), timeout=10)
+                    async with AsyncStorage(str(credentials.db_path), agent_id=credentials.agent_did) as writer:
+                        writing_agent = _RuntimeAgentHarness(PrivacyEnforcingStorage(writer), credentials.agent_did, trust_root, writer)
+                        auditing = await writer.get_node(credentials.agent_did)
+                        assert auditing.properties["genesis_audit"]["status"] == "pending"
+                        expected = await writing_agent._genesis_publication_witness(auditing)
+                        completed = await evaluate_genesis_constitution(
+                            v2_rendered, constitution_hash=_sha(v2_rendered), auditor=auditor,
+                            provenance="test:post-adoption-audit",
+                        )
+                        await writing_agent._persist_genesis_audit_completion(auditing, completed, expected=expected)
+                    assert await grants.host_grant_record_is_current(agent, admitted)
+                finally:
+                    resume.set()
+                    valid, reason = await replay
+                assert valid, reason
+                assert not agent._constitution_governing_replay_pending
+
+            node = await observer.get_node(credentials.agent_did)
+            admitted = agent._constitution_host_grant_baseline
+            checked.clear()
+            resume.clear()
             with monkeypatch.context() as during_replay:
                 during_replay.setattr(grants, "load_anchored_grant_baseline", pause_after_verification)
                 replay = asyncio.create_task(agent._refresh_constitution_host_grants(node, governing_text=v2_rendered.decode()))
