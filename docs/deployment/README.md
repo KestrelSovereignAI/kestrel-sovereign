@@ -604,6 +604,11 @@ The normal `kestrel deploy secrets sync` command manages env-var secrets.
 | [`clean-install.yml`](../../.github/workflows/clean-install.yml) | Scheduled | Verify `pip install` works from clean venv |
 | [`weekly-analysis.yml`](../../.github/workflows/weekly-analysis.yml) | Weekly cron | Codebase analysis reports |
 
+Set the repository Actions variable `KESTREL_PROD_AUTO_DEPLOY` to `false` to
+pause automatic production rollout during a recovery or traffic hold. Version
+tags still publish and sign the package and deploy DEV. When production is
+ready for rollout, remove the variable before publishing the next release.
+
 ## Secrets
 
 Stored in GCP Secret Manager. `kestrel deploy secrets sync` reads `.env` and

@@ -223,11 +223,12 @@ jobs:
   deploy-prod:
     runs-on: ubuntu-latest
     needs: build
-    # Only deploy to prod on version tags (via workflow_run from
-    # Publish to PyPI) or manual prod dispatch.
+    # An operator can pause automatic production rollout while package
+    # publication, signing, and the DEV rollout continue.
     if: >-
       (github.event_name == 'workflow_run' &&
-       startsWith(github.event.workflow_run.head_branch, 'v')) ||
+       startsWith(github.event.workflow_run.head_branch, 'v') &&
+       vars.KESTREL_PROD_AUTO_DEPLOY != 'false') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod')
     permissions:
       contents: read
