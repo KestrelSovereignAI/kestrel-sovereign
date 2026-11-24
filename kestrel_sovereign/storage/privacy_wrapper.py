@@ -760,12 +760,13 @@ class ReentrantTransitionLock:
         lender = capture_owned_task_lender()
 
         def start(operation, context=None, *, name="privacy-owned-native-work", on_completion=None,
-                  acquire_span=acquire_span, admission=None, retirement_resource=None):
+                  acquire_span=acquire_span, admission=None, retirement_resource=None,
+                  lender_capture=_AUTOMATIC_TASK_LENDER):
             return self.start_owned_native_work(operation, context=context, name=name,
                 on_completion=on_completion, acquire_span=acquire_span,
                 admission=admission, retirement_resource=retirement_resource,
                 _parent=parent if captured is not None else None, _span=captured,
-                _lender_capture=lender)
+                _lender_capture=lender if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture)
         return start
 
     def start_owned_native_work(self, operation, *, context=None,

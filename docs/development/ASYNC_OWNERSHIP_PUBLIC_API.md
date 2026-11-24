@@ -152,7 +152,10 @@ explicitly delegate across a fresh execution context; pass `None` to suppress
 lending. Native privacy factories and callback scopes retain the capture at
 creation, independently of privacy scope. A detached boundary suppresses it.
 Core's cleanup-only custody suppresses WORK lending even for previously
-captured factories. The original admitted owner still retains its physical
+captured factories, including shared stream withdrawal and restored turn
+custody. Detachment also suppresses old explicit captures; an independent
+resource owner may bind its own new policy, but cleanup-only work may not.
+The original admitted owner still retains its physical
 cleanup and reports its exact outcome; no new work grant is made there.
 
 For complete native retirement or proven nonacceptance, Core publishes one
@@ -163,6 +166,23 @@ fails. No callback runs a replacement task or acknowledges an external
 resource. Opaque factory wrappers never receive a loan. Exhausted or revoked
 policies must refuse synchronously, without allocating another owner or
 reattributing an existing resource. A reservation refusal is atomic.
+
+Only the exact, unambiguous native wrapper on the original running loop can
+receive a loan. Custom-factory construction is reconciled before admission;
+the wrapper additionally verifies its executing Task before entering payload.
+Ambiguous acceptance remains UNKNOWN even if one returned Task finishes.
+Gate cancellation/refusal is settled inside the original admission transaction
+before lending or dispatch; the physical cancellation remains on that receipt.
+
+Direct owned iterators capture their original lender separately from the source
+body context. `ExecutionStreamLifecycle.owner_factory` receives lazy body,
+context, and keyword-only `admission`/`lender_capture`; it must forward those
+exact originals to canonical construction and return the admitted producer.
+There is no legacy factory fallback or replacement receipt. Captured privacy
+factories accept the same explicit handoff. A forwarder checks producer capacity
+before allocating its watcher/closer, while source dispatch remains gated until
+all construction/registration finishes. Cooperative Event-only idle waits and
+physical closers do not consume extra WORK loans.
 
 ## Task completion is not process-tree drain
 

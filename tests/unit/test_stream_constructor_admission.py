@@ -71,10 +71,10 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
             return task
         return asyncio.Task(coroutine, loop=loop, **options)
 
-    def custom_factory(body, context):
-        admission = OwnedTaskAdmission()
+    def custom_factory(body, context, *, admission, lender_capture):
         try:
-            return create_owned_task(body(), context=context, admission=admission, retain_originals=True)
+            return create_owned_task(body(), context=context, admission=admission, retain_originals=True,
+                lender_capture=lender_capture)
         except BaseException:
             if admission.task is None:
                 raise
@@ -437,10 +437,10 @@ async def test_unstarted_reserved_source_keeps_one_original_failed_close(tmp_pat
             refused = True
             return PublicationTask(coroutine, loop=loop, **options)
         return asyncio.Task(coroutine, loop=loop, **options)
-    def original_factory(body, context):
-        admission = OwnedTaskAdmission()
+    def original_factory(body, context, *, admission, lender_capture):
         try:
-            return create_owned_task(body(), context=context, admission=admission, retain_originals=True)
+            return create_owned_task(body(), context=context, admission=admission, retain_originals=True,
+                lender_capture=lender_capture)
         except BaseException:
             assert admission.task is not None
             return admission.task
@@ -494,7 +494,7 @@ async def test_reserved_native_producer_derives_descendants_while_original_paren
             assert lock.current_native_scope() is scopes[0]
             return lifecycle(lock.capture_native_work_factory())
         return ExecutionStreamLifecycle(
-            lambda body, context: factory(body, context=context),
+            factory,
             lambda iterator, task: owners.append((iterator, task)), lambda: None,
             descendant_lifecycle=descendant)
 
@@ -602,7 +602,7 @@ async def test_every_close_observer_parks_its_original_native_privacy_writer(tmp
         async with lock:
             factory = lock.capture_native_work_factory()
             stream = await reserve_execution_stream(None, source(), lifecycle=ExecutionStreamLifecycle(
-                lambda body, context: factory(body, context=context),
+                factory,
                 lambda iterator, task: source_owners.append((iterator, task)), lambda: None))
             assert await anext(stream) == b'original'
             assert lock._writer is writer
@@ -817,7 +817,7 @@ async def test_failed_reserved_owner_keeps_a_valid_writer_for_remaining_source_c
                 loop.set_task_factory(task_factory)
                 try:
                     stream = await reserve_execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
-                        lambda body, context: native(body, context=context),
+                        native,
                         lambda iterator, task: owners.append((iterator, task)), lambda: None))
                 finally:
                     loop.set_task_factory(previous)
@@ -947,7 +947,7 @@ async def test_private_close_interrupt_of_unentered_native_source_is_not_caller_
             async with lock:
                 native = lock.capture_native_work_factory()
                 stream = await reserve_execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
-                    lambda body, context: native(body, context=context),
+                    native,
                     lambda iterator, task: owners.append((iterator, task)), lambda: None))
                 await asyncio.sleep(0)
                 assert not stream._producer_started and not owners[0][1].done()
@@ -1011,7 +1011,7 @@ async def test_close_observer_retains_native_outcome_through_original_writer_res
             async with lock:
                 native = lock.capture_native_work_factory(acquire_span=False)
                 stream = await reserve_execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
-                    lambda body, context: native(body, context=context),
+                    native,
                     lambda iterator, task: owners.append((iterator, task)), lambda: None))
                 assert await anext(stream) == b'original'
                 observer = asyncio.create_task(restore_observer(), context=Context())
@@ -1078,7 +1078,7 @@ async def test_native_retirement_owner_admission_refusal_retains_original_unclos
             def cleanup(body, context, admission, resource):
                 return native(body, context=context, admission=admission,
                     retirement_resource=resource, acquire_span=False)
-            lifecycle = ExecutionStreamLifecycle(lambda body, context: native(body, context=context),
+            lifecycle = ExecutionStreamLifecycle(native,
                 lambda iterator, task: owners.append(task), lambda: None, cleanup_factory=cleanup)
             stream = execution_stream(None, source, lifecycle=lifecycle)
             loop.set_task_factory(factory)

@@ -1838,7 +1838,10 @@ def bind_execution_cleanup(
 class ExecutionStreamLifecycle:
     """Opt-in physical producer custody supplied by its actual feature lifetime.
 
-    The factory receives the lazy body and its original context. Registration
+    The factory receives the lazy body and its original context, plus keyword
+    ``admission`` and ``lender_capture`` for the SAME original producer. It must
+    forward both to canonical task construction, not allocate its own receipt.
+    Registration
     finishes before any body step, including under an eager task factory.
     Nested forwarders inherit this same lifetime only inside source work.
     ``owner_started`` registers the physical producer. ``resource_started``
@@ -1926,11 +1929,14 @@ class _ExecutionForwarder:
             from kestrel_sovereign.llm.call_progress import inherit_call_progress
 
             inherit_call_progress(self._owner_context)
-            self._reserve_close_owner()
-            if self._close_operation.admission_error is not None:
-                raise self._close_operation.admission_error
             def started(iterator, task):
                 self._iterator = iterator
+                # Producer capacity has already been reserved before ANY native
+                # source allocation. Its dispatch gate is still shut here, so
+                # even an eager factory cannot race the original closer.
+                self._reserve_close_owner()
+                if self._close_operation.admission_error is not None:
+                    raise self._close_operation.admission_error
                 task.add_done_callback(lambda _: self._close_requested.set())
                 if self._lifecycle is not None and self._lifecycle.owner_started is not None:
                     self._lifecycle.owner_started(iterator, task)
@@ -2037,20 +2043,21 @@ class _ExecutionForwarder:
             if self._withdrawal is None:
                 await self._consumer_started.wait()
             else:
-                from kestrel_sovereign._async_ownership import gather_owned
+                from kestrel_sovereign._async_ownership import _disable_owned_task_lending, gather_owned
 
                 if not self._withdrawal.requested:
                     # Only these known, resource-free waits may be cancelled.
                     # The SAME producer retires its already-acquired source in
                     # its original finally without dispatching source payload.
-                    await gather_owned(
-                        (factory() for factory in (
-                            self._consumer_started.wait, self._withdrawal.wait,
-                        )),
-                        return_when=asyncio.FIRST_COMPLETED,
-                        retain_originals=True,
-                        name_prefix="execution-stream-consumer-wait",
-                    )
+                    with _disable_owned_task_lending(True):
+                        await gather_owned(
+                            (factory() for factory in (
+                                self._consumer_started.wait, self._withdrawal.wait,
+                            )),
+                            return_when=asyncio.FIRST_COMPLETED,
+                            retain_originals=True,
+                            name_prefix="execution-stream-consumer-wait",
+                        )
                 if self._withdrawal.requested:
                     return
             inherited = self._lifecycle
