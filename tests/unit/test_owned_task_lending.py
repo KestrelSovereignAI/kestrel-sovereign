@@ -460,6 +460,38 @@ async def test_all_restrictions_suppress_even_explicit_old_lender_capture(bounda
 
 
 @pytest.mark.asyncio
+async def test_detached_body_context_cannot_restore_an_old_explicit_capture():
+    host = CapacityLoan()
+    with ownership.bind_owned_task_lender(host):
+        capture = ownership.capture_owned_task_lender()
+        with without_owned_coordinators():
+            detached = contextvars.copy_context()
+        async def independent():
+            assert ownership.capture_owned_task_lender() is None
+            assert not host.outstanding
+        async def body():
+            await ownership.create_owned_task(independent(), lender_capture=capture)
+        await ownership.create_owned_task(body(), context=detached)
+    assert not host.retired
+
+
+@pytest.mark.asyncio
+async def test_cleanup_suppression_covers_completion_publication_in_a_fresh_context():
+    host = CapacityLoan()
+    children = []
+    async def body():
+        assert ownership.capture_owned_task_lender() is None
+    with ownership.bind_owned_task_lender(host):
+        capture = ownership.capture_owned_task_lender()
+        def completion(_task, _error):
+            children.append(ownership.create_owned_task(body(), lender_capture=capture))
+        with bind_execution_custody(ProcessRuntimeExecutionFence("cleanup-publication")), bind_execution_cleanup(None):
+            await ownership.create_owned_task(body(), context=contextvars.Context(), on_completion=completion)
+        await asyncio.gather(*children)
+    assert not host.outstanding and not host.retired
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("factory", ["direct", "privacy", "callback"])
 async def test_stream_paths_use_original_producer_receipt_and_captured_root(factory):
     from kestrel_sovereign._async_ownership import OwnedSourceAdmission, create_owned_iterator

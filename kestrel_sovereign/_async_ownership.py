@@ -146,14 +146,18 @@ def without_owned_coordinators():
 
 @contextmanager
 def _disable_owned_task_lending(disabled: bool):
-    if not disabled:
+    with _bind_owned_task_lending_suppression(_LENDING_DISABLED if disabled else None):
         yield
-        return
-    reset = _OWNED_TASK_LENDER.set(_LENDING_DISABLED)
+
+
+@contextmanager
+def _bind_owned_task_lending_suppression(suppression):
+    reset = _OWNED_TASK_LENDER.set(suppression) if suppression is not None else None
     try:
         yield
     finally:
-        _OWNED_TASK_LENDER.reset(reset)
+        if reset is not None:
+            _OWNED_TASK_LENDER.reset(reset)
 
 
 def _owned_task_lending_suppression():
@@ -644,79 +648,84 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     admitted_coordinators = ()
     admitted_lender = None
     lending_suppression = _owned_task_lending_suppression()
+    if context is not None:
+        body_suppression = context.run(_owned_task_lending_suppression)
+        if lending_suppression is None or body_suppression is _LENDING_DISABLED:
+            lending_suppression = body_suppression
     loan = None
     loan_retirement_ready = False
     loan_retirement_started = False
     unstarted_closed = False
     async def run():
         nonlocal started
-        admission._wrapper_started = True
-        observed = None
-        try:
-            if gate is not None:
-                opening = await gate
-                if opening is not None:
-                    raise opening
-            if loan is not None and asyncio.current_task() is not admission.task:
-                admission._acceptance_unknown = True
-                raise owned_task_admission_error(admission, admission,
-                    RuntimeError("host loan payload requires its exact accepted native Task"))
-            started = True
-            reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
-                (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
-            )))
-            reset_lender = _OWNED_TASK_LENDER.set(
-                lending_suppression if lending_suppression is not None else admitted_lender,
-            )
+        with _bind_owned_task_lending_suppression(lending_suppression):
+            admission._wrapper_started = True
+            observed = None
             try:
-                return await operation
-            finally:
-                _OWNED_TASK_LENDER.reset(reset_lender)
-                _OWNED_COORDINATORS.reset(reset)
-        except BaseException as error:
-            from kestrel_sovereign.execution_custody import (
-                execution_terminal_error,
-                execution_observation_error,
-                retained_execution_error,
-            )
-            admission._canonical_error = execution_terminal_error(
-                error, retain_originals=retain_originals,
-            )
-            observed = error
-            try:
-                task = asyncio.current_task()
-                cached = getattr(task, "_kestrel_owned_terminal_error", None)
-                observed = retained_execution_error(
-                    execution_observation_error(cached, error)
-                    if cached is not None and cached is not error else
-                    execution_terminal_error(error, retain_originals=retain_originals)
+                if gate is not None:
+                    opening = await gate
+                    if opening is not None:
+                        raise opening
+                if loan is not None and asyncio.current_task() is not admission.task:
+                    admission._acceptance_unknown = True
+                    raise owned_task_admission_error(admission, admission,
+                        RuntimeError("host loan payload requires its exact accepted native Task"))
+                started = True
+                reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
+                    (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
+                )))
+                reset_lender = _OWNED_TASK_LENDER.set(
+                    lending_suppression if lending_suppression is not None else admitted_lender,
                 )
-                task._kestrel_owned_terminal_error = observed
-            except BaseException as publication:
-                observed = execution_observation_error(observed, publication)
-                admission._canonical_error = observed
-                raise observed
-            raise
-        finally:
-            if on_completion is not None:
-                # This belongs to the original physical wrapper, outside its
-                # payload gate. Task callback subscription is not required to
-                # observe a failed gate, including two publication failures.
                 try:
-                    completion = on_completion(asyncio.current_task(), observed)
-                    if completion is not None:
-                        if inspect.iscoroutine(completion):
-                            completion.close()
-                        raise TypeError("native completion publisher must return synchronously with None")
+                    return await operation
+                finally:
+                    _OWNED_TASK_LENDER.reset(reset_lender)
+                    _OWNED_COORDINATORS.reset(reset)
+            except BaseException as error:
+                from kestrel_sovereign.execution_custody import (
+                    execution_terminal_error,
+                    execution_observation_error,
+                    retained_execution_error,
+                )
+                admission._canonical_error = execution_terminal_error(
+                    error, retain_originals=retain_originals,
+                )
+                observed = error
+                try:
+                    task = asyncio.current_task()
+                    cached = getattr(task, "_kestrel_owned_terminal_error", None)
+                    observed = retained_execution_error(
+                        execution_observation_error(cached, error)
+                        if cached is not None and cached is not error else
+                        execution_terminal_error(error, retain_originals=retain_originals)
+                    )
+                    task._kestrel_owned_terminal_error = observed
                 except BaseException as publication:
-                    from kestrel_sovereign.execution_custody import execution_observation_error
-                    combined = execution_observation_error(observed, publication)
+                    observed = execution_observation_error(observed, publication)
+                    admission._canonical_error = observed
+                    raise observed
+                raise
+            finally:
+                if on_completion is not None:
+                    # This belongs to the original physical wrapper, outside its
+                    # payload gate. Task callback subscription is not required to
+                    # observe a failed gate, including two publication failures.
                     try:
-                        asyncio.current_task()._kestrel_owned_terminal_error = combined
-                    except BaseException as cache_error:
-                        combined = execution_observation_error(combined, cache_error)
-                    admission._canonical_error = combined
-                    raise combined
+                        completion = on_completion(asyncio.current_task(), observed)
+                        if completion is not None:
+                            if inspect.iscoroutine(completion):
+                                completion.close()
+                            raise TypeError("native completion publisher must return synchronously with None")
+                    except BaseException as publication:
+                        from kestrel_sovereign.execution_custody import execution_observation_error
+                        combined = execution_observation_error(observed, publication)
+                        try:
+                            asyncio.current_task()._kestrel_owned_terminal_error = combined
+                        except BaseException as cache_error:
+                            combined = execution_observation_error(combined, cache_error)
+                        admission._canonical_error = combined
+                        raise combined
     wrapper = run()
 
     def retire_loan():
