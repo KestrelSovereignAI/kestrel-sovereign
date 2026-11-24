@@ -22,7 +22,6 @@ _INHERITED = {
     ("db/sqlite.py", "_retain_aiosqlite_close"),
     ("db/sqlite.py", "_close_acquired_sqlite_connection"),
     ("db/sqlite.py", "_finish_aiosqlite_connection_close"),
-    ("sqla/session.py", "SovereignSqlaSessionFactory._close_live_sqlite_connections"),
 }
 
 
