@@ -110,8 +110,11 @@ def test_explicit_native_owned_task_admissions_have_original_receipts():
 def test_nonstorage_physical_retirement_admits_inside_its_phase():
     package = Path(__file__).resolve().parents[2] / "kestrel_sovereign"
     entries = {
+        "execution_custody.py": {("close_native_execution_stream", "create_owned_task")},
         "hold/state.py": {( "_close_postgres_preflight_backends", "create_owned_task")},
         "kestrel_agent.py": {("KestrelAgent._run_durable_shutdown_tail._bounded", "create_owned_task")},
+        "llm/anthropic_adapter.py": {("_anthropic_stream_with_retry.close_acquired", "create_owned_task")},
+        "llm/lifecycle.py": {("start_llm_close_task", "create_owned_task")},
         "a2a/native_inprocess_http.py": {
             ("_Exchange.close", "create_owned_task"),
             ("_Exchange.retire_request", "retire"),

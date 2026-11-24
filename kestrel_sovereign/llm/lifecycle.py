@@ -41,10 +41,11 @@ def start_llm_close_task(owner, key, operation, *, resource=None):
         resources[key] = resource
     admission = OwnedTaskAdmission()
     try:
-        task = create_owned_task(
-            operation(), name=f"llm-close:{key}", retain_originals=True,
-            retirement_resource=resource, admission=admission,
-        )
+        with bind_execution_cleanup(owner):
+            task = create_owned_task(
+                operation(), name=f"llm-close:{key}", retain_originals=True,
+                retirement_resource=resource, admission=admission,
+            )
     except BaseException as error:
         task = admission.task
         if task is None:

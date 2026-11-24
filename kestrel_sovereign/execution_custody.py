@@ -1457,10 +1457,11 @@ async def close_native_execution_stream(
                 await result
     admission = OwnedTaskAdmission()
     try:
-        close_task = create_owned_task(
-            owned_close(), retirement_resource=stream, retain_originals=retain_originals,
-            admission=admission,
-        )
+        with bind_execution_cleanup(owner):
+            close_task = create_owned_task(
+                owned_close(), retirement_resource=stream, retain_originals=retain_originals,
+                admission=admission,
+            )
     except BaseException as error:
         close_task = admission.task
         if close_task is None:

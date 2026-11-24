@@ -344,6 +344,114 @@ async def test_native_http_exchange_retirement_needs_no_work_capacity(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["native-stream", "openai", "anthropic", "provider-client"])
+@pytest.mark.parametrize("withdrawn", [False, True])
+async def test_real_sdk_physical_close_uses_no_second_work_loan(tmp_path, profile, withdrawn):
+    import json
+    from types import SimpleNamespace
+    import httpx2 as httpx
+    from kestrel_sovereign.execution_custody import (
+        close_native_execution_stream, execution_cleanup_debts,
+    )
+    host = CapacityLoan(capacity=1)
+    fence = ProcessRuntimeExecutionFence("original-sdk-reader")
+    handle = (tmp_path / "original-sdk-response").open("w+b")
+    handle.write(b"original physical response")
+    closes, requests = [], []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            chunk = {"id": "offline", "object": "chat.completion.chunk", "created": 1,
+                "model": "offline", "choices": [{"index": 0,
+                "delta": {"content": "original"}, "finish_reason": "stop"}]}
+            yield b"data: " + json.dumps(chunk).encode() + b"\n\ndata: [DONE]\n\n"
+
+        async def aclose(self):
+            closes.append(asyncio.current_task())
+            assert ownership.capture_owned_task_lender() is None
+            with pytest.raises(ExecutionAuthorityError):
+                require_execution_work()
+            handle.close()
+
+    body = Body()
+    def respond(request):
+        assert request.url.host == "sdk.offline.invalid"
+        requests.append(request)
+        if withdrawn:
+            fence.retire()
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    client = None
+
+    async def original():
+        nonlocal client
+        if profile == "native-stream":
+            response = httpx.Response(200, stream=body)
+            if withdrawn:
+                fence.retire()
+            await close_native_execution_stream(response)
+        elif profile == "provider-client":
+            from kestrel_sovereign.llm.lifecycle import start_llm_close_task, harvest_llm_close_task
+            class PhysicalTransport(httpx.AsyncBaseTransport):
+                async def handle_async_request(self, request):
+                    pytest.fail("provider close must not dispatch a request")
+                async def aclose(self):
+                    await body.aclose()
+            physical = httpx.AsyncClient(transport=PhysicalTransport())
+            owner = SimpleNamespace()
+            try:
+                if withdrawn:
+                    fence.retire()
+                closer = start_llm_close_task(owner, "original-client", physical.aclose, resource=physical)
+                closed = await ownership.await_owned_task(closer)
+                assert closed.error is None
+                assert harvest_llm_close_task(owner, "original-client", closer) is None
+            finally:
+                # Failure-path disposal is observed separately and cannot turn
+                # the failed original retirement into a host acknowledgement.
+                with bind_execution_cleanup(None):
+                    await physical.aclose()
+        elif profile == "openai":
+            import openai
+            from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+            client = openai.AsyncOpenAI(api_key="offline-transport-only", base_url="http://sdk.offline.invalid", http_client=http, max_retries=0)
+            async for _ in OpenAIAdapter().get_streaming_response(client=client, model="offline",
+                    messages=[{"role": "user", "content": "original"}]):
+                pass
+        else:
+            import anthropic
+            from kestrel_sovereign.llm.anthropic_adapter import _anthropic_stream_with_retry
+            client = anthropic.AsyncAnthropic(api_key="offline-transport-only", base_url="http://sdk.offline.invalid", http_client=http, max_retries=0)
+            async with _anthropic_stream_with_retry(client,
+                    {"model": "offline", "messages": [{"role": "user", "content": "original"}], "max_tokens": 8},
+                    route=None, retry_open=False):
+                pass
+
+    try:
+        with bind_execution_custody(fence), ownership.bind_owned_task_lender(host):
+            task = ownership.create_owned_task(original())
+            result = await ownership.await_owned_task(task)
+            if withdrawn and profile in {"openai", "anthropic"}:
+                assert any(isinstance(error, ExecutionAuthorityError)
+                           for error in execution_evidence_carriers(result.error))
+                assert not execution_cleanup_debts(result.error)
+            else:
+                assert result.error is None and result.cancellation is None
+            async with asyncio.timeout(3):
+                while host.outstanding:
+                    host.retirement_changed.clear()
+                    await host.retirement_changed.wait()
+        assert handle.closed and len(closes) == 1
+        assert len(host.retired) == 1, "physical retirement acquired a second WORK loan"
+        assert len(requests) == (1 if profile in {"openai", "anthropic"} else 0)
+    finally:
+        handle.close()
+        with bind_execution_cleanup(None):
+            await (client.close() if client is not None else http.aclose())
+
+
+@pytest.mark.asyncio
 async def test_sqlite_original_rollback_drain_needs_no_work_capacity(tmp_path):
     from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
     backend = SQLiteBackend(str(tmp_path / "rollback-drain.sqlite"))
