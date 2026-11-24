@@ -85,6 +85,8 @@ from kestrel_sovereign.security.verify_policy import (
 )
 
 
+HISTORICAL_ARCHIVAL_ALGORITHM = "sphincs-sha2-128s-simple"
+
 # ---------------------------------------------------------------------------
 # Data structure
 # ---------------------------------------------------------------------------
@@ -751,6 +753,7 @@ def verify_succession(
     successor_policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     require_archival: bool = False,
     trusted_archival_multibase: Optional[str] = None,
+    historical_archival_verifier: Optional[Callable[..., bool]] = None,
     did_web_resolver: Optional[Callable[[str], Mapping[str, Any]]] = None,
 ) -> SuccessionVerifyResult:
     """Verify a succession statement end-to-end.
@@ -872,19 +875,37 @@ def verify_succession(
                 alg_ids_seen=frozenset(),
             )
         else:
-            archival_result = verify_signature_entries(
-                payload,
-                [statement.archival_signature],
-                [statement.archival_verification_method],
-            ).evaluate(VerifyPolicy.PQ_REQUIRED)
+            archival_algorithm = ALG_SLH_DSA_SHA2_128S
+            if historical_archival_verifier is None:
+                archival_result = verify_signature_entries(
+                    payload,
+                    [statement.archival_signature],
+                    [statement.archival_verification_method],
+                ).evaluate(VerifyPolicy.PQ_REQUIRED)
+            else:
+                archival_algorithm = HISTORICAL_ARCHIVAL_ALGORITHM
+                from kestrel_sovereign.constitution.historical_archival import HistoricalVerifierError
+
+                try:
+                    ok = bool(trusted_archival_multibase) and historical_archival_verifier(
+                        statement, trusted_archival_multibase=trusted_archival_multibase,
+                    ) is True
+                    reason = f"Historical {archival_algorithm} signature {'valid' if ok else 'failed'}"
+                except HistoricalVerifierError as exc:
+                    ok = False
+                    reason = f"Historical {archival_algorithm} verifier unavailable: {exc}"
+                archival_result = PolicyResult(
+                    ok=ok, reason=reason,
+                    alg_ids_seen=frozenset({archival_algorithm}) if ok else frozenset(),
+                )
             # Guard: archival sig must specifically be SLH-DSA-128s, not
             # any post-quantum suite. Otherwise a future caller could
             # countersign with ML-DSA-65 and still pass PQ_REQUIRED.
-            if archival_result.ok and ALG_SLH_DSA_SHA2_128S not in archival_result.alg_ids_seen:
+            if archival_result.ok and archival_algorithm not in archival_result.alg_ids_seen:
                 archival_result = PolicyResult(
                     ok=False,
                     reason=(
-                        f"archival signature must use {ALG_SLH_DSA_SHA2_128S}; "
+                        f"archival signature must use {archival_algorithm}; "
                         f"got {sorted(archival_result.alg_ids_seen)}"
                     ),
                     alg_ids_seen=archival_result.alg_ids_seen,

@@ -42,6 +42,7 @@ from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
 from kestrel_sdk.tools import DeferredToolResult
 from kestrel_sdk.tools.base import ToolSchema
+from kestrel_sovereign.hooks.decision_gate import host_approval_scope
 from kestrel_sovereign.tools.native_action import (
     NativeActionInvocation, action_audit, action_parameter_audit, snapshot_action_context,
 )
@@ -1538,6 +1539,7 @@ class OrchestratorEngineMixin:
             repaired.content = settle_repaired_content(original, repaired.content)
         return repaired
 
+    @host_approval_scope()
     async def _execute_tool_with_hooks(
         self,
         tool_name: str,
@@ -2176,6 +2178,7 @@ class OrchestratorEngineMixin:
             finally:
                 execution.release_owner_lease(self)
 
+    @host_approval_scope()
     async def _dispatch_named_tool(
         self,
         tool_name: str,
@@ -2508,6 +2511,7 @@ class OrchestratorEngineMixin:
             return None
         return visible.get(tool_name)
 
+    @host_approval_scope()
     async def _execute_named_subagent(
         self,
         feature: Any,

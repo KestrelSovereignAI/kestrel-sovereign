@@ -1092,6 +1092,7 @@ async def test_signed_native_anchor_consumes_bootstrap_custody_on_both_backends(
                 emancipation_contract_json=None, amendment_artifact_path=artifact_path,
                 amendment_artifact_bytes=artifact_bytes, amendment_artifact=artifact,
                 amendment_verification=verification,
+                transition_evidence={},
                 governance_preflight=governance_preflight,
             )
             if rollback:

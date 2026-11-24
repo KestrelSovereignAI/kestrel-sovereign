@@ -183,7 +183,12 @@ async def test_changed_hash_genesis_can_complete_in_safe_mode_before_explicit_ex
             PrivacyEnforcingStorage(storage, "isolated"), "isolated"
         )
         content = resolve_governing_constitution_bytes(None)
-        old = await storage.store_file(content + b"\nold governing revision", "old.md")
+        # This recovery exercises a Sovereign-authorized role change. The
+        # amendment procedure at the end of the document has separate authority.
+        role = b"## Book IV: Agent Identity\n"
+        assert content.count(role) == 1
+        old_content = content.replace(role, role + b"\nThe agent keeps a research journal.\n", 1)
+        old = await storage.store_file(old_content, "old.md")
         await storage.add_node(
             GraphNode(
                 node_id=agent.agent_id,

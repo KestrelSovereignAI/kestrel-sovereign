@@ -67,6 +67,7 @@ COPY --from=uv /uv /usr/local/bin/uv
 # Copy application source. .dockerignore handles exclusions (.venv, .env,
 # tests, kestrel.toml, *.db, agent_data, etc. — see /.dockerignore).
 COPY . .
+RUN sh docker/install_constitution_verifier.sh
 
 # Install the package and its declared dependencies in a dedicated runtime
 # virtual environment. UvExecutor fails closed outside a virtual environment

@@ -517,6 +517,12 @@ kestrel start
 On PostgreSQL, autovacuum makes the freed rows reusable; `VACUUM FULL`
 returns the space but locks each table it rewrites.
 
+When a host runs an agent on the second edition, Kestrel uses the GitHub CLI
+to verify the publisher's attestation against the trust root packaged with
+the release. The stock agent images include the verifier. For a source or
+wheel installation, install the [GitHub CLI](https://cli.github.com/) on the
+agent service's `PATH`. Verification runs offline and requires no GitHub login.
+
 `kestrel constitution reanchor --force` copies a SQLite agent database before
 it writes. The copy goes under the backup root, `KESTREL_BACKUP_DIR` (read from
 the project `.env` or the environment; relative to the project directory), or

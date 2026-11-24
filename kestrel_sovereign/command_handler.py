@@ -543,6 +543,8 @@ class CommandHandler:
                 "🚨 SAFE MODE ACTIVE: Agent functionality restricted due to "
                 f"{restriction}."
             )
+        if getattr(self.agent, "_constitution_governing_replay_pending", False) is True:
+            return "🚨 Governing constitution integrity verification is incomplete. Normal cognition remains restricted."
         if getattr(self.agent, "_constitution_audit_pending", False):
             return "🚨 STARTUP AUDIT PENDING: Normal cognition remains restricted."
         return "✅ Normal operation mode. No integrity issues detected."

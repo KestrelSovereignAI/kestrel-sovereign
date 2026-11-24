@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 from copy import deepcopy
 from kestrel_sdk.tools import NativeActionContext
+from kestrel_sovereign.hooks.decision_gate import ApprovalAuditEvidence
 from kestrel_sovereign.tools.native_action import snapshot_action_context
 
 from kestrel_sovereign.execution_custody import (
@@ -95,6 +96,7 @@ class ApprovalRequest:
     invocation_id: str | None = None
     once_only: bool = False
     decision_deadline: float | None = None
+    audit_evidence: ApprovalAuditEvidence | None = field(default=None, repr=False)
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -290,6 +292,7 @@ class ApprovalQueue:
         allow_blocking: bool = True,
         audit_action: str = "tool_execution",
         native_action: NativeActionContext | None = None,
+        audit_evidence: ApprovalAuditEvidence | None = None,
     ) -> tuple[bool, str]:
         """
         Queue a request and wait for user decision.
@@ -366,7 +369,7 @@ class ApprovalQueue:
                     PermissionLevel.ALLOW,
                 ):
                     if level == PermissionLevel.ALLOW:
-                        await self._permission_store.log_decision(
+                        row_id = await self._permission_store.log_decision(
                             feature_name=feature_name,
                             tool_name=tool_name,
                             action=audit_action,
@@ -374,7 +377,7 @@ class ApprovalQueue:
                             args_summary=summarize_args(tool_args, native_action=native_action),
                         )
                     else:
-                        await self._permission_store.log_decision(
+                        row_id = await self._permission_store.log_decision(
                             feature_name=feature_name,
                             tool_name=tool_name,
                             action=audit_action,
@@ -382,6 +385,8 @@ class ApprovalQueue:
                             user_choice="constitutional_honesty_unflagged",
                             args_summary=summarize_args(tool_args, native_action=native_action),
                         )
+                    if audit_evidence is not None:
+                        audit_evidence.row_id = row_id
                     logger.info(
                         "ApprovalQueue auto-mode approved %s.%s without prompting",
                         feature_name,
@@ -464,7 +469,7 @@ class ApprovalQueue:
                         repo_scope=match.rule.repo_scope,
                         rule_source=match.rule.source,
                     )
-                    await self._permission_store.log_decision(
+                    row_id = await self._permission_store.log_decision(
                         feature_name=feature_name,
                         tool_name=tool_name,
                         action=audit_action,
@@ -472,6 +477,8 @@ class ApprovalQueue:
                         user_choice=f"auto_approve:{match.rule.source}",
                         args_summary=summarize_args(tool_args),
                     )
+                    if audit_evidence is not None:
+                        audit_evidence.row_id = row_id
                     logger.info(
                         "ApprovalQueue auto-approved %s.%s for agent=%s "
                         "(audit_id=%s, source=%s)",
@@ -558,6 +565,7 @@ class ApprovalQueue:
             audit_action=audit_action,
             native_action=native_action,
             invocation_id=current_invocation_id(),
+            audit_evidence=audit_evidence,
             once_only=kite_prepared,
             decision_deadline=deadline,
         )
@@ -727,6 +735,7 @@ class ApprovalQueue:
         scope: str,
         audit_action: str = "tool_execution",
         native_action: NativeActionContext | None = None,
+        audit_evidence: ApprovalAuditEvidence | None = None,
     ) -> Optional[str]:
         """Persist the user's scope choice and write an audit row.
 
@@ -786,7 +795,7 @@ class ApprovalQueue:
                 decision = "user_denied"
 
             args_summary = summarize_args(tool_args, native_action=native_action)
-            await self._permission_store.log_decision(
+            row_id = await self._permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
                 action=audit_action,
@@ -794,6 +803,8 @@ class ApprovalQueue:
                 user_choice=scope,
                 args_summary=args_summary,
             )
+            if audit_evidence is not None:
+                audit_evidence.row_id = row_id
         except Exception as e:
             # A persistence failure must not corrupt the user's decision.
             # Log loudly and let the caller report the exact persistence
@@ -897,7 +908,7 @@ class ApprovalQueue:
                 feature_name=request.feature_name, tool_name=request.tool_name,
                 tool_args=request.tool_args, approved=approved, scope=scope,
                 audit_action=request.audit_action,
-                native_action=request.native_action,
+                native_action=request.native_action, audit_evidence=request.audit_evidence,
             ), retain_originals=True, name="approval-decision-persistence",
         )
         outcome = await request.decision_operation.observe(

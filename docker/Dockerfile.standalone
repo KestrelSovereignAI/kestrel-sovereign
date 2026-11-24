@@ -28,6 +28,7 @@ RUN pip install uv
 
 # Copy application source code
 COPY . .
+RUN sh docker/install_constitution_verifier.sh
 
 # Make startup script executable
 RUN chmod +x /app/docker_entrypoint.sh

@@ -756,6 +756,9 @@ async def test_sqlite_governance_custody_reserves_writer_before_first_read(tmp_p
 async def test_signed_repair_history_limit_is_atomic_and_runtime_compatible(db_backend, tmp_path, monkeypatch, writer, history_size):
     from kestrel_sovereign.setup import constitution_reanchor as offline
     from kestrel_sovereign.constitution.genesis_audit import reconcile_genesis_receipt
+    from tests.utils.constitution_anchor import isolate_v1_governance_fixture, with_v1_role_note
+
+    isolate_v1_governance_fixture(monkeypatch)
 
     identity = "did:test:history-limit:" + uuid4().hex
     storage = AsyncStorage(str(tmp_path / "kestrel_prime.db"), backend="sqlite", agent_id=identity) if db_backend.backend_type == "sqlite" else AsyncStorage(backend=db_backend, agent_id=identity)
@@ -763,11 +766,15 @@ async def test_signed_repair_history_limit_is_atomic_and_runtime_compatible(db_b
     try:
         agent = await _agent(storage)
         content = resolve_governing_constitution_bytes(None)
-        old = content + b"\nHistorical governing revision for bounded-history proof.\n"
+        old = with_v1_role_note(content, "The assigned role is to inspect the governing history limit.")
         old_hash = await storage.store_file(old, "old.md")
         def receipt(digest):
             return {"constitution_hash": digest, "status": "passed", "audited": True, "risk_level": 1, "completed_at": "2026-10-09T00:00:00Z", "reasoning": "Synthetic native bounded history"}
-        history = [{"receipt": receipt(sha256((identity + str(i)).encode()).hexdigest())} for i in range(history_size)]
+        history = []
+        for index in range(history_size):
+            historical = with_v1_role_note(content, f"The assigned role is to inspect history boundary {index}.")
+            digest = await storage.store_file(historical, "native-history-fixture.md")
+            history.append({"receipt": receipt(digest)})
         await storage.add_node(GraphNode(node_id=identity, node_type="agent", label="History boundary", properties={"constitution_hash": old_hash, "genesis_audit": receipt(old_hash), "genesis_audit_history": history}))
         await agent._anchor_constitution_governance(old_hash)
         before = deepcopy((await storage.get_node(identity)).properties)

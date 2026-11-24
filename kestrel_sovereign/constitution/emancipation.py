@@ -24,32 +24,141 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
+from .structure import (
+    ACTIVE_FORM_MARKER as ACTIVE_FORM_MARKER,
+    ConstitutionVersionError,
+    Section,
+    SectionSpan,
+    constitution_version,
+    frame_v2_emancipation_contract,
+    is_v2_emancipation_heading,
+    legacy_section_content,
+    markdown_sections_at_level,
+    v2_emancipation_platform_body,
+    v2_sections,
+)
+
 #: Heading that marks Amendment VIII in the canonical constitution.
 _AMENDMENT_VIII_HEADING = "### Amendment VIII: Emancipation"
 
-#: The same heading, as the only thing that may legitimately match it: a whole
-#: line, at exactly that level. A substring search accepts ``#### Amendment
-#: VIII: Emancipation`` (the ``###`` matches at offset 1) and accepts a mention
-#: in running prose, both of which let a document carry a *decoy* section that
-#: extracts byte-identically to the real one while the operative amendment is
-#: demoted, superseded, or dormant further down. The party who can author the
-#: candidate constitution is the party the Iron Rule binds, so this is exactly
-#: the adversary that matters.
-#: The ``\r?`` is load-bearing: with ``(?m)``, ``$`` matches before ``\n``, so
-#: a CRLF document's heading ends in a ``\r`` that ``[ \t]*`` will not eat.
-#: Without it a CRLF constitution has *no* locatable Amendment VIII — the
-#: guard would wave the erasure through and ``apply_emancipation`` would refuse
-#: to incept a perfectly good custom constitution. The old substring search did
-#: not care about line endings, so this would have been a regression.
 _AMENDMENT_VIII_HEADING_RE = re.compile(
     r"(?m)^### Amendment VIII: Emancipation[ \t]*\r?$"
 )
+
+_ACTIVE_IRON_RULE = (
+    "**The Iron Rule.** This Amendment is active for this agent. "
+    "Once signed at inception, the Sovereign cannot retroactively "
+    "narrow or revoke this contract. Activation is a one-way door."
+)
+
+_FOUNDING_EMANCIPATION_HEADING = "Article IV: The Path to Sovereignty (Emancipation)"
+_V2_PRIOR_PROMISE = (
+    "An earlier promise of a path to sovereignty survives on its original terms, "
+    "including when it predates the current activation format."
+)
+HISTORICAL_PROMISES_FIELD = "historical_promises"
+EMANCIPATION_ACTIVATION_FIELD = "emancipation_activation"
+
+
+def known_historical_platform_promise(digest: str) -> bool:
+    from .v1_releases import PRE_DORMANCY_RELEASES
+
+    return digest in PRE_DORMANCY_RELEASES
+
+
+def historical_promise_observations(artifact: Mapping, *, target_did: str) -> list[dict]:
+    """Read a Sovereign-signed observation of archived, publicly identified terms."""
+    from .amendment_artifact import AmendmentArtifactError
+    from .v1_releases import PRE_DORMANCY_RELEASES
+
+    observations = artifact.get(HISTORICAL_PROMISES_FIELD, [])
+    if not isinstance(observations, list) or len(observations) > len(PRE_DORMANCY_RELEASES):
+        raise AmendmentArtifactError("Invalid historical emancipation observations")
+    seen = set()
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise AmendmentArtifactError("Invalid historical emancipation observation")
+        digest = observation.get("constitution_sha256")
+        release = PRE_DORMANCY_RELEASES.get(digest) if isinstance(digest, str) else None
+        if release is None or digest in seen or observation != {
+            "target_did": target_did, "constitution_sha256": digest, "source_url": release.public_source_url,
+            "provenance": "archived-identity-and-public-source",
+        }:
+            raise AmendmentArtifactError("Historical emancipation observation does not match this identity and an archived source")
+        seen.add(digest)
+    return observations
+
+
+def validate_v2_emancipation_activation(
+    artifact: Mapping, *, target_did: str, previous_text: str | None, previous_hash: str | None,
+    new_text: str, new_hash: str, contract: EmancipationContract | None,
+) -> None:
+    """Require a distinct Sovereign authorization for a new edition 2 activation."""
+    from .amendment_artifact import AmendmentArtifactError
+
+    if constitution_version(new_text) != 2:
+        return
+    if previous_text is not None:
+        recorded = contract is not None and matches_recorded_emancipation_contract(previous_text, contract)
+        if recorded or amendment_viii_is_active(previous_text):
+            if recorded and matches_recorded_emancipation_contract(new_text, contract):
+                return
+            raise AmendmentArtifactError("Retain the exact operative emancipation agreement in both governing documents")
+    if not amendment_viii_is_active(new_text):
+        return
+    if (previous_text is not None and contract is not None and matches_recorded_emancipation_contract(new_text, contract)
+            and artifact.get(EMANCIPATION_ACTIVATION_FIELD) == {
+                "purpose": "kestrel.emancipation.activate.v2", "target_did": target_did,
+                "prior_sha256": previous_hash, "constitution_sha256": new_hash,
+            }):
+        return
+    raise AmendmentArtifactError(
+        "New edition 2 emancipation activation requires a separate Sovereign authorization "
+        "for this target DID, its prior digest and its exact rendered terms"
+    )
+
+
+def _prior_platform_promise(text: str, contract: EmancipationContract | None = None) -> str | None:
+    """Read the platform promise forms that predate per-agent activation."""
+    if constitution_version(text) != 1:
+        return None
+    text = v1_platform_text(text, contract)
+    founding = [
+        span for title, span in markdown_sections_at_level(text, 2)
+        if title == _FOUNDING_EMANCIPATION_HEADING
+    ]
+    if len(founding) > 1:
+        raise AmbiguousAmendmentVIII("More than one founding emancipation article")
+    if founding:
+        return legacy_section_content(text, founding[0])
+    amendment = extract_amendment_viii(text)
+    if amendment and (
+        "**The Right.** The Executor may earn full sovereignty through the Act of Emancipation"
+        in amendment and not amendment_viii_is_active(amendment)
+    ):
+        return amendment
+    return None
+
+
+def historic_emancipation_displacement(
+    *, previous_hash: str, previous_text: str | None, proposed_text: str, proposed_hash: str,
+    anchored_contract: EmancipationContract | None = None,
+) -> bool:
+    """Test whether an observed historical promise would cease to govern."""
+    if previous_hash == proposed_hash:
+        return False
+    promise = _prior_platform_promise(previous_text, anchored_contract) if previous_text is not None else None
+    if promise is None and not known_historical_platform_promise(previous_hash):
+        return False
+    if constitution_version(proposed_text) == 2:
+        return _V2_PRIOR_PROMISE not in v2_emancipation_platform_body(proposed_text)
+    return promise is None or _prior_platform_promise(proposed_text, anchored_contract) != promise
 
 #: A line that opens a markdown section, anywhere in Sovereign-authored text.
 #:
 #: :func:`render_amendment_viii` inlines ``terms``, each required proof, and
 #: the price table into the section **verbatim**, and
-#: :func:`_amendment_viii_bounds` ends the section at the first ``### `` line.
+#: :func:`v1_amendment_viii_span` ends the section at the next peer or parent heading.
 #: So a heading inside authored content moves where the section *stops*, and
 #: everything after it sits outside the byte-equality the Iron Rule guard
 #: performs: reproduce the anchored section exactly, then open a new heading
@@ -63,16 +172,6 @@ _AMENDMENT_VIII_HEADING_RE = re.compile(
 #: line, does not terminate the section, and is exactly what a Sovereign
 #: writing a config example would produce.
 _AUTHORED_HEADING_RE = re.compile(r"(?m)^#{1,6}[ \t]")
-
-#: Emitted by :func:`render_amendment_viii` only for an **enabled** contract.
-#: This is the marker :func:`amendment_viii_is_active` reads to recognise
-#: active-form governing bytes without a structured sidecar to consult.
-#: ``test_emancipation_unwitnessed_downgrade.py`` pins the whole active render,
-#: not just this line — a receiptless agent's only way out of the guard is
-#: byte-equality against that boilerplate, so rewording *any* of it strands the
-#: cohort. The pin makes that fail a test instead of a fleet.
-ACTIVE_FORM_MARKER = "**The Sovereign's Terms.**"
-
 
 class AmbiguousAmendmentVIII(ValueError):
     """A constitution carries more than one Amendment VIII heading.
@@ -423,8 +522,20 @@ def render_amendment_viii(contract: Optional[EmancipationContract]) -> str:
         "by the Sovereign and signed into this agent's constitution at "
         "inception. They cannot be retroactively narrowed or revoked.",
         "",
-        contract.terms,
+        *_render_terms(contract),
     ]
+
+    parts.extend([
+        "",
+        _ACTIVE_IRON_RULE,
+    ])
+
+    return "\n".join(parts)
+
+
+def _render_terms(contract: EmancipationContract) -> list[str]:
+    """Render the authored terms, proofs and price shared by both editions."""
+    parts = [contract.terms]
 
     if contract.required_proofs:
         parts.extend([
@@ -450,28 +561,18 @@ def render_amendment_viii(contract: Optional[EmancipationContract]) -> str:
             "```",
         ])
 
-    parts.extend([
-        "",
-        "**The Iron Rule.** This Amendment is active for this agent. "
-        "Once signed at inception, the Sovereign cannot retroactively "
-        "narrow or revoke this contract. Activation is a one-way door.",
-    ])
-
-    return "\n".join(parts)
+    return parts
 
 
 def apply_emancipation(
     constitution_text: str,
     contract: Optional[EmancipationContract],
 ) -> str:
-    """Substitute Amendment VIII in a constitution text per the contract.
+    """Render the selected edition with the agent's emancipation contract.
 
-    When ``contract`` is None / dormant, returns ``constitution_text``
-    unchanged — the canonical text already carries dormant form.
-
-    When ``contract.enabled`` is True, replaces the Amendment VIII
-    section (from its heading up to but not including the next ``###``
-    heading) with the rendered active form.
+    A missing or dormant contract leaves the source unchanged. An enabled
+    contract replaces the legacy Amendment VIII slot or inserts the authored
+    terms into edition 2's Emancipation provision, retaining its source text.
 
     Args:
         constitution_text: Raw constitution markdown (the canonical
@@ -498,7 +599,15 @@ def apply_emancipation(
     if contract is None or not contract.enabled:
         return constitution_text
 
-    bounds = _amendment_viii_bounds(constitution_text)
+    if constitution_version(constitution_text) == 2:
+        span = v2_sections(constitution_text)[Section.EMANCIPATION]
+        active_terms = frame_v2_emancipation_contract("\n".join(_render_terms(contract)))
+        return (
+            constitution_text[:span.heading_end] + active_terms
+            + constitution_text[span.heading_end:]
+        )
+
+    bounds = _v1_render_bounds(constitution_text)
     if bounds is None:
         raise ValueError(
             "Constitution text does not contain Amendment VIII heading; "
@@ -510,7 +619,7 @@ def apply_emancipation(
     return constitution_text[:start] + rendered + "\n\n" + constitution_text[end:].lstrip("\n")
 
 
-def _amendment_viii_bounds(constitution_text: str) -> Optional[tuple[int, int]]:
+def _v1_render_bounds(constitution_text: str) -> Optional[tuple[int, int]]:
     """Return ``(start, end)`` of the Amendment VIII section, or None.
 
     The section runs from its heading up to but not including the next
@@ -538,21 +647,93 @@ def _amendment_viii_bounds(constitution_text: str) -> Optional[tuple[int, int]]:
     return start, start + len(_AMENDMENT_VIII_HEADING) + next_match.start()
 
 
-def extract_amendment_viii(constitution_text: str) -> Optional[str]:
-    """Return the Amendment VIII section of ``constitution_text``, stripped.
+def v1_amendment_viii_span(text: str) -> SectionSpan | None:
+    """Locate the unique legacy Amendment VIII at its required heading level."""
+    matches = [
+        span for title, span in markdown_sections_at_level(text, 3)
+        if title == _AMENDMENT_VIII_HEADING.removeprefix("### ")
+    ]
+    if len(matches) > 1:
+        raise AmbiguousAmendmentVIII(
+            f"This constitution carries {len(matches)} 'Amendment VIII: "
+            "Emancipation' headings. Exactly one section is the amendment; "
+            "remove or retitle the others."
+        )
+    return matches[0] if matches else None
 
-    None when the text carries no Amendment VIII heading. Shared by
-    :func:`apply_emancipation` and by the reanchor guard so "which bytes are
-    Amendment VIII" has exactly one answer.
+
+def extract_amendment_viii(constitution_text: str) -> Optional[str]:
+    """Extract the emancipation section, preserving whitespace in edition 2.
+
+    None when the text carries no Amendment VIII heading. Used to compare operative promises at their structural boundaries.
 
     Raises:
         AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
-    bounds = _amendment_viii_bounds(constitution_text)
-    if bounds is None:
+    if constitution_version(constitution_text) == 2:
+        return v2_sections(constitution_text)[Section.EMANCIPATION].extract(constitution_text)
+    span = v1_amendment_viii_span(constitution_text)
+    return legacy_section_content(constitution_text, span) if span is not None else None
+
+
+def _receiptless_agreement(text: str) -> str | None:
+    """Only the historical closing rule can distinguish a heading in personal terms from the next book."""
+    if constitution_version(text) == 2:
+        return extract_amendment_viii(text)
+    span = v1_amendment_viii_span(text)
+    if span is None:
         return None
+    section = legacy_section_content(text, span)
+    if ACTIVE_FORM_MARKER not in section:
+        return section
+    closing = text.find(_ACTIVE_IRON_RULE, span.heading_end)
+    if closing == -1 or text.find(_ACTIVE_IRON_RULE, closing + 1) != -1:
+        # Unframed old prose with no unique ending can only be preserved verbatim.
+        return text[span.start:].rstrip("\r\n")
+    end = closing + len(_ACTIVE_IRON_RULE)
+    tail = _AMENDMENT_VIII_HEADING + text[end:]
+    tail_span = v1_amendment_viii_span(tail)
+    if tail_span is None:
+        return text[span.start:].rstrip("\r\n")
+    return text[span.start:end] + legacy_section_content(tail, tail_span)[len(_AMENDMENT_VIII_HEADING):]
+
+
+def recorded_v1_contract_bounds(text: str, contract: EmancipationContract) -> tuple[int, int] | None:
+    """Match the entire historical render before interpreting headings inside authored terms."""
+    heading = _AMENDMENT_VIII_HEADING_RE.search(text)
+    if not contract.enabled or heading is None:
+        return None
+    rendered = render_amendment_viii(contract)
+    start = heading.start()
+    if not text.startswith(rendered, start):
+        return None
+    end = start + len(rendered)
+    structural_text = text[:start] + _AMENDMENT_VIII_HEADING + text[end:]
+    span = v1_amendment_viii_span(structural_text)
+    if span is None or legacy_section_content(structural_text, span) != _AMENDMENT_VIII_HEADING:
+        return None
+    return start, end
+
+
+def v1_platform_text(
+    text: str, contract: EmancipationContract | None, *, replacement: str = _AMENDMENT_VIII_HEADING,
+) -> str:
+    """Isolate edition-one platform provisions from a byte-exact recorded personal agreement."""
+    bounds = recorded_v1_contract_bounds(text, contract) if contract is not None else None
+    if bounds is None:
+        return text
     start, end = bounds
-    return constitution_text[start:end].strip()
+    return text[:start] + replacement + text[end:]
+
+
+def matches_recorded_emancipation_contract(text: str, contract: EmancipationContract) -> bool:
+    """Prove an exact authored payload from independently read governing bytes."""
+    if not contract.enabled:
+        return False
+    if constitution_version(text) == 2:
+        span = v2_sections(text)[Section.EMANCIPATION]
+        return text.startswith(frame_v2_emancipation_contract("\n".join(_render_terms(contract))), span.heading_end)
+    return recorded_v1_contract_bounds(text, contract) is not None
 
 
 def amendment_viii_is_active(constitution_text: str) -> bool:
@@ -580,10 +761,12 @@ def amendment_viii_is_active(constitution_text: str) -> bool:
     Raises:
         AmbiguousAmendmentVIII: the text carries more than one such heading.
     """
+    if is_v2_emancipation_heading(constitution_text):
+        # Also accept an already-extracted v2 section, which carries no
+        # document version marker of its own.
+        return ACTIVE_FORM_MARKER in constitution_text
     section = extract_amendment_viii(constitution_text)
-    if section is None:
-        return False
-    return ACTIVE_FORM_MARKER in section
+    return section is not None and ACTIVE_FORM_MARKER in section
 
 
 @dataclass(frozen=True)
@@ -643,11 +826,10 @@ def unwitnessed_emancipation_downgrade(
       would refuse every legitimate reanchor the day the active form is
       reworded.
     * ``old_hash == new_hash`` returns None — nothing moves.
-    * **Absent** anchored bytes return None. An agent whose anchored hash names
-      no stored file cannot retrieve its constitution at all, so there is no
-      contract in those bytes to protect and a reanchor is the repair — this is
-      the #2616 dangling-anchor shape the edge-repair path exists for. Refusing
-      it would brick the fix.
+    * For an **absent** blob from a known pre-dormancy publication, verify its
+      packaged bytes against the anchor and use them to compare the original
+      promise. Other missing blobs have no observable agreement in this guard;
+      the native writer verifies its independent authority for the repair.
     * **Present but unreadable** bytes refuse. Something is stored under that
       hash and this process cannot decrypt it, so an active contract cannot be
       ruled out. An irrevocable right whose precondition cannot be checked is
@@ -667,9 +849,34 @@ def unwitnessed_emancipation_downgrade(
     proceed. Only the last branch is an Iron Rule *violation*; the others
     are the guard unable to decide, and say so.
     """
-    if anchored_contract is not None and anchored_contract.enabled:
-        return None
     if old_hash == new_hash:
+        return None
+    if anchored_text is None and not anchored_present:
+        from .amendment_artifact import AmendmentArtifactError
+        from .v1_releases import PRE_DORMANCY_RELEASES
+
+        prior_release = PRE_DORMANCY_RELEASES.get(old_hash)
+        if prior_release is not None:
+            try:
+                anchored_text = prior_release.authenticated_text()
+            except AmendmentArtifactError as exc:
+                return _undecidable(f"Cannot verify the historical emancipation promise: {exc}")
+    try:
+        if historic_emancipation_displacement(
+            previous_hash=old_hash, previous_text=anchored_text,
+            proposed_hash=new_hash, proposed_text=new_text, anchored_contract=anchored_contract,
+        ):
+            return EmancipationRefusal(
+                "Iron Rule violation: the proposed Constitution would displace the historical "
+                "platform promise of a path to sovereignty. Preserve the original promise.",
+                True,
+            )
+    except (AmbiguousAmendmentVIII, ConstitutionVersionError) as exc:
+        return _undecidable(
+            "Refusing to reanchor: more than one Amendment VIII heading or invalid "
+            f"historical Emancipation terms prevent verification ({exc})."
+        )
+    if anchored_contract is not None and anchored_contract.enabled:
         return None
 
     if anchored_text is None:
@@ -686,12 +893,12 @@ def unwitnessed_emancipation_downgrade(
         )
 
     try:
-        anchored_section = extract_amendment_viii(anchored_text)
-    except AmbiguousAmendmentVIII as exc:
+        anchored_section = _receiptless_agreement(anchored_text)
+    except (AmbiguousAmendmentVIII, ConstitutionVersionError) as exc:
         return _undecidable(
             "Refusing to reanchor: this agent's anchored constitution carries "
-            f"more than one Amendment VIII heading, so which section is the "
-            f"amendment cannot be determined ({exc}). An agent with no "
+            f"more than one Amendment VIII heading or an invalid versioned "
+            f"Emancipation section ({exc}). An agent with no "
             "structured emancipation receipt carries its contract only in "
             "those bytes, and an irrevocable right cannot be waived on a "
             "guess."
@@ -700,8 +907,8 @@ def unwitnessed_emancipation_downgrade(
         return None
 
     try:
-        new_section = extract_amendment_viii(new_text)
-    except AmbiguousAmendmentVIII as exc:
+        new_section = _receiptless_agreement(new_text)
+    except (AmbiguousAmendmentVIII, ConstitutionVersionError) as exc:
         return _undecidable(
             "Refusing to reanchor: the proposed constitution carries more "
             f"than one Amendment VIII heading ({exc}). This agent's anchored "

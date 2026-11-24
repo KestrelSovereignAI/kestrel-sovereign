@@ -9,6 +9,7 @@ import logging
 from typing import Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sovereign.hooks.decision_gate import begin_host_approval
 from kestrel_sovereign.agent.turn_lifecycle import current_turn_is_signal_driven
 from kestrel_sovereign.features.security.permissions import (
     SUBAGENT_DISPATCH_ACTION,
@@ -91,6 +92,7 @@ class SecurityHook(Hook):
         permission_store: PermissionStore,
         approval_queue: ApprovalQueue,
         priority: int = 10,  # Run early in hook chain
+        *, agent=None,
     ):
         """
         Initialize the security hook.
@@ -117,6 +119,7 @@ class SecurityHook(Hook):
         )
         self.permission_store = permission_store
         self.approval_queue = approval_queue
+        self.agent = agent
 
     async def execute(self, input: HookInput) -> HookOutput:
         """
@@ -150,19 +153,31 @@ class SecurityHook(Hook):
             else "tool_execution"
         )
 
+        audit_evidence = None
+        if input.hook_event_name == HookEvent.PRE_TOOL_USE.value:
+            from kestrel_sovereign.features.computer_use import ComputerUseFeature
+
+            if feature_name in (ComputerUseFeature.__name__, ComputerUseFeature.tool_name):
+                audit_evidence = begin_host_approval(self.approval_queue, tool_name)
+                if audit_evidence is not None and self.agent is not None and hasattr(self.agent, "_raw_storage"):
+                    from kestrel_sovereign.constitution.grants import resolve_amendment_ix_grants
+
+                    audit_evidence.grant = resolve_amendment_ix_grants(self.agent)
         if level == PermissionLevel.ALLOW:
-            await self.permission_store.log_decision(
+            row_id = await self.permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
                 action=audit_action,
                 decision="auto_allowed",
                 args_summary=args_summary,
             )
+            if audit_evidence is not None:
+                audit_evidence.row_id = row_id
             logger.debug(f"Auto-allowed: {feature_name}.{tool_name}")
             return HookOutput.allow(f"Auto-approved: {feature_name}.{tool_name}")
 
         if level == PermissionLevel.AUTO:
-            await self.permission_store.log_decision(
+            row_id = await self.permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
                 action=audit_action,
@@ -170,6 +185,8 @@ class SecurityHook(Hook):
                 user_choice="constitutional_honesty_unflagged",
                 args_summary=args_summary,
             )
+            if audit_evidence is not None:
+                audit_evidence.row_id = row_id
             logger.info(
                 "Auto mode approved %s.%s after earlier policy hooks did not block",
                 feature_name,
@@ -223,6 +240,7 @@ class SecurityHook(Hook):
                 tool_name=tool_name,
                 tool_args=input.tool_input or {},
                 allow_blocking=allow_blocking,
+                **({"audit_evidence": audit_evidence} if audit_evidence is not None else {}),
                 # The queue writes audit rows on paths this hook never
                 # returns through, so it needs the same fact. Without this the
                 # ASK path — which is the DEFAULT for the feature-as-subagent

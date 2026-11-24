@@ -1211,7 +1211,8 @@ def test_health_rejects_partially_loaded_fleet_with_identity_failure():
     assert "binding" not in response.text
 
 
-def test_public_health_hides_safe_mode_agent_state_and_reason():
+@pytest.mark.parametrize("replay_only", [False, True], ids=["safe-mode", "pending-governing-replay"])
+def test_public_health_hides_safe_mode_agent_state_and_reason(replay_only):
     """Safe mode blocks readiness without exposing its cause or agent."""
     from server import app
 
@@ -1231,7 +1232,10 @@ def test_public_health_hides_safe_mode_agent_state_and_reason():
     )
 
     agent = MagicMock()
-    agent._safe_mode = True
+    agent._safe_mode = not replay_only
+    agent._constitution_governing_replay_pending = replay_only
+    agent._constitution_audit_pending = False
+    agent._constitution_state_persistence_pending = False
     agent._safe_mode_reason = "secret path /private/constitution must-not-leak"
     agent._safe_mode_entered_at = datetime(
         2026, 7, 17, 12, 0, tzinfo=timezone.utc
@@ -1494,7 +1498,8 @@ def test_health_reports_startup_audit_pending_as_restricted():
     assert record["failures"] == ["startup_audit_required"]
 
 
-def test_detailed_health_cannot_report_healthy_during_safe_mode():
+@pytest.mark.parametrize("replay_only", [False, True], ids=["safe-mode", "pending-governing-replay"])
+def test_detailed_health_cannot_report_healthy_during_safe_mode(replay_only):
     from server import app
 
     @asynccontextmanager
@@ -1506,7 +1511,10 @@ def test_detailed_health_cannot_report_healthy_during_safe_mode():
     original_manager = getattr(app.state, "agent_manager", None)
 
     agent = MagicMock()
-    agent._safe_mode = True
+    agent._safe_mode = not replay_only
+    agent._constitution_governing_replay_pending = replay_only
+    agent._constitution_audit_pending = False
+    agent._constitution_state_persistence_pending = False
     agent._safe_mode_entered_at = None
     agent._constitution_state_load_error = None
     agent._agent_name = "Kite"
@@ -1528,6 +1536,11 @@ def test_detailed_health_cannot_report_healthy_during_safe_mode():
 
     assert response.status_code == 503
     assert response.json()["status"] == "restricted"
+
+    if replay_only:
+        record, = response.json()["constitution_safe_mode"]
+        assert record["state"] == "governing_replay_pending"
+        assert record["failure"] == "governing_replay_pending"
 
 
 def _make_health_agent(status, checks=None):

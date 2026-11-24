@@ -1,7 +1,9 @@
 """Native cross-replica restrictions and hash-bound direct/streamed admission."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager, suppress
+from importlib.resources import files
 from uuid import uuid4
 from unittest.mock import AsyncMock
 
@@ -18,9 +20,18 @@ from tests.unit.test_non_streaming_turn_privacy_span import _configure_turn_prob
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
-async def _ready_turn(storage, *, is_new_identity=True, execution_agent=None):
+def _role_only_revision(content):
+    role = b"Agents may be configured for specific roles:"
+    assert content.count(role) == 1
+    return content.replace(role, role + b" This test agent has an updated role.", 1)
+
+
+async def _ready_turn(storage, *, is_new_identity=True, execution_agent=None, content=None, authority=None):
     native = await _agent(storage, is_new_identity=is_new_identity)
-    content = resolve_governing_constitution_bytes(None)
+    if authority is not None:
+        native._constitution_source_descriptor_path, native._sovereign_trust_root_path = authority
+    if content is None:
+        content = resolve_governing_constitution_bytes(None)
     digest = await storage.store_file(content, "constitution.md")
 
     async def auditor(prompt):
@@ -41,6 +52,55 @@ async def _ready_turn(storage, *, is_new_identity=True, execution_agent=None):
     agent._genesis_audit_cognition_block = ConstitutionMixin._genesis_audit_cognition_block.__get__(agent)
     agent._ensure_genesis_audit_ready = ConstitutionMixin._ensure_genesis_audit_ready.__get__(agent)
     return agent, content
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_fresh_audits_do_not_admit_cognition_after_failed_governing_replay(tmp_path, db_backend):
+    from kestrel_sovereign.agent.constitution import safe_mode_cognition_block
+    from kestrel_sovereign.constitution.publisher import verify_packaged_publisher
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from tests.integration.test_constitution_source_descriptor_e2e import _descriptor_file, _ROOT_DID_DOCUMENT
+
+    release = files("kestrel_sovereign").joinpath("data/constitutions/v2/KESTREL_CONSTITUTION.md")
+    content = release.read_bytes()
+    source = tmp_path / "official-constitution.md"
+    source.write_bytes(content)
+    descriptor = _descriptor_file(tmp_path, source, content)
+    trust_root = tmp_path / "root.json"
+    trust_root.write_text(json.dumps(_ROOT_DID_DOCUMENT))
+
+    async with AsyncStorage(backend=db_backend, agent_id="did:test:turn-replay:" + uuid4().hex) as storage:
+        agent, _ = await _ready_turn(storage, content=content, authority=(descriptor, trust_root))
+        agent._sovereign_trust_root_path = trust_root
+        agent._constitution_source_descriptor_path = descriptor
+        node = await storage.get_node(storage.agent_id)
+        publisher = verify_packaged_publisher(node.properties["constitution_hash"])
+
+        # A completed Genesis content audit without its native publisher
+        # evidence cannot establish edition-two governing authority.
+        ok, _ = await agent._refresh_constitution_host_grants(node)
+        assert not ok
+        await agent._audit_constitution_on_startup()
+        state = await agent._constitution_state_store.load(storage.agent_id)
+        assert state.last_successful_audit_at is not None and not state.safe_mode
+        assert node.properties["genesis_audit"]["status"] == "passed"
+        assert "governing constitution integrity failure" in await agent._genesis_audit_cognition_block("hello")
+        with pytest.raises(ExecutionAuthorityError, match="cognition admission refused"):
+            await agent.require_cognition_admission()
+
+        for diagnostic in ("!verify-constitution", "!reanchor-constitution"):
+            assert await agent._genesis_audit_cognition_block(diagnostic) is None
+            assert safe_mode_cognition_block(agent, diagnostic) is None
+
+        # When the original verified evidence is restored, the same process
+        # resumes from a successful replay without a separate local latch.
+        node.properties["genesis_audit"]["publisher"] = publisher
+        await storage.add_node(node)
+        ok, detail = await agent._verify_constitution_integrity()
+        assert ok, detail
+        assert await agent._genesis_audit_cognition_block("hello") is None
+        assert (await agent.require_cognition_admission())[2] == node.properties["constitution_hash"]
 
 
 @pytest.mark.asyncio
@@ -99,7 +159,7 @@ async def test_turn_cannot_outrun_native_restriction_or_governing_receipt(db_bac
             assert await replica.enter_safe_mode("Another replica committed an integrity restriction")
             assert (await replica._constitution_state_store.load(storage.agent_id)).safe_mode
         else:
-            replacement = content + b"\nNew signed governing revision for the admission race.\n"
+            replacement = _role_only_revision(content)
             canonical = tmp_path / "KESTREL_CONSTITUTION.md"
             canonical.write_bytes(replacement)
             import kestrel_sovereign.config as config
