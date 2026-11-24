@@ -448,9 +448,16 @@ async def test_committed_repair_survives_native_conversation_insert_failure(
         agent = await _agent(storage)
         _privacy(agent, storage, "normal")
         content = resolve_governing_constitution_bytes(None)
-        digest = await storage.store_file(
-            content if same_hash else content + b"\nold", "old.md"
-        )
+        prior = content
+        if not same_hash:
+            # Change Book IV only. The last section defines the amendment
+            # procedure and requires the independent fixed-guarantee authority.
+            role_heading = b"### Section 3: Role-Based Identity\n"
+            assert content.count(role_heading) == 1
+            prior = content.replace(
+                role_heading, role_heading + b"\nPrevious role wording for the repair fixture.\n",
+            )
+        digest = await storage.store_file(prior, "old.md")
         await _identity(storage, {"constitution_hash": digest})
         await agent._anchor_constitution_governance(digest)
         artifact, root = _write_authority_files(tmp_path, content)
@@ -474,6 +481,9 @@ async def test_committed_repair_survives_native_conversation_insert_failure(
         node = await storage.get_node(agent.agent_id)
         assert (
             node.properties["constitution_hash"] == hashlib.sha256(content).hexdigest()
+        )
+        assert agent._constitution_verified_legacy_anchor == (
+            agent.agent_id, node.properties["constitution_hash"],
         )
         assert node.properties["constitution_reanchor"]["signed_artifact_hash"]
     finally:

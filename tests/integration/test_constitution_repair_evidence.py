@@ -380,6 +380,11 @@ async def test_same_hash_signed_repair_restores_content_and_new_signer(
         if damage == "intact":
             assert await storage.files.get_file_metadata(digest) == metadata
         after = (await storage.get_node(identity)).properties
+        if damage.startswith(("wrong-pointer-", "legacy-history-")):
+            receipt = after["constitution_reanchor"]
+            assert receipt["old_hash"] == digest
+            assert receipt["repaired_constitution_pointer"] == prior["constitution_hash"]
+            assert receipt["repaired_constitution_pointer_state"] == "inconsistent"
         assert after["constitution_reanchor"]["signed_artifact_signer"] == new_signer
         assert (
             after["constitution_reanchor_history"][-1]["receipt"]

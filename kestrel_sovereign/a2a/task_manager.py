@@ -49,6 +49,7 @@ from kestrel_sdk.native_a2a.utils.source_ownership import SourceWithdrawal
 from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
+from kestrel_sovereign.hooks.decision_gate import host_approval_scope
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
@@ -752,6 +753,7 @@ class TaskManager:
                 mark_outcome_unknown(task)
                 return task
 
+        @host_approval_scope()
         async def execute_original_skill():
             nonlocal args, session_id
             session_id = session_id or uuid4().hex

@@ -1203,7 +1203,7 @@ class PermissionStore:
         decision: str,
         user_choice: Optional[str] = None,
         args_summary: Optional[str] = None,
-    ) -> None:
+    ) -> int:
         """
         Log a permission decision to the audit log.
 
@@ -1222,13 +1222,14 @@ class PermissionStore:
             # on the column's CURRENT_TIMESTAMP default (which is space-separated,
             # offset-less, and sorts incorrectly against the ISO timestamps other
             # audit sources emit — F092).
-            await db.execute("""
+            cursor = await db.execute("""
                 INSERT INTO security_audit_log
                 (feature_name, tool_name, action, decision, user_choice, args_summary, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (feature_name, tool_name, action, decision, user_choice,
                   args_summary, utc_now_iso()))
             await db.commit()
+            return cursor.lastrowid
 
     async def get_audit_log(self, limit: int = 50) -> List[Dict]:
         """
@@ -1247,7 +1248,7 @@ class PermissionStore:
             # timestamp that sorts incorrectly against ISO rows (F092), and id
             # ordering is format-agnostic and stable.
             cursor = await db.execute("""
-                SELECT feature_name, tool_name, action, decision,
+                SELECT id, feature_name, tool_name, action, decision,
                        user_choice, args_summary, created_at
                 FROM security_audit_log
                 ORDER BY id DESC
@@ -1257,6 +1258,7 @@ class PermissionStore:
 
         return [
             {
+                "id": row["id"],
                 "feature": row["feature_name"],
                 "tool": row["tool_name"],
                 "action": row["action"],

@@ -581,17 +581,16 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     """Return a controlled operator-readiness record for a restricted agent."""
     safe_mode = getattr(agent, "_safe_mode", False) is True
     audit_pending = getattr(agent, "_constitution_audit_pending", False) is True
-    if not safe_mode and not audit_pending:
+    replay_pending = getattr(agent, "_constitution_governing_replay_pending", False) is True
+    if safe_mode:
+        state = "safe_mode"
+    elif replay_pending:
+        state = "governing_replay_pending"
+    elif audit_pending:
+        state = "audit_pending"
+    else:
         return None
-    record = {
-        "agent": agent_name,
-        "state": "safe_mode" if safe_mode else "audit_pending",
-        "error_code": (
-            "constitution_safe_mode"
-            if safe_mode
-            else "constitution_audit_pending"
-        ),
-    }
+    record = {"agent": agent_name, "state": state, "error_code": f"constitution_{state}"}
     entered_at = getattr(agent, "_safe_mode_entered_at", None)
     if isinstance(entered_at, datetime):
         record["entered_at"] = entered_at.isoformat()
@@ -603,6 +602,8 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     # other explanation was reported to the Sovereign as a violation of their
     # constitution whether or not anything failed to verify (#2920).
     failures: list[str] = []
+    if replay_pending:
+        failures.append("governing_replay_pending")
     if audit_pending and not safe_mode:
         failures.append("startup_audit_required")
     if getattr(agent, "_constitution_state_load_error", None):
@@ -639,6 +640,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     # something milder than what is actually true.
     _SEVERITY = [
         "integrity_restriction",
+        "governing_replay_pending",
         "identity_missing",
         "bootstrap_incomplete",
         "memory_unreadable",

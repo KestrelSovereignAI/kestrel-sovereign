@@ -60,6 +60,7 @@ Tools:
 """
 
 import json
+from kestrel_sovereign.hooks.decision_gate import host_approval_scope
 from kestrel_sovereign.execution_custody import is_execution_control_error
 import logging
 import time
@@ -1302,6 +1303,7 @@ class SchedulerFeature(Feature):
                 host=host, selected_generation=selected_generation,
                 validate_registration=validate_registration, complete=complete))
 
+    @host_approval_scope()
     async def _run_tool_hook_gated_body(
         self, feature_name: str, agent_tool: Any, args: dict, *,
         host: Any, selected_generation: int, validate_registration: Callable[[], None],

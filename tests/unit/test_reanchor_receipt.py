@@ -17,7 +17,11 @@ def test_new_receipt_keeps_valid_pointer_or_genuine_absence(pointer):
 
 def test_new_receipt_keeps_corruption_as_diagnostic_not_a_digest():
     prior = reanchor_prior_pointer_fields("db-writer-replaced-hash", "a" * 64)
-    assert prior == {"old_hash": "a" * 64, "repaired_constitution_pointer": "db-writer-replaced-hash"}
+    assert prior == {
+        "old_hash": "a" * 64,
+        "repaired_constitution_pointer": "db-writer-replaced-hash",
+        "repaired_constitution_pointer_state": "malformed",
+    }
     # A diagnostic annotation is never permission to accept a malformed
     # previously committed receipt as historical governing evidence.
     properties = {"constitution_reanchor": {"old_hash": "bad", "new_hash": "a" * 64, "repaired_constitution_pointer": "bad"}}
@@ -63,3 +67,15 @@ def test_new_receipt_validation_precedes_history_publication():
     with pytest.raises(ValueError, match="new_hash"):
         supersede_constitution_reanchor(properties, receipt={"new_hash": None}, provenance="native-test")
     assert properties == before
+
+
+def test_repeated_admission_archives_newly_witnessed_edges_once():
+    from kestrel_sovereign.constitution.reanchor_receipt import retained_constitution_hashes
+
+    current = {"new_hash": "a" * 64, "old_hash": "b" * 64, "signed_artifact_hash": "c" * 64}
+    properties = {"constitution_reanchor": deepcopy(current)}
+    new = {**current, "old_hash": current["new_hash"], "retained_governed_by": ["d" * 64]}
+    for _ in range(2):
+        supersede_constitution_reanchor(properties, edition=2, receipt=new, provenance="native-test")
+        assert "d" * 64 in retained_constitution_hashes(properties)
+        assert [e["receipt"] for e in properties["constitution_reanchor_history"]] == [current]

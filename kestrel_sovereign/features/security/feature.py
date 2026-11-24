@@ -364,7 +364,7 @@ class SecurityFeature(Feature):
 
         # Create security hook
         self.security_hook = SecurityHook(
-            self.permission_store, self.approval_queue
+            self.permission_store, self.approval_queue, agent=self.agent,
         )
 
         # Initialize lock for async init
@@ -1191,7 +1191,7 @@ class SecurityFeature(Feature):
         # privacy regression versus the str-only pre-fix shape, which
         # deliberately omitted args. Filter ``entries`` to the same
         # fields the confirmation displays. (Round 1 codex finding.)
-        _SAFE_AUDIT_FIELDS = ("feature", "tool", "decision", "user_choice", "timestamp")
+        _SAFE_AUDIT_FIELDS = ("id", "feature", "tool", "decision", "user_choice", "timestamp")
         safe_entries = []
         for entry in logs:
             decision_icon = {

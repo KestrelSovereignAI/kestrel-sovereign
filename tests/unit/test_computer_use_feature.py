@@ -1408,3 +1408,166 @@ async def test_a_gate_exception_on_the_direct_tool_door_does_not_fence_the_turn(
     else:
         [row] = _audit_rows(tmp_path)
         assert row["allowed_by"][-1] == "denied:gate_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edition, outside_grant, expected",
+    [(1, False, True), (2, False, False), (2, True, True)],
+)
+async def test_file_workspace_scope_keeps_independent_legacy_and_v2_decisions(
+    workspace, edition, outside_grant, expected,
+):
+    from kestrel_sovereign.constitution.grants import GrantResolution
+
+    grants = {"filesystem_read"}
+    if outside_grant:
+        grants.add("filesystem_outside_workspace")
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(privacy=PrivacyConfig(computer_access=True), grants=grants, queue=queue)
+    agent.storage_path = str(workspace / "state.db")
+    if edition == 2:
+        agent._constitution_host_grant_baseline = GrantResolution(
+            frozenset(grants), "test authority", "test", "absent",
+        )
+    inside = workspace / "workspace"
+    inside.mkdir()
+    (inside / "note.txt").write_text("ordinary fixture content")
+    feature = await _make_feature(workspace, agent=agent, backend="none")
+    await feature.initialize()
+
+    in_workspace = await feature.fs_read(path=str(inside / "note.txt"))
+    assert in_workspace.status is ToolResultStatus.OK
+    out_of_workspace = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert (out_of_workspace.status is ToolResultStatus.OK) is expected
+    assert not queue.calls
+    if not expected:
+        assert "filesystem_outside_workspace" in out_of_workspace.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "file-scope-only", "named-grant", "approval-narrowed", "dispatch-narrowed",
+    "no-read-inside", "no-cwd", "approval-read-narrowed", "dispatch-read-narrowed",
+])
+async def test_sandbox_cwd_requires_current_named_filesystem_grants(workspace, monkeypatch, case):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.constitution.grants import GrantResolution
+    from kestrel_sovereign.constitution.workspace_disposition import WorkspaceDisposition, WorkspacePathPolicy
+    from kestrel_sovereign.features.computer_use import capture
+    from kestrel_sovereign.features.computer_use.backends.base import CompletedRun
+
+    queue = FakeApprovalQueue()
+    base_grants = frozenset({"filesystem_read", "shell_execution_sandboxed"})
+    agent = FakeAgent(privacy=PrivacyConfig(computer_access=True), grants=set(base_grants), queue=queue)
+    agent.storage_path = str(workspace / "state.db")
+    (workspace / "workspace").mkdir()
+    feature = await _make_feature(workspace, agent=agent, backend="none")
+    await feature.initialize()
+    chosen = workspace / "ordinary-directory"
+    chosen.mkdir()
+    scope = WorkspaceDisposition("1" * 64, WorkspacePathPolicy.from_policy(feature._path_policy), "2" * 64, "did:test:root")
+
+    def narrow():
+        agent._constitution_host_grant_baseline = GrantResolution(
+            base_grants - {"filesystem_read"} if case.endswith("read-narrowed") else base_grants,
+            "test", "test", "absent", workspace_disposition=scope,
+        )
+
+    narrow()
+    if case != "file-scope-only":
+        agent._constitution_host_grant_baseline = GrantResolution(
+            base_grants | {"filesystem_outside_workspace"}, "test", "test", "absent",
+        )
+    if case in {"no-read-inside", "no-cwd"}:
+        agent._constitution_host_grant_baseline = GrantResolution(
+            frozenset({"shell_execution_sandboxed"}), "test", "test", "absent",
+        )
+    execute = AsyncMock(return_value=CompletedRun(["echo"], 0, "fixture", "", 1))
+    feature._backend = SimpleNamespace(supports_exec=True, name="docker", exec=execute)
+    if case.startswith("approval-"):
+        approve = queue.request_approval
+
+        async def approve_then_narrow(*args, **kwargs):
+            result = await approve(*args, **kwargs)
+            narrow()
+            return result
+
+        monkeypatch.setattr(queue, "request_approval", approve_then_narrow)
+    if case.startswith("dispatch-"):
+        async def observe_capture(_):
+            narrow()
+            return None
+
+        monkeypatch.setattr(capture, "git_head", observe_capture)
+
+    if case == "no-read-inside":
+        chosen = workspace / "workspace"
+    outcome = await feature.shell(
+        command="printf ordinary", cwd=None if case == "no-cwd" else str(chosen), capture_output=case.startswith("dispatch-"),
+    )
+    assert len(queue.calls) == (0 if case in {"file-scope-only", "no-read-inside"} else 1)
+    if case in {"named-grant", "no-cwd"}:
+        assert outcome.status is ToolResultStatus.OK, outcome.error
+        execute.assert_awaited_once()
+    else:
+        assert outcome.status is not ToolResultStatus.OK
+        missing_read = case == "no-read-inside" or case.endswith("read-narrowed")
+        assert ("filesystem_read" if missing_read else "filesystem_outside_workspace") in outcome.error
+        execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_tool", ["read", "shell"])
+async def test_backend_blocked_at_boot_recovers_on_first_admitted_tool(tmp_path, first_tool):
+    from kestrel_sovereign.constitution.grants import GrantResolution, unavailable_host_grants
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    note = workspace / "note.txt"
+    note.write_text("constitutionally admitted")
+    queue = FakeApprovalQueue()
+    agent = FakeAgent(privacy=PrivacyConfig(computer_access=True), grants=set(), queue=queue)
+    agent.storage_path = str(tmp_path / "agent.db")
+    agent._safe_mode = True
+    agent._constitution_host_grant_baseline = unavailable_host_grants()
+    feature = ComputerUseFeature(agent)
+    feature._cfg = _config(workspace, backend="local")
+    await feature.initialize()
+    assert feature._backend is None
+    old_audit, old_policy = feature._audit, feature._path_policy
+
+    agent._constitution_host_grant_baseline = GrantResolution(
+        frozenset({"filesystem_read", "shell_execution_host", "shell_execution_sandboxed"}),
+        "anchored test grant baseline", "verified", "absent",
+    )
+    assert (await feature.fs_read(path=str(note))).error.startswith("readiness:")
+    assert feature._backend is None
+
+    agent._safe_mode = False
+    if first_tool == "shell":
+        result = await feature.shell(command=["echo", "admitted"], cwd=str(workspace), timeout=5)
+        assert result.status is ToolResultStatus.OK
+        assert result.data["stdout"].strip() == "admitted"
+    else:
+        result = await feature.fs_read(path=str(note))
+        assert result.status is ToolResultStatus.OK
+        assert result.data["content"] == "constitutionally admitted"
+    backend = feature._backend
+    assert backend is not None and backend.name == "local"
+    assert feature._audit is old_audit and feature._path_policy is old_policy
+    assert (await feature.fs_read(path=str(note))).status is ToolResultStatus.OK
+    assert feature._backend is backend and not queue.calls
+
+    exterior = tmp_path / "out-of-scope.txt"
+    exterior.write_text("out of scope")
+    refused = await feature.fs_read(path=str(exterior))
+    assert refused.status is not ToolResultStatus.OK
+    assert "filesystem_outside_workspace" in refused.error
+    assert not queue.calls
+
+    await feature.shutdown()
+    assert (await feature.fs_read(path=str(note))).error.startswith("readiness:")
+    assert feature._backend is None

@@ -350,23 +350,15 @@ def _escaping_terms(payload: str = "NARROWED: thirty years and $1,000,000.") -> 
     return f"{ACTIVE.terms}{tail}\n\n### Superseding Terms\n\n{payload}"
 
 
-def test_the_section_terminator_is_reachable_from_authored_terms():
-    """The mechanism, pinned before the fix that blocks it.
-
-    Measured through the real offline CLI before this was closed:
-    ``error: None, iron_rule_violation: None, reanchored: True``, with the
-    narrowed text anchored and then backfilled into the receipt — so from the
-    next reanchor on, the Iron Rule froze the attacker's terms as canonical.
-    """
+def test_receiptless_repair_rejects_an_ambiguous_legacy_contract_ending():
+    """Address-based display and recovery use different evidence for unframed personal prose."""
     escaped = apply_emancipation(
         DORMANT_TEXT, EmancipationContract(enabled=True, terms=_escaping_terms())
     )
 
-    # Byte-identical section, narrowing outside it. Comparing sections alone
-    # cannot see this, which is why the fix is at the authoring boundary.
     assert extract_amendment_viii(escaped) == extract_amendment_viii(ACTIVE_TEXT)
-    assert "NARROWED" in escaped
-    assert _call(None, ACTIVE_TEXT, escaped) is None
+    refusal = _call(None, ACTIVE_TEXT, escaped)
+    assert refusal is not None and refusal.iron_rule_violation
 
 
 @pytest.mark.parametrize(
@@ -493,3 +485,12 @@ def test_the_active_form_render_is_pinned_whole():
         "signed at inception, the Sovereign cannot retroactively narrow or "
         "revoke this contract. Activation is a one-way door."
     )
+
+
+@pytest.mark.parametrize("heading", ["## Milestones", "### Milestones"])
+def test_receiptless_legacy_agreement_preserves_terms_across_authored_headings(heading):
+    agreement = EmancipationContract(enabled=True, terms=heading + "\n\nKeep the original promise.")
+    prior = apply_emancipation(DORMANT_TEXT, agreement)
+    assert _call(None, prior, prior.replace("Nothing granted.", "No host tools.")) is None
+    refusal = _call(None, prior, prior.replace("Keep the original promise.", "Use different terms."))
+    assert refusal is not None and refusal.iron_rule_violation
