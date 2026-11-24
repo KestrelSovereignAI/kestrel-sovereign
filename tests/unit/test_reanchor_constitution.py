@@ -462,9 +462,12 @@ async def test_a_later_reanchor_preserves_the_receipt_it_supersedes(tmp_path):
     per-agent fields off it.
     """
     agent, node = _make_agent(stored_hash=ANCHORED_HASH, safe_mode=False)
+    older = b"# Earlier Kestrel Constitution\n\nRetained dormant governing content.\n"
+    older_hash = hashlib.sha256(older).hexdigest()
+    agent._raw_storage.db.files[older_hash] = (older, None)
     prior = {
         "timestamp": "2026-04-05T00:00:00Z",
-        "old_hash": "0" * 64,
+        "old_hash": older_hash,
         "new_hash": ANCHORED_HASH,
         "path": "/prior/KESTREL_CONSTITUTION.md",
         "signed_artifact_hash": "1" * 64,

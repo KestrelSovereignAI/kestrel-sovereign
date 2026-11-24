@@ -22,15 +22,49 @@ Glob patterns are honored via ``fnmatch`` (delegated to
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import shlex
+import tomllib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
 from .path_safety import PathSafetyError, match_allow_list, resolve_realpath
+
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
+
+
+def load_computer_use_config(storage_path: str | os.PathLike | None) -> dict:
+    """Read the ComputerUse configuration selected for this agent."""
+    candidates = []
+    if storage_path:
+        storage = Path(storage_path)
+        candidates.extend([storage / "kestrel.toml", storage.parent / "kestrel.toml"])
+    candidates.extend(parent / "kestrel.toml" for parent in Path(__file__).resolve().parents)
+    for candidate in candidates:
+        if candidate.exists():
+            try:
+                with candidate.open("rb") as stream:
+                    data = tomllib.load(stream)
+                return data.get("features", {}).get("computer_use", {}) or {}
+            except (OSError, AttributeError, tomllib.TOMLDecodeError) as exc:
+                logger.warning("failed to read ComputerUse configuration: %s", exc)
+                return {}
+    return {}
+
+
+def path_policy_from_config(config: dict) -> PathPolicy:
+    return PathPolicy(
+        allow=[str(Path(path).expanduser()) for path in config.get("allowed_paths", [])],
+        deny=[str(Path(path).expanduser()) for path in config.get("deny_paths", _DEFAULT_DENY_PATHS)],
+        auto_approve_read=bool(config.get("auto_approve_read", True)),
+    )
 
 
 class Decision(str, Enum):

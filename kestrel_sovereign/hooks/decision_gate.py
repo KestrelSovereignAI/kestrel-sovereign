@@ -18,15 +18,71 @@ apart again: chat, subagent, and scheduler dispatch all route through
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
 
 from kestrel_sdk.hooks.base import PermissionDecision
 
 from kestrel_sovereign.hooks.manager import FailedHookDenial, deciding_hook
 
-__all__ = ["BlockedDecision", "decided_tool_input", "evaluate_blocking_decision"]
+if TYPE_CHECKING:
+    from kestrel_sovereign.constitution.grants import GrantResolution
+
+__all__ = [
+    "ApprovalAuditEvidence", "BlockedDecision", "begin_host_approval", "decided_tool_input",
+    "evaluate_blocking_decision", "host_approval_scope", "take_host_approval",
+]
+
+
+@dataclass
+class ApprovalAuditEvidence:
+    """A committed decision in one agent's security audit."""
+    row_id: int | None = None
+    grant: GrantResolution | None = None
+
+
+@dataclass
+class _HostApprovalTrace:
+    active: bool = True
+    queue: object | None = None
+    tool: str | None = None
+    decision: ApprovalAuditEvidence | None = None
+
+
+_host_approval: ContextVar[_HostApprovalTrace | None] = ContextVar("host_tool_approval_audit", default=None)
+
+
+@asynccontextmanager
+async def host_approval_scope():
+    """Keep an outer hook decision with its own dispatch across child task boundaries."""
+    trace = _HostApprovalTrace()
+    token = _host_approval.set(trace)
+    try:
+        yield
+    finally:
+        trace.active = False
+        _host_approval.reset(token)
+
+
+def begin_host_approval(queue, tool_name: str) -> ApprovalAuditEvidence | None:
+    trace = _host_approval.get()
+    if trace is None or not trace.active:
+        return None
+    trace.queue = queue
+    trace.tool = tool_name.replace("_", "-")
+    trace.decision = ApprovalAuditEvidence()
+    return trace.decision
+
+
+def take_host_approval(queue, tool_name: str) -> ApprovalAuditEvidence | None:
+    trace = _host_approval.get()
+    if trace is None or not trace.active or trace.queue is not queue or trace.tool != tool_name:
+        return None
+    decision, trace.decision = trace.decision, None
+    return decision
 
 
 @dataclass(frozen=True)

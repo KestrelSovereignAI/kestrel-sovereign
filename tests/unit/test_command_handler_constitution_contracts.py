@@ -37,3 +37,12 @@ async def test_verify_constitution_enters_safe_mode_on_failure():
     assert result == "🚨 Integrity failure\n\nAgent has entered SAFE MODE. Contact administrator."
     assert agent._constitution_verified is False
     agent.enter_safe_mode.assert_awaited_once_with("Integrity failure")
+
+
+@pytest.mark.asyncio
+async def test_safe_mode_reports_governing_replay_even_with_a_completed_audit():
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(_safe_mode=False, _constitution_audit_pending=False, _constitution_governing_replay_pending=True)
+    status = await CommandHandler(agent)._cmd_safe_mode("!safe-mode")
+    assert "Governing constitution integrity" in status and "restricted" in status

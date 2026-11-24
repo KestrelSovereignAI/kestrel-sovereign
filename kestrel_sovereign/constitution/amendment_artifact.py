@@ -50,6 +50,12 @@ def canonical_amendment_bytes(artifact: Mapping[str, Any]) -> bytes:
         "created_at": artifact.get("created_at"),
         "reason": artifact.get("reason", ""),
     }
+    for extra in (
+        "transition", "grant_baseline", "historical_promises", "emancipation_activation",
+        "legacy_fixed_amendment", "offline_grant_observation", "publisher_release", "workspace_disposition",
+    ):
+        if extra in artifact:
+            signed_fields[extra] = artifact[extra]
     return json.dumps(
         signed_fields,
         sort_keys=True,
@@ -66,6 +72,14 @@ def build_legacy_signed_reanchor_artifact(
     created_at: Optional[str] = None,
     reason: str = "",
     kid: str = "keys-1",
+    transition: Mapping[str, Any] | None = None,
+    grant_baseline: Mapping[str, Any] | None = None,
+    offline_grant_observation: Mapping[str, Any] | None = None,
+    publisher_release: Mapping[str, str] | None = None,
+    historical_promises: list[Mapping[str, Any]] | None = None,
+    emancipation_activation: Mapping[str, Any] | None = None,
+    legacy_fixed_amendment: Mapping[str, Any] | None = None,
+    workspace_disposition: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a detached ECDSA-signed reanchor artifact for operator tooling."""
     artifact: dict[str, Any] = {
@@ -77,6 +91,22 @@ def build_legacy_signed_reanchor_artifact(
         "created_at": created_at or datetime.now(timezone.utc).isoformat(),
         "reason": reason,
     }
+    if transition is not None:
+        artifact["transition"] = dict(transition)
+    if grant_baseline is not None:
+        artifact["grant_baseline"] = dict(grant_baseline)
+    if offline_grant_observation is not None:
+        artifact["offline_grant_observation"] = dict(offline_grant_observation)
+    if publisher_release is not None:
+        artifact["publisher_release"] = dict(publisher_release)
+    if historical_promises is not None:
+        artifact["historical_promises"] = [dict(item) for item in historical_promises]
+    if emancipation_activation is not None:
+        artifact["emancipation_activation"] = dict(emancipation_activation)
+    if legacy_fixed_amendment is not None:
+        artifact["legacy_fixed_amendment"] = dict(legacy_fixed_amendment)
+    if workspace_disposition is not None:
+        artifact["workspace_disposition"] = dict(workspace_disposition)
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
     sig = suite.sign(canonical_amendment_bytes(artifact), private_key)
     artifact["signature"] = {
@@ -96,6 +126,14 @@ def build_hybrid_signed_reanchor_artifact(
     reason: str = "",
     classical_kid: str = "key-1",
     pq_kid: str = "key-2",
+    transition: Mapping[str, Any] | None = None,
+    grant_baseline: Mapping[str, Any] | None = None,
+    offline_grant_observation: Mapping[str, Any] | None = None,
+    publisher_release: Mapping[str, str] | None = None,
+    historical_promises: list[Mapping[str, Any]] | None = None,
+    emancipation_activation: Mapping[str, Any] | None = None,
+    legacy_fixed_amendment: Mapping[str, Any] | None = None,
+    workspace_disposition: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a detached hybrid-signed reanchor artifact for operator tooling."""
     artifact: dict[str, Any] = {
@@ -107,6 +145,22 @@ def build_hybrid_signed_reanchor_artifact(
         "created_at": created_at or datetime.now(timezone.utc).isoformat(),
         "reason": reason,
     }
+    if transition is not None:
+        artifact["transition"] = dict(transition)
+    if grant_baseline is not None:
+        artifact["grant_baseline"] = dict(grant_baseline)
+    if offline_grant_observation is not None:
+        artifact["offline_grant_observation"] = dict(offline_grant_observation)
+    if publisher_release is not None:
+        artifact["publisher_release"] = dict(publisher_release)
+    if historical_promises is not None:
+        artifact["historical_promises"] = [dict(item) for item in historical_promises]
+    if emancipation_activation is not None:
+        artifact["emancipation_activation"] = dict(emancipation_activation)
+    if legacy_fixed_amendment is not None:
+        artifact["legacy_fixed_amendment"] = dict(legacy_fixed_amendment)
+    if workspace_disposition is not None:
+        artifact["workspace_disposition"] = dict(workspace_disposition)
     artifact["signatures"] = sign_hybrid(
         canonical_amendment_bytes(artifact),
         keypair,

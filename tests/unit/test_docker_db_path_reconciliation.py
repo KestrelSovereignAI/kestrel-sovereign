@@ -44,6 +44,14 @@ def test_runtime_images_install_uv_hold_filesystem_sandbox():
         assert "bubblewrap \\" in lines, dockerfile
 
 
+def test_agent_images_install_the_offline_constitution_verifier():
+    for dockerfile in UV_RUNTIME_DOCKERFILES:
+        steps = _read(dockerfile).splitlines()
+        install = steps.index("RUN sh docker/install_constitution_verifier.sh")
+        assert steps.index("COPY . .") < install, dockerfile
+        assert all(not step.startswith("USER ") for step in steps[:install]), dockerfile
+
+
 def test_single_agent_dockerfiles_use_agent_data_dir_for_db_path():
     dockerfiles = [
         "Dockerfile",

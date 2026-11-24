@@ -1116,7 +1116,9 @@ class CodexAdapter(LLMAdapter):
             return None
         try:
             agent_data = Path(storage_path).parent
-            workspace = agent_data / "workspace"
+            from kestrel_sovereign.paths import agent_workspace_path
+
+            workspace = agent_workspace_path(storage_path)
             workspace.mkdir(parents=True, exist_ok=True)
             # Codex review P0: refuse if the path is a symlink at any
             # point (the target leaf or any ancestor up to agent_data).

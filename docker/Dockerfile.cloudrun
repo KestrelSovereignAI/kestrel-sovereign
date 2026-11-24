@@ -24,6 +24,7 @@ COPY --from=uv /uv /usr/local/bin/uv
 
 # Copy application source code
 COPY . .
+RUN sh docker/install_constitution_verifier.sh
 
 # Make entrypoint executable
 RUN chmod +x /app/docker/cloudrun_entrypoint.sh

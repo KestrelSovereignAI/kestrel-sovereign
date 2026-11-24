@@ -5,6 +5,8 @@
 
 # Publishers and operators must obtain the same constitutional release bytes.
 /kestrel_sovereign/data/constitutions/*/*.md text eol=lf
+/kestrel_sovereign/data/constitutions/*/publisher/** -text
+/docker/install_constitution_verifier.sh text eol=lf
 
 # Reproducible custody bytes, independent of an operator's Git line endings.
 tests/interop/a2a_tck/* text eol=lf

@@ -95,6 +95,7 @@ class PendingListResponse(BaseModel):
 
 class AuditLogEntry(BaseModel):
     """Single audit log entry."""
+    id: Optional[int] = None
     feature: str
     tool: str
     action: str
@@ -549,6 +550,7 @@ async def get_audit_log(request: Request, limit: int = Query(50, ge=1, le=500)):
     return AuditLogResponse(
         logs=[
             AuditLogEntry(
+                id=log.get("id"),
                 feature=log["feature"],
                 tool=log["tool"],
                 action=log["action"],
