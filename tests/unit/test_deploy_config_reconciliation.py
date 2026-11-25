@@ -166,15 +166,14 @@ def test_dev_profile_uses_multi_agent_image(live_config):
     )
 
 
-async def test_azure_mount_rejection_is_scoped_to_its_deploy(live_config):
-    live_config["profiles"]["azure-dev"]["secret_files"] = {
-        "/run/secrets/demo": "demo-seed:1",
-    }
+@pytest.mark.parametrize("field, reference", [("secret_files", "demo-seed:1"), ("secret_file_adoptions", "manual-demo")])
+async def test_azure_mount_rejection_is_scoped_to_its_deploy(live_config, field, reference):
+    live_config["profiles"]["azure-dev"][field] = {"/run/secrets/demo": reference}
     manager = DeployManager(config=live_config)
     assert manager.get_profile("dev").provider is DeployProviderType.CLOUD_RUN
     profile = manager.get_profile("azure-dev")
     provider = AzureContainerProvider(subscription_id="test", resource_group="test")
-    with pytest.raises(DeployManagerError, match="secret_files is supported only on Cloud Run"):
+    with pytest.raises(DeployManagerError, match=f"{field} is supported only on Cloud Run"):
         await provider.deploy("registry.test/kestrel:demo", profile.service_name, profile)
 
 
@@ -272,6 +271,35 @@ def test_prod_profile_declares_explicit_native_a2a_authority(live_config):
     assert env["KESTREL_A2A_DISCOVERY_AGENT"] == "${KESTREL_PROD_EXPECTED_DID}"
     assert env["KESTREL_A2A_PUSH_ENABLED"] == "false"
     assert env["KESTREL_A2A_PEER_POLICY"] == "isolated"
+
+
+def test_prod_profile_preserves_serving_constitution_and_audit_pins(live_config):
+    prod = DeployManager(config=live_config).get_profile("prod")
+    source = "/var/run/kestrel-constitution/source/KESTREL_CONSTITUTION.md"
+    descriptor = "/var/run/kestrel-constitution/pin/source.signed.json"
+    root = "/var/run/kestrel-constitution/authority/root.did.json"
+    assert prod.env_vars["KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH"] == descriptor
+    assert prod.env_vars["KESTREL_SOVEREIGN_TRUST_ROOT_PATH"] == root
+    assert prod.secrets["OPENAI_API_KEY"] == "kestrel-prod-openai-key:1"
+    assert prod.secret_files == {
+        source: "kestrel-prod-constitution-source:2",
+        descriptor: "kestrel-prod-constitution-descriptor:2",
+        root: "kestrel-prod-constitution-root:1",
+    }
+    assert prod.secret_file_adoptions == {
+        source: "kestrel-prod-constitution-source-bat-nug",
+        descriptor: "kestrel-prod-constitution-descriptor-kam-dih",
+        root: "kestrel-prod-constitution-root-lax-fud",
+    }
+
+
+def test_tracked_secret_sync_preserves_the_operator_managed_audit_credential(live_config):
+    from kestrel_sovereign.features.deploy.secrets import derive_secret_mapping
+
+    combined = derive_secret_mapping(live_config)
+    assert combined["OPENAI_API_KEY"] == "kestrel-openai-key"
+    assert "kestrel-prod-openai-key" not in combined.values()
+    assert "OPENAI_API_KEY" not in derive_secret_mapping(live_config, profile="prod")
 
 
 def test_prod_publication_resolves_the_existing_pinned_identity(live_config, monkeypatch):

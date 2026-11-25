@@ -130,6 +130,8 @@ class DeploymentProfile:
     gcp_project_id: Optional[str] = None
     azure_resource_group: Optional[str] = None
     secret_files: Dict[str, str] = field(default_factory=dict)
+    # Absolute secret-file path to the existing Cloud Run volume explicitly adopted there.
+    secret_file_adoptions: Dict[str, str] = field(default_factory=dict)
 
     @property
     def is_scale_to_zero(self) -> bool:

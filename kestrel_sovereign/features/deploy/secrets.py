@@ -3,9 +3,9 @@
 This module is the Python port of the bash setup script for sub-PR 1.2 of
 epic #1050 (host-side bash → Python). The original script hardcoded three
 secret names; this implementation derives the (env-var → secret-name)
-mapping directly from ``deploy_config.toml``'s ``[profiles.*.secrets]``
-sections, so adding a new secret to a profile is the only place the
-operator needs to touch.
+mapping from ``deploy_config.toml``'s ``[profiles.*.secrets]`` sections.
+``[secret_sync].operator_managed`` reserves named credentials for explicit
+operator provisioning outside the local .env sync.
 
 Public surface
 --------------
@@ -154,8 +154,8 @@ def derive_secret_mapping(
 
     Args:
         deploy_config: Parsed ``deploy_config.toml`` as a dict (the result
-            of ``toml.load``). Only the ``[profiles.*]`` subtree is
-            consulted.
+            of ``toml.load``). ``[secret_sync].operator_managed`` names
+            destinations excluded from every sync, including a single profile.
         profile: If given, only that profile's ``[profiles.<name>.secrets]``
             section is scanned. If None, all profiles are merged.
 
@@ -167,12 +167,20 @@ def derive_secret_mapping(
 
     Raises:
         ValueError: If two profiles map the same env var to different
-            secret names. That's a config inconsistency the operator
-            should know about, not something we should silently pick a
-            winner for.
+            synchronized secret names, or the operator-managed list is malformed.
         KeyError: If ``profile`` is given but doesn't exist in the config.
     """
     profiles = deploy_config.get("profiles", {}) or {}
+    sync_settings = deploy_config.get("secret_sync", {})
+    if not isinstance(sync_settings, dict):
+        raise ValueError("secret_sync must be a table")
+    operator_managed = sync_settings.get("operator_managed", [])
+    if not isinstance(operator_managed, list) or any(
+        not isinstance(name, str) or not name or name != name.strip() or ":" in name
+        for name in operator_managed
+    ):
+        raise ValueError("secret_sync.operator_managed must list Secret Manager names without versions")
+    operator_managed_names = set(operator_managed)
 
     if profile is not None:
         if profile not in profiles:
@@ -220,6 +228,8 @@ def derive_secret_mapping(
                 continue
 
             secret_name = _strip_version(raw_value)
+            if secret_name in operator_managed_names:
+                continue
             existing = mapping.get(env_var)
             if existing is not None and existing != secret_name:
                 raise ValueError(

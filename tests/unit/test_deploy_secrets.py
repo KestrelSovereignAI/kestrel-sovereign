@@ -119,6 +119,26 @@ def test_derive_secret_mapping_all_profiles_dedupes(deploy_config_two_profiles):
     }
 
 
+def test_operator_managed_secret_is_never_a_sync_destination():
+    config = {
+        "secret_sync": {"operator_managed": ["audit-key"]},
+        "profiles": {
+            "dev": {"secrets": {"OPENAI_API_KEY": "shared-key:latest"}},
+            "prod": {"secrets": {"OPENAI_API_KEY": "audit-key:1", "OTHER": "other-key:latest"}},
+            "example": {"secrets": {"AUDIT_ALIAS": "audit-key:latest"}},
+        },
+    }
+    assert derive_secret_mapping(config) == {"OPENAI_API_KEY": "shared-key", "OTHER": "other-key"}
+    assert derive_secret_mapping(config, profile="prod") == {"OTHER": "other-key"}
+    assert derive_secret_mapping(config, profile="example") == {}
+
+
+@pytest.mark.parametrize("entries", ["audit-key", [""], [3], ["audit-key:1"], [" audit-key"]])
+def test_operator_managed_secret_configuration_must_list_names(entries):
+    with pytest.raises(ValueError, match="secret_sync.operator_managed"):
+        derive_secret_mapping({"secret_sync": {"operator_managed": entries}})
+
+
 def test_derive_secret_mapping_skips_dollar_substitutions(
     deploy_config_with_azure_substitutions,
 ):
