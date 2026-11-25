@@ -23,7 +23,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Collection
-from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import (
@@ -1825,7 +1825,7 @@ class SchedulerRunner:
             self._poll_interval,
         )
 
-    async def stop(self, *, publish_stopped: bool = True):
+    async def stop(self, *, publish_stopped: bool = True, status_owner: Any = None):
         self._arm_requested = False
         self._arm_requested_monotonic = None
         self._arm_requested_at = None
@@ -1876,6 +1876,7 @@ class SchedulerRunner:
         try:
             await self._finish_runtime_status_publication(
                 publish_stopped=publish_stopped and pending_cancellation is None,
+                status_owner=status_owner,
                 timeout=(
                     RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS
                     if pending_cancellation is None
@@ -2040,6 +2041,7 @@ class SchedulerRunner:
         self,
         *,
         publish_stopped: bool,
+        status_owner: Any,
         timeout: float,
     ) -> None:
         """Drain owned telemetry before storage teardown, cancelling last."""
@@ -2053,10 +2055,23 @@ class SchedulerRunner:
             if not prior_completed:
                 return
             if publish_stopped and self._database_is_connected():
-                await self._publish_runtime_status_best_effort(
-                    "stopped",
-                    deadline=deadline,
-                )
+                # Stopped status is new optional work. Previous publications
+                # have already been joined under their original admissions.
+                with ExitStack() as stack:
+                    try:
+                        stack.enter_context(bind_execution_runtime(status_owner))
+                    except ExecutionAuthorityError as denial:
+                        if execution_denial_scopes(denial):
+                            logger.debug(
+                                "SchedulerRunner %s skipped stopped status after work retirement",
+                                self._owner_id,
+                            )
+                            return
+                        raise
+                    await self._publish_runtime_status_best_effort(
+                        "stopped",
+                        deadline=deadline,
+                    )
                 await self._join_runtime_status_publish_task(deadline=deadline)
         except asyncio.CancelledError as cancellation:
             publish_task = self._runtime_status_publish_task

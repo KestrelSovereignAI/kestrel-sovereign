@@ -902,12 +902,10 @@ class SchedulerFeature(Feature):
             if self._runner:
                 from kestrel_sovereign.agent.runtime_start import maintenance_boot_active
 
-                if maintenance_boot_active(self.agent):
-                    # Join original owners/publications, but do not create a
-                    # new optional telemetry write after work custody retires.
-                    await self._runner.stop(publish_stopped=False)
-                else:
-                    await self._runner.stop()
+                await self._runner.stop(
+                    publish_stopped=not maintenance_boot_active(self.agent),
+                    status_owner=self.agent,
+                )
         finally:
             # Source ownership must unwind even when runner cancellation is
             # propagated through the feature's bounded shutdown slice.
