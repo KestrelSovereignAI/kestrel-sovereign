@@ -6,12 +6,21 @@ Full configured Frinz recovery remains a separate integration gate.
 """
 
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 
 from kestrel_sovereign.agent.boot import BootPhase, BootPhaseState
 from kestrel_sovereign.agent.runtime_start import MaintenanceBootError
+from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    ExecutionCustody,
+    ProcessRuntimeExecutionFence,
+    bind_execution_runtime,
+    execution_commit_outcome,
+    execution_evidence_carriers,
+)
 from kestrel_sovereign.features.delivery.feature import DeliveryFeature
 from kestrel_sovereign.features.delivery.queue import DeliveryQueue
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
@@ -46,6 +55,83 @@ async def test_maintenance_retirement_joins_without_new_status_publication(tmp_p
         assert runner._runtime_status_publish_task is None
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('authority', ['live', 'retired-owner', 'retired-ambient', 'uncertain'])
+async def test_scheduler_feature_shutdown_only_starts_telemetry_with_work_authority(tmp_path, authority):
+    agent = _make_agent(tmp_path)
+    db = await AsyncDatabase.sqlite(str(tmp_path / 'scheduler-stop-status.db'))
+    feature = SchedulerFeature(agent)
+    runner = feature._runner = SchedulerRunner(db, agent.agent_id, lambda *_: None)
+    await runner._ensure_tables()
+    if authority != 'live':
+        agent._execution_custody = ExecutionCustody(ProcessRuntimeExecutionFence(agent.agent_id))
+
+    try:
+        before = await db.fetchval('SELECT total_changes()')
+        authority_context = bind_execution_runtime(agent) if authority == 'retired-ambient' else nullcontext()
+        with authority_context:
+            if authority.startswith('retired-'):
+                agent._execution_custody.revoke('original hosted agent work retired')
+            if authority == 'uncertain':
+                agent._execution_custody.preserve_commit_uncertainty('unknown')
+                with pytest.raises(ExecutionCommitOutcomeError) as caught:
+                    await feature.shutdown()
+                assert execution_commit_outcome(caught.value) == 'unknown'
+            else:
+                await feature.shutdown()
+        after = await db.fetchval('SELECT total_changes()')
+        if authority != 'live':
+            assert after == before
+        else:
+            assert after > before
+        assert runner._runtime_status_publish_task is None
+    finally:
+        await db.close()
+        await close_agent(agent)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_feature_shutdown_retains_prior_publication_failure(tmp_path):
+    agent = _make_agent(tmp_path)
+    original = ExecutionCustody(ProcessRuntimeExecutionFence(agent.agent_id))
+    agent._execution_custody = original
+    db = await AsyncDatabase.sqlite(str(tmp_path / 'scheduler-stop-pending.db'))
+    feature = SchedulerFeature(agent)
+    runner = feature._runner = SchedulerRunner(db, agent.agent_id, lambda *_: None)
+    await runner._ensure_tables()
+    before = await db.fetchval('SELECT total_changes()')
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    failed_publication = ExecutionCommitOutcomeError('unknown')
+
+    async def original_publication():
+        entered.set()
+        await release.wait()
+        raise failed_publication
+
+    accepted = runner._runtime_status_publish_task = asyncio.create_task(original_publication())
+    shutdown = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        with bind_execution_runtime(agent):
+            original.revoke('original hosted agent work retired')
+            shutdown = asyncio.create_task(feature.shutdown())
+        await asyncio.sleep(0)
+        assert not shutdown.done() and not accepted.done()
+        release.set()
+        with pytest.raises(ExecutionCommitOutcomeError) as caught:
+            await asyncio.wait_for(shutdown, timeout=2)
+        assert execution_commit_outcome(caught.value) == 'unknown'
+        assert any(receipt is failed_publication for receipt in execution_evidence_carriers(caught.value))
+        assert accepted.done() and runner._runtime_status_publish_task is None
+        assert await db.fetchval('SELECT total_changes()') == before
+    finally:
+        release.set()
+        await asyncio.gather(*([accepted, shutdown] if shutdown is not None else [accepted]), return_exceptions=True)
+        await db.close()
+        await close_agent(agent)
 
 
 @pytest.mark.asyncio
