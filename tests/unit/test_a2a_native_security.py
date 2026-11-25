@@ -119,6 +119,30 @@ async def test_only_host_bound_proofs_reach_the_hosted_lease(native_request_admi
     assert not p.state.authorizations
 
 
+async def test_hosted_admission_refuses_uncommitted_nonce_scope(native_request_admission):
+    p = native_request_admission
+    origin = NativeLocalSender(
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: True, nullcontext,
+    )
+
+    @asynccontextmanager
+    async def acquire(_, _require_fresh):
+        pytest.fail("An uncommitted nonce cannot reach hosted admission")
+        yield None
+
+    guard = replace(
+        p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask", local_sender=origin)
+    async with p.backend.transaction():
+        with pytest.raises(ExecutionAuthorityError, match="durable nonce"):
+            async with guard.admit(params, "CancelTask", context):
+                pytest.fail("A nonce inside an outer transaction was admitted")
+    assert not p.state.authorizations
+
+
 async def test_hosted_initial_capacity_rechecks_proof_age(native_request_admission):
     p = native_request_admission
     now = NOW

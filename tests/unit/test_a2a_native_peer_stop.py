@@ -213,9 +213,8 @@ async def test_hosted_verified_peer_stop_uses_one_kind_through_the_real_receipt(
     @asynccontextmanager
     async def acquire(evidence, require_fresh):
         assert not p.lock.locked()
-        assert evidence.kind is NativeRequestKind.PEER_STOP
         assert evidence.origin is origin
-        accepted.append(evidence)
+        accepted.append((evidence, require_fresh is not None))
         if require_fresh is not None:
             require_fresh()
         yield None
@@ -241,7 +240,13 @@ async def test_hosted_verified_peer_stop_uses_one_kind_through_the_real_receipt(
         message = await handler.on_message_send(params, context)
     present, value = embedded_json_value(message.parts[0])
     assert present and value["recorded"] is True
-    assert len(accepted) >= 3 and all(evidence is accepted[0] for evidence in accepted)
+    assert [(evidence.kind, fresh) for evidence, fresh in accepted] == [
+        (NativeRequestKind.PEER_STOP, True),
+        (NativeRequestKind.PEER_STOP, True),
+        (NativeRequestKind.WORK, False),
+    ]
+    assert accepted[0][0] is accepted[1][0]
+    assert accepted[2][0].sender is accepted[0][0].sender
 
 
 async def test_peer_stop_cannot_attach_a_callback_to_its_taskless_message(

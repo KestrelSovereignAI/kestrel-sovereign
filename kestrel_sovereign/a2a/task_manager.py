@@ -2247,6 +2247,12 @@ class TaskManager:
         }
         operation_id = uuid4().hex
         cancel_kwargs["operation_id"] = operation_id
+        hosted_attempt = None
+        if projection_lease is not None:
+            hosted_attempt = self.task_store._prepare_hosted_cancellation(
+                task_id, actor=agent_name, recipient=recipient_agent_id, operation_id=operation_id,
+            )
+            cancel_kwargs["_hosted_attempt"] = hosted_attempt
         if recipient_agent_id is not None:
             cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
         if task_payload is not None:
@@ -2319,22 +2325,26 @@ class TaskManager:
             # original store outcome only after that reconciliation completes.
             store_failure = error
             try:
-                if projection_lease is None:
+                if hosted_attempt is None:
                     current, committed_here = await committed_readback()
                 else:
-                    readback = create_owned_task(
-                        committed_readback(), name="a2a-hosted-cancellation-readback",
-                    )
+                    # Original lease holders join this fixed readback even
+                    # when successful Work loans and ordinary SQL are denied.
+                    with bind_execution_cleanup(self):
+                        readback = create_owned_task(
+                            self.task_store._confirm_hosted_cancellation(hosted_attempt),
+                            name="a2a-hosted-cancellation-readback",
+                        )
                     observed = await await_owned_task(readback, retain_cancellations=True)
                     if observed.error is not None:
                         raise execution_observation_error(observed.error, observed.cancellation)
-                    if observed.result is None:
-                        raise ExecutionAuthorityError("Native cancellation readback has no original result")
                     store_failure = execution_observation_error(error, observed.cancellation)
-                    current, committed_here = observed.result
+                    current, committed_here = observed.result, observed.result is not None
             except BaseException as reconciliation_failure:  # noqa: BLE001 - preserve both native outcomes before re-raising
                 if rollback_local_intent is not None and execution_commit_outcome(error) != "committed":
                     rollback_local_intent()
+                if projection_lease is not None:
+                    raise execution_observation_error(store_failure, reconciliation_failure)
                 raise execution_terminal_error(error, reconciliation_failure)
             if not committed_here:
                 if rollback_local_intent is not None:
@@ -2387,14 +2397,15 @@ class TaskManager:
         body_failure: BaseException | None = None
 
         def committed_failure(*failures: BaseException | None) -> BaseException | None:
-            error = execution_terminal_error(store_failure, *failures, retain_originals=True)
-            if projection_lease is not None and error is not None:
+            if projection_lease is not None:
+                if store_failure is None and not any(failure is not None for failure in failures):
+                    return None
                 # Retain the cancellation operation even if a different
                 # projection COMMIT is uncertain. The general classifier may
                 # still report unknown; this exact operation remains proven.
                 evidence = NativeCancellationCommitEvidence(task_id, operation_id)
-                return execution_observation_error(evidence, error)
-            return error
+                return execution_observation_error(evidence, store_failure, *failures)
+            return execution_terminal_error(store_failure, *failures, retain_originals=True)
 
         try:
             receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}

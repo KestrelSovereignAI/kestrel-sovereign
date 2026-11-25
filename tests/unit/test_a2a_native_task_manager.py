@@ -44,8 +44,12 @@ from kestrel_sovereign.a2a.task_manager import (
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
+    ExecutionCustody,
+    ProcessRuntimeExecutionFence,
+    bind_execution_custody_snapshot,
     execution_commit_outcome,
     execution_evidence_carriers,
+    require_execution_work,
 )
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import manager_for
@@ -164,7 +168,7 @@ async def test_hosted_cancel_keeps_exact_transition_evidence_if_projection_is_un
 async def test_hosted_cancel_joins_original_readback_before_repeated_withdrawal(manager, monkeypatch):
     original = await admit(manager)
     storage_cancel = manager.task_store.cancel_if_authorized
-    storage_readback = manager.task_store.get_cancellation_operation_id
+    storage_readback = manager.task_store._confirm_hosted_cancellation
     confirmed = ExecutionCommitOutcomeError("committed")
     reading, permit, projected = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
@@ -191,7 +195,7 @@ async def test_hosted_cancel_joins_original_readback_before_repeated_withdrawal(
             pass
 
     monkeypatch.setattr(manager.task_store, "cancel_if_authorized", observed_commit)
-    monkeypatch.setattr(manager.task_store, "get_cancellation_operation_id", held_readback)
+    monkeypatch.setattr(manager.task_store, "_confirm_hosted_cancellation", held_readback)
     worker = asyncio.create_task(operate())
     try:
         async with asyncio.timeout(3):
@@ -210,6 +214,47 @@ async def test_hosted_cancel_joins_original_readback_before_repeated_withdrawal(
     finally:
         permit.set()
         await await_owned_task(worker)
+
+
+async def test_hosted_cancel_readback_does_not_reopen_work_when_original_custody_is_uncertain(
+    manager, monkeypatch,
+):
+    if not manager.task_store.is_postgres:
+        pytest.skip("process admission requires actual PostgreSQL custody")
+    original = await admit(manager)
+    storage_cancel = manager.task_store.cancel_if_authorized
+    custody = ExecutionCustody(ProcessRuntimeExecutionFence("did:kestrel:recipient"))
+    lost = ExecutionCommitOutcomeError("unknown")
+    wake_cancelled = []
+
+    async def lose_ack_after_native_commit(*args, **kwargs):
+        cancelled = await storage_cancel(*args, **kwargs)
+        assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
+        custody.preserve_commit_uncertainty("unknown")
+        raise lost
+
+    @asynccontextmanager
+    async def ordinary_projection():
+        require_execution_work()
+        yield
+
+    monkeypatch.setattr(manager.task_store, "cancel_if_authorized", lose_ack_after_native_commit)
+    monkeypatch.setattr(manager, "_on_task_cancelled", wake_cancelled.append)
+    with bind_execution_custody_snapshot((custody,)):
+        with pytest.raises(ExceptionGroup) as failed:
+            async with manager._cancel_task_and_project(
+                original.id, agent_name="did:kestrel:sender",
+                recipient_agent_id="did:kestrel:recipient", projection_lease=ordinary_projection,
+            ):
+                pass
+        with pytest.raises(ExecutionCommitOutcomeError):
+            require_execution_work()
+    evidence = execution_evidence_carriers(failed.value)
+    assert any(member is lost for member in evidence)
+    exact = [member for member in evidence if isinstance(member, NativeCancellationCommitEvidence)]
+    assert len(exact) == 1 and exact[0].task_id == original.id
+    assert [task.id for task in wake_cancelled] == [original.id]
+    assert exact[0].operation_id == await manager.task_store.get_cancellation_operation_id(original.id)
 
 
 async def test_context_admission_cannot_use_a_different_connection(

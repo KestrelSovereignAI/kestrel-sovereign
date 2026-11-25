@@ -35,6 +35,7 @@ from kestrel_sovereign.a2a.native_sender import (
     authenticate_native_request,
     reserve_native_sender_nonce,
 )
+from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
@@ -172,6 +173,8 @@ class NativeDIDRequestGuard:
             self.local_admission, NativeHostedLocalAdmission
         ):
             raise TypeError("Hosted local admission requires its typed lease contract")
+        if self.local_admission is not None and not isinstance(self.replay_store, SharedReplayNonceStore):
+            raise TypeError("Hosted local admission requires durable shared nonce storage")
 
     def _new_authority(self) -> NativeRequestAuthority:
         authority = self.authority_factory()
@@ -335,6 +338,7 @@ class NativeDIDRequestGuard:
                     origin = native_local_sender(context)
                     refusal = self._local_sender_decision(sender, origin)
                     if refusal is None:
+                        self.replay_store.require_outermost_reservation()
                         reserved = await self._spend_under_recipient_custody(sender, now_ts)
                         if isinstance(reserved, StreamRefusal):
                             refusal = reserved
@@ -524,6 +528,7 @@ class NativeDIDRequestGuard:
     @asynccontextmanager
     async def _retained_request_lease(
         self, admitted: AuthorizedNativeRequest[_Request], *, workload_only: bool,
+        first_effect: bool,
     ) -> AsyncIterator[StreamRefusal | None]:
         verified = admitted.verified_admission
         if self.local_admission is None:
@@ -536,13 +541,13 @@ class NativeDIDRequestGuard:
         else:
             if workload_only and verified.kind is not NativeRequestKind.WORK:
                 verified = replace(verified, kind=NativeRequestKind.WORK)
-            async with self._verified_local_lease(verified) as refused:
+            async with self._verified_local_lease(verified, initial=first_effect) as refused:
                 yield refused
 
     @asynccontextmanager
     async def hold_authority(
         self, admitted: AuthorizedNativeRequest[_Request], *,
-        refusal_values: bool = False, workload_only: bool = False,
+        refusal_values: bool = False, workload_only: bool = False, first_effect: bool = False,
     ) -> AsyncIterator[StreamRefusal | None]:
         """Recheck a waiting request before its next authorized read or event.
 
@@ -566,7 +571,9 @@ class NativeDIDRequestGuard:
             refused = None
             async with (
                 _native_persistence_errors(),
-                self._retained_request_lease(admitted, workload_only=workload_only) as lease_refusal,
+                self._retained_request_lease(
+                    admitted, workload_only=workload_only, first_effect=first_effect,
+                ) as lease_refusal,
             ):
                 refused = lease_refusal
                 if refused is None and self.check_recipient_custody is not None:

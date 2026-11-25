@@ -428,7 +428,9 @@ class NativeA2ARequestHandler(RequestHandler):
             from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
 
             async with AsyncExitStack() as outcome:
-                async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+                async with self.guard.hold_authority(
+                    admitted, refusal_values=True, first_effect=True,
+                ) as refused:
                     if isinstance(refused, StreamRefusal):
                         return refused
                     # The taskless operation starts here. Register the SAME
@@ -564,7 +566,9 @@ class NativeA2ARequestHandler(RequestHandler):
     @asynccontextmanager
     async def _response_authority(self, admitted: AuthorizedNativeRequest, result: Task | Message):
         """A later denial cannot retroactively turn an effect into refusal."""
-        async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+        async with self.guard.hold_authority(
+            admitted, refusal_values=True, workload_only=isinstance(result, Message),
+        ) as refused:
             if isinstance(refused, StreamRefusal):
                 self._raise_response_failure(result, refused.error)
             yield

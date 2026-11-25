@@ -7,6 +7,7 @@ primary database shares that replay decision across workers or instances.
 from __future__ import annotations
 
 from kestrel_sovereign.a2a.native_schema import native_schema_write
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.storage.db.after_commit import call_after_backend_commit
 
 
@@ -49,6 +50,11 @@ class SharedReplayNonceStore:
 
     def _record_initialized(self) -> None:
         self._initialized = True
+
+    def require_outermost_reservation(self) -> None:
+        """Hosted admission must not use a rollback-capable nonce reservation."""
+        if getattr(self._db, "owns_open_transaction", None) is not False:
+            raise ExecutionAuthorityError("Native hosted admission requires a durable nonce")
 
     async def reserve(
         self,
