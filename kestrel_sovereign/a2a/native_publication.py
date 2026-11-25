@@ -29,6 +29,10 @@ from kestrel_sovereign.a2a.native_client import (
     NativeReconciliationPolicy,
     NativeSenderInterceptor,
 )
+from kestrel_sovereign.a2a.native_context import (
+    NativeLocalSender,
+    _bind_native_local_sender,
+)
 from kestrel_sovereign.a2a.native_host import create_hosted_native_guard
 from kestrel_sovereign.a2a.native_routes import (
     NativeA2AHTTP,
@@ -36,7 +40,10 @@ from kestrel_sovereign.a2a.native_routes import (
     native_http_interfaces,
 )
 from kestrel_sovereign.a2a.native_security import NativeDIDRequestGuard
-from kestrel_sovereign.a2a.native_sender import NativeProofPolicy
+from kestrel_sovereign.a2a.native_sender import (
+    NativeProofPolicy,
+    verification_document_fingerprint,
+)
 from kestrel_sovereign.a2a.push_policy import NativePushPolicy
 from kestrel_sovereign.a2a.push_service import start_native_push_service
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
@@ -278,7 +285,9 @@ class NativeA2APublication:
         identity = self.recipient.identity
         scope = self.recipient.task_manager.task_store.scope
         if self._seeded_registration is not None:
-            from kestrel_sovereign.identity.demo_seed import demo_signing_key_fingerprint
+            from kestrel_sovereign.identity.demo_seed import (
+                demo_signing_key_fingerprint,
+            )
 
             if getattr(identity, "signing_did", None) != self._seeded_registration.signing_did:
                 raise ValueError("A seeded demo must publish with its pinned signing DID")
@@ -349,16 +358,22 @@ class NativeA2APublication:
         return self._binding is not None and self.registry.is_current(self._binding)
 
     def inprocess_http_transport(
-        self, app: Starlette, *, buffer_bytes: int = 65536,
+        self, app: Starlette, *,
+        source: "NativeA2APublication | None" = None,
+        buffer_bytes: int = 65536,
     ) -> httpx.AsyncBaseTransport:
         """Select this exact published recipient inside its original application.
 
         The normal signed SDK and recipient guards remain authoritative. This
-        binding is routing/lifetime custody only; it grants no sender permission.
+        binding alone grants no sender permission. Where supplied, the exact
+        source publication is carried out of band and checked against the
+        independently verified signing document before hosted admission.
         Client read/write deadlines must be finite; pending physical retirement
         is an original private cleanup debt, never a successful close.
         """
-        from kestrel_sovereign.a2a.native_inprocess_http import _NativeInProcessHTTPTransport
+        from kestrel_sovereign.a2a.native_inprocess_http import (
+            _NativeInProcessHTTPTransport,
+        )
         from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 
         self.registry.require_application(app)
@@ -368,6 +383,8 @@ class NativeA2APublication:
         if binding is None or not self.is_published:
             raise ExecutionAuthorityError("Native in-process recipient is not published")
 
+        local_sender = self._local_transport_sender(source) if source is not None else None
+
         def require_binding(scope):
             self.registry.require_application(app)
             if (self._binding is not binding or self.recipient is not recipient
@@ -376,16 +393,55 @@ class NativeA2APublication:
                     or not self.registry.is_current(binding)
                     or self.registry.resolve(scope) is not binding):
                 raise ExecutionAuthorityError("Original native in-process recipient changed")
+            if local_sender is not None:
+                _bind_native_local_sender(scope, local_sender)
 
         return _NativeInProcessHTTPTransport(
             application=app, public_base_url=configuration.public_base_url,
             require_binding=require_binding, buffer_bytes=buffer_bytes,
         )
 
+    def _local_transport_sender(self, source: "NativeA2APublication") -> NativeLocalSender:
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+        if (
+            not isinstance(source, NativeA2APublication)
+            or source.registry is not self.registry
+            or not source.is_published
+        ):
+            raise ExecutionAuthorityError("Native in-process source is not published by this host")
+        binding, recipient = source._binding, source.recipient
+        identity, manager = recipient.identity, recipient.task_manager
+        signing_did = identity.signing_did
+
+        def fingerprint():
+            return verification_document_fingerprint({
+                "id": identity.signing_did,
+                "verificationMethod": identity.new_verification_methods,
+            })
+
+        original_fingerprint = fingerprint()
+
+        def is_current():
+            return (
+                source.registry is self.registry
+                and source._binding is binding
+                and source.recipient is recipient
+                and source.is_published
+                and recipient.identity is identity
+                and recipient.task_manager is manager
+                and identity.signing_did == signing_did
+                and fingerprint() == original_fingerprint
+            )
+
+        return NativeLocalSender(source, signing_did, original_fingerprint, is_current)
+
     async def _verify_seeded_database(self) -> None:
         if self._seeded_registration is None:
             return
-        from kestrel_sovereign.identity.demo_seed import read_seeded_signing_key_fingerprint
+        from kestrel_sovereign.identity.demo_seed import (
+            read_seeded_signing_key_fingerprint,
+        )
 
         fingerprint = await read_seeded_signing_key_fingerprint(
             self.recipient.task_manager.task_store.backend, self.configuration.ephemeral_tenant,

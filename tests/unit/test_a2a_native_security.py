@@ -1,17 +1,26 @@
 """Real hybrid proof and durable recipient admission around canonical storage."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
-from kestrel_sdk.native_a2a.types import GetTaskRequest
+from kestrel_sdk.native_a2a.types import CancelTaskRequest, GetTaskRequest
 from kestrel_sdk.native_a2a.utils.errors import (
     ExtensionSupportRequiredError,
     InvalidParamsError,
 )
 from starlette.exceptions import HTTPException
 
-from kestrel_sovereign.a2a.native_sender import SENDER_PROOF_HEADER
+from kestrel_sovereign.a2a.native_context import NativeLocalSender
+from kestrel_sovereign.a2a.native_security import (
+    NativeHostedLocalAdmission,
+    NativeRequestKind,
+)
+from kestrel_sovereign.a2a.native_sender import (
+    SENDER_PROOF_HEADER,
+    verification_document_fingerprint,
+)
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.storage.db.interface import QueryError
@@ -23,6 +32,70 @@ from tests.utils.native_a2a_security import (
     send,
     signed_context,
 )
+
+
+@pytest.mark.parametrize("operation,expected", [
+    ("GetTask", NativeRequestKind.WORK),
+    ("CancelTask", NativeRequestKind.CANCEL_TASK),
+])
+async def test_verified_local_admission_retains_original_evidence(
+    native_request_admission, operation, expected,
+):
+    p = native_request_admission
+    acquired = []
+    current = True
+    origin = NativeLocalSender(
+        object(), SENDER, verification_document_fingerprint(p.signing[1]), lambda: current,
+    )
+
+    @asynccontextmanager
+    async def acquire(evidence):
+        assert not p.lock.locked()
+        assert evidence.origin is origin
+        assert evidence.sender.sender == SENDER
+        assert evidence.kind is expected
+        acquired.append(evidence)
+        async with p.guard.lifecycle_lease():
+            yield None
+
+    guard = replace(
+        p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    request_type = CancelTaskRequest if operation == "CancelTask" else GetTaskRequest
+    params = request_type(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation=operation, local_sender=origin)
+    async with guard.admit(params, operation, context) as admitted:
+        assert admitted.principal_id == PRINCIPAL
+        assert admitted.verified_admission is acquired[0]
+    async with guard.hold_authority(admitted):
+        assert p.lock.locked()
+    assert len(acquired) == 2 and acquired[0] is acquired[1]
+    current = False
+    with pytest.raises(HTTPException) as retired:
+        async with guard.hold_authority(admitted):
+            pytest.fail("A retained request outlived the original sender")
+    assert retired.value.status_code == 403
+    assert len(acquired) == 2
+
+
+async def test_only_host_bound_proofs_reach_the_hosted_lease(native_request_admission):
+    p = native_request_admission
+
+    @asynccontextmanager
+    async def acquire(_):
+        pytest.fail("Missing hosted provenance must not charge a lease")
+        yield None
+
+    guard = replace(
+        p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask")
+    with pytest.raises(HTTPException) as denied:
+        async with guard.admit(params, "CancelTask", context):
+            pytest.fail("Hosted-local admission requires the original source")
+    assert denied.value.status_code == 403
+    assert not p.state.authorizations
 
 
 async def test_retained_principal_policy_uses_no_new_sender_proof(native_request_admission):
@@ -577,6 +650,7 @@ async def test_extension_activation_remains_bound_to_the_verified_request_during
     native_request_admission,
 ):
     from google.protobuf.json_format import MessageToDict
+
     from kestrel_sovereign.a2a.extensions import (
         CAUSATION_URI,
         causation_metadata,

@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from typing import NoReturn
 from uuid import uuid4
 
+from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.native_a2a.server.context import ServerCallContext
 from kestrel_sdk.native_a2a.server.events.event_queue import Event
 from kestrel_sdk.native_a2a.server.request_handlers import RequestHandler
@@ -44,35 +45,38 @@ from kestrel_sdk.native_a2a.utils.errors import (
     UnsupportedOperationError,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
-from kestrel_sdk.native_a2a.utils.source_ownership import SourceWithdrawal, WakeableSource
+from kestrel_sdk.native_a2a.utils.source_ownership import (
+    SourceWithdrawal,
+    WakeableSource,
+)
 from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.native_a2a.utils.task import (
     apply_history_length,
     validate_history_length,
     validate_page_size,
 )
-from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.security.exceptions import SSRFError
 from starlette.exceptions import HTTPException
 
 from kestrel_sovereign._async_ownership import OriginalContextExit, gather_owned
 from kestrel_sovereign.a2a.extensions import (
-    NativeMessageMetadata,
     PEER_STOP_URI,
+    NativeMessageMetadata,
     parse_message_metadata,
     require_metadata_extensions,
 )
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
-from kestrel_sovereign.a2a.native_input import prepare_native_task_input
 from kestrel_sovereign.a2a.media import (
     encode_inline_json,
     skill_input_modes,
     validate_input_parts,
 )
 from kestrel_sovereign.a2a.native_context import wait_native_disconnect
+from kestrel_sovereign.a2a.native_input import prepare_native_task_input
 from kestrel_sovereign.a2a.native_security import (
     AuthorizedNativeRequest,
     NativeDIDRequestGuard,
+    NativeRequestKind,
 )
 from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
 from kestrel_sovereign.a2a.push_worker import NativePushWorker, PushRetirementPending
@@ -299,7 +303,7 @@ class NativeA2ARequestHandler(RequestHandler):
                 raise
 
     def _submission_claims(
-        self, admitted: AuthorizedNativeRequest[SendMessageRequest]
+        self, params: SendMessageRequest, activated_extensions: frozenset[str],
     ) -> NativeMessageMetadata | StreamRefusal:
         """Validate protocol input without an async/resource lifetime boundary.
 
@@ -307,11 +311,10 @@ class NativeA2ARequestHandler(RequestHandler):
         from manager I/O, original close or authority exit are not intercepted
         by a catch-all around the streaming source.
         """
-        params = admitted.request
         try:
             validate_history_length(params.configuration)
             metadata = MessageToDict(params.metadata)
-            require_metadata_extensions(metadata, admitted.activated_extensions)
+            require_metadata_extensions(metadata, activated_extensions)
             claims = parse_message_metadata(metadata)
             if claims.peer_stop is None:
                 prepare_native_task_input(params)
@@ -370,6 +373,12 @@ class NativeA2ARequestHandler(RequestHandler):
                     return StreamRefusal(error)
         return claims
 
+    def _is_peer_stop(
+        self, params: SendMessageRequest, activated_extensions: frozenset[str],
+    ) -> bool:
+        claims = self._submission_claims(params, activated_extensions)
+        return not isinstance(claims, StreamRefusal) and claims.peer_stop is not None
+
     async def _submit(
         self, admitted: AuthorizedNativeRequest[SendMessageRequest]
     ) -> Task | Message | StreamRefusal:
@@ -383,9 +392,16 @@ class NativeA2ARequestHandler(RequestHandler):
                 refusal = _push_protocol_error(error)
                 refusal.__cause__ = error
                 return StreamRefusal(refusal)
-        claims = self._submission_claims(admitted)
+        claims = self._submission_claims(params, admitted.activated_extensions)
         if isinstance(claims, StreamRefusal):
             return claims
+        verified = admitted.verified_admission
+        if verified is not None and verified.kind is not (
+            NativeRequestKind.PEER_STOP if claims.peer_stop is not None else NativeRequestKind.WORK
+        ):
+            return StreamRefusal(InvalidParamsError(
+                message="Hosted admission does not match the native operation",
+            ))
         if claims.peer_stop is not None:
             from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
 
@@ -566,7 +582,9 @@ class NativeA2ARequestHandler(RequestHandler):
     async def on_message_send(
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> Task | Message:
-        async with self.guard.admit(params, "SendMessage", context) as admitted:
+        async with self.guard.admit(
+            params, "SendMessage", context, classify_peer_stop=self._is_peer_stop,
+        ) as admitted:
             pass
         task = await self._submit(admitted)
         if isinstance(task, StreamRefusal):
@@ -627,7 +645,8 @@ class NativeA2ARequestHandler(RequestHandler):
         self, params: SendMessageRequest, context: ServerCallContext, withdrawal: SourceWithdrawal
     ) -> AsyncGenerator[Event | StreamRefusal]:
         async with self.guard.admit(
-            params, "SendStreamingMessage", context, refusal_values=True
+            params, "SendStreamingMessage", context, refusal_values=True,
+            classify_peer_stop=self._is_peer_stop,
         ) as admitted:
             streaming = (
                 self._card.capabilities.streaming

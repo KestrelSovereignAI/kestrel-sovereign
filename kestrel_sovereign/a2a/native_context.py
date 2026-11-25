@@ -8,20 +8,24 @@ constructing the complete native request used by sender verification.
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
+from google.protobuf.descriptor import FieldDescriptor
+from google.protobuf.message import Message as ProtoMessage
 from kestrel_sdk.native_a2a.server.context import ServerCallContext
 from kestrel_sdk.native_a2a.server.routes.common import DefaultServerCallContextBuilder
 from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
 from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
-from google.protobuf.descriptor import FieldDescriptor
-from google.protobuf.message import Message as ProtoMessage
 from starlette.requests import Request
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 
+if TYPE_CHECKING:
+    from kestrel_sovereign.a2a.native_publication import NativeA2APublication
+
 _CONTEXT_KEY = "kestrel.native_a2a_http_context"
+_LOCAL_SENDER_KEY = "kestrel.native_a2a_local_sender"
 _Request = TypeVar("_Request", bound=ProtoMessage)
 _Decision = TypeVar("_Decision")
 
@@ -54,6 +58,16 @@ class _NativeHTTPRequest:
     request: Request
 
 
+@dataclass(frozen=True, eq=False)
+class NativeLocalSender:
+    """Original source selected by the host's in-process transport, not the wire."""
+
+    publication: "NativeA2APublication"
+    signing_did: str
+    verification_document_fingerprint: str
+    is_current: Callable[[], bool]
+
+
 class NativeServerCallContextBuilder(DefaultServerCallContextBuilder):
     """Retain the public Request so asynchronous validation can inspect carriers."""
 
@@ -77,6 +91,16 @@ def _native_http_request(context: ServerCallContext) -> _NativeHTTPRequest:
 def native_header_values(context: ServerCallContext, name: str) -> list[str]:
     """Retain duplicate HTTP headers for the native proof verifier."""
     return _native_http_request(context).request.headers.getlist(name)
+
+
+def _bind_native_local_sender(scope: dict, sender: NativeLocalSender) -> None:
+    scope[_LOCAL_SENDER_KEY] = sender
+
+
+def native_local_sender(context: ServerCallContext) -> NativeLocalSender | None:
+    """Return only transport-owned local provenance; headers are not consulted."""
+    sender = _native_http_request(context).request.scope.get(_LOCAL_SENDER_KEY)
+    return sender if isinstance(sender, NativeLocalSender) else None
 
 
 async def wait_native_disconnect(context: ServerCallContext) -> None:

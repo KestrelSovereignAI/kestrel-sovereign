@@ -24,7 +24,13 @@ from kestrel_sovereign.a2a.extensions import (
 )
 from kestrel_sovereign.a2a.native_card import create_native_agent_card
 from kestrel_sovereign.a2a.native_client import NativePeerSession
+from kestrel_sovereign.a2a.native_context import NativeLocalSender
 from kestrel_sovereign.a2a.native_routes import NativeA2AHTTP
+from kestrel_sovereign.a2a.native_security import (
+    NativeHostedLocalAdmission,
+    NativeRequestKind,
+)
+from kestrel_sovereign.a2a.native_sender import verification_document_fingerprint
 from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
 from tests.unit import (
@@ -33,7 +39,7 @@ from tests.unit import (
     test_peer_stop_signals,
 )
 from tests.utils.native_a2a import manager_for
-from tests.utils.native_a2a_security import PRINCIPAL, signed_context
+from tests.utils.native_a2a_security import PRINCIPAL, SENDER, signed_context
 from tests.utils.native_push import managed_push_service
 
 wire = test_a2a_native_http.wire
@@ -192,6 +198,50 @@ async def receipt(control, params=None, *, streaming=False):
     return value
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_hosted_verified_peer_stop_uses_one_kind_through_the_real_receipt(
+    control, streaming,
+):
+    c = control
+    p = c.wire.admission
+    origin = NativeLocalSender(
+        object(), SENDER, verification_document_fingerprint(p.signing[1]), lambda: True,
+    )
+    accepted = []
+
+    @asynccontextmanager
+    async def acquire(evidence):
+        assert not p.lock.locked()
+        assert evidence.kind is NativeRequestKind.PEER_STOP
+        assert evidence.origin is origin
+        accepted.append(evidence)
+        async with p.guard.lifecycle_lease():
+            yield None
+
+    guard = replace(
+        p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    handler = NativeA2ARequestHandler(c.wire.manager, guard, c.card, peer_stop_target=c.rail.agent)
+    params = request()
+    params.tenant = p.scope.tenant
+    activated = frozenset(item.uri for item in c.card.capabilities.extensions)
+    context = signed_context(
+        p, params,
+        operation="SendStreamingMessage" if streaming else "SendMessage",
+        activated=activated, proof_changes={"extensions": activated}, local_sender=origin,
+    )
+    c.rail.agent._active_request_ids.add("turn-1")
+    if streaming:
+        events = [event async for event in handler.on_message_send_stream(params, context)]
+        assert len(events) == 1 and isinstance(events[0], Message)
+        message = events[0]
+    else:
+        message = await handler.on_message_send(params, context)
+    present, value = embedded_json_value(message.parts[0])
+    assert present and value["recorded"] is True
+    assert len(accepted) >= 3 and all(evidence is accepted[0] for evidence in accepted)
+
+
 async def test_peer_stop_cannot_attach_a_callback_to_its_taskless_message(
     control, monkeypatch
 ):
@@ -264,7 +314,10 @@ async def test_native_stop_requires_current_recipient_authorization(control):
 async def test_post_effect_stop_policy_loss_is_unknown_not_ordinary_refusal(
     control, monkeypatch, streaming
 ):
-    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
 
     c = control
     c.rail.agent._active_request_ids.add("turn-1")
@@ -297,7 +350,11 @@ async def test_post_effect_stop_policy_loss_is_unknown_not_ordinary_refusal(
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("exit_index", [2, 3])
 async def test_actual_stop_lease_exit_retains_taskless_operation_outcome(control, monkeypatch, streaming, exit_index):
-    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers, is_execution_control_error
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
 
     c = control
     c.rail.agent._active_request_ids.add("turn-1")

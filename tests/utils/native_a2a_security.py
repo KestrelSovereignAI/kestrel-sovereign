@@ -7,9 +7,9 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
 from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
-from google.protobuf.json_format import MessageToDict
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
@@ -126,6 +126,7 @@ def signed_context(
     proof_changes=None,
     headers=None,
     activated=EXTENSIONS,
+    local_sender=None,
 ):
     guard = admission.guard
     options = {
@@ -177,6 +178,10 @@ def signed_context(
         },
         receive,
     )
+    if local_sender is not None:
+        from kestrel_sovereign.a2a.native_context import _bind_native_local_sender
+
+        _bind_native_local_sender(request.scope, local_sender)
     context = NativeServerCallContextBuilder(
         NativeRecipientBinding(
             guard.routing_key, guard.scope.recipient_id, guard.scope.tenant, protocol
