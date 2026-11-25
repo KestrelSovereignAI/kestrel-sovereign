@@ -2410,6 +2410,11 @@ class TaskManager:
         try:
             receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}
             previous_state = receipt.get("status_before")
+            if projection_lease is not None:
+                # This only wakes existing, scoped in-process streams with
+                # the committed value. Disclosure still takes their ordinary
+                # read fence. It must not depend on projection capacity.
+                await self._notify_status_update(task, final=True, notify_completion=False)
             if self._on_task_cancelled is not None:
                 try:
                     self._on_task_cancelled(task)
@@ -2477,6 +2482,7 @@ class TaskManager:
                     agent_name=agent_name,
                     is_final=is_final,
                     reason=reason,
+                    notify_stream=projection_lease is None,
                 )
 
         projection = create_owned_task(project(), name="a2a-task-status-projection")
@@ -2595,6 +2601,7 @@ class TaskManager:
         agent_name: str | None,
         is_final: bool,
         reason: str | None = None,
+        notify_stream: bool = True,
     ) -> None:
         """Best-effort projections after the durable task row has committed.
 
@@ -2654,7 +2661,10 @@ class TaskManager:
                 )
 
         try:
-            await self._notify_status_update(task, final=is_final)
+            if notify_stream:
+                await self._notify_status_update(task, final=is_final)
+            else:
+                await self._notify_status_update(task, final=is_final, notify_stream=False)
         except Exception as execution_error:
             if is_execution_control_error(execution_error):
                 raise
@@ -2743,9 +2753,11 @@ class TaskManager:
             if not self._subscribers[task_id]:
                 del self._subscribers[task_id]
 
-    async def _notify_status_update(self, task: Task, final: bool) -> None:
+    async def _notify_status_update(
+        self, task: Task, final: bool, *, notify_completion: bool = True, notify_stream: bool = True,
+    ) -> None:
         """Publish the durable native status; no private final flag crosses wire."""
-        if final and self._on_task_complete is not None:
+        if notify_completion and final and self._on_task_complete is not None:
             candidate = await self.task_store.get_task_snapshot(
                 task.id,
                 recipient_agent_id=self.did,
@@ -2761,6 +2773,8 @@ class TaskManager:
                     if is_execution_control_error(error):
                         raise
                     logger.exception("Task completion callback failed for %s", task.id)
+        if not notify_stream:
+            return
         # A handler can return artifacts in its final Task without calling the
         # incremental artifact API. Publish those durable values before the
         # status that closes the stream. Replacements use the standard ID rule

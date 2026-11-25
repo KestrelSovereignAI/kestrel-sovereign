@@ -157,6 +157,52 @@ async def test_hosted_cancel_refuses_an_outer_transaction_before_transition(mana
     assert current.status.state == original.status.state
 
 
+@pytest.mark.parametrize("projection_available", [False, True])
+async def test_hosted_cancel_wakes_an_original_stream_before_projection_admission(
+    manager, projection_available,
+):
+    task = await admit(manager)
+    source = manager.subscribe(
+        task.id, creator_agent_id="did:kestrel:sender", recipient_agent_id="did:kestrel:recipient",
+    )
+    first = await anext(source)
+    assert first.id == task.id
+    queue = manager._subscribers[task.id][0]
+    projection_requested = False
+
+    @asynccontextmanager
+    async def projection():
+        nonlocal projection_requested
+        projection_requested = True
+        if not projection_available:
+            raise ExecutionAuthorityError("ordinary admission unavailable")
+        yield
+
+    async def cancel():
+        async with manager._cancel_task_and_project(
+            task.id, agent_name="did:kestrel:sender",
+            recipient_agent_id="did:kestrel:recipient", projection_lease=projection,
+        ):
+            assert not projection_requested
+            async with asyncio.timeout(2):
+                terminal = await anext(source)
+            assert isinstance(terminal, TaskStatusUpdateEvent)
+            assert terminal.status.state == TaskState.TASK_STATE_CANCELED
+
+    try:
+        if projection_available:
+            await cancel()
+        else:
+            with pytest.raises(ExceptionGroup) as failed:
+                await cancel()
+            assert execution_commit_outcome(failed.value) == "committed"
+        assert projection_requested and queue.empty()
+        with pytest.raises(StopAsyncIteration):
+            await anext(source)
+    finally:
+        await source.aclose()
+
+
 @pytest.mark.parametrize("native_a2a_backend_factory", ["sqlite"], indirect=True)
 async def test_hosted_sqlite_readback_requires_settled_native_connection(manager):
     store = manager.task_store
