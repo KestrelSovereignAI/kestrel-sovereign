@@ -22,8 +22,10 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sovereign.storage.db.postgres import PostgresBackend
 from tests.integration.test_execution_authority_postgres import GenerationFence
-from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.integration.test_execution_authority_postgres import native_pg as _native_pg
 from tests.unit.test_execution_custody_review43_native import carries
+
+native_pg = _native_pg
 
 
 @pytest.mark.asyncio
@@ -84,7 +86,8 @@ async def test_public_cancel_native_unknown_survives_real_reconciliation_and_lat
         code = getattr(original, "cr_code", None)
         if (
             code is not None
-            and code.co_qualname == "TaskManager._project_status_transition"
+            # The owned projection includes both admission and its body.
+            and code.co_qualname == "TaskManager._finish_status_projection.<locals>.project"
         ):
             refused.append((coroutine, original))
             raise RuntimeError("original A2A projection Task refused")
