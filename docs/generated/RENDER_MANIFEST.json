@@ -4912,6 +4912,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/releases/v0.66.13.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.66.13",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/releases/v0.66.3.md",
       "privacy": "public",
       "render": "public",
