@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import replace
 
 import pytest
@@ -37,10 +37,16 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import Observabili
 from kestrel_sovereign.a2a.stores.unified.session_service import SessionService
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
 from kestrel_sovereign.a2a.task_manager import (
+    NativeCancellationCommitEvidence,
     TaskCancellationAuthorizationError,
     TaskManager,
 )
-from kestrel_sovereign.execution_custody import execution_commit_outcome
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
+    execution_commit_outcome,
+    execution_evidence_carriers,
+)
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import manager_for
 
@@ -115,6 +121,95 @@ async def test_committed_hosted_cancel_joins_projection_admission_on_caller_with
     finally:
         permit.set()
         await await_owned_task(origin)
+
+
+async def test_hosted_cancel_refuses_an_outer_transaction_before_transition(manager):
+    original = await admit(manager)
+    async with manager.task_store.backend.transaction():
+        with pytest.raises(ExecutionAuthorityError, match="outermost commit"):
+            async with manager._cancel_task_and_project(
+                original.id, agent_name="did:kestrel:sender",
+                recipient_agent_id="did:kestrel:recipient", projection_lease=nullcontext,
+            ):
+                pytest.fail("An outer transaction cannot acknowledge durable cancellation")
+    current = await manager.task_store.get_for_creator(
+        original.id, "did:kestrel:sender", recipient_agent_id="did:kestrel:recipient",
+    )
+    assert current.status.state == original.status.state
+
+
+async def test_hosted_cancel_keeps_exact_transition_evidence_if_projection_is_uncertain(manager):
+    original = await admit(manager)
+    uncertain = ExecutionCommitOutcomeError("unknown")
+
+    @asynccontextmanager
+    async def projection():
+        raise uncertain
+        yield
+
+    with pytest.raises(ExceptionGroup) as failed:
+        async with manager._cancel_task_and_project(
+            original.id, agent_name="did:kestrel:sender",
+            recipient_agent_id="did:kestrel:recipient", projection_lease=projection,
+        ):
+            pass
+    evidence = execution_evidence_carriers(failed.value)
+    exact = [member for member in evidence if isinstance(member, NativeCancellationCommitEvidence)]
+    assert len(exact) == 1 and exact[0].task_id == original.id
+    assert exact[0].operation_id == await manager.task_store.get_cancellation_operation_id(original.id)
+    assert any(member is uncertain for member in evidence)
+    assert execution_commit_outcome(failed.value) == "unknown"
+
+
+async def test_hosted_cancel_joins_original_readback_before_repeated_withdrawal(manager, monkeypatch):
+    original = await admit(manager)
+    storage_cancel = manager.task_store.cancel_if_authorized
+    storage_readback = manager.task_store.get_cancellation_operation_id
+    confirmed = ExecutionCommitOutcomeError("committed")
+    reading, permit, projected = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def observed_commit(*args, **kwargs):
+        cancelled = await storage_cancel(*args, **kwargs)
+        assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
+        raise confirmed
+
+    async def held_readback(*args, **kwargs):
+        reading.set()
+        await permit.wait()
+        return await storage_readback(*args, **kwargs)
+
+    @asynccontextmanager
+    async def projection():
+        yield
+        projected.set()
+
+    async def operate():
+        async with manager._cancel_task_and_project(
+            original.id, agent_name="did:kestrel:sender",
+            recipient_agent_id="did:kestrel:recipient", projection_lease=projection,
+        ):
+            pass
+
+    monkeypatch.setattr(manager.task_store, "cancel_if_authorized", observed_commit)
+    monkeypatch.setattr(manager.task_store, "get_cancellation_operation_id", held_readback)
+    worker = asyncio.create_task(operate())
+    try:
+        async with asyncio.timeout(3):
+            await reading.wait()
+            worker.cancel()
+            await asyncio.sleep(0)
+            worker.cancel()
+            await asyncio.sleep(0)
+            assert not worker.done() and not projected.is_set()
+            permit.set()
+            result = await await_owned_task(worker)
+        assert projected.is_set()
+        terminal = result.error or result.cancellation
+        assert execution_commit_outcome(terminal) == "committed"
+        assert any(member is confirmed for member in execution_evidence_carriers(terminal))
+    finally:
+        permit.set()
+        await await_owned_task(worker)
 
 
 async def test_context_admission_cannot_use_a_different_connection(

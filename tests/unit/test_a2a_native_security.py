@@ -147,6 +147,38 @@ async def test_hosted_initial_capacity_rechecks_proof_age(native_request_admissi
     assert expired.value.status_code == 401
 
 
+async def test_hosted_initial_proof_expired_at_preflight_never_queues(native_request_admission):
+    p = native_request_admission
+    now = NOW
+
+    @asynccontextmanager
+    async def source_reader():
+        nonlocal now
+        now += p.guard.proof_policy.max_age_seconds + 1
+        yield None
+
+    origin = NativeLocalSender(
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: True, source_reader,
+    )
+
+    @asynccontextmanager
+    async def acquire(_, _require_fresh):
+        pytest.fail("An expired proof cannot join the capacity queue")
+        yield None
+
+    guard = replace(
+        p.guard, clock=lambda: now,
+        local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask", local_sender=origin)
+    with pytest.raises(HTTPException) as expired:
+        async with guard.admit(params, "CancelTask", context):
+            pytest.fail("An expired hosted proof was admitted")
+    assert expired.value.status_code == 401
+
+
 async def test_retained_principal_policy_uses_no_new_sender_proof(native_request_admission):
     p = native_request_admission
     async with p.guard.hold_retained_authority(PRINCIPAL):

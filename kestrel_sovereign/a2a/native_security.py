@@ -271,6 +271,8 @@ class NativeDIDRequestGuard:
             freshness = partial(self._require_fresh_proof, verified.sender) if initial else None
             async with AsyncExitStack() as leases:
                 try:
+                    if freshness is not None:
+                        freshness()
                     refused = await leases.enter_async_context(OriginalContextExit(
                         self.local_admission.acquire(verified, freshness),
                     ))

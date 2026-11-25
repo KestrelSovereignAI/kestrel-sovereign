@@ -721,6 +721,31 @@ async def test_subscription_publishes_first_event_refusal_after_original_join(wi
     assert not wire.manager._subscribers
 
 
+async def test_subscription_missing_at_disclosure_joins_before_task_not_found(wire, monkeypatch):
+    task = await submit(wire)
+    original_subscribe = wire.manager.subscribe
+    retired = []
+
+    async def remove_after_first_snapshot(*args, **kwargs):
+        source = original_subscribe(*args, **kwargs)
+        try:
+            initial = await anext(source)
+            await wire.admission.backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task.id,))
+            yield initial
+        finally:
+            await source.aclose()
+            retired.append(source)
+
+    monkeypatch.setattr(wire.manager, "subscribe", remove_after_first_snapshot)
+    with pytest.raises(TaskNotFoundError):
+        async for _ in wire.client(streaming=True).subscribe(
+            SubscribeToTaskRequest(id=task.id, tenant=wire.admission.scope.tenant)
+        ):
+            pytest.fail("A missing task exposed a subscription snapshot")
+    assert len(retired) == 1 and retired[0].ag_frame is None
+    assert not wire.manager._subscribers
+
+
 async def test_terminal_cancel_and_subscribe_return_standard_lifecycle_errors(
     wire, monkeypatch
 ):

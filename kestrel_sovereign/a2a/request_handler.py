@@ -255,12 +255,15 @@ class NativeA2ARequestHandler(RequestHandler):
         """Return a copy of the card whose capabilities this handler enforces."""
         return AgentCard.FromString(self._card.SerializeToString())
 
-    async def _task(self, task_id: str, principal_id: str) -> Task:
-        task = await self.manager.task_store.get_for_creator(
+    async def _find_task(self, task_id: str, principal_id: str) -> Task | None:
+        return await self.manager.task_store.get_for_creator(
             task_id,
             principal_id,
             recipient_agent_id=self.guard.scope.recipient_id,
         )
+
+    async def _task(self, task_id: str, principal_id: str) -> Task:
+        task = await self._find_task(task_id, principal_id)
         if task is None:
             raise TaskNotFoundError()
         return task
@@ -535,8 +538,8 @@ class NativeA2ARequestHandler(RequestHandler):
         while True:
             if response_result is None:
                 async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
-                    if refused is None:
-                        await self._task(initial.id, admitted.principal_id)
+                    if refused is None and await self._find_task(initial.id, admitted.principal_id) is None:
+                        refused = StreamRefusal(TaskNotFoundError())
                 if refused is not None:
                     yield refused
                     return
