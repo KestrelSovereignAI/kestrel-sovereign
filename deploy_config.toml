@@ -16,6 +16,10 @@ build_strategy = "prebuilt"      # prebuilt | local | cloudbuild
 health_check_timeout_seconds = 120
 health_check_path = "/health"
 
+[secret_sync]
+# The operator provisions this audit credential and chooses its pinned version.
+operator_managed = ["kestrel-prod-openai-key"]
+
 # =============================================================================
 # Cloud Run profiles (live)
 # =============================================================================
@@ -170,11 +174,13 @@ KESTREL_A2A_PEER_POLICY = "isolated"
 # This profile scales to zero; advertise push only after its background
 # delivery and independent wakeup path have been accepted for this service.
 KESTREL_A2A_PUSH_ENABLED = "false"
+KESTREL_CONSTITUTION_SOURCE_DESCRIPTOR_PATH = "/var/run/kestrel-constitution/pin/source.signed.json"
+KESTREL_SOVEREIGN_TRUST_ROOT_PATH = "/var/run/kestrel-constitution/authority/root.did.json"
 KESTREL_REQUIRE_OAUTH = "true"
 KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
 [profiles.prod.secrets]
-OPENAI_API_KEY = "kestrel-openai-key:latest"
+OPENAI_API_KEY = "kestrel-prod-openai-key:1"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATABASE_URL = "kestrel-prod-database-url:1"
 KESTREL_HOLD_EVIDENCE_DATABASE_URL = "kestrel-prod-hold-evidence-database-url:1"
@@ -184,6 +190,17 @@ KESTREL_IDENTITY_BUNDLE = "kestrel-prod-identity-bundle:1"
 GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
 GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
 KESTREL_SESSION_SECRET = "kestrel-session-secret:latest"
+
+[profiles.prod.secret_files]
+"/var/run/kestrel-constitution/source/KESTREL_CONSTITUTION.md" = "kestrel-prod-constitution-source:2"
+"/var/run/kestrel-constitution/pin/source.signed.json" = "kestrel-prod-constitution-descriptor:2"
+"/var/run/kestrel-constitution/authority/root.did.json" = "kestrel-prod-constitution-root:1"
+
+# Existing manual volumes from the verified #3819 test rollout.
+[profiles.prod.secret_file_adoptions]
+"/var/run/kestrel-constitution/source/KESTREL_CONSTITUTION.md" = "kestrel-prod-constitution-source-bat-nug"
+"/var/run/kestrel-constitution/pin/source.signed.json" = "kestrel-prod-constitution-descriptor-kam-dih"
+"/var/run/kestrel-constitution/authority/root.did.json" = "kestrel-prod-constitution-root-lax-fud"
 
 # =============================================================================
 # MultiAgent Profiles (Multi-Agent Host)

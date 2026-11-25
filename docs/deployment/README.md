@@ -326,6 +326,14 @@ key versions, then redeploying with the recorded expected DID. If any one of
 those artifacts is unavailable, stop: creating a new identity is replacement,
 not recovery.
 
+The Cloud Run prod profile also pins the governing Constitution, signed source
+descriptor, Sovereign public root, and audit credential. Use
+`secret_file_adoptions` to map each absolute file path to its existing manual
+volume name during the first managed rollout. The deployer adopts a single
+unaliased directory mount only when the Secret Manager name, pinned version,
+and exact filename already match `secret_files`. It carries the file modes
+forward and manages subsequent changes by the canonical volume name.
+
 ### Scheduler protocol-v2 upgrade (SQLite and PostgreSQL)
 
 Do not use ordinary rolling overlap when upgrading a database that has ever
@@ -620,10 +628,16 @@ ready for rollout, remove the variable before publishing the next release.
 Stored in GCP Secret Manager. `kestrel deploy secrets sync` reads `.env` and
 creates / updates secret versions per the `[profiles.*.secrets]` map in
 `deploy_config.toml`. The deploy command mounts them as env vars on Cloud Run.
+Names in `[secret_sync].operator_managed` are provisioned separately and
+excluded from both all-profile and single-profile sync.
 
 | Secret | Purpose |
 |---|---|
 | `kestrel-openai-key` | OpenAI API key |
+| `kestrel-prod-openai-key` | Operator-managed audit credential used by the prod profile |
+| `kestrel-prod-constitution-source` | Pinned governing Constitution bytes |
+| `kestrel-prod-constitution-descriptor` | Pinned Sovereign-signed source descriptor |
+| `kestrel-prod-constitution-root` | Pinned Sovereign public DID document |
 | `kestrel-anthropic-key` | Anthropic API key |
 | `kestrel-api-key` | Internal Kestrel API key |
 | `kestrel-data-key` | Encryption key for agent data |

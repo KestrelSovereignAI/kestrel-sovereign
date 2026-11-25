@@ -150,6 +150,7 @@ class DeployManagerCore:
                     env_vars=expanded_env,
                     secrets=expanded_secrets,
                     secret_files=secret_files,
+                    secret_file_adoptions=self._expand_env_vars(data.get("secret_file_adoptions", {})),
                     gcp_project_id=data.get("gcp_project_id") or self.gcp_project_id,
                     azure_resource_group=data.get("azure_resource_group"),
                 )
@@ -205,6 +206,7 @@ class DeployManagerCore:
         _check("env_vars", raw_env, profile.env_vars)
         _check("secrets", raw_secrets, profile.secrets)
         _check("secret_files", raw_profile.get("secret_files", {}), profile.secret_files)
+        _check("secret_file_adoptions", raw_profile.get("secret_file_adoptions", {}), profile.secret_file_adoptions)
 
         if unresolved or empty_after_expansion:
             details_unresolved = "; ".join(

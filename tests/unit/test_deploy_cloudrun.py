@@ -25,6 +25,7 @@ from kestrel_sovereign.features.deploy.models import (
 from kestrel_sovereign.features.deploy.providers.cloudrun import (
     CloudRunProvider,
     _apply_managed_template,
+    _secret_file_volume_name,
 )
 
 
@@ -84,6 +85,119 @@ def test_secret_file_cannot_overlap_implicit_cloud_sql_mount(deployment_profile)
         _apply_managed_template(
             service, Container(image="demo", ports=[ContainerPort(container_port=8080)]), profile,
         )
+
+
+@pytest.fixture
+def manual_secret_file(deployment_profile):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import Container, ContainerPort
+
+    path = "/var/run/governance/source/constitution.md"
+    service = Service(template={
+        "revision": "test-previous",
+        "containers": [{
+            "image": "old",
+            "env": [{"name": "OLD", "value": "retained-on-refusal"}],
+            "volume_mounts": [
+                {"name": "manual-source", "mount_path": "/var/run/governance/source"},
+                {"name": "database"},
+            ],
+        }],
+        "volumes": [
+            {"name": "manual-source", "secret": {"secret": "signed-source", "default_mode": 0o440,
+              "items": [{"path": "constitution.md", "version": "2", "mode": 0o400}]}},
+            {"name": "database", "cloud_sql_instance": {"instances": ["project:region:db"]}},
+        ],
+    })
+    profile = replace(
+        deployment_profile, secret_files={path: "signed-source:2"},
+        secret_file_adoptions={path: "manual-source"},
+    )
+    return service, Container(image="new", ports=[ContainerPort(container_port=8080)]), profile, path
+
+
+def test_declared_manual_secret_file_is_adopted_and_then_managed(manual_secret_file):
+    from google.cloud.run_v2 import Service
+
+    service, container, profile, filename = manual_secret_file
+    _apply_managed_template(service, container, profile)
+    database, managed = service.template.volumes
+    database_mount, mount = service.template.containers[0].volume_mounts
+    assert database_mount.name == database.name == "database"
+    assert managed.name == mount.name and managed.name.startswith("kestrel-secret-file-")
+    assert mount.mount_path == "/var/run/governance/source"
+    assert managed.secret.secret == "signed-source"
+    assert managed.secret.default_mode == 0o440
+    item, = managed.secret.items
+    assert (item.path, item.version, item.mode) == ("constitution.md", "2", 0o400)
+    before = Service.serialize(service)
+    _apply_managed_template(service, container, profile)
+    assert Service.serialize(service) == before
+    _apply_managed_template(service, container, replace(profile, secret_files={filename: "signed-source:3"}))
+    assert service.template.volumes[-1].secret.items[0].version == "3"
+
+    fresh = Service()
+    _apply_managed_template(fresh, container, profile)
+    assert fresh.template.volumes[0].name == managed.name
+
+
+@pytest.mark.parametrize("drift", [
+    "missing-opt-in", "undeclared-file", "wrong-name", "wrong-mount-path",
+    "wrong-volume-type", "wrong-secret", "wrong-version", "wrong-file", "extra-file",
+    "subpath", "alias", "later-file", "managed-name-collision",
+])
+def test_manual_secret_file_adoption_refuses_drift_atomically(manual_secret_file, drift):
+    from google.cloud.run_v2 import Service
+    from google.cloud.run_v2.types import VersionToPath, Volume, VolumeMount
+
+    service, container, profile, filename = manual_secret_file
+    mount = service.template.containers[0].volume_mounts[0]
+    source = service.template.volumes[0].secret
+    if drift == "missing-opt-in":
+        profile = replace(profile, secret_file_adoptions={})
+    elif drift == "undeclared-file":
+        profile = replace(profile, secret_files={})
+    elif drift == "wrong-name":
+        profile = replace(profile, secret_file_adoptions={filename: "different-mount"})
+    elif drift == "wrong-mount-path":
+        mount.mount_path = "/other-directory"
+    elif drift == "wrong-volume-type":
+        service.template.volumes[0] = Volume(name=mount.name, empty_dir={})
+    elif drift == "wrong-secret":
+        source.secret = "different-secret"
+    elif drift == "wrong-version":
+        source.items[0].version = "1"
+    elif drift == "wrong-file":
+        source.items[0].path = "different.md"
+    elif drift == "extra-file":
+        source.items.append(VersionToPath(version="2", path="other"))
+    elif drift == "subpath":
+        mount.sub_path = "source"
+    elif drift == "alias":
+        service.template.containers[0].volume_mounts.append(
+            VolumeMount(name=mount.name, mount_path="/operator-alias")
+        )
+    elif drift == "later-file":
+        second = "/var/run/governance/z/other.md"
+        service.template.containers[0].volume_mounts.append(
+            VolumeMount(name="manual-other", mount_path="/var/run/governance/z")
+        )
+        service.template.volumes.append(Volume(
+            name="manual-other",
+            secret={"secret": "other-source", "items": [{"path": "other.md", "version": "1"}]},
+        ))
+        profile = replace(
+            profile, secret_files=profile.secret_files | {second: "other-source:2"},
+            secret_file_adoptions=profile.secret_file_adoptions | {second: "manual-other"},
+        )
+    elif drift == "managed-name-collision":
+        service.template.volumes.append(Volume(
+            name=_secret_file_volume_name(mount.mount_path), secret=source,
+        ))
+    before = Service.serialize(service)
+    with pytest.raises(DeployManagerError, match="adoption|overlaps another volume"):
+        _apply_managed_template(service, container, profile)
+    assert Service.serialize(service) == before
 
 
 @pytest.mark.parametrize(

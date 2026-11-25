@@ -51,8 +51,8 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
             )
         ):
             raise DeployManagerError("Seeded demo publication requires one instance and an unsplit traffic target")
-    if count == 1:
-        current = service.template.containers[0]
+    current = service.template.containers[0] if count else container
+    if count:
         if len(current.ports) > 1:
             raise DeployManagerError("Cloud Run profile updates require one ingress port")
         port = container.ports[0].container_port
@@ -61,6 +61,10 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
                     probe.http_get.port, probe.tcp_socket.port, probe.grpc.port)):
                 raise DeployManagerError(
                     "Existing Cloud Run probe port conflicts with the configured ingress port")
+    volumes, mounts = _plan_secret_files(
+        service.template.volumes, current.volume_mounts,
+        profile.secret_files, profile.secret_file_adoptions,
+    )
     # A fetched template can name an existing immutable revision. Omit that
     # identity so Cloud Run generates a name for the new configuration (#4170).
     service.template.revision = ""
@@ -73,27 +77,51 @@ def _apply_managed_template(service: Any, container: Any, profile: DeploymentPro
             current.ports = container.ports
         current.resources.limits.update(container.resources.limits)
     else:
-        service.template.containers = [container]
-    _apply_secret_files(service, profile.secret_files)
+        service.template.containers = [current]
+    service.template.volumes = volumes
+    service.template.containers[0].volume_mounts = mounts
     service.template.scaling.min_instance_count = profile.min_instances
     service.template.scaling.max_instance_count = profile.max_instances
     service.template.timeout = f"{profile.timeout}s"
     service.template.max_instance_request_concurrency = profile.concurrency
 
 
-def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
+def _manual_secret_mount(mounts, volumes, path: PurePosixPath, volume_name: str, secret: str, version: str):
+    """Accept only the single manual mount explicitly named by the profile."""
+    directory = str(path.parent)
+    related = [mount for mount in mounts if mount.name == volume_name or mount.mount_path == directory]
+    if not related:
+        return None
+    volume = volumes.get(volume_name)
+    if len(related) == 1 and volume is not None:
+        mount = related[0]
+        if (
+            mount.name == volume_name and mount.mount_path == directory and not mount.sub_path
+            and volume.secret.secret == secret and len(volume.secret.items) == 1
+        ):
+            item = volume.secret.items[0]
+            if (item.path, item.version) == (path.name, version):
+                return mount
+    raise DeployManagerError(f"Cloud Run secret file adoption at {path} differs from the declared manual mount")
+
+
+def _plan_secret_files(
+    existing_volumes, existing_mounts, files: dict[str, str], adoptions: dict[str, str],
+) -> tuple[list, list]:
     from google.cloud.run_v2.types import SecretVolumeSource, VersionToPath, Volume, VolumeMount
 
-    container = service.template.containers[0]
-    original_volumes = {
-        volume.name: volume for volume in service.template.volumes
-    }
+    if (
+        adoptions.keys() - files.keys()
+        or any(not isinstance(name, str) or not name for name in adoptions.values())
+    ):
+        raise DeployManagerError("Cloud Run secret file adoption requires a declared file and existing volume name")
+    original_volumes = {volume.name: volume for volume in existing_volumes}
     owned = {
-        (mount.name, mount.mount_path) for mount in container.volume_mounts
+        (mount.name, mount.mount_path) for mount in existing_mounts
         if (mount.name in original_volumes and original_volumes[mount.name].secret.secret
             and mount.name == _secret_file_volume_name(mount.mount_path))
     }
-    mounts = [mount for mount in container.volume_mounts if (mount.name, mount.mount_path) not in owned]
+    mounts = [mount for mount in existing_mounts if (mount.name, mount.mount_path) not in owned]
     referenced = {mount.name for mount in mounts}
     owned_names = {name for name, _ in owned}
     volumes = {
@@ -116,14 +144,22 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
         ):
             raise DeployManagerError("Cloud Run secret files require an absolute file path and a pinned version")
         directory = str(path.parent)
+        name = _secret_file_volume_name(directory)
+        previous = original_volumes[name].secret if name in owned_names else SecretVolumeSource()
+        if filename in adoptions:
+            manual = _manual_secret_mount(mounts, volumes, path, adoptions[filename], secret, version)
+            if manual is not None:
+                if name in volumes:
+                    raise DeployManagerError("Cloud Run secret file adoption conflicts with the managed volume name")
+                previous = volumes.pop(manual.name).secret
+                mounts.remove(manual)
+                directories.remove(directory)
         if any(
             PurePosixPath(other).is_relative_to(directory) or path.parent.is_relative_to(other)
             for other in directories
         ):
             raise DeployManagerError("Cloud Run secret file mount overlaps another volume")
         directories.add(directory)
-        name = _secret_file_volume_name(directory)
-        previous = original_volumes[name].secret if name in owned_names else SecretVolumeSource()
         mode = next((item.mode for item in previous.items if item.path == path.name), 0)
         volume = Volume(
             name=name, secret=SecretVolumeSource(
@@ -135,8 +171,7 @@ def _apply_secret_files(service: Any, files: dict[str, str]) -> None:
             raise DeployManagerError("Cloud Run secret file conflicts with an existing volume")
         volumes[name] = volume
         mounts.append(VolumeMount(name=name, mount_path=directory))
-    service.template.volumes = list(volumes.values())
-    container.volume_mounts = mounts
+    return list(volumes.values()), mounts
 
 
 def _secret_file_volume_name(directory: str) -> str:
