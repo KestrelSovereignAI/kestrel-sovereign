@@ -281,26 +281,40 @@ class NativeA2ARequestHandler(RequestHandler):
     async def on_cancel_task(
         self, params: CancelTaskRequest, context: ServerCallContext
     ) -> Task:
-        async with self.guard.admit(params, "CancelTask", context) as admitted:
-            task = await self._task(admitted.request.id, admitted.principal_id)
-            if task.status.state in TERMINAL_STATES:
-                raise TaskNotCancelableError()
-            try:
-                return await self.manager.cancel_task(
-                    task.id,
-                    agent_name=admitted.principal_id,
-                    recipient_agent_id=self.guard.scope.recipient_id,
-                )
-            except TaskCancellationAuthorizationError as error:
-                raise TaskNotFoundError() from error
-            except ValueError as error:
-                # Another terminal transition may win after the authorized read.
-                if is_execution_control_error(error):
+        async with AsyncExitStack() as committed:
+            async with self.guard.admit(params, "CancelTask", context) as admitted:
+                task = await self._task(admitted.request.id, admitted.principal_id)
+                if task.status.state in TERMINAL_STATES:
+                    raise TaskNotCancelableError()
+                kwargs = {
+                    "agent_name": admitted.principal_id,
+                    "recipient_agent_id": self.guard.scope.recipient_id,
+                }
+                try:
+                    if admitted.verified_admission is None:
+                        return await self.manager.cancel_task(task.id, **kwargs)
+                    async with AsyncExitStack() as transition:
+                        cancelled = await transition.enter_async_context(
+                            self.manager._cancel_task_and_project(
+                                task.id, **kwargs,
+                                projection_lease=lambda: self.guard.hold_authority(
+                                    admitted, workload_only=True,
+                                ),
+                            )
+                        )
+                        await committed.enter_async_context(self._response_outcome(cancelled))
+                        committed.push_async_exit(transition.pop_all())
+                except TaskCancellationAuthorizationError as error:
+                    raise TaskNotFoundError() from error
+                except ValueError as error:
+                    # Another terminal transition may win after the authorized read.
+                    if is_execution_control_error(error):
+                        raise
+                    current = await self._task(task.id, admitted.principal_id)
+                    if current.status.state in TERMINAL_STATES:
+                        raise TaskNotCancelableError() from error
                     raise
-                current = await self._task(task.id, admitted.principal_id)
-                if current.status.state in TERMINAL_STATES:
-                    raise TaskNotCancelableError() from error
-                raise
+            return cancelled
 
     def _submission_claims(
         self, params: SendMessageRequest, activated_extensions: frozenset[str],
@@ -509,18 +523,21 @@ class NativeA2ARequestHandler(RequestHandler):
     async def _events(
         self, stream, initial: Task, admitted: AuthorizedNativeRequest,
         *, response_result: Task | None = None,
-    ) -> AsyncGenerator[Event]:
+    ) -> AsyncGenerator[Event | StreamRefusal]:
         # Borrow the already-owned subscription. _open_stream retains its
         # original owner across acquisition, every read, and physical close.
         event = initial
         while True:
-            authority = (
-                self.guard.hold_authority(admitted)
-                if response_result is None
-                else self._response_authority(admitted, response_result)
-            )
-            async with authority:
-                await self._task(initial.id, admitted.principal_id)
+            if response_result is None:
+                async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+                    if refused is None:
+                        await self._task(initial.id, admitted.principal_id)
+                if refused is not None:
+                    yield refused
+                    return
+            else:
+                async with self._response_authority(admitted, response_result):
+                    await self._task(initial.id, admitted.principal_id)
             yield event
             try:
                 event = await anext(stream)
@@ -679,6 +696,9 @@ class NativeA2ARequestHandler(RequestHandler):
                 self, self._send_task_events(task, admitted, withdrawal), withdrawal=withdrawal
             ) as events:
                 async for event in events:
+                    if isinstance(event, StreamRefusal):
+                        # A committed Send has a different response boundary.
+                        self._raise_response_failure(task, event.error)
                     yield event
 
     def on_subscribe_to_task(
@@ -722,8 +742,12 @@ class NativeA2ARequestHandler(RequestHandler):
                     self, self._events(stream, initial, admitted), withdrawal=withdrawal
                 ) as events:
                     async for event in events:
+                        if isinstance(event, StreamRefusal):
+                            opened = event
+                            break
                         yield event
-                return
+                if not isinstance(opened, StreamRefusal):
+                    return
         # Only explicit semantic decisions become values. An exception from
         # actual original close or authority exit never reaches this yield.
         yield opened

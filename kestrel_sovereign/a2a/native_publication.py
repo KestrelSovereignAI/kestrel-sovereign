@@ -237,6 +237,7 @@ class NativeA2APublication:
         )
         self._binding: NativeA2AHTTP | None = None
         self._guard = None
+        self._published_source: NativeLocalSender | None = None
         self._push_service = None
 
     @classmethod
@@ -344,9 +345,11 @@ class NativeA2APublication:
                 self.configuration.discovery_routing_key == self.routing_key
             ),
         )
+        source = self._capture_published_source(guard, binding)
         self.registry.publish(binding)
         self._guard = guard
         self._binding = binding
+        self._published_source = source
 
     def withdraw(self) -> None:
         if self._binding is not None:
@@ -383,7 +386,17 @@ class NativeA2APublication:
         if binding is None or not self.is_published:
             raise ExecutionAuthorityError("Native in-process recipient is not published")
 
-        local_sender = self._local_transport_sender(source) if source is not None else None
+        local_sender = None
+        if source is not None:
+            if (
+                not isinstance(source, NativeA2APublication)
+                or source is self
+                or source.registry is not self.registry
+                or source._published_source is None
+                or not source._published_source.is_current()
+            ):
+                raise ExecutionAuthorityError("Native in-process source is not current on this host")
+            local_sender = source._published_source
 
         def require_binding(scope):
             self.registry.require_application(app)
@@ -401,17 +414,14 @@ class NativeA2APublication:
             require_binding=require_binding, buffer_bytes=buffer_bytes,
         )
 
-    def _local_transport_sender(self, source: "NativeA2APublication") -> NativeLocalSender:
-        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-
-        if (
-            not isinstance(source, NativeA2APublication)
-            or source.registry is not self.registry
-            or not source.is_published
-        ):
-            raise ExecutionAuthorityError("Native in-process source is not published by this host")
-        binding, recipient = source._binding, source.recipient
+    def _capture_published_source(
+        self, guard: NativeDIDRequestGuard, binding: NativeA2AHTTP,
+    ) -> NativeLocalSender | None:
+        if guard.local_admission is None:
+            return None
+        recipient, registry = self.recipient, self.registry
         identity, manager = recipient.identity, recipient.task_manager
+        task_store = manager.task_store
         signing_did = identity.signing_did
 
         def fingerprint():
@@ -424,17 +434,22 @@ class NativeA2APublication:
 
         def is_current():
             return (
-                source.registry is self.registry
-                and source._binding is binding
-                and source.recipient is recipient
-                and source.is_published
+                self.registry is registry
+                and self._guard is guard
+                and self._binding is binding
+                and self.recipient is recipient
+                and self.is_published
                 and recipient.identity is identity
                 and recipient.task_manager is manager
+                and manager.task_store is task_store
+                and task_store.scope == guard.scope
                 and identity.signing_did == signing_did
                 and fingerprint() == original_fingerprint
             )
 
-        return NativeLocalSender(source, signing_did, original_fingerprint, is_current)
+        return NativeLocalSender(
+            self, signing_did, original_fingerprint, is_current, guard.hold_local_source,
+        )
 
     async def _verify_seeded_database(self) -> None:
         if self._seeded_registration is None:

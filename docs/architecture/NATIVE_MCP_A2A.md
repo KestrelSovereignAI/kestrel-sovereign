@@ -1151,15 +1151,18 @@ An embedding that only serves co-hosted peers can opt in to
 `NativeHostedLocalAdmission`. Give the existing in-process HTTP transport the
 original sender publication with `source=`. The transport supplies source
 provenance inside ASGI, not in the SDK wire or headers. Core verifies the
-standard signed request and matches the original publication's signing
-document before invoking the embedding's typed admission lease. The lease
-must hold the source and recipient's durable generation through the effect or
-read and enter the original Core reader last. A waiting or streaming call
+standard signed request, matches the original publication's signing document,
+and accepts the nonce before invoking the embedding's typed admission lease.
+The embedding holds the source and recipient's durable generations. Core then
+holds both original readers through the effect or read. Hosted control checks
+proof age again before charging reserved capacity. A waiting or streaming call
 retains the same source and reacquires that lease without spending another
 nonce. Durable task rows continue to use the authorized principal.
 
 Only a verified native CancelTask or a SendMessage operation validated as
-Peer Stop can receive the corresponding control lease. The default fleet and
+Peer Stop can receive the corresponding control lease. Task cancellation
+releases it after the durable transition and wake cancellation; projections use
+ordinary admission. The default fleet and
 standalone contracts are unchanged, including card and retained-principal
 authorization. This local mode adds no authorization to network traffic.
 

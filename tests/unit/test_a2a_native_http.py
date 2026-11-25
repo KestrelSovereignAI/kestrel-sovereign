@@ -41,11 +41,12 @@ from kestrel_sdk.native_a2a.utils.errors import (
     TaskNotFoundError,
     UnsupportedOperationError,
 )
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
-from kestrel_sovereign.a2a.native_client import NativeSenderInterceptor
 from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+from kestrel_sovereign.a2a.native_client import NativeSenderInterceptor
 from kestrel_sovereign.a2a.native_routes import (
     NativeA2AHTTP,
     NativeA2AHTTPRegistry,
@@ -523,7 +524,10 @@ async def test_persistence_failure_is_control_without_exposing_sql_details(
     wire,
 ):
     await wire.admission.backend.execute("DROP TABLE native_test_principals")
-    from kestrel_sovereign.execution_custody import execution_evidence_carriers, is_execution_control_error
+    from kestrel_sovereign.execution_custody import (
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
     from kestrel_sovereign.storage.db.interface import QueryError
 
     async with observed_native_http(wire) as observed:
@@ -684,11 +688,36 @@ async def test_revocation_before_the_first_stream_event_exposes_no_snapshot(wire
         wire.admission.state.current = False
         events = wire.handler._events(stream, initial, admitted)
         try:
-            with pytest.raises(HTTPException) as denied:
-                await anext(events)
-            assert denied.value.status_code == 403
+            denied = await anext(events)
+            assert isinstance(denied, StreamRefusal)
+            assert isinstance(denied.error, HTTPException) and denied.error.status_code == 403
         finally:
             await events.aclose()
+    assert not wire.manager._subscribers
+
+
+async def test_subscription_publishes_first_event_refusal_after_original_join(wire, monkeypatch):
+    task = await submit(wire)
+    original_subscribe = wire.manager.subscribe
+    retired = []
+
+    async def revoke_at_first_snapshot(*args, **kwargs):
+        source = original_subscribe(*args, **kwargs)
+        try:
+            initial = await anext(source)
+            wire.admission.state.current = False
+            yield initial
+        finally:
+            await source.aclose()
+            retired.append(source)
+
+    monkeypatch.setattr(wire.manager, "subscribe", revoke_at_first_snapshot)
+    with pytest.raises(A2AClientError, match=r"\b403\b"):
+        async for _ in wire.client(streaming=True).subscribe(
+            SubscribeToTaskRequest(id=task.id, tenant=wire.admission.scope.tenant)
+        ):
+            pytest.fail("A revoked subscription disclosed an event")
+    assert len(retired) == 1 and retired[0].ag_frame is None
     assert not wire.manager._subscribers
 
 
@@ -789,6 +818,7 @@ async def test_domain_typed_actual_authority_exit_failure_is_not_protocol_refusa
     wire, monkeypatch
 ):
     from contextlib import asynccontextmanager
+
     from kestrel_sovereign.a2a.stores.unified.task_store import TaskInputConflictError
     from kestrel_sovereign.execution_custody import (
         execution_evidence_carriers,
@@ -844,8 +874,9 @@ async def test_domain_typed_actual_postgres_release_failure_is_not_protocol_refu
     if wire.admission.backend.backend_type != "postgres":
         pytest.skip("The release witness is the actual PostgreSQL pool context")
     import asyncpg
-    from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnershipError
+
     from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
+    from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnershipError
     from kestrel_sovereign.a2a.stores.unified.task_store import (
         TaskInputConflictError,
         TaskInputUnsupportedError,
@@ -1196,6 +1227,7 @@ async def test_canonical_input_refusals_remain_standard_before_any_admission(
     wire, streaming, invalid
 ):
     from kestrel_sdk.native_a2a.types import Role
+
     from kestrel_sovereign.execution_custody import is_execution_control_error
 
     params = send(wire.admission)
@@ -1220,6 +1252,7 @@ async def test_pre_effect_policy_recheck_settles_before_http_refusal(
     wire, monkeypatch, streaming, continuation, fail_original_exit
 ):
     from contextlib import asynccontextmanager
+
     from kestrel_sovereign.execution_custody import (
         execution_evidence_carriers,
         is_execution_control_error,
@@ -1362,7 +1395,10 @@ async def test_blocking_final_response_recheck_retains_committed_outcome(wire, m
 
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_post_commit_missing_subscription_retains_committed_outcome(wire, monkeypatch, streaming):
-    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
 
     subscribe = wire.manager.subscribe
     originals = []
@@ -1398,7 +1434,10 @@ async def test_post_commit_missing_subscription_retains_committed_outcome(wire, 
 
 @pytest.mark.parametrize("operation,streaming", [("send", False), ("send", True), ("subscribe", True)])
 async def test_first_event_policy_recheck_retains_committed_outcome(wire, monkeypatch, operation, streaming):
-    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
 
     original = wire.handler.guard.lifecycle_lease
 
@@ -1629,7 +1668,10 @@ async def test_continuation_notification_follows_actual_outer_commit(native_requ
 @pytest.mark.parametrize("error_kind", ["proof", "http", "opaque"])
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_original_proof_io_exit_is_not_an_authentication_refusal(wire, monkeypatch, source, error_kind, streaming):
-    from kestrel_sovereign.execution_custody import execution_evidence_carriers, is_execution_control_error
+    from kestrel_sovereign.execution_custody import (
+        execution_evidence_carriers,
+        is_execution_control_error,
+    )
 
     authority = wire.handler.guard.authority_factory()
     physical, originals, owners, descriptors = [], [], [], []
@@ -1720,7 +1762,10 @@ async def test_input_admission_refuses_unobservable_commit_before_write(native_r
 
 
 async def test_fenced_admission_never_treats_joined_transaction_as_commit(native_request_admission):
-    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, execution_commit_outcome
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        execution_commit_outcome,
+    )
 
     a = native_request_admission
 
@@ -1746,7 +1791,9 @@ async def test_fenced_admission_never_treats_joined_transaction_as_commit(native
 async def test_empty_transaction_commit_never_claims_an_admitted_input(native_request_admission):
     from kestrel_sovereign._async_ownership import OriginalContextExit
     from kestrel_sovereign.execution_custody import (
-        execution_commit_outcome, execution_evidence_carriers, is_execution_control_error,
+        execution_commit_outcome,
+        execution_evidence_carriers,
+        is_execution_control_error,
     )
 
     a = native_request_admission
@@ -1816,7 +1863,9 @@ async def test_stream_admission_http_refusal_retires_before_status_and_challenge
     wire, operation, refusal, fail_original_exit, monkeypatch
 ):
     from contextlib import asynccontextmanager
+
     from google.protobuf.json_format import MessageToDict
+
     from kestrel_sovereign.execution_custody import (
         execution_evidence_carriers,
         is_execution_control_error,

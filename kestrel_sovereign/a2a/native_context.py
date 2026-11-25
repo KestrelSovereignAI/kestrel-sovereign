@@ -7,6 +7,7 @@ constructing the complete native request used by sender verification.
 
 import json
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
@@ -66,6 +67,7 @@ class NativeLocalSender:
     signing_did: str
     verification_document_fingerprint: str
     is_current: Callable[[], bool]
+    authority_lease: Callable[[], AbstractAsyncContextManager[StreamRefusal | None]]
 
 
 class NativeServerCallContextBuilder(DefaultServerCallContextBuilder):

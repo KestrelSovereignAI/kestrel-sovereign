@@ -2180,8 +2180,31 @@ class TaskManager:
         task_payload: Task | None = None,
         task_baseline: Task | None = None,
     ) -> Task:
+        """Cancel through the canonical transition and join its projections."""
+        async with self._cancel_task_and_project(
+            task_id, reason=reason, agent_name=agent_name,
+            recipient_agent_id=recipient_agent_id, task_payload=task_payload,
+            task_baseline=task_baseline,
+        ) as task:
+            return task
+
+    @asynccontextmanager
+    async def _cancel_task_and_project(
+        self,
+        task_id: str,
+        reason: str | None = None,
+        agent_name: str | None = None,
+        recipient_agent_id: str | None = None,
+        task_payload: Task | None = None,
+        task_baseline: Task | None = None,
+        *,
+        projection_lease: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> AsyncIterator[Task]:
         """
-        Cancel a task.
+        Commit cancellation and cancel its queued wake before the yield.
+
+        A hosted control handler can leave reserved admission at the yield;
+        the original context then joins the post-commit projections.
 
         Args:
             task_id: ID of the task to cancel
@@ -2312,7 +2335,8 @@ class TaskManager:
                 # Keep the just-acquired local execution exemption: this retry
                 # is still the same authorized recipient decline and its
                 # monitor must not cancel the response after seeing CANCELED.
-                return current
+                yield current
+                return
             if rollback_local_intent is not None:
                 rollback_local_intent()
             if current.status.state not in {
@@ -2329,6 +2353,7 @@ class TaskManager:
                 f"Agent {agent_name!r} is not authorized to cancel task {task_id!r}"
             )
 
+        body_failure: BaseException | None = None
         try:
             receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}
             previous_state = receipt.get("status_before")
@@ -2344,20 +2369,25 @@ class TaskManager:
                         exc,
                         exc_info=True,
                     )
-            await self._finish_status_projection(
-                task,
-                old_state=str(previous_state or "unspecified"),
-                new_state=TaskState.TASK_STATE_CANCELED,
-                agent_name=agent_name,
-                is_final=True,
-                reason=reason,
-            )
+            try:
+                yield task
+            except BaseException as error:  # noqa: BLE001 - join the original projection before propagating the exit
+                body_failure = error
+            async with projection_lease() if projection_lease is not None else nullcontext():
+                await self._finish_status_projection(
+                    task,
+                    old_state=str(previous_state or "unspecified"),
+                    new_state=TaskState.TASK_STATE_CANCELED,
+                    agent_name=agent_name,
+                    is_final=True,
+                    reason=reason,
+                )
         except BaseException as projection_failure:  # noqa: BLE001 - preserve the original commit receipt before re-raising
             # Exact actor/operation readback proves which CAS committed, not
             # that its UNKNOWN transport outcome may be discarded. Retain the
             # FIRST native receipt through every later callback/projection.
             raise execution_terminal_error(
-                store_failure, projection_failure, retain_originals=True
+                store_failure, body_failure, projection_failure, retain_originals=True
             )
 
         logger.info(
@@ -2367,9 +2397,9 @@ class TaskManager:
             previous_state,
             task_state_label(TaskState.TASK_STATE_CANCELED),
         )
-        if store_failure is not None:
-            raise store_failure
-        return task
+        failure = execution_terminal_error(store_failure, body_failure, retain_originals=True)
+        if failure is not None:
+            raise failure
 
     async def _finish_status_projection(
         self,

@@ -1,6 +1,6 @@
 """Native SDK messages drive the real Stop policy and durable receipt rail."""
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -205,18 +205,20 @@ async def test_hosted_verified_peer_stop_uses_one_kind_through_the_real_receipt(
     c = control
     p = c.wire.admission
     origin = NativeLocalSender(
-        object(), SENDER, verification_document_fingerprint(p.signing[1]), lambda: True,
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: True, nullcontext,
     )
     accepted = []
 
     @asynccontextmanager
-    async def acquire(evidence):
+    async def acquire(evidence, require_fresh):
         assert not p.lock.locked()
         assert evidence.kind is NativeRequestKind.PEER_STOP
         assert evidence.origin is origin
         accepted.append(evidence)
-        async with p.guard.lifecycle_lease():
-            yield None
+        if require_fresh is not None:
+            require_fresh()
+        yield None
 
     guard = replace(
         p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),

@@ -2,9 +2,10 @@
 
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, replace
 from enum import Enum
+from functools import partial
 from typing import Generic, TypeVar
 
 from google.protobuf.message import Message as ProtoMessage
@@ -113,7 +114,14 @@ class NativeHostedLocalAdmission:
     """
 
     verification_lease: Callable[[], AbstractAsyncContextManager[object]]
-    acquire: Callable[[NativeVerifiedAdmission], AbstractAsyncContextManager[StreamRefusal | None]]
+    acquire: Callable[
+        [NativeVerifiedAdmission, Callable[[], None] | None],
+        AbstractAsyncContextManager[StreamRefusal | None],
+    ]
+
+
+class NativeAdmissionExpired(NativeSenderProofError):
+    """Initial proof freshness was lost before the host's admission point."""
 
 
 @dataclass(frozen=True)
@@ -230,17 +238,56 @@ class NativeDIDRequestGuard:
             ))
         return None
 
+    def _require_fresh_proof(self, sender: NativeVerifiedSender) -> None:
+        if (
+            sender.issued_at is None
+            or abs(int(self.clock()) - sender.issued_at) > self.proof_policy.max_age_seconds
+        ):
+            raise NativeAdmissionExpired("Sender proof expired during admission")
+
+    @asynccontextmanager
+    async def hold_local_source(self) -> AsyncIterator[StreamRefusal | None]:
+        """Retain the exact published source's original Core reader."""
+        if self.local_admission is None:
+            raise RuntimeError("Native local source has no hosted admission contract")
+        async with OriginalContextExit(self.local_admission.verification_lease()):
+            refusal = self._current_decision(self._new_authority(), None)
+            if refusal is None:
+                yield None
+                return
+        yield refusal
+
     @asynccontextmanager
     async def _verified_local_lease(
-        self, verified: NativeVerifiedAdmission,
+        self, verified: NativeVerifiedAdmission, *, initial: bool = False,
     ) -> AsyncIterator[StreamRefusal | None]:
         if self.local_admission is None:
             raise RuntimeError("Native hosted admission lease was not configured")
         refused = self._local_sender_decision(verified.sender, verified.origin)
         if refused is None:
-            async with OriginalContextExit(self.local_admission.acquire(verified)) as refused:
+            freshness = partial(self._require_fresh_proof, verified.sender) if initial else None
+            async with AsyncExitStack() as leases:
+                try:
+                    refused = await leases.enter_async_context(OriginalContextExit(
+                        self.local_admission.acquire(verified, freshness),
+                    ))
+                except NativeAdmissionExpired as error:
+                    refused = self._proof_refusal(error)
                 if refused is not None and not isinstance(refused, StreamRefusal):
                     raise TypeError("Hosted admission lease returned an invalid decision")
+                if refused is None:
+                    # Both distributed generations precede the original Core
+                    # readers; the stable route order applies to reciprocal
+                    # same-process calls without turning shared locks into wait cycles.
+                    readers = (
+                        (verified.origin.authority_lease, self.hold_local_source)
+                        if verified.origin.publication.routing_key < self.routing_key
+                        else (self.hold_local_source, verified.origin.authority_lease)
+                    )
+                    for reader in readers:
+                        refused = await leases.enter_async_context(reader())
+                        if refused is not None:
+                            break
                 if refused is None:
                     refused = self._local_sender_decision(verified.sender, verified.origin)
                 if refused is None:
@@ -282,11 +329,22 @@ class NativeDIDRequestGuard:
                 else:
                     origin = native_local_sender(context)
                     refusal = self._local_sender_decision(sender, origin)
+                    if refusal is None:
+                        reserved = await self._spend_under_recipient_custody(sender, now_ts)
+                        if isinstance(reserved, StreamRefusal):
+                            refusal = reserved
+                        elif isinstance(reserved, NativeSenderProofError):
+                            refusal = self._proof_refusal(reserved)
         if refusal is not None:
             yield refusal
             return
 
         assert local is not None and origin is not None
+        async with origin.authority_lease() as refusal:
+            pass
+        if refusal is not None:
+            yield refusal
+            return
         kind = NativeRequestKind.WORK
         if operation == "CancelTask":
             kind = NativeRequestKind.CANCEL_TASK
@@ -297,16 +355,17 @@ class NativeDIDRequestGuard:
         ):
             kind = NativeRequestKind.PEER_STOP
         verified = NativeVerifiedAdmission(sender, origin, kind)
-        async with self._verified_local_lease(verified) as refusal:
+        async with self._verified_local_lease(verified, initial=True) as refusal:
             if refusal is None:
                 refusal = self._current_decision(authority, sender)
             if refusal is None:
-                now_ts = int(self.clock())
-                if sender.issued_at is None or abs(now_ts - sender.issued_at) > self.proof_policy.max_age_seconds:
-                    refusal = self._proof_refusal(NativeSenderProofError("Sender proof expired during admission"))
-                else:
-                    result = await self._authorize_initial(
-                        request, sender, authority, extensions, now_ts, verified=verified,
+                try:
+                    self._require_fresh_proof(sender)
+                except NativeAdmissionExpired as error:
+                    refusal = self._proof_refusal(error)
+                if refusal is None:
+                    result = await self._authorized_result(
+                        request, sender, authority, extensions, verified=verified,
                     )
                     if isinstance(result, StreamRefusal):
                         refusal = result
@@ -319,13 +378,19 @@ class NativeDIDRequestGuard:
     async def _authorize_initial(
         self, request: _Request, sender: NativeVerifiedSender,
         authority: NativeRequestAuthority, extensions: frozenset[str], now_ts: int,
-        *, verified: NativeVerifiedAdmission | None = None,
     ) -> AuthorizedNativeRequest[_Request] | StreamRefusal:
         result = await self._spend_under_recipient_custody(sender, now_ts)
         if isinstance(result, StreamRefusal):
             return result
         if isinstance(result, NativeSenderProofError):
             return self._proof_refusal(result)
+        return await self._authorized_result(request, sender, authority, extensions)
+
+    async def _authorized_result(
+        self, request: _Request, sender: NativeVerifiedSender,
+        authority: NativeRequestAuthority, extensions: frozenset[str],
+        *, verified: NativeVerifiedAdmission | None = None,
+    ) -> AuthorizedNativeRequest[_Request] | StreamRefusal:
         principal = await self._authorization_decision(authority, sender)
         if isinstance(principal, StreamRefusal):
             return principal
@@ -396,9 +461,9 @@ class NativeDIDRequestGuard:
         else:
             async with (
                 _native_persistence_errors(),
-                OriginalContextExit(self._admit_original(
+                self._admit_original(
                     request, operation, context, activated_extensions, classify_peer_stop,
-                )) as decision,
+                ) as decision,
             ):
                 if isinstance(decision, StreamRefusal):
                     refusal = decision
@@ -458,7 +523,7 @@ class NativeDIDRequestGuard:
 
     @asynccontextmanager
     async def _retained_request_lease(
-        self, admitted: AuthorizedNativeRequest[_Request],
+        self, admitted: AuthorizedNativeRequest[_Request], *, workload_only: bool,
     ) -> AsyncIterator[StreamRefusal | None]:
         verified = admitted.verified_admission
         if self.local_admission is None:
@@ -469,12 +534,15 @@ class NativeDIDRequestGuard:
                 status_code=403, detail="A2A request lacks original hosted admission",
             ))
         else:
-            async with OriginalContextExit(self._verified_local_lease(verified)) as refused:
+            if workload_only and verified.kind is not NativeRequestKind.WORK:
+                verified = replace(verified, kind=NativeRequestKind.WORK)
+            async with self._verified_local_lease(verified) as refused:
                 yield refused
 
     @asynccontextmanager
     async def hold_authority(
-        self, admitted: AuthorizedNativeRequest[_Request], *, refusal_values: bool = False
+        self, admitted: AuthorizedNativeRequest[_Request], *,
+        refusal_values: bool = False, workload_only: bool = False,
     ) -> AsyncIterator[StreamRefusal | None]:
         """Recheck a waiting request before its next authorized read or event.
 
@@ -498,7 +566,7 @@ class NativeDIDRequestGuard:
             refused = None
             async with (
                 _native_persistence_errors(),
-                OriginalContextExit(self._retained_request_lease(admitted)) as lease_refusal,
+                self._retained_request_lease(admitted, workload_only=workload_only) as lease_refusal,
             ):
                 refused = lease_refusal
                 if refused is None and self.check_recipient_custody is not None:

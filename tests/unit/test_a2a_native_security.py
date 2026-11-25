@@ -1,8 +1,9 @@
 """Real hybrid proof and durable recipient admission around canonical storage."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import FrozenInstanceError, replace
+from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.native_a2a.types import CancelTaskRequest, GetTaskRequest
@@ -45,18 +46,20 @@ async def test_verified_local_admission_retains_original_evidence(
     acquired = []
     current = True
     origin = NativeLocalSender(
-        object(), SENDER, verification_document_fingerprint(p.signing[1]), lambda: current,
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: current, nullcontext,
     )
 
     @asynccontextmanager
-    async def acquire(evidence):
+    async def acquire(evidence, require_fresh):
         assert not p.lock.locked()
         assert evidence.origin is origin
         assert evidence.sender.sender == SENDER
         assert evidence.kind is expected
         acquired.append(evidence)
-        async with p.guard.lifecycle_lease():
-            yield None
+        if require_fresh is not None:
+            require_fresh()
+        yield None
 
     guard = replace(
         p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
@@ -67,6 +70,11 @@ async def test_verified_local_admission_retains_original_evidence(
     async with guard.admit(params, operation, context) as admitted:
         assert admitted.principal_id == PRINCIPAL
         assert admitted.verified_admission is acquired[0]
+    with pytest.raises(HTTPException) as replayed:
+        async with guard.admit(params, operation, context):
+            pytest.fail("An already reserved request cannot reach host admission")
+    assert replayed.value.status_code == 401
+    assert len(acquired) == 1
     async with guard.hold_authority(admitted):
         assert p.lock.locked()
     assert len(acquired) == 2 and acquired[0] is acquired[1]
@@ -82,7 +90,7 @@ async def test_only_host_bound_proofs_reach_the_hosted_lease(native_request_admi
     p = native_request_admission
 
     @asynccontextmanager
-    async def acquire(_):
+    async def acquire(_, _require_fresh):
         pytest.fail("Missing hosted provenance must not charge a lease")
         yield None
 
@@ -96,6 +104,34 @@ async def test_only_host_bound_proofs_reach_the_hosted_lease(native_request_admi
             pytest.fail("Hosted-local admission requires the original source")
     assert denied.value.status_code == 403
     assert not p.state.authorizations
+
+
+async def test_hosted_initial_capacity_rechecks_proof_age(native_request_admission):
+    p = native_request_admission
+    now = NOW
+    origin = NativeLocalSender(
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: True, nullcontext,
+    )
+
+    @asynccontextmanager
+    async def acquire(_, require_fresh):
+        nonlocal now
+        now += p.guard.proof_policy.max_age_seconds + 1
+        require_fresh()
+        pytest.fail("An expired proof cannot acquire hosted control capacity")
+        yield None
+
+    guard = replace(
+        p.guard, clock=lambda: now,
+        local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask", local_sender=origin)
+    with pytest.raises(HTTPException) as expired:
+        async with guard.admit(params, "CancelTask", context):
+            pytest.fail("An expired hosted proof was admitted")
+    assert expired.value.status_code == 401
 
 
 async def test_retained_principal_policy_uses_no_new_sender_proof(native_request_admission):
