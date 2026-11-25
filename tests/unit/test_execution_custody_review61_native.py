@@ -146,7 +146,7 @@ async def test_copied_context_sibling_cannot_inherit_native_privacy_lifecycle():
     registered, children, effects = [], [], []
     attempted = asyncio.Event()
     lifecycle = ExecutionStreamLifecycle(
-        owner_factory=lambda run, context: native_factory(run, context=context),
+        owner_factory=native_factory,
         owner_started=lambda iterator, task: registered.append((iterator, task)),
         require_work=lambda: None,
     )
@@ -213,7 +213,7 @@ async def test_original_owner_cancelled_before_privacy_admission_wakes_reader():
     try:
         source = OwnedAsyncIterator(
             body, operation="native queued privacy admission",
-            owner_factory=lambda run, context: native_factory(run, context=context),
+            owner_factory=native_factory,
         )
         reader = asyncio.create_task(anext(source))
         try:

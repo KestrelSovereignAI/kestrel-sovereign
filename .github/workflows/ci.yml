@@ -333,6 +333,77 @@ jobs:
         run: uv run python run_tests.py --kestrel --skip-check --validate-only
         timeout-minutes: 5
 
+  # Host-resource loans must qualify on both supported native asyncio ABIs.
+  # These are original local Tasks and an isolated PostgreSQL service, never
+  # companion cognition, provider execution, deployment or public release proof.
+  host-resource-lending:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: lint-and-imports
+    if: needs.lint-and-imports.outputs.run_expensive != 'false'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+      KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHON_DOTENV_DISABLED: "1"
+      KESTREL_SKIP_DOTENV: "1"
+      KESTREL_PHOENIX_ENABLED: "0"
+      KESTREL_TRACING_ENABLED: "0"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      GEMINI_API_KEY: ""
+      REPLICATE_API_TOKEN: ""
+      RUNPOD_API_KEY: ""
+      XAI_API_KEY: ""
+      TAVILY_API_KEY: ""
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+      - name: Install the locked native host
+        run: uv sync --python ${{ matrix.python-version }} --locked
+      - name: Install the exact optional Frinz production loop for qualification
+        run: uv pip install --python .venv/bin/python 'uvloop==0.23.0'
+      - name: Verify original task lending and physical PostgreSQL epilogues
+        run: >-
+          uv run --python ${{ matrix.python-version }} --no-sync python -m pytest
+          -p pytest_asyncio.plugin -p pytest_timeout -p kestrel_sovereign.testing.fixtures
+          tests/unit/test_owned_task_lending.py tests/unit/test_public_async_ownership.py
+          tests/unit/test_async_ownership.py tests/unit/test_owned_callback_source.py
+          tests/unit/test_owned_operation_admission.py
+          tests/integration/test_owned_task_lending_postgres.py
+          -q --tb=short -o addopts='' --timeout=60 --session-timeout=600
+
   # Native custody must work on the declared minimum Python, not only 3.13's
   # task-preserving wait_for implementation. No provider credentials or calls.
   minimum-python-custody:

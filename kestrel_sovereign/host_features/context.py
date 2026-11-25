@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
+    bind_execution_cleanup,
     execution_cleanup_debts,
     execution_native_source_error,
     execution_terminal_error,
@@ -303,13 +304,14 @@ async def _close_partial_host_resources(
         if record.task is None and record.error is None:
             admission = OwnedTaskAdmission()
             try:
-                record.task = create_owned_task(
-                    resource.close(),
-                    retirement_resource=resource,
-                    retain_originals=True,
-                    admission=admission,
-                    name="host-original-resource-close",
-                )
+                with bind_execution_cleanup(resource):
+                    record.task = create_owned_task(
+                        resource.close(),
+                        retirement_resource=resource,
+                        retain_originals=True,
+                        admission=admission,
+                        name="host-original-resource-close",
+                    )
             except BaseException as error:
                 # Canonical admission closes refused coroutines and attaches
                 # the ACTUAL resource's unstarted retirement debt.

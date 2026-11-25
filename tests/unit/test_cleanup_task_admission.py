@@ -149,8 +149,8 @@ async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
 
     native_factory = lock.capture_native_work_factory()
 
-    def accept_producer(run, context):
-        owner = native_factory(run, context=context)
+    def accept_producer(run, context, *, admission, lender_capture):
+        owner = native_factory(run, context=context, admission=admission, lender_capture=lender_capture)
         producers.append(owner)
         return owner
 

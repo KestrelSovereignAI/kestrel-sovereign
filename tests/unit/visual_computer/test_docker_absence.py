@@ -112,3 +112,51 @@ async def test_canonical_boundary_wires_native_response_classification(tmp_path,
         await boundary.invoke(arguments)
     if style in {"wrong-target", "wrong-network-target"}:
         assert caught.value.diagnostics.get_secret_value() == b"[]\n"+error
+
+
+@pytest.mark.asyncio
+async def test_original_docker_cli_reaps_after_work_is_withdrawn(tmp_path, monkeypatch):
+    import asyncio
+    from kestrel_sovereign import async_ownership as ownership
+    from kestrel_sovereign.execution_custody import (
+        ProcessRuntimeExecutionFence, bind_execution_custody, execution_cleanup_debts,
+    )
+    from tests.unit.test_owned_task_lending import CapacityLoan
+
+    # Only the executable's application payload is controlled. The original
+    # production boundary starts and reaps its REAL native Process and pipes.
+    program = tmp_path / "docker"
+    program.write_text(f"#!{sys.executable} -B\nimport sys\nsys.stdin.buffer.read()\n")
+    program.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    boundary = DockerBoundary(str(tmp_path / "not-contacted.sock"))
+    fence, host = ProcessRuntimeExecutionFence("original-docker-reap"), CapacityLoan()
+    checks = []
+    def current():
+        checks.append(True)
+        if len(checks) == 2:
+            fence.retire()
+        fence.require_work()
+    try:
+        with bind_execution_custody(fence), ownership.bind_owned_task_lender(host):
+            with pytest.raises(BaseException) as caught:
+                await boundary.invoke(["version"], current=current)
+        assert len(checks) >= 2 and not execution_cleanup_debts(caught.value)
+        async with asyncio.timeout(3):
+            while host.outstanding:
+                host.retirement_changed.clear()
+                await host.retirement_changed.wait()
+        launched = [receipt.task for receipt in host.retired
+                    if receipt.task is not None and receipt.task.get_name() == "visual-native-launch"]
+        assert len(launched) == 1
+        process = launched[0].result()
+        assert type(process) is asyncio.subprocess.Process and process.returncode is not None
+    finally:
+        # The production closer is responsible for this native child. Any
+        # failed mutation also has a strict outer process-owner test timeout.
+        for task in [receipt.task for receipt in host.retired if receipt.task is not None]:
+            if task.get_name() == "visual-native-launch" and task.done() and task.exception() is None:
+                process = task.result()
+                if process.returncode is None:
+                    process.kill()
+                await asyncio.wait_for(process.wait(), 3)

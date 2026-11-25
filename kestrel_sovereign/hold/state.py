@@ -944,38 +944,40 @@ async def _close_postgres_preflight_backends(
     prior_error: BaseException | None = None,
 ) -> tuple[BaseException, ...]:
     """Finish every raw-pool close even under repeated caller cancellation."""
-    from kestrel_sovereign._async_ownership import (
-        OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
-    )
-    from kestrel_sovereign.execution_custody import execution_terminal_error
-
-    # Admit each independent native closer before joining any one of them.
-    # A refused admission retains that exact resource and must not skip peers.
-    owners, failures, withdrawals = [], [], []
-    for backend in backends:
-        admission = OwnedTaskAdmission()
-        try:
-            owners.append(create_owned_task(
-                backend.close(), retirement_resource=backend,
-                retain_originals=True, name="hold:preflight-native-close",
-                admission=admission,
-            ))
-        except BaseException as failure:
-            if admission.task is not None:
-                owners.append(admission.task)
-            failures.append(owned_task_admission_error(backend, admission, failure))
-    for owner in owners:
-        outcome = await await_owned_task(owner)
-        if outcome.error is not None:
-            failures.append(outcome.error)
-        if outcome.cancellation is not None:
-            withdrawals.append(outcome.cancellation)
-    if prior_error is not None or withdrawals:
-        raise execution_terminal_error(
-            prior_error, *failures, *withdrawals, retain_originals=True,
-            prefer_cancellation=True, isolate_control_originals=True,
+    from kestrel_sovereign.execution_custody import bind_execution_cleanup
+    with bind_execution_cleanup(None):
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_admission_error,
         )
-    return tuple(failures)
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        # Admit each independent native closer before joining any one of them.
+        # A refused admission retains that exact resource and must not skip peers.
+        owners, failures, withdrawals = [], [], []
+        for backend in backends:
+            admission = OwnedTaskAdmission()
+            try:
+                owners.append(create_owned_task(
+                    backend.close(), retirement_resource=backend,
+                    retain_originals=True, name="hold:preflight-native-close",
+                    admission=admission,
+                ))
+            except BaseException as failure:
+                if admission.task is not None:
+                    owners.append(admission.task)
+                failures.append(owned_task_admission_error(backend, admission, failure))
+        for owner in owners:
+            outcome = await await_owned_task(owner)
+            if outcome.error is not None:
+                failures.append(outcome.error)
+            if outcome.cancellation is not None:
+                withdrawals.append(outcome.cancellation)
+        if prior_error is not None or withdrawals:
+            raise execution_terminal_error(
+                prior_error, *failures, *withdrawals, retain_originals=True,
+                prefer_cancellation=True, isolate_control_originals=True,
+            )
+        return tuple(failures)
 
 
 async def preflight_postgres_hold_custody(

@@ -37,6 +37,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.execution_custody import (
+    bind_execution_cleanup,
     current_execution_custody, execution_cleanup_debts, execution_denial_scopes,
     execution_terminal_error, is_execution_control_error,
 )
@@ -2308,10 +2309,12 @@ class DistributedInvocationRegistry:
         if heartbeat is not None:
             # The lease was renewed through the drain and abandonment above.
             # Stopping only now lets a row left behind expire on schedule.
-            stopped = await await_owned_task(create_owned_task(
-                heartbeat.stop(timeout=max(abandon_deadline - loop.time(), 1.0)),
-                name="distributed-stop-heartbeat-stop",
-            ))
+            with bind_execution_cleanup(self):
+                closer = create_owned_task(
+                    heartbeat.stop(timeout=max(abandon_deadline - loop.time(), 1.0)),
+                    name="distributed-stop-heartbeat-stop",
+                )
+            stopped = await await_owned_task(closer)
             withdrawal = execution_terminal_error(
                 withdrawal, stopped.cancellation, retain_originals=True,
             )

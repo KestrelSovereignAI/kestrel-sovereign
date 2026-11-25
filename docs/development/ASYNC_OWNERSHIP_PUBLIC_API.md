@@ -12,10 +12,15 @@ retry policy, or altered default:
 | --- | --- |
 | `OwnedOperation` | Retain one original operation and its admission across repeated or finite borrowed observations; an explicit fresh receipt can be reserved before construction. |
 | `OwnedTaskAdmission` | Fresh caller-local receipt of the exact accepted native Task, written before callback publication; not a second registry or work grant. |
+| `OwnedTaskLender` | Synchronous host-owned resource policy. Reserve against the original admission, lend to the exact gated Task, retire only from canonical completion. |
+| `OwnedTaskLenderCapture` | One live binding occurrence and its actual admitted parent, captured separately from the body's execution context. |
 | `OwnedTaskOutcome` | Original result, failure, and caller-cancellation observation. |
 | `OwnedTaskRetirement` | Read-only snapshot of one exact admission: unknown, proven task nonacceptance, pending, or complete with its original error. |
 | `await_owned_operation` | Admit and physically join one asynchronous operation at an existing unbounded join boundary, including failed task publication. |
+| `acquire_lock_keeping_cancellation` | Acquire an existing Lock or Condition despite repeated caller withdrawal; return the original cancellation evidence for delivery after the owner's synchronous accounting/cleanup and lock release. Does not grant Work or create a Task. |
 | `await_owned_task` | Observe the same original task despite repeated caller cancellation; existing borrowing and forwarding options retain their semantics. |
+| `bind_owned_task_lender` | Route the embedding host's own policy from its actual resource-owning Task. This binding never creates a resource or grants authority on its own. |
+| `capture_owned_task_lender` | Retain the current exact parent for a later, explicitly delegated native admission. A copied context does not carry the task identity. |
 | `create_owned_task` | Create one gated original Task, retaining the exact accepted Task on an explicit admission receipt if later publication fails; true allocation refusal closes the unstarted original coroutine. |
 | `owned_task_error` | Harvest a terminal original Task's error without replacing its original cancellation or explicit evidence; an unfinished Task is not a terminal outcome. |
 | `pending_owned_retirement_error` | Snapshot unfinished original Tasks as resource-bound retirement debt without cancelling, replacing, or acknowledging them. |
@@ -136,6 +141,123 @@ completion was captured, not that its business operation succeeded. Original
 errors remain attached to the observation. These snapshots do not lend execution
 authority, retire a database lease, decrement accounting, or implement the
 cross-task resource-loan policy; physical custodians still own those obligations.
+
+## Explicit host-resource loans
+
+The embedding resource owner provides the one synchronous `OwnedTaskLender`
+policy and validates the actual creator, original admitted parent, resource
+occurrence and capacity. Core reserves against the exact admission before
+native allocation and calls `lend` before opening the payload gate.
+The original parent must be live at reservation and lending. Once accepted,
+the child's own receipt owns its loan: creator completion alone cannot revoke
+it before the first payload step. Binding exit and withdrawal of the original
+work authority still deny that step. A completed parent's old capture cannot
+reserve another child. A copied or fresh context does not supply a captured
+parent. Pass the exact capture to
+explicitly delegate across a fresh execution context; pass `None` to suppress
+lending. Native privacy factories and callback scopes retain the capture at
+creation, independently of privacy scope. A detached boundary suppresses it.
+Core's cleanup-only custody suppresses WORK lending even for previously
+captured factories, including shared stream withdrawal and restored turn
+custody. Detachment also suppresses old explicit captures; an independent
+resource owner may bind its own new policy, but cleanup-only work may not.
+The detachment occurrence is retained separately from that active policy and
+carried through the selected body context, so binding the new owner cannot
+revive a capture from before detachment. Context restrictions are read without
+entering the supplied Context, including a Context already active in its caller.
+The original admitted owner still retains its physical
+cleanup and reports its exact outcome; no new work grant is made there.
+
+`without_owned_coordinators()` is the canonical independent-owner boundary,
+not permission to evade an enclosing resource budget. The host must reserve
+that independent lifetime's resource charge before admitting its Task, retain
+its exact original owner through exit, and preserve/recheck the original
+execution-work admission. Detachment removes enclosing coordinator/loan routing;
+it does not remove execution custody or grant ordinary Work. This permits a
+separately charged SQL lifetime to retain an UNKNOWN exclusion after its request
+returns without pinning an outer reader's Work loan forever.
+
+`cancel_owned_task()` requests cancellation with the exact native admission's
+private token. `is_owned_task_cancellation()` authenticates that same original
+receipt's otherwise-unadorned cancellation; a different cancellation or attached
+execution-control evidence does not match. Hosts may normalize their own
+acquisition abort only AFTER the original native exit has physically joined.
+Observer withdrawal and unresolved retirement remain separate evidence, never
+a release acknowledgment.
+
+For complete native retirement or proven nonacceptance, Core publishes one
+canonical observation to the host. UNKNOWN retains the admission and its
+original errors for the host. Callbacks are notification, not the resource's
+owner: a host must retain and read-only reconcile its own receipts if publication
+fails. Core's original one-shot publisher is the sole caller of policy `retire`.
+A PENDING observation exposes `pending_tasks`, the exact unfinished native
+producer/watcher/closer Tasks; hosts join those originals and reconcile again.
+The producer's `task` identity is never replaced by a structural owner.
+A final UNKNOWN has no pending native owners to await and need not produce a
+retirement-change signal. Surface that original debt while retaining its
+reservation and physical resource; do not wait indefinitely or invent an ACK.
+For a COMPLETE observation preceding its already-queued publisher callback,
+a host drain waits for its retirement-change signal;
+it must not call `retire` independently, even after observing physical COMPLETE.
+This prevents a drain racing the already-queued original completion callback.
+No callback runs a replacement task or acknowledges an external
+resource. Opaque factory wrappers never receive a loan. Exhausted or revoked
+policies must refuse synchronously, without allocating another owner or
+reattributing an existing resource. A reservation refusal is atomic.
+
+Captures retain Core's canonical read-only execution-work check, including the
+same mutable stream-withdrawal records, not a new context-derived work grant.
+Admission rechecks that evidence before reservation/allocation, before and after
+lending, and at the actual first payload step. A retained callback in a fresh
+context cannot borrow from its still-unwinding withdrawn producer. Exact native
+PostgreSQL COMMIT/ROLLBACK, pool reset/close and advisory-session close suppress
+WORK lending through the same cleanup restriction; physical retirement cannot
+depend on spare WORK capacity. This does not relax standalone execution checks.
+
+Only the original native CPython selector/proactor or installed uvloop default
+constructor can receive a loan, with no configured task factory. Core checks
+implementation identity before reservation and again before allocation; it
+never silently bypasses or replaces an unsupported factory. This restriction
+applies only to live, unsuppressed host loans. Generic non-lender creation keeps
+its existing factory semantics and ambiguous-acceptance reconciliation. A
+one-turn Task snapshot or first-entry identity check cannot prove the lifetime
+of a coroutine retained by an arbitrary constructor. The exact accepted Task
+and first-entry checks remain additional safeguards, not that missing proof.
+Gate cancellation/refusal is settled inside the original admission transaction
+before lending or dispatch; the physical cancellation remains on that receipt.
+
+Direct owned iterators capture their original lender separately from the source
+body context. `ExecutionStreamLifecycle.owner_factory` receives lazy body,
+context, and keyword-only `admission`/`lender_capture`; it must forward those
+exact originals to canonical construction and return the admitted producer.
+There is no legacy factory fallback or replacement receipt. Captured privacy
+factories accept the same explicit handoff. A forwarder checks producer capacity
+before allocating its watcher/closer, while source dispatch remains gated until
+all construction/registration finishes. Cooperative Event-only idle waits and
+physical closers do not consume extra WORK loans.
+
+The original source admission also retains physical-retirement facts separately
+from exception presentation. An observed failed close keeps reconciliation
+UNKNOWN and the host loan outstanding even when its producer Task is done;
+an ordinary body failure followed by successful physical close can retire.
+The same record retains producer, watcher, and original closer receipts. Native
+completion and actual close progress re-evaluate the original one-shot retirement
+publisher, including when completion notification preceded source settlement.
+No observer timeout, lost callback, exception spelling, or replacement owner
+can manufacture an acknowledgment. A failed constructor uses a fresh pending
+source carrier rather than decorating its original refusal. The existing join
+settles that construction fact only after the exact accepted owners settled;
+independent capture, epilogue, watcher, and physical-close failures remain.
+Missing original completion-capture registration is UNKNOWN even if an
+unstarted wrapper's Task has since been joined; a later join does not replace
+that failed registration. Constructor debt names the uncertain original
+producer or watcher receipt, not a different Task that already retired.
+
+Physical HTTP-body close (including inline response close), database-facade
+disposal, and native SQLite connection close use the same cleanup-only lending
+restriction as PostgreSQL epilogues. They must retire their original resources
+even when no new WORK capacity is available, without granting new WORK authority
+or suppressing an actual failed close.
 
 ## Task completion is not process-tree drain
 

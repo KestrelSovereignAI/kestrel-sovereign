@@ -35,10 +35,10 @@ from kestrel_sdk.resources import (
 )
 from .dispatch import native_dispatch, native_trace
 from kestrel_sovereign._async_ownership import (
-    await_owned_task, await_owned_operation, gather_owned, raise_owned_outcome,
+    OwnedOperation, await_owned_task, await_owned_operation, gather_owned, raise_owned_outcome,
 )
 from kestrel_sovereign.execution_custody import (
-    execution_cleanup_debts, execution_error_with_cause, execution_terminal_error,
+    bind_execution_cleanup, execution_cleanup_debts, execution_error_with_cause, execution_terminal_error,
 )
 from .docker_policy import container_arguments, verify_container
 from .docker_egress import DockerEgressPolicy, HTTPGateway, EgressDenied, EgressUnknown
@@ -303,8 +303,10 @@ class DockerBoundary:
                     reaped = True
                     if errors:
                         raise execution_terminal_error(*errors, retain_originals=True)
-                cleanup = await await_owned_operation(retire(), name="visual-native-reap",
-                    retirement_resource=process)
+                with bind_execution_cleanup(None):
+                    retirement = OwnedOperation(retire(), name="visual-native-reap",
+                        retirement_resource=process)
+                cleanup = await retirement.observe()
             if _native_owner is not None:
                 _native_owner["settled"] = (launch_joined and streams_joined and (
                     not launch_started or exec_refused or (process is not None and reaped))

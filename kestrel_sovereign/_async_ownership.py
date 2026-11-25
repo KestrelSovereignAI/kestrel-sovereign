@@ -17,7 +17,7 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, ExitStack, a
 from dataclasses import dataclass, field
 from functools import wraps
 from types import TracebackType
-from typing import Generic, Literal, TypeVar, cast
+from typing import Generic, Literal, Protocol, TypeVar, cast
 from weakref import WeakKeyDictionary
 
 from kestrel_sdk.native_a2a.utils.source_lifetime import SourceFactory
@@ -39,10 +39,29 @@ _NATIVE_CREATE_TASK = asyncio.create_task
 _NATIVE_CREATE_TASK_CODE = asyncio.create_task.__code__
 _NATIVE_LOOP_CREATE_TASK = asyncio.BaseEventLoop.create_task
 _NATIVE_LOOP_CREATE_TASK_CODE = asyncio.BaseEventLoop.create_task.__code__
+try:
+    from uvloop import Loop as _NATIVE_UVLOOP
+except ModuleNotFoundError as unavailable:
+    if unavailable.name != "uvloop":
+        raise
+    _NATIVE_UVLOOP = None
+_NATIVE_UVLOOP_CREATE_TASK = None if _NATIVE_UVLOOP is None else _NATIVE_UVLOOP.create_task
 
 # Routing only. Each coordinator independently validates the actual caller and
 # original native admission; inheriting this context grants no membership.
 _OWNED_COORDINATORS = contextvars.ContextVar("kestrel_owned_coordinators", default=())
+_OWNED_TASK_LENDER = contextvars.ContextVar("kestrel_owned_task_lender", default=None)
+_OWNED_TASK_LENDING_BOUNDARY = contextvars.ContextVar("kestrel_owned_task_lending_boundary", default=None)
+_LENDING_DISABLED = object()
+_LENDING_DETACHED = object()
+_PRESERVE_LENDING_BOUNDARY = object()
+
+
+class _AutomaticTaskLender:
+    __slots__ = ()
+
+
+_AUTOMATIC_TASK_LENDER = _AutomaticTaskLender()
 
 
 class OriginalContextExit(AbstractAsyncContextManager[_T]):
@@ -124,10 +143,48 @@ def without_owned_coordinators():
     is created with no coordinator routed, and copies none into its context.
     """
     reset = _OWNED_COORDINATORS.set(())
+    reset_lender = _OWNED_TASK_LENDER.set(
+        _LENDING_DISABLED if _owned_task_lending_suppression() is _LENDING_DISABLED else _LENDING_DETACHED,
+    )
+    reset_boundary = _OWNED_TASK_LENDING_BOUNDARY.set(object())
     try:
         yield
     finally:
+        _OWNED_TASK_LENDING_BOUNDARY.reset(reset_boundary)
+        _OWNED_TASK_LENDER.reset(reset_lender)
         _OWNED_COORDINATORS.reset(reset)
+
+
+@contextmanager
+def _disable_owned_task_lending(disabled: bool):
+    with _bind_owned_task_lending_suppression(_LENDING_DISABLED if disabled else None):
+        yield
+
+
+@contextmanager
+def _bind_owned_task_lending_suppression(suppression, *, boundary=_PRESERVE_LENDING_BOUNDARY):
+    reset_boundary = (_OWNED_TASK_LENDING_BOUNDARY.set(boundary)
+                      if boundary is not _PRESERVE_LENDING_BOUNDARY else None)
+    reset = _OWNED_TASK_LENDER.set(suppression) if suppression is not None else None
+    try:
+        yield
+    finally:
+        if reset is not None:
+            _OWNED_TASK_LENDER.reset(reset)
+        if reset_boundary is not None:
+            _OWNED_TASK_LENDING_BOUNDARY.reset(reset_boundary)
+
+
+def _owned_task_lending_suppression(context=None):
+    # Shared stream withdrawal and restored turn custody are authoritative even
+    # when a task/factory carries an older explicit parent capture.
+    from kestrel_sovereign.execution_custody import _execution_cleanup_requested
+    lender = _OWNED_TASK_LENDER.get() if context is None else context.get(_OWNED_TASK_LENDER, None)
+    if _execution_cleanup_requested(context=context) or lender is _LENDING_DISABLED:
+        return _LENDING_DISABLED
+    if lender is _LENDING_DETACHED:
+        return _LENDING_DETACHED
+    return None
 
 
 @asynccontextmanager
@@ -175,6 +232,7 @@ class OwnedCallbackScope:
         self.tasks = set()
         self._join_observers = set()
         self.closed = False
+        self._lender = capture_owned_task_lender()
         self.coordinators = tuple(c for c in _OWNED_COORDINATORS.get()
                                   if c.current_native_scope() is not None)
         self.factories = tuple(c.capture_native_work_factory(acquire_span=False)
@@ -182,7 +240,8 @@ class OwnedCallbackScope:
         for coordinator in self.coordinators:
             coordinator.register_callback_scope(self)
 
-    def start(self, operation, *, name=None, context=None, on_completion=None):
+    def start(self, operation, *, name=None, context=None, on_completion=None,
+              admission=None, lender_capture=_AUTOMATIC_TASK_LENDER):
         """Accept original work with an explicitly selected execution context.
 
         The retained privacy factory owns resource-lifetime admission separately;
@@ -200,10 +259,13 @@ class OwnedCallbackScope:
                 raise opening
             return await operation()
 
+        capture = self._lender if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture
         task = (self.factories[0](run, name=name, context=context,
-                                 on_completion=on_completion) if self.factories else
+                                 on_completion=on_completion, admission=admission,
+                                 lender_capture=capture) if self.factories else
                 create_owned_task(run(), name=name, context=context,
-                                  retain_originals=True, on_completion=on_completion))
+                                  retain_originals=True, on_completion=on_completion,
+                                  admission=admission, lender_capture=capture))
         # Physical acceptance precedes cohort publication. Keep that exact
         # owner even when an observer/coordinator refuses its publication.
         self.tasks.add(task)
@@ -326,6 +388,8 @@ class OwnedTaskAdmission:
     _nonacceptance_proven: bool = field(default=False, repr=False)
     _operation_claimed: bool = field(default=False, repr=False)
     _operation_admitting: bool = field(default=False, repr=False)
+    _source: OwnedSourceAdmission | None = field(default=None, repr=False)
+    _retirement_publisher: Callable[[], BaseException | None] | None = field(default=None, repr=False)
 
     @property
     def dispatch_refused(self) -> bool:
@@ -346,6 +410,84 @@ class OwnedTaskRetirement:
     task: asyncio.Task | None
     state: Literal["unknown", "nonacceptance", "pending", "complete"]
     error: BaseException | None
+    pending_tasks: tuple[asyncio.Task, ...] = ()
+
+
+class OwnedTaskLender(Protocol):
+    """Synchronous host policy for one already-owned physical resource.
+
+    The host validates the exact root, creator and original parent. Its
+    reservation is atomic: refusal must not create an unreturned reservation.
+    An accepted reservation stays with the original admission even on errors.
+    Core alone invokes retire through that original receipt's one-shot
+    publisher. Hosts may join and read-only reconcile, but must never retire
+    the same reservation independently from an observer or drain loop.
+    """
+
+    def reserve(self, *, creator: asyncio.Task | None, original_parent: asyncio.Task,
+                admission: OwnedTaskAdmission, structural_role: str | None) -> object: ...
+
+    def lend(self, reservation: object, *, task: asyncio.Task,
+             admission: OwnedTaskAdmission) -> None: ...
+
+    def retire(self, reservation: object, *, retirement: OwnedTaskRetirement) -> None: ...
+
+
+@dataclass(eq=False, slots=True)
+class _OwnedTaskLenderBinding:
+    policy: OwnedTaskLender
+    detachment: object | None = None
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedTaskLenderCapture:
+    """One concrete admitted parent and its original binding occurrence."""
+
+    _binding: _OwnedTaskLenderBinding
+    _parent: asyncio.Task
+    _require_work: Callable[[], None]
+
+
+@contextmanager
+def bind_owned_task_lender(policy: OwnedTaskLender):
+    """Bind the host's live root to this exact Task until lexical exit."""
+    if _owned_task_lending_suppression() is _LENDING_DISABLED:
+        raise RuntimeError("cleanup-only custody cannot bind a work lender")
+    parent = asyncio.current_task()
+    if parent is None:
+        raise RuntimeError("owned task lender needs an original Task")
+    from kestrel_sovereign.execution_custody import capture_execution_work_check
+    binding = _OwnedTaskLenderBinding(policy, _OWNED_TASK_LENDING_BOUNDARY.get())
+    reset = _OWNED_TASK_LENDER.set(OwnedTaskLenderCapture(binding, parent, capture_execution_work_check()))
+    try:
+        yield
+    finally:
+        binding.active = False
+        _OWNED_TASK_LENDER.reset(reset)
+
+
+def capture_owned_task_lender() -> OwnedTaskLenderCapture | None:
+    """Capture the actual admitted parent; a copied ContextVar grants nothing."""
+    capture = _OWNED_TASK_LENDER.get()
+    if (_owned_task_lending_suppression() is None
+            and type(capture) is OwnedTaskLenderCapture and capture._binding.active
+            and asyncio.current_task() is capture._parent):
+        from kestrel_sovereign.execution_custody import capture_execution_work_check
+        current_check = capture_execution_work_check()
+        def require_original_work():
+            capture._require_work()
+            current_check()
+        return OwnedTaskLenderCapture(capture._binding, capture._parent, require_original_work)
+    return None
+
+
+def _require_live_owned_task_lender(capture, owner_loop, *, require_live_parent=True):
+    if (type(capture) is not OwnedTaskLenderCapture or not capture._binding.active
+            or (require_live_parent and _NATIVE_TASK.done(capture._parent))
+            or asyncio.Future.get_loop(capture._parent) is not owner_loop):
+        raise RuntimeError("original owned task lender is no longer live")
+    capture._require_work()
 
 
 def _require_fresh_owned_task_admission(admission, *, for_operation=False):
@@ -356,6 +498,29 @@ def _require_fresh_owned_task_admission(admission, *, for_operation=False):
         raise TypeError("owned admission requires a fresh original receipt")
 
 
+def _has_original_native_constructor(loop, owner_loop):
+    native_method = getattr(owner_loop.create_task, "__func__", None)
+    standard = (native_method is _NATIVE_LOOP_CREATE_TASK
+        and _NATIVE_LOOP_CREATE_TASK.__code__ is _NATIVE_LOOP_CREATE_TASK_CODE
+        and getattr(owner_loop.create_task, "__self__", None) is owner_loop)
+    uvloop = (_NATIVE_UVLOOP is not None and isinstance(owner_loop, _NATIVE_UVLOOP)
+        and native_method is _NATIVE_UVLOOP_CREATE_TASK
+        and getattr(owner_loop.create_task, "__self__", None) is owner_loop)
+    return (
+        (loop is not None or (asyncio.create_task is _NATIVE_CREATE_TASK
+            and _NATIVE_CREATE_TASK.__code__ is _NATIVE_CREATE_TASK_CODE))
+        and (standard or uvloop)
+        and asyncio.tasks.Task is _NATIVE_TASK)
+
+
+def _require_canonical_loan_constructor(loop, owner_loop):
+    # Generic non-lender work keeps its configured factory semantics. A host
+    # loan cannot rely on a snapshot of a factory that retains the coroutine
+    # and may resume it in another Task after that snapshot or first dispatch.
+    if owner_loop.get_task_factory() is not None or not _has_original_native_constructor(loop, owner_loop):
+        raise RuntimeError("host loans require a canonical native constructor without a task factory")
+
+
 def reconcile_owned_task_admission(admission: OwnedTaskAdmission) -> OwnedTaskRetirement:
     """Observe the original receipt without allocating, cancelling, or closing.
 
@@ -363,7 +528,11 @@ def reconcile_owned_task_admission(admission: OwnedTaskAdmission) -> OwnedTaskRe
     error capture as every existing join; an unfinished physical tail or lost
     capture cannot become an ACK merely because its enclosing Task is done.
     """
-    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+    return _reconcile_owned_task_admission(admission)
+
+
+def _reconcile_owned_task_admission(admission, *, include_source=True):
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_observation_error
 
     if type(admission) is not OwnedTaskAdmission:
         raise TypeError("physical reconciliation requires an original admission receipt")
@@ -375,9 +544,35 @@ def reconcile_owned_task_admission(admission: OwnedTaskAdmission) -> OwnedTaskRe
         state = "nonacceptance" if admission._nonacceptance_proven else "unknown"
         return OwnedTaskRetirement(admission, None, state, admission.error)
     if not _NATIVE_TASK.done(task):
-        return OwnedTaskRetirement(admission, task, "pending", admission.error)
+        return OwnedTaskRetirement(admission, task, "pending", admission.error, (task,))
     error = owned_task_error(task, admission=admission)
-    state = "unknown" if execution_cleanup_debts(error) else "complete"
+    state = "unknown" if (not admission._completion_capture_registered
+        or execution_cleanup_debts(error)) else "complete"
+    source = admission._source if include_source else None
+    if source is not None and source.producer is admission:
+        facts = source._state
+        errors = [error, *facts.failures]
+        pending = []
+        if facts.construction_pending or (facts.resource_required and not facts.resource_closed):
+            state = "unknown"
+        if facts.failures:
+            state = "unknown"
+        for other in (source.watcher, source.retirement):
+            if other is None or not other._creation_started:
+                continue
+            observation = _reconcile_owned_task_admission(other, include_source=False)
+            errors.append(observation.error)
+            pending.extend(observation.pending_tasks)
+            if observation.state not in {"complete", "nonacceptance"}:
+                state = "unknown"
+        if pending:
+            # A joined producer is not a final UNKNOWN while its ORIGINAL
+            # watcher/closer still runs. Expose those exact native owners so a
+            # host can join them and re-read, even when final failure publishes
+            # no retirement ACK/change signal.
+            state = "pending"
+        error = execution_observation_error(*errors)
+        return OwnedTaskRetirement(admission, task, state, error, tuple(dict.fromkeys(pending)))
     return OwnedTaskRetirement(admission, task, state, error)
 
 
@@ -506,7 +701,9 @@ def _retain_owned_admission_error(task, error, *, admission=None, gate=None):
 
 
 def create_owned_task(operation, *, name=None, context=None, retain_originals=False,
-                      retirement_resource=None, loop=None, admission=None, on_completion=None):
+                      retirement_resource=None, loop=None, admission=None, on_completion=None,
+                      lender_capture: OwnedTaskLenderCapture | _AutomaticTaskLender | None = _AUTOMATIC_TASK_LENDER,
+                      structural_role: str | None = None):
     """Capture the original carrier inside a child before asyncio can erase it.
 
     Creation retains normal copied-context semantics. The caller still owns
@@ -522,6 +719,8 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     a different loop cannot receive ownership of this caller's operation.
     A custom factory's opaque/ambiguous failure retains explicit acceptance
     debt; zero exact native matches never certifies that factory's refusal.
+    A host lender reserves before allocation and grants a loan only to the
+    exact gated native wrapper. A fresh context needs its explicit capture.
     """
     started = False
     private_admission = admission is None
@@ -529,69 +728,111 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         admission = OwnedTaskAdmission()
     gate = None
     admitted_coordinators = ()
+    admitted_lender = None
+    lending_suppression = lending_boundary = None
+    loan = None
+    loan_retirement_ready = False
+    loan_retirement_started = False
     unstarted_closed = False
     async def run():
         nonlocal started
-        admission._wrapper_started = True
-        observed = None
-        try:
-            if gate is not None:
-                opening = await gate
-                if opening is not None:
-                    raise opening
-            started = True
-            reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
-                (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
-            )))
+        with _bind_owned_task_lending_suppression(lending_suppression, boundary=lending_boundary):
+            admission._wrapper_started = True
+            observed = None
             try:
-                return await operation
-            finally:
-                _OWNED_COORDINATORS.reset(reset)
-        except BaseException as error:
-            from kestrel_sovereign.execution_custody import (
-                execution_terminal_error,
-                execution_observation_error,
-                retained_execution_error,
-            )
-            admission._canonical_error = execution_terminal_error(
-                error, retain_originals=retain_originals,
-            )
-            observed = error
-            try:
-                task = asyncio.current_task()
-                cached = getattr(task, "_kestrel_owned_terminal_error", None)
-                observed = retained_execution_error(
-                    execution_observation_error(cached, error)
-                    if cached is not None and cached is not error else
-                    execution_terminal_error(error, retain_originals=retain_originals)
+                if gate is not None:
+                    opening = await gate
+                    if opening is not None:
+                        raise opening
+                if loan is not None and asyncio.current_task() is not admission.task:
+                    admission._acceptance_unknown = True
+                    raise owned_task_admission_error(admission, admission,
+                        RuntimeError("host loan payload requires its exact accepted native Task"))
+                if loan is not None:
+                    # Reserve and lend already validated the live creator.
+                    # This child's original receipt now owns its accepted loan;
+                    # creator completion alone cannot revoke that admission.
+                    _require_live_owned_task_lender(capture, owner_loop, require_live_parent=False)
+                started = True
+                reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
+                    (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
+                )))
+                reset_lender = _OWNED_TASK_LENDER.set(
+                    lending_suppression if lending_suppression is not None else admitted_lender,
                 )
-                task._kestrel_owned_terminal_error = observed
-            except BaseException as publication:
-                observed = execution_observation_error(observed, publication)
-                admission._canonical_error = observed
-                raise observed
-            raise
-        finally:
-            if on_completion is not None:
-                # This belongs to the original physical wrapper, outside its
-                # payload gate. Task callback subscription is not required to
-                # observe a failed gate, including two publication failures.
                 try:
-                    completion = on_completion(asyncio.current_task(), observed)
-                    if completion is not None:
-                        if inspect.iscoroutine(completion):
-                            completion.close()
-                        raise TypeError("native completion publisher must return synchronously with None")
+                    return await operation
+                finally:
+                    _OWNED_TASK_LENDER.reset(reset_lender)
+                    _OWNED_COORDINATORS.reset(reset)
+            except BaseException as error:
+                from kestrel_sovereign.execution_custody import (
+                    execution_terminal_error,
+                    execution_observation_error,
+                    retained_execution_error,
+                )
+                admission._canonical_error = execution_terminal_error(
+                    error, retain_originals=retain_originals,
+                )
+                observed = error
+                try:
+                    task = asyncio.current_task()
+                    cached = getattr(task, "_kestrel_owned_terminal_error", None)
+                    observed = retained_execution_error(
+                        execution_observation_error(cached, error)
+                        if cached is not None and cached is not error else
+                        execution_terminal_error(error, retain_originals=retain_originals)
+                    )
+                    task._kestrel_owned_terminal_error = observed
                 except BaseException as publication:
-                    from kestrel_sovereign.execution_custody import execution_observation_error
-                    combined = execution_observation_error(observed, publication)
+                    observed = execution_observation_error(observed, publication)
+                    admission._canonical_error = observed
+                    raise observed
+                raise
+            finally:
+                if on_completion is not None:
+                    # This belongs to the original physical wrapper, outside its
+                    # payload gate. Task callback subscription is not required to
+                    # observe a failed gate, including two publication failures.
                     try:
-                        asyncio.current_task()._kestrel_owned_terminal_error = combined
-                    except BaseException as cache_error:
-                        combined = execution_observation_error(combined, cache_error)
-                    admission._canonical_error = combined
-                    raise combined
+                        completion = on_completion(asyncio.current_task(), observed)
+                        if completion is not None:
+                            if inspect.iscoroutine(completion):
+                                completion.close()
+                            raise TypeError("native completion publisher must return synchronously with None")
+                    except BaseException as publication:
+                        from kestrel_sovereign.execution_custody import execution_observation_error
+                        combined = execution_observation_error(observed, publication)
+                        try:
+                            asyncio.current_task()._kestrel_owned_terminal_error = combined
+                        except BaseException as cache_error:
+                            combined = execution_observation_error(combined, cache_error)
+                        admission._canonical_error = combined
+                        raise combined
     wrapper = run()
+
+    def retire_loan():
+        nonlocal loan_retirement_started
+        if loan is None or not loan_retirement_ready or loan_retirement_started:
+            return None
+        retirement = reconcile_owned_task_admission(admission)
+        if retirement.state not in {"complete", "nonacceptance"}:
+            return None
+        loan_retirement_started = True
+        admission._retirement_publisher = None
+        policy, reservation = loan
+        try:
+            policy.retire(reservation, retirement=retirement)
+        except BaseException as failure:
+            # No callback retry or manufactured success. The host still owns
+            # its original reservation and this failure remains on its receipt.
+            debt = owned_task_admission_error(reservation, admission, failure)
+            if retirement.task is not None:
+                return _retain_owned_admission_error(retirement.task, debt, admission=admission)
+            admission.error = debt
+            return debt
+        return None
+
     def close_unstarted(_task):
         nonlocal unstarted_closed
         try:
@@ -607,8 +848,12 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 # Snapshot the physical outcome before a foreign await consumes
                 # asyncio's original CancelledError, including outer epilogues.
                 owned_task_error(_task, admission=admission)
+                retire_loan()
+                if admission._source is not None:
+                    _publish_source_progress(admission._source)
 
     def fail_start(task, opening):
+        nonlocal loan_retirement_ready
         from kestrel_sovereign.execution_custody import (
             execution_observation_error, execution_terminal_error,
         )
@@ -626,6 +871,10 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 if not gate.done():
                     gate.set_result(terminal)
                 admission._start_refused = not gate.cancelled() and gate.result() is not None
+        loan_retirement_ready = True
+        retirement_failure = retire_loan()
+        if retirement_failure is not None:
+            return retirement_failure
         return terminal
 
     creation_attempted = False
@@ -643,8 +892,40 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                            for publisher in (on_completion, publisher_call))):
                 raise TypeError("native completion publisher must be a synchronous callable")
         owner_loop = asyncio.get_running_loop()
+        lending_suppression = _owned_task_lending_suppression()
+        caller_boundary = _OWNED_TASK_LENDING_BOUNDARY.get()
+        body_boundary = None
+        if context is not None:
+            if not isinstance(context, contextvars.Context):
+                raise TypeError("owned task context must be a Context")
+            body_suppression = _owned_task_lending_suppression(context)
+            if lending_suppression is None or body_suppression is _LENDING_DISABLED:
+                lending_suppression = body_suppression
+            body_boundary = context.get(_OWNED_TASK_LENDING_BOUNDARY, None)
+        lending_boundary = body_boundary if body_boundary is not None else caller_boundary
         gate = owner_loop.create_future()
         task_factory = owner_loop.get_task_factory()
+        capture = ((capture_owned_task_lender() if context is None else None)
+                   if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture)
+        if lending_suppression is not None:
+            capture = None
+        if type(capture) is OwnedTaskLenderCapture and any(
+            boundary is not None and capture._binding.detachment is not boundary
+            for boundary in (caller_boundary, body_boundary)
+        ):
+            capture = None
+        if capture is not None:
+            _require_live_owned_task_lender(capture, owner_loop)
+            _require_canonical_loan_constructor(loop, owner_loop)
+            policy = capture._binding.policy
+            reservation = policy.reserve(
+                creator=asyncio.current_task(), original_parent=capture._parent,
+                admission=admission, structural_role=structural_role,
+            )
+            loan = policy, reservation
+            admission._retirement_publisher = retire_loan
+            _require_live_owned_task_lender(capture, owner_loop)
+            _require_canonical_loan_constructor(loop, owner_loop)
         if loop is None:
             creation_attempted = True
             task = asyncio.create_task(wrapper, name=name, context=context)
@@ -684,12 +965,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             native_constructor = False
             if query_error is None:
                 try:
-                    native_constructor = (
-                        (loop is not None or (asyncio.create_task is _NATIVE_CREATE_TASK
-                            and _NATIVE_CREATE_TASK.__code__ is _NATIVE_CREATE_TASK_CODE))
-                        and getattr(owner_loop.create_task, "__func__", None) is _NATIVE_LOOP_CREATE_TASK
-                        and _NATIVE_LOOP_CREATE_TASK.__code__ is _NATIVE_LOOP_CREATE_TASK_CODE
-                        and asyncio.tasks.Task is _NATIVE_TASK)
+                    native_constructor = _has_original_native_constructor(loop, owner_loop)
                 except BaseException as failure:
                     query_error = failure
             if query_error is not None or matches or task_factory is not None or not native_constructor:
@@ -727,6 +1003,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             # Set only after the original unstarted payload was actually closed.
             admission._nonacceptance_proven = True
             admission.error = error
+        terminal = error
         if retirement_resource is not None:
             from kestrel_sovereign.execution_custody import execution_terminal_error
             debt = RuntimeError("original native closer admission refused")
@@ -735,17 +1012,39 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             # must retain it even though no accepted Task exists to harvest.
             debt.__cause__ = error
             debt._kestrel_native_retirement_debts = ((retirement_resource, None),)
-            failure = execution_terminal_error(
+            terminal = execution_terminal_error(
                 error, debt, retain_originals=True,
                 isolate_control_originals=True,
             )
             if receipt_started:
-                admission.error = failure
-            raise failure
+                admission.error = terminal
+        loan_retirement_ready = True
+        retirement_failure = retire_loan()
+        if retirement_failure is not None:
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            terminal = admission.error = execution_observation_error(terminal, retirement_failure)
+        if terminal is not error:
+            raise terminal
         raise
     admission.task = task
     admission._canonical_wrapper_only = isinstance(task, _NATIVE_TASK) and _NATIVE_TASK.get_coro(task) is wrapper
     try:
+        if loan is not None:
+            admission._acceptance_unknown = True
+            # The unchanged native constructor cannot duplicate this wrapper.
+            # Inspect the original loop registry only for substituted factories
+            # or constructors, not on the ordinary task-creation hot path.
+            matches = ((task,) if task_factory is None and _has_original_native_constructor(loop, owner_loop) else
+                tuple(candidate for candidate in asyncio.all_tasks(owner_loop)
+                    if isinstance(candidate, _NATIVE_TASK) and _NATIVE_TASK.get_coro(candidate) is wrapper))
+            if (not admission._canonical_wrapper_only
+                    or asyncio.Future.get_loop(task) is not owner_loop
+                    or len(matches) != 1 or matches[0] is not task):
+                admission._acceptance_unknown = True
+                admission._reconciled_tasks = matches
+                raise owned_task_admission_error(admission, admission,
+                    RuntimeError("opaque native task or ambiguous native acceptance cannot receive a host resource loan"))
+            admission._acceptance_unknown = False
         task._kestrel_owned_admission = admission
         task.add_done_callback(close_unstarted)
         admission._completion_capture_registered = True
@@ -754,6 +1053,10 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         # scheduling a done callback alone leaves the original C consumable.
         if task.done():
             close_unstarted(task)
+        if loan is not None and admission._acceptance_unknown:
+            raise owned_task_admission_error(
+                admission, admission, RuntimeError("opaque native task cannot receive a host resource loan"),
+            )
         # An explicit context narrows the original ownership handoff. Resident
         # contexts deliberately carry no invocation coordinator. Routing still
         # cannot enroll anything unless the actual creator is an original member.
@@ -763,6 +1066,22 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             coordinator for coordinator in coordinators
             if coordinator.admit_owned_task(asyncio.current_task(), task, admission)
         )
+        if loan is not None:
+            if gate.done() or _NATIVE_TASK.cancelling(task):
+                raise RuntimeError("owned task start gate was withdrawn before lending")
+            _require_live_owned_task_lender(capture, owner_loop)
+            if _NATIVE_TASK.done(task):
+                raise RuntimeError("owned task lender or its accepted Task is no longer live")
+            policy, reservation = loan
+            policy.lend(reservation, task=task, admission=admission)
+            _require_live_owned_task_lender(capture, owner_loop)
+            admitted_lender = OwnedTaskLenderCapture(capture._binding, task, capture._require_work)
+        # Gate settlement belongs to admission too. A synchronous factory or
+        # policy can cancel the exact accepted Task before returning to us.
+        if gate is not None:
+            if gate.done():
+                raise RuntimeError("owned task start gate was withdrawn before dispatch")
+            gate.set_result(None)
     except BaseException as opening:
         if gate is not None:
             # The payload is still behind its failed gate. Retain this actual
@@ -773,8 +1092,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 return task
             raise terminal
         raise
-    if gate is not None:
-        gate.set_result(None)
+    loan_retirement_ready = True
     return task
 
 
@@ -825,7 +1143,7 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
     return OwnedTaskOutcome((originals - pending, pending), None, withdrawal)
 
 
-async def acquire_lock_keeping_cancellation(lock: asyncio.Lock) -> BaseException | None:
+async def acquire_lock_keeping_cancellation(lock: asyncio.Lock | asyncio.Condition) -> BaseException | None:
     """Acquire ``lock`` however often the caller is cancelled meanwhile.
 
     For a closer that must still release what it owns after the lock's
@@ -892,8 +1210,7 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
                             retain_originals=retain_originals, name=name, admission=admission,
                         )
                     else:
-                        child = work_factory(operation, name=name)
-                        admission.task = child
+                        child = work_factory(operation, name=name, admission=admission)
                     children.append(child)
                     accepted_scope.accept(child)
                 except BaseException as error:
@@ -1256,6 +1573,54 @@ class _CoreSourceHandoff(SourceHandoff[_T]):
             )
 
 
+@dataclass(slots=True)
+class _OwnedSourceRetirement:
+    resource_required: bool = False
+    resource_closed: bool = False
+    failures: tuple[BaseException, ...] = ()
+    construction_pending: bool = False
+    partial: OwnedAsyncIterator | None = None
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class OwnedSourceAdmission:
+    """Exact structural receipts allocated before the first native source task."""
+
+    producer: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
+    watcher: OwnedTaskAdmission = field(default_factory=OwnedTaskAdmission)
+    retirement: OwnedTaskAdmission | None = None
+    _state: _OwnedSourceRetirement = field(default_factory=_OwnedSourceRetirement, repr=False)
+
+
+def _publish_source_progress(source):
+    facts = source._state
+    partial = facts.partial
+    if facts.construction_pending and partial is not None:
+        receipts = (source.producer, source.watcher)
+        outstanding = tuple(receipt for receipt in receipts
+            if receipt._creation_started and _reconcile_owned_task_admission(
+                receipt, include_source=False).state not in {"complete", "nonacceptance"})
+        facts.construction_pending = bool(outstanding)
+        # Update only this fresh construction carrier from original receipts.
+        # A joined producer must not be relabelled as an unknown watcher's debt;
+        # the watcher's own error/capture remains untouched in the cause chain.
+        partial._construction_error._kestrel_native_retirement_debts = tuple(
+            (partial, receipt.task) for receipt in outstanding)
+    publisher = source.producer._retirement_publisher
+    if publisher is not None:
+        return publisher()
+    return None
+
+
+def _record_source_retirement(source, *, closed=False, failure=None):
+    facts = source._state
+    facts.resource_required = True
+    if failure is not None and not any(error is failure for error in facts.failures):
+        facts.failures += (failure,)
+    facts.resource_closed = closed and not facts.failures
+    _publish_source_progress(source)
+
+
 class OwnedAsyncIterator(Generic[_T]):
     """Keep every interaction with an async iterator in one owner task.
 
@@ -1283,9 +1648,17 @@ class OwnedAsyncIterator(Generic[_T]):
         owner_context: contextvars.Context | None = None,
         owner_factory: Callable | None = None,
         owner_started: Callable | None = None,
+        source_admission: OwnedSourceAdmission | None = None,
+        lender_capture: OwnedTaskLenderCapture | _AutomaticTaskLender | None = _AUTOMATIC_TASK_LENDER,
     ) -> None:
         if (iterator_factory is None) == (source_factory is None):
             raise TypeError("Provide exactly one iterator_factory or source_factory")
+        admission = source_admission if source_admission is not None else OwnedSourceAdmission()
+        if type(admission) is not OwnedSourceAdmission:
+            raise TypeError("source requires an original source admission")
+        _require_fresh_owned_task_admission(admission.producer)
+        _require_fresh_owned_task_admission(admission.watcher)
+        self._source_admission = admission
         self._cooperative_source = source_factory is not None
         if source_factory is None:
             if not callable(iterator_factory):
@@ -1336,13 +1709,23 @@ class OwnedAsyncIterator(Generic[_T]):
             await dispatch.wait()
             await self._run()
         self._owner = None
-        owner_admission, watcher_admission = OwnedTaskAdmission(), OwnedTaskAdmission()
+        owner_admission, watcher_admission = admission.producer, admission.watcher
+        admission._state.construction_pending = True
+        for receipt in (owner_admission, watcher_admission, admission.retirement):
+            if receipt is not None:
+                receipt._source = admission
+        capture = capture_owned_task_lender() if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture
         try:
             self._owner = (
                 create_owned_task(run_owned(), name=f"owned_async_iterator:{operation}",
-                    context=owner_context, admission=owner_admission, retain_originals=True)
-                if owner_factory is None else owner_factory(run_owned, owner_context)
+                    context=owner_context, admission=owner_admission, retain_originals=True,
+                    lender_capture=capture)
+                if owner_factory is None else owner_factory(run_owned, owner_context,
+                    admission=owner_admission, lender_capture=capture)
             )
+            if self._owner is not owner_admission.task or not owner_admission._creation_started:
+                self._owner = owner_admission.task
+                raise TypeError("source factory must publish its original producer admission")
             # All accepted owners and every subsequent publication belong to
             # this one construction transaction, including the first callback.
             self._consumer_close.owner = self._owner
@@ -1351,6 +1734,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 self._watch_owner_cancellation(),
                 name=f"owned_async_iterator_cancel:{operation}",
                 admission=watcher_admission, retain_originals=True,
+                lender_capture=None,
             )
             self._cancellation_owner.add_done_callback(
                 self._interrupt_if_watch_never_started
@@ -1362,6 +1746,7 @@ class OwnedAsyncIterator(Generic[_T]):
             self._cancellation_owner = (self._cancellation_owner if self._cancellation_owner is not None
                 else watcher_admission.task)
             if self._owner is None:
+                admission._state.construction_pending = False
                 raise  # True allocation refusal; no accepted owner to join.
             from kestrel_sovereign.execution_custody import execution_observation_error
             error = execution_observation_error(error, *(
@@ -1371,18 +1756,20 @@ class OwnedAsyncIterator(Generic[_T]):
             # No source body has crossed dispatch. Retain the exact partially
             # constructed owner so the async boundary can physically join it;
             # the synchronous constructor cannot manufacture that completion.
-            self._construction_error = error
-            error._kestrel_failed_owned_iterator = self
-            error._kestrel_native_retirement_debts = (
-                *getattr(error, "_kestrel_native_retirement_debts", ()),
-                (self, self._owner),
-            )
+            opening = RuntimeError("original native source construction failed")
+            opening.__cause__ = error
+            self._construction_error = opening
+            opening._kestrel_failed_owned_iterator = self
+            opening._kestrel_native_retirement_debts = ((self, self._owner),)
+            admission._state.partial = self
             self._handoff.request_stop()
             cancel_owned_task(self._owner)
             if self._cancellation_owner is not None:
                 cancel_owned_task(self._cancellation_owner)
-            raise error
+            raise opening
+        admission._state.construction_pending = False
         dispatch.set()
+        _publish_source_progress(admission)
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
         return self
@@ -1547,6 +1934,10 @@ class OwnedAsyncIterator(Generic[_T]):
                 error is None or isinstance(error, asyncio.CancelledError) for error in originals)),
             execution_observation_error(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
+        publication = _publish_source_progress(self._source_admission)
+        if publication is not None:
+            result = OwnedTaskOutcome(result.result,
+                execution_observation_error(result.error, publication), result.cancellation)
         return result
 
     def _is_private_watcher_cancellation(self, error):
@@ -1625,6 +2016,7 @@ class OwnedAsyncIterator(Generic[_T]):
         from kestrel_sovereign.execution_custody import execution_observation_error
 
         def acquire(resources: SourceAcquisition) -> AsyncIterable[_T] | OwnedCallbackSource[_T]:
+            self._source_admission._state.resource_required = True
             source = self._acquire_source(resources)
             self._callback_source = issubclass(type(source), OwnedCallbackSource)
             return source
@@ -1638,6 +2030,10 @@ class OwnedAsyncIterator(Generic[_T]):
                 acquire, self._handoff, on_body_error=self._classify_source_failure,
             )
             retirement_errors = outcome.retirement_errors
+            for failure in retirement_errors:
+                _record_source_retirement(self._source_admission, failure=failure)
+            if not retirement_errors:
+                _record_source_retirement(self._source_admission, closed=True)
             if retirement_errors:
                 # Ordinary physical errors are originals too. The finite
                 # composer retains them in a fresh carrier instead of adding
@@ -1696,15 +2092,7 @@ class OwnedAsyncIterator(Generic[_T]):
                 if not self._owner.done() and not self._owner.cancelling() and not self._interrupted_by_cleanup:
                     self._owner_cancelled_by_close = self._cancel_owner_if_running()
             outcome = await self.join_source_owners(closing=True)
-            if self._construction_error is not None and outcome.error is None:
-                # Reconcile ONLY the original constructor task reservation, after
-                # its actual frame/lock cleanup AND watcher have physically joined.
-                # A real owner/closer failure keeps this debt and every other debt.
-                error = self._construction_error
-                error._kestrel_native_retirement_debts = tuple(
-                    debt for debt in error._kestrel_native_retirement_debts
-                    if not (debt[0] is self and debt[1] is self._owner)
-                )
+            _publish_source_progress(self._source_admission)
             raise_owned_outcome(outcome, operation=self._operation, retain_originals=True,
                                 retain_observer_cancellations=self._cooperative_source)
         finally:
@@ -1717,16 +2105,28 @@ async def create_owned_iterator(iterator_factory=None, **options):
     Public async handoffs must use this boundary, not infer that a failed
     synchronous constructor accepted no producer or cancellation watcher.
     """
+    admission = options.get("source_admission")
+    if admission is None:
+        admission = options["source_admission"] = OwnedSourceAdmission()
+    if type(admission) is not OwnedSourceAdmission:
+        raise TypeError("source requires an original source admission")
     try:
         return OwnedAsyncIterator(iterator_factory, **options)
     except BaseException as opening:
-        partial = getattr(opening, "_kestrel_failed_owned_iterator", None)
+        partial = admission._state.partial
         if isinstance(partial, OwnedAsyncIterator):
+            cleanup_error = None
             try:
                 await partial.aclose()
             except BaseException as cleanup:
-                from kestrel_sovereign.execution_custody import execution_observation_error
-                raise execution_observation_error(opening, cleanup)
+                cleanup_error = cleanup
+            # A fresh carrier is needed only while its original construction
+            # receipts remain uncertain. Physical joins may settle that marker,
+            # never any independent watcher/closer failure or original exception.
+            if opening is partial._construction_error and not admission._state.construction_pending:
+                opening = opening.__cause__
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            raise execution_observation_error(opening, cleanup_error)
         raise
 
 

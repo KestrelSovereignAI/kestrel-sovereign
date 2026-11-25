@@ -9,7 +9,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error, wait_owned_tasks_until
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_cleanup_debts,
@@ -186,13 +186,18 @@ async def native_snapshot(tmp_path, monkeypatch):
         release_server.set()
         server.close()
         await server.wait_closed()
-        for task in tasks + ([service._poll_task] if service._poll_task else []):
-            for _ in range(3):
-                if task.done():
-                    break
+        originals = tuple(dict.fromkeys(tasks + ([service._poll_task] if service._poll_task else [])))
+        for task in originals:
+            if not task.done():
                 task.cancel()
-                await asyncio.wait({task}, timeout=0.05)
-            assert task.done(), "fixture could not retire its exact owned worker"
+        # One fixture-only absolute budget observes the SAME originals. Stop
+        # requests do not acknowledge retirement, and repeated cancellation
+        # must not interrupt an already-active native close/finally.
+        observed = await wait_owned_tasks_until(
+            originals, deadline=asyncio.get_running_loop().time() + 5,
+        )
+        assert not observed.result[1], "fixture could not retire its exact owned worker"
+        for task in originals:
             with suppress(BaseException):
                 await task
         for client in clients:
@@ -200,6 +205,33 @@ async def native_snapshot(tmp_path, monkeypatch):
                 await actual_close(client._client)
         if handlers:
             await asyncio.gather(*tuple(handlers), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_fixture_waits_for_original_delayed_close_ack(native_snapshot):
+    """Teardown owns the same native HTTP worker beyond a tiny scheduling window."""
+    db, target, _, entered, close_entered, release_close, _, _, _, state, tasks = native_snapshot
+    state["close_error"] = None
+
+    async def delayed_original_ack():
+        deadline = asyncio.get_running_loop().time() + 0.3
+        while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
+            try:
+                await asyncio.sleep(remaining)
+            except asyncio.CancelledError:
+                # This is the original bounded ACK, not a replacement owner or
+                # fake completed close. Fixture Stop must still physically join.
+                continue
+
+    state["close_probe"] = delayed_original_ack
+    worker = create_owned_task(target.sync_snapshot(db), retain_originals=True)
+    tasks.append(worker)
+    await asyncio.wait_for(entered.wait(), 3)
+    state["release_server"].set()
+    release_close.set()
+    await asyncio.wait_for(close_entered.wait(), 3)
+    assert not worker.done()
+    # The fixture must join its exact accepted original, not just send Stop.
 
 
 @pytest.mark.asyncio

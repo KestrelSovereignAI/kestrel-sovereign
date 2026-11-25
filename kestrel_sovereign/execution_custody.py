@@ -913,9 +913,11 @@ _STREAM_CLEANUP: ContextVar[tuple[_StreamCleanupState, ...]] = ContextVar(
 )
 
 
-def _execution_cleanup_requested() -> bool:
-    return _CLEANUP_ONLY.get() or any(
-        state.requested and bool(state.scopes) for state in _STREAM_CLEANUP.get()
+def _execution_cleanup_requested(*, context=None) -> bool:
+    cleanup = _CLEANUP_ONLY.get() if context is None else context.get(_CLEANUP_ONLY, False)
+    streams = _STREAM_CLEANUP.get() if context is None else context.get(_STREAM_CLEANUP, ())
+    return cleanup or any(
+        state.requested and bool(state.scopes) for state in streams
     )
 
 
@@ -1455,10 +1457,11 @@ async def close_native_execution_stream(
                 await result
     admission = OwnedTaskAdmission()
     try:
-        close_task = create_owned_task(
-            owned_close(), retirement_resource=stream, retain_originals=retain_originals,
-            admission=admission,
-        )
+        with bind_execution_cleanup(owner):
+            close_task = create_owned_task(
+                owned_close(), retirement_resource=stream, retain_originals=retain_originals,
+                admission=admission,
+            )
     except BaseException as error:
         close_task = admission.task
         if close_task is None:
@@ -1817,12 +1820,18 @@ def bind_execution_cleanup(
     storage, tools and provider calls still pass through ordinary work denial.
     Children inherit this restriction even after their closer leaves the scope.
     """
+    from kestrel_sovereign._async_ownership import _disable_owned_task_lending
+
     existing = current_execution_custody(owner)
     scopes = existing + tuple(scope for scope in captured if scope not in existing)
     custody_token = _CURRENT_CUSTODY.set(scopes)
-    cleanup_token = _CLEANUP_ONLY.set(_CLEANUP_ONLY.get() or bool(scopes))
+    cleanup_only = _CLEANUP_ONLY.get() or bool(scopes)
+    cleanup_token = _CLEANUP_ONLY.set(cleanup_only)
     try:
-        yield
+        # The original physical owner carries this cleanup. It cannot request
+        # a fresh WORK loan, including through a previously captured factory.
+        with _disable_owned_task_lending(True):
+            yield
     finally:
         _CLEANUP_ONLY.reset(cleanup_token)
         _CURRENT_CUSTODY.reset(custody_token)
@@ -1832,7 +1841,10 @@ def bind_execution_cleanup(
 class ExecutionStreamLifecycle:
     """Opt-in physical producer custody supplied by its actual feature lifetime.
 
-    The factory receives the lazy body and its original context. Registration
+    The factory receives the lazy body and its original context, plus keyword
+    ``admission`` and ``lender_capture`` for the SAME original producer. It must
+    forward both to canonical task construction, not allocate its own receipt.
+    Registration
     finishes before any body step, including under an eager task factory.
     Nested forwarders inherit this same lifetime only inside source work.
     ``owner_started`` registers the physical producer. ``resource_started``
@@ -1860,6 +1872,10 @@ class _ExecutionForwarder:
     """
 
     def __init__(self, owner: Any, stream: AsyncIterator[Any], captured_custody: tuple[ExecutionCustody, ...] = (), *, lifecycle: ExecutionStreamLifecycle | None = None, withdrawal: SourceWithdrawal | None = None):
+        from kestrel_sovereign._async_ownership import (
+            OwnedSourceAdmission, OwnedTaskAdmission, capture_owned_task_lender,
+        )
+
         if withdrawal is not None and type(withdrawal) is not SourceWithdrawal:
             raise TypeError("execution withdrawal must be a SourceWithdrawal")
         self._withdrawal = withdrawal
@@ -1883,6 +1899,9 @@ class _ExecutionForwarder:
         # Capture now, dispatch only on the first admitted consumer pull.
         # A deferred HTTP response may never be consumed at all.
         self._owner_context = context
+        self._source_admission = OwnedSourceAdmission(retirement=OwnedTaskAdmission())
+        self._source_admission._state.resource_required = True
+        self._source_lender = capture_owned_task_lender()
         self._iterator = None
         self._consumer_started = asyncio.Event()
         self._producer_started = False
@@ -1914,11 +1933,14 @@ class _ExecutionForwarder:
             from kestrel_sovereign.llm.call_progress import inherit_call_progress
 
             inherit_call_progress(self._owner_context)
-            self._reserve_close_owner()
-            if self._close_operation.admission_error is not None:
-                raise self._close_operation.admission_error
             def started(iterator, task):
                 self._iterator = iterator
+                # Producer capacity has already been reserved before ANY native
+                # source allocation. Its dispatch gate is still shut here, so
+                # even an eager factory cannot race the original closer.
+                self._reserve_close_owner()
+                if self._close_operation.admission_error is not None:
+                    raise self._close_operation.admission_error
                 task.add_done_callback(lambda _: self._close_requested.set())
                 if self._lifecycle is not None and self._lifecycle.owner_started is not None:
                     self._lifecycle.owner_started(iterator, task)
@@ -1932,16 +1954,21 @@ class _ExecutionForwarder:
                     owner_context=self._owner_context,
                     owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
                     owner_started=started,
+                    source_admission=self._source_admission,
+                    lender_capture=self._source_lender,
                 )
 
     def _reserve_close_owner(self):
         if self._close_operation is None:
-            from kestrel_sovereign._async_ownership import OwnedOperation
+            from kestrel_sovereign._async_ownership import OwnedOperation, _disable_owned_task_lending
             factory = None if self._lifecycle is None else self._lifecycle.cleanup_factory
-            self._close_operation = OwnedOperation(
-                self._close_when_requested() if factory is None else self._close_when_requested,
-                retirement_resource=self, retain_originals=True,
-                context=self._owner_context.copy(), owner_factory=factory)
+            with _disable_owned_task_lending(True):
+                self._close_operation = OwnedOperation(
+                    self._close_when_requested() if factory is None else self._close_when_requested,
+                    retirement_resource=self, retain_originals=True,
+                    context=self._owner_context.copy(), owner_factory=factory,
+                    admission=self._source_admission.retirement,
+                )
 
     async def _close_when_requested(self):
         await self._close_requested.wait()
@@ -2020,20 +2047,21 @@ class _ExecutionForwarder:
             if self._withdrawal is None:
                 await self._consumer_started.wait()
             else:
-                from kestrel_sovereign._async_ownership import gather_owned
+                from kestrel_sovereign._async_ownership import _disable_owned_task_lending, gather_owned
 
                 if not self._withdrawal.requested:
                     # Only these known, resource-free waits may be cancelled.
                     # The SAME producer retires its already-acquired source in
                     # its original finally without dispatching source payload.
-                    await gather_owned(
-                        (factory() for factory in (
-                            self._consumer_started.wait, self._withdrawal.wait,
-                        )),
-                        return_when=asyncio.FIRST_COMPLETED,
-                        retain_originals=True,
-                        name_prefix="execution-stream-consumer-wait",
-                    )
+                    with _disable_owned_task_lending(True):
+                        await gather_owned(
+                            (factory() for factory in (
+                                self._consumer_started.wait, self._withdrawal.wait,
+                            )),
+                            return_when=asyncio.FIRST_COMPLETED,
+                            retain_originals=True,
+                            name_prefix="execution-stream-consumer-wait",
+                        )
                 if self._withdrawal.requested:
                     return
             inherited = self._lifecycle
@@ -2076,10 +2104,14 @@ class _ExecutionForwarder:
                     try:
                         await close()
                     except BaseException as cleanup_error:
+                        from kestrel_sovereign._async_ownership import _record_source_retirement
+                        _record_source_retirement(self._source_admission, failure=cleanup_error)
                         self._source_exhausted = False
                         self._cleanup_state.requested = True
                         raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
             self._source_closed = True
+            from kestrel_sovereign._async_ownership import _record_source_retirement
+            _record_source_retirement(self._source_admission, closed=True)
 
     async def aclose(self):
         # Normal EOF completes this source, not a queued child's independent
@@ -2136,11 +2168,17 @@ class _ExecutionForwarder:
 
     async def _close_unstarted_source(self):
         if not self._source_closed:
-            await close_execution_stream(
-                self._runtime_owner, self._source, self._scopes,
-                retain_cancellations=self._withdrawal is not None,
-            )
+            from kestrel_sovereign._async_ownership import _record_source_retirement
+            try:
+                await close_execution_stream(
+                    self._runtime_owner, self._source, self._scopes,
+                    retain_cancellations=self._withdrawal is not None,
+                )
+            except BaseException as failure:
+                _record_source_retirement(self._source_admission, failure=failure)
+                raise
             self._source_closed = True
+            _record_source_retirement(self._source_admission, closed=True)
 
 
 async def close_execution_stream(

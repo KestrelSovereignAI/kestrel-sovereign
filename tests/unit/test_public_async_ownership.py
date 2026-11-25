@@ -29,17 +29,25 @@ def test_public_owned_tail_api_is_exact_canonical_identity_and_signature():
     names = {
         "OwnedOperation",
         "OwnedTaskAdmission",
+        "OwnedTaskLender",
+        "OwnedTaskLenderCapture",
         "OwnedTaskOutcome",
         "OwnedTaskRetirement",
+        "acquire_lock_keeping_cancellation",
         "await_owned_operation",
         "await_owned_task",
+        "bind_owned_task_lender",
+        "capture_owned_task_lender",
+        "cancel_owned_task",
         "create_owned_task",
+        "is_owned_task_cancellation",
         "owned_task_error",
         "pending_owned_retirement_error",
         "raise_owned_outcome",
         "reconcile_owned_task_admission",
         "run_blocking_operation",
         "wait_owned_tasks_until",
+        "without_owned_coordinators",
     }
     assert set(public.__all__) == names
     for name in names:

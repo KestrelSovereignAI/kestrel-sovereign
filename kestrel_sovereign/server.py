@@ -2471,7 +2471,7 @@ async def _shutdown_phoenix(app: FastAPI, *, withdrawals=None, finite_errors=Non
         owned_task_admission_error,
         owned_task_error,
     )
-    from kestrel_sovereign.execution_custody import execution_native_source_error
+    from kestrel_sovereign.execution_custody import bind_execution_cleanup, execution_native_source_error
 
     close_task = getattr(app.state, "phoenix_proxy_close_task", None)
     close_failure = getattr(app.state, "phoenix_proxy_close_error", None)
@@ -2496,11 +2496,12 @@ async def _shutdown_phoenix(app: FastAPI, *, withdrawals=None, finite_errors=Non
             app.state.phoenix_proxy_close_resource = resource
             admission = OwnedTaskAdmission()
             try:
-                close_task = create_owned_task(
-                    phoenix.aclose(), name="server_phoenix:original_proxy_close",
-                    retain_originals=True, retirement_resource=resource,
-                    admission=admission,
-                )
+                with bind_execution_cleanup(phoenix):
+                    close_task = create_owned_task(
+                        phoenix.aclose(), name="server_phoenix:original_proxy_close",
+                        retain_originals=True, retirement_resource=resource,
+                        admission=admission,
+                    )
                 app.state.phoenix_proxy_close_task = close_task
             except BaseException as error:
                 close_task = admission.task

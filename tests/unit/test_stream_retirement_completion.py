@@ -45,7 +45,7 @@ async def test_delivered_body_failure_does_not_hide_an_original_native_epilogue(
             raise body_error
         async def aclose(self):
             attempts.append(asyncio.current_task())
-    def factory(body, context):
+    def factory(body, context, *, admission, lender_capture):
         async def original():
             try:
                 await body()
@@ -54,7 +54,8 @@ async def test_delivered_body_failure_does_not_hide_an_original_native_epilogue(
                 if failed_epilogue:
                     raise execution_observation_error(error, epilogue_error)
                 raise
-        return create_owned_task(original(), context=context, retain_originals=True)
+        return create_owned_task(original(), context=context, retain_originals=True,
+            admission=admission, lender_capture=lender_capture)
     stream = execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(factory, None, lambda: None))
     try:
         with pytest.raises(BaseException) as terminal:
@@ -106,7 +107,7 @@ async def test_terminal_retirement_joins_original_native_child_before_settling(t
     try:
         native = lock.capture_native_work_factory()
         stream = execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
-            lambda body, context: native(body, context=context),
+            native,
             lambda iterator, task: owners.append((iterator, task)), lambda: None))
         try:
             assert await anext(stream) == b'original'
@@ -330,7 +331,7 @@ async def test_private_close_cannot_acknowledge_an_independent_original_failure(
         async def aclose(self):
             attempts.append(asyncio.current_task())
             handle.close()
-    def factory(body, context):
+    def factory(body, context, *, admission, lender_capture):
         async def original():
             if phase == 'admission':
                 entered.set()
@@ -345,7 +346,8 @@ async def test_private_close_cannot_acknowledge_an_independent_original_failure(
             completions.append(task)
             if phase == 'completion' and kind is not None:
                 raise independent
-        return create_owned_task(original(), context=context, retain_originals=True, on_completion=publish)
+        return create_owned_task(original(), context=context, retain_originals=True, on_completion=publish,
+            admission=admission, lender_capture=lender_capture)
     lifecycle = ExecutionStreamLifecycle(factory, None, lambda: None)
     stream = (await reserve_execution_stream(None, Source(), lifecycle=lifecycle) if phase == 'admission'
               else execution_stream(None, Source(), lifecycle=lifecycle))
@@ -457,12 +459,13 @@ async def test_private_unstarted_owner_close_cannot_erase_independent_watcher(tm
         async def aclose(self):
             attempts.append(asyncio.current_task())
             handle.close()
-    def producer(body, context):
+    def producer(body, context, *, admission, lender_capture):
         async def original():
             entered.set()
             await release.wait()
             await body()
-        return create_owned_task(original(), context=context, retain_originals=True)
+        return create_owned_task(original(), context=context, retain_originals=True,
+            admission=admission, lender_capture=lender_capture)
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     def factory(loop, coroutine, **options):
         operation = coroutine.cr_frame.f_locals.get('operation')

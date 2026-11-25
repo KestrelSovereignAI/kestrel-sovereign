@@ -79,38 +79,40 @@ class DatabaseInitializationCleanupError(ConnectionError):
 
 async def _close_owned_database(db: "AsyncDatabase", operation_error: BaseException | None = None) -> None:
     """Settle the one owned close through repeated cancellation on every exit."""
+    from kestrel_sovereign.execution_custody import bind_execution_cleanup
+    with bind_execution_cleanup(db):
 
-    from kestrel_sovereign._async_ownership import await_owned_operation
+        from kestrel_sovereign._async_ownership import await_owned_operation
 
-    outcome = await await_owned_operation(
-        db.close(), name="owned-database-retirement",
-        retain_originals=True, retirement_resource=db,
-    )
-    close_exc = outcome.error
-    if close_exc is not None:
-        # Keep the resource-retirement wrapper/owner AND the original control
-        # cause. A failed close cannot turn uncertain COMMIT into plain error.
-        # This finite lifecycle also retains the actual observer withdrawal;
-        # selecting a stronger close/body receipt must not discard it.
-        cause = execution_terminal_error(
-            operation_error, close_exc, outcome.cancellation,
-            retain_originals=True, isolate_control_originals=True,
+        outcome = await await_owned_operation(
+            db.close(), name="owned-database-retirement",
+            retain_originals=True, retirement_resource=db,
         )
-        raise DatabaseRetirementError(db, operation_error, close_exc) from cause
-    if db.connection_retirement_pending:
-        failure = DatabaseRetirementError(db, operation_error)
-        raise failure from execution_terminal_error(
-            operation_error, outcome.cancellation, retain_originals=True,
-            isolate_control_originals=True,
-        )
-    if outcome.cancellation is not None:
-        terminal = execution_terminal_error(
-            operation_error, outcome.cancellation,
-            retain_originals=True, prefer_cancellation=True,
-            isolate_control_originals=True,
-        )
-        terminal.add_note("Caller cancellation occurred during joined database retirement")
-        raise terminal
+        close_exc = outcome.error
+        if close_exc is not None:
+            # Keep the resource-retirement wrapper/owner AND the original control
+            # cause. A failed close cannot turn uncertain COMMIT into plain error.
+            # This finite lifecycle also retains the actual observer withdrawal;
+            # selecting a stronger close/body receipt must not discard it.
+            cause = execution_terminal_error(
+                operation_error, close_exc, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True,
+            )
+            raise DatabaseRetirementError(db, operation_error, close_exc) from cause
+        if db.connection_retirement_pending:
+            failure = DatabaseRetirementError(db, operation_error)
+            raise failure from execution_terminal_error(
+                operation_error, outcome.cancellation, retain_originals=True,
+                isolate_control_originals=True,
+            )
+        if outcome.cancellation is not None:
+            terminal = execution_terminal_error(
+                operation_error, outcome.cancellation,
+                retain_originals=True, prefer_cancellation=True,
+                isolate_control_originals=True,
+            )
+            terminal.add_note("Caller cancellation occurred during joined database retirement")
+            raise terminal
 
 
 async def _close_failed_database_initialization(db: "AsyncDatabase", initialization_error: BaseException) -> None:
@@ -4073,14 +4075,16 @@ class AsyncDatabase:
         from kestrel_sovereign._async_ownership import (
             await_owned_operation,
         )
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
         errors = []
         # Independent resource retirement must finish even if an earlier owner
         # reports grouped control or the caller is cancelled during a join.
         for index, operation in enumerate((self.dispose_cached_sqla_factory, self._backend.close)):
-            outcome = await await_owned_operation(
-                operation(), retirement_resource=self, retain_originals=True,
-                cancel_on_caller_cancellation=index == 0,
-            )
+            with bind_execution_cleanup(self):
+                outcome = await await_owned_operation(
+                    operation(), retirement_resource=self, retain_originals=True,
+                    cancel_on_caller_cancellation=index == 0,
+                )
             errors.extend((outcome.error, outcome.cancellation))
         self._initialized = False
 

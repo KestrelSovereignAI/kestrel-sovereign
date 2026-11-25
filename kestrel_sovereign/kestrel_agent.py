@@ -11309,10 +11309,12 @@ Expected Duration: {expected_duration}
 
                 admission = OwnedTaskAdmission()
                 try:
-                    task = create_owned_task(
-                        coro, retirement_resource=retirement_resource,
-                        retain_originals=True, admission=admission,
-                    )
+                    from kestrel_sovereign.execution_custody import bind_execution_cleanup
+                    with bind_execution_cleanup(retirement_resource):
+                        task = create_owned_task(
+                            coro, retirement_resource=retirement_resource,
+                            retain_originals=True, admission=admission,
+                        )
                 except BaseException as failure:
                     accepted = admission.task
                     outcome = await await_owned_task(accepted) if accepted is not None else None

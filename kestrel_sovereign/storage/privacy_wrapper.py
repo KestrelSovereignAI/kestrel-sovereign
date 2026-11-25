@@ -31,7 +31,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from kestrel_sovereign._async_ownership import (
-    OwnedTaskAdmission, _retain_owned_admission_error, await_owned_task,
+    OwnedTaskAdmission, _AUTOMATIC_TASK_LENDER, _retain_owned_admission_error,
+    await_owned_task, capture_owned_task_lender,
     create_owned_task, owned_task_error, raise_owned_outcome,
     without_owned_coordinators,
 )
@@ -756,19 +757,22 @@ class ReentrantTransitionLock:
     def capture_native_work_factory(self, *, acquire_span=True):
         parent = asyncio.current_task()
         captured = self.current_native_scope()
+        lender = capture_owned_task_lender()
 
         def start(operation, context=None, *, name="privacy-owned-native-work", on_completion=None,
-                  acquire_span=acquire_span, admission=None, retirement_resource=None):
+                  acquire_span=acquire_span, admission=None, retirement_resource=None,
+                  lender_capture=_AUTOMATIC_TASK_LENDER):
             return self.start_owned_native_work(operation, context=context, name=name,
                 on_completion=on_completion, acquire_span=acquire_span,
                 admission=admission, retirement_resource=retirement_resource,
-                _parent=parent if captured is not None else None, _span=captured)
+                _parent=parent if captured is not None else None, _span=captured,
+                _lender_capture=lender if lender_capture is _AUTOMATIC_TASK_LENDER else lender_capture)
         return start
 
     def start_owned_native_work(self, operation, *, context=None,
                                 name="privacy-owned-native-work", acquire_span=True,
                                 on_completion=None, admission=None, retirement_resource=None,
-                                _parent=None, _span=None):
+                                _parent=None, _span=None, _lender_capture=_AUTOMATIC_TASK_LENDER):
         parent = asyncio.current_task() if _parent is None else _parent
         captured = self.current_native_scope() if _span is None else _span
         if captured is not None and (
@@ -795,11 +799,13 @@ class ReentrantTransitionLock:
 
         if admission is None:
             admission = OwnedTaskAdmission()
+        lender = (capture_owned_task_lender() if _lender_capture is _AUTOMATIC_TASK_LENDER
+                  else _lender_capture)
         opening = None
         try:
             task = create_owned_task(run(), name=name, context=context,
                 admission=admission, retain_originals=True, on_completion=on_completion,
-                retirement_resource=retirement_resource)
+                retirement_resource=retirement_resource, lender_capture=lender)
         except BaseException as error:
             if admission.task is None:
                 raise

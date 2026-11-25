@@ -184,8 +184,9 @@ async def test_fresh_callback_iterator_retains_physical_close_and_privacy_writer
             async with coordinator:
                 scope = OwnedCallbackScope()
 
-                def start_original(operation, context):
-                    return scope.start(operation, context=context, name="fresh-original-application")
+                def start_original(operation, context, *, admission, lender_capture):
+                    return scope.start(operation, context=context, name="fresh-original-application",
+                        admission=admission, lender_capture=lender_capture)
 
                 source = await create_owned_iterator(
                     lambda: OwnedCallbackSource(produce), operation="fresh-application-frames",
@@ -361,8 +362,8 @@ async def test_concurrent_callback_emitters_do_not_hold_writer_while_waiting_for
         async with coordinator:
             scope = OwnedCallbackScope()
 
-            def start_original(operation, context):
-                return scope.start(operation, context=context)
+            def start_original(operation, context, *, admission, lender_capture):
+                return scope.start(operation, context=context, admission=admission, lender_capture=lender_capture)
 
             source = await create_owned_iterator(
                 lambda: OwnedCallbackSource(produce), operation="concurrent privacy callbacks",

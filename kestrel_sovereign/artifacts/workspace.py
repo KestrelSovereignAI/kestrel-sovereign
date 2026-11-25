@@ -18,6 +18,7 @@ from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, Reso
 from kestrel_sdk.workspaces import WorkspaceExportRequest, WorkspaceImportRequest, WorkspaceTransfer, WorkspaceTransferProvider
 
 from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task, raise_owned_outcome
+from kestrel_sovereign.execution_custody import bind_execution_cleanup, execution_terminal_error
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 from .repository import ArtifactIntegrityError
 from .service import ArtifactAccessDenied, ArtifactAction
@@ -133,7 +134,7 @@ class ArtifactWorkspaceBroker:
                 raise ResourceOutcomeUnknown('workspace result requires original-ID reconciliation') from None
             raise
 
-    async def _cleanup(self, lease, method, transfer_id):
+    async def _cleanup(self, lease, method, transfer_id, *, primary=None):
         async def retire():
             try:
                 # No new context, current-data grant, or session selection is
@@ -143,9 +144,16 @@ class ArtifactWorkspaceBroker:
                 return status.state in {'released', 'aborted', 'complete'}
             except (ResourceError, OSError, ValueError, TimeoutError):
                 return False
-        cleanup = create_owned_task(retire(), name='artifact-workspace-retirement')
-        outcome = await await_owned_task(cleanup)
-        return raise_owned_outcome(outcome, operation='workspace retirement')
+        try:
+            with bind_execution_cleanup(None):
+                cleanup = create_owned_task(retire(), name='artifact-workspace-retirement')
+            outcome = await await_owned_task(cleanup)
+            return raise_owned_outcome(outcome, operation='workspace retirement')
+        except BaseException as cleanup_error:
+            raise execution_terminal_error(
+                primary, cleanup_error, retain_originals=True,
+                isolate_control_originals=True,
+            )
 
     @staticmethod
     def _commit(request, manifest, title, publication_key, artifact_id, expected_revision_id):
@@ -160,6 +168,7 @@ class ArtifactWorkspaceBroker:
             raise ArtifactAccessDenied('workspace publication is not granted')
         context = lease.contexts.artifacts
         retiring = False
+        body_error = None
         try:
             receipt = await self.service.publication_status(context, publication_key)
             if receipt is not None:
@@ -212,8 +221,13 @@ class ArtifactWorkspaceBroker:
                         or receipt.scope != self.service._scope(context) or receipt.storage_id != self.service.repository.storage_id):
                     raise ResourceOutcomeUnknown('workspace publication receipt does not match')
                 revision = await self.service.get(context, receipt.ref)
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            cleanup_confirmed = await self._cleanup(lease, lease.transfer.release_export, request.transfer_id) if retiring else None
+            cleanup_confirmed = await self._cleanup(
+                lease, lease.transfer.release_export, request.transfer_id, primary=body_error,
+            ) if retiring else None
         self._ack(lease)
         return {'state':'saved', 'receipt':receipt.model_dump(mode='json'), 'revision':revision.model_dump(mode='json'),
                 'transfer_id':request.transfer_id, 'cleanup_confirmed':cleanup_confirmed}
@@ -253,11 +267,11 @@ class ArtifactWorkspaceBroker:
                 raise ResourceOutcomeUnknown('workspace materialization receipt does not match')
             self._ack(lease)
             return {'state':'complete', 'materialization':receipt.model_dump(mode='json'), 'revision':revision.model_dump(mode='json')}
-        except BaseException:
+        except BaseException as error:
             # Unknown commit can already be complete; SDK abort observes that
             # completed transfer and never uninstalls/replays its import.
             if attempted:
-                await self._cleanup(lease, lease.transfer.abort_import, request.transfer_id)
+                await self._cleanup(lease, lease.transfer.abort_import, request.transfer_id, primary=error)
             raise
 
     @staticmethod

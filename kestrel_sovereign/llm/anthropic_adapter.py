@@ -219,10 +219,11 @@ async def _anthropic_stream_with_retry(
         admission = OwnedTaskAdmission()
         opening = None
         try:
-            task = create_owned_task(
-                owned_close(), retirement_resource=pair[1], retain_originals=True,
-                admission=admission,
-            )
+            with bind_execution_cleanup(None):
+                task = create_owned_task(
+                    owned_close(), retirement_resource=pair[1], retain_originals=True,
+                    admission=admission,
+                )
         except BaseException as admission_error:
             opening = admission_error
             task = admission.task

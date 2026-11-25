@@ -359,47 +359,52 @@ class SovereignSqlaSessionFactory:
 
     async def close(self) -> None:
         """Dispose the engine and drain every SQLite worker it opened."""
-        loop = asyncio.get_running_loop()
-        diagnostics: _SQLiteCloseDiagnostics | None = None
-        if getattr(self._engine.dialect, "name", None) == "sqlite":
-            if self._sqlite_close_diagnostics is None:
-                # Once, before the first close: a retry must not report a -wal
-                # that the first attempt's driver closes have already consumed.
-                self._sqlite_close_diagnostics = _capture_close_diagnostics(
-                    self._sqlite_path, None
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            loop = asyncio.get_running_loop()
+            diagnostics: _SQLiteCloseDiagnostics | None = None
+            if getattr(self._engine.dialect, "name", None) == "sqlite":
+                if self._sqlite_close_diagnostics is None:
+                    # Once, before the first close: a retry must not report a -wal
+                    # that the first attempt's driver closes have already consumed.
+                    self._sqlite_close_diagnostics = _capture_close_diagnostics(
+                        self._sqlite_path, None
+                    )
+                # Each attempt is timed against its own deadline.
+                diagnostics = replace(
+                    self._sqlite_close_diagnostics, started_at=loop.time()
                 )
-            # Each attempt is timed against its own deadline.
-            diagnostics = replace(
-                self._sqlite_close_diagnostics, started_at=loop.time()
-            )
-        deadline = loop.time() + _minimum_close_timeout_s()
-        if not self._close_started:
-            self._close_started = True
-            for session in tuple(self._active_sessions):
-                close_task = create_owned_task(
-                    session.close(),
-                    name=f"sqla-session-close:{id(session)}",
+            deadline = loop.time() + _minimum_close_timeout_s()
+            if not self._close_started:
+                self._close_started = True
+                for session in tuple(self._active_sessions):
+                    close_task = create_owned_task(
+                        session.close(),
+                        name=f"sqla-session-close:{id(session)}",
+                    )
+                    close_task.add_done_callback(
+                        self._capture_session_close_result
+                    )
+                    self._session_close_tasks.add(close_task)
+            if self._engine_dispose_task is None:
+                self._engine_dispose_task = create_owned_task(
+                    self._engine.dispose(),
+                    name=f"sqla-engine-dispose:{id(self)}",
                 )
-                close_task.add_done_callback(
-                    self._capture_session_close_result
+                self._engine_dispose_task.add_done_callback(
+                    self._capture_engine_dispose_result
                 )
-                self._session_close_tasks.add(close_task)
-        if self._engine_dispose_task is None:
-            self._engine_dispose_task = create_owned_task(
-                self._engine.dispose(),
-                name=f"sqla-engine-dispose:{id(self)}",
-            )
-            self._engine_dispose_task.add_done_callback(
-                self._capture_engine_dispose_result
-            )
 
-        # Establish durable ownership and start every raw SQLite close before
-        # the first potentially blocking disposal await.  Kestrel's bounded
-        # shutdown can hard-close this coroutine with ``GeneratorExit``; the
-        # independent retained close/reaper tasks must already own each worker
-        # when that happens.
-        self._begin_sqlite_connection_retirement()
+            # Establish durable ownership and start every raw SQLite close before
+            # the first potentially blocking disposal await.  Kestrel's bounded
+            # shutdown can hard-close this coroutine with ``GeneratorExit``; the
+            # independent retained close/reaper tasks must already own each worker
+            # when that happens.
+            self._begin_sqlite_connection_retirement()
 
+        # Admission is synchronous. The original children inherit cleanup;
+        # do not hold ContextVar tokens across the observer await, because a
+        # legacy hard-abandon may close this Python frame from another Task.
         lifecycle_error: BaseException | None = None
         try:
             # ``asyncio.wait`` does not transfer caller cancellation to the
@@ -492,67 +497,69 @@ class SovereignSqlaSessionFactory:
 
     def _begin_sqlite_connection_retirement(self, connections: Any = None) -> None:
         """Synchronously retain close ownership for every live SQLite worker."""
-        if getattr(self._engine.dialect, "name", None) != "sqlite":
-            return
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            if getattr(self._engine.dialect, "name", None) != "sqlite":
+                return
 
-        _prune_retained_aiosqlite_closes(self._retired_sqlite_closes)
-        candidates = (
-            self._sqlite_connections if connections is None else connections
-        )
-        for connection in candidates:
-            if not _aiosqlite_worker_is_alive(connection):
-                continue
-            if connection in self._retired_sqlite_closes:
-                continue
+            _prune_retained_aiosqlite_closes(self._retired_sqlite_closes)
+            candidates = (
+                self._sqlite_connections if connections is None else connections
+            )
+            for connection in candidates:
+                if not _aiosqlite_worker_is_alive(connection):
+                    continue
+                if connection in self._retired_sqlite_closes:
+                    continue
 
-            dispose_task = self._engine_dispose_task
-            if dispose_task is None:
-                raise RuntimeError(
-                    "SQLite retirement started before engine disposal ownership"
-                )
+                dispose_task = self._engine_dispose_task
+                if dispose_task is None:
+                    raise RuntimeError(
+                        "SQLite retirement started before engine disposal ownership"
+                    )
 
-            async def close_after_dispose(
-                owned_connection: Any = connection,
-                owned_dispose_task: asyncio.Task[None] = dispose_task,
-            ) -> None:
-                # Disposal may be part-way through this driver's own
-                # ``close()``. A second ``close()`` started beside it queues a
-                # second stop sentinel behind the first; the worker exits on
-                # the first and never answers the second, so this task would
-                # wait forever (#3858). A cancellation therefore never ends
-                # the wait for disposal: it is raised once the driver is
-                # retired.
-                pending_cancellation: BaseException | None = None
-                while not owned_dispose_task.done():
+                async def close_after_dispose(
+                    owned_connection: Any = connection,
+                    owned_dispose_task: asyncio.Task[None] = dispose_task,
+                ) -> None:
+                    # Disposal may be part-way through this driver's own
+                    # ``close()``. A second ``close()`` started beside it queues a
+                    # second stop sentinel behind the first; the worker exits on
+                    # the first and never answers the second, so this task would
+                    # wait forever (#3858). A cancellation therefore never ends
+                    # the wait for disposal: it is raised once the driver is
+                    # retired.
+                    pending_cancellation: BaseException | None = None
+                    while not owned_dispose_task.done():
+                        try:
+                            await asyncio.wait({owned_dispose_task})
+                        except asyncio.CancelledError as exc:
+                            pending_cancellation = execution_terminal_error(
+                                pending_cancellation, exc, retain_originals=True,
+                                isolate_control_originals=True,
+                            )
                     try:
-                        await asyncio.wait({owned_dispose_task})
-                    except asyncio.CancelledError as exc:
-                        pending_cancellation = execution_terminal_error(
-                            pending_cancellation, exc, retain_originals=True,
-                            isolate_control_originals=True,
-                        )
-                try:
-                    owned_task_error(owned_dispose_task)
-                except BaseException:
-                    # Disposal failure is surfaced by ``close``.  It cannot
-                    # transfer ownership of a checked-out/raw driver.
-                    pass
-                if _aiosqlite_worker_is_alive(owned_connection):
-                    await owned_connection.close()
-                if pending_cancellation is not None:
-                    raise pending_cancellation
+                        owned_task_error(owned_dispose_task)
+                    except BaseException:
+                        # Disposal failure is surfaced by ``close``.  It cannot
+                        # transfer ownership of a checked-out/raw driver.
+                        pass
+                    if _aiosqlite_worker_is_alive(owned_connection):
+                        await owned_connection.close()
+                    if pending_cancellation is not None:
+                        raise pending_cancellation
 
-            raw_close_task = create_owned_task(
-                close_after_dispose(),
-                name=f"sqla-aiosqlite-driver-close:{id(connection)}",
-            )
-            self._driver_close_tasks.add(raw_close_task)
-            raw_close_task.add_done_callback(self._capture_driver_close_result)
-            _retain_aiosqlite_close(
-                connection,
-                raw_close_task,
-                self._retired_sqlite_closes,
-            )
+                raw_close_task = create_owned_task(
+                    close_after_dispose(),
+                    name=f"sqla-aiosqlite-driver-close:{id(connection)}",
+                )
+                self._driver_close_tasks.add(raw_close_task)
+                raw_close_task.add_done_callback(self._capture_driver_close_result)
+                _retain_aiosqlite_close(
+                    connection,
+                    raw_close_task,
+                    self._retired_sqlite_closes,
+                )
 
     async def _close_live_sqlite_connections(
         self,
@@ -577,25 +584,27 @@ class SovereignSqlaSessionFactory:
         # per-connection waits both exceeded that reservation and could leave
         # later workers without retained lifecycle ownership when an outer
         # shutdown guard expired.
-        self._begin_sqlite_connection_retirement()
-        close_tasks: list[asyncio.Task[None]] = []
-        for connection in self._sqlite_connections:
-            retained = self._retired_sqlite_closes.get(connection)
-            if retained is None:
-                continue
-            close_tasks.append(
-                create_owned_task(
-                    _close_aiosqlite_connection(
-                        connection,
-                        retained_closes=self._retired_sqlite_closes,
-                        deadline=deadline,
-                        close_task=retained.close_task,
-                        cancel_close_task_on_timeout=False,
-                        diagnostics=diagnostics,
-                    ),
-                    name=f"sqla-aiosqlite-close:{id(connection)}",
+        from kestrel_sovereign.execution_custody import bind_execution_cleanup
+        with bind_execution_cleanup(self):
+            self._begin_sqlite_connection_retirement()
+            close_tasks: list[asyncio.Task[None]] = []
+            for connection in self._sqlite_connections:
+                retained = self._retired_sqlite_closes.get(connection)
+                if retained is None:
+                    continue
+                close_tasks.append(
+                    create_owned_task(
+                        _close_aiosqlite_connection(
+                            connection,
+                            retained_closes=self._retired_sqlite_closes,
+                            deadline=deadline,
+                            close_task=retained.close_task,
+                            cancel_close_task_on_timeout=False,
+                            diagnostics=diagnostics,
+                        ),
+                        name=f"sqla-aiosqlite-close:{id(connection)}",
+                    )
                 )
-            )
 
         failure = None
         for task in close_tasks:
