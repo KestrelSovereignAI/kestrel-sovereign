@@ -1,17 +1,28 @@
 """Real hybrid proof and durable recipient admission around canonical storage."""
 
 import asyncio
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import FrozenInstanceError, replace
+from types import SimpleNamespace
 
 import pytest
-from kestrel_sdk.native_a2a.types import GetTaskRequest
+from kestrel_sdk.native_a2a.types import CancelTaskRequest, GetTaskRequest
 from kestrel_sdk.native_a2a.utils.errors import (
     ExtensionSupportRequiredError,
     InvalidParamsError,
 )
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from starlette.exceptions import HTTPException
 
-from kestrel_sovereign.a2a.native_sender import SENDER_PROOF_HEADER
+from kestrel_sovereign.a2a.native_context import NativeLocalSender
+from kestrel_sovereign.a2a.native_security import (
+    NativeHostedLocalAdmission,
+    NativeRequestKind,
+)
+from kestrel_sovereign.a2a.native_sender import (
+    SENDER_PROOF_HEADER,
+    verification_document_fingerprint,
+)
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.storage.db.interface import QueryError
@@ -23,6 +34,173 @@ from tests.utils.native_a2a_security import (
     send,
     signed_context,
 )
+
+
+@pytest.mark.parametrize("operation,expected", [
+    ("GetTask", NativeRequestKind.WORK),
+    ("CancelTask", NativeRequestKind.CANCEL_TASK),
+])
+async def test_verified_local_admission_retains_original_evidence(
+    native_request_admission, operation, expected,
+):
+    p = native_request_admission
+    acquired = []
+    current = True
+    policy_current = True
+
+    @asynccontextmanager
+    async def source_reader():
+        yield None if policy_current else StreamRefusal(HTTPException(403, "Source policy retired"))
+
+    origin = NativeLocalSender(
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: current, source_reader,
+    )
+
+    @asynccontextmanager
+    async def acquire(evidence, require_fresh):
+        assert not p.lock.locked()
+        assert evidence.origin is origin
+        assert evidence.sender.sender == SENDER
+        assert evidence.kind is expected
+        acquired.append(evidence)
+        if require_fresh is not None:
+            require_fresh()
+        yield None
+
+    guard = replace(
+        p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    request_type = CancelTaskRequest if operation == "CancelTask" else GetTaskRequest
+    params = request_type(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation=operation, local_sender=origin)
+    async with guard.admit(params, operation, context) as admitted:
+        assert admitted.principal_id == PRINCIPAL
+        assert admitted.verified_admission is acquired[0]
+    with pytest.raises(HTTPException) as replayed:
+        async with guard.admit(params, operation, context):
+            pytest.fail("An already reserved request cannot reach host admission")
+    assert replayed.value.status_code == 401
+    assert len(acquired) == 1
+    async with guard.hold_authority(admitted):
+        assert p.lock.locked()
+    assert len(acquired) == 2 and acquired[0] is acquired[1]
+    policy_current = False
+    with pytest.raises(HTTPException) as retired:
+        async with guard.hold_authority(admitted):
+            pytest.fail("A retained request outlived the original sender")
+    assert retired.value.status_code == 403
+    assert len(acquired) == 2
+    policy_current = True
+    current = False
+    with pytest.raises(HTTPException) as replaced:
+        async with guard.hold_authority(admitted):
+            pytest.fail("A retained request outlived its publication")
+    assert replaced.value.status_code == 403 and len(acquired) == 2
+
+
+async def test_only_host_bound_proofs_reach_the_hosted_lease(native_request_admission):
+    p = native_request_admission
+
+    @asynccontextmanager
+    async def acquire(_, _require_fresh):
+        pytest.fail("Missing hosted provenance must not charge a lease")
+        yield None
+
+    guard = replace(
+        p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask")
+    with pytest.raises(HTTPException) as denied:
+        async with guard.admit(params, "CancelTask", context):
+            pytest.fail("Hosted-local admission requires the original source")
+    assert denied.value.status_code == 403
+    assert not p.state.authorizations
+
+
+async def test_hosted_admission_refuses_uncommitted_nonce_scope(native_request_admission):
+    p = native_request_admission
+    origin = NativeLocalSender(
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: True, nullcontext,
+    )
+
+    @asynccontextmanager
+    async def acquire(_, _require_fresh):
+        pytest.fail("An uncommitted nonce cannot reach hosted admission")
+        yield None
+
+    guard = replace(
+        p.guard, local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask", local_sender=origin)
+    async with p.backend.transaction():
+        with pytest.raises(ExecutionAuthorityError, match="durable nonce"):
+            async with guard.admit(params, "CancelTask", context):
+                pytest.fail("A nonce inside an outer transaction was admitted")
+    assert not p.state.authorizations
+
+
+async def test_hosted_initial_capacity_rechecks_proof_age(native_request_admission):
+    p = native_request_admission
+    now = NOW
+    origin = NativeLocalSender(
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: True, nullcontext,
+    )
+
+    @asynccontextmanager
+    async def acquire(_, require_fresh):
+        nonlocal now
+        now += p.guard.proof_policy.max_age_seconds + 1
+        require_fresh()
+        pytest.fail("An expired proof cannot acquire hosted control capacity")
+        yield None
+
+    guard = replace(
+        p.guard, clock=lambda: now,
+        local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask", local_sender=origin)
+    with pytest.raises(HTTPException) as expired:
+        async with guard.admit(params, "CancelTask", context):
+            pytest.fail("An expired hosted proof was admitted")
+    assert expired.value.status_code == 401
+
+
+async def test_hosted_initial_proof_expired_at_preflight_never_queues(native_request_admission):
+    p = native_request_admission
+    now = NOW
+
+    @asynccontextmanager
+    async def source_reader():
+        nonlocal now
+        now += p.guard.proof_policy.max_age_seconds + 1
+        yield None
+
+    origin = NativeLocalSender(
+        SimpleNamespace(routing_key="original-source"), SENDER,
+        verification_document_fingerprint(p.signing[1]), lambda: True, source_reader,
+    )
+
+    @asynccontextmanager
+    async def acquire(_, _require_fresh):
+        pytest.fail("An expired proof cannot join the capacity queue")
+        yield None
+
+    guard = replace(
+        p.guard, clock=lambda: now,
+        local_admission=NativeHostedLocalAdmission(p.guard.lifecycle_lease, acquire),
+    )
+    params = CancelTaskRequest(id="original-task", tenant=p.scope.tenant)
+    context = signed_context(p, params, operation="CancelTask", local_sender=origin)
+    with pytest.raises(HTTPException) as expired:
+        async with guard.admit(params, "CancelTask", context):
+            pytest.fail("An expired hosted proof was admitted")
+    assert expired.value.status_code == 401
 
 
 async def test_retained_principal_policy_uses_no_new_sender_proof(native_request_admission):
@@ -577,6 +755,7 @@ async def test_extension_activation_remains_bound_to_the_verified_request_during
     native_request_admission,
 ):
     from google.protobuf.json_format import MessageToDict
+
     from kestrel_sovereign.a2a.extensions import (
         CAUSATION_URI,
         causation_metadata,

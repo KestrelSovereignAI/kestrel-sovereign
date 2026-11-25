@@ -2315,6 +2315,26 @@ class PostgresBackend(DatabaseBackend):
                         abandon_if,
                     )
 
+    async def confirm_native_task_cancellation(self, attempt) -> bool:
+        """Confirm one prepared cancellation without admitting ordinary work."""
+        from kestrel_sovereign.a2a.stores.unified.task_store import (
+            _CANCELLATION_COMMIT_READBACK,
+            _HostedCancellationAttempt,
+        )
+
+        if type(attempt) is not _HostedCancellationAttempt:
+            raise TypeError("Native cancellation readback requires original prepared evidence")
+        pool = self._pool
+        if pool is None:
+            raise ConnectionError("Native cancellation readback requires the original connected backend")
+        params = attempt.parameters(self)
+        sql, _ = sqlite_to_postgres(_CANCELLATION_COMMIT_READBACK)
+        async with asyncio.timeout(5):
+            async with self._tracked_pool_checkout(pool, admit_work=False) as (connection, _):
+                if self._pool is not pool:
+                    raise ConnectionError("Native cancellation readback lost its original pool")
+                return await connection.fetchval(sql, *params) == 1
+
     async def release_initial_reservations(
         self, *, agent_id: str, owner_id: str, now: datetime,
         mark_owner_stopped: bool,

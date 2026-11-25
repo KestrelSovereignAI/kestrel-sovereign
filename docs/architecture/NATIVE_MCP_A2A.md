@@ -1147,6 +1147,27 @@ close only their response subscription; the accepted task remains durable.
 
 ### Recipient policy v1
 
+An embedding that only serves co-hosted peers can opt in to
+`NativeHostedLocalAdmission`. Give the existing in-process HTTP transport the
+original sender publication with `source=`. The transport supplies source
+provenance inside ASGI, not in the SDK wire or headers. Core verifies the
+standard signed request, matches the original publication's signing document,
+and accepts the nonce before invoking the embedding's typed admission lease.
+The embedding holds the source and recipient's durable generations. Core then
+holds both original readers through the effect or read. Hosted control checks
+proof age again before charging reserved capacity. A waiting or streaming call
+retains the same source and reacquires that lease without spending another
+nonce. Durable task rows continue to use the authorized principal.
+
+Only a verified native CancelTask or a SendMessage operation validated as
+Peer Stop can receive the corresponding control lease. Task cancellation
+releases it after the durable transition and wake cancellation; projections use
+ordinary admission. The default fleet and standalone lease and policy
+contracts do not change, including card and retained-principal authorization.
+Across all hosts a denied read-only subscription may return its refusal after
+the original stream closes; the response to a committed Send still retains
+its original effect outcome. Local mode adds no authorization to network traffic.
+
 Native admission authenticates the caller and applies recipient policy before
 creating a context or task. The committed task's creator, recipient and tenant
 columns are the authority for later reads and wakes. A native wake snapshot

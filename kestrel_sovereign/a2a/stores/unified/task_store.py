@@ -7,6 +7,7 @@ Works with both SQLite and PostgreSQL backends.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from collections.abc import Mapping
@@ -63,6 +64,7 @@ from kestrel_sovereign.a2a.stores.unified.context_store import (
     ContextStore,
 )
 from kestrel_sovereign.a2a.stores.unified.task_change_store import TaskChangeStore
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.storage.db.interface import DatabaseBackend, QueryError
 
 logger = logging.getLogger(__name__)
@@ -83,6 +85,10 @@ _TASK_COLUMNS = (
 
 
 _TASK_SCOPE = "recipient_agent_id = ? AND tenant = ?"
+_CANCELLATION_COMMIT_READBACK = (
+    f"SELECT 1 FROM a2a_tasks WHERE id = ? AND {_TASK_SCOPE} "
+    "AND creator_agent_id = ? AND canceled_by = ? AND cancel_operation_id = ? AND status = 'canceled'"
+)
 _SNAPSHOT_COLUMNS = (
     _TASK_COLUMNS + ", (SELECT request_json FROM a2a_task_inputs AS native_input "
     "WHERE native_input.task_id = a2a_tasks.id AND native_input.input_revision = a2a_tasks.input_revision), "
@@ -122,6 +128,39 @@ class TaskCancellationSnapshot:
     input_revision: int = 0
     cognition_wake_eligible: bool = True
     input_wake_eligible: bool = True
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class _HostedCancellationAttempt:
+    """Retain one original prepared cancellation without opening a task reader."""
+
+    store: TaskStore
+    backend: DatabaseBackend
+    scope: NativeRecipientScope
+    owner: asyncio.Task
+    task_id: str
+    actor: str
+    operation_id: str
+    prepared: bytes | None = None
+
+    def record_prepared(self, candidate: Task) -> None:
+        if self.owner is not asyncio.current_task() or self.prepared is not None or candidate.id != self.task_id:
+            raise ExecutionAuthorityError("Hosted cancellation no longer owns its original attempt")
+        object.__setattr__(self, "prepared", candidate.SerializeToString())
+
+    def parameters(self, backend: DatabaseBackend) -> tuple[str, ...]:
+        if (
+            backend is not self.backend
+            or self.store.backend is not backend
+            or self.store.scope != self.scope
+            or self.owner.done()
+            or self.prepared is None
+        ):
+            raise ExecutionAuthorityError("Hosted cancellation readback lacks its original prepared attempt")
+        return (
+            self.task_id, self.scope.recipient_id, self.scope.tenant,
+            self.actor, self.actor, self.operation_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -1317,6 +1356,28 @@ class TaskStore(UnifiedStoreBase):
         )
         return row[0] if row else None
 
+    def _prepare_hosted_cancellation(
+        self, task_id: str, *, actor: str, recipient: str | None, operation_id: str,
+    ) -> _HostedCancellationAttempt:
+        owner = asyncio.current_task()
+        if owner is None or recipient != self.scope.recipient_id:
+            raise ExecutionAuthorityError("Hosted cancellation lacks its original recipient and owner")
+        return _HostedCancellationAttempt(
+            self, self._backend, self.scope, owner, task_id, actor, operation_id,
+        )
+
+    async def _confirm_hosted_cancellation(self, attempt: _HostedCancellationAttempt) -> Task | None:
+        if attempt.store is not self:
+            raise ExecutionAuthorityError("Hosted cancellation belongs to another task store")
+        if attempt.prepared is None:
+            return None
+        check = getattr(self._backend, "confirm_native_task_cancellation", None)
+        if not callable(check):
+            raise ExecutionAuthorityError("Original backend has no fixed hosted cancellation readback")
+        if await check(attempt):
+            return Task.FromString(attempt.prepared)
+        return None
+
     async def get_recipient_terminal_operation_id(
         self,
         task_id: str,
@@ -1430,6 +1491,7 @@ class TaskStore(UnifiedStoreBase):
         task_payload: Task | None = None,
         task_baseline: Task | None = None,
         operation_id: str | None = None,
+        _hosted_attempt: _HostedCancellationAttempt | None = None,
     ) -> Task | None:
         """Atomically cancel one live task owned by or delegated to ``actor``.
 
@@ -1453,6 +1515,18 @@ class TaskStore(UnifiedStoreBase):
             raise ValueError(
                 "Expected cancellation recipient must be a concrete agent identity"
             )
+        if _hosted_attempt is not None and (
+            _hosted_attempt.store is not self
+            or _hosted_attempt.backend is not self._backend
+            or _hosted_attempt.scope != self.scope
+            or _hosted_attempt.owner is not asyncio.current_task()
+            or _hosted_attempt.task_id != task_id
+            or _hosted_attempt.actor != actor_agent_id
+            or _hosted_attempt.operation_id != operation_id
+            or _hosted_attempt.prepared is not None
+            or expected_recipient_agent_id != self.scope.recipient_id
+        ):
+            raise ExecutionAuthorityError("Hosted cancellation changed its original attempt")
         if (task_payload is None) != (task_baseline is None):
             raise ValueError(
                 "Cancellation payload and baseline must be supplied together"
@@ -1518,6 +1592,8 @@ class TaskStore(UnifiedStoreBase):
             if current is None:
                 return None
 
+            if _hosted_attempt is not None and current[11] != actor_agent_id:
+                raise ExecutionAuthorityError("Hosted cancellation requires its durable creator")
             latest = self._row_to_task(current)
             try:
                 merged = (
@@ -1595,6 +1671,8 @@ class TaskStore(UnifiedStoreBase):
                 canceled_row[20] = timestamp.seconds
                 canceled_row[21] = timestamp.nanos
                 committed = self._row_to_task(tuple(canceled_row))
+                if _hosted_attempt is not None:
+                    _hosted_attempt.record_prepared(committed)
         if conflict is not None:
             raise conflict
         return committed

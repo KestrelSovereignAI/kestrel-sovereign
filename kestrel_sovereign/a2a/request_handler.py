@@ -5,10 +5,16 @@ import base64
 import binascii
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from typing import NoReturn
 from uuid import uuid4
 
+from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.native_a2a.server.context import ServerCallContext
 from kestrel_sdk.native_a2a.server.events.event_queue import Event
 from kestrel_sdk.native_a2a.server.request_handlers import RequestHandler
@@ -44,35 +50,38 @@ from kestrel_sdk.native_a2a.utils.errors import (
     UnsupportedOperationError,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
-from kestrel_sdk.native_a2a.utils.source_ownership import SourceWithdrawal, WakeableSource
+from kestrel_sdk.native_a2a.utils.source_ownership import (
+    SourceWithdrawal,
+    WakeableSource,
+)
 from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from kestrel_sdk.native_a2a.utils.task import (
     apply_history_length,
     validate_history_length,
     validate_page_size,
 )
-from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.security.exceptions import SSRFError
 from starlette.exceptions import HTTPException
 
-from kestrel_sovereign._async_ownership import OriginalContextExit, gather_owned
+from kestrel_sovereign._async_ownership import gather_owned
 from kestrel_sovereign.a2a.extensions import (
-    NativeMessageMetadata,
     PEER_STOP_URI,
+    NativeMessageMetadata,
     parse_message_metadata,
     require_metadata_extensions,
 )
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
-from kestrel_sovereign.a2a.native_input import prepare_native_task_input
 from kestrel_sovereign.a2a.media import (
     encode_inline_json,
     skill_input_modes,
     validate_input_parts,
 )
 from kestrel_sovereign.a2a.native_context import wait_native_disconnect
+from kestrel_sovereign.a2a.native_input import prepare_native_task_input
 from kestrel_sovereign.a2a.native_security import (
     AuthorizedNativeRequest,
     NativeDIDRequestGuard,
+    NativeRequestKind,
 )
 from kestrel_sovereign.a2a.push_service import PushServiceUnavailable
 from kestrel_sovereign.a2a.push_worker import NativePushWorker, PushRetirementPending
@@ -246,12 +255,15 @@ class NativeA2ARequestHandler(RequestHandler):
         """Return a copy of the card whose capabilities this handler enforces."""
         return AgentCard.FromString(self._card.SerializeToString())
 
-    async def _task(self, task_id: str, principal_id: str) -> Task:
-        task = await self.manager.task_store.get_for_creator(
+    async def _find_task(self, task_id: str, principal_id: str) -> Task | None:
+        return await self.manager.task_store.get_for_creator(
             task_id,
             principal_id,
             recipient_agent_id=self.guard.scope.recipient_id,
         )
+
+    async def _task(self, task_id: str, principal_id: str) -> Task:
+        task = await self._find_task(task_id, principal_id)
         if task is None:
             raise TaskNotFoundError()
         return task
@@ -277,29 +289,43 @@ class NativeA2ARequestHandler(RequestHandler):
     async def on_cancel_task(
         self, params: CancelTaskRequest, context: ServerCallContext
     ) -> Task:
-        async with self.guard.admit(params, "CancelTask", context) as admitted:
-            task = await self._task(admitted.request.id, admitted.principal_id)
-            if task.status.state in TERMINAL_STATES:
-                raise TaskNotCancelableError()
-            try:
-                return await self.manager.cancel_task(
-                    task.id,
-                    agent_name=admitted.principal_id,
-                    recipient_agent_id=self.guard.scope.recipient_id,
-                )
-            except TaskCancellationAuthorizationError as error:
-                raise TaskNotFoundError() from error
-            except ValueError as error:
-                # Another terminal transition may win after the authorized read.
-                if is_execution_control_error(error):
+        async with AsyncExitStack() as committed:
+            async with self.guard.admit(params, "CancelTask", context) as admitted:
+                task = await self._task(admitted.request.id, admitted.principal_id)
+                if task.status.state in TERMINAL_STATES:
+                    raise TaskNotCancelableError()
+                kwargs = {
+                    "agent_name": admitted.principal_id,
+                    "recipient_agent_id": self.guard.scope.recipient_id,
+                }
+                try:
+                    if admitted.verified_admission is None:
+                        return await self.manager.cancel_task(task.id, **kwargs)
+                    async with AsyncExitStack() as transition:
+                        cancelled = await transition.enter_async_context(
+                            self.manager._cancel_task_and_project(
+                                task.id, **kwargs,
+                                projection_lease=lambda: self.guard.hold_authority(
+                                    admitted, workload_only=True,
+                                ),
+                            )
+                        )
+                        await committed.enter_async_context(self._response_outcome(cancelled))
+                        committed.push_async_exit(transition.pop_all())
+                except TaskCancellationAuthorizationError as error:
+                    raise TaskNotFoundError() from error
+                except ValueError as error:
+                    # Another terminal transition may win after the authorized read.
+                    if is_execution_control_error(error):
+                        raise
+                    current = await self._task(task.id, admitted.principal_id)
+                    if current.status.state in TERMINAL_STATES:
+                        raise TaskNotCancelableError() from error
                     raise
-                current = await self._task(task.id, admitted.principal_id)
-                if current.status.state in TERMINAL_STATES:
-                    raise TaskNotCancelableError() from error
-                raise
+            return cancelled
 
     def _submission_claims(
-        self, admitted: AuthorizedNativeRequest[SendMessageRequest]
+        self, params: SendMessageRequest, activated_extensions: frozenset[str],
     ) -> NativeMessageMetadata | StreamRefusal:
         """Validate protocol input without an async/resource lifetime boundary.
 
@@ -307,11 +333,10 @@ class NativeA2ARequestHandler(RequestHandler):
         from manager I/O, original close or authority exit are not intercepted
         by a catch-all around the streaming source.
         """
-        params = admitted.request
         try:
             validate_history_length(params.configuration)
             metadata = MessageToDict(params.metadata)
-            require_metadata_extensions(metadata, admitted.activated_extensions)
+            require_metadata_extensions(metadata, activated_extensions)
             claims = parse_message_metadata(metadata)
             if claims.peer_stop is None:
                 prepare_native_task_input(params)
@@ -370,6 +395,12 @@ class NativeA2ARequestHandler(RequestHandler):
                     return StreamRefusal(error)
         return claims
 
+    def _is_peer_stop(
+        self, params: SendMessageRequest, activated_extensions: frozenset[str],
+    ) -> bool:
+        claims = self._submission_claims(params, activated_extensions)
+        return not isinstance(claims, StreamRefusal) and claims.peer_stop is not None
+
     async def _submit(
         self, admitted: AuthorizedNativeRequest[SendMessageRequest]
     ) -> Task | Message | StreamRefusal:
@@ -383,14 +414,23 @@ class NativeA2ARequestHandler(RequestHandler):
                 refusal = _push_protocol_error(error)
                 refusal.__cause__ = error
                 return StreamRefusal(refusal)
-        claims = self._submission_claims(admitted)
+        claims = self._submission_claims(params, admitted.activated_extensions)
         if isinstance(claims, StreamRefusal):
             return claims
+        verified = admitted.verified_admission
+        if verified is not None and verified.kind is not (
+            NativeRequestKind.PEER_STOP if claims.peer_stop is not None else NativeRequestKind.WORK
+        ):
+            return StreamRefusal(InvalidParamsError(
+                message="Hosted admission does not match the native operation",
+            ))
         if claims.peer_stop is not None:
             from kestrel_sovereign.signals.sources.peer_stop import dispatch_peer_stop
 
             async with AsyncExitStack() as outcome:
-                async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+                async with self.guard.hold_authority(
+                    admitted, refusal_values=True, first_effect=True,
+                ) as refused:
                     if isinstance(refused, StreamRefusal):
                         return refused
                     # The taskless operation starts here. Register the SAME
@@ -413,8 +453,8 @@ class NativeA2ARequestHandler(RequestHandler):
                     ],
                 )
 
-        def admission_fence() -> OriginalContextExit[StreamRefusal | None]:
-            return OriginalContextExit(self.guard.hold_authority(admitted, refusal_values=True))
+        def admission_fence() -> AbstractAsyncContextManager[StreamRefusal | None]:
+            return self.guard.hold_authority(admitted, refusal_values=True)
 
         try:
             if params.message.task_id:
@@ -493,18 +533,21 @@ class NativeA2ARequestHandler(RequestHandler):
     async def _events(
         self, stream, initial: Task, admitted: AuthorizedNativeRequest,
         *, response_result: Task | None = None,
-    ) -> AsyncGenerator[Event]:
+    ) -> AsyncGenerator[Event | StreamRefusal]:
         # Borrow the already-owned subscription. _open_stream retains its
         # original owner across acquisition, every read, and physical close.
         event = initial
         while True:
-            authority = (
-                self.guard.hold_authority(admitted)
-                if response_result is None
-                else self._response_authority(admitted, response_result)
-            )
-            async with authority:
-                await self._task(initial.id, admitted.principal_id)
+            if response_result is None:
+                async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+                    if refused is None and await self._find_task(initial.id, admitted.principal_id) is None:
+                        refused = StreamRefusal(TaskNotFoundError())
+                if refused is not None:
+                    yield refused
+                    return
+            else:
+                async with self._response_authority(admitted, response_result):
+                    await self._task(initial.id, admitted.principal_id)
             yield event
             try:
                 event = await anext(stream)
@@ -523,7 +566,9 @@ class NativeA2ARequestHandler(RequestHandler):
     @asynccontextmanager
     async def _response_authority(self, admitted: AuthorizedNativeRequest, result: Task | Message):
         """A later denial cannot retroactively turn an effect into refusal."""
-        async with self.guard.hold_authority(admitted, refusal_values=True) as refused:
+        async with self.guard.hold_authority(
+            admitted, refusal_values=True, workload_only=isinstance(result, Message),
+        ) as refused:
             if isinstance(refused, StreamRefusal):
                 self._raise_response_failure(result, refused.error)
             yield
@@ -566,7 +611,9 @@ class NativeA2ARequestHandler(RequestHandler):
     async def on_message_send(
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> Task | Message:
-        async with self.guard.admit(params, "SendMessage", context) as admitted:
+        async with self.guard.admit(
+            params, "SendMessage", context, classify_peer_stop=self._is_peer_stop,
+        ) as admitted:
             pass
         task = await self._submit(admitted)
         if isinstance(task, StreamRefusal):
@@ -627,7 +674,8 @@ class NativeA2ARequestHandler(RequestHandler):
         self, params: SendMessageRequest, context: ServerCallContext, withdrawal: SourceWithdrawal
     ) -> AsyncGenerator[Event | StreamRefusal]:
         async with self.guard.admit(
-            params, "SendStreamingMessage", context, refusal_values=True
+            params, "SendStreamingMessage", context, refusal_values=True,
+            classify_peer_stop=self._is_peer_stop,
         ) as admitted:
             streaming = (
                 self._card.capabilities.streaming
@@ -660,6 +708,9 @@ class NativeA2ARequestHandler(RequestHandler):
                 self, self._send_task_events(task, admitted, withdrawal), withdrawal=withdrawal
             ) as events:
                 async for event in events:
+                    if isinstance(event, StreamRefusal):
+                        # A committed Send has a different response boundary.
+                        self._raise_response_failure(task, event.error)
                     yield event
 
     def on_subscribe_to_task(
@@ -703,8 +754,12 @@ class NativeA2ARequestHandler(RequestHandler):
                     self, self._events(stream, initial, admitted), withdrawal=withdrawal
                 ) as events:
                     async for event in events:
+                        if isinstance(event, StreamRefusal):
+                            opened = event
+                            break
                         yield event
-                return
+                if not isinstance(opened, StreamRefusal):
+                    return
         # Only explicit semantic decisions become values. An exception from
         # actual original close or authority exit never reaches this yield.
         yield opened

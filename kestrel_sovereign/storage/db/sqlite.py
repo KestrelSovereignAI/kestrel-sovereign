@@ -3521,6 +3521,34 @@ class SQLiteBackend(DatabaseBackend):
         """Fetch a single row after retained cancellation cleanup drains."""
         return await self._fetch_one(query, params, diagnostic=False)
 
+    async def confirm_native_task_cancellation(self, attempt) -> bool:
+        """Confirm the same original attempt after SQLite's native drain."""
+        from kestrel_sovereign.a2a.stores.unified.task_store import (
+            _CANCELLATION_COMMIT_READBACK,
+            _HostedCancellationAttempt,
+        )
+
+        if type(attempt) is not _HostedCancellationAttempt:
+            raise TypeError("Native cancellation readback requires original prepared evidence")
+        connection = self._connection
+        params = attempt.parameters(self)
+        async with asyncio.timeout(5):
+            await self._wait_for_cancelled_write_drain()
+            async with self._write_lock:
+                self.assert_connected_file_still_valid()
+                if (
+                    self._connection is not connection
+                    or self._in_transaction
+                    or connection.in_transaction
+                    or self._cancelled_write_drain is not None
+                    or self._cancelled_write_drain_error is not None
+                ):
+                    raise ConnectionError("Native cancellation readback requires the original committed connection")
+                row = await self._fetch_on_connection(
+                    connection, _CANCELLATION_COMMIT_READBACK, params, one=True,
+                )
+                return row == (1,)
+
     async def fetch_one_diagnostic(
         self, query: str, params: Params = ()
     ) -> Optional[Row]:

@@ -115,6 +115,7 @@ class NativeVerifiedSender:
     sender: str
     nonce: str
     verification_document_fingerprint: str
+    issued_at: int | None = None
 
 
 def _extension_set(extensions: Iterable[str]) -> list[str]:
@@ -313,7 +314,7 @@ async def authenticate_native_request(
         denied = NativeSenderProofError("Sender DID document cannot be fingerprinted")
         denied.__cause__ = error
         return _proof_refusal(denied, refusal_values)
-    return NativeVerifiedSender(claims.sender, claims.nonce, fingerprint)
+    return NativeVerifiedSender(claims.sender, claims.nonce, fingerprint, claims.timestamp)
 
 
 async def reserve_native_sender_nonce(

@@ -101,6 +101,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
 )
 from kestrel_sovereign.execution_custody import (
     bind_execution_cleanup,
+    ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
     execution_commit_outcome,
     execution_observation_error,
@@ -120,6 +121,15 @@ logger = logging.getLogger(__name__)
 
 class TaskCancellationAuthorizationError(PermissionError):
     """The caller has no durable creator/recipient authority for a task."""
+
+
+class NativeCancellationCommitEvidence(ExecutionCommitOutcomeError):
+    """A specific Task cancellation committed independently of its projections."""
+
+    def __init__(self, task_id: str, operation_id: str):
+        super().__init__("committed")
+        self.task_id = task_id
+        self.operation_id = operation_id
 
 
 class OutboundActorScopeError(PermissionError):
@@ -2180,8 +2190,31 @@ class TaskManager:
         task_payload: Task | None = None,
         task_baseline: Task | None = None,
     ) -> Task:
+        """Cancel through the canonical transition and join its projections."""
+        async with self._cancel_task_and_project(
+            task_id, reason=reason, agent_name=agent_name,
+            recipient_agent_id=recipient_agent_id, task_payload=task_payload,
+            task_baseline=task_baseline,
+        ) as task:
+            return task
+
+    @asynccontextmanager
+    async def _cancel_task_and_project(
+        self,
+        task_id: str,
+        reason: str | None = None,
+        agent_name: str | None = None,
+        recipient_agent_id: str | None = None,
+        task_payload: Task | None = None,
+        task_baseline: Task | None = None,
+        *,
+        projection_lease: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> AsyncIterator[Task]:
         """
-        Cancel a task.
+        Commit cancellation and cancel its queued wake before the yield.
+
+        A hosted control handler can leave reserved admission at the yield;
+        the original context then joins the post-commit projections.
 
         Args:
             task_id: ID of the task to cancel
@@ -2203,6 +2236,10 @@ class TaskManager:
             raise TaskCancellationAuthorizationError(
                 "Task cancellation requires a concrete agent identity"
             )
+        if projection_lease is not None and getattr(
+            self.task_store.backend, "owns_open_transaction", None,
+        ) is not False:
+            raise ExecutionAuthorityError("Native hosted cancellation requires its own outermost commit")
 
         cancel_kwargs = {
             "actor_agent_id": agent_name,
@@ -2210,6 +2247,12 @@ class TaskManager:
         }
         operation_id = uuid4().hex
         cancel_kwargs["operation_id"] = operation_id
+        hosted_attempt = None
+        if projection_lease is not None:
+            hosted_attempt = self.task_store._prepare_hosted_cancellation(
+                task_id, actor=agent_name, recipient=recipient_agent_id, operation_id=operation_id,
+            )
+            cancel_kwargs["_hosted_attempt"] = hosted_attempt
         if recipient_agent_id is not None:
             cancel_kwargs["expected_recipient_agent_id"] = recipient_agent_id
         if task_payload is not None:
@@ -2260,6 +2303,15 @@ class TaskManager:
                 agent_name,
             )
 
+        async def committed_readback() -> tuple[Task | None, bool]:
+            current = await reconciliation_read()
+            committed_here = (
+                current is not None
+                and await is_this_actor_receipt(current)
+                and await self.task_store.get_cancellation_operation_id(task_id) == operation_id
+            )
+            return current, committed_here
+
         try:
             task = await self.task_store.cancel_if_authorized(
                 task_id,
@@ -2273,21 +2325,33 @@ class TaskManager:
             # original store outcome only after that reconciliation completes.
             store_failure = error
             try:
-                current = await reconciliation_read()
-                committed_here = (
-                    current is not None
-                    and await is_this_actor_receipt(current)
-                    and await self.task_store.get_cancellation_operation_id(task_id)
-                    == operation_id
-                )
+                if hosted_attempt is None:
+                    current, committed_here = await committed_readback()
+                else:
+                    # Original lease holders join this fixed readback even
+                    # when successful Work loans and ordinary SQL are denied.
+                    with bind_execution_cleanup(self):
+                        readback = create_owned_task(
+                            self.task_store._confirm_hosted_cancellation(hosted_attempt),
+                            name="a2a-hosted-cancellation-readback",
+                        )
+                    observed = await await_owned_task(readback, retain_cancellations=True)
+                    if observed.error is not None:
+                        raise execution_observation_error(observed.error, observed.cancellation)
+                    store_failure = execution_observation_error(error, observed.cancellation)
+                    current, committed_here = observed.result, observed.result is not None
             except BaseException as reconciliation_failure:  # noqa: BLE001 - preserve both native outcomes before re-raising
-                if rollback_local_intent is not None:
+                if rollback_local_intent is not None and execution_commit_outcome(error) != "committed":
                     rollback_local_intent()
+                if projection_lease is not None:
+                    raise execution_observation_error(store_failure, reconciliation_failure)
                 raise execution_terminal_error(error, reconciliation_failure)
             if not committed_here:
                 if rollback_local_intent is not None:
                     rollback_local_intent()
-                raise
+                if store_failure is error:
+                    raise
+                raise store_failure from error
             task = current
         if task is None:
             try:
@@ -2312,7 +2376,8 @@ class TaskManager:
                 # Keep the just-acquired local execution exemption: this retry
                 # is still the same authorized recipient decline and its
                 # monitor must not cancel the response after seeing CANCELED.
-                return current
+                yield current
+                return
             if rollback_local_intent is not None:
                 rollback_local_intent()
             if current.status.state not in {
@@ -2329,9 +2394,27 @@ class TaskManager:
                 f"Agent {agent_name!r} is not authorized to cancel task {task_id!r}"
             )
 
+        body_failure: BaseException | None = None
+
+        def committed_failure(*failures: BaseException | None) -> BaseException | None:
+            if projection_lease is not None:
+                if store_failure is None and not any(failure is not None for failure in failures):
+                    return None
+                # Retain the cancellation operation even if a different
+                # projection COMMIT is uncertain. The general classifier may
+                # still report unknown; this exact operation remains proven.
+                evidence = NativeCancellationCommitEvidence(task_id, operation_id)
+                return execution_observation_error(evidence, store_failure, *failures)
+            return execution_terminal_error(store_failure, *failures, retain_originals=True)
+
         try:
             receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}
             previous_state = receipt.get("status_before")
+            if projection_lease is not None:
+                # This only wakes existing, scoped in-process streams with
+                # the committed value. Disclosure still takes their ordinary
+                # read fence. It must not depend on projection capacity.
+                await self._notify_status_update(task, final=True, notify_completion=False)
             if self._on_task_cancelled is not None:
                 try:
                     self._on_task_cancelled(task)
@@ -2344,6 +2427,11 @@ class TaskManager:
                         exc,
                         exc_info=True,
                     )
+            try:
+                yield task
+            except BaseException as error:  # noqa: BLE001 - join the original projection before propagating the exit
+                body_failure = error
+            scope = {"projection_lease": projection_lease} if projection_lease is not None else {}
             await self._finish_status_projection(
                 task,
                 old_state=str(previous_state or "unspecified"),
@@ -2351,14 +2439,13 @@ class TaskManager:
                 agent_name=agent_name,
                 is_final=True,
                 reason=reason,
+                **scope,
             )
         except BaseException as projection_failure:  # noqa: BLE001 - preserve the original commit receipt before re-raising
             # Exact actor/operation readback proves which CAS committed, not
             # that its UNKNOWN transport outcome may be discarded. Retain the
             # FIRST native receipt through every later callback/projection.
-            raise execution_terminal_error(
-                store_failure, projection_failure, retain_originals=True
-            )
+            raise committed_failure(body_failure, projection_failure)
 
         logger.info(
             "Task %s canceled by %s: %s -> %s",
@@ -2367,9 +2454,9 @@ class TaskManager:
             previous_state,
             task_state_label(TaskState.TASK_STATE_CANCELED),
         )
-        if store_failure is not None:
-            raise store_failure
-        return task
+        failure = committed_failure(body_failure)
+        if failure is not None:
+            raise failure
 
     async def _finish_status_projection(
         self,
@@ -2380,21 +2467,33 @@ class TaskManager:
         agent_name: str | None,
         is_final: bool,
         reason: str | None = None,
+        projection_lease: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> None:
         """Join post-commit projections before propagating caller cancellation."""
 
-        projection = create_owned_task(
-            self._project_status_transition(
-                task,
-                old_state=old_state,
-                new_state=new_state,
-                agent_name=agent_name,
-                is_final=is_final,
-                reason=reason,
-            ),
-            name="a2a-task-status-projection",
+        async def project():
+            # The actual owned Task must also own any wait for ordinary
+            # authority and its retirement, not just the projection body.
+            async with projection_lease() if projection_lease is not None else nullcontext():
+                await self._project_status_transition(
+                    task,
+                    old_state=old_state,
+                    new_state=new_state,
+                    agent_name=agent_name,
+                    is_final=is_final,
+                    reason=reason,
+                    notify_stream=projection_lease is None,
+                )
+
+        projection = create_owned_task(project(), name="a2a-task-status-projection")
+        outcome = await await_owned_task(
+            projection, retain_cancellations=projection_lease is not None,
         )
-        outcome = await await_owned_task(projection)
+        if projection_lease is not None:
+            failure = execution_observation_error(outcome.error, outcome.cancellation)
+            if failure is not None:
+                raise failure
+            return
         raise_owned_outcome(
             outcome,
             operation="A2A task status projection",
@@ -2502,6 +2601,7 @@ class TaskManager:
         agent_name: str | None,
         is_final: bool,
         reason: str | None = None,
+        notify_stream: bool = True,
     ) -> None:
         """Best-effort projections after the durable task row has committed.
 
@@ -2561,7 +2661,10 @@ class TaskManager:
                 )
 
         try:
-            await self._notify_status_update(task, final=is_final)
+            if notify_stream:
+                await self._notify_status_update(task, final=is_final)
+            else:
+                await self._notify_status_update(task, final=is_final, notify_stream=False)
         except Exception as execution_error:
             if is_execution_control_error(execution_error):
                 raise
@@ -2650,9 +2753,11 @@ class TaskManager:
             if not self._subscribers[task_id]:
                 del self._subscribers[task_id]
 
-    async def _notify_status_update(self, task: Task, final: bool) -> None:
+    async def _notify_status_update(
+        self, task: Task, final: bool, *, notify_completion: bool = True, notify_stream: bool = True,
+    ) -> None:
         """Publish the durable native status; no private final flag crosses wire."""
-        if final and self._on_task_complete is not None:
+        if notify_completion and final and self._on_task_complete is not None:
             candidate = await self.task_store.get_task_snapshot(
                 task.id,
                 recipient_agent_id=self.did,
@@ -2668,6 +2773,8 @@ class TaskManager:
                     if is_execution_control_error(error):
                         raise
                     logger.exception("Task completion callback failed for %s", task.id)
+        if not notify_stream:
+            return
         # A handler can return artifacts in its final Task without calling the
         # incremental artifact API. Publish those durable values before the
         # status that closes the stream. Replacements use the standard ID rule
