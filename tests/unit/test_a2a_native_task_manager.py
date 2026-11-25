@@ -51,6 +51,9 @@ from kestrel_sovereign.execution_custody import (
     execution_evidence_carriers,
     require_execution_work,
 )
+from kestrel_sovereign.storage.db.interface import (
+    ConnectionError as StorageConnectionError,
+)
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import manager_for
 
@@ -85,10 +88,14 @@ async def admit(manager, params=None, creator="did:kestrel:sender"):
     )
 
 
-async def test_committed_hosted_cancel_joins_projection_admission_on_caller_withdrawal(manager):
+@pytest.mark.parametrize("projection_fails", [False, True])
+async def test_committed_hosted_cancel_joins_projection_admission_on_caller_withdrawal(
+    manager, projection_fails,
+):
     original = await admit(manager)
     entering, permit, retired = asyncio.Event(), asyncio.Event(), asyncio.Event()
     origin = None
+    projection_failure = ExecutionCommitOutcomeError("unknown")
 
     @asynccontextmanager
     async def workload_lease():
@@ -96,6 +103,8 @@ async def test_committed_hosted_cancel_joins_projection_admission_on_caller_with
         entering.set()
         await permit.wait()
         try:
+            if projection_fails:
+                raise projection_failure
             yield
         finally:
             retired.set()
@@ -121,7 +130,13 @@ async def test_committed_hosted_cancel_joins_projection_admission_on_caller_with
             permit.set()
             outcome = await await_owned_task(origin)
         assert retired.is_set() and origin.done()
-        assert execution_commit_outcome(outcome.error or outcome.cancellation) == "committed"
+        terminal = outcome.error or outcome.cancellation
+        originals = execution_evidence_carriers(terminal)
+        assert any(isinstance(error, NativeCancellationCommitEvidence) for error in originals)
+        assert any(isinstance(error, asyncio.CancelledError) for error in originals)
+        assert execution_commit_outcome(terminal) == ("unknown" if projection_fails else "committed")
+        if projection_fails:
+            assert any(error is projection_failure for error in originals)
     finally:
         permit.set()
         await await_owned_task(origin)
@@ -140,6 +155,31 @@ async def test_hosted_cancel_refuses_an_outer_transaction_before_transition(mana
         original.id, "did:kestrel:sender", recipient_agent_id="did:kestrel:recipient",
     )
     assert current.status.state == original.status.state
+
+
+@pytest.mark.parametrize("native_a2a_backend_factory", ["sqlite"], indirect=True)
+async def test_hosted_sqlite_readback_requires_settled_native_connection(manager):
+    store = manager.task_store
+    task = await admit(manager)
+    attempt = store._prepare_hosted_cancellation(
+        task.id, actor="did:kestrel:sender", recipient="did:kestrel:recipient",
+        operation_id="original-cancellation-attempt",
+    )
+    await store.cancel_if_authorized(
+        task.id, actor_agent_id="did:kestrel:sender",
+        expected_recipient_agent_id="did:kestrel:recipient",
+        operation_id=attempt.operation_id, _hosted_attempt=attempt,
+    )
+    connection = store.backend._connection
+    async with connection.execute("BEGIN"):
+        pass
+    try:
+        assert not store.backend.owns_open_transaction and connection.in_transaction
+        with pytest.raises(StorageConnectionError, match="original committed connection"):
+            await store._confirm_hosted_cancellation(attempt)
+    finally:
+        await connection.rollback()
+    assert (await store._confirm_hosted_cancellation(attempt)).id == task.id
 
 
 async def test_hosted_cancel_keeps_exact_transition_evidence_if_projection_is_uncertain(manager):

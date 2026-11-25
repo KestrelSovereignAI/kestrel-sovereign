@@ -3536,7 +3536,13 @@ class SQLiteBackend(DatabaseBackend):
             await self._wait_for_cancelled_write_drain()
             async with self._write_lock:
                 self.assert_connected_file_still_valid()
-                if self._connection is not connection or self._in_transaction:
+                if (
+                    self._connection is not connection
+                    or self._in_transaction
+                    or connection.in_transaction
+                    or self._cancelled_write_drain is not None
+                    or self._cancelled_write_drain_error is not None
+                ):
                     raise ConnectionError("Native cancellation readback requires the original committed connection")
                 row = await self._fetch_on_connection(
                     connection, _CANCELLATION_COMMIT_READBACK, params, one=True,

@@ -2480,7 +2480,14 @@ class TaskManager:
                 )
 
         projection = create_owned_task(project(), name="a2a-task-status-projection")
-        outcome = await await_owned_task(projection)
+        outcome = await await_owned_task(
+            projection, retain_cancellations=projection_lease is not None,
+        )
+        if projection_lease is not None:
+            failure = execution_observation_error(outcome.error, outcome.cancellation)
+            if failure is not None:
+                raise failure
+            return
         raise_owned_outcome(
             outcome,
             operation="A2A task status projection",
