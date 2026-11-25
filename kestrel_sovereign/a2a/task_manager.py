@@ -2354,6 +2354,17 @@ class TaskManager:
             )
 
         body_failure: BaseException | None = None
+
+        def committed_failure(*failures: BaseException | None) -> BaseException | None:
+            error = execution_terminal_error(store_failure, *failures, retain_originals=True)
+            if (
+                projection_lease is not None
+                and error is not None
+                and execution_commit_outcome(error) is None
+            ):
+                return execution_observation_error(ExecutionCommitOutcomeError("committed"), error)
+            return error
+
         try:
             receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}
             previous_state = receipt.get("status_before")
@@ -2373,22 +2384,21 @@ class TaskManager:
                 yield task
             except BaseException as error:  # noqa: BLE001 - join the original projection before propagating the exit
                 body_failure = error
-            async with projection_lease() if projection_lease is not None else nullcontext():
-                await self._finish_status_projection(
-                    task,
-                    old_state=str(previous_state or "unspecified"),
-                    new_state=TaskState.TASK_STATE_CANCELED,
-                    agent_name=agent_name,
-                    is_final=True,
-                    reason=reason,
-                )
+            scope = {"projection_lease": projection_lease} if projection_lease is not None else {}
+            await self._finish_status_projection(
+                task,
+                old_state=str(previous_state or "unspecified"),
+                new_state=TaskState.TASK_STATE_CANCELED,
+                agent_name=agent_name,
+                is_final=True,
+                reason=reason,
+                **scope,
+            )
         except BaseException as projection_failure:  # noqa: BLE001 - preserve the original commit receipt before re-raising
             # Exact actor/operation readback proves which CAS committed, not
             # that its UNKNOWN transport outcome may be discarded. Retain the
             # FIRST native receipt through every later callback/projection.
-            raise execution_terminal_error(
-                store_failure, body_failure, projection_failure, retain_originals=True
-            )
+            raise committed_failure(body_failure, projection_failure)
 
         logger.info(
             "Task %s canceled by %s: %s -> %s",
@@ -2397,7 +2407,7 @@ class TaskManager:
             previous_state,
             task_state_label(TaskState.TASK_STATE_CANCELED),
         )
-        failure = execution_terminal_error(store_failure, body_failure, retain_originals=True)
+        failure = committed_failure(body_failure)
         if failure is not None:
             raise failure
 
@@ -2410,20 +2420,24 @@ class TaskManager:
         agent_name: str | None,
         is_final: bool,
         reason: str | None = None,
+        projection_lease: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> None:
         """Join post-commit projections before propagating caller cancellation."""
 
-        projection = create_owned_task(
-            self._project_status_transition(
-                task,
-                old_state=old_state,
-                new_state=new_state,
-                agent_name=agent_name,
-                is_final=is_final,
-                reason=reason,
-            ),
-            name="a2a-task-status-projection",
-        )
+        async def project():
+            # The actual owned Task must also own any wait for ordinary
+            # authority and its retirement, not just the projection body.
+            async with projection_lease() if projection_lease is not None else nullcontext():
+                await self._project_status_transition(
+                    task,
+                    old_state=old_state,
+                    new_state=new_state,
+                    agent_name=agent_name,
+                    is_final=is_final,
+                    reason=reason,
+                )
+
+        projection = create_owned_task(project(), name="a2a-task-status-projection")
         outcome = await await_owned_task(projection)
         raise_owned_outcome(
             outcome,

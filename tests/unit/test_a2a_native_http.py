@@ -825,8 +825,7 @@ async def test_domain_typed_actual_authority_exit_failure_is_not_protocol_refusa
         is_execution_control_error,
     )
 
-    guard_type = type(wire.admission.guard)
-    hold = guard_type.hold_authority
+    lifecycle_lease = wire.admission.guard.lifecycle_lease
     reserve = wire.manager.context_store.reserve
     original = TaskInputConflictError(
         "Actual native authority exit acknowledgement failed"
@@ -841,11 +840,11 @@ async def test_domain_typed_actual_authority_exit_failure_is_not_protocol_refusa
         return result
 
     @asynccontextmanager
-    async def lose_original_authority_ack(guard, admitted, **options):
+    async def lose_original_authority_ack():
         nonlocal armed
-        async with hold(guard, admitted, **options) as decision:
-            yield decision
-        if guard is wire.admission.guard and armed:
+        async with lifecycle_lease():
+            yield
+        if armed:
             armed = False
             assert not wire.admission.lock.locked()
             witnesses.append(asyncio.current_task())
@@ -854,7 +853,10 @@ async def test_domain_typed_actual_authority_exit_failure_is_not_protocol_refusa
     monkeypatch.setattr(
         wire.manager.context_store, "reserve", arm_after_original_reservation
     )
-    monkeypatch.setattr(guard_type, "hold_authority", lose_original_authority_ack)
+    monkeypatch.setattr(
+        wire.handler, "guard",
+        replace(wire.admission.guard, lifecycle_lease=lose_original_authority_ack),
+    )
     with pytest.raises(BaseException) as failed:
         async for _ in wire.client(streaming=True).send_message(send(wire.admission)):
             pytest.fail("An actual failed authority exit became protocol data")
@@ -1433,7 +1435,7 @@ async def test_post_commit_missing_subscription_retains_committed_outcome(wire, 
 
 
 @pytest.mark.parametrize("operation,streaming", [("send", False), ("send", True), ("subscribe", True)])
-async def test_first_event_policy_recheck_retains_committed_outcome(wire, monkeypatch, operation, streaming):
+async def test_first_event_policy_recheck_distinguishes_committed_send_from_read(wire, monkeypatch, operation, streaming):
     from kestrel_sovereign.execution_custody import (
         execution_commit_outcome,
         is_execution_control_error,
@@ -1454,15 +1456,19 @@ async def test_first_event_policy_recheck_retains_committed_outcome(wire, monkey
     if operation == "subscribe":
         task = await wire.manager.create_task(send(wire.admission), creator_agent_id=PRINCIPAL)
         params = SubscribeToTaskRequest(id=task.id, tenant=wire.admission.scope.tenant)
+    status = 500 if operation == "send" else 403
     async with observed_native_http(wire) as observed:
-        with pytest.raises(A2AClientError, match="500"):
+        with pytest.raises(A2AClientError, match=str(status)):
             client = wire.client(streaming=streaming, polling=False, http_client=observed.http)
             source = client.send_message(params) if operation == "send" else client.subscribe(params)
             async for _ in source:
                 pytest.fail("Post-acquisition authority loss delivered a normal response")
-    assert observed.statuses == [500]
-    assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
-    assert execution_commit_outcome(observed.failures[0]) == ("committed" if operation == "send" else None)
+    assert observed.statuses == [status]
+    if operation == "send":
+        assert len(observed.failures) == 1 and is_execution_control_error(observed.failures[0])
+        assert execution_commit_outcome(observed.failures[0]) == "committed"
+    else:
+        assert not observed.failures
     assert len(wire.submissions) == 1
     rows = await wire.admission.backend.fetch_all("SELECT id FROM a2a_tasks")
     assert len(rows) == 1 and rows[0][0] == wire.submissions[0].task.id

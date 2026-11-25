@@ -11,6 +11,7 @@ from kestrel_sdk.native_a2a.utils.errors import (
     ExtensionSupportRequiredError,
     InvalidParamsError,
 )
+from kestrel_sdk.native_a2a.utils.stream_refusal import StreamRefusal
 from starlette.exceptions import HTTPException
 
 from kestrel_sovereign.a2a.native_context import NativeLocalSender
@@ -45,9 +46,15 @@ async def test_verified_local_admission_retains_original_evidence(
     p = native_request_admission
     acquired = []
     current = True
+    policy_current = True
+
+    @asynccontextmanager
+    async def source_reader():
+        yield None if policy_current else StreamRefusal(HTTPException(403, "Source policy retired"))
+
     origin = NativeLocalSender(
         SimpleNamespace(routing_key="original-source"), SENDER,
-        verification_document_fingerprint(p.signing[1]), lambda: current, nullcontext,
+        verification_document_fingerprint(p.signing[1]), lambda: current, source_reader,
     )
 
     @asynccontextmanager
@@ -78,12 +85,18 @@ async def test_verified_local_admission_retains_original_evidence(
     async with guard.hold_authority(admitted):
         assert p.lock.locked()
     assert len(acquired) == 2 and acquired[0] is acquired[1]
-    current = False
+    policy_current = False
     with pytest.raises(HTTPException) as retired:
         async with guard.hold_authority(admitted):
             pytest.fail("A retained request outlived the original sender")
     assert retired.value.status_code == 403
     assert len(acquired) == 2
+    policy_current = True
+    current = False
+    with pytest.raises(HTTPException) as replaced:
+        async with guard.hold_authority(admitted):
+            pytest.fail("A retained request outlived its publication")
+    assert replaced.value.status_code == 403 and len(acquired) == 2
 
 
 async def test_only_host_bound_proofs_reach_the_hosted_lease(native_request_admission):

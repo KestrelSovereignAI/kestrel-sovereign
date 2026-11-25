@@ -5,7 +5,12 @@ import base64
 import binascii
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from typing import NoReturn
 from uuid import uuid4
 
@@ -58,7 +63,7 @@ from kestrel_sdk.native_a2a.utils.task import (
 from kestrel_sdk.security.exceptions import SSRFError
 from starlette.exceptions import HTTPException
 
-from kestrel_sovereign._async_ownership import OriginalContextExit, gather_owned
+from kestrel_sovereign._async_ownership import gather_owned
 from kestrel_sovereign.a2a.extensions import (
     PEER_STOP_URI,
     NativeMessageMetadata,
@@ -443,8 +448,8 @@ class NativeA2ARequestHandler(RequestHandler):
                     ],
                 )
 
-        def admission_fence() -> OriginalContextExit[StreamRefusal | None]:
-            return OriginalContextExit(self.guard.hold_authority(admitted, refusal_values=True))
+        def admission_fence() -> AbstractAsyncContextManager[StreamRefusal | None]:
+            return self.guard.hold_authority(admitted, refusal_values=True)
 
         try:
             if params.message.task_id:

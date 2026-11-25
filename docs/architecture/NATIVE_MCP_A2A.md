@@ -1162,9 +1162,11 @@ nonce. Durable task rows continue to use the authorized principal.
 Only a verified native CancelTask or a SendMessage operation validated as
 Peer Stop can receive the corresponding control lease. Task cancellation
 releases it after the durable transition and wake cancellation; projections use
-ordinary admission. The default fleet and
-standalone contracts are unchanged, including card and retained-principal
-authorization. This local mode adds no authorization to network traffic.
+ordinary admission. The default fleet and standalone lease and policy
+contracts do not change, including card and retained-principal authorization.
+Across all hosts a denied read-only subscription may return its refusal after
+the original stream closes; the response to a committed Send still retains
+its original effect outcome. Local mode adds no authorization to network traffic.
 
 Native admission authenticates the caller and applies recipient policy before
 creating a context or task. The committed task's creator, recipient and tenant

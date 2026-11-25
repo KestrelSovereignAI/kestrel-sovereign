@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 
 import pytest
@@ -40,6 +40,7 @@ from kestrel_sovereign.a2a.task_manager import (
     TaskCancellationAuthorizationError,
     TaskManager,
 )
+from kestrel_sovereign.execution_custody import execution_commit_outcome
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from tests.utils.native_a2a import manager_for
 
@@ -72,6 +73,48 @@ async def admit(manager, params=None, creator="did:kestrel:sender"):
     return await manager.create_task(
         request() if params is None else params, creator_agent_id=creator
     )
+
+
+async def test_committed_hosted_cancel_joins_projection_admission_on_caller_withdrawal(manager):
+    original = await admit(manager)
+    entering, permit, retired = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    origin = None
+
+    @asynccontextmanager
+    async def workload_lease():
+        assert asyncio.current_task() is not origin
+        entering.set()
+        await permit.wait()
+        try:
+            yield
+        finally:
+            retired.set()
+
+    async def operate():
+        async with manager._cancel_task_and_project(
+            original.id, agent_name="did:kestrel:sender",
+            recipient_agent_id="did:kestrel:recipient", projection_lease=workload_lease,
+        ):
+            pass
+
+    origin = asyncio.create_task(operate())
+    try:
+        async with asyncio.timeout(3):
+            await entering.wait()
+            task = await manager.task_store.get_for_creator(
+                original.id, "did:kestrel:sender", recipient_agent_id="did:kestrel:recipient",
+            )
+            assert task.status.state == TaskState.TASK_STATE_CANCELED
+            origin.cancel()
+            await asyncio.sleep(0)
+            assert not origin.done() and not retired.is_set()
+            permit.set()
+            outcome = await await_owned_task(origin)
+        assert retired.is_set() and origin.done()
+        assert execution_commit_outcome(outcome.error or outcome.cancellation) == "committed"
+    finally:
+        permit.set()
+        await await_owned_task(origin)
 
 
 async def test_context_admission_cannot_use_a_different_connection(

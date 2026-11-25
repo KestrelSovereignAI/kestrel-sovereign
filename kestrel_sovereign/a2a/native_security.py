@@ -265,6 +265,9 @@ class NativeDIDRequestGuard:
             raise RuntimeError("Native hosted admission lease was not configured")
         refused = self._local_sender_decision(verified.sender, verified.origin)
         if refused is None:
+            async with verified.origin.authority_lease() as refused:
+                pass
+        if refused is None:
             freshness = partial(self._require_fresh_proof, verified.sender) if initial else None
             async with AsyncExitStack() as leases:
                 try:
@@ -340,11 +343,6 @@ class NativeDIDRequestGuard:
             return
 
         assert local is not None and origin is not None
-        async with origin.authority_lease() as refusal:
-            pass
-        if refusal is not None:
-            yield refusal
-            return
         kind = NativeRequestKind.WORK
         if operation == "CancelTask":
             kind = NativeRequestKind.CANCEL_TASK
