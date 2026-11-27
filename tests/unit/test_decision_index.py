@@ -886,6 +886,140 @@ class TestSupersessionThroughTheGraphPath:
             "superseded_by"
         ] == NEW_ID
 
+    async def test_a_refusal_whose_reindex_fails_says_so_and_keeps_refusing(
+        self, raw, strategy_path, monkeypatch
+    ):
+        """The refusal re-reads the file, so its digest no longer stops a
+        retry. When the re-index fails too, recall still shows the decision as
+        it was, and a retry decided on that must not write over the operator's
+        edit; nor may the refusal claim recall shows the file."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        _write_strategy_file(strategy_path, [_OLD, _NEW])
+        agent = self._agent(raw, strategy_path)
+        strategic = await self._strategic(agent)
+        memory = self._memory(agent)
+        _write_strategy_file(
+            strategy_path, [{**_OLD, "superseded_by": self._OPERATOR_CHOICE}, _NEW]
+        )
+        edited = strategy_path.read_bytes()
+
+        async def refused(*args, **kwargs):
+            raise RuntimeError("graph write refused")
+
+        monkeypatch.setattr(raw.graph, "compare_and_swap_node", refused)
+
+        first = await memory.mark_superseded(old_id=OLD_ID, new_id=NEW_ID)
+
+        assert first.status is ToolResultStatus.ERROR, first
+        assert first.data["conflict"] is True
+        assert first.data["reread_from_disk"] is True
+        assert "could not be re-indexed" in first.error
+        assert "now shows" not in first.error
+        assert "superseded_by" not in (await raw.graph.get_node(OLD_ID)).properties
+
+        # Decided on what recall still shows: the decision as current.
+        retried = await memory.mark_superseded(old_id=OLD_ID, new_id=NEW_ID)
+
+        assert retried.status is ToolResultStatus.ERROR, retried
+        assert retried.data["conflict"] is True
+        assert retried.data["reread_from_disk"] is False
+        assert "other than the one this was decided on" in retried.error
+        assert "could not be re-indexed" in retried.error
+        assert strategy_path.read_bytes() == edited, "the operator's edit stands"
+        assert _decision_in(strategic._data, _OLD["decision"])["superseded_by"] == (
+            self._OPERATOR_CHOICE
+        ), "the refused mark is not kept in memory"
+        assert await self._supersedes_edges(raw) == []
+
+        # Once the index can be written, a refusal brings recall up to date,
+        # and a supersession decided on what it then shows goes through.
+        monkeypatch.undo()
+        caught_up = await memory.mark_superseded(old_id=OLD_ID, new_id=NEW_ID)
+        assert caught_up.status is ToolResultStatus.ERROR, caught_up
+        assert "now shows this decision as the file has it" in caught_up.error
+        recalled = await self._recalled(memory, include_superseded=True)
+        assert recalled[_OLD["decision"]]["superseded_by"] == self._OPERATOR_CHOICE
+        assert strategy_path.read_bytes() == edited
+
+        deliberate = await memory.mark_superseded(old_id=OLD_ID, new_id=NEW_ID)
+        assert deliberate.status is ToolResultStatus.OK, deliberate
+        assert _decision_in(_read_strategy_file(strategy_path), _OLD["decision"])[
+            "superseded_by"
+        ] == NEW_ID
+
+    async def test_a_refusal_names_the_supersession_fields_that_differ(
+        self, raw, strategy_path
+    ):
+        _write_strategy_file(
+            strategy_path,
+            [{**_OLD, "superseded_by": NEW_ID, "superseded_at": "2026-07-05"}, _NEW],
+        )
+        agent = self._agent(raw, strategy_path)
+        strategic = await self._strategic(agent)
+        before = strategy_path.read_bytes()
+
+        outcome = await strategic.supersede_decision(
+            OLD_ID, NEW_ID, superseded_at="2026-07-07T00:00:00+00:00",
+            seen={"superseded_by": NEW_ID, "superseded_at": "2026-07-06"},
+        )
+
+        assert not outcome.recorded and outcome.conflict
+        assert "(superseded_at differ;" in outcome.error
+        assert "now shows this decision as the file has it" in outcome.error
+        assert strategy_path.read_bytes() == before
+
+    async def test_entries_that_disagree_are_refused_without_inviting_a_retry(
+        self, raw, strategy_path
+    ):
+        """Two entries share a date and text, hence a node, and only one was
+        marked superseded by hand: no node can show both, so a retry would be
+        refused again and the refusal must not suggest one."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        _write_strategy_file(
+            strategy_path,
+            [{**_OLD, "superseded_by": self._OPERATOR_CHOICE}, dict(_OLD), _NEW],
+        )
+        agent = self._agent(raw, strategy_path)
+        await self._strategic(agent)
+        before = strategy_path.read_bytes()
+
+        result = await self._memory(agent).mark_superseded(old_id=OLD_ID, new_id=NEW_ID)
+
+        assert result.status is ToolResultStatus.ERROR, result
+        assert result.data["conflict"] is True
+        assert "2 entries for" in result.error
+        assert "record different supersessions" in result.error
+        assert "until they are reconciled in the file" in result.error
+        assert "supersede again" not in result.error
+        assert strategy_path.read_bytes() == before
+        assert await self._supersedes_edges(raw) == []
+
+    async def test_a_stopped_read_back_after_a_refusal_is_not_reported(
+        self, raw, strategy_path, monkeypatch
+    ):
+        """The re-projection after a refusal is best-effort and hears no Stop;
+        the read-back that reports on it must not fold one into the refusal."""
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+        _write_strategy_file(strategy_path, [_OLD, _NEW])
+        agent = self._agent(raw, strategy_path)
+        strategic = await self._strategic(agent)
+        _write_strategy_file(
+            strategy_path, [{**_OLD, "superseded_by": self._OPERATOR_CHOICE}, _NEW]
+        )
+
+        async def stopped(*args, **kwargs):
+            raise ExecutionAuthorityError("execution was stopped")
+
+        monkeypatch.setattr(raw.graph, "get_node", stopped)
+
+        with pytest.raises(ExecutionAuthorityError):
+            await strategic.supersede_decision(
+                OLD_ID, NEW_ID, superseded_at="2026-07-05T00:00:00+00:00", seen={}
+            )
+
     async def test_a_reprojection_that_does_not_land_is_partial(
         self, raw, strategy_path, monkeypatch
     ):
@@ -950,7 +1084,7 @@ class TestSupersessionThroughTheGraphPath:
 
         with pytest.raises(ExecutionAuthorityError):
             await strategic.supersede_decision(
-                OLD_ID, NEW_ID, superseded_at="2026-07-05T00:00:00+00:00"
+                OLD_ID, NEW_ID, superseded_at="2026-07-05T00:00:00+00:00", seen={}
             )
 
     async def test_a_decision_the_file_no_longer_holds_is_not_superseded(
@@ -973,6 +1107,8 @@ class TestSupersessionThroughTheGraphPath:
         assert await raw.graph.get_node(OLD_ID) is None, (
             "re-read, the file no longer holds it, so neither does the index"
         )
+        assert "the index holds no node for it" in result.error
+        assert "supersede again" not in result.error, "there is nothing to supersede"
 
     @pytest.mark.parametrize("failure", ["write_fails", "file_removed"])
     async def test_an_unwritten_supersession_is_not_kept_in_memory(
@@ -1022,13 +1158,15 @@ class TestSupersessionThroughTheGraphPath:
 
         outcome = await strategic.supersede_decision(
             "decision:not-in-the-file", NEW_ID,
-            superseded_at="2026-07-05T00:00:00+00:00",
+            superseded_at="2026-07-05T00:00:00+00:00", seen={},
         )
 
         assert not outcome.recorded
         assert outcome.conflict
         assert not outcome.reread, "the file did not change, so there is nothing to re-read"
         assert "holds no decision" in outcome.error
+        assert "the index holds no node for it" in outcome.error
+        assert "supersede again" not in outcome.error
         assert strategy_path.read_bytes() == before
         assert strategic._data == data_before
 
@@ -1078,6 +1216,86 @@ class TestSupersessionThroughTheGraphPath:
         assert strategy_path.read_bytes() == file_before
         assert await self._supersedes_edges(raw) == []
 
+    async def _assert_refused_as_disabled(
+        self, result, raw, strategic, strategy_path, node_before, file_before,
+        data_before,
+    ):
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        assert result.status is ToolResultStatus.ERROR, result
+        assert "strategic memory is disabled" in result.error
+        assert result.data["yaml_written"] is False
+        assert result.data["edge_written"] is False
+        assert result.data["conflict"] is False
+        assert strategy_path.read_bytes() == file_before
+        assert strategic._data == data_before
+        assert (await raw.graph.get_node(OLD_ID)).properties == node_before
+        assert await self._supersedes_edges(raw) == []
+
+    async def test_refused_when_strategic_memory_is_disabled(self, raw, strategy_path):
+        """A soft-disabled feature stays in ``agent.features`` with
+        ``enabled=False``, and ``get_feature`` still returns it; it must not
+        write STRATEGY.yaml for a supersession."""
+        _write_strategy_file(strategy_path, [_OLD, _NEW])
+        agent = self._agent(raw, strategy_path)
+        strategic = await self._strategic(agent)
+        node_before = (await raw.graph.get_node(OLD_ID)).properties
+        file_before = strategy_path.read_bytes()
+        data_before = copy.deepcopy(strategic._data)
+        # What the disable endpoint leaves behind: the instance, retained.
+        strategic.enabled = False
+        assert agent.get_feature("StrategicMemoryFeature") is strategic
+
+        result = await self._memory(agent).mark_superseded(old_id=OLD_ID, new_id=NEW_ID)
+
+        await self._assert_refused_as_disabled(
+            result, raw, strategic, strategy_path, node_before, file_before,
+            data_before,
+        )
+
+    async def test_a_disable_while_the_supersede_waits_is_refused(
+        self, raw, strategy_path
+    ):
+        """The lookup that found the feature enabled is not the moment of the
+        write: a disable landing while the supersession waits for its lock is
+        refused too."""
+        import asyncio
+
+        class _SignallingLock(asyncio.Lock):
+            def __init__(self):
+                super().__init__()
+                self.contended = asyncio.Event()
+
+            async def acquire(self):
+                if self.locked():
+                    self.contended.set()
+                return await super().acquire()
+
+        _write_strategy_file(strategy_path, [_OLD, _NEW])
+        agent = self._agent(raw, strategy_path)
+        strategic = await self._strategic(agent)
+        node_before = (await raw.graph.get_node(OLD_ID)).properties
+        file_before = strategy_path.read_bytes()
+        data_before = copy.deepcopy(strategic._data)
+        lock = _SignallingLock()
+        strategic._decision_index_lock = lock
+
+        await lock.acquire()
+        try:
+            supersede = asyncio.create_task(
+                self._memory(agent).mark_superseded(old_id=OLD_ID, new_id=NEW_ID)
+            )
+            await asyncio.wait_for(lock.contended.wait(), timeout=10)
+            strategic.enabled = False
+        finally:
+            lock.release()
+        result = await supersede
+
+        await self._assert_refused_as_disabled(
+            result, raw, strategic, strategy_path, node_before, file_before,
+            data_before,
+        )
+
 
 class TestProjectionRacingASupersession:
     @pytest.mark.asyncio
@@ -1118,7 +1336,7 @@ class TestProjectionRacingASupersession:
         reindex = asyncio.create_task(feature._reindex_decisions())
         await graph.paused.wait()
         supersede = asyncio.create_task(feature.supersede_decision(
-            OLD_ID, NEW_ID, superseded_at="2026-07-05T00:00:00+00:00"
+            OLD_ID, NEW_ID, superseded_at="2026-07-05T00:00:00+00:00", seen={}
         ))
         for _ in range(20):
             await asyncio.sleep(0)

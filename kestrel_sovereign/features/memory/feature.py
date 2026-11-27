@@ -2339,7 +2339,7 @@ class MemoryFeature(Feature):
 
         if is_strategy_decision(old_node):
             return await self._supersede_strategy_decision(
-                storage.graph, old_id, new_id, reason
+                storage.graph, old_id, new_id, reason, seen=old_props
             )
 
         edge_props = {"reason": reason, "superseded_at": _utc_now_iso()}
@@ -2407,6 +2407,8 @@ class MemoryFeature(Feature):
         old_id: str,
         new_id: str,
         reason: Optional[str],
+        *,
+        seen: Dict[str, Any],
     ) -> ToolResult:
         """Supersede a decision whose canonical home is STRATEGY.yaml (#4154).
 
@@ -2415,6 +2417,13 @@ class MemoryFeature(Feature):
         the file first, by strategic memory, which then re-projects the node;
         only after that is the ``supersedes`` edge added. When the file cannot
         take it, nothing of this supersession is written to either store.
+        ``seen`` is the old node's properties as read for this call: the file
+        is written only if it still gives the decision the supersession they
+        show.
+
+        ``get_feature`` returns a disabled feature too. Strategic memory
+        refuses the write when disabled, under the lock it writes under, so a
+        disable landing after this lookup is refused as well.
         """
         from kestrel_sovereign.features.strategic_memory.feature import (
             StrategicMemoryFeature,
@@ -2435,7 +2444,7 @@ class MemoryFeature(Feature):
 
         superseded_at = _utc_now_iso()
         outcome = await strategic.supersede_decision(
-            old_id, new_id, superseded_at=superseded_at, reason=reason
+            old_id, new_id, superseded_at=superseded_at, seen=seen, reason=reason
         )
         if not outcome.recorded:
             return ToolResult.failed(

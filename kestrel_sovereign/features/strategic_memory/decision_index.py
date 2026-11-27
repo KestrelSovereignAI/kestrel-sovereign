@@ -127,6 +127,29 @@ def supersession_of(record: Dict[str, Any]) -> Dict[str, str]:
     return supersession
 
 
+def entries_for_decision(
+    entries: List[Any], agent_id: str, node_id: str
+) -> List[Dict[str, Any]]:
+    """The STRATEGY.yaml entries that project to the decision node ``node_id``,
+    in file order. Entries sharing a date and text share a node."""
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and str(entry.get("decision") or "").strip()
+        and strategy_decision_node_id(agent_id, entry) == node_id
+    ]
+
+
+def agreed_supersession(entries: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """The supersession every one of ``entries`` records (see
+    :func:`supersession_of`), or None when they record different ones -- as
+    hand-edited entries sharing a node can, and then no node can show both."""
+    found = [supersession_of(entry) for entry in entries]
+    first = found[0] if found else {}
+    return first if all(other == first for other in found) else None
+
+
 def supersede_entries(
     entries: List[Any],
     agent_id: str,
@@ -146,11 +169,7 @@ def supersede_entries(
     superseded again does not keep the earlier supersession's reason.
     """
     matched = 0
-    for entry in entries:
-        if not isinstance(entry, dict) or not str(entry.get("decision") or "").strip():
-            continue
-        if strategy_decision_node_id(agent_id, entry) != node_id:
-            continue
+    for entry in entries_for_decision(entries, agent_id, node_id):
         entry["superseded_by"] = superseded_by
         entry["superseded_at"] = superseded_at
         if reason:
