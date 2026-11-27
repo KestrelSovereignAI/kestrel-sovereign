@@ -60,8 +60,10 @@ _PROJECTION_SOURCE = "strategic_memory"
 #: canonical file could never take effect in the index, and the recall then
 #: reported that as a healthy empty result (#3064).
 #:
-#: ``decision_index`` keeps its own carry-over deliberately -- decisions ARE
-#: claim-shaped, so there the graph really can own a supersession.
+#: ``decision_index`` dropped its carry-over too. Decisions ARE claim-shaped,
+#: so ``mark_superseded`` can supersede one, but it now writes that to
+#: STRATEGY.yaml first and the node is re-projected from the file: a
+#: decision's supersession is the file's as well (#4154).
 
 
 def ledger_node_id(node_type: str, agent_id: str, row_id: str) -> str:

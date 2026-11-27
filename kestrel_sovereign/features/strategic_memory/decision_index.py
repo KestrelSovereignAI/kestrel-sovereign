@@ -12,22 +12,29 @@ and returned, while `recall_decisions` queried a node type nothing ever wrote.
 The graph reported a truthful zero for a question whose answer was sitting in a
 66 KB file (#2851).
 
-Two rules keep the direction of truth honest:
+Three rules keep the direction of truth honest:
 
 1. **The projection never writes back to YAML.** A derived index that edits its
    own source is no longer derived.
-2. **Re-projecting is idempotent and non-destructive.** Node ids are derived
-   from the entry's own content, so the same decision always lands on the same
-   node, and graph-only state that YAML cannot express — chiefly supersession —
-   is carried across rather than flattened. Rebuilding the index must never
-   silently un-supersede a decision.
+2. **Re-projecting is idempotent.** Node ids are derived from the entry's own
+   content, so the same decision always lands on the same node.
+3. **Supersession is the file's, like everything else about a decision.** An
+   entry's ``superseded_by``/``superseded_at``/``superseded_reason`` project to
+   the node, and their absence projects as absence. Superseding a decision
+   through the graph writes the file first and re-projects the node from it
+   (:func:`supersede_entries`), so the graph is never the only record. When the
+   node and the file disagree, the file wins and the disagreement is logged
+   (#4154). This used to be the other way round: the graph owned supersession
+   and a rebuild carried it across, so a decision the file marked superseded
+   still came back from ``recall_decisions`` as current.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import Any, Collection, Dict, List, Optional, Set
 
 from .timestamps import stamp_created_at
 
@@ -40,10 +47,11 @@ DECISION_NODE_TYPE = "decision"
 #: removed on our behalf.
 _PROJECTION_SOURCE = "strategic_memory"
 
-#: Node properties owned by the graph, not by STRATEGY.yaml. They are written
-#: by `mark_superseded` and have no representation in the YAML entry, so a
-#: rebuild must preserve them or it would quietly revive a superseded decision.
-_GRAPH_OWNED_PROPERTIES = (
+#: A decision entry's supersession, under the names the strategy ledger uses
+#: for a superseded pattern. Each is read from the STRATEGY.yaml entry and
+#: projected to the node property of the same name; an entry without one
+#: projects a node without it (#4154).
+SUPERSESSION_FIELDS = (
     "superseded_by",
     "superseded_at",
     "superseded_reason",
@@ -93,9 +101,116 @@ def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         "claim_source": "strategy_yaml",
         "source": _PROJECTION_SOURCE,
     }
+    # Supersession comes from the entry, so ``recall_decisions`` excludes a
+    # decision exactly when the file says it was superseded (#4154). A field
+    # the entry does not carry is left absent, not empty.
+    properties.update(supersession_of(entry))
     # The entry's day at midnight UTC, in the graph contract; absent when the
     # entry has no date (#3255).
     return stamp_created_at(properties, entry.get("date"))
+
+
+def supersession_of(record: Dict[str, Any]) -> Dict[str, str]:
+    """The supersession fields a YAML entry or node carries, as text, omitting
+    empty ones -- one reading for both, so comparing them compares meaning.
+
+    Text because the graph stores JSON and a hand-written ``superseded_at:
+    2026-07-05`` loads as a ``date``. ``str`` of it is the day as written, the
+    same rule the ledger projection applies to a superseded pattern.
+    """
+    supersession: Dict[str, str] = {}
+    for key in SUPERSESSION_FIELDS:
+        value = record.get(key)
+        text = "" if value is None else str(value).strip()
+        if text:
+            supersession[key] = text
+    return supersession
+
+
+def entries_for_decision(
+    entries: List[Any], agent_id: str, node_id: str
+) -> List[Dict[str, Any]]:
+    """The STRATEGY.yaml entries that project to the decision node ``node_id``,
+    in file order. Entries sharing a date and text share a node."""
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and str(entry.get("decision") or "").strip()
+        and strategy_decision_node_id(agent_id, entry) == node_id
+    ]
+
+
+def agreed_supersession(entries: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """The supersession every one of ``entries`` records (see
+    :func:`supersession_of`), or None when they record different ones -- as
+    hand-edited entries sharing a node can, and then no node can show both."""
+    found = [supersession_of(entry) for entry in entries]
+    first = found[0] if found else {}
+    return first if all(other == first for other in found) else None
+
+
+def supersede_entries(
+    entries: List[Any],
+    agent_id: str,
+    node_id: str,
+    *,
+    superseded_by: str,
+    superseded_at: str,
+    reason: Optional[str] = None,
+) -> int:
+    """Record in STRATEGY.yaml's entries that the decision ``node_id`` was superseded.
+
+    Mutates the entries that project to ``node_id`` and returns how many did:
+    zero means the file holds no such decision, and the caller must refuse
+    rather than record a supersession the canonical file cannot hold. Entries
+    sharing a date and text share a node, so every one of them is marked. A
+    reason replaces a previous one, and no reason removes it, so a decision
+    superseded again does not keep the earlier supersession's reason.
+    """
+    matched = 0
+    for entry in entries_for_decision(entries, agent_id, node_id):
+        entry["superseded_by"] = superseded_by
+        entry["superseded_at"] = superseded_at
+        if reason:
+            entry["superseded_reason"] = reason
+        else:
+            entry.pop("superseded_reason", None)
+        matched += 1
+    return matched
+
+
+def is_strategy_decision(node: Any) -> bool:
+    """Whether ``node`` is a decision this projection derived from STRATEGY.yaml.
+
+    Such a node is a copy, so a change to it belongs in the file: superseding
+    one through the graph alone would be undone by the next reindex.
+    """
+    if node is None or getattr(node, "node_type", None) != DECISION_NODE_TYPE:
+        return False
+    return (getattr(node, "properties", None) or {}).get("source") == _PROJECTION_SOURCE
+
+
+@dataclass(frozen=True)
+class DecisionSupersession:
+    """What superseding a STRATEGY.yaml decision did, for the caller to report.
+
+    ``recorded`` is the canonical fact: STRATEGY.yaml now says the decision
+    was superseded. When it is false nothing was written anywhere, and
+    ``conflict`` says whether that was a refusal to write over a file that
+    changed on disk or no longer holds the decision. ``reread`` says the file
+    had changed since it was read, and has been read again and its decisions
+    re-projected, so the caller can see the change before it supersedes
+    again. ``projected`` says the node was re-projected from the file; when
+    it is false the file still holds the supersession and the next reindex
+    projects it.
+    """
+
+    recorded: bool
+    error: Optional[str] = None
+    conflict: bool = False
+    reread: bool = False
+    projected: bool = False
 
 
 def _label_for(entry: Dict[str, Any], limit: int = 120) -> str:
@@ -109,6 +224,8 @@ async def project_decisions(
     graph_store,
     agent_id: str,
     entries: List[Dict[str, Any]],
+    *,
+    changed: Collection[str] = (),
 ) -> Dict[str, Any]:
     """Upsert STRATEGY.yaml decision entries as graph nodes.
 
@@ -116,10 +233,18 @@ async def project_decisions(
     never fail the strategic-memory write that YAML already persisted. The
     canonical record is on disk either way, and the next projection reconciles.
 
+    A node whose supersession differs from its entry's is rewritten to the
+    entry's and the difference is logged as a disagreement (#4154). ``changed``
+    names the nodes whose entries the caller has just rewritten itself: there
+    the node trailing the file is the change being projected, not a
+    disagreement.
+
     Returns a content-free report — counts and reasons only, never decision
     text, since callers surface it to logs.
     """
-    report: Dict[str, Any] = {"projected": 0, "skipped": 0, "failed": 0}
+    report: Dict[str, Any] = {
+        "projected": 0, "skipped": 0, "failed": 0, "disagreements": 0,
+    }
     if graph_store is None:
         report["skipped_reason"] = "no_graph_store"
         report["skipped"] = len(entries)
@@ -161,23 +286,36 @@ async def project_decisions(
         try:
             existing = await graph_store.get_node(node_id)
         except Exception as e:  # noqa: BLE001
-            # A failed READ must not be treated as "no node". Doing so drops
-            # the graph-owned properties below and the write then revives a
-            # superseded decision — the exact loss this projection exists to
-            # prevent, caused by an error it merely failed to hear.
+            # A failed READ must not be treated as "no node": the write below
+            # is conditional on the state it read, and a write made without
+            # knowing that state cannot be conditional on it.
             logger.debug("decision projection could not read %s: %s", node_id, e)
             report["failed"] += 1
             continue
 
         expected = existing.properties if existing is not None else None
         if existing is not None:
-            existing_props = existing.properties or {}
-            # Carry across what the graph owns and YAML cannot express.
-            # Without this, re-projecting a superseded decision would drop its
-            # supersession and quietly restore it to recall.
-            for key in _GRAPH_OWNED_PROPERTIES:
-                if key in existing_props:
-                    properties[key] = existing_props[key]
+            graph_says = supersession_of(existing.properties or {})
+            file_says = supersession_of(entry)
+            if graph_says != file_says and node_id not in changed:
+                # The file wins. Ids and field names only: a reason is
+                # free text, and this goes to the log.
+                report["disagreements"] += 1
+                logger.warning(
+                    "decision %s: the graph and STRATEGY.yaml disagree on its "
+                    "supersession (%s differ; graph superseded_by=%r, file "
+                    "superseded_by=%r). STRATEGY.yaml is canonical, so the "
+                    "node now follows the file.",
+                    node_id,
+                    ", ".join(
+                        sorted(
+                            key for key in SUPERSESSION_FIELDS
+                            if graph_says.get(key) != file_says.get(key)
+                        )
+                    ),
+                    graph_says.get("superseded_by"),
+                    file_says.get("superseded_by"),
+                )
 
         node = GraphNode(
             node_id=node_id,
@@ -187,11 +325,11 @@ async def project_decisions(
         )
         try:
             # Conditional, not a clobber. add_node is a whole-row upsert, so a
-            # mark_superseded landing between the read above and this write
-            # would be overwritten by the stale snapshot we just read — and the
-            # decision would silently come back. CAS makes the check and the
-            # write one serialized unit; a lost race means someone else changed
-            # the node, and the next reindex projects the newer state.
+            # write landing between the read above and this one would be
+            # overwritten by the stale snapshot we just read. CAS makes the
+            # check and the write one serialized unit; a lost race means
+            # someone else changed the node, and the next reindex projects
+            # the file onto whatever they left.
             outcome = await graph_store.compare_and_swap_node(
                 node_id, expected, node
             )
@@ -234,7 +372,7 @@ async def _remove_orphans(
         # a decision node written by anything else is not ours to delete.
         if properties.get("agent_id") != agent_id:
             continue
-        if properties.get("source") != _PROJECTION_SOURCE:
+        if not is_strategy_decision(node):
             continue
         if node.node_id in keep:
             continue

@@ -2333,6 +2333,15 @@ class MemoryFeature(Feature):
                 f"got '{new_node.node_type}'."
             )
 
+        from kestrel_sovereign.features.strategic_memory.decision_index import (
+            is_strategy_decision,
+        )
+
+        if is_strategy_decision(old_node):
+            return await self._supersede_strategy_decision(
+                storage.graph, old_id, new_id, reason, seen=old_props
+            )
+
         edge_props = {"reason": reason, "superseded_at": _utc_now_iso()}
         try:
             await storage.graph.add_edge(
@@ -2390,6 +2399,100 @@ class MemoryFeature(Feature):
                 "edge_written": True,
                 "property_updated": True,
             },
+        )
+
+    async def _supersede_strategy_decision(
+        self,
+        graph: Any,
+        old_id: str,
+        new_id: str,
+        reason: Optional[str],
+        *,
+        seen: Dict[str, Any],
+    ) -> ToolResult:
+        """Supersede a decision whose canonical home is STRATEGY.yaml (#4154).
+
+        The node is a projection of a STRATEGY.yaml entry, and the next
+        reindex projects the file over it. So the supersession is written to
+        the file first, by strategic memory, which then re-projects the node;
+        only after that is the ``supersedes`` edge added. When the file cannot
+        take it, nothing of this supersession is written to either store.
+        ``seen`` is the old node's properties as read for this call: the file
+        is written only if it still gives the decision the supersession they
+        show.
+
+        ``get_feature`` returns a disabled feature too. Strategic memory
+        refuses the write when disabled, under the lock it writes under, so a
+        disable landing after this lookup is refused as well.
+        """
+        from kestrel_sovereign.features.strategic_memory.feature import (
+            StrategicMemoryFeature,
+        )
+
+        base = {"old_id": old_id, "new_id": new_id, "reason": reason}
+        get_feature = getattr(self.agent, "get_feature", None)
+        strategic = get_feature("StrategicMemoryFeature") if callable(get_feature) else None
+        if not isinstance(strategic, StrategicMemoryFeature):
+            return ToolResult.failed(
+                f"{old_id} is a decision recorded in STRATEGY.yaml, and strategic "
+                "memory is not loaded to record its supersession there. Nothing "
+                "was written: a supersession only the graph held would be undone "
+                "the next time the file is indexed.",
+                data={**base, "yaml_written": False, "edge_written": False,
+                      "property_updated": False},
+            )
+
+        superseded_at = _utc_now_iso()
+        outcome = await strategic.supersede_decision(
+            old_id, new_id, superseded_at=superseded_at, seen=seen, reason=reason
+        )
+        if not outcome.recorded:
+            return ToolResult.failed(
+                f"Could not record in STRATEGY.yaml that {old_id} was superseded: "
+                f"{outcome.error} Nothing was written.",
+                data={**base, "yaml_written": False, "conflict": outcome.conflict,
+                      "reread_from_disk": outcome.reread,
+                      "edge_written": False, "property_updated": False},
+            )
+
+        problems: List[str] = []
+        if not outcome.projected:
+            problems.append(
+                f"the node {old_id} was not re-projected from STRATEGY.yaml, so "
+                "recall_decisions will not filter it out until the next reindex"
+            )
+        edge_written = True
+        try:
+            await graph.add_edge(
+                new_id,
+                old_id,
+                "supersedes",
+                properties={"reason": reason, "superseded_at": superseded_at},
+            )
+        except Exception as e:
+            if is_execution_control_error(e):
+                raise
+            logger.error("mark_superseded edge write failed: %s", e)
+            edge_written = False
+            problems.append(
+                f"the supersedes edge {new_id} -> {old_id} could not be written: {e}"
+            )
+        data = {**base, "yaml_written": True, "edge_written": edge_written,
+                "property_updated": outcome.projected}
+        if problems:
+            return ToolResult.partial(
+                confirmation=(
+                    f"STRATEGY.yaml records {old_id} as superseded by {new_id}"
+                ),
+                error="; ".join(problems),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Marked {old_id} as superseded by {new_id} in STRATEGY.yaml"
+                + (f" ({reason})" if reason else "")
+            ),
+            data=data,
         )
 
 
