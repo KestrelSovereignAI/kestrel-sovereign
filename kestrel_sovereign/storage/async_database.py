@@ -43,6 +43,7 @@ from .db import (
     normalize_schema,
 )
 from .session_id_column import backfill_statement
+from . import node_type_registry
 
 logger = logging.getLogger(__name__)
 
@@ -1698,6 +1699,7 @@ class AsyncDatabase:
         await self._ensure_wait_signal_rekeys()
         await self._ensure_strategy_ledger_row_attestations()
         await self._ensure_corpus_exclusion_watermarks()
+        await self._ensure_node_type_registry()
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
         # sequence but not safe in parallel, and ``_init_schema`` runs on every
@@ -2543,6 +2545,35 @@ class AsyncDatabase:
                 f"{table} was not created; a governed corpus could not refuse "
                 "an exclusion manifest that moved back"
             )
+
+    async def _ensure_node_type_registry(self) -> None:
+        """Create and seed the #4153 node-type registry under concurrent boot.
+
+        New in an upgrade, so the first post-upgrade PostgreSQL boot races
+        exactly as ``_ensure_wait_signal_rekeys`` describes. Same probe ->
+        migration lock -> re-probe for the table. The seed entries are
+        registered once, under their own ``schema_backfills`` marker, and
+        inside the same lock and transaction as that marker. Seeding never
+        replaces an entry already registered, so a durable entry outlives
+        every later boot.
+        """
+        table = node_type_registry.TABLE
+        if not await self.table_exists(table):
+            async with self.migration_lock(f"create_{table}"):
+                if not await self.table_exists(table):
+                    await self.execute(node_type_registry.DDL)
+
+        if not await self.table_exists(table):
+            raise RuntimeError(
+                f"{table} was not created; graph node types would have no "
+                "owning feature or canonical home on record"
+            )
+        marker = node_type_registry.SEED_MARKER
+        if not await self._backfill_completed(marker):
+            async with self.migration_lock(marker):
+                if not await self._backfill_completed(marker):
+                    await node_type_registry.seed_node_type_registry(self)
+                    await self._mark_backfill_completed(marker)
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",
