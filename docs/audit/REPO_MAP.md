@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-11-27
-**Scope:** 3960 tracked files (3032 `.py`, 404 `.md`, 524 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-11-28
+**Scope:** 3965 tracked files (3037 `.py`, 404 `.md`, 524 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -829,7 +829,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/strategic_memory/blocker_reconcile.py** — Reconcile ledger blockers against live GitHub issue state.
   - `def split_issue_reference(value)`; `def parse_issue_ref(value)`; `def configured_repos(strategy_data)`; `def normalize_repository(value, configured, self_repo)`; `def issue_repository_conflict(issue, repo, self_repo)`; `class BlockerReference`; `def resolve_blocker_reference(row, configured, self_repo)`; `def contradicts_inference(row, issue)`; `…`
 - **kestrel_sovereign/features/strategic_memory/decision_index.py** — Project STRATEGY.yaml decisions into the knowledge graph as an index.
-  - `def strategy_decision_node_id(agent_id, entry)`; `async def project_decisions(graph_store, agent_id, entries)`; `def decision_entries(data)`
+  - `def strategy_decision_node_id(agent_id, entry)`; `def supersession_of(record)`; `def entries_for_decision(entries, agent_id, node_id)`; `def agreed_supersession(entries)`; `def supersede_entries(entries, agent_id, node_id)`; `def is_strategy_decision(node)`; `class DecisionSupersession`; `async def project_decisions(graph_store, agent_id, entries)`; `…`
 - **kestrel_sovereign/features/strategic_memory/feature.py** — Strategic Memory Feature for Kestrel agents.
   - `class StrategicMemoryFeature`
 - **kestrel_sovereign/features/strategic_memory/github_integration.py** — GitHub API integration helpers for Strategic Memory.
@@ -1764,6 +1764,10 @@ Repo entry points and standard project files.
   - `class MemoryRetriever`; `def calculate_decay(created_at, importance, access_count, decay_protected, …)`
 - **kestrel_sovereign/storage/memory_system.py** — Human-Like Memory System - Unified Interface.
   - `class MemoryConsolidationTimeoutError`; `class MemoryApplicationNotRecorded`; `class AnswerabilitySettings`; `class AttestationSettings`; `class MemorySystem`
+- **kestrel_sovereign/storage/node_type_census.py** — Read-only census of graph node types (#4153, step 1 of rv-4135-1).
+  - `class WriteSite`; `def default_package_root()`; `def scan_write_sites(package_root)`; `class NodeTypeCensusRow`; `class NodeTypeCensus`; `async def run_census(db)`; `def main(argv)`
+- **kestrel_sovereign/storage/node_type_registry.py** — The durable registry of graph node types (#4153, step 1 of rv-4135-1).
+  - `def strategy_decision_id_prefix(agent_id)`; `def is_pre_split_strategy_decision(node_type, properties)`; `class CanonicalHome`; `class RetireBehaviour`; `class LifecyclePolicy`; `class NodeTypeRegistrationConflict`; `class NodeTypeEntry`; `async def seed_node_type_registry(db, entries)`; `…`
 - **kestrel_sovereign/storage/operator_notice_store.py** — Durable operator-notice audit record (#2530).
   - `class OperatorNoticeState`; `class OperatorNoticeRecord`; `class OperatorNoticeAuditStore`
 - **kestrel_sovereign/storage/original_acquisition_result.py** — Closed original request-row acquisition custody, never an SQL permit.
@@ -4001,6 +4005,12 @@ Repo entry points and standard project files.
   - `class TestTheAcceptance`; `class TestWhatTheInvariantBuys`; `async def test_a_stamped_row_beside_a_legacy_cluster_still_lists(tmp_path)`; `class TestTheFrontierIsExact`; `async def test_a_stamped_chain_no_longer_extends_the_fence(tmp_path)`
 - **tests/unit/storage/test_legacy_session_stamp.py** — #3120: a legacy row writes down which session it is in.
   - `class TestWhatItWritesDown`; `class TestWhatItLeavesAlone`; `class TestThePass`
+- **tests/unit/storage/test_node_type_census.py** — #4153: the read-only node-type census (rv-4135-1, "census before enforcement").
+  - `def source_tree(tmp_path)`; `def test_scan_lists_writer_call_sites(source_tree)`; `def handed_on_tree(tmp_path)`; `def test_scan_lists_writes_of_nodes_it_did_not_build(handed_on_tree)`; `def test_forwarders_name_real_facades_passing_on_their_node(tmp_path, monkeypatch)`; `async def test_census_counts_by_type_and_agent(tmp_path, source_tree)`; `def test_census_is_read_only(tmp_path, capsys)`; `def test_census_reads_a_database_without_a_registry(tmp_path, capsys)`; `…`
+- **tests/unit/storage/test_node_type_registry.py** — #4153: the durable node-type registry (rv-4135-1, Registry and Types (d)).
+  - `async def db(tmp_path)`; `async def test_registry_persists_across_reload(tmp_path)`; `async def test_reopening_never_reseeds_over_a_registered_entry(tmp_path)`; `async def test_seeding_runs_once_per_database(tmp_path)`; `async def test_seeding_leaves_a_registered_entry_as_it_is(db)`; `async def test_released_database_gains_the_seeded_registry(tmp_path)`; `async def test_registry_has_owning_feature_not_owner(db)`; `async def test_governed_is_derived(db)`; `…`
+- **tests/unit/storage/test_node_type_registry_seed_v2.py** — #4248: the v2 seed migration that splits ``decision`` (rv-4244-1 §3).
+  - `async def rewind_to_v1(database)`; `async def test_an_unreadable_decision_entry_is_refused_with_its_cause(db_path)`; `async def write_pre_split_graph(database)`; `async def pre_split_database(path)`; `def db_path(tmp_path)`; `async def test_migration_retypes_projections_and_leaves_the_rest(db_path)`; `async def test_report_counts_retyped_left_and_mismatched(db_path)`; `async def test_open_reports_the_counts(db_path)`; `…`
 - **tests/unit/storage/test_postgres_runtime_owner_renewal_close.py** — #4040: a cancelled PostgreSQL close still closes every pool it owns.
   - `async def test_cancelling_close_while_it_joins_a_renewal_still_closes_every_pool()`; `async def test_a_close_cancelled_repeatedly_still_closes_every_pool()`
 - **tests/unit/storage/test_review73_worker_exit_custody.py** — Native SQLite worker-exit hooks must not erase retained control receipts.
@@ -4748,7 +4758,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_decision_http_original_close.py** — Decision HTTP normalization cannot erase original native close ownership.
   - `async def test_actual_decision_http_close_keeps_original_native_debt(monkeypatch)`
 - **tests/unit/test_decision_index.py** — STRATEGY.yaml decisions must be reachable through the graph (#2851).
-  - `class TestProjection`; `class TestSupersessionSurvivesRebuild`; `class TestIndexNeverOwnsTheTruth`; `class TestEndToEndThroughTheFeature`; `class TestProductionIdentity`; `class TestReconciliation`; `class TestConcurrentSupersession`
+  - `class TestProjection`; `class TestSupersessionIsTheFiles`; `class TestIndexNeverOwnsTheTruth`; `class TestEndToEndThroughTheFeature`; `class TestProductionIdentity`; `class TestReconciliation`; `class TestRoutingByRegisteredType`; `class TestConcurrentSupersession`; `…`
 - **tests/unit/test_decisions_adapters.py** — OpenRouter and Ollama decision routes (#3424): wire dialect, discovery, error typing, and Ollama's chat-listing exclusion.
   - `def fake_http(monkeypatch)`; `async def test_openrouter_posts_the_canonical_systemone_request(monkeypatch, fake_http)`; `async def test_openrouter_discovery_filters_the_decisions_modality(monkeypatch, fake_http)`; `async def test_openrouter_without_a_key_is_a_transport_error(monkeypatch)`; `async def test_http_errors_are_typed_and_never_echo_the_body(monkeypatch, fake_http)`; `async def test_non_json_and_non_object_bodies_are_protocol_errors(monkeypatch, fake_http)`; `def test_num_ctx_is_read_from_parameters_not_the_base_model()`; `async def test_ollama_posts_to_the_routes_daemon_with_a_timeout(fake_http)`; `…`
 - **tests/unit/test_decisions_core.py** — Decisions modality (#3424): config, override grammar, normaliser, thresholds, fit, and route resolution.
