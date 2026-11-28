@@ -105,11 +105,16 @@ def _make_memory():
 
 class TestMemoryActionItemStatus:
     @pytest.mark.asyncio
-    async def test_completed_synonym_accepted(self):
+    async def test_completed_synonym_accepted(self, tmp_path):
+        from tests.utils.recall_storage import governed_storage
+
         feat = _make_memory()
-        result = await feat.recall_action_items(status="completed")
+        # The recall reads through the privacy wrapper (#4155).
+        async with governed_storage(str(tmp_path / "kestrel.db"), feat.agent_id) as (storage, _):
+            feat.agent.storage = storage
+            result = await feat.recall_action_items(status="completed")
         # 'completed' normalizes to 'done' -> passes validation -> OK (empty set)
-        assert result.status is not ToolResultStatus.ERROR, result
+        assert result.status is ToolResultStatus.OK, result
 
     @pytest.mark.asyncio
     async def test_typo_status_rejected_with_listing(self):

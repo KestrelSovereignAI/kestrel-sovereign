@@ -45,6 +45,8 @@ BLOCKER_NODE_TYPE = "strategy_blocker"
 #: rows carrying it, so a node written by anything else is never removed on
 #: our behalf.
 _PROJECTION_SOURCE = "strategic_memory"
+#: The same marker, for the generic recall read's filter (#4155).
+PROJECTION_SOURCE = _PROJECTION_SOURCE
 
 #: There are none for a ledger row, and that is the point.
 #:
@@ -545,69 +547,31 @@ async def index_membership(
     return membership, len(nodes) < MEMBERSHIP_READ_CAP
 
 
-async def recall_nodes(
-    graph_store: Any,
-    agent_id: str,
-    node_type: str,
-    *,
-    include_retired: bool = False,
-    limit: int = 25,
-) -> List[Dict[str, Any]]:
-    """Read projected ledger rows back out of the graph.
+def recalled_row(node: Any) -> Dict[str, Any]:
+    """One projected ledger node as ``recall_patterns``/``recall_blockers`` return it.
 
-    This is the consumer half of the projection, and it exists because a
-    derived index nothing reads is not an index — it is a write nobody
-    checked. The tools in :mod:`feature` call it instead of reading the YAML
-    they already hold, so the graph path is the one actually exercised: an
-    index that stops populating fails a query here rather than going unnoticed
-    until someone opens the database.
+    The query is the generic recall read's since #4155
+    (:mod:`kestrel_sovereign.features.registered_recall`): it pushes this
+    projection's ``source`` marker and, for a current read, its
+    :data:`ACTIVE_STATUS` into SQL, so the limit means what the caller asked
+    for. Post-filtering a ``LIMIT``-ed page under-reports: ask for 25 active
+    patterns when the 25 most recent rows are all superseded and the answer
+    is zero, with a hundred active rows just past the page (#3064).
 
-    Every predicate is an exact equality and therefore goes into SQL, not into
-    a loop over the result. Post-filtering a ``LIMIT``-ed page under-reports:
-    ask for 25 active patterns when the 25 most recent rows all happen to be
-    superseded and the honest-looking answer is zero, with a hundred active
-    rows sitting just past the page boundary. Pushing the predicates down makes
-    the limit mean what the caller asked for, and lets the JSON-path partial
-    indexes do the work.
-
-    Raises rather than returning ``[]`` when the graph cannot be queried. An
-    empty list is an answer ("no such rows"); a failure is not, and the whole
-    ticket exists because a truthful-looking zero was returned for a question
-    with a non-empty answer.
+    ``label`` is derived from the properties, not read off the row.
+    compare_and_swap_node is deliberately properties-only -- a node's label is
+    written once at creation and a swap never touches it -- so editing a
+    pattern's text under a preserved id leaves GraphNode.label holding the OLD
+    text while ``text`` holds the new one. Surfacing the stored label would
+    hand a caller a stale field out of an index the health check had just
+    certified as current (#3064).
     """
-    if graph_store is None:
-        raise RuntimeError("Graph store not available")
-
-    # ``source`` keeps a hand-written node of the same type out of an answer
-    # that claims to describe the ledger; ``agent_id`` is the tenant boundary.
-    filters: Dict[str, Any] = {
-        "agent_id": agent_id,
-        "source": _PROJECTION_SOURCE,
+    properties = node.properties or {}
+    return {
+        "node_id": node.node_id,
+        **properties,
+        "label": _label(properties.get("text")),
     }
-    if not include_retired:
-        filters["status"] = ACTIVE_STATUS
-
-    nodes = await graph_store.query_nodes_by_type_and_property(
-        node_type,
-        filters=filters,
-        order_by_created=True,
-        limit=max(1, int(limit)),
-    )
-    return [
-        # ``label`` is derived from the properties, not read off the row.
-        # compare_and_swap_node is deliberately properties-only -- a node's
-        # label is written once at creation and a swap never touches it -- so
-        # editing a pattern's text under a preserved id leaves GraphNode.label
-        # holding the OLD text while ``text`` holds the new one. Surfacing the
-        # stored label would hand a caller a stale field out of an index the
-        # health check had just certified as current (#3064).
-        {
-            "node_id": node.node_id,
-            **(node.properties or {}),
-            "label": _label((node.properties or {}).get("text")),
-        }
-        for node in (nodes or [])
-    ]
 
 
 def search_rows(

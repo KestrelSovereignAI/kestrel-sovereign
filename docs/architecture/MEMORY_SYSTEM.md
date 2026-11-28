@@ -251,6 +251,36 @@ a mix of SQL tables and graph nodes:
   properties on the existing `mentions` edges between message and
   person concept nodes — no new edge type.
 
+### The generic recall read (#4155)
+
+`recall(node_type=...)` and `recall_get(item_id, node_type=...)` read the
+graph nodes of a registered node type, and `recall_types` lists the
+node-type registry (owning feature, canonical home, original or
+projection, governed). The read lives in
+`kestrel_sovereign.features.registered_recall` and follows rv-4135-1 (c):
+
+- It goes only through `PrivacyEnforcingStorage`, and EPHEMERAL, ISOLATED
+  and DEIDENTIFIED deny it.
+- It is scoped to the agent the graph store is bound to.
+- It is a bounded keyset page, newest first, at most 200 rows, with a
+  `next_cursor`.
+- A governed type (`strategy_pattern`, `strategy_blocker`) is returned only
+  while its canonical assertion is active. `include_retired=True` also
+  admits a retracted one, labelled `canonical_status`. An erased, deleted,
+  quarantined or missing assertion is never admitted.
+- A `message` node is returned only while its conversation row is live.
+  Trashing a message leaves its graph node in place, so without this check
+  the node of a trashed message would still be reachable.
+- Each row carries `home`: its canonical home and whether it is the
+  original or a projection.
+
+It serves `action_item`, `decision`, `strategy_decision`,
+`strategy_pattern`, `strategy_blocker` and `message`, the types the fixed
+recall tools already exposed. `recall_types` gives the reason each other
+type is withheld. `recall_decisions`, `recall_action_items`,
+`recall_interactions`, `recall_patterns` and `recall_blockers` are
+deprecated aliases of this read, removed in 0.67.0.
+
 ### Why everything in the graph
 
 The earlier design had `action_items` as a dedicated SQL table because

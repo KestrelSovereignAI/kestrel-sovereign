@@ -237,7 +237,15 @@ def hides_persisted_user_content(agent: Any) -> bool:
     graph wrapper and consolidator gates that do cover it (#2672 live-path
     bypass).
     """
-    config = resolve_agent_privacy_config(agent)
+    return config_hides_persisted_user_content(resolve_agent_privacy_config(agent))
+
+
+def config_hides_persisted_user_content(config: Any) -> bool:
+    """:func:`hides_persisted_user_content` for one privacy config.
+
+    For a caller that holds the privacy wrapper itself and must read its
+    config rather than the agent's (#4155).
+    """
     if config is None:
         return False
     is_ephemeral = getattr(config, "is_ephemeral", None)

@@ -13,7 +13,7 @@ import pytest_asyncio
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.memory.feature import MemoryFeature
-from kestrel_sovereign.storage.async_graph_store import Edge, GraphNode
+from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 
 def _make_mock_db():
@@ -52,6 +52,36 @@ async def feature():
     return f
 
 
+AGENT_ID = "did:test:recall-agent"
+OTHER_AGENT_ID = "did:test:other-agent"
+
+
+@pytest_asyncio.fixture
+async def real(tmp_path):
+    """MemoryFeature over a real agent store behind the real privacy wrapper.
+
+    The recall tools are aliases of the generic recall read (#4155), which
+    reads only through PrivacyEnforcingStorage with a graph bound to the agent.
+    """
+    from tests.utils.recall_storage import governed_storage
+
+    async with governed_storage(str(tmp_path / "kestrel.db"), AGENT_ID) as (storage, raw):
+        agent = MagicMock()
+        agent.did = AGENT_ID
+        agent.agent_id = AGENT_ID
+        agent.storage = storage
+        f = MemoryFeature.__new__(MemoryFeature)
+        f.agent = agent
+        f.agent_id = AGENT_ID
+        yield f, raw
+
+
+def _other_agent_graph(raw):
+    from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+
+    return AsyncGraphStore(raw.db, agent_id=OTHER_AGENT_ID)
+
+
 # =============================================================================
 # recall_action_items
 # =============================================================================
@@ -80,12 +110,13 @@ def _action_node(node_id, text, status="pending", agent_id="did:test:recall-agen
 class TestRecallActionItems:
 
     @pytest.mark.asyncio
-    async def test_returns_own_items(self, feature):
-        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
-            _action_node("action:did:test:recall-agent:a", "Call mom"),
-            _action_node("action:did:test:recall-agent:b", "Ship PR", status="done",
-                         created_at="2026-04-19T09:00:00+00:00"),
-        ])
+    async def test_returns_own_items(self, real):
+        feature, raw = real
+        await raw.graph.add_node(_action_node(f"action:{AGENT_ID}:a", "Call mom"))
+        await raw.graph.add_node(_action_node(
+            f"action:{AGENT_ID}:b", "Ship PR", status="done",
+            created_at="2026-04-19T09:00:00+00:00",
+        ))
         result = await feature.recall_action_items()
         assert result.status is ToolResultStatus.OK
         assert result.data["count"] == 2
@@ -93,51 +124,70 @@ class TestRecallActionItems:
         # Sorted by created_at desc (SQL ORDER BY)
         assert items[0]["text"] == "Call mom"
         assert items[1]["status"] == "done"
+        assert items[0]["home"]["canonical_home"] == "graph"
 
     @pytest.mark.asyncio
-    async def test_filters_by_status(self, feature):
-        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
-            _action_node("a1", "Pending one", status="pending"),
-        ])
+    async def test_filters_by_status(self, real):
+        feature, raw = real
+        await raw.graph.add_node(_action_node(f"action:{AGENT_ID}:a1", "Pending one"))
+        await raw.graph.add_node(_action_node(f"action:{AGENT_ID}:a2", "Done one", status="done"))
         result = await feature.recall_action_items(status="pending")
         assert result.status is ToolResultStatus.OK
         assert result.data["count"] == 1
         assert result.data["action_items"][0]["text"] == "Pending one"
 
     @pytest.mark.asyncio
-    async def test_filters_by_assignee(self, feature):
-        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
-            _action_node("a1", "Call mom", assignee="concept:agent:alice"),
-        ])
+    async def test_filters_by_assignee(self, real):
+        feature, raw = real
+        await raw.graph.add_node(_action_node(
+            f"action:{AGENT_ID}:a1", "Call mom", assignee="concept:agent:alice"
+        ))
+        await raw.graph.add_node(_action_node(f"action:{AGENT_ID}:a2", "Unassigned"))
         result = await feature.recall_action_items(assignee_concept_id="concept:agent:alice")
         assert result.status is ToolResultStatus.OK
         assert result.data["count"] == 1
         assert result.data["action_items"][0]["assignee_concept_id"] == "concept:agent:alice"
 
     @pytest.mark.asyncio
-    async def test_filters_by_days_window(self, feature):
+    async def test_filters_by_days_window(self, real):
         from datetime import datetime, timezone
+        feature, raw = real
         recent = datetime.now(timezone.utc).isoformat()
-        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[
-            _action_node("a1", "Recent", created_at=recent),
-        ])
+        await raw.graph.add_node(_action_node(f"action:{AGENT_ID}:a1", "Recent", created_at=recent))
+        await raw.graph.add_node(_action_node(
+            f"action:{AGENT_ID}:a2", "Old", created_at="2020-01-01T00:00:00+00:00"
+        ))
         result = await feature.recall_action_items(days=7)
         assert result.status is ToolResultStatus.OK
         assert result.data["count"] == 1
         assert result.data["action_items"][0]["text"] == "Recent"
 
     @pytest.mark.asyncio
-    async def test_passes_filters_to_query(self, feature):
-        """Verify that agent_id, status, and created_since are pushed into SQL filters."""
-        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[])
-        await feature.recall_action_items(status="pending", days=7, assignee_concept_id="concept:x:alice")
-        call = feature.agent.storage.graph.query_nodes_by_type_and_property.await_args
-        assert call.args[0] == "action_item"
-        filters = call.kwargs.get("filters") or call.args[1] if len(call.args) > 1 else call.kwargs["filters"]
-        assert filters["agent_id"] == "did:test:recall-agent"
-        assert filters["status"] == "pending"
-        assert filters["assignee_concept_id"] == "concept:x:alice"
-        assert call.kwargs.get("created_since") is not None
+    async def test_filters_combine_and_stay_agent_scoped(self, real):
+        """status, assignee, the days window and the agent scope all hold at once."""
+        from datetime import datetime, timezone
+        feature, raw = real
+        recent = datetime.now(timezone.utc).isoformat()
+        wanted = _action_node(
+            f"action:{AGENT_ID}:hit", "Hit", created_at=recent, assignee="concept:x:alice"
+        )
+        await raw.graph.add_node(wanted)
+        await raw.graph.add_node(_action_node(
+            f"action:{AGENT_ID}:done", "Done", status="done", created_at=recent,
+            assignee="concept:x:alice",
+        ))
+        await raw.graph.add_node(_action_node(
+            f"action:{AGENT_ID}:old", "Old", created_at="2020-01-01T00:00:00+00:00",
+            assignee="concept:x:alice",
+        ))
+        await _other_agent_graph(raw).add_node(_action_node(
+            f"action:{OTHER_AGENT_ID}:theirs", "Theirs", created_at=recent,
+            assignee="concept:x:alice", agent_id=OTHER_AGENT_ID,
+        ))
+        result = await feature.recall_action_items(
+            status="pending", days=7, assignee_concept_id="concept:x:alice"
+        )
+        assert [item["id"] for item in result.data["action_items"]] == [wanted.node_id]
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_status(self, feature):
@@ -240,47 +290,58 @@ class TestUpdateActionItem:
 class TestRecallDecisions:
 
     @pytest.mark.asyncio
-    async def test_returns_own_decisions_only(self, feature):
+    async def test_returns_own_decisions_only(self, real):
+        feature, raw = real
         node_mine = GraphNode(
-            node_id="decision:did:test:recall-agent:abc",
+            node_id=f"decision:{AGENT_ID}:abc",
             node_type="decision",
             label="Move to Brooklyn",
             properties={
                 "text": "move to brooklyn",
-                "agent_id": "did:test:recall-agent",
+                "agent_id": AGENT_ID,
                 "created_at": "2026-04-19T10:00:00",
                 "confidence": 0.8,
             },
         )
-        # query_nodes_by_type_and_property filters by agent_id in SQL,
-        # so only the agent's own nodes are returned.
-        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(
-            return_value=[node_mine]
-        )
+        await raw.graph.add_node(node_mine)
+        await _other_agent_graph(raw).add_node(GraphNode(
+            node_id=f"decision:{OTHER_AGENT_ID}:def",
+            node_type="decision",
+            label="Theirs",
+            properties={"text": "theirs", "agent_id": OTHER_AGENT_ID,
+                        "created_at": "2026-04-20T10:00:00"},
+        ))
 
         result = await feature.recall_decisions()
         assert result.status is ToolResultStatus.OK
         labels = [d["label"] for d in result.data["decisions"]]
-        assert "Move to Brooklyn" in labels
+        assert labels == ["Move to Brooklyn"]
         assert result.data["count"] == 1
 
     @pytest.mark.asyncio
-    async def test_empty(self, feature):
+    async def test_empty(self, real):
+        feature, _ = real
         result = await feature.recall_decisions()
         assert result.status is ToolResultStatus.OK
         assert result.data["decisions"] == []
         assert result.data["count"] == 0
 
     @pytest.mark.asyncio
-    async def test_passes_agent_filter_to_query(self, feature):
-        """Verify agent_id filter is pushed into SQL."""
-        feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[])
-        await feature.recall_decisions()
-        call = feature.agent.storage.graph.query_nodes_by_type_and_property.await_args
-        # One query over both decision types (rv-4244-1 split ``decision``).
-        assert tuple(call.args[0]) == ("decision", "strategy_decision")
-        filters = call.kwargs.get("filters") or call.args[1] if len(call.args) > 1 else call.kwargs["filters"]
-        assert filters["agent_id"] == "did:test:recall-agent"
+    async def test_reads_both_decision_types_newest_first(self, real):
+        """One query over both decision types (rv-4244-1 split ``decision``)."""
+        feature, raw = real
+        for node_type, stamp in (("decision", "2026-04-18"), ("strategy_decision", "2026-04-19")):
+            await raw.graph.add_node(GraphNode(
+                node_id=f"decision:{AGENT_ID}:{node_type}",
+                node_type=node_type,
+                label=node_type,
+                properties={"text": node_type, "agent_id": AGENT_ID,
+                            "created_at": f"{stamp}T00:00:00+00:00"},
+            ))
+        result = await feature.recall_decisions()
+        assert [d["label"] for d in result.data["decisions"]] == [
+            "strategy_decision", "decision",
+        ]
 
 
 # =============================================================================
@@ -288,33 +349,47 @@ class TestRecallDecisions:
 # =============================================================================
 
 
+async def _mentioning_message(storage, raw, concept_id, label="mentions", properties=None):
+    """A live conversation row, its message node, and an edge to ``concept_id``."""
+    row_id = await storage.add_conversation("user", "a message")
+    node_id = f"message:{AGENT_ID}:{row_id}"
+    await raw.graph.add_node(GraphNode(
+        node_id=node_id, node_type="message", label=f"Message {row_id}",
+        properties={"message_id": str(row_id), "agent_id": AGENT_ID,
+                    "created_at": f"2026-04-1{row_id}T00:00:00+00:00"},
+    ))
+    await raw.graph.add_edge(node_id, concept_id, label, properties=properties or {})
+    return node_id
+
+
+async def _concept(raw, concept_id):
+    await raw.graph.add_node(GraphNode(
+        node_id=concept_id, node_type="concept", label="alice",
+        properties={"agent_id": AGENT_ID, "category": "proper_noun"},
+    ))
+
+
 class TestRecallInteractions:
 
     @pytest.mark.asyncio
-    async def test_returns_mention_edges_with_properties(self, feature):
-        edges = [
-            Edge(
-                source_id="message:did:test:recall-agent:msg-1",
-                target_id="concept:did:test:recall-agent:alice",
-                label="mentions",
-                properties={"sentiment": "positive", "topics": ["weekend"]},
-            ),
-            Edge(
-                source_id="message:did:test:recall-agent:msg-2",
-                target_id="concept:did:test:recall-agent:alice",
-                label="other_edge",
-                properties={},
-            ),
-        ]
-        feature.agent.storage.graph.get_edges = AsyncMock(return_value=edges)
-        result = await feature.recall_interactions(person_concept_id="concept:did:test:recall-agent:alice")
+    async def test_returns_mention_edges_with_properties(self, real):
+        feature, raw = real
+        concept = f"concept:{AGENT_ID}:alice"
+        await _concept(raw, concept)
+        storage = feature.agent.storage
+        await _mentioning_message(
+            storage, raw, concept, properties={"sentiment": "positive", "topics": ["weekend"]}
+        )
+        await _mentioning_message(storage, raw, concept, label="other_edge")
+        result = await feature.recall_interactions(person_concept_id=concept)
         # Only 'mentions' edges are interactions
         assert result.status is ToolResultStatus.OK
         assert result.data["count"] == 1
         assert result.data["interactions"][0]["properties"]["sentiment"] == "positive"
 
     @pytest.mark.asyncio
-    async def test_empty(self, feature):
+    async def test_empty(self, real):
+        feature, _ = real
         result = await feature.recall_interactions(person_concept_id="concept:agent-1:nobody")
         assert result.status is ToolResultStatus.OK
         assert result.data["interactions"] == []
@@ -475,29 +550,24 @@ class TestDueDateValidation:
 class TestRecallInteractionsAgentScope:
 
     @pytest.mark.asyncio
-    async def test_filters_out_other_agents_message_edges(self, feature):
-        """Person concept ids can be shared across agents in theory; the
-        recall tool must only return edges whose source message node is
-        prefixed with this agent's id."""
-        edges = [
-            Edge(
-                source_id="message:did:test:recall-agent:my-msg",
-                target_id="concept:x:alice",
-                label="mentions",
-                properties={"sentiment": "positive"},
-            ),
-            Edge(
-                source_id="message:did:other-agent:their-msg",
-                target_id="concept:x:alice",
-                label="mentions",
-                properties={"sentiment": "negative"},
-            ),
-        ]
-        feature.agent.storage.graph.get_edges = AsyncMock(return_value=edges)
-        result = await feature.recall_interactions(person_concept_id="concept:x:alice")
+    async def test_filters_out_other_agents_message_edges(self, real):
+        """The recall tool must only return this agent's own messages' mentions."""
+        feature, raw = real
+        other = _other_agent_graph(raw)
+        concept = f"concept:{OTHER_AGENT_ID}:alice"
+        await other.add_node(GraphNode(
+            node_id=concept, node_type="concept", label="alice",
+            properties={"agent_id": OTHER_AGENT_ID},
+        ))
+        message = f"message:{OTHER_AGENT_ID}:their-msg"
+        await other.add_node(GraphNode(
+            node_id=message, node_type="message", label="Message their-msg",
+            properties={"message_id": "1", "agent_id": OTHER_AGENT_ID},
+        ))
+        await other.add_edge(message, concept, "mentions", properties={"sentiment": "negative"})
+        result = await feature.recall_interactions(person_concept_id=concept)
         assert result.status is ToolResultStatus.OK
-        assert result.data["count"] == 1
-        assert result.data["interactions"][0]["message_node_id"].endswith("my-msg")
+        assert result.data["count"] == 0
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from time import monotonic, perf_counter
 from typing import (
     AbstractSet, Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence,
-    Literal, Tuple, overload,
+    Literal, Set, Tuple, overload,
 )
 
 from kestrel_sovereign._async_ownership import run_blocking_operation
@@ -5744,6 +5744,33 @@ class AsyncConversationStore:
             if await self.update_message_metadata(msg_id, metadata_updates):
                 updated_count += 1
         return updated_count
+
+    #: Ids per ``IN`` clause of :meth:`live_message_ids`, well under SQLite's
+    #: common 999-variable limit with ``agent_id`` added.
+    _LIVE_ID_CHUNK = 500
+
+    async def live_message_ids(self, message_ids: Iterable[int]) -> Set[int]:
+        """The ids among ``message_ids`` of this agent's rows not in Trash (#4155).
+
+        A row is live while it exists and ``deleted_at`` is unset. Archived
+        rows are live: archiving a session, or the consolidator's decay
+        (``archived_at``), hides a row from the active list without trashing
+        it. A purged row is gone, so it is not live either. Reads ids only;
+        nothing is decrypted.
+        """
+        ids = sorted({int(value) for value in message_ids})
+        live: Set[int] = set()
+        for start in range(0, len(ids), self._LIVE_ID_CHUNK):
+            chunk = ids[start:start + self._LIVE_ID_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self.db.fetchall(
+                f"SELECT id FROM conversation_history "
+                f"WHERE id IN ({placeholders}) AND agent_id = ? "
+                f"AND deleted_at IS NULL",
+                (*chunk, self.agent_id),
+            )
+            live.update(int(row[0]) for row in rows)
+        return live
 
     async def get_messages_by_ids(
         self,

@@ -39,6 +39,13 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+from kestrel_sovereign.features.registered_recall import (
+    MENTIONS_EDGE,
+    RecallRefused,
+    alias_result,
+    fixed_recall_alias,
+    read_page,
+)
 from kestrel_sovereign.features.memory.search_results import (
     bounded_echo,
     fit_search_result,
@@ -1817,9 +1824,21 @@ class MemoryFeature(Feature):
     # routing never ran.
     # ------------------------------------------------------------------
 
+    async def _alias_page(self, tool: str, **kwargs: Any):
+        """One page of the generic recall read for a fixed alias (#4155)."""
+        alias = fixed_recall_alias(tool)
+        return alias, await read_page(
+            storage=getattr(self.agent, "storage", None),
+            registry_db=resolve_feature_database(self.agent),
+            conversation_store=resolve_feature_conversation_store(self.agent),
+            agent_id=self.agent_id,
+            node_types=alias.node_types,
+            **kwargs,
+        )
+
     @tool(
         name="recall_action_items",
-        description="Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee. Superseded items are excluded by default; pass include_superseded=True to see them.",
+        description="Deprecated alias of recall(node_type='action_item'), removed in 0.67.0. Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee. Superseded items are excluded by default; pass include_superseded=True to see them.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory actions",
     )
@@ -1833,10 +1852,9 @@ class MemoryFeature(Feature):
     ) -> ToolResult:
         """Query action_item graph nodes with optional property filters.
 
-        Action items live as graph nodes of type `action_item` (no
-        separate SQL table). The graph's `node_type` index makes the
-        initial scan fast; remaining filters run in memory over
-        at-most a few thousand nodes per agent.
+        An alias of the generic recall read (#4155): the rows are
+        ``recall(node_type='action_item')``'s, narrowed by the filters below,
+        which go into the same bounded SQL query.
 
         Args:
             status: Filter by status ("pending", "done", "cancelled").
@@ -1855,10 +1873,6 @@ class MemoryFeature(Feature):
                 "include_superseded must be a boolean, "
                 f"got {type(include_superseded).__name__}={include_superseded!r}"
             )
-
-        storage = getattr(self.agent, "storage", None)
-        if storage is None or not hasattr(storage, "graph"):
-            return ToolResult.failed("Graph store not available")
 
         limit_val, err = _coerce_int(limit, "limit", lo=1, hi=200)
         if err:
@@ -1879,31 +1893,33 @@ class MemoryFeature(Feature):
             from datetime import datetime, timezone, timedelta
             since = (datetime.now(timezone.utc) - timedelta(days=days_val)).isoformat()
 
-        filters: dict = {"agent_id": self.agent_id}
+        filters: dict = {}
         if status is not None:
             filters["status"] = status
         if assignee_concept_id is not None:
             filters["assignee_concept_id"] = assignee_concept_id
 
         try:
-            nodes = await storage.graph.query_nodes_by_type_and_property(
-                "action_item",
+            alias, page = await self._alias_page(
+                "recall_action_items",
+                limit=limit_val,
+                include_retired=include_superseded,
                 filters=filters,
                 created_since=since,
-                order_by_created=True,
-                limit=limit_val,
             )
+        except RecallRefused as e:
+            return ToolResult.failed(str(e), data={"refused": e.reason})
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("recall_action_items query failed: %s", e)
             return ToolResult.failed(str(e))
 
         matching = []
-        for n in nodes:
-            props = n.properties or {}
-            if not include_superseded and props.get("superseded_by"):
-                continue
+        for row in page.rows:
+            props = row.node.properties or {}
             matching.append({
-                "id": n.node_id,
+                "id": row.node.node_id,
                 "source_message_id": props.get("source_message_id"),
                 "text": props.get("text"),
                 "status": props.get("status"),
@@ -1915,6 +1931,7 @@ class MemoryFeature(Feature):
                 "claim_source": props.get("claim_source"),
                 "temporal_validity": props.get("temporal_validity"),
                 "superseded_by": props.get("superseded_by"),
+                "home": row.home(),
             })
 
         filter_clause = ""
@@ -1924,7 +1941,9 @@ class MemoryFeature(Feature):
             filter_clause += f" within last {days_val}d"
         if assignee_concept_id:
             filter_clause += f" assignee={assignee_concept_id}"
-        return ToolResult.ok(
+        return alias_result(
+            alias,
+            page,
             confirmation=(
                 f"Retrieved {len(matching)} action item(s){filter_clause} "
                 f"(limit requested: {limit_val})"
@@ -2019,7 +2038,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_decisions",
-        description="Retrieve recorded decisions, newest first: graph nodes of type 'decision' (extracted from conversation) and 'strategy_decision' (from STRATEGY.yaml). Superseded decisions are excluded by default; pass include_superseded=True to see them.",
+        description="Deprecated alias of recall(node_type='decision,strategy_decision'), removed in 0.67.0. Retrieve recorded decisions, newest first: graph nodes of type 'decision' (extracted from conversation) and 'strategy_decision' (from STRATEGY.yaml). Superseded decisions are excluded by default; pass include_superseded=True to see them.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory decisions",
     )
@@ -2030,41 +2049,38 @@ class MemoryFeature(Feature):
     ) -> ToolResult:
         """List decisions from the graph, of both decision types (rv-4244-1).
 
-        One query over both, so the order and the limit are the ones a query
-        over the single type gave before ``decision`` was split.
+        An alias of the generic recall read over both types (#4155): one
+        bounded query, so the order and the limit are the ones a query over
+        the single type gave before ``decision`` was split.
         """
-        from kestrel_sovereign.storage.schema_router import DECISION_NODE_TYPES
-
         if not isinstance(include_superseded, bool):
             return ToolResult.failed(
                 "include_superseded must be a boolean, "
                 f"got {type(include_superseded).__name__}={include_superseded!r}"
             )
 
-        storage = getattr(self.agent, "storage", None)
-        if storage is None or not hasattr(storage, "graph"):
-            return ToolResult.failed("Graph store not available")
-
         limit_val, err = _coerce_int(limit, "limit", lo=1, hi=200)
         if err:
             return ToolResult.failed(err)
 
         try:
-            nodes = await storage.graph.query_nodes_by_type_and_property(
-                DECISION_NODE_TYPES,
-                filters={"agent_id": self.agent_id},
-                order_by_created=True,
+            alias, page = await self._alias_page(
+                "recall_decisions",
                 limit=limit_val,
+                include_retired=include_superseded,
             )
+        except RecallRefused as e:
+            return ToolResult.failed(str(e), data={"refused": e.reason})
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("recall_decisions failed: %s", e)
             return ToolResult.failed(str(e))
 
         own = []
-        for n in nodes:
+        for row in page.rows:
+            n = row.node
             props = n.properties or {}
-            if not include_superseded and props.get("superseded_by"):
-                continue
             own.append({
                 "id": n.node_id,
                 "label": n.label,
@@ -2076,8 +2092,11 @@ class MemoryFeature(Feature):
                 "claim_source": props.get("claim_source"),
                 "temporal_validity": props.get("temporal_validity"),
                 "superseded_by": props.get("superseded_by"),
+                "home": row.home(),
             })
-        return ToolResult.ok(
+        return alias_result(
+            alias,
+            page,
             confirmation=(
                 f"Retrieved {len(own)} decision(s) "
                 f"(limit requested: {limit_val})"
@@ -2092,7 +2111,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_interactions",
-        description="List recent message→person interactions for a given person concept, with sentiment and topics.",
+        description="Deprecated alias of recall(node_type='message') narrowed to messages mentioning a person, removed in 0.67.0. List recent message→person interactions for a given person concept, with sentiment and topics.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory interactions",
     )
@@ -2101,46 +2120,63 @@ class MemoryFeature(Feature):
         person_concept_id: str,
         limit: int = 25,
     ) -> ToolResult:
-        """Return recent mentions edges pointing at a person concept."""
-        storage = getattr(self.agent, "storage", None)
-        if storage is None or not hasattr(storage, "graph"):
-            return ToolResult.failed("Graph store not available")
+        """Recent messages that mention a person concept, with the mention's properties.
 
+        An alias of the generic recall read of ``message`` nodes (#4155),
+        narrowed in SQL to those with a ``mentions`` edge to the concept, so
+        the limit counts only such messages. A message in Trash is withheld
+        after the query; the read queries on until the page is full, and the
+        result names what it withheld (``withheld``) and whether it stopped
+        at its scan bound first (``stopped_short``). Newest message first.
+        """
         limit_val, err = _coerce_int(limit, "limit", lo=1, hi=200)
         if err:
             return ToolResult.failed(err)
+        if not isinstance(person_concept_id, str) or not person_concept_id:
+            return ToolResult.failed("person_concept_id must be a non-empty string")
 
+        storage = getattr(self.agent, "storage", None)
         try:
-            edges = await storage.graph.get_edges(person_concept_id, direction="in")
+            alias, page = await self._alias_page(
+                "recall_interactions",
+                limit=limit_val,
+                linked_to=(MENTIONS_EDGE, person_concept_id),
+            )
+            interactions = []
+            for row in page.rows:
+                edges = await storage.graph.get_edges(row.node.node_id, direction="out")
+                mention = next(
+                    (
+                        e for e in edges
+                        if e.label == MENTIONS_EDGE and e.target_id == person_concept_id
+                    ),
+                    None,
+                )
+                if mention is None:
+                    continue
+                interactions.append({
+                    "message_node_id": row.node.node_id,
+                    "properties": mention.properties or {},
+                    "home": row.home(),
+                })
+        except RecallRefused as e:
+            return ToolResult.failed(str(e), data={"refused": e.reason})
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error("recall_interactions failed: %s", e)
             return ToolResult.failed(str(e))
 
-        # Message nodes are namespaced by agent id: `message:{agent_id}:{msg}`.
-        # Without this guard, a caller passing a shared concept id could
-        # retrieve edges from other agents' messages.
-        agent_prefix = f"message:{self.agent_id}:"
-        interactions = [
-            {
-                "message_node_id": e.source_id,
-                "properties": e.properties or {},
-            }
-            for e in edges
-            if e.label == "mentions" and e.source_id.startswith(agent_prefix)
-        ]
-        interactions.sort(
-            key=lambda i: (i.get("properties") or {}).get("recorded_at") or "",
-            reverse=True,
-        )
-        truncated = interactions[:limit_val]
-        return ToolResult.ok(
+        return alias_result(
+            alias,
+            page,
             confirmation=(
-                f"Retrieved {len(truncated)} interaction(s) for "
+                f"Retrieved {len(interactions)} interaction(s) for "
                 f"{person_concept_id} (limit requested: {limit_val})"
             ),
             data={
-                "interactions": truncated,
-                "count": len(truncated),
+                "interactions": interactions,
+                "count": len(interactions),
                 "person_concept_id": person_concept_id,
                 "limit_requested": limit_val,
             },

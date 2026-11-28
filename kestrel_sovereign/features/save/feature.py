@@ -20,8 +20,18 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
+from kestrel_sovereign.features.registered_recall import (
+    MAX_PAGE_SIZE,
+    WITHHELD_REASONS,
+    RecallRefused,
+    list_recall_types,
+    parse_node_types,
+    read_node,
+    read_page,
+)
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
+    resolve_feature_conversation_store,
     resolve_feature_database,
 )
 from kestrel_sovereign.storage.saved_items_store import (
@@ -512,29 +522,61 @@ class SaveFeature(Feature):
     @tool(
         name="recall",
         description=(
-            "Search saved items. Find previously saved stashes, excerpts, "
+            "Search saved items, or list remembered records of a registered "
+            "node type. With query: find previously saved stashes, excerpts, "
             "files, and items by meaning; legacy learned-fact graph rows may "
-            "also appear by keyword during the compatibility window. Optional item_type filter "
-            "must be one of: stash, file, excerpt, structured; passing one "
-            "scopes the search to saved items only."
+            "also appear by keyword during the compatibility window. Optional "
+            "item_type filter must be one of: stash, file, excerpt, structured; "
+            "passing one scopes the search to saved items only. With node_type "
+            "(see recall_types; several may be joined by commas) and no query: "
+            "list that type's records newest first, a page at a time (limit up "
+            "to 200; pass the returned next_cursor as cursor for the next "
+            "page). Retired records are left out unless include_retired=True."
         ),
         category=ToolCategory.MEMORY,
         command_prefix="!recall"
     )
     async def recall(
         self,
-        query: str,
+        query: str = "",
         item_type: str = "",
-        limit: int = 5
+        limit: int = 5,
+        node_type: str = "",
+        cursor: str = "",
+        include_retired: bool = False,
     ) -> ToolResult:
         """
-        Semantic search across saved items.
+        Semantic search across saved items, or a paged read of a node type.
 
         Args:
             query: Search query (searches by meaning, not just keywords)
             item_type: Filter by type — one of stash | file | excerpt | structured
             limit: Maximum results to return
+            node_type: A registered node type to list instead of searching
+            cursor: The next_cursor of the previous page of a node_type read
+            include_retired: Include superseded or resolved records in a node_type read
         """
+        if node_type:
+            if query or item_type:
+                return ToolResult.failed(
+                    "recall with node_type lists that type's records; it takes "
+                    "no query or item_type. Drop node_type to search saved items.",
+                    data={"node_type": node_type, "query": query, "item_type": item_type},
+                )
+            return await self._recall_node_type(
+                node_type, limit=limit, cursor=cursor, include_retired=include_retired
+            )
+        if cursor or include_retired is not False:
+            return ToolResult.failed(
+                "cursor and include_retired apply to a node_type read",
+                data={"cursor": cursor, "include_retired": include_retired},
+            )
+        if not str(query or "").strip():
+            return ToolResult.failed(
+                "recall needs a query to search saved items, or a node_type to "
+                "list (recall_types lists them)",
+                data={"query": query},
+            )
         store = self._get_store()
         if not store:
             if self._persistent_content_hidden():
@@ -702,6 +744,118 @@ class SaveFeature(Feature):
             )
         return formatted
 
+    def _recall_refused(self, error: RecallRefused, data: Dict[str, Any]) -> ToolResult:
+        return ToolResult.failed(str(error), data={**data, "refused": error.reason})
+
+    async def _recall_node_type(
+        self, node_type: str, *, limit: Any, cursor: str, include_retired: Any
+    ) -> ToolResult:
+        """``recall(node_type=...)``: one page of the generic read (#4155)."""
+        request = {"node_type": node_type, "cursor": cursor or None}
+        try:
+            page = await read_page(
+                storage=self.storage,
+                registry_db=resolve_feature_database(self.agent),
+                conversation_store=resolve_feature_conversation_store(self.agent),
+                agent_id=self.agent_id,
+                node_types=parse_node_types(node_type),
+                limit=limit,
+                cursor=cursor or None,
+                include_retired=include_retired,
+            )
+        except RecallRefused as error:
+            return self._recall_refused(error, request)
+        data = {"success": True, **page.to_dict()}
+        notes = []
+        if page.limit_clamped:
+            notes.append(f"limit clamped to {page.limit} (max {MAX_PAGE_SIZE})")
+        if page.withheld:
+            notes.append(
+                "withheld "
+                + ", ".join(f"{count} {reason}" for reason, count in sorted(page.withheld.items()))
+            )
+        if page.next_cursor:
+            notes.append("more may remain: pass next_cursor as cursor")
+        suffix = f" ({'; '.join(notes)})" if notes else ""
+        confirmation = (
+            f"Recalled {len(page.rows)} {', '.join(page.node_types)} "
+            f"record(s){suffix}"
+        )
+        short = page.stopped_short_note()
+        if short is not None:
+            return ToolResult.partial(confirmation=confirmation, error=short, data=data)
+        return ToolResult.ok(confirmation=confirmation, data=data)
+
+    async def _recall_get_node(
+        self, node_type: str, node_id: str, *, include_retired: Any
+    ) -> ToolResult:
+        """``recall_get(node_type=...)``: one node through the generic read (#4155)."""
+        request = {"node_type": node_type, "item_id": node_id}
+        try:
+            lookup = await read_node(
+                storage=self.storage,
+                registry_db=resolve_feature_database(self.agent),
+                conversation_store=resolve_feature_conversation_store(self.agent),
+                agent_id=self.agent_id,
+                node_type=node_type,
+                node_id=node_id,
+                include_retired=include_retired,
+            )
+        except RecallRefused as error:
+            return self._recall_refused(error, request)
+        if lookup.row is None:
+            # Another agent's row reads as absent, not as withheld.
+            if lookup.missing in ("not_found", "foreign"):
+                message = f"{node_type} {node_id} is not found"
+            else:
+                message = (
+                    f"{node_type} {node_id} is withheld: "
+                    f"{WITHHELD_REASONS[lookup.missing]}"
+                )
+            return ToolResult.failed(message, data={**request, "missing": lookup.missing})
+        return ToolResult.ok(
+            confirmation=f"Retrieved {node_type} {node_id}",
+            data={"success": True, "result": lookup.row.to_dict()},
+        )
+
+    @tool(
+        name="recall_types",
+        description=(
+            "List the registered node types recall(node_type=...) and "
+            "recall_get(node_type=...) can read: each type's owning feature, "
+            "canonical home, whether its graph record is the original or a "
+            "projection, whether it is governed, and, for a type the generic "
+            "read does not serve, why."
+        ),
+        category=ToolCategory.MEMORY,
+        command_prefix="!recall types"
+    )
+    async def recall_types(self) -> ToolResult:
+        """List the node type registry as the generic recall read sees it."""
+        registry_db = resolve_feature_database(self.agent)
+        if registry_db is None:
+            return ToolResult.failed("The node type registry is not available")
+        try:
+            types = await list_recall_types(registry_db)
+        except Exception as e:
+            if is_execution_control_error(e):
+                raise
+            logger.error(f"recall_types failed: {e}")
+            return ToolResult.failed(str(e))
+        served = [t.entry.node_type for t in types if t.served]
+        return ToolResult.ok(
+            confirmation=(
+                f"{len(types)} registered node type(s); the generic read serves "
+                f"{len(served)}: {', '.join(served)}"
+            ),
+            data={
+                "success": True,
+                "count": len(types),
+                "types": [t.to_dict() for t in types],
+                "served": served,
+            },
+        )
+
     @tool(
         name="recall_list",
         description=(
@@ -770,17 +924,33 @@ class SaveFeature(Feature):
 
     @tool(
         name="recall_get",
-        description="Get the full content of a saved item by ID.",
+        description=(
+            "Get the full content of a saved item by ID, or, with node_type, "
+            "one record of that registered node type by its node id."
+        ),
         category=ToolCategory.MEMORY,
         command_prefix="!recall get"
     )
-    async def recall_get(self, item_id: str) -> ToolResult:
+    async def recall_get(
+        self, item_id: str, node_type: str = "", include_retired: bool = False
+    ) -> ToolResult:
         """
-        Get full content of a saved item.
+        Get full content of a saved item, or one registered node.
 
         Args:
-            item_id: The ID of the item to retrieve
+            item_id: The ID of the item to retrieve (a node id with node_type)
+            node_type: The registered node type the record has (see recall_types)
+            include_retired: Return the record even if it is superseded or resolved
         """
+        if node_type:
+            return await self._recall_get_node(
+                node_type, item_id, include_retired=include_retired
+            )
+        if include_retired is not False:
+            return ToolResult.failed(
+                "include_retired applies to a node_type read",
+                data={"include_retired": include_retired},
+            )
         store = self._get_store()
         if not store:
             if self._persistent_content_hidden():

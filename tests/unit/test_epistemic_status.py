@@ -589,33 +589,56 @@ class TestMarkSuperseded:
 
 
 class TestRecallSupersededFilter:
+    """The recall aliases' superseded filter, on the generic read (#4155)."""
 
-    @pytest.mark.asyncio
-    async def test_recall_decisions_excludes_superseded_by_default(self):
-        agent = _make_mock_agent("agent-1")
-        feature = _make_memory_feature(agent)
+    @pytest.fixture
+    async def recall(self, tmp_path):
+        from unittest.mock import MagicMock
 
-        active_node = GraphNode(
-            node_id="decision:agent-1:active",
-            node_type="decision",
+        from kestrel_sovereign.features.memory.feature import MemoryFeature
+        from tests.utils.recall_storage import governed_storage
+
+        async with governed_storage(str(tmp_path / "kestrel.db"), "did:test:agent-1") as (
+            storage,
+            raw,
+        ):
+            agent = MagicMock()
+            agent.did = agent.agent_id = "did:test:agent-1"
+            agent.storage = storage
+            feature = MemoryFeature.__new__(MemoryFeature)
+            feature.agent = agent
+            feature.agent_id = agent.did
+            yield feature, raw.graph
+
+    @staticmethod
+    def _pair(node_type, prefix):
+        active = GraphNode(
+            node_id=f"{prefix}:did:test:agent-1:active",
+            node_type=node_type,
             label="active",
-            properties={"agent_id": "agent-1", "text": "use Postgres", "created_at": "2026-04-01T00:00:00+00:00"},
+            properties={"agent_id": "did:test:agent-1", "status": "pending",
+                        "text": "use Postgres", "created_at": "2026-04-01T00:00:00+00:00"},
         )
-        superseded_node = GraphNode(
-            node_id="decision:agent-1:old",
-            node_type="decision",
+        superseded = GraphNode(
+            node_id=f"{prefix}:did:test:agent-1:old",
+            node_type=node_type,
             label="old",
             properties={
-                "agent_id": "agent-1",
+                "agent_id": "did:test:agent-1",
+                "status": "pending",
                 "text": "use MySQL",
                 "created_at": "2026-03-01T00:00:00+00:00",
-                "superseded_by": "decision:agent-1:active",
+                "superseded_by": f"{prefix}:did:test:agent-1:active",
             },
         )
+        return active, superseded
 
-        agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(
-            return_value=[active_node, superseded_node]
-        )
+    @pytest.mark.asyncio
+    async def test_recall_decisions_excludes_superseded_by_default(self, recall):
+        feature, graph = recall
+        active_node, superseded_node = self._pair("decision", "decision")
+        await graph.add_node(active_node)
+        await graph.add_node(superseded_node)
 
         # Default: exclude superseded
         result = await feature.recall_decisions(limit=25, include_superseded=False)
@@ -624,63 +647,21 @@ class TestRecallSupersededFilter:
         assert result.data["decisions"][0]["id"] == active_node.node_id
 
     @pytest.mark.asyncio
-    async def test_recall_decisions_includes_superseded_when_asked(self):
-        agent = _make_mock_agent("agent-1")
-        feature = _make_memory_feature(agent)
-
-        active_node = GraphNode(
-            node_id="decision:agent-1:active",
-            node_type="decision",
-            label="active",
-            properties={"agent_id": "agent-1", "text": "use Postgres", "created_at": "2026-04-01T00:00:00+00:00"},
-        )
-        superseded_node = GraphNode(
-            node_id="decision:agent-1:old",
-            node_type="decision",
-            label="old",
-            properties={
-                "agent_id": "agent-1",
-                "text": "use MySQL",
-                "created_at": "2026-03-01T00:00:00+00:00",
-                "superseded_by": "decision:agent-1:active",
-            },
-        )
-
-        agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(
-            return_value=[active_node, superseded_node]
-        )
+    async def test_recall_decisions_includes_superseded_when_asked(self, recall):
+        feature, graph = recall
+        for node in self._pair("decision", "decision"):
+            await graph.add_node(node)
 
         result = await feature.recall_decisions(limit=25, include_superseded=True)
         assert result.status is ToolResultStatus.OK
         assert result.data["count"] == 2
 
     @pytest.mark.asyncio
-    async def test_recall_action_items_excludes_superseded_by_default(self):
-        agent = _make_mock_agent("agent-1")
-        feature = _make_memory_feature(agent)
-
-        active = GraphNode(
-            node_id="action:agent-1:active",
-            node_type="action_item",
-            label="active",
-            properties={"agent_id": "agent-1", "status": "pending", "text": "do X", "created_at": "2026-04-01T00:00:00+00:00"},
-        )
-        superseded = GraphNode(
-            node_id="action:agent-1:old",
-            node_type="action_item",
-            label="old",
-            properties={
-                "agent_id": "agent-1",
-                "status": "pending",
-                "text": "do Y",
-                "created_at": "2026-03-01T00:00:00+00:00",
-                "superseded_by": "action:agent-1:active",
-            },
-        )
-
-        agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(
-            return_value=[active, superseded]
-        )
+    async def test_recall_action_items_excludes_superseded_by_default(self, recall):
+        feature, graph = recall
+        active, superseded = self._pair("action_item", "action")
+        await graph.add_node(active)
+        await graph.add_node(superseded)
 
         result = await feature.recall_action_items(limit=25, include_superseded=False)
         assert result.status is ToolResultStatus.OK
@@ -688,27 +669,21 @@ class TestRecallSupersededFilter:
         assert result.data["action_items"][0]["id"] == active.node_id
 
     @pytest.mark.asyncio
-    async def test_recall_returns_epistemic_fields(self):
-        agent = _make_mock_agent("agent-1")
-        feature = _make_memory_feature(agent)
-
-        node = GraphNode(
-            node_id="decision:agent-1:ep",
+    async def test_recall_returns_epistemic_fields(self, recall):
+        feature, graph = recall
+        await graph.add_node(GraphNode(
+            node_id="decision:did:test:agent-1:ep",
             node_type="decision",
             label="epistemic decision",
             properties={
-                "agent_id": "agent-1",
+                "agent_id": "did:test:agent-1",
                 "text": "use Postgres",
                 "created_at": "2026-04-01T00:00:00+00:00",
                 "claim_certainty": 0.9,
                 "claim_source": "direct",
                 "temporal_validity": "durable",
             },
-        )
-
-        agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(
-            return_value=[node]
-        )
+        ))
 
         result = await feature.recall_decisions(limit=25)
         assert result.status is ToolResultStatus.OK
