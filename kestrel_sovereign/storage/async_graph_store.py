@@ -856,6 +856,43 @@ class GraphNode:
     properties: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class NodePagePosition:
+    """Where a page of :meth:`AsyncGraphStore.query_nodes_by_type_and_property` ended.
+
+    A keyset read (``keyset=True``) orders by ``created_at`` newest first,
+    unstamped rows last, then by ``node_id``. A position is the last row's key
+    in that order, so the next page starts strictly after it and every row is
+    read exactly once (#4155).
+    """
+
+    created_at: Optional[str]
+    node_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node_id, str) or not self.node_id:
+            raise ValueError("a page position names a node id")
+        if self.created_at is not None and not isinstance(self.created_at, str):
+            raise ValueError("a page position's created_at is a string or absent")
+
+    @classmethod
+    def after(cls, node: "GraphNode") -> "NodePagePosition":
+        """The position just past ``node``.
+
+        Refuses a node whose ``created_at`` is present but not a string. The
+        graph contract stamps an ISO-8601 string, and a value of another type
+        sorts by type on SQLite and by its text on PostgreSQL, so no position
+        could be placed after it the same way on both.
+        """
+        created_at = (node.properties or {}).get("created_at")
+        if created_at is not None and not isinstance(created_at, str):
+            raise ValueError(
+                f"graph node {node.node_id!r} has a non-string created_at "
+                f"({type(created_at).__name__}); a page cannot end after it"
+            )
+        return cls(created_at=created_at, node_id=node.node_id)
+
+
 @dataclass
 class Edge:
     """Represents an edge between nodes."""
@@ -1782,6 +1819,20 @@ class AsyncGraphStore:
             return f"({column}::jsonb)->>'{path}'"
         return f"json_extract({column}, '$.{path}')"
 
+    def _created_order(self, *, keyset: bool = False) -> str:
+        """The ``ORDER BY`` terms of a created-ordered node read.
+
+        A node with no created_at sorts LAST on both backends. Without NULLS
+        LAST, SQLite puts NULL last under DESC and Postgres puts it first, so
+        an unstamped projection row would lead a recall on one backend and
+        trail it on the other (#3255). The created-at partial indexes are
+        stored to serve exactly this order. ``keyset`` adds ``node_id`` as a
+        tiebreak, which those indexes do not cover, so the order is total
+        and a page position is exact (#4155).
+        """
+        order = f"{self._json_extract('properties', 'created_at')} DESC NULLS LAST"
+        return f"{order}, node_id" if keyset else order
+
     async def query_nodes_by_type_and_property(
         self,
         node_type: Union[str, Sequence[str]],
@@ -1790,6 +1841,8 @@ class AsyncGraphStore:
         created_since: Optional[str] = None,
         order_by_created: bool = True,
         limit: int = 200,
+        keyset: bool = False,
+        after: Optional[NodePagePosition] = None,
     ) -> List[GraphNode]:
         """Query graph nodes by type with property-level SQL filters.
 
@@ -1808,12 +1861,22 @@ class AsyncGraphStore:
             created_since: ISO-8601 timestamp lower bound on
                 ``properties->>'created_at'``.  Uses ``>=`` comparison.
             order_by_created: If True (default), results are ordered by
-                ``properties->>'created_at' DESC``.
+                ``properties->>'created_at' DESC NULLS LAST``.
             limit: Maximum rows returned (clamped to 1-10000).
+            keyset: Break ``created_at`` ties by ``node_id`` too, so the
+                order is total and a page can end exactly after a row (#4155).
+                The created-at partial indexes do not cover the tiebreak, so
+                only a paged read asks for it. Requires ``order_by_created``.
+            after: Start strictly after this position in the keyset order.
+                Requires ``keyset``.
 
         Returns:
             List of matching :class:`GraphNode` instances.
         """
+        if keyset and not order_by_created:
+            raise ValueError("a keyset read orders by created_at")
+        if after is not None and not keyset:
+            raise ValueError("a page position needs the keyset order")
         limit = max(1, min(limit, 10000))
         node_types = (node_type,) if isinstance(node_type, str) else tuple(node_type)
         if not node_types or not all(isinstance(value, str) for value in node_types):
@@ -1832,18 +1895,29 @@ class AsyncGraphStore:
             clauses.append(f"{self._json_extract('properties', key)} = ?")
             params.append(value)
 
+        created_at = self._json_extract("properties", "created_at")
         if created_since is not None:
-            clauses.append(f"{self._json_extract('properties', 'created_at')} >= ?")
+            clauses.append(f"{created_at} >= ?")
             params.append(created_since)
 
+        if after is not None:
+            # The position's own row and every row before it in the order
+            # below are excluded: newer stamps, the same stamp with a smaller
+            # node id, and (past an unstamped row) every stamped row.
+            if after.created_at is None:
+                clauses.append(f"({created_at} IS NULL AND node_id > ?)")
+                params.append(after.node_id)
+            else:
+                clauses.append(
+                    f"({created_at} < ? OR ({created_at} = ? AND node_id > ?) "
+                    f"OR {created_at} IS NULL)"
+                )
+                params.extend((after.created_at, after.created_at, after.node_id))
+
         where = " AND ".join(clauses)
-        order = ""
-        if order_by_created:
-            # A node with no created_at sorts LAST on both backends. Without
-            # NULLS LAST, SQLite puts NULL last under DESC and Postgres puts
-            # it first, so an unstamped projection row would lead a recall on
-            # one backend and trail it on the other (#3255).
-            order = f" ORDER BY {self._json_extract('properties', 'created_at')} DESC NULLS LAST"
+        order = (
+            f" ORDER BY {self._created_order(keyset=keyset)}" if order_by_created else ""
+        )
 
         sql = (
             f"SELECT node_id, node_type, label, properties "

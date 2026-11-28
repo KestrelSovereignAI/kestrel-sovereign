@@ -795,16 +795,19 @@ async def test_settle_wait_is_bounded_once_per_tick(tmp_path, monkeypatch):
                 result = await await_within_hang_guard(
                     feat.restart_coordinator(), step="coordinator tick",
                 )
-            elapsed = clock.time() - started
+            finished = clock.time()
             assert not blocker.done()
         finally:
             await _cancel_all(blocker)
 
     spawn.assert_not_called()
+    # Compare absolute loop times, as the settle compares its deadline.
+    # ``finished - started`` rounds at the loop clock's magnitude and can
+    # read 9.999999999999886 after a full 10 s settle.
     assert (
-        IDLE_SETTLE_SECONDS
-        <= elapsed
-        <= IDLE_SETTLE_SECONDS + IDLE_SETTLE_POLL_SECONDS
+        started + IDLE_SETTLE_SECONDS
+        <= finished
+        <= started + IDLE_SETTLE_SECONDS + IDLE_SETTLE_POLL_SECONDS
     )
     assert max(sleeps) <= IDLE_SETTLE_POLL_SECONDS
     assert {entry["request_id"] for entry in result.data["deferred"]} == {

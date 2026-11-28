@@ -431,12 +431,10 @@ def map_ledger_row(
     row's content was attested in (#3990); without it every row is
     unattested.
     """
-    from kestrel_sovereign.knowledge.assertion import derive_assertion_id
-
     row_id = section.row_id(row)
-    subject = ledger_subject(tenant_id)
-    predicate = IRI(f"{ontology_ref.namespace}{section_term(section)}")
-    target = ledger_row_object(tenant_id, row_id)
+    subject, predicate, target, assertion_id = _row_assertion_identity(
+        section, tenant_id=tenant_id, row_id=row_id, ontology_ref=ontology_ref
+    )
     content_digest = row_content_digest(section, row)
     attested = attestations.get((section.ledger_key, content_digest), frozenset())
     return LedgerRowProposal(
@@ -447,15 +445,68 @@ def map_ledger_row(
         object=target,
         ontology=ontology_ref,
         content_digest=content_digest,
-        assertion_id=derive_assertion_id(
-            tenant_id=tenant_id,
-            subject=subject,
-            predicate=predicate,
-            object=target,
-        ),
+        assertion_id=assertion_id,
         sessions=tuple(sorted(item for item in attested if item is not None)),
         attested=bool(attested),
     )
+
+
+def _row_assertion_identity(
+    section: LedgerSection,
+    *,
+    tenant_id: str,
+    row_id: str,
+    ontology_ref: OntologyRef,
+) -> Tuple[IRI, IRI, IRI, str]:
+    """``(subject, predicate, object, assertion_id)`` of one row's assertion.
+
+    The one derivation both the producer and the read-side mapping below use,
+    so a graph node is checked against the assertion this module writes.
+    """
+    from kestrel_sovereign.knowledge.assertion import derive_assertion_id
+
+    subject = ledger_subject(tenant_id)
+    predicate = IRI(f"{ontology_ref.namespace}{section_term(section)}")
+    target = ledger_row_object(tenant_id, row_id)
+    return subject, predicate, target, derive_assertion_id(
+        tenant_id=tenant_id, subject=subject, predicate=predicate, object=target
+    )
+
+
+_SECTIONS_BY_NODE_TYPE = {section.node_type: section for section in _SECTIONS}
+
+
+def graph_node_assertion_ids(
+    tenant_id: str, nodes: Iterable[Any]
+) -> Dict[str, str]:
+    """The assertion each projected ledger graph node stands for (#4155).
+
+    The governed read's half of rv-4135-1 (c): a ``strategy_pattern`` or
+    ``strategy_blocker`` node is returned only while the assertion this
+    module derives for the same row is in an admitted state, so the read
+    needs that assertion's id. Keyed by node id. A node is absent from the
+    result when it cannot name one: another type, no ``row_id``, a ``row_id``
+    that is not an IRI-safe token, or a projection for another tenant. The
+    caller treats an absent node as unverifiable and withholds it.
+    """
+    ontology_ref = ontology()
+    mapped: Dict[str, str] = {}
+    for node in nodes:
+        section = _SECTIONS_BY_NODE_TYPE.get(getattr(node, "node_type", None))
+        properties = getattr(node, "properties", None) or {}
+        row_id = properties.get("row_id")
+        if section is None or not isinstance(row_id, str):
+            continue
+        if properties.get("agent_id") != tenant_id:
+            continue
+        try:
+            *_, assertion_id = _row_assertion_identity(
+                section, tenant_id=tenant_id, row_id=row_id, ontology_ref=ontology_ref
+            )
+        except LedgerAssertionMappingError:
+            continue
+        mapped[node.node_id] = assertion_id
+    return mapped
 
 
 def build_proposal_plan(

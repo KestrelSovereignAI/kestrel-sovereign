@@ -45,6 +45,8 @@ BLOCKER_NODE_TYPE = "strategy_blocker"
 #: rows carrying it, so a node written by anything else is never removed on
 #: our behalf.
 _PROJECTION_SOURCE = "strategic_memory"
+#: The same marker, for the generic recall read's filter (#4155).
+PROJECTION_SOURCE = _PROJECTION_SOURCE
 
 #: There are none for a ledger row, and that is the point.
 #:
