@@ -384,8 +384,30 @@ def postgres_url(request):
     return url
 
 
+async def _registry_types_in(admin, schema: str):
+    """The node types in ``schema``'s own registry, or ``None`` when it has none."""
+    from tests.utils.postgres_schema import quoted_search_path
+
+    table = f"{quoted_search_path(schema)}.{registry.TABLE}"
+    if await admin.fetchval("SELECT to_regclass(?)::text", (table,)) is None:
+        return None
+    return sorted(row[0] for row in await admin.fetchall(f"SELECT node_type FROM {table}"))
+
+
 async def test_registry_and_census_on_postgres(postgres_url):
-    """The same table, seed and census on PostgreSQL, in a schema of its own."""
+    """The same table, seed and census on PostgreSQL, in a schema of its own.
+
+    Another schema on the search path already holds a seeded registry, as
+    ``public`` does once a boot has run there (#4153 review P2-b). The boot
+    creates and seeds its own registry and reads and writes that one; the
+    other schema's is left as it was. No other table of a booted database is
+    on the path, so none can resolve outside these two schemas (#4239).
+
+    pgvector's schema is off the path too: the case needs no vector, and the
+    boot's ``embedding_vec`` migrations fail without one, non-fatally. The
+    extension is installed first, so the boot's ``CREATE EXTENSION IF NOT
+    EXISTS vector`` never puts it in a schema this case then removes.
+    """
     from kestrel_sovereign.storage.node_type_census import run_census
     from tests.utils.postgres_schema import (
         disposable_postgres_schema,
@@ -394,36 +416,55 @@ async def test_registry_and_census_on_postgres(postgres_url):
         with_search_path,
     )
 
+    sentinel = _entry("other_schema_sentinel")
     admin = await AsyncDatabase.postgres(postgres_url, schema_initializer=_no_schema)
     try:
-        vector_schema = await pgvector_schema(admin)
-        async with disposable_postgres_schema(admin, "node_type_registry") as schema:
-            url = with_search_path(postgres_url, quoted_search_path(schema, vector_schema))
-            for _boot in range(2):
-                database = await AsyncDatabase.postgres(url)
-                await database.close()
-            database = await AsyncDatabase.postgres(url, schema_initializer=_no_schema)
-            try:
-                assert await list_node_types(database) == sorted(
-                    SEED_ENTRIES, key=lambda entry: entry.node_type
+        await pgvector_schema(admin)
+        async with disposable_postgres_schema(admin, "node_type_registry_other") as other:
+            async with disposable_postgres_schema(admin, "node_type_registry") as schema:
+                seeded = await AsyncDatabase.postgres(
+                    with_search_path(postgres_url, quoted_search_path(other)),
+                    schema_initializer=_no_schema,
                 )
-                probe = _entry()
-                assert await register_node_type(database, probe) == probe
-                with pytest.raises(NodeTypeRegistrationConflict):
-                    await register_node_type(database, _entry(owning_feature="OtherFeature"))
-                store = AsyncGraphStore(database, agent_id="did:example:pg")
-                await store.add_node(
-                    GraphNode(node_id="pg:1", node_type="health_check", label="h", properties={})
-                )
-                report = await run_census(database, write_sites=())
-            finally:
-                await database.close()
+                try:
+                    await seeded.execute(registry.DDL)
+                    await registry.seed_node_type_registry(seeded, (*SEED_ENTRIES, sentinel))
+                finally:
+                    await seeded.close()
+                other_before = await _registry_types_in(admin, other)
+
+                url = with_search_path(postgres_url, quoted_search_path(schema, other))
+                for _boot in range(2):
+                    database = await AsyncDatabase.postgres(url)
+                    await database.close()
+                database = await AsyncDatabase.postgres(url, schema_initializer=_no_schema)
+                try:
+                    assert await list_node_types(database) == sorted(
+                        SEED_ENTRIES, key=lambda entry: entry.node_type
+                    )
+                    probe = _entry()
+                    assert await register_node_type(database, probe) == probe
+                    with pytest.raises(NodeTypeRegistrationConflict):
+                        await register_node_type(database, _entry(owning_feature="OtherFeature"))
+                    store = AsyncGraphStore(database, agent_id="did:example:pg")
+                    await store.add_node(
+                        GraphNode(node_id="pg:1", node_type="health_check", label="h", properties={})
+                    )
+                    report = await run_census(database, write_sites=())
+                finally:
+                    await database.close()
+                own = await _registry_types_in(admin, schema)
+                other_after = await _registry_types_in(admin, other)
     finally:
         await admin.close()
+    seeds = sorted(entry.node_type for entry in SEED_ENTRIES)
+    assert own == sorted([*seeds, probe.node_type])
+    assert other_after == other_before == sorted([*seeds, sentinel.node_type])
     health = report.row("health_check")
     assert (health.total_rows, dict(health.rows_by_agent)) == (1, {"did:example:pg": 1})
     assert health.owning_feature is None
     assert report.row("probe_note").registered == probe
+    assert sentinel.node_type not in {row.node_type for row in report.types}
 
 
 async def test_unregistered_types_still_write(db):

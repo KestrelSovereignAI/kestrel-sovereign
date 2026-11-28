@@ -2556,14 +2556,18 @@ class AsyncDatabase:
         inside the same lock and transaction as that marker. Seeding never
         replaces an entry already registered, so a durable entry outlives
         every later boot.
+
+        The probe is :meth:`_node_type_registry_in_creation_schema`, not
+        :meth:`table_exists`, so the table is found in the schema it is
+        created in.
         """
         table = node_type_registry.TABLE
-        if not await self.table_exists(table):
+        if not await self._node_type_registry_in_creation_schema():
             async with self.migration_lock(f"create_{table}"):
-                if not await self.table_exists(table):
+                if not await self._node_type_registry_in_creation_schema():
                     await self.execute(node_type_registry.DDL)
 
-        if not await self.table_exists(table):
+        if not await self._node_type_registry_in_creation_schema():
             raise RuntimeError(
                 f"{table} was not created; graph node types would have no "
                 "owning feature or canonical home on record"
@@ -2574,6 +2578,33 @@ class AsyncDatabase:
                 if not await self._backfill_completed(marker):
                     await node_type_registry.seed_node_type_registry(self)
                     await self._mark_backfill_completed(marker)
+
+    async def _node_type_registry_in_creation_schema(self) -> bool:
+        """Whether the registry exists in the schema its DDL creates it in.
+
+        On PostgreSQL :meth:`table_exists` answers for every schema on the
+        search path, while ``CREATE TABLE IF NOT EXISTS`` creates in
+        ``current_schema()``, the first one. A registry in a later schema
+        would pass for this one: the table would never be created here, and
+        the seed would go to the other schema under a marker recorded in this
+        one's ``schema_backfills``. Once the table is in ``current_schema()``,
+        every unqualified read and write finds it first. The catalog is read
+        directly, as ``PostgresBackend.table_exists`` reads it, so a fresh
+        statement sees DDL a concurrent initializer committed. SQLite's
+        ``table_exists`` already reads ``main``, where ``CREATE TABLE``
+        writes. The search-path probe every other table uses is #4239.
+        """
+        if self.backend_type == "postgres":
+            return bool(await self.fetchval(
+                "SELECT EXISTS ("
+                "SELECT 1 FROM pg_catalog.pg_class relation "
+                "JOIN pg_catalog.pg_namespace namespace "
+                "ON namespace.oid = relation.relnamespace "
+                "WHERE relation.relname = ? "
+                "AND namespace.nspname = current_schema())",
+                (node_type_registry.TABLE,),
+            ))
+        return await self.table_exists(node_type_registry.TABLE)
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",
