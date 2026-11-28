@@ -22,7 +22,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
@@ -1784,7 +1784,7 @@ class AsyncGraphStore:
 
     async def query_nodes_by_type_and_property(
         self,
-        node_type: str,
+        node_type: Union[str, Sequence[str]],
         filters: Optional[Dict[str, Any]] = None,
         *,
         created_since: Optional[str] = None,
@@ -1800,7 +1800,9 @@ class AsyncGraphStore:
         stored DESC NULLS LAST to match the ordering below).
 
         Args:
-            node_type: Required ``node_type`` value (e.g. ``"action_item"``).
+            node_type: Required ``node_type`` value (e.g. ``"action_item"``),
+                or a sequence of them: a node of any one matches, and the
+                order and limit apply to all of them together.
             filters: Dict of ``{property_name: value}`` for equality checks
                 pushed into ``WHERE json_extract(properties, '$.key') = ?``.
             created_since: ISO-8601 timestamp lower bound on
@@ -1813,8 +1815,14 @@ class AsyncGraphStore:
             List of matching :class:`GraphNode` instances.
         """
         limit = max(1, min(limit, 10000))
-        clauses: List[str] = ["node_type = ?"]
-        params: List[Any] = [node_type]
+        node_types = (node_type,) if isinstance(node_type, str) else tuple(node_type)
+        if not node_types or not all(isinstance(value, str) for value in node_types):
+            raise ValueError("node_type must be a node type or a non-empty sequence of them")
+        if len(node_types) == 1:
+            clauses: List[str] = ["node_type = ?"]
+        else:
+            clauses = [f"node_type IN ({', '.join('?' for _ in node_types)})"]
+        params: List[Any] = list(node_types)
 
         scope, scope_params = self._node_scope()
         clauses.append(scope)

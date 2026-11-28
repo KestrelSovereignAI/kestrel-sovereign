@@ -2019,7 +2019,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_decisions",
-        description="Retrieve decisions the user has recorded (stored as graph nodes of type 'decision'). Superseded decisions are excluded by default; pass include_superseded=True to see them.",
+        description="Retrieve recorded decisions, newest first: graph nodes of type 'decision' (extracted from conversation) and 'strategy_decision' (from STRATEGY.yaml). Superseded decisions are excluded by default; pass include_superseded=True to see them.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory decisions",
     )
@@ -2028,7 +2028,13 @@ class MemoryFeature(Feature):
         limit: int = 25,
         include_superseded: bool = False,
     ) -> ToolResult:
-        """List decisions from the graph."""
+        """List decisions from the graph, of both decision types (rv-4244-1).
+
+        One query over both, so the order and the limit are the ones a query
+        over the single type gave before ``decision`` was split.
+        """
+        from kestrel_sovereign.storage.schema_router import DECISION_NODE_TYPES
+
         if not isinstance(include_superseded, bool):
             return ToolResult.failed(
                 "include_superseded must be a boolean, "
@@ -2045,7 +2051,7 @@ class MemoryFeature(Feature):
 
         try:
             nodes = await storage.graph.query_nodes_by_type_and_property(
-                "decision",
+                DECISION_NODE_TYPES,
                 filters={"agent_id": self.agent_id},
                 order_by_created=True,
                 limit=limit_val,
@@ -2276,7 +2282,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="mark_superseded",
-        description="Mark a claim node (decision or action_item) as superseded by a newer one. Creates a 'supersedes' edge from new to old and sets superseded_by on the old node.",
+        description="Mark a claim node (decision, strategy_decision or action_item) as superseded by a newer one. Creates a 'supersedes' edge from new to old and sets superseded_by on the old node.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory supersede",
     )
@@ -2288,8 +2294,13 @@ class MemoryFeature(Feature):
     ) -> ToolResult:
         """Mark old_id as superseded by new_id.
 
-        Only claim-shaped node types (decision, action_item) can be
-        superseded. Both nodes must belong to this agent.
+        Only claim-shaped node types (decision, strategy_decision,
+        action_item) can be superseded. Both nodes must belong to this agent.
+        Routed by the old node's type: a ``strategy_decision`` is a copy of a
+        STRATEGY.yaml entry, so the file records its supersession and the node
+        is re-projected from it; any other is superseded in place, its graph
+        row being the original (rv-4244-1). ``is_strategy_decision`` also
+        routes a marked node still typed ``decision`` to the file.
 
         Args:
             old_id: Node ID of the claim being replaced.

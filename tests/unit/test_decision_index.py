@@ -19,9 +19,14 @@ import pytest
 
 from kestrel_sovereign.features.strategic_memory.decision_index import (
     decision_entries,
+    is_strategy_decision,
     project_decisions,
     strategy_decision_node_id,
     supersede_entries,
+)
+from kestrel_sovereign.storage.node_type_registry import (
+    DECISION_NODE_TYPE,
+    STRATEGY_DECISION_NODE_TYPE,
 )
 
 
@@ -111,7 +116,8 @@ class TestProjection:
         assert report["projected"] == 2
         assert len(graph.nodes) == 2
         for node in graph.nodes.values():
-            assert node.node_type == "decision"
+            # The projection's own type since rv-4244-1 split ``decision``.
+            assert node.node_type == STRATEGY_DECISION_NODE_TYPE
             # Both are load-bearing: recall_decisions filters on agent_id and
             # orders on created_at, so a node missing either is unreachable.
             assert node.properties["agent_id"] == AGENT
@@ -287,11 +293,14 @@ class TestEndToEndThroughTheFeature:
         assert result.data["recorded"] is True
 
         # Reachable the way recall_decisions reaches it.
+        from kestrel_sovereign.storage.schema_router import DECISION_NODE_TYPES
+
         decisions = [
             n for n in graph.nodes.values()
-            if n.node_type == "decision"
+            if n.node_type in DECISION_NODE_TYPES
             and (n.properties or {}).get("agent_id") == AGENT
         ]
+        assert [n.node_type for n in decisions] == [STRATEGY_DECISION_NODE_TYPE]
         assert len(decisions) == 1, "a recorded decision must be recallable"
         assert "durable leases" in decisions[0].label
 
@@ -467,6 +476,84 @@ class TestReconciliation:
         assert "other-agent" in graph.nodes
         assert "hand-written" in graph.nodes
 
+    @pytest.mark.asyncio
+    async def test_reconcile_covers_its_rows_under_either_type(self):
+        """rv-4244-1 §4: a marked row still typed ``decision`` is the projection's too.
+
+        It can come from a writer or a restore that predates the split. A
+        reconcile reading only the new type would leave it reachable after its
+        entry left the file.
+        """
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        graph = _FakeGraph()
+        kept = _entry("kept")
+        gone = _entry("gone from the file")
+        for entry in (kept, gone):
+            node_id = strategy_decision_node_id(AGENT, entry)
+            graph.nodes[node_id] = GraphNode(
+                node_id=node_id,
+                node_type=DECISION_NODE_TYPE,
+                label=entry["decision"],
+                properties={"agent_id": AGENT, "source": "strategic_memory"},
+            )
+        # Neither of these was written by the projection: no marker.
+        for node_type in (DECISION_NODE_TYPE, STRATEGY_DECISION_NODE_TYPE):
+            graph.nodes[f"unmarked-{node_type}"] = GraphNode(
+                node_id=f"unmarked-{node_type}",
+                node_type=node_type,
+                label="unmarked",
+                properties={"agent_id": AGENT},
+            )
+
+        report = await project_decisions(graph, AGENT, [kept])
+
+        assert graph.deleted == [strategy_decision_node_id(AGENT, gone)]
+        assert report["removed"] == 1
+        # A swap writes properties only: the kept pre-split row keeps its type,
+        # and stays reconcilable under it.
+        kept_node = graph.nodes[strategy_decision_node_id(AGENT, kept)]
+        assert kept_node.node_type == DECISION_NODE_TYPE
+        assert kept_node.properties["text"] == "kept"
+        assert {"unmarked-decision", "unmarked-strategy_decision"} <= set(graph.nodes)
+
+
+class TestRoutingByRegisteredType:
+    """rv-4244-1 §4: which decisions are copies of a STRATEGY.yaml entry."""
+
+    @staticmethod
+    def _node(node_type, properties):
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        return GraphNode(node_id="n", node_type=node_type, label="l", properties=properties)
+
+    def test_a_strategy_decision_is_a_projection_by_its_type(self):
+        assert is_strategy_decision(self._node(STRATEGY_DECISION_NODE_TYPE, {"source": "strategic_memory"}))
+        # Its type decides, not a property a row could lack.
+        assert is_strategy_decision(self._node(STRATEGY_DECISION_NODE_TYPE, {}))
+
+    def test_a_marked_decision_is_still_a_projection_for_now(self):
+        """The one-release fallback: a pre-split row is routed to the file."""
+        assert is_strategy_decision(self._node(DECISION_NODE_TYPE, {"source": "strategic_memory"}))
+
+    def test_an_unmarked_decision_is_an_original(self):
+        assert not is_strategy_decision(self._node(DECISION_NODE_TYPE, {"source_message_id": "1"}))
+        assert not is_strategy_decision(self._node(DECISION_NODE_TYPE, {"source": "elsewhere"}))
+        assert not is_strategy_decision(self._node("action_item", {"source": "strategic_memory"}))
+        assert not is_strategy_decision(None)
+
+    def test_routing_matches_the_registry(self):
+        """The claim-shaped types mark_superseded sends to a file are exactly
+        the claim-shaped types the registry seeds as projections."""
+        from kestrel_sovereign.storage.node_type_registry import SEED_ENTRIES
+        from kestrel_sovereign.storage.schema_router import CLAIM_SHAPED_NODE_TYPES
+
+        seeds = {entry.node_type: entry for entry in SEED_ENTRIES}
+        for node_type in CLAIM_SHAPED_NODE_TYPES:
+            routed_to_file = is_strategy_decision(self._node(node_type, {}))
+            assert routed_to_file is seeds[node_type].is_projection, node_type
+        assert seeds[STRATEGY_DECISION_NODE_TYPE].canonical_location == "STRATEGY.yaml"
+
 
 class TestConcurrentSupersession:
     """A rebuild must not write over a node changed under it mid-projection.
@@ -640,6 +727,151 @@ class TestSupersessionThroughTheGraphPath:
     async def _supersedes_edges(self, raw):
         edges = await raw.graph.get_edges(NEW_ID, direction="out")
         return [(e.source_id, e.target_id) for e in edges if e.label == "supersedes"]
+
+    # --- #4248: splitting ``decision`` changes typing, not behaviour --------
+
+    #: Decisions extracted from conversation, interleaved in time with the
+    #: two STRATEGY.yaml decisions (2026-07-01 and 2026-07-02).
+    _EXTRACTED = (
+        ("move to brooklyn", "2026-07-03T09:00:00+00:00"),
+        ("keep the old car", "2026-07-01T12:00:00+00:00"),
+        ("learn the cello", "2026-06-30T08:00:00+00:00"),
+    )
+
+    @staticmethod
+    def _extracted_id(index):
+        return f"decision:{AGENT}:{index:016x}"
+
+    async def _pre_split_world(self, tmp_path, name):
+        """A real agent store as it stood before the split: STRATEGY.yaml
+        decisions projected as marked ``decision`` rows, beside extracted ones."""
+        from contextlib import AsyncExitStack
+
+        from kestrel_sovereign.storage import AsyncStorage
+        from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+        stack = AsyncExitStack()
+        raw = await stack.enter_async_context(
+            AsyncStorage(str(tmp_path / f"{name}.db"), agent_id=AGENT)
+        )
+        strategy_path = tmp_path / name / "STRATEGY.yaml"
+        strategy_path.parent.mkdir()
+        _write_strategy_file(strategy_path, [_OLD, _NEW])
+        agent = self._agent(raw, strategy_path)
+        await self._strategic(agent)
+        await raw.db.execute(
+            "UPDATE graph_nodes SET node_type = ? WHERE node_type = ?",
+            (DECISION_NODE_TYPE, STRATEGY_DECISION_NODE_TYPE),
+        )
+        for index, (text, created_at) in enumerate(self._EXTRACTED):
+            await raw.graph.add_node(GraphNode(
+                node_id=self._extracted_id(index),
+                node_type=DECISION_NODE_TYPE,
+                label=text,
+                properties={"text": text, "agent_id": AGENT, "confidence": 0.8,
+                            "source_message_id": str(index), "created_at": created_at},
+            ))
+        return stack, raw, agent, strategy_path
+
+    async def _recalls(self, memory):
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        found = {}
+        for kwargs in ({}, {"include_superseded": True}, {"limit": 3}, {"limit": 1}):
+            result = await memory.recall_decisions(**kwargs)
+            assert result.status is ToolResultStatus.OK, result
+            found[repr(kwargs)] = result.data["decisions"]
+        return found
+
+    async def test_recall_decisions_is_the_same_before_and_after_the_split(self, tmp_path):
+        """Same rows, same order, same limit, from both types (rv-4244-1 §4)."""
+        from kestrel_sovereign.storage.node_type_registry import apply_seed_v2
+
+        stack, raw, agent, _ = await self._pre_split_world(tmp_path, "world")
+        async with stack:
+            memory = self._memory(agent)
+            # What the single-type query returned before the split.
+            pre_split = await raw.graph.query_nodes_by_type_and_property(
+                DECISION_NODE_TYPE, filters={"agent_id": AGENT}, order_by_created=True, limit=3,
+            )
+            before = await self._recalls(memory)
+
+            report = await apply_seed_v2(raw.db)
+            assert report.retyped == 2
+            after = await self._recalls(memory)
+
+        assert after == before
+        assert [d["id"] for d in before["{'limit': 3}"]] == [n.node_id for n in pre_split]
+        # Newest first across both kinds, cut by the limit.
+        assert [d["text"] for d in after["{'limit': 3}"]] == [
+            "move to brooklyn", _NEW["decision"], "keep the old car",
+        ]
+        assert len(after["{}"]) == len(self._EXTRACTED) + 2
+        assert [d["text"] for d in after["{'limit': 1}"]] == ["move to brooklyn"]
+
+    async def test_mark_superseded_is_the_same_before_and_after_the_split(self, tmp_path):
+        """A projected decision goes to the file and an extracted one is
+        superseded in place, before the split (the marked-row fallback) and
+        after it (the registered type), across the two kinds."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.storage.node_type_registry import apply_seed_v2
+
+        outcomes = {}
+        for migrated in (False, True):
+            name = "after" if migrated else "before"
+            stack, raw, agent, strategy_path = await self._pre_split_world(tmp_path, name)
+            async with stack:
+                if migrated:
+                    await apply_seed_v2(raw.db)
+                assert (await raw.graph.get_node(OLD_ID)).node_type == (
+                    STRATEGY_DECISION_NODE_TYPE if migrated else DECISION_NODE_TYPE
+                )
+                memory = self._memory(agent)
+                extracted = self._extracted_id(1)
+                in_place = await memory.mark_superseded(old_id=extracted, new_id=NEW_ID, reason="moved")
+                to_file = await memory.mark_superseded(
+                    old_id=OLD_ID, new_id=self._extracted_id(0), reason="leases"
+                )
+                for result in (in_place, to_file):
+                    assert result.status is ToolResultStatus.OK, result
+                # A restart re-projects the file over the graph: neither
+                # supersession is undone by it.
+                restarted = self._agent(raw, strategy_path)
+                await self._strategic(restarted)
+                edges = []
+                for node_id in (NEW_ID, self._extracted_id(0)):
+                    for e in await raw.graph.get_edges(node_id, direction="out"):
+                        edges.append(
+                            (e.source_id, e.target_id, e.label, (e.properties or {}).get("reason"))
+                        )
+                edges.sort()
+                superseded = {
+                    node_id: (await raw.graph.get_node(node_id)).properties.get("superseded_by")
+                    for node_id in (extracted, OLD_ID)
+                }
+                on_disk = _decision_in(_read_strategy_file(strategy_path), _OLD["decision"])
+                outcomes[migrated] = {
+                    "in_place": in_place.data,
+                    "to_file": to_file.data,
+                    "edges": edges,
+                    "superseded_by": superseded,
+                    "file_superseded_by": on_disk["superseded_by"],
+                    "recall": await self._recalls(self._memory(restarted)),
+                }
+
+        assert outcomes[True] == outcomes[False]
+        assert outcomes[True]["to_file"]["yaml_written"] is True
+        assert "yaml_written" not in outcomes[True]["in_place"]
+        assert outcomes[True]["superseded_by"] == {
+            self._extracted_id(1): NEW_ID, OLD_ID: self._extracted_id(0),
+        }
+        assert outcomes[True]["file_superseded_by"] == self._extracted_id(0)
+        assert outcomes[True]["edges"] == sorted([
+            (NEW_ID, self._extracted_id(1), "supersedes", "moved"),
+            (self._extracted_id(0), OLD_ID, "supersedes", "leases"),
+        ])
+        current = [d["id"] for d in outcomes[True]["recall"]["{}"]]
+        assert self._extracted_id(1) not in current and OLD_ID not in current
 
     async def test_yaml_superseded_by_projects_to_node(self, raw, strategy_path):
         _write_strategy_file(

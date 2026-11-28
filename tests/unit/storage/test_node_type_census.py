@@ -18,6 +18,7 @@ from kestrel_sovereign.storage.node_type_census import (
     CORE_OWNER,
     SITE_GRAPH_NODE,
     SITE_SQL,
+    WriteSite,
     run_census,
     scan_write_sites,
 )
@@ -25,8 +26,19 @@ from kestrel_sovereign.storage.node_type_census import (
 ALICE = "did:example:alice"
 BOB = "did:example:bob"
 
-#: rv-4135-1's ruled types. Their seeds follow the ruling, not the census.
-RULED = {"fact", "strategy_pattern", "strategy_blocker", "decision", "learned_fact", "note", "excerpt", "stash"}
+#: The ruled types: rv-4135-1's, with ``decision`` replaced by the
+#: ``strategy_decision`` rv-4244-1 split from it. Their seeds follow the
+#: rulings, not the census. ``decision`` is out of this set, so its seed is
+#: checked against the census like any other (rv-4244-1 §5): this exemption
+#: is what let its wrong v1 seed pass.
+RULED = {
+    "fact", "strategy_pattern", "strategy_blocker", "strategy_decision",
+    "learned_fact", "note", "excerpt", "stash",
+}
+
+#: Ruled types whose census shows more than one owner, each with the issue
+#: that settles who owns it. Empty: every ruled type the census sees has one.
+RULED_MULTI_OWNER: dict[str, int] = {}
 
 
 def _write(root: Path, relative: str, source: str) -> None:
@@ -395,7 +407,18 @@ def test_real_tree_write_sites(real_tree_sites):
     assert [(s.path, s.function) for s in by_type["todo_item"]] == [
         ("kestrel_sovereign/features/todo/feature.py", "TodoFeature._persist")
     ]
-    assert {s.owning_feature for s in by_type["decision"]} == {"StrategicMemoryFeature", CORE_OWNER}
+    # rv-4244-1 §5: one owner each, and the census finds one module for
+    # ``decision``, which its seed names as its writer.
+    assert {s.owning_feature for s in by_type["decision"]} == {CORE_OWNER}
+    assert {s.module for s in by_type["decision"]} == {"kestrel_sovereign.storage.schema_router"}
+    assert {s.owning_feature for s in by_type["strategy_decision"]} == {"StrategicMemoryFeature"}
+    assert {s.module for s in by_type["strategy_decision"]} == {
+        "kestrel_sovereign.features.strategic_memory.decision_index",
+    }
+    # The v2 seed migration retypes rows of both: a core site of no one type.
+    assert (
+        "kestrel_sovereign.storage.node_type_registry", "apply_seed_v2",
+    ) in {(s.module, s.function) for s in by_type[None]}
     assert {s.module for s in by_type["feature_config"]} == {
         "kestrel_sovereign.features.base", "kestrel_sovereign.features.isolated_runtime",
     }
@@ -424,6 +447,57 @@ def test_real_tree_write_sites(real_tree_sites):
     } <= dynamic
     # The storage facades are the write path: their callers are listed instead.
     assert not {(s.module, s.function) for s in sites} & census_module.GRAPH_WRITE_FORWARDERS
+
+
+def _ruled_multi_owner_violations(sites, ruled, listed) -> dict:
+    """The ruled types the census gives more than one owner, unless listed."""
+    owners: dict = {}
+    for site in sites:
+        if site.node_type in ruled:
+            owners.setdefault(site.node_type, set()).add(site.owning_feature)
+    return {
+        node_type: found
+        for node_type, found in owners.items()
+        if len(found) > 1 and node_type not in listed
+    }
+
+
+def test_a_ruled_type_has_one_owner_unless_listed(real_tree_sites):
+    """rv-4244-1 §5: a ruled type with two owners fails unless an issue owns it.
+
+    A ruled type's seed follows its ruling, not the census, so nothing else
+    notices when a second owner writes it. ``decision`` had two that way.
+    """
+    assert _ruled_multi_owner_violations(real_tree_sites, RULED, RULED_MULTI_OWNER) == {}
+    owners: dict = {}
+    for site in real_tree_sites:
+        owners.setdefault(site.node_type, set()).add(site.owning_feature)
+    for node_type, issue in RULED_MULTI_OWNER.items():
+        assert node_type in RULED, node_type
+        assert isinstance(issue, int) and issue > 0, (node_type, issue)
+        # A listed type that has one owner again comes off the list.
+        assert len(owners.get(node_type, ())) > 1, node_type
+
+
+def test_multi_owner_guard_fails_a_second_owner():
+    """The guard fires on the shape it exists for, and a listing silences it."""
+
+    def site(node_type, owner):
+        return WriteSite("m", "m.py", 1, "f", SITE_GRAPH_NODE, node_type, "'t'", owner)
+
+    sites = [
+        site("ruled_type", "OneFeature"),
+        site("ruled_type", CORE_OWNER),
+        site("single_owner", CORE_OWNER),
+        site("unruled", "OneFeature"),
+        site("unruled", CORE_OWNER),
+    ]
+    ruled = {"ruled_type", "single_owner"}
+
+    assert _ruled_multi_owner_violations(sites, ruled, {}) == {
+        "ruled_type": {"OneFeature", CORE_OWNER},
+    }
+    assert _ruled_multi_owner_violations(sites, ruled, {"ruled_type": 4244}) == {}
 
 
 def test_seeds_agree_with_the_census(real_tree_sites):

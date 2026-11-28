@@ -39,6 +39,7 @@ from .db import (
     ConnectionError,
     DatabaseBackend,
     SQLiteBackend,
+    TransactionError,
     get_backend,
     normalize_schema,
 )
@@ -2555,7 +2556,9 @@ class AsyncDatabase:
         registered once, under their own ``schema_backfills`` marker, and
         inside the same lock and transaction as that marker. Seeding never
         replaces an entry already registered, so a durable entry outlives
-        every later boot.
+        every later boot. The one entry a later seed changes, ``decision``,
+        is changed by that seed's own migration and marker
+        (:func:`node_type_registry.apply_seed_v2`).
 
         The probe is :meth:`_node_type_registry_in_creation_schema`, not
         :meth:`table_exists`, so the table is found in the schema it is
@@ -2578,6 +2581,30 @@ class AsyncDatabase:
                 if not await self._backfill_completed(marker):
                     await node_type_registry.seed_node_type_registry(self)
                     await self._mark_backfill_completed(marker)
+
+        # rv-4244-1's split of ``decision``, in the same transaction as its
+        # marker. Reported only once that has committed, so a rolled-back run
+        # reports nothing; a refusal raises before it writes.
+        marker = node_type_registry.SEED_V2_MARKER
+        report = None
+        if not await self._backfill_completed(marker):
+            try:
+                async with self.migration_lock(marker):
+                    if not await self._backfill_completed(marker):
+                        report = await node_type_registry.apply_seed_v2(self)
+                        await self._mark_backfill_completed(marker)
+            except TransactionError as exc:
+                # The migration transaction wraps what its block raised. A
+                # refusal is a named boot outcome, not a storage fault. It is
+                # raised with its own cause: ``from exc`` would make the chain
+                # a cycle, ``exc`` being caused by it.
+                refused = exc.__cause__
+                if isinstance(refused, node_type_registry.SeedV2Refused):
+                    raise refused from refused.__cause__
+                raise
+        if report is not None:
+            log = logger.warning if report.id_shape_mismatches else logger.info
+            log("%s: %s", marker, report.describe())
 
     async def _node_type_registry_in_creation_schema(self) -> bool:
         """Whether the registry exists in the schema its DDL creates it in.

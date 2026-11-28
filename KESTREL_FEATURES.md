@@ -460,7 +460,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `get_episodes` | `!memory episodes` | `memory` | `limit`, `query` | 152 | `enabled` |
 | `list_conversations` | `!memory conversations` | `memory` | `limit`, `include_trashed` | 168 | `enabled` |
 | `list_trashed_messages` | `!memory trash` | `memory` | `limit` | 168 | `enabled` |
-| `mark_superseded` | `!memory supersede` | `memory` | `old_id`, `new_id`, `reason` | 140 | `enabled` |
+| `mark_superseded` | `!memory supersede` | `memory` | `old_id`, `new_id`, `reason` | 144 | `enabled` |
 | `memory_consolidate` | `!memory consolidate` | `memory` |  | 72 | `enabled` |
 | `memory_index_backfill` | `!memory index-backfill` | `system` | `batch_size` | 67 | `enabled` |
 | `memory_status` | `!memory status` | `system` |  | 36 | `enabled` |
@@ -468,7 +468,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `purge_message_by_id` | `!memory purge-message` | `memory` | `message_id`, `confirm`, `session_id`, `reason` | 210 | `enabled` |
 | `read_message_by_id` | `!memory read-message` | `memory` | `message_id`, `offset`, `length`, `session_id` | 259 | `enabled` |
 | `recall_action_items` | `!memory actions` | `memory` | `status`, `days`, `assignee_concept_id`, `limit`, `include_superseded` | 240 | `enabled` |
-| `recall_decisions` | `!memory decisions` | `memory` | `limit`, `include_superseded` | 91 | `enabled` |
+| `recall_decisions` | `!memory decisions` | `memory` | `limit`, `include_superseded` | 108 | `enabled` |
 | `recall_emotional` | `!memory recall` | `memory` | `query`, `mood`, `limit`, `min_relevance` | 237 | `enabled` |
 | `recall_interactions` | `!memory interactions` | `memory` | `person_concept_id`, `limit` | 67 | `enabled` |
 | `recall_recent` | `!memory recent` | `memory` | `limit` | 80 | `enabled` |
@@ -1071,7 +1071,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!memory confirm-person` | `memory` | `<message_id> <mentioned_label> <concept_id>` | Resolve an ambiguous person mention by confirming which existing concept it refers to. |
 | `!memory consolidate` | `memory` |  | Consolidate recent messages into narrative episodes, detect temporal patterns, and archive decayed memories. Runs the cognitive memory pipeline that turns raw conversation into structured long-term memory. Safe to schedule periodically (e.g. nightly). |
 | `!memory conversations` | `memory` | `[limit] [include_trashed]` | List your conversation sessions so you can navigate them before pruning. Returns session_id, title, message counts, timestamps and a short preview, most-recent first. Pass include_trashed=True to list soft-deleted sessions available to restore. Use the returned session_id with delete_conversation / restore_conversation / purge_conversation. |
-| `!memory decisions` | `memory` | `[limit] [include_superseded]` | Retrieve decisions the user has recorded (stored as graph nodes of type 'decision'). Superseded decisions are excluded by default; pass include_superseded=True to see them. |
+| `!memory decisions` | `memory` | `[limit] [include_superseded]` | Retrieve recorded decisions, newest first: graph nodes of type 'decision' (extracted from conversation) and 'strategy_decision' (from STRATEGY.yaml). Superseded decisions are excluded by default; pass include_superseded=True to see them. |
 | `!memory delete` | `memory` | `<pattern> [confirm] [session_id]` | Delete individual conversation messages matching a text pattern. Pass session_id to confine deletion to one conversation (recommended) so the pattern can't reach across unrelated sessions; omit it only to sweep all conversations. To discard a whole conversation, prefer delete_conversation. Requires Sovereign authorization. |
 | `!memory delete-conversation` | `memory` | `<session_id> [confirm]` | Soft-delete an entire conversation session (moves it to Trash; recoverable with restore_conversation). This is the right tool for discarding a whole disposable/test conversation — use it instead of pattern-matching delete_messages. Requires Sovereign authorization. |
 | `!memory delete-message` | `memory` | `<message_id> [session_id]` | Soft-delete a SINGLE conversation message by its message_id (moves it to Trash; recoverable with restore_message_by_id). Use this for surgical removal of one specific message — it addresses the row by identity, unlike delete_messages which matches by text. Pass session_id to guard: the delete is refused if that message isn't in the named conversation. Requires Sovereign authorization. |
@@ -1088,7 +1088,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!memory restore-message` | `memory` | `<message_id> [session_id]` | Restore a single soft-deleted message from Trash by its message_id, bringing it back into normal history. Pass session_id to guard against acting on the wrong message. |
 | `!memory search` | `memory` | `<query> [limit] [session_id]` | PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches conversation history client-side for reliable results. Pass session_id to scope to a single conversation thread. Each hit is a short snippet around the match with its message_id; read the message itself with read_message_by_id(message_id, offset=snippet_start). |
 | `!memory status` | `memory` |  | Check memory system health and statistics. Use this to understand my memory capabilities and current state. |
-| `!memory supersede` | `memory` | `<old_id> <new_id> [reason]` | Mark a claim node (decision or action_item) as superseded by a newer one. Creates a 'supersedes' edge from new to old and sets superseded_by on the old node. |
+| `!memory supersede` | `memory` | `<old_id> <new_id> [reason]` | Mark a claim node (decision, strategy_decision or action_item) as superseded by a newer one. Creates a 'supersedes' edge from new to old and sets superseded_by on the old node. |
 | `!memory trash` | `memory` | `[limit]` | List soft-deleted (trashed) individual messages so you can find one to restore_message_by_id or purge_message_by_id. Returns message_id, session_id, role, a short preview, and when it was trashed — most-recently-trashed first. This is the message-level counterpart to list_conversations(include_trashed=True), which lists whole trashed sessions; use this to find messages that were trashed individually (e.g. by delete_messages) inside otherwise-live conversations. |
 | `!memory-admin-unpin-all` | `memory_agency` |  | Administrative command: remove ALL active pins for this agent. Sovereign/admin use only. |
 | `!memory-admin-unpin-oldest` | `memory_agency` | `<count>` | Administrative command: remove the N oldest active pins. Sovereign/admin use only. |

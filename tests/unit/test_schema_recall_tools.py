@@ -277,7 +277,8 @@ class TestRecallDecisions:
         feature.agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=[])
         await feature.recall_decisions()
         call = feature.agent.storage.graph.query_nodes_by_type_and_property.await_args
-        assert call.args[0] == "decision"
+        # One query over both decision types (rv-4244-1 split ``decision``).
+        assert tuple(call.args[0]) == ("decision", "strategy_decision")
         filters = call.kwargs.get("filters") or call.args[1] if len(call.args) > 1 else call.kwargs["filters"]
         assert filters["agent_id"] == "did:test:recall-agent"
 

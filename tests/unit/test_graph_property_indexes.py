@@ -250,6 +250,29 @@ class TestQueryNodesByTypeAndProperty:
         assert results[0].node_type == "action_item"
 
     @pytest.mark.asyncio
+    async def test_several_types_share_one_order_and_limit(self, graph):
+        """A sequence of types is one query: newest first across all of them (#4248)."""
+        for node_id, node_type, created_at in (
+            ("decision:agent-A:1", "decision", "2026-07-01T00:00:00+00:00"),
+            ("decision:agent-A:strategy:2", "strategy_decision", "2026-07-03T00:00:00+00:00"),
+            ("decision:agent-A:3", "decision", "2026-07-02T00:00:00+00:00"),
+        ):
+            await graph.add_node(GraphNode(
+                node_id=node_id, node_type=node_type, label=node_id,
+                properties={"agent_id": "agent-A", "created_at": created_at},
+            ))
+        await graph.add_node(_make_action("agent-A"))
+
+        results = await graph.query_nodes_by_type_and_property(
+            ("decision", "strategy_decision"), filters={"agent_id": "agent-A"}, limit=2,
+        )
+
+        assert [n.node_id for n in results] == ["decision:agent-A:strategy:2", "decision:agent-A:3"]
+        for empty in ((), [], ("decision", 3)):
+            with pytest.raises(ValueError):
+                await graph.query_nodes_by_type_and_property(empty)
+
+    @pytest.mark.asyncio
     async def test_assignee_filter(self, graph):
         await graph.add_node(_make_action("agent-A", assignee="concept:alice"))
         await graph.add_node(_make_action("agent-A", assignee="concept:bob"))

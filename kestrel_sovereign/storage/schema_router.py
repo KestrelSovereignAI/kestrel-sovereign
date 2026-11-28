@@ -34,6 +34,7 @@ from kestrel_sovereign.execution_custody import is_execution_control_error
 
 from .associative_linker import LinkedConcept
 from .async_graph_store import AsyncGraphStore, GraphNode
+from .node_type_registry import DECISION_NODE_TYPE, STRATEGY_DECISION_NODE_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 ACTION_ITEM_NODE_TYPE = "action_item"
-DECISION_NODE_TYPE = "decision"
 
 ACTION_ITEM_STATUSES = ("pending", "done", "cancelled")
 
@@ -905,7 +905,16 @@ def _extract_epistemic_fields(metadata: Optional[Dict[str, Any]]) -> Optional[Di
     return fields if fields else None
 
 
-CLAIM_SHAPED_NODE_TYPES = frozenset({ACTION_ITEM_NODE_TYPE, DECISION_NODE_TYPE})
+#: The node types that hold a decision, both read by ``recall_decisions``: a
+#: decision this router extracts from conversation, and the copy of a
+#: ``STRATEGY.yaml`` decision strategic memory projects (rv-4244-1).
+DECISION_NODE_TYPES = (DECISION_NODE_TYPE, STRATEGY_DECISION_NODE_TYPE)
+
+#: The node types ``mark_superseded`` supersedes. Where it records one is
+#: ``decision_index.is_strategy_decision``'s answer: a ``strategy_decision``,
+#: and for now a marked ``decision`` from before the split, in ``STRATEGY.yaml``;
+#: every other node in place.
+CLAIM_SHAPED_NODE_TYPES = frozenset({ACTION_ITEM_NODE_TYPE, *DECISION_NODE_TYPES})
 
 
 def _deterministic_decision_node_id(

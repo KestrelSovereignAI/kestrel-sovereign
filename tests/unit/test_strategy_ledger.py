@@ -606,10 +606,11 @@ class TestProjection:
         healthy (#3064).
 
         The theory was that the graph might own a retirement the file cannot
-        express. Nothing can write one: memory_supersede_claim refuses every
-        node type outside CLAIM_SHAPED_NODE_TYPES, update_action_item
-        type-guards, and no module outside strategic_memory names these node
-        types at all. So the mechanism had no reachable legitimate case and
+        express. Nothing can write one: mark_superseded refuses every node
+        type outside CLAIM_SHAPED_NODE_TYPES (action_item, decision,
+        strategy_decision), update_action_item type-guards, and no module
+        outside strategic_memory writes these node types (the node-type
+        registry names them, and writes none of them). So the mechanism had no reachable legitimate case and
         one reachable harmful one, and the test that pinned it hand-wrote a
         world production cannot produce.
         """

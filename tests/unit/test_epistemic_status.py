@@ -13,8 +13,7 @@ Covers:
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -783,9 +782,8 @@ class TestRetrieverCertaintyWeighting:
 
 class TestClaimShapedNodeTypes:
 
-    def test_includes_decision_and_action_item(self):
-        assert "decision" in CLAIM_SHAPED_NODE_TYPES
-        assert "action_item" in CLAIM_SHAPED_NODE_TYPES
+    def test_includes_both_decision_types_and_action_item(self):
+        assert CLAIM_SHAPED_NODE_TYPES == {"action_item", "decision", "strategy_decision"}
 
     def test_excludes_concept(self):
         assert "concept" not in CLAIM_SHAPED_NODE_TYPES
