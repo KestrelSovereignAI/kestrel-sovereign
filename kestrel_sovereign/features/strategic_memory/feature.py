@@ -102,7 +102,7 @@ from .ledger_index import (
     LedgerSection,
     index_membership,
     project_ledger,
-    recalled_row,
+    recall_nodes,
     search_rows,
 )
 from .morning_signal import generate_morning_signal
@@ -2066,7 +2066,6 @@ class StrategicMemoryFeature(Feature):
 
     async def _recall_ledger(
         self,
-        tool: str,
         section: LedgerSection,
         limit: Any,
         include_retired: bool,
@@ -2128,40 +2127,15 @@ class StrategicMemoryFeature(Feature):
                 section.node_type,
                 e,
             )
-        # Imported here, not at module top: registered_recall imports this
-        # package's ledger_index, and this package's __init__ imports this
-        # module, so a top-level import would be circular.
-        from kestrel_sovereign.features.registered_recall import (
-            WITHHELD_REASONS,
-            RecallRefused,
-            fixed_recall_alias,
-            read_page,
-        )
-        from kestrel_sovereign.features.storage_access import (
-            resolve_feature_database,
-        )
-
-        alias = fixed_recall_alias(tool)
         try:
-            # The generic recall read (#4155): bounded, through the privacy
-            # wrapper, agent-scoped, and a governed row only while its
-            # canonical assertion is in an admitted state.
-            page = await read_page(
-                storage=storage,
-                registry_db=resolve_feature_database(self.agent),
-                agent_id=agent_id,
-                node_types=alias.node_types,
-                limit=limit_val,
+            rows = await recall_nodes(
+                graph_store,
+                agent_id,
+                section.node_type,
                 include_retired=include_retired,
-            )
-        except RecallRefused as e:
-            return ToolResult.failed(
-                str(e),
-                data={"node_type": section.node_type, "count": 0, "refused": e.reason},
+                limit=limit_val,
             )
         except Exception as e:  # noqa: BLE001
-            if is_execution_control_error(e):
-                raise
             # A query failure is not an empty result. Reporting zero here is
             # the precise lie this ticket was filed on.
             logger.error(
@@ -2171,18 +2145,12 @@ class StrategicMemoryFeature(Feature):
                 f"Could not read the strategy index: {e}",
                 data={"node_type": section.node_type, "count": 0},
             )
-        rows = [
-            {**recalled_row(row.node), "home": row.home(), "canonical_status": row.canonical_status}
-            for row in page.rows
-        ]
 
         data: Dict[str, Any] = {
             "count": len(rows),
             "limit_requested": limit_val,
             section.include_flag_name: include_retired,
             noun: rows,
-            **page.withheld_data(),
-            "deprecated_alias": alias.notice(),
         }
         confirmation = (
             f"Retrieved {len(rows)} {noun[:-1] if len(rows) == 1 else noun} "
@@ -2308,59 +2276,8 @@ class StrategicMemoryFeature(Feature):
             ):
                 drifted.add(row_id)
 
-        fallback = "strategy_search"
-        if include_retired:
-            # The advice has to name a path that can actually return the rows
-            # it is about: strategy_search excludes retired rows unless told
-            # otherwise, so recommending it bare for a retired-mode recall
-            # promises a fallback that structurally cannot answer (#3064).
-            fallback = "strategy_search(..., include_retired=True)"
-
-        # Rows the index holds that the generic read withheld (#4155): a
-        # governed row is recalled only while its canonical assertion is in an
-        # admitted state (rv-4135-1). Withholding is never silent: a short or
-        # empty page over rows the index holds is not a clean answer, and each
-        # reason is named for what it is.
-        withheld_notes = []
-        for reason, count in sorted(page.withheld.items()):
-            if reason == "canonical_inactive":
-                withheld_notes.append(
-                    f"{count} row(s) the index returned were withheld because "
-                    "their canonical assertion is not "
-                    + ("active or retired" if include_retired else "active")
-                    + f". A row retracted and then reactivated by hand in "
-                    f"{LEDGER_FILENAME} stays retracted, since retraction is "
-                    "terminal for the ledger's assertions."
-                )
-            elif reason == "canonical_absent":
-                withheld_notes.append(
-                    f"{count} row(s) the index returned were withheld because "
-                    "the assertion store holds no canonical assertion for "
-                    "them: the assertion was erased, or the ledger's assertion "
-                    "projection never wrote one. A privacy mode that writes no "
-                    "canonical assertions (anonymous) skips that projection, so "
-                    "a row added in it has none until a projection runs in a "
-                    "mode that does; a failed projection is retried on the next "
-                    f"one. This read ran in {storage.privacy_mode.value} mode."
-                )
-            else:
-                withheld_notes.append(
-                    f"{count} row(s) the index returned were withheld: "
-                    f"{WITHHELD_REASONS[reason]}."
-                )
-        stopped_short = page.stopped_short_note()
-        if stopped_short is not None:
-            withheld_notes.append(stopped_short)
-        withheld_note = " ".join(withheld_notes) if withheld_notes else None
-
         if not (missing or orphaned or misfiled or colliding or drifted):
-            if withheld_note is None:
-                return ToolResult.ok(confirmation=confirmation, data=data)
-            return ToolResult.partial(
-                confirmation=confirmation,
-                error=f"{withheld_note} Use {fallback} to read the canonical file.",
-                data=data,
-            )
+            return ToolResult.ok(confirmation=confirmation, data=data)
 
         data["index_stale"] = True
         divergences = []
@@ -2395,6 +2312,13 @@ class StrategicMemoryFeature(Feature):
                 "the index can hold only one of each -- reprojecting cannot "
                 f"fix that, {LEDGER_FILENAME} needs the duplicate ids resolved"
             )
+        fallback = "strategy_search"
+        if include_retired:
+            # The advice has to name a path that can actually return the rows
+            # it is about: strategy_search excludes retired rows unless told
+            # otherwise, so recommending it bare for a retired-mode recall
+            # promises a fallback that structurally cannot answer (#3064).
+            fallback = "strategy_search(..., include_retired=True)"
         if missing or orphaned or misfiled or drifted:
             remedy = (
                 "The index is stale or was never built -- restart the agent "
@@ -2417,7 +2341,6 @@ class StrategicMemoryFeature(Feature):
                 + ", and ".join(divergences)
                 + ". "
                 + remedy
-                + (f" {withheld_note}" if withheld_note else "")
             ),
             data=data,
         )
@@ -2425,8 +2348,6 @@ class StrategicMemoryFeature(Feature):
     @tool(
         name="recall_patterns",
         description=(
-            "Deprecated alias of recall(node_type='strategy_pattern'), removed "
-            "in 0.67.0. "
             "Recall learned patterns from the strategy index (graph nodes of "
             "type 'strategy_pattern'). Superseded patterns are excluded by "
             "default; pass include_superseded=True to see them."
@@ -2445,7 +2366,6 @@ class StrategicMemoryFeature(Feature):
             include_superseded: Include patterns that have been retired
         """
         return await self._recall_ledger(
-            tool="recall_patterns",
             section=PATTERN_SECTION,
             limit=limit,
             include_retired=include_superseded,
@@ -2454,8 +2374,6 @@ class StrategicMemoryFeature(Feature):
     @tool(
         name="recall_blockers",
         description=(
-            "Deprecated alias of recall(node_type='strategy_blocker'), removed "
-            "in 0.67.0. "
             "Recall blockers from the strategy index (graph nodes of type "
             "'strategy_blocker'). Resolved blockers are excluded by default; "
             "pass include_resolved=True to see them."
@@ -2474,7 +2392,6 @@ class StrategicMemoryFeature(Feature):
             include_resolved: Include blockers that have been resolved
         """
         return await self._recall_ledger(
-            tool="recall_blockers",
             section=BLOCKER_SECTION,
             limit=limit,
             include_retired=include_resolved,

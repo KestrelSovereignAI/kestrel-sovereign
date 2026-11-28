@@ -8,31 +8,42 @@ status, message trash state) live in those layers and not in a double.
 
 from __future__ import annotations
 
+import base64
+import dataclasses
+import importlib
+import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.a2a.task_manager import TaskManager
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.features import registered_recall
-from kestrel_sovereign.features.memory.feature import MemoryFeature
 from kestrel_sovereign.features.registered_recall import (
-    ALIAS_REMOVAL_RELEASE,
-    FIXED_RECALL_ALIASES,
     MAX_PAGE_SIZE,
     WITHHELD_REASONS,
     RecallRefused,
+    ScopeCarrier,
+    ServedType,
+    SourceCheck,
     list_recall_types,
+    read_node,
     read_page,
 )
+from kestrel_sovereign.features.save import feature as save_module
 from kestrel_sovereign.features.save.feature import SaveFeature
 from kestrel_sovereign.features.strategic_memory.feature import (
     StrategicMemoryFeature,
 )
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.knowledge import AssertionQuery, AssertionStatus
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
 from kestrel_sovereign.storage.node_type_registry import (
+    Governance,
     derive_governance,
     list_node_types,
 )
@@ -74,13 +85,6 @@ async def _save(agent) -> SaveFeature:
     return feature
 
 
-def _memory(agent) -> MemoryFeature:
-    feature = MemoryFeature.__new__(MemoryFeature)
-    feature.agent = agent
-    feature.agent_id = AGENT
-    return feature
-
-
 async def _strategic(agent) -> StrategicMemoryFeature:
     feature = StrategicMemoryFeature(agent)
     await feature.initialize()
@@ -88,16 +92,15 @@ async def _strategic(agent) -> StrategicMemoryFeature:
     return feature
 
 
-def _decision(index, *, created_at, agent=AGENT, **extra):
+def _decision(index, *, created_at, agent=AGENT, node_type="decision", **extra):
     return GraphNode(
-        node_id=f"decision:{agent}:{index:016x}",
-        node_type="decision",
-        label=f"decision {index}",
+        node_id=f"{node_type}:{agent}:{index:016x}",
+        node_type=node_type,
+        label=f"{node_type} {index}",
         properties={
-            "text": f"decision {index}",
+            "text": f"{node_type} {index}",
             "agent_id": agent,
             "confidence": 0.8,
-            "source_message_id": str(index),
             **({"created_at": created_at} if created_at is not None else {}),
             **extra,
         },
@@ -110,11 +113,15 @@ async def _recall(save, **kwargs):
     return result.data
 
 
+def _ids(data):
+    return [row["node_id"] for row in data["results"]]
+
+
 async def _all_pages(save, node_type, limit, **kwargs):
     seen, cursor, pages = [], "", 0
     while True:
         data = await _recall(save, node_type=node_type, limit=limit, cursor=cursor, **kwargs)
-        seen.extend(row["node_id"] for row in data["results"])
+        seen.extend(_ids(data))
         pages += 1
         cursor = data["next_cursor"] or ""
         if not cursor:
@@ -122,7 +129,7 @@ async def _all_pages(save, node_type, limit, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# recall_types
+# recall_types and the served-type declarations
 # ---------------------------------------------------------------------------
 
 
@@ -162,12 +169,66 @@ async def test_recall_types_lists_registry(stores, tmp_path):
     assert "API keys" in listed["feature_config"]["withheld_reason"]
 
 
-async def test_every_served_governed_type_has_a_canonical_status_mapping(stores):
+def test_every_served_type_declares_scope_source_and_canonical_requirement():
+    """C3 (au-4155-1): no served type goes without its three declarations.
+
+    The three fields have no default, so a type added to ``_SERVED`` without
+    one of them fails to construct; a default added to a field later fails
+    here. The table pins what each type declares (Findings 5 and 6, and the
+    message scoping of rv-4155-1).
+    """
+    fields = {f.name: f for f in dataclasses.fields(ServedType)}
+    for name in ("scope", "source", "canonical_required"):
+        assert fields[name].default is dataclasses.MISSING, name
+        assert fields[name].default_factory is dataclasses.MISSING, name
+    served = registered_recall._SERVED
+    assert set(served) == SERVED
+    for node_type, declaration in served.items():
+        assert isinstance(declaration.scope, ScopeCarrier), node_type
+        assert isinstance(declaration.source, SourceCheck), node_type
+        assert type(declaration.canonical_required) is bool, node_type
+    assert {
+        node_type: (d.scope, d.source, d.canonical_required) for node_type, d in served.items()
+    } == {
+        "action_item": (ScopeCarrier.AGENT_ID_PROPERTY, SourceCheck.SOURCE_MESSAGE_ID, False),
+        "decision": (ScopeCarrier.AGENT_ID_PROPERTY, SourceCheck.SOURCE_MESSAGE_ID, False),
+        "strategy_decision": (ScopeCarrier.AGENT_ID_PROPERTY, SourceCheck.NONE, False),
+        "strategy_pattern": (ScopeCarrier.AGENT_ID_PROPERTY, SourceCheck.NONE, True),
+        "strategy_blocker": (ScopeCarrier.AGENT_ID_PROPERTY, SourceCheck.NONE, True),
+        "message": (ScopeCarrier.NODE_ID_PREFIX, SourceCheck.OWN_ROW, False),
+    }
+    with pytest.raises(TypeError):
+        ServedType(scope=None, source=SourceCheck.NONE, canonical_required=False)
+    with pytest.raises(TypeError):
+        ServedType(
+            scope=ScopeCarrier.AGENT_ID_PROPERTY, source=SourceCheck.NONE, canonical_required=None
+        )
+    with pytest.raises(ValueError):
+        ServedType(
+            scope=ScopeCarrier.AGENT_ID_PROPERTY,
+            source=SourceCheck.OWN_ROW,
+            canonical_required=False,
+        )
+
+
+async def test_every_canonical_required_type_is_served_with_a_mapper(stores):
+    """Finding 11: named types, so a missing mapper fails here, not elsewhere.
+
+    ``withheld_reason`` withholds a governed type whose producer has no
+    mapper, so asking "is every served governed type mapped" could never
+    fail. This names the types that must be served and checks the mapper
+    directly.
+    """
     _, raw = stores
-    for described in await list_recall_types(raw.db):
-        if described.served and described.governance.governed:
-            module = __import__(described.governance.producer.module, fromlist=["x"])
-            assert callable(getattr(module, "graph_node_assertion_ids", None))
+    required = {t for t, d in registered_recall._SERVED.items() if d.canonical_required}
+    assert required == {"strategy_pattern", "strategy_blocker"}
+    listed = {d.entry.node_type: d for d in await list_recall_types(raw.db)}
+    for node_type in sorted(required):
+        described = listed[node_type]
+        assert described.served, (node_type, described.withheld)
+        assert described.governance.governed, node_type
+        module = importlib.import_module(described.governance.producer.module)
+        assert callable(getattr(module, "graph_node_assertion_ids", None)), node_type
 
 
 async def test_an_unregistered_or_withheld_type_is_refused(stores, tmp_path):
@@ -182,6 +243,102 @@ async def test_an_unregistered_or_withheld_type_is_refused(stores, tmp_path):
     assert withheld.status is ToolResultStatus.ERROR
     assert withheld.data["refused"] == "withheld"
     assert "API keys" in withheld.error
+
+
+def _governance_override(monkeypatch, node_type, governance):
+    real = registered_recall.derive_governance
+
+    def derive(name, **kwargs):
+        return governance if name == node_type else real(name, **kwargs)
+
+    monkeypatch.setattr(registered_recall, "derive_governance", derive)
+
+
+async def test_a_canonical_required_type_governance_calls_ungoverned_is_refused(
+    stores, tmp_path, monkeypatch
+):
+    """Finding 6: the canonical filter fails closed, not open.
+
+    A producer/ontology pin mismatch, a broken vocabulary package or a
+    missing producer module makes ``derive_governance`` report a ledger type
+    ungoverned. The read then refuses the type instead of serving its graph
+    nodes with no canonical check, so a retracted pattern stays out.
+    """
+    storage, _ = stores
+    agent, _strategic_feature, save, assertion, node_id = await _pattern_and_its_assertion(
+        storage, tmp_path
+    )
+    await storage.retract_assertion(
+        assertion.assertion_id, assertion.revision_id, operation_id="test:retract:f6"
+    )
+    pin = "ledger_assertions binds ontology kestrel-vocab@1.3.0, not kestrel-vocab@1.2.0"
+    _governance_override(
+        monkeypatch, "strategy_pattern", Governance("strategy_pattern", False, pin)
+    )
+
+    for include_retired in (False, True):
+        refused = await save.recall(node_type="strategy_pattern", include_retired=include_retired)
+        assert refused.status is ToolResultStatus.ERROR, refused
+        assert refused.data["refused"] == "withheld"
+        assert "ungoverned" in refused.error and pin in refused.error
+    lookup = await save.recall_get(node_id, node_type="strategy_pattern", include_retired=True)
+    assert lookup.data["refused"] == "withheld"
+    listed = {row["node_type"]: row for row in (await save.recall_types()).data["types"]}
+    assert listed["strategy_pattern"]["generic_read"] is False
+    assert pin in listed["strategy_pattern"]["withheld_reason"]
+    assert listed["strategy_blocker"]["generic_read"] is True
+
+
+@pytest.mark.parametrize("producer_module", [None, "kestrel_sovereign.features.registered_recall"])
+async def test_a_canonical_required_type_with_no_mapping_producer_is_refused(
+    stores, tmp_path, monkeypatch, producer_module
+):
+    """Governed with no producer, or one that maps no node: refused, not served.
+
+    The listing names the reason rather than failing for every type.
+    """
+    storage, _ = stores
+    agent, _strategic_feature, save, _assertion, node_id = await _pattern_and_its_assertion(
+        storage, tmp_path
+    )
+    producer = derive_governance("strategy_pattern").producer
+    if producer_module is not None:
+        producer = dataclasses.replace(producer, module=producer_module)
+    _governance_override(
+        monkeypatch,
+        "strategy_pattern",
+        Governance("strategy_pattern", True, "test", None if producer_module is None else producer),
+    )
+
+    refused = await save.recall(node_type="strategy_pattern")
+    lookup = await save.recall_get(node_id, node_type="strategy_pattern")
+    listing = await save.recall_types()
+
+    assert refused.data["refused"] == "withheld"
+    assert "maps no graph node to its assertion" in refused.error
+    assert lookup.data["refused"] == "withheld"
+    assert listing.status is ToolResultStatus.OK, listing
+    listed = {row["node_type"]: row for row in listing.data["types"]}
+    assert listed["strategy_pattern"]["generic_read"] is False
+    assert listed["strategy_blocker"]["generic_read"] is True
+
+
+async def test_a_governed_type_not_declared_canonical_required_is_refused(
+    stores, tmp_path, monkeypatch
+):
+    """A type that became governed is not served until its declaration says so."""
+    storage, raw = stores
+    await raw.graph.add_node(_decision(1, created_at="2026-07-01T00:00:00+00:00"))
+    producer = derive_governance("strategy_pattern").producer
+    _governance_override(
+        monkeypatch, "decision", Governance("decision", True, "test producer", producer)
+    )
+    save = await _save(_agent(storage, tmp_path))
+
+    refused = await save.recall(node_type="decision")
+
+    assert refused.data["refused"] == "withheld"
+    assert "does not require canonical status" in refused.error
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +380,7 @@ async def test_generic_read_is_paged_and_capped(stores, tmp_path):
     assert all(s is None for s in stamps[len(stamped):])
 
 
-async def test_a_cursor_for_another_type_is_refused(stores, tmp_path):
+async def test_a_cursor_for_another_type_or_not_a_string_is_refused(stores, tmp_path):
     storage, raw = stores
     for index in range(3):
         await raw.graph.add_node(_decision(index, created_at="2026-07-01T00:00:00+00:00"))
@@ -232,9 +389,15 @@ async def test_a_cursor_for_another_type_is_refused(stores, tmp_path):
 
     other = await save.recall(node_type="action_item", cursor=first["next_cursor"])
     garbage = await save.recall(node_type="decision", cursor="not-a-cursor")
+    not_a_string = await save.recall(node_type="decision", cursor=17)
+    nested = await save.recall(
+        node_type="decision", cursor=base64.urlsafe_b64encode(b"[" * 200_000).decode()
+    )
 
     assert other.data["refused"] == "bad_cursor"
     assert garbage.data["refused"] == "bad_cursor"
+    assert not_a_string.data["refused"] == "bad_cursor"
+    assert nested.data["refused"] == "bad_cursor"
 
 
 async def test_generic_read_agent_scoped(stores, tmp_path):
@@ -249,15 +412,13 @@ async def test_generic_read_agent_scoped(stores, tmp_path):
     data = await _recall(save, node_type="decision", limit=50)
     lookup = await save.recall_get(theirs.node_id, node_type="decision")
 
-    assert [row["node_id"] for row in data["results"]] == [mine.node_id]
+    assert _ids(data) == [mine.node_id]
     assert lookup.status is ToolResultStatus.ERROR
-    # And the aliases see exactly the same.
-    decisions = await _memory(_agent(storage, tmp_path)).recall_decisions()
-    assert [d["id"] for d in decisions.data["decisions"]] == [mine.node_id]
+    assert lookup.data["missing"] == "not_found"
 
 
 async def test_a_row_owned_here_but_naming_another_agent_is_not_returned(stores, tmp_path):
-    """The SQL agent_id filter holds even where the ownership ledger would not."""
+    """The agent_id property carrier holds even where the ownership ledger would not."""
     storage, raw = stores
     mine = _decision(1, created_at="2026-07-01T00:00:00+00:00")
     await raw.graph.add_node(mine)
@@ -273,7 +434,7 @@ async def test_a_row_owned_here_but_naming_another_agent_is_not_returned(stores,
     data = await _recall(save, node_type="decision", limit=50)
     lookup = await save.recall_get(theirs.node_id, node_type="decision")
 
-    assert [row["node_id"] for row in data["results"]] == [mine.node_id]
+    assert _ids(data) == [mine.node_id]
     assert lookup.data["missing"] == "foreign"
 
 
@@ -284,10 +445,40 @@ async def test_an_unbound_graph_store_is_refused(stores, tmp_path):
 
     with pytest.raises(RecallRefused) as refused:
         await read_page(
-            storage=storage, registry_db=raw.db, agent_id=AGENT, node_types=("decision",)
+            storage=storage,
+            registry_db=raw.db,
+            agent_id=AGENT,
+            node_types=("decision",),
+            conversation_store=raw.conversation,
         )
 
     assert refused.value.reason == "unscoped"
+
+
+async def test_a_missing_or_foreign_conversation_store_is_refused(stores, tmp_path):
+    """A type whose source is a message is refused when that cannot be checked."""
+    storage, raw = stores
+    async with governed_storage(str(raw.db_path), OTHER) as (_, other_raw):
+        for node_types in (("message",), ("decision",), ("action_item",)):
+            with pytest.raises(RecallRefused) as missing:
+                await read_page(
+                    storage=storage, registry_db=raw.db, agent_id=AGENT, node_types=node_types
+                )
+            assert missing.value.reason == "unavailable", node_types
+            with pytest.raises(RecallRefused) as foreign:
+                await read_page(
+                    storage=storage,
+                    registry_db=raw.db,
+                    agent_id=AGENT,
+                    node_types=node_types,
+                    conversation_store=other_raw.conversation,
+                )
+            assert foreign.value.reason == "unscoped", node_types
+    # A type with no message source needs no conversation store.
+    page = await read_page(
+        storage=storage, registry_db=raw.db, agent_id=AGENT, node_types=("strategy_decision",)
+    )
+    assert page.rows == ()
 
 
 @pytest.mark.parametrize(
@@ -296,8 +487,7 @@ async def test_an_unbound_graph_store_is_refused(stores, tmp_path):
 async def test_generic_read_through_privacy_wrapper(stores, tmp_path, mode):
     storage, raw = stores
     await raw.graph.add_node(_decision(1, created_at="2026-07-01T00:00:00+00:00"))
-    agent = _agent(storage, tmp_path)
-    save = await _save(agent)
+    save = await _save(_agent(storage, tmp_path))
     assert (await _recall(save, node_type="decision"))["count"] == 1
 
     # The raw store, unwrapped, is refused outright.
@@ -307,27 +497,63 @@ async def test_generic_read_through_privacy_wrapper(stores, tmp_path, mode):
         )
     assert unwrapped.value.reason == "not_privacy_wrapped"
 
-    strategic = await _strategic(agent)
-    memory = _memory(agent)
     storage.set_privacy_mode(mode)
     results = {
         "recall": await save.recall(node_type="decision"),
         "recall_get": await save.recall_get(
             _decision(1, created_at=None).node_id, node_type="decision"
         ),
-        # Every alias reads through the same gate.
-        "recall_decisions": await memory.recall_decisions(),
-        "recall_action_items": await memory.recall_action_items(),
-        "recall_interactions": await memory.recall_interactions(
-            person_concept_id=f"concept:{AGENT}:alice"
-        ),
-        "recall_patterns": await strategic.recall_patterns(),
-        "recall_blockers": await strategic.recall_blockers(),
     }
 
     for name, result in results.items():
         assert result.status is ToolResultStatus.ERROR, name
         assert result.data["refused"] == "privacy", name
+
+
+async def test_a_store_failure_is_a_failed_result_and_control_is_raised(
+    stores, tmp_path, monkeypatch
+):
+    """Finding 7: only a refusal was turned into a result before."""
+    storage, _ = stores
+    save = await _save(_agent(storage, tmp_path))
+
+    async def broken(**_):
+        raise RuntimeError("the graph store is gone")
+
+    monkeypatch.setattr(save_module, "read_page", broken)
+    monkeypatch.setattr(save_module, "read_node", broken)
+    failed_page = await save.recall(node_type="decision")
+    failed_lookup = await save.recall_get("decision:x", node_type="decision")
+    for result in (failed_page, failed_lookup):
+        assert result.status is ToolResultStatus.ERROR, result
+        assert "the graph store is gone" in result.error
+
+    async def withdrawn(**_):
+        raise ExecutionAuthorityError("original authority withdrawn")
+
+    monkeypatch.setattr(save_module, "read_page", withdrawn)
+    monkeypatch.setattr(save_module, "read_node", withdrawn)
+    with pytest.raises(ExecutionAuthorityError):
+        await save.recall(node_type="decision")
+    with pytest.raises(ExecutionAuthorityError):
+        await save.recall_get("decision:x", node_type="decision")
+
+
+def test_recall_types_command_routes_to_recall_types(tmp_path):
+    """Finding 10: a command routes by its first word.
+
+    ``!recall`` is recall's, so ``!recall types`` ran a saved-items search
+    for "types". This registers SaveFeature through the agent's own wiring
+    and routes through the real TaskManager.
+    """
+    manager = TaskManager.__new__(TaskManager)
+    manager._providers = {}
+    manager._skill_to_agent = {}
+    manager._command_to_skill = {}
+    save = SaveFeature(_agent(MagicMock(), tmp_path))
+    KestrelAgent._wire_feature_a2a(SimpleNamespace(task_manager=manager), save)
+
+    assert manager.get_agent_for_command("!recall-types") == (save.name, "recall_types")
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +590,6 @@ async def test_retracted_assertion_node_not_returned(stores, tmp_path):
     data = await _recall(save, node_type="strategy_pattern")
     assert data["count"] == 0
     assert data["withheld"] == {"canonical_inactive": 1}
-    assert (await strategic.recall_patterns()).data["count"] == 0
     lookup = await save.recall_get(node_id, node_type="strategy_pattern")
     assert lookup.status is ToolResultStatus.ERROR
     assert lookup.data["missing"] == "canonical_inactive"
@@ -386,7 +611,6 @@ async def test_erased_assertion_node_not_returned(stores, tmp_path):
         )
         assert data["count"] == 0, include_retired
         assert data["withheld"] == {"canonical_absent": 1}
-    assert (await strategic.recall_patterns(include_superseded=True)).data["count"] == 0
     lookup = await save.recall_get(node_id, node_type="strategy_pattern", include_retired=True)
     assert lookup.data["missing"] == "canonical_absent"
 
@@ -403,25 +627,28 @@ async def test_a_retired_pattern_returns_only_on_request_labelled_retracted(stor
     current = await _recall(save, node_type="strategy_pattern")
     retired = await _recall(save, node_type="strategy_pattern", include_retired=True)
     assert current["count"] == 0
-    assert [row["node_id"] for row in retired["results"]] == [node_id]
+    assert _ids(retired) == [node_id]
     assert retired["results"][0]["canonical_status"] == AssertionStatus.RETRACTED.value
 
 
-async def test_a_governed_row_with_no_assertion_is_withheld_as_absent(stores, tmp_path):
-    """ANONYMOUS writes no canonical assertion, and erasure leaves none (#4155 review).
+async def test_anonymous_mode_refuses_governed_types_and_their_rows_read_as_absent(
+    stores, tmp_path
+):
+    """ANONYMOUS writes no canonical assertions (rv-4155-1, Finding 2).
 
-    The two cannot be told apart, so the row stays withheld, under its own
-    reason, and the ledger's note names that cause rather than a hand edit.
-    A row written in a mode that does write assertions is still returned.
+    The read refuses the governed types there, naming the mode. A row written
+    in it has no assertion, so a later read in a mode that checks canonical
+    status withholds it as absent, while a row written with its assertion is
+    still returned. Ungoverned types still read in ANONYMOUS.
     """
-    storage, _ = stores
+    storage, raw = stores
     agent, strategic, save, assertion, kept = await _pattern_and_its_assertion(
         storage, tmp_path
     )
+    await raw.graph.add_node(_decision(1, created_at="2026-07-01T00:00:00+00:00"))
     storage.set_privacy_mode(PrivacyMode.ANONYMOUS)
 
     added = await strategic.strategy_add_pattern(pattern="learned while anonymous")
-
     assert added.status is ToolResultStatus.OK, added
     nodes = await storage.graph.query_nodes_by_type_and_property(
         "strategy_pattern", filters={"agent_id": AGENT}
@@ -431,48 +658,48 @@ async def test_a_governed_row_with_no_assertion_is_withheld_as_absent(stores, tm
         assertion.assertion_id
     ], "the assertion projection did not: anonymous mode refuses the write"
 
-    data = await _recall(save, node_type="strategy_pattern")
-    recalled = await strategic.recall_patterns()
+    for node_type in ("strategy_pattern", "strategy_blocker"):
+        refused = await save.recall(node_type=node_type)
+        assert refused.status is ToolResultStatus.ERROR, node_type
+        assert refused.data["refused"] == "privacy", node_type
+        assert "anonymous" in refused.error, node_type
+    lookup = await save.recall_get(kept, node_type="strategy_pattern")
+    assert lookup.data["refused"] == "privacy"
+    assert (await _recall(save, node_type="decision"))["count"] == 1
 
-    assert [row["node_id"] for row in data["results"]] == [kept]
+    storage.set_privacy_mode(PrivacyMode.NORMAL)
+    data = await _recall(save, node_type="strategy_pattern")
+    assert _ids(data) == [kept]
     assert data["withheld"] == {"canonical_absent": 1}
-    assert "erased" in data["withheld_reasons"]["canonical_absent"]
-    assert [row["node_id"] for row in recalled.data["patterns"]] == [kept]
-    assert recalled.data["withheld"] == {"canonical_absent": 1}
-    assert recalled.status is ToolResultStatus.PARTIAL
-    assert "no canonical assertion" in recalled.error
-    assert "This read ran in anonymous mode" in recalled.error
-    assert "reactivated by hand" not in recalled.error, (
-        "an absent assertion is not a retraction undone by hand"
-    )
+    assert "anonymous" in data["withheld_reasons"]["canonical_absent"]
 
 
 # ---------------------------------------------------------------------------
-# message: trash state at the source
+# message: scope by owner table and id prefix, trash state of its own row
 # ---------------------------------------------------------------------------
 
 
 _EPOCH = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
 
-async def _message_with_node(storage, raw, text, *, concept=None):
+def _message_properties(row_id, *, stamp_agent):
+    return {
+        "message_id": str(row_id),
+        **({"agent_id": AGENT} if stamp_agent else {}),
+        # Later rows are newer, so the newest message has the highest id.
+        "created_at": (_EPOCH + timedelta(minutes=row_id)).isoformat(),
+    }
+
+
+async def _message_with_node(storage, raw, text, *, stamp_agent=True):
     row_id = await storage.add_conversation("user", text)
     node_id = f"message:{AGENT}:{row_id}"
     await raw.graph.add_node(GraphNode(
         node_id=node_id,
         node_type="message",
         label=f"Message {row_id}",
-        properties={
-            "message_id": str(row_id),
-            "agent_id": AGENT,
-            # Later rows are newer, so the newest message has the highest id.
-            "created_at": (_EPOCH + timedelta(minutes=row_id)).isoformat(),
-        },
+        properties=_message_properties(row_id, stamp_agent=stamp_agent),
     ))
-    if concept is not None:
-        await raw.graph.add_edge(
-            node_id, concept, "mentions", properties={"sentiment": "positive", "topics": []}
-        )
     return row_id, node_id
 
 
@@ -490,10 +717,132 @@ async def test_trashed_message_not_returned(stores, tmp_path):
     # node is reachable through the graph after the message is in Trash.
     assert await raw.graph.get_node(trashed) is not None
     data = await _recall(save, node_type="message")
-    assert [row["node_id"] for row in data["results"]] == [kept]
+    assert _ids(data) == [kept]
     assert data["withheld"] == {"source_trashed": 1}
     lookup = await save.recall_get(trashed, node_type="message")
     assert lookup.data["missing"] == "source_trashed"
+
+
+async def test_a_message_without_an_agent_id_property_is_served(stores, tmp_path):
+    """C2 (au-4155-1): owner row and id prefix scope a message, not the property."""
+    storage, raw = stores
+    row_id, node_id = await _message_with_node(storage, raw, "no property", stamp_agent=False)
+    stored = await raw.graph.get_node(node_id)
+    assert "agent_id" not in stored.properties, "the bound store stamps no property"
+    save = await _save(_agent(storage, tmp_path))
+
+    data = await _recall(save, node_type="message")
+    lookup = await save.recall_get(node_id, node_type="message")
+
+    assert _ids(data) == [node_id]
+    assert data["withheld"] == {}
+    assert lookup.status is ToolResultStatus.OK, lookup
+    assert lookup.data["result"]["node_id"] == node_id
+
+
+async def _insert_legacy_message_node(raw, agent_id, row_id):
+    """A message node as a pre-#2649 writer left it: no agent_id, no owner row."""
+    await raw.db.execute(
+        "INSERT OR IGNORE INTO graph_nodes (node_id, node_type, label, properties) "
+        "VALUES (?, 'agent', ?, ?)",
+        (agent_id, agent_id, json.dumps({})),
+    )
+    node_id = f"message:{agent_id}:{row_id}"
+    await raw.db.execute(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) VALUES (?, ?, ?, ?)",
+        (node_id, "message", f"Message {row_id}",
+         json.dumps(_message_properties(row_id, stamp_agent=False))),
+    )
+    return node_id
+
+
+async def test_a_legacy_message_node_is_served_after_the_ownership_backfill(stores, tmp_path):
+    """rv-4155-1 (4): an upgraded database's message nodes stay readable.
+
+    Message nodes written before #2649 carry no ``properties.agent_id``; the
+    ownership backfill records their owner from the id prefix and does not
+    stamp the property. Pushing ``agent_id`` into SQL for ``message`` (as
+    eca5d166 did) would drop every such node silently. Another agent's legacy
+    node is owned by that agent and returned by neither read.
+    """
+    storage, raw = stores
+    mine_row = await storage.add_conversation("user", "before the owner table")
+    mine = await _insert_legacy_message_node(raw, AGENT, mine_row)
+    async with governed_storage(str(raw.db_path), OTHER) as (other, other_raw):
+        theirs_row = await other.add_conversation("user", "another agent's")
+        theirs = await _insert_legacy_message_node(other_raw, OTHER, theirs_row)
+    assert await raw.graph.get_node(mine) is None, "unowned before the backfill"
+
+    await raw.db._backfill_graph_ownership()
+
+    owners = dict(await raw.db.fetchall(
+        "SELECT node_id, agent_id FROM graph_node_owners WHERE node_id IN (?, ?)",
+        (mine, theirs),
+    ))
+    assert owners == {mine: AGENT, theirs: OTHER}
+    assert "agent_id" not in (await raw.graph.get_node(mine)).properties
+    save = await _save(_agent(storage, tmp_path))
+
+    data = await _recall(save, node_type="message")
+    page = await read_page(
+        storage=storage,
+        registry_db=raw.db,
+        agent_id=AGENT,
+        node_types=("message",),
+        conversation_store=raw.conversation,
+    )
+    found = await read_node(
+        storage=storage,
+        registry_db=raw.db,
+        agent_id=AGENT,
+        node_type="message",
+        node_id=mine,
+        conversation_store=raw.conversation,
+    )
+    other_lookup = await read_node(
+        storage=storage,
+        registry_db=raw.db,
+        agent_id=AGENT,
+        node_type="message",
+        node_id=theirs,
+        conversation_store=raw.conversation,
+    )
+
+    assert _ids(data) == [mine]
+    assert [row.node.node_id for row in page.rows] == [mine]
+    assert page.withheld == {}
+    assert found.row is not None and found.row.node.node_id == mine
+    assert other_lookup.row is None and other_lookup.missing == "not_found"
+
+
+async def test_a_message_node_owned_here_with_another_agents_prefix_is_foreign(
+    stores, tmp_path
+):
+    """The id prefix is the message scope carrier: failing it is withheld and counted."""
+    storage, raw = stores
+    _, mine = await _message_with_node(storage, raw, "mine")
+    row_id = await storage.add_conversation("user", "a live row of mine")
+    stray = GraphNode(
+        node_id=f"message:{OTHER}:{row_id}",
+        node_type="message",
+        label=f"Message {row_id}",
+        properties=_message_properties(row_id, stamp_agent=False),
+    )
+    await AsyncGraphStore(raw.db, agent_id=OTHER).add_node(stray)
+    await raw.db.execute(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+        (stray.node_id, AGENT),
+    )
+    assert await raw.graph.get_node(stray.node_id) is not None, "owned here too"
+    save = await _save(_agent(storage, tmp_path))
+
+    data = await _recall(save, node_type="message")
+    lookup = await save.recall_get(stray.node_id, node_type="message")
+
+    assert _ids(data) == [mine]
+    assert data["withheld"] == {"foreign": 1}
+    assert lookup.data["missing"] == "foreign"
+    assert "not found" in lookup.error
 
 
 async def test_an_archived_message_is_live_and_a_purged_one_is_not(stores, tmp_path):
@@ -502,7 +851,7 @@ async def test_an_archived_message_is_live_and_a_purged_one_is_not(stores, tmp_p
     ``memory_consolidator._archive_decayed`` stamps ``archived_at`` on any
     message whose strength decays below its floor, so archived means "faded",
     not trashed or erased. ``get_conversation_message`` hides archived rows,
-    which is why the read no longer asks it.
+    which is why the read does not ask it.
     """
     storage, raw = stores
     archived_row, archived = await _message_with_node(storage, raw, "faded")
@@ -514,7 +863,7 @@ async def test_an_archived_message_is_live_and_a_purged_one_is_not(stores, tmp_p
     )
     assert await storage.purge_conversation_message(purged_row, AGENT) is True
     assert await storage.get_conversation_message(archived_row) is None, (
-        "the old liveness check: an archived row reads as gone"
+        "the other liveness check: an archived row reads as gone"
     )
     save = await _save(_agent(storage, tmp_path))
 
@@ -522,7 +871,7 @@ async def test_an_archived_message_is_live_and_a_purged_one_is_not(stores, tmp_p
     archived_lookup = await save.recall_get(archived, node_type="message")
     purged_lookup = await save.recall_get(purged, node_type="message")
 
-    assert [row["node_id"] for row in data["results"]] == [archived]
+    assert _ids(data) == [archived]
     assert data["withheld"] == {"source_trashed": 1}
     assert data["withheld_reasons"] == {"source_trashed": WITHHELD_REASONS["source_trashed"]}
     assert archived_lookup.status is ToolResultStatus.OK
@@ -557,73 +906,104 @@ async def test_live_message_ids_reads_trash_state_only(stores):
     assert await raw.conversation.live_message_ids(many) == {live, archived}
 
 
-async def _mentioned_messages(storage, raw, *, total, trashed_newest):
-    """``total`` messages mentioning one person, the newest ``trashed_newest`` in Trash."""
-    concept = f"concept:{AGENT}:alice"
-    await raw.graph.add_node(GraphNode(
-        node_id=concept, node_type="concept", label="alice",
-        properties={"agent_id": AGENT, "category": "proper_noun"},
-    ))
-    made = [
-        await _message_with_node(storage, raw, f"alice {n}", concept=concept)
-        for n in range(total)
-    ]
+async def _messages(storage, raw, *, total, trashed_newest):
+    """``total`` messages, the newest ``trashed_newest`` in Trash."""
+    made = [await _message_with_node(storage, raw, f"message {n}") for n in range(total)]
     for row_id, _ in made[total - trashed_newest:]:
         assert await storage.delete_conversation_message(row_id, AGENT) is True
-    live_newest_first = [node_id for _, node_id in reversed(made[: total - trashed_newest])]
-    return concept, live_newest_first
+    return [node_id for _, node_id in reversed(made[: total - trashed_newest])]
 
 
-async def test_recall_interactions_fills_its_page_past_trashed_messages(stores, tmp_path):
+async def test_a_page_is_filled_past_withheld_rows(stores, tmp_path):
     """A page whose newest rows are withheld is not returned short (#4155 review).
 
-    30 messages mention the person and the 10 newest are in Trash, so 20 live
-    interactions exist. One bounded query of 10 finds only trashed messages;
-    the read queries on until the page is full and says what it withheld.
+    30 messages exist and the 10 newest are in Trash, so 20 are live. One
+    bounded query of 10 finds only trashed messages; the read queries on
+    until the page is full and says what it withheld.
     """
     storage, raw = stores
-    concept, live = await _mentioned_messages(storage, raw, total=30, trashed_newest=10)
-    agent = _agent(storage, tmp_path)
-    memory = _memory(agent)
-    save = await _save(agent)
+    live = await _messages(storage, raw, total=30, trashed_newest=10)
+    save = await _save(_agent(storage, tmp_path))
 
-    interactions = await memory.recall_interactions(person_concept_id=concept, limit=10)
-    generic = await _recall(save, node_type="message", limit=10)
+    first = await _recall(save, node_type="message", limit=10)
 
-    assert interactions.status is ToolResultStatus.OK, interactions
-    assert [i["message_node_id"] for i in interactions.data["interactions"]] == live[:10]
-    assert interactions.data["withheld"] == {"source_trashed": 10}
-    assert interactions.data["stopped_short"] is False
-    assert interactions.data["next_cursor"], "ten more live interactions remain"
-    assert [row["node_id"] for row in generic["results"]] == live[:10]
-    assert generic["withheld"] == {"source_trashed": 10}
-
-    rest = await _recall(save, node_type="message", limit=10, cursor=generic["next_cursor"])
-    assert [row["node_id"] for row in rest["results"]] == live[10:]
+    assert _ids(first) == live[:10]
+    assert first["withheld"] == {"source_trashed": 10}
+    assert first["stopped_short"] is False
+    assert first["next_cursor"], "ten more live messages remain"
+    rest = await _recall(save, node_type="message", limit=10, cursor=first["next_cursor"])
+    assert _ids(rest) == live[10:]
     assert rest["withheld"] == {}, "a withheld row is counted on the page that passed it"
 
 
 async def test_a_page_stopped_at_the_scan_bound_says_so(stores, tmp_path, monkeypatch):
     """A short page is partial when the read stopped before the type ran out."""
     storage, raw = stores
-    concept, live = await _mentioned_messages(storage, raw, total=30, trashed_newest=10)
+    live = await _messages(storage, raw, total=30, trashed_newest=10)
     monkeypatch.setattr(registered_recall, "MAX_SCAN_QUERIES", 1)
-    agent = _agent(storage, tmp_path)
-    memory = _memory(agent)
-    save = await _save(agent)
+    save = await _save(_agent(storage, tmp_path))
 
-    interactions = await memory.recall_interactions(person_concept_id=concept, limit=10)
-    generic = await save.recall(node_type="message", limit=10)
+    result = await save.recall(node_type="message", limit=10)
 
-    for result, key in ((interactions, "interactions"), (generic, "results")):
-        assert result.status is ToolResultStatus.PARTIAL, result
-        assert result.data[key] == []
-        assert result.data["withheld"] == {"source_trashed": 10}
-        assert result.data["stopped_short"] is True
-        assert result.data["next_cursor"]
-        assert "older rows past next_cursor were not read" in result.error
-    rest = await _recall(save, node_type="message", limit=10, cursor=generic.data["next_cursor"])
-    assert [row["node_id"] for row in rest["results"]] == live[:10]
+    assert result.status is ToolResultStatus.PARTIAL, result
+    assert result.data["results"] == []
+    assert result.data["withheld"] == {"source_trashed": 10}
+    assert result.data["stopped_short"] is True
+    assert result.data["next_cursor"]
+    assert "older rows past next_cursor were not read" in result.error
+    rest = await _recall(save, node_type="message", limit=10, cursor=result.data["next_cursor"])
+    assert _ids(rest) == live[:10]
+
+
+# ---------------------------------------------------------------------------
+# action_item and decision: the message each was extracted from
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("node_type", ["action_item", "decision"])
+async def test_a_row_whose_source_message_is_gone_is_withheld(stores, tmp_path, node_type):
+    """Finding 5: an extracted row is served only while its source message is live.
+
+    ``schema_router`` writes the message text into the row and names the
+    message as ``source_message_id``. Trash and purge leave the row in place
+    (no cascade), so the read withholds it and counts it. A row with no
+    source message, and an archived source, are served.
+    """
+    storage, raw = stores
+    rows = {}
+    for name in ("live", "archived", "trashed", "purged"):
+        rows[name] = await storage.add_conversation("user", f"call my lawyer ({name})")
+    nodes = {
+        name: _decision(index, created_at=f"2026-07-0{index + 1}T00:00:00+00:00",
+                        node_type=node_type, source_message_id=str(row_id))
+        for index, (name, row_id) in enumerate(rows.items())
+    }
+    nodes["unsourced"] = _decision(5, created_at="2026-07-06T00:00:00+00:00",
+                                   node_type=node_type, source_message_id=None)
+    nodes["unverifiable"] = _decision(6, created_at="2026-07-07T00:00:00+00:00",
+                                      node_type=node_type, source_message_id="not-a-row")
+    for node in nodes.values():
+        await raw.graph.add_node(node)
+    await raw.db.execute(
+        "UPDATE conversation_history SET archived_at = ? WHERE id = ?",
+        (_EPOCH.isoformat(), rows["archived"]),
+    )
+    assert await storage.delete_conversation_message(rows["trashed"], AGENT) is True
+    assert await storage.purge_conversation_message(rows["purged"], AGENT) is True
+    save = await _save(_agent(storage, tmp_path))
+
+    data = await _recall(save, node_type=node_type, limit=50)
+
+    assert set(_ids(data)) == {
+        nodes[name].node_id for name in ("live", "archived", "unsourced")
+    }
+    assert data["withheld"] == {"source_trashed": 2, "source_unverifiable": 1}
+    for name in ("trashed", "purged"):
+        assert await raw.graph.get_node(nodes[name].node_id) is not None, "no purge cascade"
+        lookup = await save.recall_get(nodes[name].node_id, node_type=node_type)
+        assert lookup.data["missing"] == "source_trashed", name
+    unverifiable = await save.recall_get(nodes["unverifiable"].node_id, node_type=node_type)
+    assert unverifiable.data["missing"] == "source_unverifiable"
 
 
 # ---------------------------------------------------------------------------
@@ -668,120 +1048,6 @@ async def test_result_names_home_and_projection(stores, tmp_path):
     marked = next(row for row in relabelled if row["node_id"] == projected["node_id"])
     assert marked["home"]["registered_type"] == "strategy_decision"
     assert marked["home"]["is_projection"] is True
-
-
-# ---------------------------------------------------------------------------
-# The fixed tools are aliases
-# ---------------------------------------------------------------------------
-
-
-async def _world(storage, raw, tmp_path):
-    agent = _agent(storage, tmp_path)
-    strategic = await _strategic(agent)
-    for index, stamp in enumerate(("2026-07-03", "2026-06-30")):
-        await raw.graph.add_node(_decision(index, created_at=f"{stamp}T00:00:00+00:00"))
-    await raw.graph.add_node(_decision(
-        9, created_at="2026-07-04T00:00:00+00:00", superseded_by=_decision(0, created_at=None).node_id
-    ))
-    await strategic.strategy_add_decision(decision="adopt durable leases", rationale="r")
-    for index, status in enumerate(("pending", "done")):
-        await raw.graph.add_node(GraphNode(
-            node_id=f"action:{AGENT}:{index}",
-            node_type="action_item",
-            label=f"item {index}",
-            properties={"text": f"item {index}", "status": status, "agent_id": AGENT,
-                        "created_at": f"2026-07-0{index + 1}T00:00:00+00:00"},
-        ))
-    await raw.graph.add_node(GraphNode(
-        node_id=f"action:{AGENT}:old",
-        node_type="action_item",
-        label="old",
-        properties={"text": "old", "status": "pending", "agent_id": AGENT,
-                    "created_at": "2026-07-05T00:00:00+00:00",
-                    "superseded_by": f"action:{AGENT}:0"},
-    ))
-    kept = await strategic.strategy_add_pattern(pattern="kept pattern")
-    retired = await strategic.strategy_add_pattern(pattern="retired pattern")
-    await strategic.strategy_supersede_pattern(
-        pattern_id=retired.data["pattern_id"], reason="no longer holds"
-    )
-    assert kept.status is ToolResultStatus.OK
-    await strategic.strategy_add_blocker(issue="#1", title="open blocker", severity="high")
-    resolved = await strategic.strategy_add_blocker(issue="#2", title="closed blocker")
-    await strategic.strategy_resolve_blocker(
-        issue=resolved.data["blocker_id"], resolution="landed"
-    )
-    concept = f"concept:{AGENT}:alice"
-    await raw.graph.add_node(GraphNode(
-        node_id=concept, node_type="concept", label="alice",
-        properties={"agent_id": AGENT, "category": "proper_noun"},
-    ))
-    await _message_with_node(storage, raw, "talked to alice", concept=concept)
-    trashed_row, _ = await _message_with_node(storage, raw, "alice again", concept=concept)
-    await _message_with_node(storage, raw, "no mention")
-    await storage.delete_conversation_message(trashed_row, AGENT)
-    return agent, strategic, concept
-
-
-async def test_alias_parity(stores, tmp_path):
-    storage, raw = stores
-    agent, strategic, concept = await _world(storage, raw, tmp_path)
-    memory = _memory(agent)
-    save = await _save(agent)
-
-    async def generic(node_type, **kwargs):
-        data = await _recall(save, node_type=node_type, limit=25, **kwargs)
-        return [row["node_id"] for row in data["results"]]
-
-    checks = [
-        ("recall_decisions", memory.recall_decisions, "decisions", "id", "decision,strategy_decision", "include_superseded"),
-        ("recall_action_items", memory.recall_action_items, "action_items", "id", "action_item", "include_superseded"),
-        ("recall_patterns", strategic.recall_patterns, "patterns", "node_id", "strategy_pattern", "include_superseded"),
-        ("recall_blockers", strategic.recall_blockers, "blockers", "node_id", "strategy_blocker", "include_resolved"),
-    ]
-    for tool, call, key, id_key, node_type, flag in checks:
-        for retired in (False, True):
-            result = await call(**{flag: retired})
-            assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL), (tool, result)
-            ids = [row[id_key] for row in result.data[key]]
-            assert ids, (tool, retired)
-            assert ids == await generic(node_type, include_retired=retired), (tool, retired)
-            assert all("home" in row for row in result.data[key])
-            assert result.data["deprecated_alias"]["removal_release"] == ALIAS_REMOVAL_RELEASE
-        # The default leaves retired rows out, the flag brings them back.
-        assert len(await generic(node_type)) < len(await generic(node_type, include_retired=True))
-
-    interactions = await memory.recall_interactions(person_concept_id=concept)
-    page = await read_page(
-        storage=storage,
-        registry_db=raw.db,
-        conversation_store=raw.conversation,
-        agent_id=AGENT,
-        node_types=("message",),
-        linked_to=("mentions", concept),
-    )
-    assert [i["message_node_id"] for i in interactions.data["interactions"]] == [
-        row.node.node_id for row in page.rows
-    ]
-    assert len(page.rows) == 1, "the trashed message's mention is not returned"
-    assert interactions.data["interactions"][0]["properties"]["sentiment"] == "positive"
-
-
-def test_fixed_tools_are_marked_deprecated_with_their_removal_release():
-    owners = {"MemoryFeature": MemoryFeature, "StrategicMemoryFeature": StrategicMemoryFeature}
-    assert {alias.tool for alias in FIXED_RECALL_ALIASES} == {
-        "recall_decisions",
-        "recall_action_items",
-        "recall_patterns",
-        "recall_blockers",
-        "recall_interactions",
-    }
-    for alias in FIXED_RECALL_ALIASES:
-        method = getattr(owners[alias.feature], alias.tool)
-        description = method._tool_schema["description"]
-        assert description.startswith("Deprecated alias of recall("), alias.tool
-        assert f"removed in {alias.removal_release}" in description, alias.tool
-        assert alias.removal_release == ALIAS_REMOVAL_RELEASE
 
 
 def test_no_knowledge_prefixed_tools():

@@ -467,10 +467,10 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `purge_conversation` | `!memory purge-conversation` | `memory` | `session_id`, `confirm`, `reason` | 155 | `enabled` |
 | `purge_message_by_id` | `!memory purge-message` | `memory` | `message_id`, `confirm`, `session_id`, `reason` | 210 | `enabled` |
 | `read_message_by_id` | `!memory read-message` | `memory` | `message_id`, `offset`, `length`, `session_id` | 259 | `enabled` |
-| `recall_action_items` | `!memory actions` | `memory` | `status`, `days`, `assignee_concept_id`, `limit`, `include_superseded` | 258 | `enabled` |
-| `recall_decisions` | `!memory decisions` | `memory` | `limit`, `include_superseded` | 129 | `enabled` |
+| `recall_action_items` | `!memory actions` | `memory` | `status`, `days`, `assignee_concept_id`, `limit`, `include_superseded` | 240 | `enabled` |
+| `recall_decisions` | `!memory decisions` | `memory` | `limit`, `include_superseded` | 108 | `enabled` |
 | `recall_emotional` | `!memory recall` | `memory` | `query`, `mood`, `limit`, `min_relevance` | 237 | `enabled` |
-| `recall_interactions` | `!memory interactions` | `memory` | `person_concept_id`, `limit` | 95 | `enabled` |
+| `recall_interactions` | `!memory interactions` | `memory` | `person_concept_id`, `limit` | 67 | `enabled` |
 | `recall_recent` | `!memory recent` | `memory` | `limit` | 80 | `enabled` |
 | `restore_conversation` | `!memory restore-conversation` | `memory` | `session_id` | 80 | `enabled` |
 | `restore_message_by_id` | `!memory restore-message` | `memory` | `message_id`, `session_id` | 118 | `enabled` |
@@ -562,11 +562,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `recall` | `!recall` | `memory` | `query`, `item_type`, `limit`, `node_type`, `cursor`, `include_retired` | 386 | `enabled` |
+| `recall` | `!recall` | `memory` | `query`, `item_type`, `limit`, `node_type`, `cursor`, `include_retired` | 389 | `enabled` |
 | `recall_delete` | `!recall delete` | `memory` | `item_id` | 41 | `enabled` |
 | `recall_get` | `!recall get` | `memory` | `item_id`, `node_type`, `include_retired` | 148 | `enabled` |
 | `recall_list` | `!recall list` | `memory` | `item_type`, `limit` | 108 | `enabled` |
-| `recall_types` | `!recall types` | `memory` |  | 78 | `enabled` |
+| `recall_types` | `!recall-types` | `memory` |  | 78 | `enabled` |
 | `save_excerpt` | `!save excerpt` | `memory` | `target`, `name`, `summary`, `tags` | 182 | `enabled` |
 | `save_item` | `!save item` | `memory` | `name`, `content`, `item_type`, `summary`, `tags`, `schema_id` | 302 | `enabled` |
 | `save_stash` | `!save stash` | `memory` | `stash_id`, `name`, `summary`, `tags` | 171 | `enabled` |
@@ -662,8 +662,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|---:|---|
 | `backlog_hygiene` | `!hygiene` | `system` | `fix` | 88 | `enabled` |
 | `morning_signal` | `!morning` | `system` |  | 67 | `enabled` |
-| `recall_blockers` | `!blockers` | `memory` | `limit`, `include_resolved` | 139 | `enabled` |
-| `recall_patterns` | `!patterns` | `memory` | `limit`, `include_superseded` | 142 | `enabled` |
+| `recall_blockers` | `!blockers` | `memory` | `limit`, `include_resolved` | 120 | `enabled` |
+| `recall_patterns` | `!patterns` | `memory` | `limit`, `include_superseded` | 123 | `enabled` |
 | `session_log` | `!sessionlog` | `system` | `session_id`, `focus` | 125 | `enabled` |
 | `signal_dispatch` | `!dispatch` | `system` | `mode` | 142 | `enabled` |
 | `strategy_add_blocker` |  | `system` | `issue`, `title`, `severity`, `owner`, `repo`, `notes` | 243 | `enabled` |
@@ -1067,19 +1067,19 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!remove-key` | `keys` | `<provider>` | Remove/deactivate a service key. Valid providers: openrouter, openai, anthropic, lighthouse, github, runpod, vastai (use list_providers for the authoritative set). |
 | `!rotate-key` | `keys` | `<provider> <new_api_key>` | Rotate an API key (requires constitutional approval). Valid providers: openrouter, openai, anthropic, lighthouse, github, runpod, vastai (use list_providers for the authoritative set). |
 | `!memory action update` | `memory` | `<item_id> [status] [due_date] [assignee_concept_id]` | Update an action item's status (pending/done/cancelled), due date, or assignee. |
-| `!memory actions` | `memory` | `[status] [days] [assignee_concept_id] [limit] [include_superseded]` | Deprecated alias of recall(node_type='action_item'), removed in 0.67.0. Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee. Superseded items are excluded by default; pass include_superseded=True to see them. |
+| `!memory actions` | `memory` | `[status] [days] [assignee_concept_id] [limit] [include_superseded]` | Retrieve action items the user committed to. Filters: status, creation-date window (days), assignee. Superseded items are excluded by default; pass include_superseded=True to see them. |
 | `!memory cases` | `memory` | `<query> [limit]` | Search past audit decisions and constitutional interpretations. Use this when I need precedent for ethical or governance decisions. |
 | `!memory confirm-person` | `memory` | `<message_id> <mentioned_label> <concept_id>` | Resolve an ambiguous person mention by confirming which existing concept it refers to. |
 | `!memory consolidate` | `memory` |  | Consolidate recent messages into narrative episodes, detect temporal patterns, and archive decayed memories. Runs the cognitive memory pipeline that turns raw conversation into structured long-term memory. Safe to schedule periodically (e.g. nightly). |
 | `!memory conversations` | `memory` | `[limit] [include_trashed]` | List your conversation sessions so you can navigate them before pruning. Returns session_id, title, message counts, timestamps and a short preview, most-recent first. Pass include_trashed=True to list soft-deleted sessions available to restore. Use the returned session_id with delete_conversation / restore_conversation / purge_conversation. |
-| `!memory decisions` | `memory` | `[limit] [include_superseded]` | Deprecated alias of recall(node_type='decision,strategy_decision'), removed in 0.67.0. Retrieve recorded decisions, newest first: graph nodes of type 'decision' (extracted from conversation) and 'strategy_decision' (from STRATEGY.yaml). Superseded decisions are excluded by default; pass include_superseded=True to see them. |
+| `!memory decisions` | `memory` | `[limit] [include_superseded]` | Retrieve recorded decisions, newest first: graph nodes of type 'decision' (extracted from conversation) and 'strategy_decision' (from STRATEGY.yaml). Superseded decisions are excluded by default; pass include_superseded=True to see them. |
 | `!memory delete` | `memory` | `<pattern> [confirm] [session_id]` | Delete individual conversation messages matching a text pattern. Pass session_id to confine deletion to one conversation (recommended) so the pattern can't reach across unrelated sessions; omit it only to sweep all conversations. To discard a whole conversation, prefer delete_conversation. Requires Sovereign authorization. |
 | `!memory delete-conversation` | `memory` | `<session_id> [confirm]` | Soft-delete an entire conversation session (moves it to Trash; recoverable with restore_conversation). This is the right tool for discarding a whole disposable/test conversation — use it instead of pattern-matching delete_messages. Requires Sovereign authorization. |
 | `!memory delete-message` | `memory` | `<message_id> [session_id]` | Soft-delete a SINGLE conversation message by its message_id (moves it to Trash; recoverable with restore_message_by_id). Use this for surgical removal of one specific message — it addresses the row by identity, unlike delete_messages which matches by text. Pass session_id to guard: the delete is refused if that message isn't in the named conversation. Requires Sovereign authorization. |
 | `!memory docs` | `memory` | `<query> [limit]` | Search my knowledge base and RAG documents for relevant information. Use this when I need to find information from files, documents, or other stored knowledge. |
 | `!memory episodes` | `memory` | `[limit] [query]` | Get consolidated memory episodes - narrative summaries of past conversation themes. Use this for high-level recall of what we've discussed over time. Pass `query` to recall episodes RELEVANT to a topic (semantic search, can surface older episodes); omit it for the most recent episodes. |
 | `!memory index-backfill` | `memory` | `[batch_size]` | Start or resume the privacy-preserving lexical memory index backfill. Runs in the background; use memory_status for durable coverage and completion health. |
-| `!memory interactions` | `memory` | `<person_concept_id> [limit]` | Deprecated alias of recall(node_type='message') narrowed to messages mentioning a person, removed in 0.67.0. List recent message→person interactions for a given person concept, with sentiment and topics. |
+| `!memory interactions` | `memory` | `<person_concept_id> [limit]` | List recent message→person interactions for a given person concept, with sentiment and topics. |
 | `!memory purge-conversation` | `memory` | `<session_id> [confirm] [reason]` | PERMANENTLY delete a conversation session — there is no recovery. Use only to destroy data for good; otherwise prefer delete_conversation (Trash). Requires Sovereign authorization. |
 | `!memory purge-message` | `memory` | `<message_id> [confirm] [session_id] [reason]` | PERMANENTLY delete a single message by its message_id — there is no recovery. This is the intentionally-harder path: prefer delete_message_by_id (Trash) unless you must destroy the data for good. Requires confirm=True and Sovereign authorization. |
 | `!memory read-message` | `memory` | `<message_id> [offset] [length] [session_id]` | Read ONE stored conversation message by its message_id, in ranged chunks. search_memory returns only a snippet of each hit; use this to read the message itself. Pass offset (for example a hit's snippet_start) to start mid-message and length to bound the chunk. Each chunk reports total_chars and next_offset: call again with offset=next_offset to read on. Pass session_id to refuse a stale id from another conversation. |
@@ -1128,7 +1128,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!recall delete` | `save` | `<item_id>` | Delete a saved item by ID. |
 | `!recall get` | `save` | `<item_id> [node_type] [include_retired]` | Get the full content of a saved item by ID, or, with node_type, one record of that registered node type by its node id. |
 | `!recall list` | `save` | `[item_type] [limit]` | List all saved items, optionally filtered by type. Optional item_type filter must be one of: stash, file, excerpt, structured. |
-| `!recall types` | `save` |  | List the registered node types recall(node_type=...) and recall_get(node_type=...) can read: each type's owning feature, canonical home, whether its graph record is the original or a projection, whether it is governed, and, for a type the generic read does not serve, why. |
+| `!recall-types` | `save` |  | List the registered node types recall(node_type=...) and recall_get(node_type=...) can read: each type's owning feature, canonical home, whether its graph record is the original or a projection, whether it is governed, and, for a type the generic read does not serve, why. |
 | `!save excerpt` | `save` | `<target> <name> [summary] [tags]` | Save conversation messages for later retrieval. Use this to preserve important discussions, decisions, or information. The target selects which messages: 'last_N' (e.g. last_10) for the most recent N messages, or 'ids:1,2,3' for specific message ids. |
 | `!save item` | `save` | `<name> <content> [item_type] [summary] [tags] [schema_id]` | Save arbitrary content (text, JSON) for later retrieval. Good for recipes, notes, decisions, and other content you want to recall. item_type must be one of: stash, file, excerpt, structured (default: structured) — do NOT invent your own type or the item becomes unfindable via recall. To finely type a 'structured' item (recipe, user_story, etc.) pass schema_id, not a custom item_type. |
 | `!save stash` | `save` | `[stash_id] [name] [summary] [tags]` | Save a stash to long-term storage for later retrieval. The stash content gets an embedding so you can find it later with semantic search. |
@@ -1158,11 +1158,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!export-sovereignty` | `sovereignty` | `[storage_tier] [encrypt] [on_progress]` | Export the agent's entire state to IPFS/Filecoin for sovereignty backup. storage_tier must be one of 'local', 'ipfs' (default), or 'filecoin'; an unrecognized value is rejected (it is NOT silently defaulted to ipfs). |
 | `!import-sovereignty` | `sovereignty` | `<cid>` | Restore this agent's CONVERSATION HISTORY from a prior backup (IPFS CID). Faithfully preserves message timestamps and trash state. NOTE: this currently restores conversation history only — NOT full agent state (memories, knowledge graph, saved items, files, settings). Full-state restore is tracked separately. |
 | `!state-of-mind` | `state_of_mind` |  | Get the current constitutional governance state for this agent |
-| `!blockers` | `strategic_memory` | `[limit] [include_resolved]` | Deprecated alias of recall(node_type='strategy_blocker'), removed in 0.67.0. Recall blockers from the strategy index (graph nodes of type 'strategy_blocker'). Resolved blockers are excluded by default; pass include_resolved=True to see them. |
+| `!blockers` | `strategic_memory` | `[limit] [include_resolved]` | Recall blockers from the strategy index (graph nodes of type 'strategy_blocker'). Resolved blockers are excluded by default; pass include_resolved=True to see them. |
 | `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and start it through a live feature-contributed dispatch workflow. Preview with mode='suggest'; execute fails closed when no compatible workflow capability and governed runner are enabled. When Talon policy names another agent as the host's dispatcher, execute instead sends that agent a work order (send_a2a_task) and arms wait('a2a:<dispatch_id>', mode='signal') for its report, one order at a time. |
 | `!hygiene` | `strategic_memory` | `[fix]` | Scan all repos for backlog hygiene issues: missing assignees, milestones, status labels. Reports gaps and flags items needing human review. |
 | `!morning` | `strategic_memory` |  | Generate a morning strategic briefing -- milestone status, blockers, the last 24h of workflow runs (failures and persistently failing workflows), recommended work items. Pulls live data from GitHub when GITHUB_TOKEN is available. |
-| `!patterns` | `strategic_memory` | `[limit] [include_superseded]` | Deprecated alias of recall(node_type='strategy_pattern'), removed in 0.67.0. Recall learned patterns from the strategy index (graph nodes of type 'strategy_pattern'). Superseded patterns are excluded by default; pass include_superseded=True to see them. |
+| `!patterns` | `strategic_memory` | `[limit] [include_superseded]` | Recall learned patterns from the strategy index (graph nodes of type 'strategy_pattern'). Superseded patterns are excluded by default; pass include_superseded=True to see them. |
 | `!sessionlog` | `strategic_memory` | `[session_id] [focus]` | End-of-day session log collector. Scans all repos for today's activity (issues closed, PRs merged, comments, commits) and generates a structured session summary with outcomes and metrics. |
 | `!strategy` | `strategic_memory` | `[section]` | View the current strategic context: vision, milestones, stakeholders, decisions, blockers, and patterns. |
 | `!strategy-reconcile` | `strategic_memory` | `[apply]` | Check each active blocker against live GitHub issue state and report which reference already-closed issues. Pass apply='yes' to resolve the stale rows. |

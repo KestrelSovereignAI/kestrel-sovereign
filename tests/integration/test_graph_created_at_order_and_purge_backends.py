@@ -214,23 +214,3 @@ async def test_keyset_pages_read_every_row_once_in_created_order(db_backend):
     assert seen == [n.node_id for n in whole], "pages concatenate to the whole order"
     assert sorted(seen) == sorted(expected) and len(seen) == len(set(seen))
 
-
-@pytest.mark.asyncio
-@pytest.mark.dual_backend
-async def test_linked_to_reads_only_nodes_with_that_edge(db_backend):
-    db = await _database(db_backend)
-    agent = f"did:test:linked-{uuid.uuid4().hex}"
-    node_type = f"linked_{uuid.uuid4().hex[:8]}"
-    graph = AsyncGraphStore(db, agent_id=agent)
-    target = f"{agent}:target"
-    await graph.add_node(_node(agent, target, "concept"))
-    for name in ("mentions", "other", "none"):
-        await graph.add_node(_node(agent, f"{agent}:{name}", node_type, created_at="2026-07-01T00:00:00+00:00"))
-    await graph.add_edge(f"{agent}:mentions", target, "mentions")
-    await graph.add_edge(f"{agent}:other", target, "other")
-
-    nodes = await graph.query_nodes_by_type_and_property(
-        node_type, filters={"agent_id": agent}, linked_to=("mentions", target)
-    )
-
-    assert [n.node_id for n in nodes] == [f"{agent}:mentions"]

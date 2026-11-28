@@ -46,31 +46,9 @@ from kestrel_sovereign.features.strategic_memory.ledger_index import (
     search_rows,
 )
 from tests.utils.ledger_storage import without_row_attestations
-from tests.utils.recall_storage import open_governed_storage
 
 
 AGENT = "did:test:ledger"
-
-
-class _Desc(str):
-    """A string that sorts in reverse, for the double's newest-first order."""
-
-    def __lt__(self, other):
-        return str.__gt__(self, other)
-
-    def __gt__(self, other):
-        return str.__lt__(self, other)
-
-
-#: Raw stores ``_feature`` opened, closed after each test.
-_OPEN_STORES = []
-
-
-@pytest.fixture(autouse=True)
-async def _close_feature_stores():
-    yield
-    while _OPEN_STORES:
-        await _OPEN_STORES.pop().close()
 
 
 class _FakeGraph:
@@ -82,9 +60,7 @@ class _FakeGraph:
     production.
     """
 
-    def __init__(self, *, fail_on=None, fail_read_on=None, fail_query_on=None, agent_id=AGENT):
-        # The generic recall read (#4155) reads only a graph bound to the agent.
-        self.agent_id = agent_id
+    def __init__(self, *, fail_on=None, fail_read_on=None, fail_query_on=None):
         self.nodes = {}
         self.writes = 0
         self.deleted = []
@@ -137,21 +113,17 @@ class _FakeGraph:
 
     async def query_nodes_by_type_and_property(
         self, node_type, filters=None, *, created_since=None,
-        order_by_created=True, limit=200, keyset=False, after=None, linked_to=None,
+        order_by_created=True, limit=200,
     ):
-        """Mirrors AsyncGraphStore: equality filters, created_at DESC NULLS
-        LAST, with node_id as a tiebreak under ``keyset``, a keyset ``after``,
-        limit.
+        """Mirrors AsyncGraphStore: equality filters, created_at DESC, limit.
 
         ``TestRecallAgainstRealGraphStore`` below runs the same consumer
         against the real store, so this double is a convenience rather than
         the only thing the recall path is ever proven against.
         """
-        types = (node_type,) if isinstance(node_type, str) else tuple(node_type)
-        if self._fail_query_on and any(self._fail_query_on in t for t in types):
+        if self._fail_query_on and self._fail_query_on in node_type:
             raise RuntimeError("graph query refused")
-        assert linked_to is None, "the strategy index never reads by edge"
-        rows = [n for n in self.nodes.values() if n.node_type in types]
+        rows = [n for n in self.nodes.values() if n.node_type == node_type]
         for key, value in (filters or {}).items():
             rows = [n for n in rows if (n.properties or {}).get(key) == value]
         if created_since is not None:
@@ -159,42 +131,20 @@ class _FakeGraph:
                 n for n in rows
                 if str((n.properties or {}).get("created_at") or "") >= created_since
             ]
-
-        def key(n):
-            stamp = (n.properties or {}).get("created_at")
-            # Newest first, unstamped last, then node id: one total order.
-            return (stamp is None, _Desc(stamp or ""), n.node_id)
-
-        assert keyset or after is None, "a page position needs the keyset order"
         if order_by_created:
-            rows.sort(key=key)
-            if after is not None:
-                position = (after.created_at is None, _Desc(after.created_at or ""), after.node_id)
-                rows = [n for n in rows if key(n) > position]
+            rows.sort(
+                key=lambda n: str((n.properties or {}).get("created_at") or ""),
+                reverse=True,
+            )
         return rows[: max(1, min(int(limit), 10000))]
 
 
-def _graph(feature):
-    """The graph store ``_feature`` gave the agent, not the wrapper's view of it."""
-    return feature.agent._test_graph
-
-
 async def _feature(tmp_path, *, graph=None, strategy=None):
-    """The feature over a real agent store behind the real privacy wrapper.
-
-    recall_patterns / recall_blockers read through the generic recall read
-    (#4155), which needs PrivacyEnforcingStorage and the canonical assertion
-    the ledger projection writes. ``graph`` stays swappable: most tests here
-    are about the strategy index, and poke the double directly (``_graph``).
-    """
     agent = MagicMock()
     agent.agent_id = AGENT
     agent.agent_data_dir = str(tmp_path)
-    agent._test_graph = graph if graph is not None else _FakeGraph()
-    agent.storage, raw = await open_governed_storage(
-        ":memory:", AGENT, graph=agent._test_graph
-    )
-    _OPEN_STORES.append(raw)
+    agent.storage = without_row_attestations(MagicMock())
+    agent.storage.graph = graph if graph is not None else _FakeGraph()
     if strategy is not None:
         (tmp_path / "STRATEGY.yaml").write_text(
             _yaml.dump(strategy), encoding="utf-8"
@@ -1078,7 +1028,7 @@ class TestTheIndexHasAConsumer:
         """The index is a genuine second copy, not a view over the loaded file."""
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="a durable observation")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
 
         # Empty the in-memory ledger. A reader that had been going to YAML all
         # along would now report zero.
@@ -1196,7 +1146,7 @@ class TestTheIndexHasAConsumer:
         await feature.strategy_add_pattern(pattern="canonical but unindexed")
         # Lose the index without touching the canonical file — a database
         # restore from before the projection, or a projection that never ran.
-        _graph(feature).nodes.clear()
+        feature.agent.storage.graph.nodes.clear()
 
         result = await feature.recall_patterns()
 
@@ -1218,7 +1168,7 @@ class TestTheIndexHasAConsumer:
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="the first observation")
         await feature.strategy_add_pattern(pattern="the second observation")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         # Drop exactly one projected node. The ledger still holds both.
         victim = next(
             node_id
@@ -1245,7 +1195,7 @@ class TestTheIndexHasAConsumer:
         """
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="the canonical observation")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         victim, node = next(
             (nid, n)
             for nid, n in graph.nodes.items()
@@ -1259,13 +1209,9 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns()
 
-        # The stranger node stands for no canonical row, so it has no
-        # assertion and the generic read withholds it as absent (#4155).
-        assert result.data["count"] == 0
-        assert result.data["withheld"] == {"canonical_absent": 1}
+        assert result.data["count"] == 1
         assert result.status.value == "partial"
         assert result.data["missing_count"] == 1
-        assert result.data["orphaned_count"] == 1
 
     @pytest.mark.asyncio
     async def test_a_retired_row_still_answering_as_current_is_a_divergence(
@@ -1281,7 +1227,7 @@ class TestTheIndexHasAConsumer:
         """
         feature = await _feature(tmp_path)
         added = await feature.strategy_add_pattern(pattern="old guidance")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         # The projection of the supersession fails. The canonical file records
         # it; the index still answers with the active row.
         graph._fail_on = PATTERN_NODE_TYPE
@@ -1291,10 +1237,7 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns()
 
-        # The graph write failed but the assertion was retracted, so the stale
-        # node is withheld rather than returned as current (rv-4135-1, #4155).
-        assert result.data["count"] == 0, "a retracted row is not returned"
-        assert result.data["withheld"] == {"canonical_inactive": 1}
+        assert result.data["count"] == 1, "the stale node is still returned"
         assert result.data["canonical_expected"] == 0
         assert result.status.value == "partial", (
             "an index answering with a row the ledger retired is not ok"
@@ -1330,15 +1273,10 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns()
 
-        # The index follows the file, but the row's assertion stays retracted:
-        # retraction is terminal for the ledger's assertions (a hand edit is
-        # the only way to reactivate an id). The generic read therefore
-        # withholds it (#4155), and says so rather than certifying an empty
-        # page as clean -- the defect this test was written for (#3064).
-        assert result.data["count"] == 0
-        assert result.data["withheld"] == {"canonical_inactive": 1}
-        assert result.status.value == "partial"
-        assert "retraction is" in (result.error or "")
+        assert result.data["count"] == 1
+        assert result.status.value == "ok"
+        assert result.data["completeness_checked"] is True
+
         assert result.data["completeness_checked"] is True
 
     @pytest.mark.asyncio
@@ -1352,7 +1290,7 @@ class TestTheIndexHasAConsumer:
         feature = await _feature(tmp_path)
         for n in range(3):
             await feature.strategy_add_pattern(pattern=f"observation {n}")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         node = next(
             n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
         )
@@ -1360,10 +1298,7 @@ class TestTheIndexHasAConsumer:
 
         result = await feature.recall_patterns(limit=2)
 
-        # The stranger is withheld (it has no assertion) and the read queries
-        # on to fill the page: two of the three rows, never more.
-        assert result.data["count"] == 2, "the page is full and still bounded"
-        assert result.data["withheld"] in ({}, {"canonical_absent": 1})
+        assert result.data["count"] == 2, "the page itself is still bounded"
         assert result.status.value == "partial"
         assert result.data["index_stale"] is True
         assert result.data["completeness_checked"] is True, (
@@ -1386,7 +1321,7 @@ class TestTheIndexHasAConsumer:
         await feature.strategy_supersede_pattern(
             pattern_id=added.data["pattern_id"], reason="no longer holds"
         )
-        _graph(feature).nodes.clear()
+        feature.agent.storage.graph.nodes.clear()
 
         result = await feature.recall_patterns(include_superseded=True)
 
@@ -1418,7 +1353,7 @@ class TestTheIndexHasAConsumer:
             row["superseded_at"] = "2026-01-01"
             row["superseded_reason"] = "no longer holds"
         feature._ledger.save()
-        _graph(feature).nodes.clear()
+        feature.agent.storage.graph.nodes.clear()
 
         active = await feature.recall_patterns()
         assert active.data["canonical_expected"] == 0, (
@@ -1472,7 +1407,7 @@ class TestTheIndexHasAConsumer:
         await feature.strategy_add_blocker(
             issue="#42", title="wedged", severity="high", repo="owner/repo"
         )
-        _graph(feature)._fail_on = BLOCKER_NODE_TYPE
+        feature.agent.storage.graph._fail_on = BLOCKER_NODE_TYPE
         for row in feature._ledger.data[BLOCKERS_KEY]:
             row["repo"] = "someone-else/other"
             row["severity"] = "critical"
@@ -1502,7 +1437,7 @@ class TestTheIndexHasAConsumer:
         rows = feature._ledger.data[PATTERNS_KEY]
         rows[0]["id"] = "  " + rows[0]["id"] + "  "
         feature._ledger.save()
-        _graph(feature).nodes.clear()
+        feature.agent.storage.graph.nodes.clear()
         await feature._reindex_ledger()
 
         result = await feature.recall_patterns()
@@ -1528,7 +1463,7 @@ class TestTheIndexHasAConsumer:
         await feature.strategy_supersede_pattern(
             pattern_id=added.data["pattern_id"], reason="original reason"
         )
-        _graph(feature)._fail_on = PATTERN_NODE_TYPE
+        feature.agent.storage.graph._fail_on = PATTERN_NODE_TYPE
         for row in feature._ledger.data[PATTERNS_KEY]:
             row["superseded_reason"] = "a corrected reason"
         feature._ledger.save()
@@ -1550,7 +1485,7 @@ class TestTheIndexHasAConsumer:
         await feature.strategy_add_pattern(pattern="an active row")
         node = next(
             n
-            for n in _graph(feature).nodes.values()
+            for n in feature.agent.storage.graph.nodes.values()
             if n.node_type == PATTERN_NODE_TYPE
         )
         node.properties["status"] = "mangled"
@@ -1590,7 +1525,7 @@ class TestTheIndexHasAConsumer:
         """And the advice must not disappear for the case a restart fixes."""
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="canonical but unindexed")
-        _graph(feature).nodes.clear()
+        feature.agent.storage.graph.nodes.clear()
 
         result = await feature.recall_patterns()
 
@@ -1635,7 +1570,7 @@ class TestTheIndexHasAConsumer:
         row_id = feature._ledger.data[BLOCKERS_KEY][0]["id"]
         await feature.strategy_resolve_blocker(issue=row_id, resolution="fixed")
         # Reopened by hand, and the reprojection cannot land.
-        _graph(feature)._fail_on = BLOCKER_NODE_TYPE
+        feature.agent.storage.graph._fail_on = BLOCKER_NODE_TYPE
         for row in feature._ledger.data[BLOCKERS_KEY]:
             row.pop("resolved_at", None)
             row.pop("resolution", None)
@@ -1691,7 +1626,7 @@ class TestTheIndexHasAConsumer:
         """
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="the first observation")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         original = graph.query_nodes_by_type_and_property
         state = {"reads": 0}
 
@@ -1739,7 +1674,7 @@ class TestTheIndexHasAConsumer:
 
         node = next(
             n
-            for n in _graph(feature).nodes.values()
+            for n in feature.agent.storage.graph.nodes.values()
             if n.node_type == PATTERN_NODE_TYPE
         )
         assert node.label == "the corrected wording", (
@@ -1766,7 +1701,7 @@ class TestTheIndexHasAConsumer:
         """
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="the original wording")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         node = next(
             n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
         )
@@ -1807,7 +1742,7 @@ class TestTheIndexHasAConsumer:
 
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="unchanged wording")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         node = next(
             n for n in graph.nodes.values() if n.node_type == PATTERN_NODE_TYPE
         )
@@ -1853,7 +1788,7 @@ class TestTheIndexHasAConsumer:
         """
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="an indexed observation")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         original = graph.query_nodes_by_type_and_property
         state = {"membership_reads": 0}
 
@@ -1918,7 +1853,7 @@ class TestTheIndexHasAConsumer:
 
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="a real observation")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         node_id = f"{PATTERN_NODE_TYPE}:{AGENT}:hand_written"
         graph.nodes[node_id] = GraphNode(
             node_id=node_id,
@@ -1949,7 +1884,7 @@ class TestTheIndexHasAConsumer:
         """
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="an indexed observation")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         original = graph.query_nodes_by_type_and_property
 
         async def _refuse_membership(node_type, filters=None, **kwargs):
@@ -2046,7 +1981,7 @@ class TestTheIndexHasAConsumer:
 
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="mine")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         graph.nodes["strategy_pattern:did:other:x"] = GraphNode(
             node_id="strategy_pattern:did:other:x",
             node_type=PATTERN_NODE_TYPE,
@@ -2070,7 +2005,7 @@ class TestTheIndexHasAConsumer:
 
         feature = await _feature(tmp_path)
         await feature.strategy_add_pattern(pattern="projected")
-        graph = _graph(feature)
+        graph = feature.agent.storage.graph
         graph.nodes["strategy_pattern:handwritten"] = GraphNode(
             node_id="strategy_pattern:handwritten",
             node_type=PATTERN_NODE_TYPE,
@@ -2126,7 +2061,7 @@ class TestRecallAgainstRealGraphStore:
 
         database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
         try:
-            graph = AsyncGraphStore(database, agent_id=AGENT)
+            graph = AsyncGraphStore(database)
             feature = await _feature(tmp_path, graph=graph)
 
             await feature.strategy_add_pattern(
@@ -2158,7 +2093,7 @@ class TestRecallAgainstRealGraphStore:
 
         database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
         try:
-            graph = AsyncGraphStore(database, agent_id=AGENT)
+            graph = AsyncGraphStore(database)
             feature = await _feature(tmp_path, graph=graph)
             added = await feature.strategy_add_pattern(pattern="true until it wasn't")
 
@@ -2184,13 +2119,11 @@ class TestRecallAgainstRealGraphStore:
 
         database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
         try:
-            graph = AsyncGraphStore(database, agent_id=AGENT)
+            graph = AsyncGraphStore(database)
             feature = await _feature(tmp_path, graph=graph)
             await feature.strategy_add_pattern(pattern="mine")
 
-            # Owned by the stranger, as another tenant's row in a shared DB is.
-            stranger = AsyncGraphStore(database, agent_id="did:test:stranger")
-            await stranger.add_node(GraphNode(
+            await graph.add_node(GraphNode(
                 node_id="strategy_pattern:did:test:stranger:z",
                 node_type=PATTERN_NODE_TYPE,
                 label="theirs",
@@ -2448,7 +2381,7 @@ class TestRecallLimitIsNotUnderReported:
         database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
         try:
             feature = await self._with_retired_newest(
-                tmp_path, AsyncGraphStore(database, agent_id=AGENT)
+                tmp_path, AsyncGraphStore(database)
             )
 
             result = await feature.recall_patterns(limit=3)
@@ -2476,7 +2409,7 @@ class TestRecallLimitIsNotUnderReported:
         database = await AsyncDatabase.sqlite(str(tmp_path / "graph.db"))
         try:
             feature = await _feature(
-                tmp_path, graph=AsyncGraphStore(database, agent_id=AGENT)
+                tmp_path, graph=AsyncGraphStore(database)
             )
             await feature.strategy_add_pattern(pattern="the original wording")
             rows = feature._ledger.data[PATTERNS_KEY]
@@ -2485,7 +2418,7 @@ class TestRecallLimitIsNotUnderReported:
             feature._ledger.save()
             await feature._reindex_ledger()
 
-            node = await _graph(feature).get_node(
+            node = await feature.agent.storage.graph.get_node(
                 ledger_node_id(PATTERN_NODE_TYPE, AGENT, row_id)
             )
             assert node is not None

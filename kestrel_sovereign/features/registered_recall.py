@@ -4,44 +4,53 @@ Architect ruling rv-4135-1 (#4135, ruling (c), "Read and write surface")
 extends the existing ``recall`` family instead of adding a ``knowledge_*``
 one: ``recall`` and ``recall_get`` accept a registered node type, and
 ``recall_types`` lists the registry. This module is that read. The tools
-live on ``SaveFeature``; the five fixed recall tools that predate it are
-aliases of it (:data:`FIXED_RECALL_ALIASES`).
+live on ``SaveFeature``.
 
 What every read does, in order:
 
 1. **Through ``PrivacyEnforcingStorage``.** Any other storage object is
    refused, and a volatile privacy mode (EPHEMERAL, ISOLATED, DEIDENTIFIED)
    denies the read, the same predicate the Save feature uses.
-2. **Agent-scoped.** The graph store must be bound to the reading agent, so
-   ``graph_node_owners`` scopes every row, and ``agent_id`` is pushed into SQL
-   besides.
+2. **Agent-scoped by the owner table.** The graph store must be bound to the
+   reading agent, so ``graph_node_owners`` scopes every row; an unbound store
+   is refused. Each served type also declares the scope carrier its rows
+   hold (:class:`ScopeCarrier`), and a row whose carrier names another agent
+   is withheld as ``foreign``.
 3. **Paged, with a hard maximum.** Bounded keyset queries
    (``query_nodes_by_type_and_property(keyset=True, after=...)``), never the
    unbounded ``get_nodes_by_type``. A request above :data:`MAX_PAGE_SIZE` is
    clamped. A page withholds rows (below) after the query, so the read runs
    further bounded queries, at most :data:`MAX_SCAN_QUERIES`, until the page
    is full or the type runs out; a page that stopped at that bound says so.
-4. **Governed types by canonical status.** A governed type's graph node is
-   returned while its canonical assertion is active, and never when that
-   assertion is deleted, quarantined or absent. Erasure removes an assertion
-   physically and keeps no record of it, so an absent assertion cannot be
-   told from an erased one and is never admitted; it is withheld under its
-   own reason, ``canonical_absent``. The bounded producer that makes the type
-   governed maps the node to its assertion (``graph_node_assertion_ids``); a
-   governed type whose producer has no such mapping is withheld.
-5. **Source trash state.** A ``message`` node is returned only while the
-   conversation row it stands for is live: present and not in Trash. An
-   archived row is live (the consolidator's decay archives it).
+4. **Governed types by canonical status.** A type that declares canonical
+   status required has its graph node returned while its canonical
+   assertion is active, and never when that assertion is deleted,
+   quarantined or absent. Erasure removes an assertion physically and keeps
+   no record of it, so an absent assertion cannot be told from an erased one
+   and is never admitted; it is withheld under its own reason,
+   ``canonical_absent``. The bounded producer that makes the type governed
+   maps the node to its assertion (``graph_node_assertion_ids``).
+5. **Source trash state.** Each served type declares its source
+   (:class:`SourceCheck`). A ``message`` node is returned only while the
+   conversation row it stands for is live; an ``action_item`` or
+   ``decision`` only while the message it was extracted from is. Live means
+   present and not in Trash. An archived row is live (the consolidator's
+   decay archives it).
 6. **Home and projection.** Every row names its canonical home and whether
    the graph node is the original or a projection.
 
+A declared check that cannot be made at read time refuses the type with a
+named reason; no type is served unchecked.
+
 Which registered types are served is :data:`_SERVED`, and every other type
 is withheld with its reason (:func:`withheld_reason`). The served set is the
-types the five fixed tools already exposed, so the generic read exposes no
-graph content that was not model-visible before it. Other types stay off
-until each is reviewed: some hold operator configuration, possibly API keys
-(``feature_config``), some are projections of tables whose trash or erasure
-state this read does not consult.
+types the fixed recall tools (``recall_decisions``, ``recall_action_items``,
+``recall_interactions``, ``recall_patterns``, ``recall_blockers``) already
+exposed, so the generic read exposes no graph content that was not
+model-visible before it. Other types stay off until each is reviewed: some
+hold operator configuration, possibly API keys (``feature_config``), some
+are projections of tables whose trash or erasure state this read does not
+consult.
 """
 
 from __future__ import annotations
@@ -51,10 +60,9 @@ import binascii
 import importlib
 import json
 from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
-
-from kestrel_sdk.tools.result import ToolResult
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from kestrel_sovereign.features.storage_access import (
     config_hides_persisted_user_content,
@@ -80,7 +88,7 @@ from kestrel_sovereign.storage.node_type_registry import (
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
 #: The largest page one read returns. A larger request is clamped to it. The
-#: five fixed tools already allowed limits up to 200.
+#: fixed recall tools already allowed limits up to 200.
 MAX_PAGE_SIZE = 200
 
 #: The page a read returns when the caller names no limit.
@@ -91,16 +99,12 @@ DEFAULT_PAGE_SIZE = 25
 #: :data:`MAX_PAGE_SIZE` rows, so one read scans at most about a thousand.
 MAX_SCAN_QUERIES = 5
 
-#: The release that removes the five fixed recall tools (rv-4135-1, Tool
-#: budget). Today's release line is 0.66; the aliases ship through it.
-ALIAS_REMOVAL_RELEASE = "0.67.0"
-
 #: The property a retired graph-original row carries (``mark_superseded``,
 #: and the STRATEGY.yaml supersession ``decision_index`` projects).
 RETIRED_MARKER = "superseded_by"
 
-#: The edge a message node has to a person concept it mentions.
-MENTIONS_EDGE = "mentions"
+#: The property an extracted row names its source conversation message by.
+SOURCE_MESSAGE_PROPERTY = "source_message_id"
 
 MESSAGE_NODE_TYPE = "message"
 ACTION_ITEM_NODE_TYPE = "action_item"
@@ -133,6 +137,10 @@ WITHHELD_REASONS: Mapping[str, str] = MappingProxyType(
             "so an absent assertion is never admitted"
         ),
         "source_trashed": "its source conversation message is in Trash or purged",
+        "source_unverifiable": (
+            "the source conversation message it names is not a conversation row "
+            "id, so whether that message is in Trash cannot be checked"
+        ),
     }
 )
 
@@ -150,32 +158,99 @@ class RecallRefused(ValueError):
         self.reason = reason
 
 
-@dataclass(frozen=True)
-class ReadPolicy:
-    """How the generic read filters one served type."""
+class ScopeCarrier(str, Enum):
+    """What on a served type's row names its agent, besides the owner table."""
 
+    #: ``properties.agent_id``, pushed into SQL and checked on a single row.
+    AGENT_ID_PROPERTY = "agent_id_property"
+    #: The node id, which begins ``{node_type}:{agent_id}:``.
+    NODE_ID_PREFIX = "node_id_prefix"
+
+
+class SourceCheck(str, Enum):
+    """Which conversation row a served type's row stands on, if any."""
+
+    #: None: the row's own canonical home settles whether it is current.
+    NONE = "none"
+    #: The row is a projection of the conversation row its id names
+    #: (``{node_type}:{agent_id}:{row id}``), which must be live.
+    OWN_ROW = "own_row"
+    #: ``properties.source_message_id``, when set, names a row that must be
+    #: live. A row with none was not extracted from a message and is served.
+    SOURCE_MESSAGE_ID = "source_message_id"
+
+
+@dataclass(frozen=True)
+class ServedType:
+    """How the generic read checks one served type.
+
+    The first three fields have no default on purpose: a type is served only
+    once its scope carrier, source and canonical-status requirement are
+    declared (#4155).
+    """
+
+    scope: ScopeCarrier
+    source: SourceCheck
+    #: Whether a row is returned only while its canonical assertion is in an
+    #: admitted state. A governed type must declare it; a type that declares
+    #: it must be governed with a mapping producer, or it is withheld.
+    canonical_required: bool
     #: Exact property filters every read of the type pushes into SQL.
     filters: Mapping[str, str] = _EMPTY
     #: Exact property filters a current read (not ``include_retired``) adds.
     current_filters: Mapping[str, str] = _EMPTY
-    #: Whether each row's source conversation message must still be live.
-    requires_live_message: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scope, ScopeCarrier):
+            raise TypeError("a served type declares its scope carrier")
+        if not isinstance(self.source, SourceCheck):
+            raise TypeError("a served type declares its source")
+        if not isinstance(self.canonical_required, bool):
+            raise TypeError("a served type declares whether canonical status is required")
+        if self.source is SourceCheck.OWN_ROW and self.scope is not ScopeCarrier.NODE_ID_PREFIX:
+            raise ValueError("a row that stands for its own conversation row is named by its id")
+
+    @property
+    def needs_conversation_store(self) -> bool:
+        return self.source is not SourceCheck.NONE
 
 
-_LEDGER_PROJECTION = ReadPolicy(
+_LEDGER_PROJECTION = ServedType(
+    scope=ScopeCarrier.AGENT_ID_PROPERTY,
+    source=SourceCheck.NONE,
+    canonical_required=True,
     filters=MappingProxyType({"source": PROJECTION_SOURCE}),
     current_filters=MappingProxyType({"status": ACTIVE_STATUS}),
 )
 
-#: The registered types the generic read serves.
-_SERVED: Mapping[str, ReadPolicy] = MappingProxyType(
+#: The registered types the generic read serves, each with its declaration.
+#: The property filters are the ones the fixed tool reading the type already
+#: applies; ``message`` has none, because a message node written before
+#: #2649 carries no ``properties.agent_id`` (its id prefix names the agent).
+_SERVED: Mapping[str, ServedType] = MappingProxyType(
     {
-        ACTION_ITEM_NODE_TYPE: ReadPolicy(),
-        DECISION_NODE_TYPE: ReadPolicy(),
-        STRATEGY_DECISION_NODE_TYPE: ReadPolicy(),
+        ACTION_ITEM_NODE_TYPE: ServedType(
+            scope=ScopeCarrier.AGENT_ID_PROPERTY,
+            source=SourceCheck.SOURCE_MESSAGE_ID,
+            canonical_required=False,
+        ),
+        DECISION_NODE_TYPE: ServedType(
+            scope=ScopeCarrier.AGENT_ID_PROPERTY,
+            source=SourceCheck.SOURCE_MESSAGE_ID,
+            canonical_required=False,
+        ),
+        STRATEGY_DECISION_NODE_TYPE: ServedType(
+            scope=ScopeCarrier.AGENT_ID_PROPERTY,
+            source=SourceCheck.NONE,
+            canonical_required=False,
+        ),
         PATTERN_NODE_TYPE: _LEDGER_PROJECTION,
         BLOCKER_NODE_TYPE: _LEDGER_PROJECTION,
-        MESSAGE_NODE_TYPE: ReadPolicy(requires_live_message=True),
+        MESSAGE_NODE_TYPE: ServedType(
+            scope=ScopeCarrier.NODE_ID_PREFIX,
+            source=SourceCheck.OWN_ROW,
+            canonical_required=False,
+        ),
     }
 )
 
@@ -235,77 +310,39 @@ _NOT_REVIEWED = (
 )
 
 
-@dataclass(frozen=True)
-class FixedRecallAlias:
-    """One fixed recall tool that is now an alias of the generic read."""
-
-    tool: str
-    feature: str
-    node_types: Tuple[str, ...]
-    removal_release: str = ALIAS_REMOVAL_RELEASE
-
-    def notice(self) -> Dict[str, Any]:
-        """The ``deprecated_alias`` block each alias result carries."""
-        return {
-            "alias_of": "recall",
-            "node_types": list(self.node_types),
-            "removal_release": self.removal_release,
-        }
-
-
-#: The fixed recall tools rv-4135-1 makes aliases, with the release that
-#: removes them. ``recall_decisions`` reads both decision types (rv-4244-1).
-FIXED_RECALL_ALIASES: Tuple[FixedRecallAlias, ...] = (
-    FixedRecallAlias(
-        "recall_decisions",
-        "MemoryFeature",
-        (DECISION_NODE_TYPE, STRATEGY_DECISION_NODE_TYPE),
-    ),
-    FixedRecallAlias("recall_action_items", "MemoryFeature", (ACTION_ITEM_NODE_TYPE,)),
-    FixedRecallAlias("recall_interactions", "MemoryFeature", (MESSAGE_NODE_TYPE,)),
-    FixedRecallAlias("recall_patterns", "StrategicMemoryFeature", (PATTERN_NODE_TYPE,)),
-    FixedRecallAlias("recall_blockers", "StrategicMemoryFeature", (BLOCKER_NODE_TYPE,)),
-)
-
-_ALIASES_BY_TOOL = {alias.tool: alias for alias in FIXED_RECALL_ALIASES}
-
-
-def fixed_recall_alias(tool: str) -> FixedRecallAlias:
-    return _ALIASES_BY_TOOL[tool]
-
-
-def alias_result(
-    alias: FixedRecallAlias,
-    page: "RecallPage",
-    *,
-    confirmation: str,
-    data: Mapping[str, Any],
-) -> ToolResult:
-    """A fixed alias's result: its own rows, plus what the read withheld.
-
-    A page the read could not fill before its scan bound is partial, not ok:
-    a short page there is not the end of the type (#4155).
-    """
-    merged = {**data, **page.withheld_data(), "deprecated_alias": alias.notice()}
-    note = page.stopped_short_note()
-    if note is None:
-        return ToolResult.ok(confirmation=confirmation, data=merged)
-    return ToolResult.partial(confirmation=confirmation, error=note, data=merged)
-
-
 def withheld_reason(entry: NodeTypeEntry, governance: Governance) -> Optional[str]:
-    """Why ``entry``'s type is off the generic read, or ``None`` when served."""
-    if entry.node_type not in _SERVED:
+    """Why ``entry``'s type is off the generic read, or ``None`` when served.
+
+    A served type whose declared canonical-status check cannot be made is
+    withheld, with the reason, rather than served unchecked.
+    """
+    declaration = _SERVED.get(entry.node_type)
+    if declaration is None:
         reason = _WITHHELD.get(entry.node_type)
         if reason is not None:
             return reason
         if entry.is_projection and entry.canonical_location:
             return _TABLE_PROJECTION.format(location=entry.canonical_location)
         return _NOT_REVIEWED
-    if governance.governed and _assertion_mapper(governance) is None:
+    if declaration.canonical_required:
+        if not governance.governed:
+            return (
+                "its canonical status is required, but governance reports it "
+                f"ungoverned ({governance.reason}), so that status cannot be checked"
+            )
+        if _assertion_mapper(governance) is None:
+            producer = (
+                "names no module" if governance.producer is None
+                else governance.producer.module
+            )
+            return (
+                f"governed, but its producer ({producer}) maps no graph node to "
+                "its assertion, so canonical status cannot be checked"
+            )
+    elif governance.governed:
         return (
-            f"governed, but its producer {governance.producer.module} maps no "
-            "graph node to its assertion, so canonical status cannot be checked"
+            "governed, but its generic-read declaration does not require "
+            "canonical status, so that status would go unchecked"
         )
     return None
 
@@ -465,6 +502,16 @@ class _Outcome:
     withheld: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class _Candidate:
+    """A node past the scope and retired checks, with what describes it."""
+
+    node: GraphNode
+    entry: NodeTypeEntry
+    governance: Governance
+    declaration: ServedType
+
+
 def parse_node_types(value: Any) -> Tuple[str, ...]:
     """The node types a ``node_type`` argument names: one, or several by comma."""
     if not isinstance(value, str):
@@ -500,10 +547,13 @@ def encode_cursor(node_types: Sequence[str], node: GraphNode) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def decode_cursor(node_types: Sequence[str], cursor: str) -> NodePagePosition:
+def decode_cursor(node_types: Sequence[str], cursor: Any) -> NodePagePosition:
+    if not isinstance(cursor, str):
+        raise RecallRefused("bad_cursor", "cursor is not one this read issued")
     try:
         payload = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
-    except (UnicodeEncodeError, binascii.Error, ValueError):
+    except (UnicodeEncodeError, binascii.Error, ValueError, RecursionError):
+        # RecursionError: a deeply nested JSON body, which this read never issues.
         raise RecallRefused("bad_cursor", "cursor is not one this read issued") from None
     if not isinstance(payload, dict) or payload.get("v") != 1:
         raise RecallRefused("bad_cursor", "cursor is not one this read issued")
@@ -542,32 +592,63 @@ def _require_governed_storage(storage: Any, agent_id: Any) -> Any:
     return graph
 
 
+def _require_served(entry: NodeTypeEntry) -> Governance:
+    described = describe_type(entry)
+    if not described.served:
+        raise RecallRefused(
+            "withheld",
+            f"{entry.node_type!r} is not on the generic read: {described.withheld}",
+        )
+    return described.governance
+
+
 async def _served_entries(
     registry_db: Any, node_types: Sequence[str]
 ) -> Dict[str, Tuple[NodeTypeEntry, Governance]]:
+    """Each requested type's entry and governance, every one of them served.
+
+    A ``decision`` read also describes its pre-split ``STRATEGY.yaml`` rows by
+    the ``strategy_decision`` entry (:func:`_describing_entry`), so that entry
+    is checked as served too.
+    """
     if registry_db is None:
         raise RecallRefused("unregistered", "the node type registry is not available")
+    wanted = list(node_types)
+    if DECISION_NODE_TYPE in wanted and STRATEGY_DECISION_NODE_TYPE not in wanted:
+        wanted.append(STRATEGY_DECISION_NODE_TYPE)
     entries: Dict[str, Tuple[NodeTypeEntry, Governance]] = {}
-    for node_type in node_types:
+    for node_type in wanted:
         entry = await get_node_type(registry_db, node_type)
         if entry is None:
             raise RecallRefused(
                 "unregistered",
                 f"{node_type!r} is not a registered node type; recall_types lists them",
             )
-        described = describe_type(entry)
-        if not described.served:
-            raise RecallRefused(
-                "withheld",
-                f"{node_type!r} is not on the generic read: {described.withheld}",
-            )
-        entries[node_type] = (entry, described.governance)
+        entries[node_type] = (entry, _require_served(entry))
     return entries
 
 
-def _policy_for(node_types: Sequence[str]) -> ReadPolicy:
-    first, *rest = (_SERVED[node_type] for node_type in node_types)
-    if any(policy != first for policy in rest):
+def _sql_filters(
+    agent_id: str, declaration: ServedType, include_retired: bool
+) -> Dict[str, Any]:
+    """The exact property filters a read of the type pushes into SQL."""
+    merged: Dict[str, Any] = {}
+    if declaration.scope is ScopeCarrier.AGENT_ID_PROPERTY:
+        merged["agent_id"] = agent_id
+    merged.update(declaration.filters)
+    if not include_retired:
+        merged.update(declaration.current_filters)
+    return merged
+
+
+def _common_sql_filters(
+    agent_id: str, node_types: Sequence[str], include_retired: bool
+) -> Dict[str, Any]:
+    """The one SQL filter set a page of several types is queried with."""
+    first, *rest = (
+        _sql_filters(agent_id, _SERVED[node_type], include_retired) for node_type in node_types
+    )
+    if any(filters != first for filters in rest):
         raise RecallRefused(
             "bad_request",
             "these node types are filtered differently, so they cannot be read "
@@ -576,45 +657,85 @@ def _policy_for(node_types: Sequence[str]) -> ReadPolicy:
     return first
 
 
-def _sql_filters(
-    agent_id: str,
-    policy: ReadPolicy,
-    include_retired: bool,
-    filters: Optional[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    merged: Dict[str, Any] = {"agent_id": agent_id, **policy.filters}
-    if not include_retired:
-        merged.update(policy.current_filters)
-    for key, value in (filters or {}).items():
-        if key in merged:
-            raise RecallRefused("bad_request", f"the read already filters on {key!r}")
-        merged[key] = value
-    return merged
+def _require_mode_can_check_canonical(
+    storage: PrivacyEnforcingStorage, node_types: Sequence[str]
+) -> None:
+    """Refuse a governed read in a mode that writes no canonical assertions."""
+    governed = [node_type for node_type in node_types if _SERVED[node_type].canonical_required]
+    if governed and storage.privacy_config.requires_anonymization():
+        raise RecallRefused(
+            "privacy",
+            f"{', '.join(governed)} is not read in {storage.privacy_mode.value} mode: "
+            "that mode writes no canonical assertions, so the canonical status "
+            "of a row written in it cannot be checked",
+        )
+
+
+def _require_conversation_store(
+    node_types: Sequence[str], conversation_store: Any, agent_id: str
+) -> None:
+    """Refuse a read whose source check has no store, or another agent's."""
+    sourced = [node_type for node_type in node_types if _SERVED[node_type].needs_conversation_store]
+    if not sourced:
+        return
+    if conversation_store is None:
+        raise RecallRefused(
+            "unavailable",
+            f"the conversation store is not available, so whether the message "
+            f"each {', '.join(sourced)} row stands on is in Trash cannot be checked",
+        )
+    if getattr(conversation_store, "agent_id", None) != agent_id:
+        raise RecallRefused(
+            "unscoped",
+            "the conversation store is not bound to the reading agent, so the "
+            "messages its rows stand on cannot be checked",
+        )
 
 
 def _describing_entry(
-    node: GraphNode,
-    entries: Mapping[str, Tuple[NodeTypeEntry, Governance]],
-    strategy_decision: Optional[NodeTypeEntry],
+    node: GraphNode, entries: Mapping[str, Tuple[NodeTypeEntry, Governance]]
 ) -> Tuple[NodeTypeEntry, Governance]:
     """The entry whose home a node has.
 
     A marked ``decision`` row from before the split (rv-4244-1) is a
     ``STRATEGY.yaml`` projection; for one release ``mark_superseded`` treats
-    it as one, and so does this read's label.
+    it as one, and so does this read.
     """
-    entry, governance = entries[node.node_type]
-    if strategy_decision is not None and is_pre_split_strategy_decision(
-        node.node_type, node.properties
-    ):
-        return strategy_decision, derive_governance(strategy_decision.node_type)
-    return entry, governance
+    if is_pre_split_strategy_decision(node.node_type, node.properties):
+        return entries[STRATEGY_DECISION_NODE_TYPE]
+    return entries[node.node_type]
+
+
+def _scope_prefix(node_type: str, agent_id: str) -> str:
+    return f"{node_type}:{agent_id}:"
+
+
+def _carries_scope(node: GraphNode, declaration: ServedType, agent_id: str) -> bool:
+    """Whether the node's scope carrier names the reading agent."""
+    if declaration.scope is ScopeCarrier.NODE_ID_PREFIX:
+        return node.node_id.startswith(_scope_prefix(node.node_type, agent_id))
+    return (node.properties or {}).get("agent_id") == agent_id
+
+
+def _source_row_id(
+    node: GraphNode, declaration: ServedType, agent_id: str
+) -> Tuple[bool, Optional[int]]:
+    """``(stands on a row, its id)``; the id is ``None`` when it cannot be read."""
+    if declaration.source is SourceCheck.OWN_ROW:
+        suffix = node.node_id[len(_scope_prefix(node.node_type, agent_id)):]
+        return True, coerce_persistent_message_id(suffix)
+    if declaration.source is SourceCheck.SOURCE_MESSAGE_ID:
+        named = (node.properties or {}).get(SOURCE_MESSAGE_PROPERTY)
+        if named is None:
+            return False, None
+        return True, coerce_persistent_message_id(named)
+    return False, None
 
 
 async def _canonical_outcomes(
     storage: PrivacyEnforcingStorage,
     agent_id: str,
-    governed: Sequence[Tuple[GraphNode, Governance]],
+    governed: Sequence[_Candidate],
     include_retired: bool,
 ) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
     """``node_id -> (admitted status, withheld reason)`` of each governed node.
@@ -635,12 +756,13 @@ async def _canonical_outcomes(
         admitted |= {AssertionStatus.RETRACTED, AssertionStatus.SUPERSEDED}
     by_producer: Dict[str, List[GraphNode]] = {}
     mappers = {}
-    for node, governance in governed:
-        mapper = _assertion_mapper(governance)
+    for candidate in governed:
+        mapper = _assertion_mapper(candidate.governance)
         if mapper is None:
             continue
-        by_producer.setdefault(governance.producer.module, []).append(node)
-        mappers[governance.producer.module] = mapper
+        module = candidate.governance.producer.module
+        by_producer.setdefault(module, []).append(candidate.node)
+        mappers[module] = mapper
     statuses: Dict[str, Any] = {}
     mapped: Dict[str, str] = {}
     for module, nodes in by_producer.items():
@@ -658,29 +780,17 @@ async def _canonical_outcomes(
         )
         statuses.update({assertion.assertion_id: assertion.status for assertion in found})
     outcomes: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-    for node, _ in governed:
+    for candidate in governed:
         # A node its producer cannot map names no assertion, so the store
         # holds none for it.
-        status = statuses.get(mapped.get(node.node_id))
+        status = statuses.get(mapped.get(candidate.node.node_id))
         if status is None:
-            outcomes[node.node_id] = (None, "canonical_absent")
+            outcomes[candidate.node.node_id] = (None, "canonical_absent")
         elif AssertionStatus(status) in admitted:
-            outcomes[node.node_id] = (AssertionStatus(status).value, None)
+            outcomes[candidate.node.node_id] = (AssertionStatus(status).value, None)
         else:
-            outcomes[node.node_id] = (None, "canonical_inactive")
+            outcomes[candidate.node.node_id] = (None, "canonical_inactive")
     return outcomes
-
-
-def _message_row_id(node: GraphNode) -> Optional[int]:
-    return coerce_persistent_message_id((node.properties or {}).get("message_id"))
-
-
-async def _live_message_nodes(conversation_store: Any, nodes: Sequence[GraphNode]) -> Set[str]:
-    """The ids of the nodes in ``nodes`` whose conversation row is live."""
-    row_ids = {node.node_id: _message_row_id(node) for node in nodes}
-    wanted = {row_id for row_id in row_ids.values() if row_id is not None}
-    live = await conversation_store.live_message_ids(wanted) if wanted else set()
-    return {node_id for node_id, row_id in row_ids.items() if row_id in live}
 
 
 async def _admit(
@@ -689,71 +799,88 @@ async def _admit(
     agent_id: str,
     nodes: Sequence[GraphNode],
     entries: Mapping[str, Tuple[NodeTypeEntry, Governance]],
-    strategy_decision: Optional[NodeTypeEntry],
-    policy: ReadPolicy,
     include_retired: bool,
 ) -> List[_Outcome]:
-    """One outcome per node, in the order the query returned them."""
+    """One outcome per node, in the order the query returned them.
+
+    Each node is checked by the declaration of the entry that describes it:
+    scope carrier, retired marker, canonical status, then source.
+    """
     decided: Dict[str, _Outcome] = {}
-    candidates: List[Tuple[GraphNode, NodeTypeEntry, Governance]] = []
+    candidates: List[_Candidate] = []
     for node in nodes:
         if node.node_type not in entries:
+            decided[node.node_id] = _Outcome(node, withheld="foreign")
+            continue
+        entry, governance = _describing_entry(node, entries)
+        declaration = _SERVED[entry.node_type]
+        if not _carries_scope(node, declaration, agent_id):
             decided[node.node_id] = _Outcome(node, withheld="foreign")
             continue
         if not include_retired and (node.properties or {}).get(RETIRED_MARKER):
             decided[node.node_id] = _Outcome(node, withheld="retired")
             continue
-        entry, governance = _describing_entry(node, entries, strategy_decision)
-        candidates.append((node, entry, governance))
+        candidates.append(_Candidate(node, entry, governance, declaration))
 
-    governed = [(node, gov) for node, _, gov in candidates if gov.governed]
+    governed = [c for c in candidates if c.declaration.canonical_required]
     canonical = (
         await _canonical_outcomes(storage, agent_id, governed, include_retired)
         if governed
         else {}
     )
     statuses: Dict[str, Optional[str]] = {}
-    remaining: List[Tuple[GraphNode, NodeTypeEntry]] = []
-    for node, entry, governance in candidates:
-        if governance.governed:
-            status, reason = canonical[node.node_id]
+    sourced: Dict[str, int] = {}
+    remaining: List[_Candidate] = []
+    for candidate in candidates:
+        node_id = candidate.node.node_id
+        if candidate.declaration.canonical_required:
+            status, reason = canonical[node_id]
             if reason is not None:
-                decided[node.node_id] = _Outcome(node, withheld=reason)
+                decided[node_id] = _Outcome(candidate.node, withheld=reason)
                 continue
-            statuses[node.node_id] = status
-        remaining.append((node, entry))
+            statuses[node_id] = status
+        stands_on_row, row_id = _source_row_id(candidate.node, candidate.declaration, agent_id)
+        if stands_on_row and row_id is None:
+            decided[node_id] = _Outcome(candidate.node, withheld="source_unverifiable")
+            continue
+        if stands_on_row:
+            sourced[node_id] = row_id
+        remaining.append(candidate)
 
     live = (
-        await _live_message_nodes(conversation_store, [node for node, _ in remaining])
-        if policy.requires_live_message and remaining
-        else None
+        await conversation_store.live_message_ids(set(sourced.values())) if sourced else set()
     )
-    for node, entry in remaining:
-        if live is not None and node.node_id not in live:
+    for candidate in remaining:
+        node = candidate.node
+        if node.node_id in sourced and sourced[node.node_id] not in live:
             decided[node.node_id] = _Outcome(node, withheld="source_trashed")
             continue
         decided[node.node_id] = _Outcome(
             node,
-            row=RecallRow(node=node, entry=entry, canonical_status=statuses.get(node.node_id)),
+            row=RecallRow(
+                node=node, entry=candidate.entry, canonical_status=statuses.get(node.node_id)
+            ),
         )
     return [decided[node.node_id] for node in nodes]
 
 
-async def _strategy_decision_entry(
-    registry_db: Any, node_types: Sequence[str]
-) -> Optional[NodeTypeEntry]:
-    if DECISION_NODE_TYPE not in node_types:
-        return None
-    return await get_node_type(registry_db, STRATEGY_DECISION_NODE_TYPE)
-
-
-def _require_conversation_store(policy: ReadPolicy, conversation_store: Any) -> None:
-    if policy.requires_live_message and conversation_store is None:
-        raise RecallRefused(
-            "unavailable",
-            "the conversation store is not available, so whether each message "
-            "is in Trash cannot be checked",
-        )
+async def _gate(
+    *,
+    storage: Any,
+    registry_db: Any,
+    agent_id: str,
+    node_types: Sequence[str],
+    conversation_store: Any,
+    include_retired: Any,
+) -> Tuple[Any, Dict[str, Tuple[NodeTypeEntry, Governance]]]:
+    """Every check a read makes before it queries: ``(graph, entries)``."""
+    if not isinstance(include_retired, bool):
+        raise RecallRefused("bad_request", "include_retired must be a boolean")
+    graph = _require_governed_storage(storage, agent_id)
+    entries = await _served_entries(registry_db, node_types)
+    _require_mode_can_check_canonical(storage, node_types)
+    _require_conversation_store(node_types, conversation_store, agent_id)
+    return graph, entries
 
 
 async def read_page(
@@ -766,32 +893,29 @@ async def read_page(
     limit: Any = DEFAULT_PAGE_SIZE,
     cursor: Optional[str] = None,
     include_retired: bool = False,
-    filters: Optional[Mapping[str, Any]] = None,
-    created_since: Optional[str] = None,
-    linked_to: Optional[Tuple[str, str]] = None,
 ) -> RecallPage:
     """One page of registered nodes, newest first.
 
-    ``filters``, ``created_since`` and ``linked_to`` narrow the bounded query
-    for the fixed aliases' own arguments. ``conversation_store`` answers
-    whether a ``message`` node's row is in Trash; it is required for that
-    type. Rows withheld after the query do not shorten the page: the read
-    queries on, up to :data:`MAX_SCAN_QUERIES` times, and ``withheld`` counts
-    every row it passed over. ``next_cursor`` is set unless the type ran out;
+    ``conversation_store`` answers whether the message a row stands on is in
+    Trash; it is required for a type whose declared source is a message. Rows
+    withheld after the query do not shorten the page: the read queries on, up
+    to :data:`MAX_SCAN_QUERIES` times, and ``withheld`` counts every row it
+    passed over. ``next_cursor`` is set unless the type ran out;
     :attr:`RecallPage.stopped_short` says a short page stopped at the bound.
     Raises :class:`RecallRefused` for a read refused before any row.
     """
-    if not isinstance(include_retired, bool):
-        raise RecallRefused("bad_request", "include_retired must be a boolean")
     node_types = tuple(node_types)
-    graph = _require_governed_storage(storage, agent_id)
-    entries = await _served_entries(registry_db, node_types)
-    policy = _policy_for(node_types)
-    _require_conversation_store(policy, conversation_store)
+    graph, entries = await _gate(
+        storage=storage,
+        registry_db=registry_db,
+        agent_id=agent_id,
+        node_types=node_types,
+        conversation_store=conversation_store,
+        include_retired=include_retired,
+    )
+    sql_filters = _common_sql_filters(agent_id, node_types, include_retired)
     page_limit = clamp_limit(limit)
     position = decode_cursor(node_types, cursor) if cursor else None
-    sql_filters = _sql_filters(agent_id, policy, include_retired, filters)
-    strategy_decision = await _strategy_decision_entry(registry_db, node_types)
 
     rows: List[RecallRow] = []
     withheld: Dict[str, int] = {}
@@ -803,24 +927,15 @@ async def read_page(
             await graph.query_nodes_by_type_and_property(
                 node_types if len(node_types) > 1 else node_types[0],
                 filters=sql_filters,
-                created_since=created_since,
                 order_by_created=True,
                 keyset=True,
                 limit=requested,
                 after=position,
-                linked_to=linked_to,
             )
             or []
         )
         outcomes = await _admit(
-            storage,
-            conversation_store,
-            agent_id,
-            nodes,
-            entries,
-            strategy_decision,
-            policy,
-            include_retired,
+            storage, conversation_store, agent_id, nodes, entries, include_retired
         )
         consumed = 0
         for outcome in outcomes:
@@ -860,35 +975,34 @@ async def read_node(
     include_retired: bool = False,
 ) -> RecallLookup:
     """One registered node by id, through the same gates as :func:`read_page`."""
-    if not isinstance(include_retired, bool):
-        raise RecallRefused("bad_request", "include_retired must be a boolean")
     if not isinstance(node_id, str) or not node_id:
         raise RecallRefused("bad_request", "node_id must be a non-empty string")
-    graph = _require_governed_storage(storage, agent_id)
-    entries = await _served_entries(registry_db, (node_type,))
-    policy = _SERVED[node_type]
-    _require_conversation_store(policy, conversation_store)
+    if not isinstance(node_type, str):
+        raise RecallRefused("bad_request", "node_type must be a string")
+    graph, entries = await _gate(
+        storage=storage,
+        registry_db=registry_db,
+        agent_id=agent_id,
+        node_types=(node_type,),
+        conversation_store=conversation_store,
+        include_retired=include_retired,
+    )
     node = await graph.get_node(node_id)
     if node is None or node.node_type != node_type:
         return RecallLookup(row=None, missing="not_found")
-    # The same SQL filters a page applies, checked on the one row: a row
-    # another agent names, or another writer's row of the type, is foreign; a
-    # row a current read leaves out by status is retired.
+    # The SQL filters a page applies, checked on the one row: another
+    # writer's row of the type is foreign; a row a current read leaves out by
+    # status is retired. The scope carrier itself is checked by _admit, as
+    # on a page.
     properties = node.properties or {}
-    scoped = _sql_filters(agent_id, policy, True, None)
+    declaration = _SERVED[node_type]
+    scoped = _sql_filters(agent_id, declaration, True)
     if any(properties.get(key) != value for key, value in scoped.items()):
         return RecallLookup(row=None, missing="foreign")
-    current = _sql_filters(agent_id, policy, include_retired, None)
+    current = _sql_filters(agent_id, declaration, include_retired)
     if any(properties.get(key) != value for key, value in current.items()):
         return RecallLookup(row=None, missing="retired")
     (outcome,) = await _admit(
-        storage,
-        conversation_store,
-        agent_id,
-        (node,),
-        entries,
-        await _strategy_decision_entry(registry_db, (node_type,)),
-        policy,
-        include_retired,
+        storage, conversation_store, agent_id, (node,), entries, include_retired
     )
     return RecallLookup(row=outcome.row, missing=outcome.withheld)

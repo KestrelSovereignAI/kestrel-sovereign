@@ -1843,7 +1843,6 @@ class AsyncGraphStore:
         limit: int = 200,
         keyset: bool = False,
         after: Optional[NodePagePosition] = None,
-        linked_to: Optional[tuple[str, str]] = None,
     ) -> List[GraphNode]:
         """Query graph nodes by type with property-level SQL filters.
 
@@ -1870,9 +1869,6 @@ class AsyncGraphStore:
                 only a paged read asks for it. Requires ``order_by_created``.
             after: Start strictly after this position in the keyset order.
                 Requires ``keyset``.
-            linked_to: ``(label, target_id)``: only nodes with an edge of
-                that label to that target. The edge is scoped by the same
-                capability as the node.
 
         Returns:
             List of matching :class:`GraphNode` instances.
@@ -1903,18 +1899,6 @@ class AsyncGraphStore:
         if created_since is not None:
             clauses.append(f"{created_at} >= ?")
             params.append(created_since)
-
-        if linked_to is not None:
-            label, target_id = linked_to
-            if not isinstance(label, str) or not isinstance(target_id, str):
-                raise ValueError("linked_to is (edge label, target node id)")
-            edge_scope, edge_scope_params = self._edge_scope("link_edge")
-            clauses.append(
-                "EXISTS (SELECT 1 FROM graph_edges AS link_edge "
-                "WHERE link_edge.source_id = graph_nodes.node_id "
-                f"AND link_edge.target_id = ? AND link_edge.label = ? AND {edge_scope})"
-            )
-            params.extend((target_id, label, *edge_scope_params))
 
         if after is not None:
             # The position's own row and every row before it in the order

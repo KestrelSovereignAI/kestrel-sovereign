@@ -254,32 +254,42 @@ a mix of SQL tables and graph nodes:
 ### The generic recall read (#4155)
 
 `recall(node_type=...)` and `recall_get(item_id, node_type=...)` read the
-graph nodes of a registered node type, and `recall_types` lists the
-node-type registry (owning feature, canonical home, original or
+graph nodes of a registered node type, and `recall_types` (`!recall-types`)
+lists the node-type registry (owning feature, canonical home, original or
 projection, governed). The read lives in
 `kestrel_sovereign.features.registered_recall` and follows rv-4135-1 (c):
 
 - It goes only through `PrivacyEnforcingStorage`, and EPHEMERAL, ISOLATED
   and DEIDENTIFIED deny it.
-- It is scoped to the agent the graph store is bound to.
+- It is scoped by `graph_node_owners` to the agent the graph store is
+  bound to, and refuses an unbound store. Each served type also declares
+  its scope carrier: `properties.agent_id`, or for `message` the
+  `message:{agent_id}:` id prefix, since a message node written before
+  #2649 has no `agent_id` property.
 - It is a bounded keyset page, newest first, at most 200 rows, with a
   `next_cursor`.
-- A governed type (`strategy_pattern`, `strategy_blocker`) is returned only
-  while its canonical assertion is active. `include_retired=True` also
-  admits a retracted one, labelled `canonical_status`. An erased, deleted,
-  quarantined or missing assertion is never admitted.
-- A `message` node is returned only while its conversation row is live.
-  Trashing a message leaves its graph node in place, so without this check
-  the node of a trashed message would still be reachable.
+- A type that declares canonical status required (`strategy_pattern`,
+  `strategy_blocker`) is returned only while its canonical assertion is
+  active. `include_retired=True` also admits a retracted or superseded
+  one, labelled with its `canonical_status`. An erased, deleted, quarantined or missing assertion
+  is never admitted. ANONYMOUS mode writes no canonical assertions, so
+  the read refuses these types there.
+- Each served type declares its source. A `message` node is returned only
+  while its own conversation row is live. An `action_item` or `decision`
+  that names a `source_message_id` is returned only while that message is
+  live. Trashing a message leaves its graph node and the nodes extracted
+  from it in place, so without this check they would still be reachable.
+- A declared check that cannot be made at read time refuses the type with
+  a named reason.
 - Each row carries `home`: its canonical home and whether it is the
   original or a projection.
 
 It serves `action_item`, `decision`, `strategy_decision`,
 `strategy_pattern`, `strategy_blocker` and `message`, the types the fixed
-recall tools already exposed. `recall_types` gives the reason each other
-type is withheld. `recall_decisions`, `recall_action_items`,
-`recall_interactions`, `recall_patterns` and `recall_blockers` are
-deprecated aliases of this read, removed in 0.67.0.
+recall tools already expose. `recall_types` gives the reason each other
+type is withheld. The fixed tools (`recall_decisions`,
+`recall_action_items`, `recall_interactions`, `recall_patterns`,
+`recall_blockers`) are unchanged by it.
 
 ### Why everything in the graph
 

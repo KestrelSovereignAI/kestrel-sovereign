@@ -538,7 +538,7 @@ class SaveFeature(Feature):
     )
     async def recall(
         self,
-        query: str = "",
+        query: Optional[str] = None,
         item_type: str = "",
         limit: int = 5,
         node_type: str = "",
@@ -571,7 +571,7 @@ class SaveFeature(Feature):
                 "cursor and include_retired apply to a node_type read",
                 data={"cursor": cursor, "include_retired": include_retired},
             )
-        if not str(query or "").strip():
+        if query is None:
             return ToolResult.failed(
                 "recall needs a query to search saved items, or a node_type to "
                 "list (recall_types lists them)",
@@ -765,6 +765,11 @@ class SaveFeature(Feature):
             )
         except RecallRefused as error:
             return self._recall_refused(error, request)
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logger.error(f"recall(node_type={node_type!r}) failed: {error}")
+            return ToolResult.failed(str(error), data=request)
         data = {"success": True, **page.to_dict()}
         notes = []
         if page.limit_clamped:
@@ -803,6 +808,11 @@ class SaveFeature(Feature):
             )
         except RecallRefused as error:
             return self._recall_refused(error, request)
+        except Exception as error:
+            if is_execution_control_error(error):
+                raise
+            logger.error(f"recall_get(node_type={node_type!r}) failed: {error}")
+            return ToolResult.failed(str(error), data=request)
         if lookup.row is None:
             # Another agent's row reads as absent, not as withheld.
             if lookup.missing in ("not_found", "foreign"):
@@ -828,7 +838,9 @@ class SaveFeature(Feature):
             "read does not serve, why."
         ),
         category=ToolCategory.MEMORY,
-        command_prefix="!recall types"
+        # One word: a command routes by its first word, and "!recall" is
+        # recall's, so "!recall types" would run a search for "types".
+        command_prefix="!recall-types"
     )
     async def recall_types(self) -> ToolResult:
         """List the node type registry as the generic recall read sees it."""
