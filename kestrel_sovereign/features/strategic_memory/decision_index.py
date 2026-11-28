@@ -4,8 +4,14 @@ STRATEGY.yaml is canonical. It is human-editable, diffable, reviewable, and it
 survives loss of the database — which is what makes an agent's decision record
 its own rather than the storage layer's. The graph holds a *derived* copy so the
 decision-reasoning surface has something to operate on: ``recall_decisions``
-reads ``decision``-typed nodes, and ``mark_superseded`` needs real nodes to link
-with ``supersedes`` edges.
+reads the copies, typed ``strategy_decision``, beside the decisions
+``schema_router`` extracts from conversation, typed ``decision``; and
+``mark_superseded`` needs real nodes to link with ``supersedes`` edges.
+
+The copies were typed ``decision`` too until rv-4244-1 (#4244) split the type,
+because only the extracted ones have the graph as their home. The v2 registry
+seed migration retyped the copies already in the graph; ids and edges did not
+change (``node_type_registry.apply_seed_v2``).
 
 Before this, the two stores never met — `strategy_add_decision` appended to YAML
 and returned, while `recall_decisions` queried a node type nothing ever wrote.
@@ -36,16 +42,27 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Collection, Dict, List, Optional, Set
 
+from kestrel_sovereign.storage.node_type_registry import (
+    DECISION_NODE_TYPE,
+    STRATEGY_DECISION_NODE_TYPE,
+    STRATEGY_DECISION_SOURCE,
+    is_pre_split_strategy_decision,
+    strategy_decision_id_prefix,
+)
+
 from .timestamps import stamp_created_at
 
 logger = logging.getLogger(__name__)
 
-DECISION_NODE_TYPE = "decision"
+#: The types this projection's own rows have: the one it writes, and the one
+#: it wrote before rv-4244-1. A row of the older type appears only from a
+#: writer or a restore that predates the split, and reconciliation covers it.
+PROJECTED_NODE_TYPES = (STRATEGY_DECISION_NODE_TYPE, DECISION_NODE_TYPE)
 
 #: Marks a node as created by THIS projection. Reconciliation deletes only
 #: rows carrying it, so a decision node written by anything else is never
 #: removed on our behalf.
-_PROJECTION_SOURCE = "strategic_memory"
+_PROJECTION_SOURCE = STRATEGY_DECISION_SOURCE
 
 #: A decision entry's supersession, under the names the strategy ledger uses
 #: for a superseded pattern. Each is read from the STRATEGY.yaml entry and
@@ -76,7 +93,7 @@ def strategy_decision_node_id(agent_id: str, entry: Dict[str, Any]) -> str:
     digest = hashlib.sha1(
         f"{date_part}\x00{text_part}".encode("utf-8")
     ).hexdigest()[:16]
-    return f"decision:{agent_id}:strategy:{digest}"
+    return f"{strategy_decision_id_prefix(agent_id)}{digest}"
 
 
 def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -185,10 +202,28 @@ def is_strategy_decision(node: Any) -> bool:
 
     Such a node is a copy, so a change to it belongs in the file: superseding
     one through the graph alone would be undone by the next reindex.
+
+    Its registered type decides: a ``strategy_decision`` is one, whatever its
+    properties hold. So, for now, is a node still typed ``decision`` that
+    carries this projection's marker (rv-4244-1 §4): one from a writer or a
+    restore that predates the split, which would otherwise get a graph-only
+    supersession the next reindex undoes. That stays until every path that
+    brings graph rows back applies the split's retype (au-4244-1 C4, #4249).
     """
-    if node is None or getattr(node, "node_type", None) != DECISION_NODE_TYPE:
+    if node is None:
         return False
-    return (getattr(node, "properties", None) or {}).get("source") == _PROJECTION_SOURCE
+    node_type = getattr(node, "node_type", None)
+    if node_type == STRATEGY_DECISION_NODE_TYPE:
+        return True
+    return is_pre_split_strategy_decision(node_type, getattr(node, "properties", None))
+
+
+def _is_own_projection(node: Any) -> bool:
+    """Whether this projection wrote ``node``: either of its types, and its marker."""
+    return (
+        getattr(node, "node_type", None) in PROJECTED_NODE_TYPES
+        and (getattr(node, "properties", None) or {}).get("source") == _PROJECTION_SOURCE
+    )
 
 
 @dataclass(frozen=True)
@@ -317,9 +352,11 @@ async def project_decisions(
                     file_says.get("superseded_by"),
                 )
 
+        # A swap writes properties only, so a node that predates the split
+        # keeps its type here; reconciliation covers it under either.
         node = GraphNode(
             node_id=node_id,
-            node_type=DECISION_NODE_TYPE,
+            node_type=STRATEGY_DECISION_NODE_TYPE,
             label=_label_for(entry),
             properties=properties,
         )
@@ -360,19 +397,21 @@ async def _remove_orphans(
     graph_store: Any, agent_id: str, keep: Set[str]
 ) -> int:
     """Delete this agent's projected nodes that YAML no longer contains."""
+    nodes: List[Any] = []
     try:
-        nodes = await graph_store.get_nodes_by_type(DECISION_NODE_TYPE)
+        for node_type in PROJECTED_NODE_TYPES:
+            nodes.extend(await graph_store.get_nodes_by_type(node_type) or [])
     except Exception as e:  # noqa: BLE001
         logger.debug("decision reconcile could not list nodes: %s", e)
         return 0
     removed = 0
-    for node in nodes or []:
+    for node in nodes:
         properties = node.properties or {}
         # Only this agent's rows, and only rows this projection created —
         # a decision node written by anything else is not ours to delete.
         if properties.get("agent_id") != agent_id:
             continue
-        if not is_strategy_decision(node):
+        if not _is_own_projection(node):
             continue
         if node.node_id in keep:
             continue

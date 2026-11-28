@@ -24,6 +24,13 @@ Three rules from the ruling shape it:
 
 The census that counts each type's rows and lists its writers is
 :mod:`kestrel_sovereign.storage.node_type_census`.
+
+Architect ruling rv-4244-1 (#4244) split ``decision``, which rv-4135-1 had
+given one home although two writers write it: the copies strategic memory
+projects from ``STRATEGY.yaml`` are ``strategy_decision``, and the decisions
+``schema_router`` extracts from conversation, whose graph row is the original,
+keep ``decision``. :func:`apply_seed_v2` moves a database seeded before the
+split across it.
 """
 
 from __future__ import annotations
@@ -33,18 +40,60 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 TABLE = "node_type_registry"
 
 #: ``schema_backfills`` marker of the one-time seeding of :data:`SEED_ENTRIES`.
-#: A later release that changes the seeds adds its own marker and migration;
-#: seeding never overwrites an entry that is already registered.
+#: It registers this release's seeds in a database that has none. A database
+#: seeded by an earlier release is brought forward by a later marker's
+#: migration instead (:data:`SEED_V2_MARKER`); seeding never overwrites an
+#: entry that is already registered.
 SEED_MARKER = "node_type_registry_seed_v1"
+
+#: ``schema_backfills`` marker of :func:`apply_seed_v2`, the migration that
+#: splits ``decision`` (rv-4244-1 §3).
+SEED_V2_MARKER = "node_type_registry_seed_v2"
 
 #: The ``owning_feature`` of a type written by core code rather than by a
 #: feature package. Core cannot be unloaded.
 CORE_OWNER = "core"
+
+#: A decision ``schema_router`` extracts from a user message. Its graph row is
+#: the original (rv-4244-1).
+DECISION_NODE_TYPE = "decision"
+
+#: The graph copy of a ``STRATEGY.yaml`` decision, which strategic memory's
+#: ``decision_index`` projects. Typed ``decision`` before rv-4244-1.
+STRATEGY_DECISION_NODE_TYPE = "strategy_decision"
+
+#: ``properties.source`` on every node ``decision_index`` projects. It is what
+#: told a projected decision from an extracted one while both were typed
+#: ``decision``.
+STRATEGY_DECISION_SOURCE = "strategic_memory"
+
+
+def strategy_decision_id_prefix(agent_id: str) -> str:
+    """The start of the node id of every decision projected for ``agent_id``.
+
+    Matched as a whole, never by splitting an id on ``:``: an agent id is a
+    DID, which has colons of its own (au-4244-1 C3).
+    """
+    return f"decision:{agent_id}:strategy:"
+
+
+def is_pre_split_strategy_decision(node_type: Optional[str], properties: Any) -> bool:
+    """Whether a node is a projected decision still typed ``decision``.
+
+    These are the rows :func:`apply_seed_v2` retypes. One can still appear
+    after it ran: from a writer that predates the split, or from a restore of
+    a database taken before it.
+    """
+    return (
+        node_type == DECISION_NODE_TYPE
+        and isinstance(properties, dict)
+        and properties.get("source") == STRATEGY_DECISION_SOURCE
+    )
 
 
 class CanonicalHome(str, Enum):
@@ -309,9 +358,10 @@ SEED_ENTRIES: Tuple[NodeTypeEntry, ...] = (
     ),
     _strategy_ledger_row("strategy_pattern", "PATTERN_SECTION"),
     _strategy_ledger_row("strategy_blocker", "BLOCKER_SECTION"),
-    # Not governed until its preconditions are met (rv-4135-1, Types (d)).
+    # The row rv-4135-1 gave ``decision``, under the name rv-4244-1 gave the
+    # projection. Not governed until rv-4135-1's preconditions are met.
     NodeTypeEntry(
-        node_type="decision",
+        node_type=STRATEGY_DECISION_NODE_TYPE,
         owning_feature="StrategicMemoryFeature",
         canonical_home=CanonicalHome.FILE,
         canonical_location="STRATEGY.yaml",
@@ -359,6 +409,21 @@ SEED_ENTRIES: Tuple[NodeTypeEntry, ...] = (
     ),
     _graph_original("SovereignAgent", CORE_OWNER, ("kestrel_sovereign.kestrel_agent",)),
     _graph_original("action_item", CORE_OWNER, ("kestrel_sovereign.storage.schema_router",)),
+    # An extracted claim with a confidence, not a candidate for governance
+    # (rv-4244-1). ``mark_superseded`` supersedes it in place. No retention
+    # sweep or decay reads it: it is kept until it is erased.
+    NodeTypeEntry(
+        node_type=DECISION_NODE_TYPE,
+        owning_feature=CORE_OWNER,
+        canonical_home=CanonicalHome.GRAPH,
+        canonical_location="graph_nodes",
+        writer=("kestrel_sovereign.storage.schema_router",),
+        property_schema=None,
+        retire_behaviour=RetireBehaviour.GRAPH_SUPERSEDE,
+        retention=LifecyclePolicy.NONE,
+        decay=LifecyclePolicy.NONE,
+        is_projection=False,
+    ),
     _graph_original("backup_artifact", CORE_OWNER, ("kestrel_sovereign.storage.async_storage",)),
     _graph_original("concept", CORE_OWNER, ("kestrel_sovereign.storage.associative_linker",)),
     _graph_original(
@@ -508,6 +573,194 @@ async def register_node_type(db, entry: NodeTypeEntry) -> NodeTypeEntry:
             f"it cannot be registered again as {entry.owning_feature!r}'s"
         )
     return registered
+
+
+#: ``decision`` exactly as :data:`SEED_MARKER` registered it before rv-4244-1:
+#: one home, ``STRATEGY.yaml``, for a type with two writers. The only stored
+#: ``decision`` entry :func:`apply_seed_v2` replaces.
+SEED_V1_DECISION = NodeTypeEntry(
+    node_type=DECISION_NODE_TYPE,
+    owning_feature="StrategicMemoryFeature",
+    canonical_home=CanonicalHome.FILE,
+    canonical_location="STRATEGY.yaml",
+    writer=("kestrel_sovereign.features.strategic_memory.feature",),
+    property_schema=None,
+    retire_behaviour=RetireBehaviour.CANONICAL_HOME,
+    retention=LifecyclePolicy.CANONICAL_HOME,
+    decay=LifecyclePolicy.CANONICAL_HOME,
+    is_projection=True,
+)
+
+#: Rows :func:`apply_seed_v2` reads at a time.
+_SEED_V2_PAGE = 500
+
+
+class SeedV2Refused(RuntimeError):
+    """The v2 seed migration found a registry it will not change.
+
+    Raised before it writes anything, so the database is left as it was and
+    the migration is tried again at the next open.
+    """
+
+
+@dataclass(frozen=True)
+class SeedV2Report:
+    """What :func:`apply_seed_v2` did (rv-4244-1 §3)."""
+
+    #: Projected decisions retyped from ``decision`` to ``strategy_decision``.
+    retyped: int
+    #: Rows still typed ``decision``: none carries the projection's marker.
+    left: int
+    #: Rows among ``left`` whose node id has a projected decision's shape. Each
+    #: stays ``decision``: nothing guesses it is a projection, and nothing
+    #: deletes it.
+    id_shape_mismatches: int
+    #: Whether this run replaced the v1 ``decision`` entry. False when an
+    #: earlier, interrupted run already had.
+    decision_entry_replaced: bool
+
+    def describe(self) -> str:
+        return (
+            f"retyped {self.retyped} projected decision row(s) to "
+            f"{STRATEGY_DECISION_NODE_TYPE}; left {self.left} row(s) typed "
+            f"{DECISION_NODE_TYPE}, {self.id_shape_mismatches} of them with a "
+            "projected decision's node id and no projection marker; the "
+            f"{DECISION_NODE_TYPE} entry was "
+            + ("replaced" if self.decision_entry_replaced else "already the v2 entry")
+        )
+
+
+def _seeded(node_type: str) -> NodeTypeEntry:
+    return next(entry for entry in SEED_ENTRIES if entry.node_type == node_type)
+
+
+async def _stored_entry_or_refuse(db, node_type: str) -> Optional[NodeTypeEntry]:
+    try:
+        return await get_node_type(db, node_type)
+    except (ValueError, TypeError) as error:
+        raise SeedV2Refused(
+            f"{SEED_V2_MARKER}: the stored {node_type!r} entry is not a valid "
+            f"registry entry ({error}); nothing was changed"
+        ) from error
+
+
+async def _replace_entry(db, entry: NodeTypeEntry) -> None:
+    columns = _COLUMNS[1:]
+    assignments = ", ".join(f"{column} = ?" for column in (*columns, "registered_at"))
+    await db.execute(
+        f"UPDATE {TABLE} SET {assignments} WHERE node_type = ?",
+        _row(entry)[1:] + (datetime.now(timezone.utc).isoformat(), entry.node_type),
+    )
+
+
+def _properties_of(raw: Any) -> Any:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        # Unreadable properties carry no marker, so the row is left as it is.
+        return None
+
+
+async def _owners_of(db, node_ids: Sequence[str]) -> Dict[str, Set[str]]:
+    placeholders = ", ".join("?" for _ in node_ids)
+    rows = await db.fetchall(
+        f"SELECT node_id, agent_id FROM graph_node_owners WHERE node_id IN ({placeholders})",
+        tuple(node_ids),
+    )
+    owners: Dict[str, Set[str]] = {}
+    for node_id, agent_id in rows:
+        owners.setdefault(node_id, set()).add(agent_id)
+    return owners
+
+
+def _has_projected_id_shape(node_id: str, agent_ids: Iterable[Any]) -> bool:
+    return any(
+        isinstance(agent_id, str)
+        and agent_id
+        and node_id.startswith(strategy_decision_id_prefix(agent_id))
+        for agent_id in agent_ids
+    )
+
+
+async def apply_seed_v2(db) -> SeedV2Report:
+    """Split ``decision`` in a database seeded before rv-4244-1 (§3).
+
+    Registers ``strategy_decision``, retypes every row
+    :func:`is_pre_split_strategy_decision` matches to it, and replaces the
+    ``decision`` entry with the v2 one. Node ids and edges do not change, so a
+    ``supersedes`` edge and a ``superseded_by`` in ``STRATEGY.yaml`` stay
+    valid, and no file is touched. A row without the marker stays
+    ``decision``.
+
+    The caller runs it in one transaction where the backend has them. Where it
+    does not, an interrupted run leaves some prefix of the writes, in the
+    order: register, retype, replace. The stored entries this accepts are
+    therefore v1 or v2 ``decision``, and no ``strategy_decision`` or the v2
+    one: every prefix resumes, and a completed run changes nothing when run
+    again (au-4244-1 C2). Any other stored entry stops the migration before
+    it writes, with :class:`SeedV2Refused`.
+    """
+    decision_v2 = _seeded(DECISION_NODE_TYPE)
+    strategy_v2 = _seeded(STRATEGY_DECISION_NODE_TYPE)
+    stored_decision = await _stored_entry_or_refuse(db, DECISION_NODE_TYPE)
+    if stored_decision not in (SEED_V1_DECISION, decision_v2):
+        raise SeedV2Refused(
+            f"{SEED_V2_MARKER}: the stored {DECISION_NODE_TYPE!r} entry is neither "
+            f"the v1 seed nor the v2 one, so it is not replaced and no row is "
+            f"retyped. Stored: {stored_decision.to_dict() if stored_decision else None}; "
+            f"v1 seed: {SEED_V1_DECISION.to_dict()}; v2 seed: {decision_v2.to_dict()}"
+        )
+    stored_strategy = await _stored_entry_or_refuse(db, STRATEGY_DECISION_NODE_TYPE)
+    if stored_strategy not in (None, strategy_v2):
+        raise SeedV2Refused(
+            f"{SEED_V2_MARKER}: {STRATEGY_DECISION_NODE_TYPE!r} is already registered "
+            f"with another entry, so no row is retyped to it. Stored: "
+            f"{stored_strategy.to_dict()}; v2 seed: {strategy_v2.to_dict()}"
+        )
+
+    await _insert_if_absent(db, strategy_v2)
+
+    retyped = left = mismatches = 0
+    after = ""
+    while True:
+        page = await db.fetchall(
+            "SELECT node_id, properties FROM graph_nodes "
+            "WHERE node_type = ? AND node_id > ? ORDER BY node_id LIMIT ?",
+            (DECISION_NODE_TYPE, after, _SEED_V2_PAGE),
+        )
+        if not page:
+            break
+        after = page[-1][0]
+        unmarked: List[Tuple[str, Any]] = []
+        for node_id, raw in page:
+            properties = _properties_of(raw)
+            if not is_pre_split_strategy_decision(DECISION_NODE_TYPE, properties):
+                unmarked.append((node_id, properties))
+                continue
+            retyped += await db.execute(
+                "UPDATE graph_nodes SET node_type = ? WHERE node_id = ? AND node_type = ?",
+                (STRATEGY_DECISION_NODE_TYPE, node_id, DECISION_NODE_TYPE),
+            )
+        if not unmarked:
+            continue
+        left += len(unmarked)
+        owners = await _owners_of(db, [node_id for node_id, _ in unmarked])
+        for node_id, properties in unmarked:
+            claimed = properties.get("agent_id") if isinstance(properties, dict) else None
+            if _has_projected_id_shape(node_id, {claimed, *owners.get(node_id, ())}):
+                mismatches += 1
+
+    decision_entry_replaced = stored_decision == SEED_V1_DECISION
+    if decision_entry_replaced:
+        await _replace_entry(db, decision_v2)
+    return SeedV2Report(
+        retyped=retyped,
+        left=left,
+        id_shape_mismatches=mismatches,
+        decision_entry_replaced=decision_entry_replaced,
+    )
 
 
 @dataclass(frozen=True)

@@ -243,6 +243,10 @@ a mix of SQL tables and graph nodes:
   filters in memory.
 - **Decisions** become graph nodes of type `decision`, same pattern
   as skills from [#643](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/643).
+  The graph row is the original. The decisions strategic memory projects
+  from `STRATEGY.yaml` are a different type, `strategy_decision`, because
+  their original is the file (rv-4244-1, #4248). `recall_decisions` reads
+  both.
 - **Interactions** (per-person sentiment + topics) are stored as
   properties on the existing `mentions` edges between message and
   person concept nodes — no new edge type.

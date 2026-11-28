@@ -51,19 +51,20 @@ _PROJECTION_SOURCE = "strategic_memory"
 #: This projection used to carry ``superseded_by``/``superseded_at``/
 #: ``superseded_reason`` across from the existing node wherever the ledger was
 #: silent, on the theory that the graph might own a retirement the file has no
-#: field for. Nothing can write one: ``memory_supersede_claim`` refuses every
-#: node type outside ``CLAIM_SHAPED_NODE_TYPES`` (``decision``,
-#: ``action_item``), and ``StrategyLedger.supersede`` -- the file itself -- is
-#: the only other writer. So the carry-over could only ever preserve a value a
-#: PREVIOUS projection had written from YAML, which is exactly the outcome the
+#: field for. Nothing can write one: ``mark_superseded`` refuses every node
+#: type outside ``CLAIM_SHAPED_NODE_TYPES`` (``action_item``, ``decision``,
+#: ``strategy_decision``), and ``StrategyLedger.supersede`` -- the file
+#: itself -- is the only other writer. So the carry-over could only ever
+#: preserve a value a PREVIOUS projection had written from YAML, which is
+#: exactly the outcome the
 #: module docstring said it existed to avoid: clearing the fields in the
 #: canonical file could never take effect in the index, and the recall then
 #: reported that as a healthy empty result (#3064).
 #:
-#: ``decision_index`` dropped its carry-over too. Decisions ARE claim-shaped,
-#: so ``mark_superseded`` can supersede one, but it now writes that to
-#: STRATEGY.yaml first and the node is re-projected from the file: a
-#: decision's supersession is the file's as well (#4154).
+#: ``decision_index`` dropped its carry-over too. Its ``strategy_decision``
+#: nodes ARE claim-shaped, so ``mark_superseded`` can supersede one, but it
+#: writes that to STRATEGY.yaml first and the node is re-projected from the
+#: file: a projected decision's supersession is the file's as well (#4154).
 
 
 def ledger_node_id(node_type: str, agent_id: str, row_id: str) -> str:

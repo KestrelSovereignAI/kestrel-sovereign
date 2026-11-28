@@ -35,12 +35,15 @@ from kestrel_sovereign.storage.node_type_registry import (
 )
 from tests.shared.agent_store_schema import load, snapshot_path
 
-#: rv-4135-1's Types (d) table, as the ruling states it.
+#: rv-4135-1's Types (d) table, as the ruling states it, with its ``decision``
+#: row amended by rv-4244-1: the projection is ``strategy_decision``, and
+#: ``decision`` is an original whose home is the graph.
 RULED = {
     "fact": (CanonicalHome.ASSERTION_STORE, "semantic_assertions", True),
     "strategy_pattern": (CanonicalHome.FILE, "STRATEGY_LEDGER.yaml", True),
     "strategy_blocker": (CanonicalHome.FILE, "STRATEGY_LEDGER.yaml", True),
-    "decision": (CanonicalHome.FILE, "STRATEGY.yaml", False),
+    "strategy_decision": (CanonicalHome.FILE, "STRATEGY.yaml", False),
+    "decision": (CanonicalHome.GRAPH, "graph_nodes", False),
     "learned_fact": (CanonicalHome.GRAPH, "graph_nodes", False),
     "note": (CanonicalHome.FEATURE_TABLE, "saved_items", False),
     "excerpt": (CanonicalHome.FEATURE_TABLE, "saved_items", False),
@@ -301,8 +304,14 @@ async def test_seed_types_match_ruling(db):
     )
     assert entries["fact"].owning_feature == "MemoryAgencyFeature"
     assert entries["fact"].writer == ("kestrel_sovereign.features.memory_agency.semantic_facts",)
-    for node_type in ("strategy_pattern", "strategy_blocker", "decision"):
+    for node_type in ("strategy_pattern", "strategy_blocker", "strategy_decision"):
         assert entries[node_type].owning_feature == "StrategicMemoryFeature"
+    decision = entries["decision"]
+    assert decision.owning_feature == CORE_OWNER
+    assert decision.writer == ("kestrel_sovereign.storage.schema_router",)
+    assert decision.retire_behaviour is RetireBehaviour.GRAPH_SUPERSEDE
+    # Nothing sweeps or decays an extracted decision (rv-4244-1 §2).
+    assert (decision.retention, decision.decay) == (LifecyclePolicy.NONE, LifecyclePolicy.NONE)
     for node_type in ("note", "excerpt", "stash"):
         assert entries[node_type].owning_feature == "SaveFeature"
     for entry in entries.values():
@@ -317,7 +326,7 @@ def test_seed_locations_match_their_owners_constants():
 
     entries = {entry.node_type: entry for entry in SEED_ENTRIES}
     assert entries["strategy_pattern"].canonical_location == LEDGER_FILENAME
-    assert entries["decision"].canonical_location == StrategicMemoryFeature.STRATEGY_FILENAME
+    assert entries["strategy_decision"].canonical_location == StrategicMemoryFeature.STRATEGY_FILENAME
 
 
 def test_seed_references_resolve():
